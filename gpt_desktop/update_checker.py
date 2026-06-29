@@ -2,6 +2,7 @@ import platform
 import re
 import sys
 from dataclasses import dataclass
+from html import unescape
 from typing import Optional
 
 import requests
@@ -177,17 +178,95 @@ def parse_github_release(data, current_version=APP_VERSION, platform_key=None):
     )
 
 
+def parse_github_release_page(html_text, final_url="", current_version=APP_VERSION, platform_key=None):
+    text = unescape(str(html_text or ""))
+    final_url = str(final_url or APP_RELEASES_URL)
+
+    latest = ""
+    tag_match = re.search(r"/releases/tag/([^/?#\"']+)", final_url)
+    if tag_match:
+        latest = tag_match.group(1)
+    if not latest:
+        tag_match = re.search(r"/releases/download/([^/?#\"']+)/", text)
+        if tag_match:
+            latest = tag_match.group(1)
+    latest = normalize_version(latest)
+    if not latest:
+        raise ValueError("GitHub 发布页里没有找到版本号。")
+
+    hrefs = re.findall(r'href="([^"]*/releases/download/[^"]+)"', text)
+    assets = []
+    seen = set()
+    for href in hrefs:
+        href = unescape(href)
+        if href in seen:
+            continue
+        seen.add(href)
+        name = href.rsplit("/", 1)[-1]
+        if not name or name in ("zip", "tar.gz"):
+            continue
+        if href.startswith("/"):
+            url = f"https://github.com{href}"
+        elif href.startswith("http://") or href.startswith("https://"):
+            url = href
+        else:
+            continue
+        assets.append({"name": name, "browser_download_url": url})
+
+    release_url = final_url if "/releases/tag/" in final_url else APP_RELEASES_URL
+    asset = select_release_asset(assets, platform_key=platform_key)
+    return UpdateInfo(
+        current_version=normalize_version(current_version),
+        latest_version=latest,
+        has_update=compare_versions(current_version, latest) < 0,
+        release_url=release_url,
+        release_notes="",
+        asset=asset,
+    )
+
+
+def check_latest_release_page(current_version=APP_VERSION, platform_key=None, timeout=15):
+    headers = {
+        "Accept": "text/html",
+        "User-Agent": "GPTLocalToolbox-Updater",
+    }
+    resp = requests.get(APP_RELEASES_URL, headers=headers, timeout=timeout, allow_redirects=True)
+    if resp.status_code >= 400:
+        raise RuntimeError(f"检查更新失败：GitHub 发布页返回 {resp.status_code}")
+    return parse_github_release_page(
+        resp.text,
+        final_url=getattr(resp, "url", "") or APP_RELEASES_URL,
+        current_version=current_version,
+        platform_key=platform_key,
+    )
+
+
 def check_latest_release(current_version=APP_VERSION, platform_key=None, timeout=15):
     headers = {
         "Accept": "application/vnd.github+json",
         "User-Agent": "GPTLocalToolbox-Updater",
     }
-    resp = requests.get(APP_RELEASES_API_URL, headers=headers, timeout=timeout)
-    if resp.status_code == 404:
-        raise RuntimeError("没有找到 GitHub Release。请先在仓库里发布一个版本。")
-    if resp.status_code >= 400:
-        raise RuntimeError(f"检查更新失败：GitHub 返回 {resp.status_code}")
-    return parse_github_release(resp.json(), current_version=current_version, platform_key=platform_key)
+    try:
+        resp = requests.get(APP_RELEASES_API_URL, headers=headers, timeout=timeout)
+        if resp.status_code == 404:
+            raise RuntimeError("没有找到 GitHub Release。请先在仓库里发布一个版本。")
+        if resp.status_code >= 400:
+            return check_latest_release_page(
+                current_version=current_version,
+                platform_key=platform_key,
+                timeout=timeout,
+            )
+        return parse_github_release(resp.json(), current_version=current_version, platform_key=platform_key)
+    except RuntimeError:
+        raise
+    except Exception:
+        return check_latest_release_page(
+            current_version=current_version,
+            platform_key=platform_key,
+            timeout=timeout,
+        )
+
+
 
 
 def safe_asset_filename(name):

@@ -2,6 +2,7 @@ import unittest
 
 from gpt_desktop.update_checker import (
     compare_versions,
+    parse_github_release_page,
     parse_github_release,
     select_release_asset,
 )
@@ -67,6 +68,25 @@ class UpdateCheckerTests(unittest.TestCase):
         self.assertTrue(info.has_update)
         self.assertEqual(info.latest_version, "1.2.0")
         self.assertEqual(info.asset.name, "GPTLocalToolbox_Setup_v1.2.0_windows_x64.exe")
+
+    def test_parse_release_page_fallback_selects_asset(self):
+        html = """
+        <a href="/yydsmf/AI/releases/download/v1.2.0/GPTLocalToolbox_Setup_v1.2.0_windows_x64.exe">win</a>
+        <a href="/yydsmf/AI/releases/download/v1.2.0/GPTLocalToolbox_v1.2.0_macos_arm64.app.zip">arm</a>
+        <a href="/yydsmf/AI/archive/refs/tags/v1.2.0.zip">source</a>
+        """
+
+        info = parse_github_release_page(
+            html,
+            final_url="https://github.com/yydsmf/AI/releases/tag/v1.2.0",
+            current_version="1.0.0",
+            platform_key="windows-x64",
+        )
+
+        self.assertTrue(info.has_update)
+        self.assertEqual(info.latest_version, "1.2.0")
+        self.assertEqual(info.asset.name, "GPTLocalToolbox_Setup_v1.2.0_windows_x64.exe")
+        self.assertTrue(info.asset.url.startswith("https://github.com/"))
 
 
 if __name__ == "__main__":

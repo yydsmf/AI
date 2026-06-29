@@ -42,6 +42,14 @@ jobs:
         shell: powershell
         run: python -m PyInstaller --clean --noconfirm --distpath dist --workpath build GPTLocalToolbox_windows.spec
 
+      - name: Bundle Microsoft VC++ Runtime
+        shell: powershell
+        run: |
+          New-Item -ItemType Directory -Force installer\redist | Out-Null
+          Invoke-WebRequest `
+            -Uri "https://aka.ms/vs/17/release/vc_redist.x64.exe" `
+            -OutFile "installer\redist\VC_redist.x64.exe"
+
       - name: Build Setup.exe
         shell: powershell
         run: |

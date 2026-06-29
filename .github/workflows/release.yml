@@ -59,6 +59,22 @@ jobs:
           if ($refName.StartsWith("v")) { $version = $refName.TrimStart("v") } else { $version = "manual" }
           Copy-Item GPTLocalToolbox_Setup.exe "GPTLocalToolbox_Setup_v${version}_windows_x64.exe" -Force
 
+      - name: Sign Windows installer
+        shell: powershell
+        env:
+          WINDOWS_SIGNING_PFX_BASE64: ${{ secrets.WINDOWS_SIGNING_PFX_BASE64 }}
+          WINDOWS_SIGNING_PFX_PASSWORD: ${{ secrets.WINDOWS_SIGNING_PFX_PASSWORD }}
+          WINDOWS_SIGNTOOL_PATH: ${{ secrets.WINDOWS_SIGNTOOL_PATH }}
+          WINDOWS_TIMESTAMP_URL: ${{ secrets.WINDOWS_TIMESTAMP_URL }}
+        run: |
+          if ($env:WINDOWS_SIGNING_PFX_BASE64) {
+            $refName = "${{ github.ref_name }}"
+            if ($refName.StartsWith("v")) { $version = $refName.TrimStart("v") } else { $version = "manual" }
+            python scripts\release_signing.py --sign-windows "GPTLocalToolbox_Setup_v${version}_windows_x64.exe"
+          } else {
+            Write-Host "Windows signing skipped: no signing certificate configured."
+          }
+
       - uses: actions/upload-artifact@v4
         with:
           name: windows-installer
@@ -116,18 +132,50 @@ jobs:
       - name: Build app
         run: python -m PyInstaller --clean --noconfirm GPTLocalToolbox.spec
 
-      - name: Package app zip
+      - name: Sign macOS app
+        env:
+          MAC_CODESIGN_IDENTITY: ${{ secrets.MAC_CODESIGN_IDENTITY }}
+          MAC_NOTARY_APPLE_ID: ${{ secrets.MAC_NOTARY_APPLE_ID }}
+          MAC_NOTARY_TEAM_ID: ${{ secrets.MAC_NOTARY_TEAM_ID }}
+          MAC_NOTARY_PASSWORD: ${{ secrets.MAC_NOTARY_PASSWORD }}
+          MAC_ENTITLEMENTS_PATH: ${{ secrets.MAC_ENTITLEMENTS_PATH }}
+        run: |
+          if [[ -n "$MAC_CODESIGN_IDENTITY" ]]; then
+            python3 scripts/release_signing.py --sign-macos "dist/GPTLocalToolbox.app"
+          else
+            echo "Mac signing skipped: no Developer ID identity configured."
+          fi
+
+      - name: Package macOS dmg
         run: |
           if [[ "$GITHUB_REF_NAME" == v* ]]; then VERSION="${GITHUB_REF_NAME#v}"; else VERSION="manual"; fi
-          ditto -c -k --keepParent "dist/GPTLocalToolbox.app" "GPTLocalToolbox_v${VERSION}_macos_${{ matrix.arch }}.app.zip"
+          rm -rf dmg-root
+          mkdir -p dmg-root
+          cp -R "dist/GPTLocalToolbox.app" "dmg-root/"
+          ln -s /Applications "dmg-root/Applications"
+          hdiutil create -volname "GPT 本地工具箱" -srcfolder "dmg-root" -ov -format UDZO "GPTLocalToolbox_v${VERSION}_macos_${{ matrix.arch }}.dmg"
+
+      - name: Notarize macOS dmg
+        env:
+          MAC_CODESIGN_IDENTITY: ${{ secrets.MAC_CODESIGN_IDENTITY }}
+          MAC_NOTARY_APPLE_ID: ${{ secrets.MAC_NOTARY_APPLE_ID }}
+          MAC_NOTARY_TEAM_ID: ${{ secrets.MAC_NOTARY_TEAM_ID }}
+          MAC_NOTARY_PASSWORD: ${{ secrets.MAC_NOTARY_PASSWORD }}
+        run: |
+          if [[ -n "$MAC_CODESIGN_IDENTITY" && -n "$MAC_NOTARY_APPLE_ID" && -n "$MAC_NOTARY_TEAM_ID" && -n "$MAC_NOTARY_PASSWORD" ]]; then
+            if [[ "$GITHUB_REF_NAME" == v* ]]; then VERSION="${GITHUB_REF_NAME#v}"; else VERSION="manual"; fi
+            python3 scripts/release_signing.py --notarize-macos "GPTLocalToolbox_v${VERSION}_macos_${{ matrix.arch }}.dmg"
+          else
+            echo "Mac notarization skipped: no Apple notarization credentials configured."
+          fi
 
       - uses: actions/upload-artifact@v4
         with:
-          name: macos-${{ matrix.arch }}-app
-          path: GPTLocalToolbox_v*_macos_${{ matrix.arch }}.app.zip
+          name: macos-${{ matrix.arch }}-dmg
+          path: GPTLocalToolbox_v*_macos_${{ matrix.arch }}.dmg
 
       - name: Upload to GitHub Release
         if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
-          files: GPTLocalToolbox_v*_macos_${{ matrix.arch }}.app.zip
+          files: GPTLocalToolbox_v*_macos_${{ matrix.arch }}.dmg

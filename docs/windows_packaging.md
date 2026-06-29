@@ -168,6 +168,21 @@ VC_redist.x64.exe /install /quiet /norestart
 
 如果没有放入 `VC_redist.x64.exe`，安装包仍然可以正常编译，只是不会自动安装 VC++ 运行库。
 
+## 发布签名
+
+如果你准备公开分发，建议再给 Windows 安装器加代码签名。这样用户下载时更不容易被 SmartScreen 提示拦住。
+
+当前仓库已经预留了签名入口，后续只要在 GitHub Secrets 里配置：
+
+- `WINDOWS_SIGNING_PFX_BASE64`
+- `WINDOWS_SIGNING_PFX_PASSWORD`
+- `WINDOWS_SIGNTOOL_PATH`（可选）
+- `WINDOWS_TIMESTAMP_URL`（可选）
+
+就会自动签名；没配置则跳过。
+
+如果你本地手工测试，也可以把 `.pfx` 转成 Base64 再放进环境变量里。
+
 ## 截图里的 PySide6 安装报错
 
 截图中失败位置是安装 `PySide6_Essentials`，错误类似：

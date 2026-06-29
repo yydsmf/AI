@@ -101,7 +101,7 @@ def _asset_score(asset_name, platform_key):
         if "arm64" in name or "aarch64" in name or "apple" in name or "silicon" in name:
             score += 90
         if "universal" in name or "universal2" in name:
-            score += 80
+            score += 120
         if name.endswith(".dmg"):
             score += 60
         if name.endswith(".pkg"):
@@ -118,7 +118,7 @@ def _asset_score(asset_name, platform_key):
         if "x64" in name or "x86_64" in name or "intel" in name:
             score += 90
         if "universal" in name or "universal2" in name:
-            score += 80
+            score += 120
         if name.endswith(".dmg"):
             score += 60
         if name.endswith(".pkg"):

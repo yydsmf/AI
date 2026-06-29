@@ -63,6 +63,9 @@ def sign_macos_app(app_path: str) -> bool:
         return False
 
     entitlements = _env("MAC_ENTITLEMENTS_PATH")
+    if entitlements and not Path(entitlements).exists():
+        raise RuntimeError(f"找不到 macOS entitlements 文件：{entitlements}")
+
     codesign = shutil.which("codesign")
     if not codesign:
         raise RuntimeError("找不到 codesign。")
@@ -81,6 +84,7 @@ def sign_macos_app(app_path: str) -> bool:
         cmd += ["--entitlements", entitlements]
     cmd.append(app_path)
     _run(cmd)
+    _run([codesign, "--verify", "--deep", "--strict", "--verbose=2", app_path])
     return True
 
 
@@ -101,6 +105,7 @@ def sign_macos_dmg(dmg_path: str) -> bool:
         identity,
         dmg_path,
     ])
+    _run([codesign, "--verify", "--verbose=2", dmg_path])
     return True
 
 
@@ -130,6 +135,23 @@ def notarize_macos_file(path: str) -> bool:
             path,
         ])
         _run([xcrun, "stapler", "staple", path])
+        _run([xcrun, "stapler", "validate", path])
+        spctl = shutil.which("spctl")
+        if spctl:
+            suffix = Path(path).suffix.lower()
+            if suffix == ".dmg":
+                _run([
+                    spctl,
+                    "-a",
+                    "-vv",
+                    "-t",
+                    "open",
+                    "--context",
+                    "context:primary-signature",
+                    path,
+                ])
+            else:
+                _run([spctl, "-a", "-vv", "-t", "exec", path])
         return True
     finally:
         pass
@@ -144,13 +166,17 @@ def main():
     args = parser.parse_args()
 
     if args.sign_windows:
-        sign_windows_file(args.sign_windows)
+        if not sign_windows_file(args.sign_windows):
+            raise SystemExit("Windows signing skipped: no signing certificate configured.")
     if args.sign_macos:
-        sign_macos_app(args.sign_macos)
+        if not sign_macos_app(args.sign_macos):
+            raise SystemExit("Mac signing skipped: no Developer ID identity configured.")
     if args.sign_macos_dmg:
-        sign_macos_dmg(args.sign_macos_dmg)
+        if not sign_macos_dmg(args.sign_macos_dmg):
+            raise SystemExit("Mac DMG signing skipped: no Developer ID identity configured.")
     if args.notarize_macos:
-        notarize_macos_file(args.notarize_macos)
+        if not notarize_macos_file(args.notarize_macos):
+            raise SystemExit("Mac notarization skipped: no Apple notarization credentials configured.")
 
 
 if __name__ == "__main__":

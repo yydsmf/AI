@@ -104,6 +104,68 @@ jobs:
         with:
           python-version: "3.11"
 
+      - name: Validate macOS signing secrets
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          MAC_CERTIFICATE_P12_BASE64: ${{ secrets.MAC_CERTIFICATE_P12_BASE64 }}
+          MAC_CERTIFICATE_PASSWORD: ${{ secrets.MAC_CERTIFICATE_PASSWORD }}
+          MAC_CODESIGN_IDENTITY: ${{ secrets.MAC_CODESIGN_IDENTITY }}
+          MAC_NOTARY_APPLE_ID: ${{ secrets.MAC_NOTARY_APPLE_ID }}
+          MAC_NOTARY_TEAM_ID: ${{ secrets.MAC_NOTARY_TEAM_ID }}
+          MAC_NOTARY_PASSWORD: ${{ secrets.MAC_NOTARY_PASSWORD }}
+        run: |
+          missing=0
+          for name in \
+            MAC_CERTIFICATE_P12_BASE64 \
+            MAC_CERTIFICATE_PASSWORD \
+            MAC_CODESIGN_IDENTITY \
+            MAC_NOTARY_APPLE_ID \
+            MAC_NOTARY_TEAM_ID \
+            MAC_NOTARY_PASSWORD
+          do
+            if [[ -z "${!name}" ]]; then
+              echo "::error::$name is required for tagged macOS releases."
+              missing=1
+            fi
+          done
+          if [[ "$missing" != "0" ]]; then
+            echo "::error::Tagged macOS releases must be Developer ID signed and notarized so downloaded apps open normally."
+            exit 1
+          fi
+
+      - name: Import macOS signing certificate
+        env:
+          MAC_CERTIFICATE_P12_BASE64: ${{ secrets.MAC_CERTIFICATE_P12_BASE64 }}
+          MAC_CERTIFICATE_PASSWORD: ${{ secrets.MAC_CERTIFICATE_PASSWORD }}
+          MAC_KEYCHAIN_PASSWORD: macos-signing-${{ github.run_id }}-${{ matrix.arch }}
+        run: |
+          if [[ -z "$MAC_CERTIFICATE_P12_BASE64" ]]; then
+            echo "Mac certificate import skipped: no certificate configured."
+            exit 0
+          fi
+
+          CERTIFICATE_PATH="$RUNNER_TEMP/developer_id_application.p12"
+          KEYCHAIN_PATH="$RUNNER_TEMP/app-signing.keychain-db"
+          export CERTIFICATE_PATH
+          python3 - <<'PY'
+          import base64
+          import os
+          from pathlib import Path
+
+          Path(os.environ["CERTIFICATE_PATH"]).write_bytes(
+              base64.b64decode(os.environ["MAC_CERTIFICATE_P12_BASE64"])
+          )
+          PY
+
+          security create-keychain -p "$MAC_KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
+          security unlock-keychain -p "$MAC_KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security import "$CERTIFICATE_PATH" -P "$MAC_CERTIFICATE_PASSWORD" -A -t cert -f pkcs12 -k "$KEYCHAIN_PATH"
+          ORIGINAL_KEYCHAINS="$(security list-keychains -d user | tr -d '"')"
+          security list-keychains -d user -s "$KEYCHAIN_PATH" $ORIGINAL_KEYCHAINS
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$MAC_KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security find-identity -v -p codesigning "$KEYCHAIN_PATH"
+
       - name: Install Python dependencies
         run: |
           python -m pip install --upgrade pip
@@ -151,15 +213,12 @@ jobs:
       - name: Sign macOS app
         env:
           MAC_CODESIGN_IDENTITY: ${{ secrets.MAC_CODESIGN_IDENTITY }}
-          MAC_NOTARY_APPLE_ID: ${{ secrets.MAC_NOTARY_APPLE_ID }}
-          MAC_NOTARY_TEAM_ID: ${{ secrets.MAC_NOTARY_TEAM_ID }}
-          MAC_NOTARY_PASSWORD: ${{ secrets.MAC_NOTARY_PASSWORD }}
-          MAC_ENTITLEMENTS_PATH: ${{ secrets.MAC_ENTITLEMENTS_PATH }}
+          MAC_ENTITLEMENTS_PATH: packaging/macos.entitlements
         run: |
-          if [[ -n "$MAC_CODESIGN_IDENTITY" ]]; then
-            python3 scripts/release_signing.py --sign-macos "dist/GPTLocalToolbox.app"
-          else
+          if [[ -z "$MAC_CODESIGN_IDENTITY" ]]; then
             echo "Mac signing skipped: no Developer ID identity configured."
+          else
+            python3 scripts/release_signing.py --sign-macos "dist/GPTLocalToolbox.app"
           fi
 
       - name: Package macOS dmg
@@ -175,11 +234,11 @@ jobs:
         env:
           MAC_CODESIGN_IDENTITY: ${{ secrets.MAC_CODESIGN_IDENTITY }}
         run: |
-          if [[ -n "$MAC_CODESIGN_IDENTITY" ]]; then
+          if [[ -z "$MAC_CODESIGN_IDENTITY" ]]; then
+            echo "Mac DMG signing skipped: no Developer ID identity configured."
+          else
             if [[ "$GITHUB_REF_NAME" == v* ]]; then VERSION="${GITHUB_REF_NAME#v}"; else VERSION="manual"; fi
             python3 scripts/release_signing.py --sign-macos-dmg "GPTLocalToolbox_v${VERSION}_macos_${{ matrix.arch }}.dmg"
-          else
-            echo "Mac DMG signing skipped: no Developer ID identity configured."
           fi
 
       - name: Notarize macOS dmg
@@ -189,11 +248,11 @@ jobs:
           MAC_NOTARY_TEAM_ID: ${{ secrets.MAC_NOTARY_TEAM_ID }}
           MAC_NOTARY_PASSWORD: ${{ secrets.MAC_NOTARY_PASSWORD }}
         run: |
-          if [[ -n "$MAC_CODESIGN_IDENTITY" && -n "$MAC_NOTARY_APPLE_ID" && -n "$MAC_NOTARY_TEAM_ID" && -n "$MAC_NOTARY_PASSWORD" ]]; then
+          if [[ -z "$MAC_CODESIGN_IDENTITY" || -z "$MAC_NOTARY_APPLE_ID" || -z "$MAC_NOTARY_TEAM_ID" || -z "$MAC_NOTARY_PASSWORD" ]]; then
+            echo "Mac notarization skipped: no Apple notarization credentials configured."
+          else
             if [[ "$GITHUB_REF_NAME" == v* ]]; then VERSION="${GITHUB_REF_NAME#v}"; else VERSION="manual"; fi
             python3 scripts/release_signing.py --notarize-macos "GPTLocalToolbox_v${VERSION}_macos_${{ matrix.arch }}.dmg"
-          else
-            echo "Mac notarization skipped: no Apple notarization credentials configured."
           fi
 
       - uses: actions/upload-artifact@v4
@@ -206,3 +265,11 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           files: GPTLocalToolbox_v*_macos_${{ matrix.arch }}.dmg
+
+      - name: Clean macOS signing keychain
+        if: always()
+        run: |
+          KEYCHAIN_PATH="$RUNNER_TEMP/app-signing.keychain-db"
+          if [[ -f "$KEYCHAIN_PATH" ]]; then
+            security delete-keychain "$KEYCHAIN_PATH"
+          fi

@@ -109,6 +109,22 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install --prefer-binary -r requirements-windows.txt
 
+      - name: Check macOS dependency compatibility
+        run: |
+          python - <<'PY'
+          import PySide6
+          parts = []
+          for piece in PySide6.__version__.split(".")[:2]:
+              try:
+                  parts.append(int(piece))
+              except ValueError:
+                  parts.append(0)
+          version = tuple(parts + [0, 0])[:2]
+          if version >= (6, 10):
+              raise SystemExit(f"PySide6 {PySide6.__version__} requires newer macOS than this app target.")
+          print(f"Using PySide6 {PySide6.__version__} for macOS package.")
+          PY
+
       - name: Set package version
         run: |
           if [[ "$GITHUB_REF_NAME" == v* ]]; then VERSION="${GITHUB_REF_NAME#v}"; else VERSION="1.0.0"; fi
@@ -154,6 +170,17 @@ jobs:
           cp -R "dist/GPTLocalToolbox.app" "dmg-root/"
           ln -s /Applications "dmg-root/Applications"
           hdiutil create -volname "GPT 本地工具箱" -srcfolder "dmg-root" -ov -format UDZO "GPTLocalToolbox_v${VERSION}_macos_${{ matrix.arch }}.dmg"
+
+      - name: Sign macOS dmg
+        env:
+          MAC_CODESIGN_IDENTITY: ${{ secrets.MAC_CODESIGN_IDENTITY }}
+        run: |
+          if [[ -n "$MAC_CODESIGN_IDENTITY" ]]; then
+            if [[ "$GITHUB_REF_NAME" == v* ]]; then VERSION="${GITHUB_REF_NAME#v}"; else VERSION="manual"; fi
+            python3 scripts/release_signing.py --sign-macos-dmg "GPTLocalToolbox_v${VERSION}_macos_${{ matrix.arch }}.dmg"
+          else
+            echo "Mac DMG signing skipped: no Developer ID identity configured."
+          fi
 
       - name: Notarize macOS dmg
         env:

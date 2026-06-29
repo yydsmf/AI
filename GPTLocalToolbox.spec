@@ -7,7 +7,7 @@ from PyInstaller.utils.hooks import collect_data_files, collect_submodules
 
 project_dir = Path(SPECPATH).resolve()
 icon_file = project_dir / "app_icon_trimmed.icns"
-app_version = "1.0.0"
+app_version = "1.0.5"
 
 
 def _collect_submodules(package):
@@ -84,6 +84,6 @@ app = BUNDLE(
         'CFBundleDisplayName': 'GPT 本地工具箱',
         'CFBundleShortVersionString': app_version,
         'CFBundleVersion': app_version,
-        'LSMinimumSystemVersion': '11.0',
+        'LSMinimumSystemVersion': '12.0',
     },
 )

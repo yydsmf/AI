@@ -354,6 +354,35 @@ class NovelImportCandidateTests(unittest.TestCase):
         self.assertEqual(candidates["project_materials"]["bible"], "")
         self.assertEqual(candidates["project_materials"]["timeline"], "")
 
+    def test_apply_import_candidates_does_not_auto_merge_core_project_materials(self):
+        project = {"bible": "已有圣经。", "world_rules": "已有规则。"}
+        candidates = {
+            "characters": [],
+            "lore": [],
+            "foreshadows": [],
+            "project_materials": {
+                "bible": "新主线矛盾。",
+                "world_rules": "新世界规则。",
+                "timeline": "第1章旧案重启。",
+                "summary": "赵明拿到缺页卷宗。",
+            },
+        }
+
+        result = _apply_import_candidates(project, candidates, {})
+
+        self.assertNotIn("新主线矛盾", project["bible"])
+        self.assertNotIn("新世界规则", project["world_rules"])
+        self.assertIn("第1章旧案重启", project["timeline"])
+        self.assertIn("缺页卷宗", project["summary"])
+        self.assertFalse(result["materials"]["bible"])
+        self.assertFalse(result["materials"]["world_rules"])
+        self.assertTrue(result["materials"]["timeline"])
+        self.assertTrue(result["materials"]["summary"])
+        self.assertEqual(candidates["project_materials"]["bible"], "新主线矛盾。")
+        self.assertEqual(candidates["project_materials"]["world_rules"], "新世界规则。")
+        self.assertEqual(candidates["project_materials"]["timeline"], "")
+        self.assertEqual(candidates["project_materials"]["summary"], "")
+
     def test_apply_import_candidates_dedupes_project_material_lines(self):
         repeated = "皇商账册缺页牵出旧案。"
         project = {

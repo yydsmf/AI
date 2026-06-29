@@ -6,6 +6,22 @@ import hashlib
 from .core import now_str
 
 CHAPTER_ANALYSIS_HASH_VERSION = "2"
+_STORY_ORDER_MISSING = 10 ** 9
+_CHINESE_NUMERAL_DIGITS = {
+    "零": 0,
+    "〇": 0,
+    "一": 1,
+    "二": 2,
+    "两": 2,
+    "三": 3,
+    "四": 4,
+    "五": 5,
+    "六": 6,
+    "七": 7,
+    "八": 8,
+    "九": 9,
+}
+_CHINESE_NUMERAL_UNITS = {"十": 10, "百": 100, "千": 1000, "万": 10000}
 
 
 def _safe_name(name):
@@ -21,6 +37,55 @@ def _as_text(value):
 
 def _compact_text(value):
     return re.sub(r"\s+", "", str(value or ""))
+
+
+def _chinese_numeral_to_int(value):
+    text = str(value or "").strip()
+    if not text:
+        return None
+    if text.isdigit():
+        return int(text)
+    total = 0
+    section = 0
+    number = 0
+    used = False
+    for ch in text:
+        if ch in _CHINESE_NUMERAL_DIGITS:
+            number = _CHINESE_NUMERAL_DIGITS[ch]
+            used = True
+        elif ch in _CHINESE_NUMERAL_UNITS:
+            unit = _CHINESE_NUMERAL_UNITS[ch]
+            used = True
+            if unit == 10000:
+                section = (section + (number or 0)) * unit
+                total += section
+                section = 0
+            else:
+                section += (number or 1) * unit
+            number = 0
+        else:
+            return None
+    return total + section + number if used else None
+
+
+def _story_order_from_text(value):
+    text = str(value or "")
+    if not text.strip():
+        return _STORY_ORDER_MISSING
+    patterns = (
+        r"第\s*([一二两三四五六七八九十百千万零〇\d]+)\s*[章节回卷部集场]",
+        r"\b(?:EP(?:ISODE)?\.?|E)\s*0*(\d{1,4})\b",
+        r"\bChapter\s+0*(\d{1,4})\b",
+        r"(^|[^\d])0*(\d{1,4})\s*[章节回卷部集场]",
+    )
+    hits = []
+    for pattern in patterns:
+        for match in re.finditer(pattern, text, flags=re.IGNORECASE):
+            raw = match.group(match.lastindex or 1)
+            number = _chinese_numeral_to_int(raw)
+            if number is not None:
+                hits.append(number)
+    return min(hits) if hits else _STORY_ORDER_MISSING
 
 
 def _infer_chapter_status(chap, preserve_manual=True):
@@ -2747,7 +2812,7 @@ def _build_foreshadow_notes_draft(project):
     return "\n".join(lines).strip()
 
 
-def _open_foreshadow_queue_score(item, index):
+def _open_foreshadow_queue_score(item, index, current_order=None):
     item = item if isinstance(item, dict) else {}
     status = str(item.get("status", "") or "").strip()
     score = 0
@@ -2761,6 +2826,26 @@ def _open_foreshadow_queue_score(item, index):
         score += 1200
     if setup:
         score += 500
+    current_order = current_order if isinstance(current_order, int) and current_order != _STORY_ORDER_MISSING else None
+    setup_order = _story_order_from_text(setup)
+    payoff_order = _story_order_from_text(payoff)
+    if current_order is not None and payoff_order != _STORY_ORDER_MISSING:
+        distance = payoff_order - current_order
+        if distance <= 0:
+            score += 2600
+        elif distance <= 2:
+            score += 2200
+        elif distance <= 6:
+            score += 1500
+        elif distance <= 12:
+            score += 800
+        else:
+            score += 240
+    if current_order is not None and setup_order != _STORY_ORDER_MISSING:
+        if status == "未埋" and setup_order > current_order + 2:
+            score -= 900
+        elif setup_order <= current_order:
+            score += 260
     desc = _dedupe_text_lines(item.get("description", ""))
     compact_desc = _compact_text(desc).strip("。.!！?？；;，,、")
     if compact_desc:
@@ -2791,6 +2876,7 @@ def _rank_open_foreshadow_candidates(
     route_style="route",
     skip_placeholders=True,
     include_desc=True,
+    current_order=None,
 ):
     items = items if isinstance(items, list) else []
     selected_keys = selected_keys if isinstance(selected_keys, set) else set()
@@ -2813,7 +2899,7 @@ def _rank_open_foreshadow_candidates(
             and compact_desc in {"后续处理", "待后续处理", "待回收"}
         ):
             continue
-        score, tie_index = _open_foreshadow_queue_score(item, index)
+        score, tie_index = _open_foreshadow_queue_score(item, index, current_order=current_order)
         line = _open_foreshadow_line(item, index, route_style=route_style, include_desc=include_desc)
         candidates.append((-score, tie_index, item, line))
     candidates.sort()
@@ -2827,6 +2913,7 @@ def _rank_open_foreshadow_lines(
     route_style="route",
     skip_placeholders=True,
     include_desc=True,
+    current_order=None,
 ):
     candidates = _rank_open_foreshadow_candidates(
         items,
@@ -2834,12 +2921,13 @@ def _rank_open_foreshadow_lines(
         route_style=route_style,
         skip_placeholders=skip_placeholders,
         include_desc=include_desc,
+        current_order=current_order,
     )
     selected = candidates[: max(1, int(limit or 1))]
     return [(item, line) for _score, _tie_index, item, line in selected]
 
 
-def _build_open_foreshadow_queue(project, selected_items=None, limit=12):
+def _build_open_foreshadow_queue(project, selected_items=None, limit=12, current_order=None):
     project = project if isinstance(project, dict) else {}
     selected_keys = set()
     for item in selected_items if isinstance(selected_items, list) else []:
@@ -2848,7 +2936,11 @@ def _build_open_foreshadow_queue(project, selected_items=None, limit=12):
             selected_keys.add(_compact_text(item.get("name", "")))
     items = project.get("foreshadow_items", [])
     items = items if isinstance(items, list) else []
-    candidates = _rank_open_foreshadow_candidates(items, selected_keys=selected_keys)
+    candidates = _rank_open_foreshadow_candidates(
+        items,
+        selected_keys=selected_keys,
+        current_order=current_order,
+    )
     selected = candidates[: max(1, int(limit or 1))]
     lines = [line for _score, _tie_index, _item, line in selected]
     if not lines:
@@ -2856,7 +2948,7 @@ def _build_open_foreshadow_queue(project, selected_items=None, limit=12):
     omitted = max(0, len(candidates) - len(lines))
     if omitted > 0:
         lines.append(f"- ……另有 {omitted} 条开放伏笔未列出")
-    return "开放伏笔队列（未被本章命中，避免遗忘）：\n" + "\n".join(lines)
+    return "开放伏笔队列（未被本章命中，仅提醒，避免遗忘；不要无计划回收）：\n" + "\n".join(lines)
 
 
 def _recent_chapter_context(chapters, chapter_index, window=6, project=None):
@@ -3290,25 +3382,35 @@ def _build_chapter_ai_context(project, chapter_index, action):
             project.get("summary", ""),
             "自动章节压缩：\n" + auto_summary if auto_summary else "",
         )
-    open_foreshadows = _build_open_foreshadow_queue(project, selected_foreshadows)
+    current_story_order = _story_order_from_text(chap.get("title", ""))
+    if current_story_order == _STORY_ORDER_MISSING:
+        current_story_order = chapter_index + 1
+    open_foreshadows = _build_open_foreshadow_queue(
+        project,
+        selected_foreshadows,
+        current_order=current_story_order,
+    )
     foreshadow_context = context_parts(
         "\n".join(foreshadow_lines),
         project.get("foreshadows", ""),
         open_foreshadows,
     )
     long_form_progress = _long_form_progress_text(project, chapter_index)
+    core_project_info = "\n".join([
+        f"书名：{meta.get('title', '')}",
+        f"类型：{meta.get('genre', '')}",
+        f"风格：{meta.get('style', '')}",
+        f"叙事人称：{meta.get('pov', '')}",
+        f"故事核心：{clean_context_text(meta.get('premise', ''), 2200)}",
+    ])
     common_sections = [
-        ("项目基础", "\n".join([
-            f"书名：{meta.get('title', '')}",
-            f"类型：{meta.get('genre', '')}",
-            f"风格：{meta.get('style', '')}",
-            f"叙事人称：{meta.get('pov', '')}",
-            f"项目总目标字数：{_target_words_label(meta.get('target_words', ''))}",
-            f"故事核心：{clean_context_text(meta.get('premise', ''), 2000)}",
-        ]), 1800, False),
+        ("项目核心信息", core_project_info, 1200, False),
         ("长篇进度 / 节奏", long_form_progress, 1200, False),
         ("长篇继承规则", inheritance_rules, 1500, False),
         ("本次任务", task_text, 2200, False),
+        ("项目基础", "\n".join([
+            f"项目总目标字数：{_target_words_label(meta.get('target_words', ''))}",
+        ]), 500, False),
     ]
     if action == "draft":
         common_sections.insert(3, ("本章写作长度", chapter_length_section, 500, False))
@@ -3325,14 +3427,14 @@ def _build_chapter_ai_context(project, chapter_index, action):
         knowledge_sections = [
             ("小说圣经", _dedupe_text_lines(project.get("bible", "")) or "暂无", 3600, True),
             ("世界观 / 规则", _dedupe_text_lines(project.get("world_rules", "")) or "暂无", 2800, True),
-            ("时间线", timeline_context, 4200, True),
+            ("时间线", timeline_context, 5000, True),
             ("续写承接点", continuation_text or "暂无", 3600, True),
             ("前文继承摘要", previous_summary, 9000, True),
             ("近几章连续性", recent_context_section, 3600, True),
             ("本章相关人物", "\n".join(character_lines) or "暂无", 6000, False),
             ("本章相关设定", "\n".join(lore_lines) or "暂无", 4200, False),
             ("本章相关伏笔", foreshadow_context, 5000, True),
-            ("全局摘要 / 日志", summary_context, 4200, True),
+            ("全局摘要 / 日志", summary_context, 5000, True),
         ]
     if action == "draft":
         knowledge_sections.insert(4, ("后续规划 / 边界", future_plan_text, 3600, True))

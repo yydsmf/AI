@@ -218,6 +218,11 @@ _PROJECT_MATERIAL_ALIASES = {
     "timeline": ("timeline", "时间线", "时间顺序", "事件线", "剧情时间线"),
     "summary": ("summary", "摘要", "阶段摘要", "全局摘要", "故事摘要", "剧情摘要"),
 }
+_PROJECT_MATERIAL_KEYS = ("bible", "world_rules", "timeline", "summary")
+_MANUAL_PROJECT_MATERIAL_KEYS = {"bible", "world_rules"}
+_AUTO_PROJECT_MATERIAL_KEYS = tuple(
+    key for key in _PROJECT_MATERIAL_KEYS if key not in _MANUAL_PROJECT_MATERIAL_KEYS
+)
 
 
 def _project_material_key(value):
@@ -364,7 +369,7 @@ def _normalize_ai_candidates(data):
     material_sources.append(data)
     for source in material_sources:
         if isinstance(source, dict):
-            for key in ("bible", "world_rules", "timeline", "summary"):
+            for key in _PROJECT_MATERIAL_KEYS:
                 out["project_materials"][key] = merge_candidate_text(
                     out["project_materials"].get(key, ""),
                     str(_candidate_field(source, *_PROJECT_MATERIAL_ALIASES[key]) or "").strip(),
@@ -595,7 +600,7 @@ def _apply_import_candidates(project, candidates, checked):
 
     materials = candidates.get("project_materials", {})
     if isinstance(materials, dict):
-        material_keys = ("bible", "world_rules", "timeline", "summary")
+        material_keys = _PROJECT_MATERIAL_KEYS
         selected = checked.get("project_materials", None)
         if isinstance(selected, list):
             selected_keys = set()
@@ -605,7 +610,7 @@ def _apply_import_candidates(project, candidates, checked):
                 elif str(item) in material_keys:
                     selected_keys.add(str(item))
         else:
-            selected_keys = set(material_keys)
+            selected_keys = set(_AUTO_PROJECT_MATERIAL_KEYS)
         for key in material_keys:
             if key not in selected_keys:
                 continue

@@ -32,6 +32,14 @@ class NovelLongFormContextTests(unittest.TestCase):
             "chapters": [current],
         }
 
+    def _context_section(self, context, title):
+        marker = f"【{title}】\n"
+        start = context.find(marker)
+        self.assertNotEqual(start, -1, f"missing context section: {title}")
+        start += len(marker)
+        end = context.find("\n\n【", start)
+        return context[start:] if end < 0 else context[start:end]
+
     def test_outline_context_requests_compact_outline(self):
         current = _new_chapter(0)
         current["title"] = "第一章 入城"
@@ -391,6 +399,36 @@ class NovelLongFormContextTests(unittest.TestCase):
         self.assertIn("终局密钥", context)
         self.assertIn("关系最终真相", context)
         self.assertLess(context.index("终局密钥"), context.index("背景待处理0"))
+
+    def test_chapter_context_prioritizes_due_open_foreshadow_queue(self):
+        current = _new_chapter(39)
+        current["title"] = "第四十章 风雪夜谈"
+        current["outline"] = "本章处理人物关系，不直接回收伏笔。"
+        project = self._project_with_current_chapter(current)
+        project["foreshadow_items"] = [
+            {
+                "name": f"普通伏笔{i}",
+                "status": "已埋",
+                "setup_chapter": "第1章",
+                "payoff_chapter": "",
+                "description": "普通背景线索，暂不影响主线。",
+            }
+            for i in range(20)
+        ]
+        project["foreshadow_items"].append({
+            "name": "临近回收伏笔",
+            "status": "已埋",
+            "setup_chapter": "第5章",
+            "payoff_chapter": "第四十一章",
+            "description": "临近当前章节，应该优先提醒。",
+        })
+
+        context = _build_chapter_ai_context(project, 0, "draft")
+
+        self.assertIn("开放伏笔队列", context)
+        self.assertIn("不要无计划回收", context)
+        self.assertIn("临近回收伏笔", context)
+        self.assertLess(context.index("临近回收伏笔"), context.index("普通伏笔0"))
 
     def test_chapter_context_prioritizes_foreshadow_alias_from_description(self):
         current = _new_chapter(0)
@@ -795,6 +833,23 @@ class NovelLongFormContextTests(unittest.TestCase):
         self.assertIn("必须保留的当前正文尾巴", context)
         self.assertIn("【续写承接点】", context)
         self.assertIn("纸包里露出半枚虎符", context)
+
+    def test_chapter_context_allows_larger_timeline_and_summary_windows(self):
+        current = _new_chapter(0)
+        current["title"] = "第八十章 终局前夜"
+        current["outline"] = "主角整理所有线索，准备进入终局法庭。"
+        project = self._project_with_current_chapter(current)
+        project["timeline"] = "时间线资料。" * 1200
+        project["summary"] = "全局摘要资料。" * 1200
+
+        context = _build_chapter_ai_context(project, 0, "draft")
+        timeline_section = self._context_section(context, "时间线")
+        summary_section = self._context_section(context, "全局摘要 / 日志")
+
+        self.assertGreater(len(timeline_section), 4200)
+        self.assertLessEqual(len(timeline_section), 5000)
+        self.assertGreater(len(summary_section), 4200)
+        self.assertLessEqual(len(summary_section), 5000)
 
     def test_chapter_context_includes_long_form_progress_rhythm(self):
         chapters = []

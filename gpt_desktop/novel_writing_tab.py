@@ -37,6 +37,7 @@ from PySide6.QtWidgets import (
 from .core import clean_error_text, get_provider, load_json_file, log_debug, now_str, save_config, save_json_file
 from .model_bar_mixin import SimpleModelBarMixin
 from .novel_import import (
+    _MANUAL_PROJECT_MATERIAL_KEYS,
     _apply_import_candidates,
     _candidate_analysis_text,
     _candidate_analysis_dossier_text,
@@ -2001,8 +2002,8 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
             self.chapter_linked.setText(", ".join(linked))
             self.current_chapter_index = row
             self._refresh_read_aloud_scope_combo()
-            if not self._has_partial_draft_preview():
-                self._set_partial_draft_preview_state(False)
+            if not self._has_partial_chapter_ai_preview():
+                self._set_partial_chapter_ai_preview_state(False)
         finally:
             self._loading = was_loading
 
@@ -2853,7 +2854,8 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
                 for key, label, value in self._candidate_material_items():
                     row = QListWidgetItem(label)
                     row_key = self._candidate_item_check_key("project_materials", {"name": key}, key)
-                    row.setCheckState(previous_checks.get(row_key, Qt.Checked))
+                    default_state = self._default_candidate_material_check_state(key)
+                    row.setCheckState(previous_checks.get(row_key, default_state))
                     row.setData(Qt.UserRole, key)
                     row.setData(Qt.UserRole + 1, row_key)
                     row.setToolTip(value)
@@ -2920,6 +2922,9 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
             for key, label in labels
             if str(materials.get(key, "") or "").strip()
         ]
+
+    def _default_candidate_material_check_state(self, key):
+        return Qt.Unchecked if key in _MANUAL_PROJECT_MATERIAL_KEYS else Qt.Checked
 
     def _candidate_material_labels(self, material_result=None):
         labels = (
@@ -3376,13 +3381,22 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
         self._flush_current_editors()
         return _build_chapter_ai_context(self.current_project, self.current_chapter_index, action)
 
-    def _has_partial_draft_preview(self):
-        return (
+    def _has_partial_chapter_ai_preview(self, action=None):
+        preview_action = getattr(self, "_chapter_ai_preview_action", "")
+        if action is not None and preview_action != action:
+            return False
+        if not (
             getattr(self, "_chapter_ai_preview_is_partial", False)
-            and getattr(self, "_chapter_ai_preview_action", "") == "draft"
+            and preview_action in {"draft", "outline", "summary"}
             and getattr(self, "_chapter_ai_preview_chapter_id", "") == self._current_chapter_id()
-            and bool(str(self.chapter_ai_preview.toPlainText() or "").strip())
-        )
+        ):
+            return False
+        if preview_action in {"outline", "summary"}:
+            return True
+        return bool(str(self.chapter_ai_preview.toPlainText() or "").strip())
+
+    def _has_partial_draft_preview(self):
+        return self._has_partial_chapter_ai_preview("draft")
 
     def _chapter_ai_context_with_preview(self, action):
         self._flush_current_editors()
@@ -3398,26 +3412,38 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
             chap["text"] = _append_text_without_duplicate_overlap(chap.get("text", ""), preview_text)
         return _build_chapter_ai_context(project, self.current_chapter_index, action)
 
-    def _set_partial_draft_preview_state(self, enabled):
+    def _set_partial_chapter_ai_preview_state(self, enabled, action="draft"):
         self._chapter_ai_preview_is_partial = bool(enabled)
         if enabled:
-            self._chapter_ai_preview_action = "draft"
+            if action not in {"draft", "outline", "summary"}:
+                action = "draft"
+            self._chapter_ai_preview_action = action
             self._chapter_ai_preview_chapter_id = self._current_chapter_id()
         else:
             self._chapter_ai_preview_action = ""
             self._chapter_ai_preview_chapter_id = ""
         self._refresh_chapter_ai_action_labels()
 
+    def _set_partial_draft_preview_state(self, enabled):
+        self._set_partial_chapter_ai_preview_state(enabled, "draft")
+
     def _refresh_chapter_ai_action_labels(self):
         btn = getattr(self, "_chapter_ai_buttons_by_action", {}).get("draft")
         if btn is None:
             return
-        if self._has_partial_draft_preview():
-            btn.setText("续写正文")
-            btn.setToolTip("从当前保留的正文预览继续生成，完成后自动应用并补提纲和摘要/关键事实")
-        else:
-            btn.setText("扩写正文并补提纲和摘要")
-            btn.setToolTip("先扩写正文，再根据实际正文补提纲和摘要/关键事实")
+        partial_action = getattr(self, "_chapter_ai_preview_action", "") if self._has_partial_chapter_ai_preview() else ""
+        partial_labels = {
+            "draft": ("续写正文", "从当前保留的正文预览继续生成，完成后自动应用并补提纲和摘要/关键事实"),
+            "outline": ("续写提纲", "重新生成本章提纲，完成后继续提炼摘要/关键事实"),
+            "summary": ("续写摘要", "重新提炼本章摘要/关键事实，完成后结束本次流程"),
+        }
+        if partial_action in partial_labels:
+            text, tooltip = partial_labels[partial_action]
+            btn.setText(text)
+            btn.setToolTip(tooltip)
+            return
+        btn.setText("扩写正文并补提纲和摘要")
+        btn.setToolTip("先扩写正文，再根据实际正文补提纲和摘要/关键事实")
 
     def _reset_chapter_ai_sequence(self):
         self._chapter_ai_sequence_active = False
@@ -3466,7 +3492,7 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
         self._chapter_ai_sequence_active = True
         self._chapter_ai_sequence_chapter_id = self._current_chapter_id()
         self._chapter_ai_sequence_started_outline = self.chapter_outline.toPlainText().strip()
-        self._set_partial_draft_preview_state(False)
+        self._set_partial_chapter_ai_preview_state(False)
         self._chapter_ai_resume_prefix = ""
         self.chapter_ai_preview.setPlainText("")
         try:
@@ -3509,8 +3535,12 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
         if self.writing_worker is not None and self.writing_worker.isRunning():
             self.set_status_tip("AI 写作助手正在生成，请稍等。")
             return
-        resume_partial = action == "draft" and self._has_partial_draft_preview()
-        if action == "draft" and not resume_partial:
+        partial_action = ""
+        if action == "draft" and self._has_partial_chapter_ai_preview():
+            partial_action = getattr(self, "_chapter_ai_preview_action", "")
+        resume_partial = partial_action == "draft"
+        resume_sequence_action = partial_action if partial_action in {"outline", "summary"} else ""
+        if action == "draft" and not resume_partial and not resume_sequence_action:
             self._start_chapter_ai_sequence()
             return
         provider, model, error = self._current_novel_ai_selection()
@@ -3521,6 +3551,19 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
             return
         self._chapter_ai_provider = provider
         self._chapter_ai_model = model
+        if resume_sequence_action:
+            started_outline = self.chapter_outline.toPlainText().strip()
+            self._reset_chapter_ai_sequence()
+            self._chapter_ai_sequence_active = True
+            self._chapter_ai_sequence_chapter_id = self._current_chapter_id()
+            self._chapter_ai_sequence_started_outline = started_outline
+            self._chapter_ai_resume_prefix = ""
+            self.chapter_ai_stream_text = ""
+            self.chapter_ai_preview.clear()
+            self._set_partial_chapter_ai_preview_state(False)
+            if not self._continue_chapter_ai_sequence(resume_sequence_action):
+                self._reset_chapter_ai_sequence()
+            return
         if resume_partial:
             self._reset_chapter_ai_sequence()
             self._chapter_ai_sequence_active = True
@@ -3536,7 +3579,7 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
         self.set_chapter_ai_panel_expanded(True)
         self.chapter_ai_stream_text = self.chapter_ai_preview.toPlainText().strip() if resume_partial else ""
         if not resume_partial:
-            self._set_partial_draft_preview_state(False)
+            self._set_partial_chapter_ai_preview_state(False)
             self._chapter_ai_resume_prefix = ""
             self.chapter_ai_preview.setPlainText("")
         else:
@@ -3582,8 +3625,8 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
             self.chapter_ai_preview.setPlainText(final_text)
         if getattr(self, "_chapter_ai_stop_requested_by_user", False):
             if final_text:
-                if action == "draft":
-                    self._set_partial_draft_preview_state(True)
+                if action in {"draft", "outline", "summary"}:
+                    self._set_partial_chapter_ai_preview_state(True, action)
                 self.set_status_tip("AI 辅助生成已中止，已保留当前预览内容。")
             else:
                 self.set_status_tip("AI 辅助生成已中止。")
@@ -3605,7 +3648,7 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
         }
         target = target_map.get(action)
         if target:
-            self._set_partial_draft_preview_state(False)
+            self._set_partial_chapter_ai_preview_state(False)
             self._chapter_ai_resume_prefix = ""
             if getattr(self, "_chapter_ai_sequence_active", False):
                 if self._current_chapter_id() != getattr(self, "_chapter_ai_sequence_chapter_id", ""):
@@ -3635,13 +3678,26 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
 
     def on_chapter_ai_failed(self, err):
         action = getattr(self, "_chapter_ai_running_action", "")
-        if self.chapter_ai_stream_text.strip():
-            self.chapter_ai_preview.setPlainText(self.chapter_ai_stream_text.strip())
-        if action == "draft" and self.chapter_ai_stream_text.strip():
-            self._set_partial_draft_preview_state(True)
+        sequence_active = bool(getattr(self, "_chapter_ai_sequence_active", False))
+        kept_preview = self.chapter_ai_stream_text.strip()
+        if kept_preview:
+            self.chapter_ai_preview.setPlainText(kept_preview)
+        if action == "draft" and kept_preview:
+            self._set_partial_chapter_ai_preview_state(True, action)
+        elif action in {"outline", "summary"}:
+            self._set_partial_chapter_ai_preview_state(True, action)
         self._reset_chapter_ai_sequence()
-        self.set_status_tip(f"AI 写作失败，已保留预览，可点续写正文继续：{clean_error_text(err)[:80]}")
-        QMessageBox.warning(self, "AI 写作失败", clean_error_text(err))
+        action_label = {"draft": "正文", "outline": "提纲", "summary": "摘要"}.get(action, "正文")
+        err_text = clean_error_text(err)
+        if sequence_active and action == "outline":
+            status = f"正文已写入，补提纲失败，可继续补提纲：{err_text[:80]}"
+        elif sequence_active and action == "summary":
+            status = f"正文已写入，补摘要/关键事实失败，可继续补摘要：{err_text[:80]}"
+        else:
+            kept_hint = "已保留预览，" if kept_preview else ""
+            status = f"AI 写作失败，{kept_hint}可点续写{action_label}继续：{err_text[:80]}"
+        self.set_status_tip(status)
+        QMessageBox.warning(self, "AI 写作失败", err_text)
 
     def _cleanup_writing_worker(self):
         worker = self.sender()
@@ -3696,7 +3752,7 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
             self._merge_chapter_linked_names(inferred_names)
         self._mark_chapter_dirty()
         self.chapter_ai_preview.clear()
-        self._set_partial_draft_preview_state(False)
+        self._set_partial_chapter_ai_preview_state(False)
         self._chapter_ai_resume_prefix = ""
         self.set_chapter_ai_panel_expanded(False)
         if should_auto_summary:

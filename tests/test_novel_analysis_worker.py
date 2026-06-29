@@ -111,8 +111,28 @@ class NovelAnalysisWorkerTests(unittest.TestCase):
 
         self.assertIn("已有项目档案", prompt)
         self.assertIn("同名、别称或同一线索不要重复新增", prompt)
-        self.assertIn("已有人物 notes", prompt)
+        self.assertIn("长期有效的人物变化才写入已有人物 notes", prompt)
+        self.assertIn("普通章节行动、临时情绪、一次性互动", prompt)
+        self.assertIn("characters.notes 要求：只写会影响后续多章的人物档案增量", prompt)
+        self.assertIn("没有明确全局增量时，project_materials 对应字段请留空字符串", prompt)
+        self.assertIn("timeline 只记录关键转折、时间顺序变化、伏笔推进/回收", prompt)
+        self.assertIn("summary 只写对全局剧情有继承价值的简短状态变化，控制在 1-3 条", prompt)
+        self.assertIn("设定和伏笔不要原文重复", prompt)
+        self.assertIn("lore 写规则本身，foreshadows 改写成待验证/待回收的问题或结果", prompt)
+        self.assertIn("名称不要与 lore 完全相同", prompt)
+        self.assertIn("foreshadows 要求：只提取会跨章节影响后文的明确线索", prompt)
+        self.assertIn("普通悬念、单章情绪钩子、一次性疑问", prompt)
+        self.assertIn("每个片段优先提取 0-3 条最重要伏笔", prompt)
         self.assertIn("不要把已有档案里没有在本片段推进的信息当作新发现重复输出", prompt)
+
+    def test_draft_prompt_distinguishes_relevant_and_open_foreshadows(self):
+        worker = NovelWritingWorker("http://example.test", "key", "model", "draft", "context")
+
+        prompt = worker._action_prompt()
+
+        self.assertIn("只有【本章相关伏笔】里被本章标题、提纲或正文目标命中的伏笔", prompt)
+        self.assertIn("【开放伏笔队列】只用于提醒不要遗忘", prompt)
+        self.assertIn("不要提前兑现或解释队列里的伏笔", prompt)
 
     def test_analysis_chunk_user_text_injects_dossier_outside_fragment(self):
         worker = NovelAnalysisWorker(

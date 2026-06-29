@@ -84,6 +84,26 @@ def sign_macos_app(app_path: str) -> bool:
     return True
 
 
+def sign_macos_dmg(dmg_path: str) -> bool:
+    identity = _env("MAC_CODESIGN_IDENTITY")
+    if not identity:
+        return False
+
+    codesign = shutil.which("codesign")
+    if not codesign:
+        raise RuntimeError("找不到 codesign。")
+
+    _run([
+        codesign,
+        "--force",
+        "--timestamp",
+        "--sign",
+        identity,
+        dmg_path,
+    ])
+    return True
+
+
 def notarize_macos_file(path: str) -> bool:
     apple_id = _env("MAC_NOTARY_APPLE_ID")
     team_id = _env("MAC_NOTARY_TEAM_ID")
@@ -119,6 +139,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--sign-windows", dest="sign_windows")
     parser.add_argument("--sign-macos", dest="sign_macos")
+    parser.add_argument("--sign-macos-dmg", dest="sign_macos_dmg")
     parser.add_argument("--notarize-macos", dest="notarize_macos")
     args = parser.parse_args()
 
@@ -126,6 +147,8 @@ def main():
         sign_windows_file(args.sign_windows)
     if args.sign_macos:
         sign_macos_app(args.sign_macos)
+    if args.sign_macos_dmg:
+        sign_macos_dmg(args.sign_macos_dmg)
     if args.notarize_macos:
         notarize_macos_file(args.notarize_macos)
 

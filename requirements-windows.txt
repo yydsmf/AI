@@ -1,4 +1,5 @@
-PySide6>=6.8,<6.12
+# PySide6 6.10+ macOS wheels require macOS 13+; keep release builds on macOS 12-compatible Qt.
+PySide6>=6.8,<6.10
 requests>=2.32,<3
 python-docx>=1.1,<2
 pypdf>=5,<6

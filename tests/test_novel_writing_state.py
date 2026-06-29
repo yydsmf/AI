@@ -2,6 +2,7 @@ import unittest
 import tempfile
 from pathlib import Path
 
+from PySide6.QtCore import Qt
 from PySide6.QtWidgets import QPlainTextEdit
 
 from gpt_desktop.novel_import import Document as DocxDocument, WD_ALIGN_PARAGRAPH, _write_docx_text
@@ -415,6 +416,14 @@ class NovelWritingStateTests(unittest.TestCase):
         summary = merged["project_materials"]["summary"]
         self.assertEqual(summary.count(repeated_summary), 1)
         self.assertIn("补充：赵明拿到半枚虎符。", summary)
+
+    def test_core_project_material_candidates_default_unchecked(self):
+        tab = NovelWritingTab.__new__(NovelWritingTab)
+
+        self.assertEqual(tab._default_candidate_material_check_state("bible"), Qt.Unchecked)
+        self.assertEqual(tab._default_candidate_material_check_state("world_rules"), Qt.Unchecked)
+        self.assertEqual(tab._default_candidate_material_check_state("timeline"), Qt.Checked)
+        self.assertEqual(tab._default_candidate_material_check_state("summary"), Qt.Checked)
 
     def test_merge_import_candidates_uses_character_canonical_key(self):
         tab = NovelWritingTab.__new__(NovelWritingTab)
@@ -892,6 +901,117 @@ class NovelWritingStateTests(unittest.TestCase):
         self.assertEqual(tab.chapter_outline.toPlainText(), "续写后的提纲")
         self.assertEqual(started, ["draft", "outline", "summary"])
 
+    def test_resumed_outline_sequence_does_not_restart_draft(self):
+        chapter = _new_chapter(0)
+        chapter["text"] = "已完成正文"
+        tab = NovelWritingTab.__new__(NovelWritingTab)
+        tab.current_project = {"chapters": [chapter], "characters": []}
+        tab.current_chapter_index = 0
+        tab.writing_worker = None
+        tab.chapter_ai_preview = _FakePlainTextEdit("断线提纲")
+        tab.chapter_title = _FakeLineEdit("第一章")
+        tab.chapter_status = _FakeComboBox(["大纲", "写作中", "已完成", "待重写"], "写作中")
+        tab.chapter_linked = _FakeLineEdit("")
+        tab.chapter_outline = _FakePlainTextEdit("")
+        tab.chapter_text = _FakePlainTextEdit("已完成正文")
+        tab.chapter_summary = _FakePlainTextEdit("")
+        tab.chapter_key_facts = _FakePlainTextEdit("")
+        tab._dirty = False
+        tab._loading = False
+        tab._refresh_chapter_item = lambda _index: None
+        tab._schedule_refresh = lambda include_manuscript=False: None
+        tab._set_text_without_signals = lambda widget, text: widget.setPlainText(text)
+        tab._infer_current_chapter_linked_names = lambda extra_text="": []
+        tab._merge_chapter_linked_names = lambda _names: None
+        tab.set_chapter_ai_panel_expanded = lambda _expanded: None
+        tab.set_status_tip = lambda _text: None
+        tab._set_chapter_ai_actions_enabled = lambda _enabled: None
+        tab._chapter_ai_preview_is_partial = True
+        tab._chapter_ai_preview_action = "outline"
+        tab._chapter_ai_preview_chapter_id = chapter["id"]
+        tab._chapter_ai_resume_prefix = ""
+        tab._chapter_ai_stop_requested_by_user = False
+        tab._chapter_ai_running_action = ""
+        button = _FakeButton()
+        tab._chapter_ai_buttons_by_action = {"draft": button}
+        tab._chapter_ai_provider = {"base_url": "http://example.test", "api_key": "key", "proxy_url": ""}
+        tab._chapter_ai_model = "model"
+        tab._provider_proxy_mode = lambda _provider: "不使用代理"
+        tab._current_novel_ai_selection = lambda: (tab._chapter_ai_provider, tab._chapter_ai_model, "")
+        tab._flush_current_editors = lambda: None
+        tab._chapter_ai_context_with_preview = lambda action: f"context:{action}"
+        started = []
+        tab._start_chapter_ai_worker = lambda action, _context, status_text="", resume_prefix="": started.append(action)
+
+        tab.run_chapter_ai_action("draft")
+
+        self.assertEqual(started, ["outline"])
+        self.assertTrue(tab._chapter_ai_sequence_active)
+        self.assertEqual(button.text, "扩写正文并补提纲和摘要")
+
+        tab.chapter_ai_preview.setPlainText("续写后的提纲")
+        tab.on_chapter_ai_ready("outline", "续写后的提纲")
+
+        self.assertEqual(tab.chapter_outline.toPlainText(), "续写后的提纲")
+        self.assertEqual(started, ["outline", "summary"])
+
+    def test_resumed_summary_sequence_does_not_restart_draft_or_outline(self):
+        chapter = _new_chapter(0)
+        chapter["text"] = "已完成正文"
+        chapter["outline"] = "已完成提纲"
+        tab = NovelWritingTab.__new__(NovelWritingTab)
+        tab.current_project = {"chapters": [chapter], "characters": []}
+        tab.current_chapter_index = 0
+        tab.writing_worker = None
+        tab.chapter_ai_preview = _FakePlainTextEdit("断线摘要")
+        tab.chapter_title = _FakeLineEdit("第一章")
+        tab.chapter_status = _FakeComboBox(["大纲", "写作中", "已完成", "待重写"], "写作中")
+        tab.chapter_linked = _FakeLineEdit("")
+        tab.chapter_outline = _FakePlainTextEdit("已完成提纲")
+        tab.chapter_text = _FakePlainTextEdit("已完成正文")
+        tab.chapter_summary = _FakePlainTextEdit("")
+        tab.chapter_key_facts = _FakePlainTextEdit("")
+        tab._dirty = False
+        tab._loading = False
+        tab._refresh_chapter_item = lambda _index: None
+        tab._schedule_refresh = lambda include_manuscript=False: None
+        tab._set_text_without_signals = lambda widget, text: widget.setPlainText(text)
+        tab._set_line_text_without_signals = lambda widget, text: widget.setText(text)
+        tab._infer_current_chapter_linked_names = lambda extra_text="": []
+        tab.set_chapter_ai_panel_expanded = lambda _expanded: None
+        tab.set_status_tip = lambda _text: None
+        tab._set_chapter_ai_actions_enabled = lambda _enabled: None
+        tab._chapter_ai_preview_is_partial = True
+        tab._chapter_ai_preview_action = "summary"
+        tab._chapter_ai_preview_chapter_id = chapter["id"]
+        tab._chapter_ai_resume_prefix = ""
+        tab._chapter_ai_stop_requested_by_user = False
+        tab._chapter_ai_running_action = ""
+        button = _FakeButton()
+        tab._chapter_ai_buttons_by_action = {"draft": button}
+        tab._chapter_ai_provider = {"base_url": "http://example.test", "api_key": "key", "proxy_url": ""}
+        tab._chapter_ai_model = "model"
+        tab._provider_proxy_mode = lambda _provider: "不使用代理"
+        tab._current_novel_ai_selection = lambda: (tab._chapter_ai_provider, tab._chapter_ai_model, "")
+        tab._flush_current_editors = lambda: None
+        tab._chapter_ai_context_with_preview = lambda action: f"context:{action}"
+        started = []
+        tab._start_chapter_ai_worker = lambda action, _context, status_text="", resume_prefix="": started.append(action)
+
+        tab.run_chapter_ai_action("draft")
+
+        self.assertEqual(started, ["summary"])
+        self.assertTrue(tab._chapter_ai_sequence_active)
+        self.assertEqual(button.text, "扩写正文并补提纲和摘要")
+
+        tab.chapter_ai_preview.setPlainText("本章摘要：续写后的摘要。\n本章需继承的关键事实：续写后的事实。")
+        tab.on_chapter_ai_ready("summary", "本章摘要：续写后的摘要。\n本章需继承的关键事实：续写后的事实。")
+
+        self.assertEqual(tab.chapter_summary.toPlainText(), "续写后的摘要。")
+        self.assertEqual(tab.chapter_key_facts.toPlainText(), "续写后的事实。")
+        self.assertEqual(started, ["summary"])
+        self.assertFalse(tab._chapter_ai_sequence_active)
+
     def test_auto_chapter_outline_keeps_manual_outline(self):
         chapter = _new_chapter(0)
         tab = NovelWritingTab.__new__(NovelWritingTab)
@@ -968,6 +1088,93 @@ class NovelWritingStateTests(unittest.TestCase):
         self.assertEqual(tab.chapter_ai_preview.toPlainText(), "断线前正文")
         self.assertTrue(tab._has_partial_draft_preview())
         self.assertEqual(button.text, "续写正文")
+
+    def test_failed_outline_without_preview_still_changes_button_to_continue(self):
+        chapter = _new_chapter(0)
+        tab = NovelWritingTab.__new__(NovelWritingTab)
+        tab.current_project = {"chapters": [chapter], "characters": []}
+        tab.current_chapter_index = 0
+        tab.chapter_ai_preview = _FakePlainTextEdit("")
+        tab.chapter_ai_stream_text = ""
+        tab._chapter_ai_running_action = "outline"
+        tab._chapter_ai_preview_is_partial = False
+        tab._chapter_ai_preview_action = ""
+        tab._chapter_ai_preview_chapter_id = ""
+        button = _FakeButton()
+        tab._chapter_ai_buttons_by_action = {"draft": button}
+        tab.set_status_tip = lambda _text: None
+
+        import gpt_desktop.novel_writing_tab as writing_tab
+        original_warning = writing_tab.QMessageBox.warning
+        try:
+            writing_tab.QMessageBox.warning = lambda *_args, **_kwargs: None
+            tab.on_chapter_ai_failed("timeout")
+        finally:
+            writing_tab.QMessageBox.warning = original_warning
+
+        self.assertEqual(tab.chapter_ai_preview.toPlainText(), "")
+        self.assertTrue(tab._has_partial_chapter_ai_preview("outline"))
+        self.assertEqual(button.text, "续写提纲")
+
+    def test_failed_sequence_outline_status_names_written_body_and_resume_step(self):
+        chapter = _new_chapter(0)
+        tab = NovelWritingTab.__new__(NovelWritingTab)
+        tab.current_project = {"chapters": [chapter], "characters": []}
+        tab.current_chapter_index = 0
+        tab.chapter_ai_preview = _FakePlainTextEdit("")
+        tab.chapter_ai_stream_text = ""
+        tab._chapter_ai_running_action = "outline"
+        tab._chapter_ai_preview_is_partial = False
+        tab._chapter_ai_preview_action = ""
+        tab._chapter_ai_preview_chapter_id = ""
+        tab._chapter_ai_sequence_active = True
+        button = _FakeButton()
+        tab._chapter_ai_buttons_by_action = {"draft": button}
+        statuses = []
+        tab.set_status_tip = lambda text: statuses.append(text)
+
+        import gpt_desktop.novel_writing_tab as writing_tab
+        original_warning = writing_tab.QMessageBox.warning
+        try:
+            writing_tab.QMessageBox.warning = lambda *_args, **_kwargs: None
+            tab.on_chapter_ai_failed("接口错误 500：server down")
+        finally:
+            writing_tab.QMessageBox.warning = original_warning
+
+        self.assertIn("正文已写入", statuses[-1])
+        self.assertIn("补提纲失败", statuses[-1])
+        self.assertIn("可继续补提纲", statuses[-1])
+        self.assertIn("接口错误 500", statuses[-1])
+
+    def test_failed_sequence_summary_status_names_written_body_and_resume_step(self):
+        chapter = _new_chapter(0)
+        tab = NovelWritingTab.__new__(NovelWritingTab)
+        tab.current_project = {"chapters": [chapter], "characters": []}
+        tab.current_chapter_index = 0
+        tab.chapter_ai_preview = _FakePlainTextEdit("")
+        tab.chapter_ai_stream_text = ""
+        tab._chapter_ai_running_action = "summary"
+        tab._chapter_ai_preview_is_partial = False
+        tab._chapter_ai_preview_action = ""
+        tab._chapter_ai_preview_chapter_id = ""
+        tab._chapter_ai_sequence_active = True
+        button = _FakeButton()
+        tab._chapter_ai_buttons_by_action = {"draft": button}
+        statuses = []
+        tab.set_status_tip = lambda text: statuses.append(text)
+
+        import gpt_desktop.novel_writing_tab as writing_tab
+        original_warning = writing_tab.QMessageBox.warning
+        try:
+            writing_tab.QMessageBox.warning = lambda *_args, **_kwargs: None
+            tab.on_chapter_ai_failed("接口错误 500：server down")
+        finally:
+            writing_tab.QMessageBox.warning = original_warning
+
+        self.assertIn("正文已写入", statuses[-1])
+        self.assertIn("补摘要/关键事实失败", statuses[-1])
+        self.assertIn("可继续补摘要", statuses[-1])
+        self.assertIn("接口错误 500", statuses[-1])
 
     def test_save_chapter_auto_updates_default_status(self):
         chapter = _new_chapter(0)

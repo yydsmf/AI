@@ -18,9 +18,6 @@ ArchitecturesInstallIn64BitMode=x64compatible
 SetupIconFile=..\app_icon.ico
 UninstallDisplayIcon={app}\{#MyAppExeName}
 
-[Languages]
-Name: "chinesesimp"; MessagesFile: "compiler:Languages\ChineseSimplified.isl"
-
 [Files]
 Source: "..\GPTLocalToolbox.exe"; DestDir: "{app}"; Flags: ignoreversion
 Source: "redist\VC_redist.x64.exe"; DestDir: "{tmp}"; Flags: deleteafterinstall skipifsourcedoesntexist; Check: NeedsVCRedist

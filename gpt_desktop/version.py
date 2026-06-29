@@ -1,4 +1,4 @@
-APP_NAME = "GPT 本地工具箱"
+APP_NAME = "GPT工具箱"
 APP_VERSION = "1.0.5"
 APP_RELEASE_REPO = "yydsmf/AI"
 APP_RELEASES_URL = f"https://github.com/{APP_RELEASE_REPO}/releases/latest"

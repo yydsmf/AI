@@ -76,12 +76,12 @@ coll = COLLECT(
 )
 app = BUNDLE(
     coll,
-    name='GPTLocalToolbox.app',
+    name='GPT工具箱.app',
     icon=str(icon_file) if icon_file.exists() else None,
     bundle_identifier='com.gptlocaltoolbox.app',
     version=app_version,
     info_plist={
-        'CFBundleDisplayName': 'GPT 本地工具箱',
+        'CFBundleDisplayName': 'GPT工具箱',
         'CFBundleShortVersionString': app_version,
         'CFBundleVersion': app_version,
         'LSMinimumSystemVersion': '12.0',

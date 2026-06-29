@@ -88,6 +88,23 @@ def sign_macos_app(app_path: str) -> bool:
     return True
 
 
+def sign_macos_internal_app(app_path: str) -> bool:
+    codesign = shutil.which("codesign")
+    if not codesign:
+        raise RuntimeError("找不到 codesign。")
+
+    _run([
+        codesign,
+        "--force",
+        "--deep",
+        "--sign",
+        "-",
+        app_path,
+    ])
+    _run([codesign, "--verify", "--deep", "--strict", "--verbose=2", app_path])
+    return True
+
+
 def sign_macos_dmg(dmg_path: str) -> bool:
     identity = _env("MAC_CODESIGN_IDENTITY")
     if not identity:
@@ -161,6 +178,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--sign-windows", dest="sign_windows")
     parser.add_argument("--sign-macos", dest="sign_macos")
+    parser.add_argument("--sign-macos-internal", dest="sign_macos_internal")
     parser.add_argument("--sign-macos-dmg", dest="sign_macos_dmg")
     parser.add_argument("--notarize-macos", dest="notarize_macos")
     args = parser.parse_args()
@@ -171,6 +189,8 @@ def main():
     if args.sign_macos:
         if not sign_macos_app(args.sign_macos):
             raise SystemExit("Mac signing skipped: no Developer ID identity configured.")
+    if args.sign_macos_internal:
+        sign_macos_internal_app(args.sign_macos_internal)
     if args.sign_macos_dmg:
         if not sign_macos_dmg(args.sign_macos_dmg):
             raise SystemExit("Mac DMG signing skipped: no Developer ID identity configured.")

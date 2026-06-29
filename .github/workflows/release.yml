@@ -105,7 +105,7 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Validate macOS signing secrets
+      - name: Select macOS signing mode
         if: startsWith(github.ref, 'refs/tags/')
         env:
           MAC_CERTIFICATE_P12_BASE64: ${{ secrets.MAC_CERTIFICATE_P12_BASE64 }}
@@ -116,6 +116,7 @@ jobs:
           MAC_NOTARY_PASSWORD: ${{ secrets.MAC_NOTARY_PASSWORD }}
         run: |
           missing=0
+          missing_names=()
           for name in \
             MAC_CERTIFICATE_P12_BASE64 \
             MAC_CERTIFICATE_PASSWORD \
@@ -125,13 +126,17 @@ jobs:
             MAC_NOTARY_PASSWORD
           do
             if [[ -z "${!name}" ]]; then
-              echo "::error::$name is required for tagged macOS releases."
+              echo "::warning::$name is not configured; macOS package will use internal ad-hoc signing."
               missing=1
+              missing_names+=("$name")
             fi
           done
           if [[ "$missing" != "0" ]]; then
-            echo "::error::Tagged macOS releases must be Developer ID signed and notarized so downloaded apps open normally."
-            exit 1
+            echo "MAC_SIGNING_MODE=internal" >> "$GITHUB_ENV"
+            printf 'Missing macOS notarization secrets: %s\n' "${missing_names[*]}"
+            echo "::warning::Building an internal macOS package. It is signed for internal testing but not Apple-notarized."
+          else
+            echo "MAC_SIGNING_MODE=notarized" >> "$GITHUB_ENV"
           fi
 
       - name: Import macOS signing certificate
@@ -140,7 +145,7 @@ jobs:
           MAC_CERTIFICATE_PASSWORD: ${{ secrets.MAC_CERTIFICATE_PASSWORD }}
           MAC_KEYCHAIN_PASSWORD: macos-signing-${{ github.run_id }}-${{ matrix.arch }}
         run: |
-          if [[ -z "$MAC_CERTIFICATE_P12_BASE64" ]]; then
+          if [[ "${MAC_SIGNING_MODE:-internal}" != "notarized" ]]; then
             echo "Mac certificate import skipped: no certificate configured."
             exit 0
           fi
@@ -216,10 +221,10 @@ jobs:
           MAC_CODESIGN_IDENTITY: ${{ secrets.MAC_CODESIGN_IDENTITY }}
           MAC_ENTITLEMENTS_PATH: packaging/macos.entitlements
         run: |
-          if [[ -z "$MAC_CODESIGN_IDENTITY" ]]; then
-            echo "Mac signing skipped: no Developer ID identity configured."
+          if [[ "${MAC_SIGNING_MODE:-internal}" == "notarized" ]]; then
+            python3 scripts/release_signing.py --sign-macos "dist/GPT工具箱.app"
           else
-            python3 scripts/release_signing.py --sign-macos "dist/GPTLocalToolbox.app"
+            python3 scripts/release_signing.py --sign-macos-internal "dist/GPT工具箱.app"
           fi
 
       - name: Package macOS dmg
@@ -227,19 +232,19 @@ jobs:
           if [[ "$GITHUB_REF_NAME" == v* ]]; then VERSION="${GITHUB_REF_NAME#v}"; else VERSION="manual"; fi
           rm -rf dmg-root
           mkdir -p dmg-root
-          cp -R "dist/GPTLocalToolbox.app" "dmg-root/"
+          cp -R "dist/GPT工具箱.app" "dmg-root/"
           ln -s /Applications "dmg-root/Applications"
-          hdiutil create -volname "GPT 本地工具箱" -srcfolder "dmg-root" -ov -format UDZO "GPTLocalToolbox_v${VERSION}_macos_${{ matrix.arch }}.dmg"
+          hdiutil create -volname "GPT工具箱" -srcfolder "dmg-root" -ov -format UDZO "GPTLocalToolbox_v${VERSION}_macos_${{ matrix.arch }}.dmg"
 
       - name: Sign macOS dmg
         env:
           MAC_CODESIGN_IDENTITY: ${{ secrets.MAC_CODESIGN_IDENTITY }}
         run: |
-          if [[ -z "$MAC_CODESIGN_IDENTITY" ]]; then
-            echo "Mac DMG signing skipped: no Developer ID identity configured."
-          else
+          if [[ "${MAC_SIGNING_MODE:-internal}" == "notarized" ]]; then
             if [[ "$GITHUB_REF_NAME" == v* ]]; then VERSION="${GITHUB_REF_NAME#v}"; else VERSION="manual"; fi
             python3 scripts/release_signing.py --sign-macos-dmg "GPTLocalToolbox_v${VERSION}_macos_${{ matrix.arch }}.dmg"
+          else
+            echo "Mac DMG signing skipped for internal ad-hoc release."
           fi
 
       - name: Notarize macOS dmg
@@ -249,11 +254,11 @@ jobs:
           MAC_NOTARY_TEAM_ID: ${{ secrets.MAC_NOTARY_TEAM_ID }}
           MAC_NOTARY_PASSWORD: ${{ secrets.MAC_NOTARY_PASSWORD }}
         run: |
-          if [[ -z "$MAC_CODESIGN_IDENTITY" || -z "$MAC_NOTARY_APPLE_ID" || -z "$MAC_NOTARY_TEAM_ID" || -z "$MAC_NOTARY_PASSWORD" ]]; then
-            echo "Mac notarization skipped: no Apple notarization credentials configured."
-          else
+          if [[ "${MAC_SIGNING_MODE:-internal}" == "notarized" ]]; then
             if [[ "$GITHUB_REF_NAME" == v* ]]; then VERSION="${GITHUB_REF_NAME#v}"; else VERSION="manual"; fi
             python3 scripts/release_signing.py --notarize-macos "GPTLocalToolbox_v${VERSION}_macos_${{ matrix.arch }}.dmg"
+          else
+            echo "Mac notarization skipped for internal ad-hoc release."
           fi
 
       - uses: actions/upload-artifact@v4

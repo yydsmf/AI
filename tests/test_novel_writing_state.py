@@ -11,6 +11,7 @@ from gpt_desktop.novel_utils import (
     _append_text_without_duplicate_overlap,
     _chapter_analysis_hash,
     _chapter_analysis_legacy_hash,
+    _chapter_list_text,
     _character_list_text,
     _compact_chapter_key_facts_text,
     _compact_chapter_summary_text,
@@ -58,6 +59,39 @@ class NovelWritingStateTests(unittest.TestCase):
         self.assertEqual(project["chapters"][0]["draft_words"], "3200")
         self.assertEqual(project["chapters"][1]["draft_words"], "")
 
+    def test_chapter_list_text_shows_ai_analysis_status_instead_of_draft_words(self):
+        chapter = _new_chapter(0)
+        chapter["title"] = "章节1"
+        chapter["status"] = "已完成"
+        chapter["text"] = "正文内容"
+        chapter["draft_words"] = "3000"
+
+        text = _chapter_list_text(0, chapter)
+
+        self.assertIn("待AI分析", text)
+        self.assertNotIn("扩写约3000字", text)
+
+        _mark_chapters_analyzed([chapter], [chapter["id"]])
+        text = _chapter_list_text(0, chapter)
+
+        self.assertIn("已AI分析", text)
+        self.assertNotIn("扩写约3000字", text)
+        self.assertTrue(chapter["analysis_baseline"])
+        self.assertTrue(chapter["analysis_linked_hash"] or "linked_characters" in chapter)
+
+    def test_chapter_list_text_shows_small_change_for_minor_edit(self):
+        chapter = _new_chapter(0)
+        chapter["title"] = "章节1"
+        chapter["status"] = "已完成"
+        chapter["text"] = "正文内容很多。" * 80
+        _mark_chapters_analyzed([chapter], [chapter["id"]])
+
+        chapter["text"] += "补充几字。"
+        text = _chapter_list_text(0, chapter)
+
+        self.assertIn("小改", text)
+        self.assertNotIn("待AI分析", text)
+
     def test_project_meta_text_includes_summary_fact_words(self):
         chapter = _new_chapter(0)
         chapter["text"] = "正文内容"
@@ -80,6 +114,18 @@ class NovelWritingStateTests(unittest.TestCase):
         self.assertIn("正文 4/100", text)
         self.assertIn("大纲 4", text)
         self.assertIn("摘要/事实 9", text)
+
+    def test_update_stats_label_uses_project_title_not_import_filename(self):
+        tab = NovelWritingTab.__new__(NovelWritingTab)
+        tab.current_project = {"meta": {"title": "《什么鬼系统？见谁都是四六开》第一季"}, "chapters": []}
+        tab.current_project_path = "/tmp/《什么鬼系统？见谁都是四六开》框架.json"
+        tab.project_meta_label = _FakeLabel()
+
+        tab._update_stats_label()
+
+        self.assertIn("第一季", tab.project_meta_label.text)
+        self.assertNotIn("框架", tab.project_meta_label.text)
+        self.assertIn("框架.json", tab.project_meta_label.tooltip)
 
     def test_edge_tts_worker_accepts_rate_argument(self):
         worker = EdgeTTSWorker("文本", "/tmp/test.mp3", rate="+20%")
@@ -162,6 +208,14 @@ class NovelWritingStateTests(unittest.TestCase):
         self.assertLessEqual(len(compacted), 120)
         self.assertLessEqual(compacted.count("。"), 2)
 
+    def test_compact_chapter_summary_keeps_all_text_by_default(self):
+        text = "\n".join(f"摘要短句{index}。" for index in range(1, 9))
+
+        compacted = _compact_chapter_summary_text(text)
+
+        self.assertEqual(compacted, text)
+        self.assertIn("摘要短句8。", compacted)
+
     def test_compact_chapter_key_facts_limits_items(self):
         text = "\n".join(f"{index}. 关键事实{index}会影响后文。" for index in range(1, 10))
 
@@ -181,6 +235,39 @@ class NovelWritingStateTests(unittest.TestCase):
         self.assertIn("苏不欺学心猿破流血", compacted)
         self.assertNotIn("4。", compacted)
         self.assertNotRegex(compacted, r"(?:^|[；;\n])\s*4[.。]\s*$")
+
+    def test_compact_chapter_key_facts_does_not_hard_cut_long_fact_tail(self):
+        long_fact = (
+            "赵元宝私用下品定身符失效，设定圆脸外门弟子，被陆长明撞见；"
+            "苏不欺掌心伤口重新渗血，收下陆长明给的止血散并随身带着；"
+            "苏不欺已领败债宫竹牌、灰布袋、两套衣、一枚引路符和三块下品灵石，暂未使用。"
+        )
+
+        compacted = _compact_chapter_key_facts_text(long_fact, max_chars=45, max_items=6)
+
+        self.assertIn("赵元宝私用下品定身符失效", compacted)
+        self.assertNotIn("苏不欺掌心伤口", compacted)
+        self.assertNotRegex(compacted, r"[，,、]\s*。$")
+
+    def test_compact_chapter_key_facts_keeps_all_items_by_default(self):
+        text = "\n".join(f"{index}. 关键事实{index}会影响后文。" for index in range(1, 10))
+
+        compacted = _compact_chapter_key_facts_text(text)
+
+        self.assertEqual(len(compacted.splitlines()), 9)
+        self.assertIn("关键事实9会影响后文。", compacted)
+
+    def test_compact_chapter_key_facts_does_not_treat_commas_as_item_limit(self):
+        text = (
+            "苏不欺掌心伤口重新渗血，收下陆长明给的止血散并随身带着；"
+            "苏不欺已领取候查竹牌、灰布袋、两套衣、一枚引路符和三块下品灵石，暂未使用。"
+        )
+
+        compacted = _compact_chapter_key_facts_text(text)
+
+        self.assertIn("止血散并随身带着", compacted)
+        self.assertIn("三块下品灵石，暂未使用。", compacted)
+        self.assertNotIn("暂。", compacted)
 
     def test_compact_chapter_summary_drops_empty_numbered_tail(self):
         compacted = _compact_chapter_summary_text("1. 赵明进入王城。2。")
@@ -287,9 +374,9 @@ class NovelWritingStateTests(unittest.TestCase):
         pending_chapter["text"] = "正文一"
         changed_chapter = _new_chapter(1)
         changed_chapter["title"] = "第二章"
-        changed_chapter["text"] = "正文二"
-        changed_chapter["analysis_hash"] = _chapter_analysis_hash(changed_chapter)
-        changed_chapter["text"] = "正文二 已修改"
+        changed_chapter["text"] = "正文二。" * 80
+        _mark_chapters_analyzed([changed_chapter], [changed_chapter["id"]])
+        changed_chapter["text"] = "第二章被大幅改写。" * 80
         tab = NovelWritingTab.__new__(NovelWritingTab)
         tab.current_project = {"chapters": [pending_chapter, changed_chapter]}
         tab.pending_analysis_chapter_ids = [pending_chapter["id"]]
@@ -299,10 +386,46 @@ class NovelWritingStateTests(unittest.TestCase):
             [pending_chapter["id"], changed_chapter["id"]],
         )
 
+    def test_pending_candidate_analysis_ids_skip_small_changes(self):
+        chapter = _new_chapter(0)
+        chapter["title"] = "第一章"
+        chapter["text"] = "赵明进入王城。" * 80
+        _mark_chapters_analyzed([chapter], [chapter["id"]])
+        chapter["text"] += "补充一句。"
+        tab = NovelWritingTab.__new__(NovelWritingTab)
+        tab.current_project = {"chapters": [chapter]}
+        tab.pending_analysis_chapter_ids = []
+
+        self.assertEqual(tab._pending_candidate_analysis_chapter_ids(), [])
+
+    def test_pending_candidate_analysis_ids_skip_same_length_small_changes(self):
+        chapter = _new_chapter(0)
+        chapter["title"] = "第一章"
+        chapter["text"] = "赵明进入王城。" * 80
+        _mark_chapters_analyzed([chapter], [chapter["id"]])
+        chapter["text"] = chapter["text"].replace("王城", "皇城", 1)
+        tab = NovelWritingTab.__new__(NovelWritingTab)
+        tab.current_project = {"chapters": [chapter]}
+        tab.pending_analysis_chapter_ids = []
+
+        self.assertEqual(tab._pending_candidate_analysis_chapter_ids(), [])
+
+    def test_pending_candidate_analysis_ids_include_same_length_large_changes(self):
+        chapter = _new_chapter(0)
+        chapter["title"] = "第一章"
+        chapter["text"] = "赵明进入王城。" * 80
+        _mark_chapters_analyzed([chapter], [chapter["id"]])
+        chapter["text"] = "苏秦离开边城。" * 80
+        tab = NovelWritingTab.__new__(NovelWritingTab)
+        tab.current_project = {"chapters": [chapter]}
+        tab.pending_analysis_chapter_ids = []
+
+        self.assertEqual(tab._pending_candidate_analysis_chapter_ids(), [chapter["id"]])
+
     def test_pending_candidate_analysis_ids_include_changed_linked_characters_after_new_hash(self):
         chapter = _new_chapter(0)
         chapter["title"] = "第一章"
-        chapter["text"] = "赵明进入王城。"
+        chapter["text"] = "赵明进入王城。" * 80
         chapter["linked_characters"] = ["赵明"]
         _mark_chapters_analyzed([chapter], [chapter["id"]])
         self.assertEqual(chapter["analysis_hash_version"], CHAPTER_ANALYSIS_HASH_VERSION)
@@ -1394,6 +1517,22 @@ class NovelWritingStateTests(unittest.TestCase):
         self.assertEqual(key_facts, "赵明拿到旧案钥匙。\n王城暗门开启。")
         self.assertEqual(linked, ["赵明", "迟到主角"])
 
+    def test_split_chapter_summary_bundle_keeps_all_key_facts(self):
+        tab = NovelWritingTab.__new__(NovelWritingTab)
+        facts = "\n".join(f"{index}. 关键事实{index}会影响后文。" for index in range(1, 10))
+
+        summary, key_facts, linked = tab._split_chapter_summary_bundle(
+            "本章摘要：赵明进入王城。\n"
+            "本章需继承的关键事实：\n"
+            f"{facts}\n"
+            "本章关联人物：赵明"
+        )
+
+        self.assertEqual(summary, "赵明进入王城。")
+        self.assertEqual(len(key_facts.splitlines()), 9)
+        self.assertIn("关键事实9会影响后文。", key_facts)
+        self.assertEqual(linked, ["赵明"])
+
     def test_split_chapter_summary_bundle_accepts_fenced_json_output(self):
         tab = NovelWritingTab.__new__(NovelWritingTab)
 
@@ -1806,11 +1945,15 @@ class _FakeTimer:
 
 
 class _FakeLabel:
-    def setText(self, _text):
-        pass
+    def __init__(self):
+        self.text = ""
+        self.tooltip = ""
 
-    def setToolTip(self, _text):
-        pass
+    def setText(self, text):
+        self.text = text
+
+    def setToolTip(self, text):
+        self.tooltip = text
 
 
 class _FakeListItem:

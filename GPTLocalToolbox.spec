@@ -7,7 +7,7 @@ from PyInstaller.utils.hooks import collect_data_files, collect_submodules
 
 project_dir = Path(SPECPATH).resolve()
 icon_file = project_dir / "app_icon_trimmed.icns"
-app_version = "1.0.8"
+app_version = "1.0.10"
 
 
 def _collect_submodules(package):

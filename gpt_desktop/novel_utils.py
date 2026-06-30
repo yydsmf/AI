@@ -2,10 +2,12 @@ import os
 import re
 import uuid
 import hashlib
+from difflib import SequenceMatcher
 
 from .core import now_str
 
 CHAPTER_ANALYSIS_HASH_VERSION = "2"
+CHAPTER_ANALYSIS_SMALL_CHANGE_RATIO = 0.10
 _STORY_ORDER_MISSING = 10 ** 9
 _CHINESE_NUMERAL_DIGITS = {
     "零": 0,
@@ -360,6 +362,8 @@ def _new_chapter(index):
         "analysis_hash": "",
         "analysis_hash_version": "",
         "analysis_analyzed_at": "",
+        "analysis_baseline": "",
+        "analysis_linked_hash": "",
     }
 
 
@@ -478,6 +482,8 @@ def _normalize_project(data):
                     "analysis_hash",
                     "analysis_hash_version",
                     "analysis_analyzed_at",
+                    "analysis_baseline",
+                    "analysis_linked_hash",
                     "adaptation_mode",
                     "adaptation_optimization",
                     "adaptation_source_hash",
@@ -485,6 +491,9 @@ def _normalize_project(data):
                 ):
                     chap[key] = _as_text(chap.get(key, ""))
                 chap["linked_characters"] = _normalize_name_list(chap.get("linked_characters", []))
+                if _chapter_analysis_is_current(chap):
+                    chap["analysis_baseline"] = chap.get("analysis_baseline", "") or _chapter_analysis_content_text(chap)
+                    chap["analysis_linked_hash"] = chap.get("analysis_linked_hash", "") or _chapter_analysis_linked_hash(chap)
     foreshadow_items = data.get("foreshadow_items", [])
     if isinstance(foreshadow_items, list):
         base["foreshadow_items"] = [c for c in foreshadow_items if isinstance(c, dict)]
@@ -665,11 +674,101 @@ def _text_len(value):
     return len(str(value or "").strip())
 
 
-def _clip_context_text(value, limit, keep_tail=False):
+def _line_join_length(lines):
+    return len("\n".join(str(line or "") for line in lines))
+
+
+def _clip_lines_head(lines, limit):
+    lines = [str(line or "").strip() for line in (lines or []) if str(line or "").strip()]
+    limit = int(limit or 0)
+    if not lines or limit <= 0:
+        return ""
+    text = "\n".join(lines)
+    if len(text) <= limit:
+        return text
+    kept = []
+    for index, line in enumerate(lines):
+        omitted = len(lines) - index
+        marker = f"……（后续 {omitted} 条已压缩省略）……"
+        candidate = "\n".join(kept + [line, marker]).strip() if kept else "\n".join([line, marker]).strip()
+        if len(candidate) <= limit:
+            kept.append(line)
+            continue
+        if kept:
+            omitted = len(lines) - len(kept)
+            marker = f"……（后续 {omitted} 条已压缩省略）……"
+            candidate = "\n".join(kept + [marker]).strip()
+            if len(candidate) <= limit:
+                return candidate
+            return "\n".join(kept).strip()
+        return _clip_context_text(line, limit, keep_tail=True)
+    return "\n".join(kept).strip()
+
+
+def _tail_lines_by_limit(lines, limit):
+    lines = [str(line or "").strip() for line in (lines or []) if str(line or "").strip()]
+    limit = int(limit or 0)
+    if not lines or limit <= 0:
+        return []
+    if _line_join_length(lines) <= limit:
+        return lines
+    selected = []
+    total = 0
+    for line in reversed(lines):
+        line_len = len(line) + (1 if selected else 0)
+        if selected and total + line_len > limit:
+            break
+        if not selected and line_len > limit:
+            selected.append(_clip_context_text(line, limit, keep_tail=True))
+            break
+        selected.append(line)
+        total += line_len
+    return list(reversed(selected))
+
+
+def _select_lines_by_char_budget(lines, limit, omitted_label="条"):
+    lines = [str(line or "").strip() for line in (lines or []) if str(line or "").strip()]
+    limit = int(limit or 0)
+    if not lines:
+        return []
+    if limit <= 0 or _line_join_length(lines) <= limit:
+        return lines
+    selected = []
+    for index, line in enumerate(lines):
+        omitted = len(lines) - index
+        marker = f"- ……另有 {omitted} {omitted_label}已省略"
+        candidate = "\n".join(selected + [line, marker]).strip()
+        if len(candidate) <= limit:
+            selected.append(line)
+            continue
+        break
+    omitted = len(lines) - len(selected)
+    if omitted > 0:
+        marker = f"- ……另有 {omitted} {omitted_label}已省略"
+        if selected and len("\n".join(selected + [marker]).strip()) <= limit:
+            selected.append(marker)
+        elif not selected:
+            selected.append(_clip_context_text(lines[0], limit, keep_tail=True))
+    return selected
+
+
+def _clip_context_text(value, limit, keep_tail=False, preserve_lines=False):
     text = str(value or "").strip()
     limit = int(limit or 0)
     if limit <= 0 or len(text) <= limit:
         return text
+    if preserve_lines:
+        lines = [line.strip() for line in text.splitlines() if line.strip()]
+        if len(lines) <= 1:
+            lines = [
+                part.strip()
+                for part in re.findall(r".+?(?:……|[。！？!?；;…]+|$)", text)
+                if part.strip()
+            ]
+        if len(lines) > 1:
+            if keep_tail:
+                return _clip_lines_balanced(lines, limit)
+            return _clip_lines_head(lines, limit)
     marker = "\n……（内容过长，已裁剪）……\n"
     if keep_tail and limit > len(marker) + 200:
         head_len = max(120, limit // 3)
@@ -678,11 +777,15 @@ def _clip_context_text(value, limit, keep_tail=False):
     return text[: max(0, limit - len(marker))].rstrip() + marker.strip()
 
 
-def _compact_chapter_summary_text(value, max_chars=220, max_sentences=3):
+def _compact_chapter_summary_text(value, max_chars=0, max_sentences=0):
     text = _clean_empty_numbered_list_items(_dedupe_text_lines(value))
-    max_chars = max(1, int(max_chars or 1))
-    max_sentences = max(1, int(max_sentences or 1))
-    if len(text) <= max_chars:
+    max_chars = int(max_chars or 0)
+    max_sentences = int(max_sentences or 0)
+    if not text:
+        return ""
+    if max_chars <= 0 and max_sentences <= 0:
+        return text
+    if max_chars > 0 and max_sentences <= 0 and len(text) <= max_chars:
         return text
     parts = [
         part.strip()
@@ -693,17 +796,21 @@ def _compact_chapter_summary_text(value, max_chars=220, max_sentences=3):
         selected = []
         total = 0
         for part in parts:
-            if len(selected) >= max_sentences:
+            if max_sentences > 0 and len(selected) >= max_sentences:
                 break
             next_total = total + len(part)
-            if selected and next_total > max_chars:
+            if max_chars > 0 and selected and next_total > max_chars:
+                break
+            if max_chars > 0 and not selected and len(part) > max_chars:
                 break
             selected.append(part)
             total = next_total
         compacted = "".join(selected).strip()
         if compacted:
-            return compacted[:max_chars].rstrip()
-    return text[:max_chars].rstrip()
+            return compacted
+    if max_chars > 0:
+        return _clip_context_text(text, max_chars, keep_tail=True)
+    return text
 
 
 def _clean_empty_numbered_list_items(value):
@@ -723,10 +830,10 @@ def _clean_empty_numbered_list_items(value):
     return "\n".join(cleaned_lines).strip()
 
 
-def _compact_chapter_key_facts_text(value, max_chars=360, max_items=6):
+def _compact_chapter_key_facts_text(value, max_chars=0, max_items=0):
     text = _clean_empty_numbered_list_items(_dedupe_text_lines(value))
-    max_chars = max(1, int(max_chars or 1))
-    max_items = max(1, int(max_items or 1))
+    max_chars = int(max_chars or 0)
+    max_items = int(max_items or 0)
     if not text:
         return ""
     raw_items = []
@@ -734,11 +841,13 @@ def _compact_chapter_key_facts_text(value, max_chars=360, max_items=6):
         line = re.sub(r"^\s*(?:[-*•]\s+|[（(]?\d+[）).、]\s*)", "", line).strip()
         if not line or line in {"无", "没有", "暂无", "无新增"}:
             continue
-        sentence_parts = [
-            part.strip()
-            for part in re.findall(r".+?(?:……|[。！？!?…]+|$)", line)
-            if part.strip()
-        ]
+        sentence_parts = []
+        for part in re.findall(r".+?(?:……|[。！？!?…]+|$)", line):
+            part = part.strip()
+            if not part:
+                continue
+            segments = [seg.strip() for seg in re.split(r"(?<=[；;])", part) if seg.strip()]
+            sentence_parts.extend(segments or [part])
         raw_items.extend(sentence_parts or [line])
 
     items = []
@@ -747,17 +856,15 @@ def _compact_chapter_key_facts_text(value, max_chars=360, max_items=6):
         item = item.strip()
         if not item:
             continue
-        if len(item) > 90:
-            item = item[:90].rstrip("，,；;、 ") + "。"
         key = re.sub(r"\s+", "", item)
         if key in seen:
             continue
         seen.add(key)
         items.append(item)
-        if len(items) >= max_items:
+        if max_items > 0 and len(items) >= max_items:
             break
     compacted = "\n".join(items).strip()
-    if len(compacted) <= max_chars:
+    if max_chars <= 0 or len(compacted) <= max_chars:
         return compacted
     kept = []
     total = 0
@@ -767,7 +874,7 @@ def _compact_chapter_key_facts_text(value, max_chars=360, max_items=6):
             break
         kept.append(item)
         total += item_len
-    return "\n".join(kept).strip() or compacted[:max_chars].rstrip()
+    return "\n".join(kept).strip()
 
 
 def _clip_lines_balanced(lines, limit, head=8, tail=10):
@@ -778,21 +885,52 @@ def _clip_lines_balanced(lines, limit, head=8, tail=10):
     text = "\n".join(lines)
     if len(text) <= limit:
         return text
-    if len(lines) <= max(2, int(head or 0) + int(tail or 0)):
-        return _clip_context_text(text, limit, keep_tail=True)
 
-    head_count = max(1, int(head or 1))
-    tail_count = max(1, int(tail or 1))
-    marker = f"……（中间 {max(0, len(lines) - head_count - tail_count)} 条已压缩省略）……"
-    out = lines[:head_count] + [marker] + lines[-tail_count:]
-    text = "\n".join(out)
-    if len(text) <= limit:
-        return text
-    head_budget = max(1, min(head_count, max(1, head_count // 2)))
-    tail_budget = max(1, min(tail_count, max(1, tail_count // 2)))
-    marker = f"……（中间 {max(0, len(lines) - head_budget - tail_budget)} 条已压缩省略）……"
-    text = "\n".join(lines[:head_budget] + [marker] + lines[-tail_budget:])
-    return _clip_context_text(text, limit, keep_tail=True)
+    head_lines = []
+    tail_lines = []
+    head_index = 0
+    tail_index = len(lines) - 1
+
+    def build_text(extra_head=None, extra_tail=None):
+        head_part = head_lines + ([extra_head] if extra_head else [])
+        tail_part = ([extra_tail] if extra_tail else []) + tail_lines
+        omitted = max(0, len(lines) - len(head_part) - len(tail_part))
+        marker = f"……（中间 {omitted} 条已按字符预算压缩省略）……"
+        return "\n".join(head_part + [marker] + tail_part).strip()
+
+    def can_add_head():
+        if head_index > tail_index:
+            return False
+        return len(build_text(extra_head=lines[head_index])) <= limit
+
+    def can_add_tail():
+        if head_index > tail_index:
+            return False
+        return len(build_text(extra_tail=lines[tail_index])) <= limit
+
+    while head_index <= tail_index:
+        progressed = False
+        head_chars = _line_join_length(head_lines)
+        tail_chars = _line_join_length(tail_lines)
+        prefer_tail = bool(tail_lines) and tail_chars <= head_chars or not head_lines
+        attempts = ("tail", "head") if prefer_tail else ("head", "tail")
+        for side in attempts:
+            if side == "head" and can_add_head():
+                head_lines.append(lines[head_index])
+                head_index += 1
+                progressed = True
+                break
+            if side == "tail" and can_add_tail():
+                tail_lines.insert(0, lines[tail_index])
+                tail_index -= 1
+                progressed = True
+                break
+        if not progressed:
+            break
+
+    if not head_lines and not tail_lines:
+        return _clip_context_text(text, limit, keep_tail=True)
+    return build_text()
 
 
 def _drop_first_nonempty_lines(text, count):
@@ -924,7 +1062,9 @@ def _prioritize_named_records(records, context_text, linked_names=None, name_key
             continue
         ranked.append((-score, index, item))
     ranked.sort()
-    return [item for _score, _index, item in ranked[: max(0, int(limit or 0))]]
+    if limit is None or int(limit or 0) <= 0:
+        return [item for _score, _index, item in ranked]
+    return [item for _score, _index, item in ranked[: int(limit or 0)]]
 
 
 def _infer_linked_character_names(project, chapter, extra_text=""):
@@ -1173,7 +1313,8 @@ def _active_character_summary_lines(project, limit=12):
             ranked.append((-count, index, name, char, activity.get(name, {})))
     ranked.sort()
     lines = []
-    for _score, _index, name, char, stat in ranked[: max(0, int(limit or 0))]:
+    selected = ranked if limit is None or int(limit or 0) <= 0 else ranked[: int(limit or 0)]
+    for _score, _index, name, char, stat in selected:
         detail_parts = []
         for label, field, clip_limit in (
             ("身份", "role", 80),
@@ -1208,7 +1349,8 @@ def _active_lore_summary_lines(project, limit=12):
             ranked.append((-count, index, name, item, activity.get(name, {})))
     ranked.sort()
     lines = []
-    for _score, _index, name, item, stat in ranked[: max(0, int(limit or 0))]:
+    selected = ranked if limit is None or int(limit or 0) <= 0 else ranked[: int(limit or 0)]
+    for _score, _index, name, item, stat in selected:
         typ = str(item.get("type", "") or "其他").strip()
         desc = _clip_context_text(_stable_lore_description_context(item.get("description", "")), 160)
         last_chapter = str(stat.get("last_chapter", "") or "").strip()
@@ -1899,6 +2041,8 @@ def _split_chapters_from_text(text, import_type="小说"):
             "analysis_hash": "",
             "analysis_hash_version": "",
             "analysis_analyzed_at": "",
+            "analysis_baseline": "",
+            "analysis_linked_hash": "",
         }
         chap["status"] = _infer_chapter_status(chap, preserve_manual=False)
         return [chap] if body else []
@@ -1925,6 +2069,8 @@ def _split_chapters_from_text(text, import_type="小说"):
                 "analysis_hash": "",
                 "analysis_hash_version": "",
                 "analysis_analyzed_at": "",
+                "analysis_baseline": "",
+                "analysis_linked_hash": "",
             }
             chap["status"] = _infer_chapter_status(chap, preserve_manual=False)
             chapters.append(chap)
@@ -1956,6 +2102,8 @@ def _split_chapters_from_text(text, import_type="小说"):
             "analysis_hash": "",
             "analysis_hash_version": "",
             "analysis_analyzed_at": "",
+            "analysis_baseline": "",
+            "analysis_linked_hash": "",
         }
         chap["status"] = _infer_chapter_status(chap, preserve_manual=False)
         chapters.append(chap)
@@ -2067,6 +2215,8 @@ def _split_manuscript_into_target_chapters(project, target_words):
                 "analysis_hash": "",
                 "analysis_hash_version": "",
                 "analysis_analyzed_at": "",
+                "analysis_baseline": "",
+                "analysis_linked_hash": "",
             })
         current_units = []
         current_chars = 0
@@ -2141,6 +2291,75 @@ def _chapter_analysis_legacy_hash(chap):
     return hashlib.sha1(text.encode("utf-8")).hexdigest() if text.strip() else ""
 
 
+def _chapter_analysis_content_text(chap):
+    return _chapter_analysis_hash_text(chap, include_linked=False).strip()
+
+
+def _chapter_analysis_linked_hash(chap):
+    linked = "、".join(_normalize_name_list((chap if isinstance(chap, dict) else {}).get("linked_characters", [])))
+    return hashlib.sha1(linked.encode("utf-8")).hexdigest() if linked else ""
+
+
+def _chapter_analysis_has_saved_current_version(chap):
+    chap = chap if isinstance(chap, dict) else {}
+    return (
+        bool(str(chap.get("analysis_hash", "") or "").strip())
+        and str(chap.get("analysis_hash_version", "") or "").strip() == CHAPTER_ANALYSIS_HASH_VERSION
+    )
+
+
+def _chapter_analysis_diff_ratio(old_text, new_text):
+    old_text = str(old_text or "").strip()
+    new_text = str(new_text or "").strip()
+    if old_text == new_text:
+        return 0.0
+    length_delta_ratio = abs(len(new_text) - len(old_text)) / max(len(old_text), len(new_text), 1)
+    prefix = 0
+    shortest = min(len(old_text), len(new_text))
+    while prefix < shortest and old_text[prefix] == new_text[prefix]:
+        prefix += 1
+    suffix = 0
+    while (
+        suffix < shortest - prefix
+        and old_text[len(old_text) - 1 - suffix] == new_text[len(new_text) - 1 - suffix]
+    ):
+        suffix += 1
+    changed_old = len(old_text) - prefix - suffix
+    changed_new = len(new_text) - prefix - suffix
+    local_ratio = max(changed_old, changed_new) / max(len(old_text), len(new_text), 1)
+    if length_delta_ratio <= CHAPTER_ANALYSIS_SMALL_CHANGE_RATIO and local_ratio <= CHAPTER_ANALYSIS_SMALL_CHANGE_RATIO:
+        return local_ratio
+    if max(len(old_text), len(new_text)) > 12000:
+        return max(length_delta_ratio, local_ratio)
+    similarity = SequenceMatcher(None, old_text, new_text, autojunk=False).ratio()
+    return max(length_delta_ratio, 1.0 - similarity)
+
+
+def _chapter_analysis_small_change_ratio(chap):
+    chap = chap if isinstance(chap, dict) else {}
+    baseline = str(chap.get("analysis_baseline", "") or "").strip()
+    if not baseline:
+        return None
+    current_text = _chapter_analysis_content_text(chap)
+    if not current_text:
+        return None
+    return _chapter_analysis_diff_ratio(baseline, current_text)
+
+
+def _chapter_analysis_is_small_change(chap):
+    chap = chap if isinstance(chap, dict) else {}
+    current = _chapter_analysis_hash(chap)
+    if not current or not _chapter_analysis_has_saved_current_version(chap):
+        return False
+    if current == str(chap.get("analysis_hash", "") or "").strip():
+        return False
+    saved_linked_hash = str(chap.get("analysis_linked_hash", "") or "").strip()
+    if "analysis_linked_hash" in chap and saved_linked_hash != _chapter_analysis_linked_hash(chap):
+        return False
+    ratio = _chapter_analysis_small_change_ratio(chap)
+    return ratio is not None and ratio <= CHAPTER_ANALYSIS_SMALL_CHANGE_RATIO
+
+
 def _chapter_needs_analysis(chap):
     current = _chapter_analysis_hash(chap)
     if not current:
@@ -2154,6 +2373,8 @@ def _chapter_needs_analysis(chap):
         and saved
         and saved == _chapter_analysis_legacy_hash(chap)
     ):
+        return False
+    if _chapter_analysis_is_small_change(chap):
         return False
     return True
 
@@ -2183,6 +2404,8 @@ def _mark_chapters_analyzed(chapters, chapter_ids):
         chap["analysis_hash"] = current
         chap["analysis_hash_version"] = CHAPTER_ANALYSIS_HASH_VERSION
         chap["analysis_analyzed_at"] = now_str()
+        chap["analysis_baseline"] = _chapter_analysis_content_text(chap)
+        chap["analysis_linked_hash"] = _chapter_analysis_linked_hash(chap)
         count += 1
     return count
 
@@ -2228,11 +2451,16 @@ def _chapter_list_text(index, chap):
     title = chap.get("title") or f"章节 {index + 1}"
     status = chap.get("status") or "大纲"
     words = _text_len(chap.get("text", ""))
-    draft_words = _draft_words_label(chap.get("draft_words", ""))
     unit = UNIT_TYPE_LABELS.get(str(chap.get("unit_type", "chapter") or "chapter"), "章")
-    parts = [f"{index + 1}. {unit}｜{title}", status, f"{words}字"]
-    if draft_words:
-        parts.append(f"扩写约{draft_words}")
+    if _chapter_analysis_is_current(chap):
+        analysis_status = "已AI分析"
+    elif _chapter_analysis_is_small_change(chap):
+        analysis_status = "小改"
+    elif _chapter_needs_analysis(chap):
+        analysis_status = "待AI分析"
+    else:
+        analysis_status = "未写正文"
+    parts = [f"{index + 1}. {unit}｜{title}", status, f"{words}字", analysis_status]
     return "  ·  ".join(parts)
 
 
@@ -2291,15 +2519,23 @@ def _chapter_reference_line(
 ):
     chap = chap if isinstance(chap, dict) else {}
     title = str(chap.get("title", "") or "").strip() or f"章节 {index}"
-    summary = _clip_context_text(_dedupe_text_lines(chap.get("summary", "")), summary_limit)
-    key_facts = _clip_context_text(_dedupe_text_lines(chap.get("key_facts", "")), facts_limit)
+    summary = _clip_context_text(
+        _dedupe_text_lines(chap.get("summary", "")),
+        summary_limit,
+        preserve_lines=True,
+    )
+    key_facts = _clip_context_text(
+        _dedupe_text_lines(chap.get("key_facts", "")),
+        facts_limit,
+        preserve_lines=True,
+    )
     parts = []
     if summary:
         parts.append("摘要：" + summary)
     if key_facts:
         parts.append("关键事实：" + key_facts)
     if not parts and include_outline_fallback:
-        outline = _clip_context_text(_dedupe_text_lines(chap.get("outline", "")), 260)
+        outline = _clip_context_text(_dedupe_text_lines(chap.get("outline", "")), 260, preserve_lines=True)
         if outline:
             parts.append("提纲：" + outline)
     if not (summary or key_facts) and text_fallback_limit:
@@ -2316,34 +2552,30 @@ def _chapter_reference_line(
 
 
 def _build_previous_inheritance_text(chapters, chapter_index):
-    recent_start = max(0, chapter_index - 12)
-    recent_lines = []
-    for index, chap in enumerate(chapters[recent_start:chapter_index], recent_start + 1):
+    previous_lines = []
+    milestone_lines = []
+    for index, chap in enumerate(chapters[:chapter_index], 1):
         if not isinstance(chap, dict):
             continue
-        line = _chapter_reference_line(index, chap, include_outline_fallback=True, text_fallback_limit=420)
+        line = _chapter_reference_line(index, chap, summary_limit=220, facts_limit=420, text_fallback_limit=260)
         if line:
-            recent_lines.append(line)
-
-    older_lines = []
-    older_milestone_lines = []
-    for index, chap in enumerate(chapters[:recent_start], 1):
-        if not isinstance(chap, dict):
-            continue
-        line = _chapter_reference_line(index, chap, summary_limit=120, facts_limit=260, text_fallback_limit=240)
-        if line:
-            older_lines.append(line)
+            previous_lines.append(line)
             if _is_timeline_milestone(chap, line):
-                older_milestone_lines.append(line)
+                milestone_lines.append(line)
+
+    recent_lines = _tail_lines_by_limit(previous_lines, 5200)
+    recent_keys = set(recent_lines)
+    older_lines = [line for line in previous_lines if line not in recent_keys]
+    older_milestone_lines = [line for line in milestone_lines if line not in recent_keys]
 
     parts = []
     if recent_lines:
         parts.append("近期章节（优先继承）：\n" + "\n".join(recent_lines))
     if older_lines:
-        older_text = _clip_lines_balanced(older_lines, 6500, head=10, tail=12)
+        older_text = _clip_lines_balanced(older_lines, 6500)
         parts.append("远期关键事实（已压缩，保留开端与近中段）：\n" + older_text)
     if older_milestone_lines:
-        milestone_text = _clip_lines_balanced(older_milestone_lines[-16:], 2600, head=6, tail=8)
+        milestone_text = _clip_lines_balanced(older_milestone_lines, 2600)
         parts.append("历史关键转折锚点：\n" + milestone_text)
     return "\n\n".join(parts) or "暂无"
 
@@ -2370,20 +2602,25 @@ def _timeline_section_lines(events, total_limit=9000):
     events = events if isinstance(events, list) else []
     if not events:
         return []
-    if len(events) <= 32:
+    event_lines = [line for _index, line, _is_milestone in events]
+    if _line_join_length(event_lines) <= total_limit:
         return [line for _index, line, _is_milestone in events]
 
-    recent_events = events[-12:]
-    older_events = events[:-12]
+    recent_lines = _tail_lines_by_limit(event_lines, max(3200, total_limit // 3))
+    recent_keys = set(recent_lines)
+    older_events = [
+        (index, line, is_milestone)
+        for index, line, is_milestone in events
+        if line not in recent_keys
+    ]
     milestone_events = [
         (index, line, is_milestone)
         for index, line, is_milestone in older_events
         if is_milestone
     ]
-    milestone_events = milestone_events[-16:]
 
     lines = ["近期章节："]
-    lines.extend(line for _index, line, _is_milestone in recent_events)
+    lines.extend(recent_lines)
     if older_events:
         lines.extend([
             "",
@@ -2391,8 +2628,6 @@ def _timeline_section_lines(events, total_limit=9000):
             _clip_lines_balanced(
                 [line for _index, line, _is_milestone in older_events],
                 max(2400, total_limit // 2),
-                head=8,
-                tail=10,
             ),
         ])
     if milestone_events:
@@ -2402,8 +2637,6 @@ def _timeline_section_lines(events, total_limit=9000):
             _clip_lines_balanced(
                 [line for _index, line, _is_milestone in milestone_events],
                 max(1800, total_limit // 3),
-                head=6,
-                tail=8,
             ),
         ])
     return lines
@@ -2413,24 +2646,24 @@ def _summary_section_lines(events, total_limit=8200):
     events = events if isinstance(events, list) else []
     if not events:
         return []
-    if len(events) <= 32:
-        recent_count = min(12, len(events))
-        older_lines = [line for _index, line, _is_milestone in events[:-recent_count]]
-        recent_lines = [line for _index, line, _is_milestone in events[-recent_count:]]
-        lines = ["近期章节：", *recent_lines]
-        if older_lines:
-            lines.extend(["", "长期关键事实：", _clip_lines_balanced(older_lines, 7000, head=10, tail=12)])
-        return lines
+    event_lines = [line for _index, line, _is_milestone in events]
+    if _line_join_length(event_lines) <= total_limit:
+        return ["近期章节：", *event_lines]
 
-    recent_events = events[-12:]
-    older_events = events[:-12]
+    recent_lines = _tail_lines_by_limit(event_lines, max(3000, total_limit // 3))
+    recent_keys = set(recent_lines)
+    older_events = [
+        (index, line, is_milestone)
+        for index, line, is_milestone in events
+        if line not in recent_keys
+    ]
     milestone_events = [
         (index, line, is_milestone)
         for index, line, is_milestone in older_events
         if is_milestone
-    ][-16:]
+    ]
     lines = ["近期章节："]
-    lines.extend(line for _index, line, _is_milestone in recent_events)
+    lines.extend(recent_lines)
     if older_events:
         lines.extend([
             "",
@@ -2438,8 +2671,6 @@ def _summary_section_lines(events, total_limit=8200):
             _clip_lines_balanced(
                 [line for _index, line, _is_milestone in older_events],
                 max(3000, total_limit // 2),
-                head=8,
-                tail=10,
             ),
         ])
     if milestone_events:
@@ -2449,8 +2680,6 @@ def _summary_section_lines(events, total_limit=8200):
             _clip_lines_balanced(
                 [line for _index, line, _is_milestone in milestone_events],
                 max(2200, total_limit // 3),
-                head=6,
-                tail=8,
             ),
         ])
     return lines
@@ -2480,33 +2709,33 @@ def _build_project_summary_draft(project):
         lines.append(f"故事核心：{premise}")
     lines.extend(["", *_summary_section_lines(events)])
 
-    active_character_lines = _active_character_summary_lines(project, limit=12)
+    active_character_lines = _active_character_summary_lines(project, limit=0)
     if active_character_lines:
         lines.extend([
             "",
             "高频人物快照：",
-            *_clip_context_text("\n".join(active_character_lines), 3000).splitlines(),
+            *_select_lines_by_char_budget(active_character_lines, 3000, omitted_label="人物"),
         ])
-    active_lore_lines = _active_lore_summary_lines(project, limit=12)
+    active_lore_lines = _active_lore_summary_lines(project, limit=0)
     if active_lore_lines:
         lines.extend([
             "",
             "高频设定快照：",
-            *_clip_context_text("\n".join(active_lore_lines), 3000).splitlines(),
+            *_select_lines_by_char_budget(active_lore_lines, 3000, omitted_label="设定"),
         ])
 
     active_foreshadows = [
         line
         for _item, line in _rank_open_foreshadow_lines(
             project.get("foreshadow_items", []),
-            limit=60,
+            limit=0,
             route_style="fields",
             skip_placeholders=False,
             include_desc=False,
         )
     ]
     if active_foreshadows:
-        lines.extend(["", "未完成伏笔：", *_clip_context_text("\n".join(active_foreshadows), 3000).splitlines()])
+        lines.extend(["", "未完成伏笔：", *_select_lines_by_char_budget(active_foreshadows, 3000, omitted_label="伏笔")])
     return "\n".join(str(line) for line in lines).strip()
 
 
@@ -2576,7 +2805,7 @@ def _build_foreshadow_notes_draft(project):
     if not any(grouped.values()):
         return ""
 
-    limits = {"未埋": 20, "已埋": 40, "已回收": 8, "废弃": 3, "其他": 8}
+    budgets = {"未埋": 2600, "已埋": 4200, "已回收": 1800, "废弃": 800, "其他": 1400}
     lines = ["伏笔汇总草稿"]
     for status in ("未埋", "已埋", "已回收", "废弃", "其他"):
         group_items = grouped[status]
@@ -2584,12 +2813,8 @@ def _build_foreshadow_notes_draft(project):
             continue
         group_items.sort()
         group_lines = [line for _score, _tie_index, line in group_items]
-        limit = limits.get(status, 8)
-        selected = group_lines[:limit]
-        omitted = len(group_lines) - len(selected)
+        selected = _select_lines_by_char_budget(group_lines, budgets.get(status, 1200), omitted_label=f"{status}伏笔")
         lines.extend(["", status + "：", *selected])
-        if omitted > 0:
-            lines.append(f"- ……另有 {omitted} 条{status}伏笔已省略")
     return "\n".join(lines).strip()
 
 
@@ -2704,11 +2929,11 @@ def _rank_open_foreshadow_lines(
         include_desc=include_desc,
         current_order=current_order,
     )
-    selected = candidates[: max(1, int(limit or 1))]
+    selected = candidates if limit is None or int(limit or 0) <= 0 else candidates[: max(1, int(limit or 1))]
     return [(item, line) for _score, _tie_index, item, line in selected]
 
 
-def _build_open_foreshadow_queue(project, selected_items=None, limit=12, current_order=None):
+def _build_open_foreshadow_queue(project, selected_items=None, limit=0, current_order=None):
     project = project if isinstance(project, dict) else {}
     selected_keys = set()
     for item in selected_items if isinstance(selected_items, list) else []:
@@ -2722,13 +2947,11 @@ def _build_open_foreshadow_queue(project, selected_items=None, limit=12, current
         selected_keys=selected_keys,
         current_order=current_order,
     )
-    selected = candidates[: max(1, int(limit or 1))]
-    lines = [line for _score, _tie_index, _item, line in selected]
+    raw_lines = [line for _score, _tie_index, _item, line in candidates]
+    budget = int(limit or 0)
+    lines = _select_lines_by_char_budget(raw_lines, budget if budget > 0 else 2400, omitted_label="开放伏笔")
     if not lines:
         return ""
-    omitted = max(0, len(candidates) - len(lines))
-    if omitted > 0:
-        lines.append(f"- ……另有 {omitted} 条开放伏笔未列出")
     return "开放伏笔队列（未被本章命中，仅提醒，避免遗忘；不要无计划回收）：\n" + "\n".join(lines)
 
 
@@ -3058,6 +3281,7 @@ def _build_chapter_ai_context(project, chapter_index, action):
             "请根据当前章节正文草稿提炼本章摘要与本章需继承的关键事实；章节提纲只作辅助，正文没有写到的内容不要写入摘要或关键事实。"
             "摘要用于简短记录发生了什么；关键事实只记录后续必须继承的事实，"
             "包括人物关系、线索、伏笔、伤势、物品、地点变化和情绪关系变化。不要评价，不要写创作建议。"
+            "关键事实条数不固定，按完整事实逐条写；不要因为压缩或固定条数删掉会影响后文连续性的变化。"
             "请严格按以下格式输出三段内容：\n"
             "本章摘要：...\n"
             "本章需继承的关键事实：...\n"
@@ -3246,7 +3470,13 @@ def _build_chapter_ai_context(project, chapter_index, action):
         if remaining <= 1200:
             break
         section_content = content if title == "当前章节" else _dedupe_text_lines(content)
-        clipped = _clip_context_text(section_content, min(limit, remaining - 64), keep_tail=keep_tail) or "暂无"
+        preserve_lines = title != "当前章节"
+        clipped = _clip_context_text(
+            section_content,
+            min(limit, remaining - 64),
+            keep_tail=keep_tail,
+            preserve_lines=preserve_lines,
+        ) or "暂无"
         block = f"【{title}】\n{clipped}"
         out.append(block)
         used += len(block) + 2

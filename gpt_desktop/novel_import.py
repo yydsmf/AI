@@ -15,6 +15,7 @@ from .novel_utils import (
     _normalize_name_list,
     _prepare_character_candidate,
     _record_alias_keys,
+    _select_lines_by_char_budget,
     _stable_foreshadow_description_context,
 )
 
@@ -239,6 +240,19 @@ def _project_material_key(value):
 
 
 _LORE_DESCRIPTION_PLACEHOLDERS = {"AI 分析候选", "文档导入候选"}
+_LOW_VALUE_DOSSIER_TEXTS = {
+    "偏远地点暂不影响主线",
+    "普通背景线索暂不影响主线",
+    "暂不影响主线",
+    "已处理",
+    "已回收",
+    "处理完毕",
+}
+
+
+def _is_low_value_dossier_text(value):
+    compact = re.sub(r"[。！？!?；;，,、\s]+", "", str(value or ""))
+    return bool(compact) and any(marker in compact for marker in _LOW_VALUE_DOSSIER_TEXTS)
 
 
 def _lore_description_core(value):
@@ -732,14 +746,18 @@ def _rank_candidate_dossier_characters(project, limit=40):
             continue
         stat = activity.get(name, {})
         count = int(stat.get("chapters", 0) or 0)
-        score = count * 1000
-        score += _candidate_dossier_detail_score(
+        detail_score = _candidate_dossier_detail_score(
             item,
             (("role", 160), ("goal", 120), ("secret", 120), ("voice", 80), ("notes", 50)),
         )
+        if count <= 0 and detail_score <= 0:
+            continue
+        score = count * 1000 + detail_score
         ranked.append((-score, -count, index, item))
     ranked.sort()
-    return [item for _score, _count, _index, item in ranked[: max(0, int(limit or 0))]]
+    if limit is None or int(limit or 0) <= 0:
+        return [item for _score, _count, _index, item in ranked]
+    return [item for _score, _count, _index, item in ranked[: int(limit or 0)]]
 
 
 def _rank_candidate_dossier_lore(project, limit=40):
@@ -756,15 +774,19 @@ def _rank_candidate_dossier_lore(project, limit=40):
             continue
         stat = activity.get(name, {})
         count = int(stat.get("chapters", 0) or 0)
-        score = count * 1000
         stable_desc = _stable_lore_description_delta(item.get("description", ""))
-        score += _candidate_dossier_detail_score(
+        detail_score = _candidate_dossier_detail_score(
             {"type": item.get("type", ""), "description": stable_desc},
             (("type", 80), ("description", 180)),
         )
+        if count <= 0 and (not stable_desc or _is_low_value_dossier_text(stable_desc)):
+            continue
+        score = count * 1000 + detail_score
         ranked.append((-score, -count, index, item))
     ranked.sort()
-    return [item for _score, _count, _index, item in ranked[: max(0, int(limit or 0))]]
+    if limit is None or int(limit or 0) <= 0:
+        return [item for _score, _count, _index, item in ranked]
+    return [item for _score, _count, _index, item in ranked[: int(limit or 0)]]
 
 
 def _rank_candidate_dossier_foreshadows(project, limit=60):
@@ -789,9 +811,13 @@ def _rank_candidate_dossier_foreshadows(project, limit=60):
         desc_text = _compact_text(item.get("description", ""))
         if desc_text in {"AI分析候选", "文档导入候选", "后续处理", "待后续处理", "待回收"}:
             score -= 500
+        if status in {"已回收", "废弃"} and _is_low_value_dossier_text(desc_text):
+            continue
         ranked.append((-score, index if status in {"未埋", "已埋"} else -index, item))
     ranked.sort()
-    return [item for _score, _tie_index, item in ranked[: max(0, int(limit or 0))]]
+    if limit is None or int(limit or 0) <= 0:
+        return [item for _score, _tie_index, item in ranked]
+    return [item for _score, _tie_index, item in ranked[: int(limit or 0)]]
 
 
 def _candidate_analysis_dossier_text(project):
@@ -811,11 +837,11 @@ def _candidate_analysis_dossier_text(project):
         ("时间线", "timeline", 1400),
         ("阶段摘要", "summary", 1400),
     ):
-        value = _clip_context_text(_dedupe_text_lines(project.get(key, "")), limit, keep_tail=True)
+        value = _clip_context_text(_dedupe_text_lines(project.get(key, "")), limit, keep_tail=True, preserve_lines=True)
         if value:
             context_parts.append(f"{label}：\n{value}")
     character_lines = []
-    for item in _rank_candidate_dossier_characters(project, limit=40):
+    for item in _rank_candidate_dossier_characters(project, limit=0):
         if not isinstance(item, dict):
             continue
         name = str(item.get("name", "") or "").strip()
@@ -828,9 +854,12 @@ def _candidate_analysis_dossier_text(project):
         )
         character_lines.append(f"- {name}｜{detail}" if detail else f"- {name}")
     if character_lines:
-        context_parts.append("已有主要人物（同名/别称请合并，不要重复新增）：\n" + "\n".join(character_lines))
+        context_parts.append(
+            "已有主要人物（同名/别称请合并，不要重复新增）：\n"
+            + "\n".join(_select_lines_by_char_budget(character_lines, 2600, omitted_label="人物"))
+        )
     lore_lines = []
-    for item in _rank_candidate_dossier_lore(project, limit=40):
+    for item in _rank_candidate_dossier_lore(project, limit=0):
         if not isinstance(item, dict):
             continue
         name = str(item.get("name", "") or "").strip()
@@ -840,9 +869,12 @@ def _candidate_analysis_dossier_text(project):
         desc = _clip_context_text(_stable_lore_description_delta(item.get("description", "")), 120)
         lore_lines.append(f"- {name}｜{typ}｜{desc}" if desc else f"- {name}｜{typ}")
     if lore_lines:
-        context_parts.append("已有设定库（同名/别称请合并，不要重复新增）：\n" + "\n".join(lore_lines))
+        context_parts.append(
+            "已有设定库（同名/别称请合并，不要重复新增）：\n"
+            + "\n".join(_select_lines_by_char_budget(lore_lines, 2600, omitted_label="设定"))
+        )
     foreshadow_lines = []
-    for item in _rank_candidate_dossier_foreshadows(project, limit=60):
+    for item in _rank_candidate_dossier_foreshadows(project, limit=0):
         if not isinstance(item, dict):
             continue
         name = str(item.get("name", "") or "").strip()
@@ -859,7 +891,10 @@ def _candidate_analysis_dossier_text(project):
         tail = f"｜{desc}" if desc else ""
         foreshadow_lines.append(f"- {name}｜{status}{route}{tail}")
     if foreshadow_lines:
-        context_parts.append("已有伏笔（继续补充状态/章节，不要重复新增）：\n" + "\n".join(foreshadow_lines))
+        context_parts.append(
+            "已有伏笔（继续补充状态/章节，不要重复新增）：\n"
+            + "\n".join(_select_lines_by_char_budget(foreshadow_lines, 3000, omitted_label="伏笔"))
+        )
     if not context_parts:
         return ""
     return "【已有项目档案】\n" + "\n\n".join(context_parts)

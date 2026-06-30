@@ -1,5 +1,5 @@
 APP_NAME = "GPT工具箱"
-APP_VERSION = "1.0.8"
+APP_VERSION = "1.0.10"
 APP_RELEASE_REPO = "yydsmf/AI"
 APP_RELEASES_URL = f"https://github.com/{APP_RELEASE_REPO}/releases/latest"
 APP_RELEASES_API_URL = f"https://api.github.com/repos/{APP_RELEASE_REPO}/releases/latest"

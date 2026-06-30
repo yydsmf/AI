@@ -1,6 +1,7 @@
 #define MyAppName "GPT工具箱"
-#define MyAppVersion "1.0.8"
+#define MyAppVersion "1.0.10"
 #define MyAppExeName "GPTLocalToolbox.exe"
+#define MyUpdaterExeName "GPTToolboxUpdater.exe"
 
 [Setup]
 AppId={{8A37DE0D-0B7D-4B4F-9B0B-7E51B53E54BC}
@@ -22,6 +23,7 @@ CloseApplicationsFilter={#MyAppExeName}
 
 [Files]
 Source: "..\GPTLocalToolbox.exe"; DestDir: "{app}"; Flags: ignoreversion
+Source: "..\GPTToolboxUpdater.exe"; DestDir: "{app}"; Flags: ignoreversion
 Source: "redist\VC_redist.x64.exe"; DestDir: "{tmp}"; Flags: deleteafterinstall skipifsourcedoesntexist; Check: NeedsVCRedist
 
 [Icons]

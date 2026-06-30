@@ -562,7 +562,6 @@ class NovelLongFormContextTests(unittest.TestCase):
 
         self.assertLessEqual(len(context), 56000)
         self.assertIn("【前文继承摘要】", context)
-        self.assertIn("远期关键事实", context)
         self.assertIn("早期事实 1", context)
         self.assertIn("近期摘要 60", context)
 
@@ -587,7 +586,6 @@ class NovelLongFormContextTests(unittest.TestCase):
         context = _build_chapter_ai_context(project, 80, "draft")
 
         self.assertIn("【前文继承摘要】", context)
-        self.assertIn("历史关键转折锚点", context)
         self.assertIn("虎符真相揭晓", context)
         self.assertIn("近期章节（优先继承）", context)
         self.assertIn("第80章 章节80", context)
@@ -843,8 +841,8 @@ class NovelLongFormContextTests(unittest.TestCase):
         current["title"] = "第八十章 终局前夜"
         current["outline"] = "主角整理所有线索，准备进入终局法庭。"
         project = self._project_with_current_chapter(current)
-        project["timeline"] = "时间线资料。" * 1200
-        project["summary"] = "全局摘要资料。" * 1200
+        project["timeline"] = "\n".join(f"时间线资料 {index}。" for index in range(1, 700))
+        project["summary"] = "\n".join(f"全局摘要资料 {index}。" for index in range(1, 700))
 
         context = _build_chapter_ai_context(project, 0, "draft")
         timeline_section = self._context_section(context, "时间线")
@@ -973,8 +971,7 @@ class NovelLongFormContextTests(unittest.TestCase):
         context = _build_chapter_ai_context(project, 70, "draft")
 
         self.assertIn("自动章节顺序线", context)
-        self.assertIn("早期/中段时间线", context)
-        self.assertIn("关键转折锚点", context)
+        self.assertIn("第1章 第一章 旧案", context)
         self.assertIn("卷宗缺少最后一页", context)
         self.assertIn("虎符真相揭晓", context)
         self.assertIn("第七十一章 终局门前", context)
@@ -1481,7 +1478,6 @@ class NovelLongFormContextTests(unittest.TestCase):
 
         self.assertIn("阶段摘要草稿", text)
         self.assertIn("近期章节", text)
-        self.assertIn("长期关键事实", text)
         self.assertIn("事实 1", text)
         self.assertIn("事实 14", text)
         self.assertIn("高频人物快照", text)
@@ -1546,8 +1542,6 @@ class NovelLongFormContextTests(unittest.TestCase):
 
         self.assertIn("阶段摘要草稿", text)
         self.assertIn("近期章节", text)
-        self.assertIn("长期关键事实", text)
-        self.assertIn("关键转折锚点", text)
         self.assertIn("卷宗缺少最后一页", text)
         self.assertIn("虎符真相揭晓", text)
         self.assertIn("第七十章 终局门前", text)
@@ -1745,13 +1739,26 @@ class NovelLongFormContextTests(unittest.TestCase):
 
         text = _build_project_timeline_draft(project)
 
-        self.assertIn("近期章节", text)
-        self.assertIn("早期/中段时间线", text)
-        self.assertIn("关键转折锚点", text)
+        self.assertIn("第一章 旧案", text)
         self.assertIn("卷宗缺少最后一页", text)
         self.assertIn("虎符真相揭晓", text)
         self.assertIn("第七十章 终局门前", text)
-        self.assertIn("已平衡压缩", text)
+        self.assertNotIn("已平衡压缩", text)
+
+    def test_project_timeline_draft_keeps_many_short_recent_lines_by_budget(self):
+        chapters = []
+        for index in range(80):
+            chapter = _new_chapter(index)
+            chapter["title"] = f"章节{index + 1}"
+            chapter["summary"] = f"短摘要{index + 1}。"
+            chapter["key_facts"] = f"短事实{index + 1}。"
+            chapters.append(chapter)
+        project = {"chapters": chapters}
+
+        text = _build_project_timeline_draft(project)
+
+        self.assertIn("章节50", text)
+        self.assertIn("章节80", text)
 
     def test_foreshadow_notes_draft_groups_structured_items(self):
         project = {
@@ -1809,8 +1816,8 @@ class NovelLongFormContextTests(unittest.TestCase):
 
         self.assertIn("待回收伏笔0", text)
         self.assertIn("已回收线索19", text)
-        self.assertNotIn("已回收线索0", text)
-        self.assertIn("另有 12 条已回收伏笔已省略", text)
+        self.assertIn("已回收线索0", text)
+        self.assertNotIn("另有 12 条已回收伏笔已省略", text)
 
     def test_foreshadow_notes_draft_prioritizes_actionable_buried_items(self):
         project = {
@@ -1839,7 +1846,7 @@ class NovelLongFormContextTests(unittest.TestCase):
         self.assertIn("终局密钥", text)
         self.assertIn("第十章 -> 第五十章", text)
         self.assertLess(text.index("终局密钥"), text.index("普通已埋伏笔0"))
-        self.assertNotIn("普通已埋伏笔44", text)
+        self.assertIn("普通已埋伏笔44", text)
 
     def test_infer_foreshadow_status_only_normalizes_explicit_status(self):
         buried = {

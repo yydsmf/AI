@@ -820,7 +820,8 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
 
     def _project_title(self):
         meta = self.current_project.get("meta", {}) if isinstance(self.current_project, dict) else {}
-        return str(meta.get("title") or self.title_edit.text() or "未命名小说").strip() or "未命名小说"
+        title_edit_text = self.title_edit.text() if hasattr(self, "title_edit") else ""
+        return str(meta.get("title") or title_edit_text or "未命名小说").strip() or "未命名小说"
 
     def _get_export_path(self, dialog_title, suggested_name, default_ext, file_filter):
         safe_title = _safe_name(suggested_name) or "novel"
@@ -1340,7 +1341,9 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
             (self.candidate_foreshadow_list, "foreshadows"),
             (self.candidate_material_list, "project_materials"),
         ):
-            widget.currentRowChanged.connect(lambda row, k=kind: self.show_import_candidate_detail(k, row))
+            widget.itemClicked.connect(
+                lambda item, w=widget, k=kind: self.show_import_candidate_detail(k, w.row(item))
+            )
 
         self.candidate_detail_box = QFrame()
         self.candidate_detail_box.setObjectName("novel_detail_panel")
@@ -1441,7 +1444,7 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
         label.setObjectName("field_label")
         layout.addWidget(label)
         lst = QListWidget()
-        lst.setSelectionMode(QListWidget.MultiSelection)
+        lst.setSelectionMode(QListWidget.NoSelection)
         lst.setMinimumHeight(180)
         lst.setToolTip("勾选要加入项目的候选项；点击一项可在下方查看详情。")
         layout.addWidget(lst, 1)
@@ -1608,12 +1611,9 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
         if not hasattr(self, "project_meta_label"):
             return
         path = str(self.current_project_path or "").strip()
-        if not path or path == NOVEL_DRAFT_FILE:
-            source = "自动草稿"
-        else:
-            source = os.path.splitext(os.path.basename(path))[0]
-        self.project_meta_label.setText(_project_meta_text(self.current_project, source))
+        source = self._project_title()
         self.project_meta_label.setToolTip(path or "未保存项目")
+        self.project_meta_label.setText(_project_meta_text(self.current_project, source))
 
     def _save_current_fields(self):
         if self._loading:
@@ -4238,6 +4238,7 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
         total, succeeded = self._apply_candidate_analysis_result(data)
         self._persist_candidate_analysis_state()
         self._refresh_candidate_analysis_result_view()
+        self._reload_chapter_list(self.current_chapter_index)
         material_hits = self._candidate_material_status_text()
         cleanup_tail = self._candidate_auto_cleanup_status_text()
         if self.failed_analysis_chunks:
@@ -4255,6 +4256,7 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
         self._apply_candidate_analysis_result(data)
         self._persist_candidate_analysis_draft_state()
         self._refresh_candidate_analysis_result_view()
+        self._reload_chapter_list(self.current_chapter_index)
         material_hits = self._candidate_material_status_text()
         failed_count = len(self.failed_analysis_chunks)
         tail = f"，待重试 {failed_count} 块" if failed_count else ""
@@ -4329,6 +4331,7 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
         self._sync_candidate_analysis_state()
         self._sync_import_candidates_to_project()
         self.refresh_import_candidate_lists()
+        self._reload_chapter_list(self.current_chapter_index)
         if (
             not any(added.values())
             and not any(merged.values())
@@ -4750,7 +4753,7 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
 
     def set_status_tip(self, text):
         text = str(text or "")
-        self.setToolTip(text)
+        self.setToolTip("")
         if hasattr(self, "status_label"):
             self.status_label.setText(text)
         try:

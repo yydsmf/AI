@@ -21,7 +21,7 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
 )
 
-from .update_checker import check_latest_release, download_release_asset
+from .update_checker import check_latest_release, download_release_asset, launch_windows_updater
 from .version import APP_RELEASES_URL, APP_VERSION
 from .core import (
     AGENT_HISTORY_FILE,
@@ -734,9 +734,11 @@ class ProviderManagerDialog(QDialog):
             f"最新版本：{getattr(info, 'latest_version', '')}\n\n"
         )
         if asset_name:
+            action_text = "退出并自动安装" if sys.platform.startswith("win") else "下载并退出安装"
             text += (
                 f"已找到适合本电脑的安装包：\n{asset_name}\n\n"
-                "点击“下载并退出安装”后会先下载更新包。下载完成后，程序会退出并自动打开安装包。"
+                f"点击“{action_text}”后会启动更新器。更新器会把安装包下载到系统“下载”目录，"
+                "确认主程序退出后自动打开安装包。"
             )
         else:
             text += "没有自动匹配到适合本电脑的安装包，可以打开发布页手动下载。"
@@ -744,7 +746,8 @@ class ProviderManagerDialog(QDialog):
 
         download_btn = None
         if asset_url:
-            download_btn = msg.addButton("下载并退出安装", QMessageBox.AcceptRole)
+            download_text = "退出并自动安装" if sys.platform.startswith("win") else "下载并退出安装"
+            download_btn = msg.addButton(download_text, QMessageBox.AcceptRole)
         release_btn = msg.addButton("打开发布页", QMessageBox.ActionRole)
         later_btn = msg.addButton("稍后", QMessageBox.RejectRole)
         msg.setDefaultButton(download_btn or release_btn)
@@ -752,7 +755,10 @@ class ProviderManagerDialog(QDialog):
 
         clicked = msg.clickedButton()
         if download_btn is not None and clicked is download_btn:
-            self.start_update_download(asset)
+            if sys.platform.startswith("win"):
+                self.start_windows_auto_update(asset, release_url)
+            else:
+                self.start_update_download(asset)
         elif clicked is release_btn:
             self._open_url(release_url)
         elif clicked is later_btn:
@@ -774,6 +780,48 @@ class ProviderManagerDialog(QDialog):
         self.update_download_worker.failed.connect(self.on_update_download_failed)
         self.update_download_worker.finished.connect(self.cleanup_update_download_worker)
         self.update_download_worker.start()
+
+    def _prepare_parent_for_shutdown(self):
+        try:
+            parent = self.parent()
+            while parent is not None and not hasattr(parent, "prepare_for_shutdown"):
+                parent = parent.parent()
+            if parent is not None:
+                parent.prepare_for_shutdown()
+        except Exception:
+            pass
+
+    def _quit_application_soon(self):
+        app = QApplication.instance()
+        if app is None:
+            return
+        try:
+            for window in QApplication.topLevelWidgets():
+                window.close()
+        except Exception:
+            pass
+        QTimer.singleShot(300, app.quit)
+
+    def start_windows_auto_update(self, asset, release_url):
+        if asset is None:
+            QMessageBox.warning(self, "无法更新", "没有找到适合本电脑的更新包。")
+            return
+
+        started = launch_windows_updater(asset, release_url=release_url)
+        if not started:
+            QMessageBox.warning(
+                self,
+                "更新器启动失败",
+                "没有找到独立更新器，已改为旧方式下载安装包。\n\n"
+                "安装包仍会保存到系统“下载”目录。"
+            )
+            self.start_update_download(asset)
+            return
+
+        self.update_check_btn.setEnabled(False)
+        self.update_check_btn.setText("正在退出...")
+        self._prepare_parent_for_shutdown()
+        self._quit_application_soon()
 
     def on_update_download_progress(self, done, total):
         try:
@@ -825,22 +873,8 @@ class ProviderManagerDialog(QDialog):
                 QMessageBox.warning(self, "打开失败", f"自动打开失败，请手动打开这个文件安装：\n{path}")
                 return
 
-        app = QApplication.instance()
-        if app is not None:
-            try:
-                parent = self.parent()
-                while parent is not None and not hasattr(parent, "prepare_for_shutdown"):
-                    parent = parent.parent()
-                if parent is not None:
-                    parent.prepare_for_shutdown()
-            except Exception:
-                pass
-            try:
-                for window in QApplication.topLevelWidgets():
-                    window.close()
-            except Exception:
-                pass
-            QTimer.singleShot(300, app.quit)
+        self._prepare_parent_for_shutdown()
+        self._quit_application_soon()
 
     def on_update_download_failed(self, err):
         QMessageBox.warning(

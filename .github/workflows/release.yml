@@ -42,6 +42,10 @@ jobs:
         shell: powershell
         run: python -m PyInstaller --clean --noconfirm --distpath dist --workpath build GPTLocalToolbox_windows.spec
 
+      - name: Build updater executable
+        shell: powershell
+        run: python -m PyInstaller --clean --noconfirm --distpath dist --workpath build-updater GPTToolboxUpdater_windows.spec
+
       - name: Bundle Microsoft VC++ Runtime
         shell: powershell
         run: |
@@ -54,6 +58,7 @@ jobs:
         shell: powershell
         run: |
           Copy-Item dist\GPTLocalToolbox.exe GPTLocalToolbox.exe -Force
+          Copy-Item dist\GPTToolboxUpdater.exe GPTToolboxUpdater.exe -Force
           & "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" /O"." /F"GPTLocalToolbox_Setup" "installer\GPTLocalToolbox.iss"
           $refName = "${{ github.ref_name }}"
           if ($refName.StartsWith("v")) { $version = $refName.TrimStart("v") } else { $version = "manual" }

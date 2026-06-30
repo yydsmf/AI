@@ -1,8 +1,16 @@
+import os
+import sys
+import tempfile
 import unittest
+from unittest import mock
 
 from gpt_desktop.core import _build_windows_open_after_exit_script
 from gpt_desktop.update_checker import (
+    ReleaseAsset,
+    build_windows_updater_command,
     compare_versions,
+    copy_windows_updater_to_temp,
+    default_windows_app_exe_name,
     parse_github_release_page,
     parse_github_release,
     select_release_asset,
@@ -103,6 +111,54 @@ class UpdateCheckerTests(unittest.TestCase):
         self.assertIn("taskkill /F /T /PID %APP_PID%", script)
         self.assertIn('taskkill /F /T /IM "%APP_PROCESS%"', script)
         self.assertIn('start "" "%TARGET%"', script)
+
+    def test_build_windows_updater_command_contains_update_context(self):
+        asset = ReleaseAsset(
+            name='GPTLocalToolbox_Setup_v1.2.0_windows:x64?.exe',
+            url="https://download.test/setup.exe",
+        )
+
+        cmd = build_windows_updater_command(
+            asset,
+            release_url="https://github.com/yydsmf/AI/releases/tag/v1.2.0",
+            parent_pid=1234,
+            updater_path=r"C:\Program Files\GPTLocalToolbox\GPTToolboxUpdater.exe",
+            app_exe="GPTLocalToolbox.exe",
+        )
+
+        self.assertEqual(cmd[0], r"C:\Program Files\GPTLocalToolbox\GPTToolboxUpdater.exe")
+        self.assertIn("--url", cmd)
+        self.assertIn("https://download.test/setup.exe", cmd)
+        self.assertIn("--name", cmd)
+        self.assertIn("GPTLocalToolbox_Setup_v1.2.0_windows_x64_.exe", cmd)
+        self.assertIn("--parent-pid", cmd)
+        self.assertIn("1234", cmd)
+        self.assertIn("--app-exe", cmd)
+        self.assertIn("GPTLocalToolbox.exe", cmd)
+        self.assertIn("--release-url", cmd)
+
+    def test_default_windows_app_exe_avoids_python_name(self):
+        with mock.patch.object(sys, "executable", r"C:\Python311\pythonw.exe"):
+            self.assertEqual(default_windows_app_exe_name(), "GPTLocalToolbox.exe")
+        with mock.patch.object(sys, "executable", r"C:\App\GPTLocalToolbox.exe"):
+            self.assertEqual(default_windows_app_exe_name(), "GPTLocalToolbox.exe")
+
+    def test_copy_windows_updater_to_temp(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            source = os.path.join(tmp, "GPTToolboxUpdater.exe")
+            with open(source, "wb") as f:
+                f.write(b"updater")
+            with mock.patch.object(sys, "platform", "win32"):
+                copied = copy_windows_updater_to_temp(source)
+
+            self.assertTrue(copied.endswith(".exe"))
+            self.assertTrue(os.path.exists(copied))
+            with open(copied, "rb") as f:
+                self.assertEqual(f.read(), b"updater")
+            try:
+                os.remove(copied)
+            except OSError:
+                pass
 
 
 if __name__ == "__main__":

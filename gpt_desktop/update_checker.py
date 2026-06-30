@@ -1,6 +1,11 @@
 import platform
 import re
 import sys
+import os
+import subprocess
+import shutil
+import tempfile
+import uuid
 from dataclasses import dataclass
 from html import unescape
 from typing import Optional
@@ -309,3 +314,110 @@ def download_release_asset(asset, dest_dir, progress_callback=None, timeout=30):
     if not os.path.exists(dest_path) or os.path.getsize(dest_path) <= 0:
         raise RuntimeError("更新包下载完成但文件为空。")
     return dest_path
+
+
+def windows_updater_executable_path():
+    if not sys.platform.startswith("win"):
+        return ""
+
+    base_dir = ""
+    try:
+        if getattr(sys, "frozen", False):
+            base_dir = os.path.dirname(os.path.abspath(sys.executable))
+        else:
+            base_dir = os.path.abspath(os.getcwd())
+    except Exception:
+        base_dir = os.getcwd()
+
+    candidates = [
+        os.path.join(base_dir, "GPTToolboxUpdater.exe"),
+        os.path.join(os.path.dirname(os.path.abspath(sys.executable)), "GPTToolboxUpdater.exe"),
+        os.path.abspath("GPTToolboxUpdater.exe"),
+    ]
+    for path in candidates:
+        if path and os.path.exists(path):
+            return path
+    return candidates[0]
+
+
+def default_windows_app_exe_name():
+    app_exe = re.split(r"[\\/]", sys.executable or "")[-1].strip()
+    if not app_exe or app_exe.lower() in ("python.exe", "pythonw.exe"):
+        return "GPTLocalToolbox.exe"
+    return app_exe
+
+
+def copy_windows_updater_to_temp(updater_path=None):
+    if not sys.platform.startswith("win"):
+        return ""
+    updater_path = str(updater_path or windows_updater_executable_path() or "").strip()
+    if not updater_path or not os.path.exists(updater_path):
+        return ""
+    try:
+        temp_dir = tempfile.gettempdir()
+        os.makedirs(temp_dir, exist_ok=True)
+        temp_path = os.path.join(temp_dir, f"GPTToolboxUpdater_{os.getpid()}_{uuid.uuid4().hex[:8]}.exe")
+        shutil.copy2(updater_path, temp_path)
+        return temp_path
+    except Exception:
+        return ""
+
+
+def build_windows_updater_command(asset, release_url="", parent_pid=None, updater_path=None, app_exe=None):
+    if asset is None:
+        raise ValueError("没有可下载的更新包。")
+    url = str(getattr(asset, "url", "") or "").strip()
+    name = safe_asset_filename(getattr(asset, "name", "") or "")
+    if not url:
+        raise ValueError("更新包下载地址为空。")
+
+    updater_path = str(updater_path or windows_updater_executable_path() or "").strip()
+    if not updater_path:
+        raise ValueError("找不到更新器。")
+
+    app_exe = str(app_exe or default_windows_app_exe_name() or "").strip()
+    parent_pid = int(parent_pid or os.getpid())
+    cmd = [
+        updater_path,
+        "--url", url,
+        "--name", name,
+        "--parent-pid", str(parent_pid),
+        "--app-exe", app_exe,
+    ]
+    release_url = str(release_url or "").strip()
+    if release_url:
+        cmd.extend(["--release-url", release_url])
+    return cmd
+
+
+def launch_windows_updater(asset, release_url="", parent_pid=None):
+    if not sys.platform.startswith("win"):
+        return False
+    updater_path = windows_updater_executable_path()
+    if not updater_path or not os.path.exists(updater_path):
+        return False
+    launch_path = copy_windows_updater_to_temp(updater_path)
+    if not launch_path or not os.path.exists(launch_path):
+        return False
+    cmd = build_windows_updater_command(
+        asset,
+        release_url=release_url,
+        parent_pid=parent_pid or os.getpid(),
+        updater_path=launch_path,
+    )
+    try:
+        flags = 0
+        for name in ("CREATE_NEW_PROCESS_GROUP",):
+            flags |= int(getattr(subprocess, name, 0))
+        subprocess.Popen(
+            cmd,
+            cwd=os.path.dirname(launch_path) or None,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            close_fds=True,
+            creationflags=flags,
+        )
+        return True
+    except Exception:
+        return False

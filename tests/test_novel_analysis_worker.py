@@ -15,9 +15,9 @@ class NovelAnalysisWorkerTests(unittest.TestCase):
         self.assertIn("具体姓名", prompt)
         self.assertIn("不要只写主角/反派/配角", prompt)
         self.assertIn("成熟的商业小说作者兼责任编辑", prompt)
-        self.assertIn("1-3 句", prompt)
-        self.assertIn("3-6 条短句", prompt)
-        self.assertEqual(worker._max_tokens_for_request(), 700)
+        self.assertIn("条数不固定", prompt)
+        self.assertIn("重要连续性事实必须保留", prompt)
+        self.assertEqual(worker._max_tokens_for_request(), 1200)
 
     def test_writing_prompts_include_editorial_quality_standard(self):
         for action in (
@@ -119,13 +119,14 @@ class NovelAnalysisWorkerTests(unittest.TestCase):
         self.assertIn("lore.description 要求：只写后续章节需要继承的稳定设定增量", prompt)
         self.assertIn("没有明确全局增量时，project_materials 对应字段请留空字符串", prompt)
         self.assertIn("timeline 只记录关键转折、时间顺序变化、伏笔推进/回收", prompt)
-        self.assertIn("summary 只写对全局剧情有继承价值的简短状态变化，控制在 1-3 条", prompt)
+        self.assertIn("summary 只写对全局剧情有继承价值的简短状态变化", prompt)
+        self.assertIn("不要因为固定条数限制丢掉会影响后续章节继承的信息", prompt)
         self.assertIn("设定和伏笔不要原文重复", prompt)
         self.assertIn("lore 写规则本身，foreshadows 改写成待验证/待回收的问题或结果", prompt)
         self.assertIn("名称不要与 lore 完全相同", prompt)
         self.assertIn("foreshadows 要求：只提取会跨章节影响后文的明确线索", prompt)
         self.assertIn("普通悬念、单章情绪钩子、一次性疑问", prompt)
-        self.assertIn("每个片段优先提取 0-3 条最重要伏笔", prompt)
+        self.assertIn("不要为了凑数写普通悬念", prompt)
         self.assertIn("不要把已有档案里没有在本片段推进的信息当作新发现重复输出", prompt)
 
     def test_draft_prompt_distinguishes_relevant_and_open_foreshadows(self):

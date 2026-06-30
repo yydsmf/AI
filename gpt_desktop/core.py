@@ -1350,16 +1350,114 @@ def open_local_file(path):
         return False
 
 
+def get_default_download_dir():
+    candidates = []
+    if sys.platform.startswith("win"):
+        try:
+            import ctypes
+            from ctypes import wintypes
+
+            class GUID(ctypes.Structure):
+                _fields_ = [
+                    ("Data1", wintypes.DWORD),
+                    ("Data2", wintypes.WORD),
+                    ("Data3", wintypes.WORD),
+                    ("Data4", ctypes.c_ubyte * 8),
+                ]
+
+            folder_id_downloads = GUID(
+                0x374DE290,
+                0x123F,
+                0x4565,
+                (ctypes.c_ubyte * 8)(0x91, 0x64, 0x39, 0xC4, 0x92, 0x5E, 0x46, 0x7B),
+            )
+            path_ptr = wintypes.LPWSTR()
+            result = ctypes.windll.shell32.SHGetKnownFolderPath(
+                ctypes.byref(folder_id_downloads),
+                0,
+                None,
+                ctypes.byref(path_ptr),
+            )
+            if result == 0 and path_ptr.value:
+                candidates.append(path_ptr.value)
+            try:
+                ctypes.windll.ole32.CoTaskMemFree(path_ptr)
+            except Exception:
+                pass
+        except Exception:
+            pass
+        user_profile = os.environ.get("USERPROFILE", "")
+        if user_profile:
+            candidates.append(os.path.join(user_profile, "Downloads"))
+    else:
+        xdg_download = os.environ.get("XDG_DOWNLOAD_DIR", "")
+        if xdg_download:
+            candidates.append(os.path.expandvars(os.path.expanduser(xdg_download.strip('"'))))
+    candidates.append(os.path.join(os.path.expanduser("~"), "Downloads"))
+    candidates.append(os.path.expanduser("~"))
+
+    for path in candidates:
+        path = os.path.abspath(str(path or "").strip())
+        if not path:
+            continue
+        try:
+            os.makedirs(path, exist_ok=True)
+            return path
+        except Exception:
+            continue
+    return os.getcwd()
+
+
+def schedule_windows_process_force_exit(pid=None, delay_seconds=8):
+    if not sys.platform.startswith("win"):
+        return False
+    try:
+        import tempfile
+
+        pid = int(pid or os.getpid())
+        delay_seconds = max(1, int(delay_seconds or 1))
+        script_dir = tempfile.gettempdir()
+        os.makedirs(script_dir, exist_ok=True)
+        script_path = os.path.join(script_dir, f"gpt_toolbox_force_exit_{pid}.cmd")
+        script = "\r\n".join([
+            "@echo off",
+            "setlocal EnableExtensions",
+            f"set \"APP_PID={pid}\"",
+            f"timeout /T {delay_seconds} /NOBREAK >NUL",
+            "tasklist /FI \"PID eq %APP_PID%\" 2>NUL | find \"%APP_PID%\" >NUL",
+            "if not errorlevel 1 taskkill /F /T /PID %APP_PID% >NUL 2>NUL",
+            "del \"%~f0\" >NUL 2>NUL",
+            "",
+        ])
+        with open(script_path, "w", encoding="utf-8", newline="") as f:
+            f.write(script)
+
+        flags = 0
+        for name in ("CREATE_NO_WINDOW", "CREATE_NEW_PROCESS_GROUP"):
+            flags |= int(getattr(subprocess, name, 0))
+        subprocess.Popen(
+            ["cmd.exe", "/c", script_path],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            close_fds=True,
+            creationflags=flags,
+        )
+        return True
+    except Exception:
+        return False
+
+
 def _escape_windows_batch_value(value):
     return str(value or "").replace("%", "%%")
 
 
-def _build_windows_open_after_exit_script(target_path, current_pid, process_name, max_wait_seconds=120):
+def _build_windows_open_after_exit_script(target_path, current_pid, process_name, max_wait_seconds=15):
     target_path = _escape_windows_batch_value(os.path.abspath(target_path))
     process_name = _escape_windows_batch_value(process_name)
     return "\r\n".join([
         "@echo off",
-        "setlocal EnableExtensions EnableDelayedExpansion",
+        "setlocal EnableExtensions",
         f"set \"TARGET={target_path}\"",
         f"set \"APP_PID={int(current_pid)}\"",
         f"set \"APP_PROCESS={process_name}\"",
@@ -1367,21 +1465,16 @@ def _build_windows_open_after_exit_script(target_path, current_pid, process_name
         "set /a WAITED=0",
         ":wait_pid",
         "tasklist /FI \"PID eq %APP_PID%\" 2>NUL | find \"%APP_PID%\" >NUL",
-        "if not errorlevel 1 (",
-        "  timeout /T 1 /NOBREAK >NUL",
-        "  set /a WAITED+=1",
-        "  if !WAITED! LSS !MAX_WAIT! goto wait_pid",
-        ")",
-        "set /a WAITED=0",
-        ":wait_process",
-        "if not \"%APP_PROCESS%\"==\"\" (",
-        "  tasklist /FI \"IMAGENAME eq %APP_PROCESS%\" 2>NUL | find /I \"%APP_PROCESS%\" >NUL",
-        "  if not errorlevel 1 (",
-        "    timeout /T 1 /NOBREAK >NUL",
-        "    set /a WAITED+=1",
-        "    if !WAITED! LSS 10 goto wait_process",
-        "  )",
-        ")",
+        "if errorlevel 1 goto kill_process_name",
+        "if %WAITED% GEQ %MAX_WAIT% goto kill_current_pid",
+        "timeout /T 1 /NOBREAK >NUL",
+        "set /a WAITED+=1",
+        "goto wait_pid",
+        ":kill_current_pid",
+        "taskkill /F /T /PID %APP_PID% >NUL 2>NUL",
+        ":kill_process_name",
+        "if not \"%APP_PROCESS%\"==\"\" taskkill /F /T /IM \"%APP_PROCESS%\" >NUL 2>NUL",
+        "timeout /T 1 /NOBREAK >NUL",
         "start \"\" \"%TARGET%\"",
         "del \"%~f0\" >NUL 2>NUL",
         "",
@@ -1394,10 +1487,14 @@ def open_local_file_after_app_exit(path):
             return False
 
         if sys.platform.startswith("win"):
-            updates_dir = os.path.join(APP_DIR, "updates")
-            os.makedirs(updates_dir, exist_ok=True)
-            script_path = os.path.join(updates_dir, f"open_update_after_exit_{os.getpid()}.cmd")
+            import tempfile
+
+            script_dir = tempfile.gettempdir()
+            os.makedirs(script_dir, exist_ok=True)
+            script_path = os.path.join(script_dir, f"open_update_after_exit_{os.getpid()}.cmd")
             process_name = os.path.basename(sys.executable or "")
+            if process_name.lower() != "gptlocaltoolbox.exe":
+                process_name = ""
             script = _build_windows_open_after_exit_script(path, os.getpid(), process_name)
             with open(script_path, "w", encoding="utf-8", newline="") as f:
                 f.write(script)

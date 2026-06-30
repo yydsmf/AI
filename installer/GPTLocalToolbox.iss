@@ -1,5 +1,5 @@
 #define MyAppName "GPT工具箱"
-#define MyAppVersion "1.0.7"
+#define MyAppVersion "1.0.8"
 #define MyAppExeName "GPTLocalToolbox.exe"
 
 [Setup]
@@ -17,6 +17,8 @@ ArchitecturesAllowed=x64compatible
 ArchitecturesInstallIn64BitMode=x64compatible
 SetupIconFile=..\app_icon.ico
 UninstallDisplayIcon={app}\{#MyAppExeName}
+CloseApplications=yes
+CloseApplicationsFilter={#MyAppExeName}
 
 [Files]
 Source: "..\GPTLocalToolbox.exe"; DestDir: "{app}"; Flags: ignoreversion
@@ -31,6 +33,14 @@ Filename: "{tmp}\VC_redist.x64.exe"; Parameters: "/install /quiet /norestart"; S
 Filename: "{app}\{#MyAppExeName}"; Description: "启动 {#MyAppName}"; Flags: nowait postinstall skipifsilent
 
 [Code]
+function InitializeSetup: Boolean;
+var
+  ResultCode: Integer;
+begin
+  Exec(ExpandConstant('{cmd}'), '/C taskkill /F /T /IM "{#MyAppExeName}" >NUL 2>NUL', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+  Result := True;
+end;
+
 function NeedsVCRedist: Boolean;
 var
   Installed: Cardinal;

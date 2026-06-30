@@ -37,6 +37,7 @@ from .core import (
     VIDEO_DIR,
     VIDEO_HISTORY_FILE,
     format_cache_size,
+    get_default_download_dir,
     get_path_size,
     load_input_drafts,
     load_json_file,
@@ -764,7 +765,7 @@ class ProviderManagerDialog(QDialog):
         if self.update_download_worker is not None and self.update_download_worker.isRunning():
             return
 
-        updates_dir = os.path.join(APP_DIR, "updates")
+        updates_dir = get_default_download_dir()
         self.update_check_btn.setEnabled(False)
         self.update_check_btn.setText("正在下载...")
         self.update_download_worker = UpdateDownloadWorker(asset, updates_dir, self)
@@ -826,7 +827,20 @@ class ProviderManagerDialog(QDialog):
 
         app = QApplication.instance()
         if app is not None:
-            QTimer.singleShot(0, app.quit)
+            try:
+                parent = self.parent()
+                while parent is not None and not hasattr(parent, "prepare_for_shutdown"):
+                    parent = parent.parent()
+                if parent is not None:
+                    parent.prepare_for_shutdown()
+            except Exception:
+                pass
+            try:
+                for window in QApplication.topLevelWidgets():
+                    window.close()
+            except Exception:
+                pass
+            QTimer.singleShot(300, app.quit)
 
     def on_update_download_failed(self, err):
         QMessageBox.warning(

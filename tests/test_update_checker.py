@@ -100,7 +100,8 @@ class UpdateCheckerTests(unittest.TestCase):
         self.assertIn('set "APP_PID=1234"', script)
         self.assertIn('set "APP_PROCESS=GPTLocalToolbox.exe"', script)
         self.assertIn('tasklist /FI "PID eq %APP_PID%"', script)
-        self.assertIn('tasklist /FI "IMAGENAME eq %APP_PROCESS%"', script)
+        self.assertIn("taskkill /F /T /PID %APP_PID%", script)
+        self.assertIn('taskkill /F /T /IM "%APP_PROCESS%"', script)
         self.assertIn('start "" "%TARGET%"', script)
 
 

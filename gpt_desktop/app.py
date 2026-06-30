@@ -6,7 +6,14 @@ from PySide6.QtWidgets import QApplication, QLineEdit, QMainWindow, QPlainTextEd
 
 from .agent_tab import AgentTab
 from .ai_workflow_tab import AIWorkflowTab
-from .core import APP_STYLE, CONTEXT_MENU_FEEDBACK_STYLE, load_config, log_debug, save_config
+from .core import (
+    APP_STYLE,
+    CONTEXT_MENU_FEEDBACK_STYLE,
+    load_config,
+    log_debug,
+    save_config,
+    schedule_windows_process_force_exit,
+)
 from .image_tab import ImageGeneratorTab
 from .novel_adaptation_tab import NovelAdaptationTab
 from .novel_writing_tab import NovelWritingTab
@@ -43,6 +50,7 @@ def fit_window_to_screen(window, preferred_width, preferred_height, min_width=10
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
+        self._shutdown_prepared = False
         self.setWindowTitle(f"{APP_NAME} v{APP_VERSION}")
         fit_window_to_screen(self, 1320, 880)
         self.setMinimumSize(720, 420)
@@ -144,6 +152,112 @@ class MainWindow(QMainWindow):
             return
         self.novel_writing_tab.open_project_file(path)
         self.tabs.setCurrentWidget(self.novel_writing_tab)
+
+    def _stop_worker(self, worker):
+        if worker is None:
+            return
+        try:
+            if hasattr(worker, "stop"):
+                worker.stop()
+            else:
+                worker.requestInterruption()
+        except Exception as e:
+            log_debug("退出时请求后台任务停止失败", e)
+        try:
+            worker.requestInterruption()
+        except Exception:
+            pass
+        try:
+            worker.quit()
+        except Exception:
+            pass
+
+    def _stop_worker_attrs(self, obj, names):
+        for name in names:
+            try:
+                self._stop_worker(getattr(obj, name, None))
+            except Exception as e:
+                log_debug(f"退出时停止 {name} 失败", e)
+
+    def prepare_for_shutdown(self):
+        if self._shutdown_prepared:
+            return
+        self._shutdown_prepared = True
+
+        try:
+            save_config(self.config)
+        except Exception as e:
+            log_debug("退出前保存配置失败", e)
+
+        try:
+            self.image_tab.save_image_input_draft()
+            self.image_tab.save_persistent_history()
+            self.image_tab.save_persistent_task_log()
+            self.image_tab.stop_generation()
+            self._stop_worker_attrs(self.image_tab, ("worker", "model_worker", "thumbnail_worker"))
+        except Exception as e:
+            log_debug("退出前清理图片任务失败", e)
+
+        try:
+            self.video_tab.save_video_draft()
+            self.video_tab.save_persistent_history()
+            self.video_tab.stop_generation()
+            self._stop_worker_attrs(self.video_tab, ("model_worker",))
+            for worker in list(getattr(self.video_tab, "running_tasks", {}).values()):
+                self._stop_worker(worker)
+        except Exception as e:
+            log_debug("退出前清理视频任务失败", e)
+
+        try:
+            self.ai_workflow_tab._save_workflow_state()
+        except Exception as e:
+            log_debug("退出前保存工作流失败", e)
+
+        try:
+            self.novel_writing_tab.stop_read_aloud(silent=True, keep_resume=True)
+            self.novel_writing_tab.stop_import_candidate_analysis()
+            self.novel_writing_tab.stop_chapter_ai_action()
+            self._stop_worker_attrs(
+                self.novel_writing_tab,
+                (
+                    "model_worker",
+                    "analysis_worker",
+                    "writing_worker",
+                    "auto_summary_worker",
+                    "auto_outline_worker",
+                    "read_aloud_worker",
+                ),
+            )
+            for worker in list(getattr(self.novel_writing_tab, "read_aloud_retired_workers", [])):
+                self._stop_worker(worker)
+            self.novel_writing_tab._save_current_work("退出前保存", refresh_project_list=False)
+        except Exception as e:
+            log_debug("退出前保存小说项目失败", e)
+
+        try:
+            self.adaptation_tab.stop_adaptation()
+            self._stop_worker_attrs(self.adaptation_tab, ("model_worker", "adaptation_worker"))
+        except Exception as e:
+            log_debug("退出前清理改编任务失败", e)
+
+        try:
+            self.agent_tab.save_agent_input_draft()
+            self.agent_tab.save_current_session_model_config(persist=True)
+            self.agent_tab.save_persistent_chat()
+            self.agent_tab.stop_current_task()
+            self._stop_worker_attrs(self.agent_tab, ("worker", "model_worker"))
+            for worker in list(getattr(self.agent_tab, "_zombie_workers", [])):
+                self._stop_worker(worker)
+        except Exception as e:
+            log_debug("退出前清理智能体任务失败", e)
+
+    def closeEvent(self, event):
+        try:
+            self.prepare_for_shutdown()
+            schedule_windows_process_force_exit(delay_seconds=8)
+        except Exception as e:
+            log_debug("主窗口退出清理失败", e)
+        super().closeEvent(event)
 
 class ImageOnlyWindow(QMainWindow):
     def __init__(self):

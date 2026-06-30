@@ -113,7 +113,10 @@ class NovelAnalysisWorkerTests(unittest.TestCase):
         self.assertIn("同名、别称或同一线索不要重复新增", prompt)
         self.assertIn("长期有效的人物变化才写入已有人物 notes", prompt)
         self.assertIn("普通章节行动、临时情绪、一次性互动", prompt)
+        self.assertIn("稳定设定变化才写入 lore.description", prompt)
+        self.assertIn("本章出现、追问、调查、发送、发现线索、谁去问谁等临时推进", prompt)
         self.assertIn("characters.notes 要求：只写会影响后续多章的人物档案增量", prompt)
+        self.assertIn("lore.description 要求：只写后续章节需要继承的稳定设定增量", prompt)
         self.assertIn("没有明确全局增量时，project_materials 对应字段请留空字符串", prompt)
         self.assertIn("timeline 只记录关键转折、时间顺序变化、伏笔推进/回收", prompt)
         self.assertIn("summary 只写对全局剧情有继承价值的简短状态变化，控制在 1-3 条", prompt)
@@ -220,6 +223,41 @@ class NovelAnalysisWorkerTests(unittest.TestCase):
         self.assertEqual(merged["foreshadows"][0]["payoff_chapter"], "第二十章")
         self.assertIn("旧案牵动三代人", merged["project_materials"]["bible"])
         self.assertIn("第一章旧案重启", merged["project_materials"]["timeline"])
+
+    def test_analysis_merge_keeps_candidate_source_label(self):
+        worker = NovelAnalysisWorker("http://example.test", "key", "model", "context")
+        merged = {"characters": [], "lore": [], "foreshadows": [], "project_materials": {}}
+
+        worker._merge_analysis_result(
+            merged,
+            {"characters": [{"name": "沈慕白", "notes": "长期关注泄露责任链。"}]},
+            source_label="第 2/5 块",
+        )
+        worker._merge_analysis_result(
+            merged,
+            {"characters": [{"name": "沈慕白", "notes": "对慕白资本邮箱极度敏感。"}]},
+            source_label="第 3/5 块",
+        )
+
+        self.assertIn("第 2/5 块", merged["characters"][0]["_source_label"])
+        self.assertIn("第 3/5 块", merged["characters"][0]["_source_label"])
+
+    def test_analysis_merge_does_not_overwrite_foreshadow_status_without_explicit_status(self):
+        worker = NovelAnalysisWorker("http://example.test", "key", "model", "context")
+        merged = {"characters": [], "lore": [], "foreshadows": [], "project_materials": {}}
+
+        worker._merge_analysis_result(
+            merged,
+            {"foreshadows": [{"name": "虎符失踪", "status": "已埋", "description": "半枚虎符首次出现。"}]},
+        )
+        worker._merge_analysis_result(
+            merged,
+            {"foreshadows": [{"name": "虎符失踪", "description": "后续牵出兵权交易。"}]},
+        )
+
+        self.assertEqual(len(merged["foreshadows"]), 1)
+        self.assertEqual(merged["foreshadows"][0]["status"], "已埋")
+        self.assertIn("后续牵出兵权交易", merged["foreshadows"][0]["description"])
 
     def test_analysis_merge_accepts_material_list_and_top_level_materials(self):
         worker = NovelAnalysisWorker("http://example.test", "key", "model", "context")

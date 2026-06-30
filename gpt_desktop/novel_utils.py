@@ -125,25 +125,28 @@ def _infer_foreshadow_status(item, preserve_manual=True):
     item = item if isinstance(item, dict) else {}
     current = str(item.get("status", "") or "").strip()
     valid_statuses = {"未埋", "已埋", "已回收", "废弃"}
-    if preserve_manual and current in {"已埋", "已回收", "废弃"}:
+    if current in valid_statuses:
         return current
-    setup = str(item.get("setup_chapter", "") or "").strip()
-    payoff = str(item.get("payoff_chapter", "") or "").strip()
-    current_for_keywords = "" if "/" in current or "或" in current else current
-    text = " ".join(
-        str(item.get(key, "") or "")
-        for key in ("name", "setup_chapter", "payoff_chapter", "description")
-    )
-    text = f"{current_for_keywords} {text}"
-    if any(k in text for k in ("废弃", "作废", "弃用", "不再使用")):
+
+    # Keep this conservative: only normalize the explicit status field.
+    # Narrative text such as "揭晓/确认/解释" is too easy to misread and
+    # should stay as AI/user-reviewed content, not become an automatic status.
+    status_text = current.lower()
+    if any(k in current for k in ("废弃", "作废", "弃用", "不再使用")):
         return "废弃"
-    recovery_negative = _has_foreshadow_recovery_negative(text)
-    setup_negative = any(k in text for k in ("未埋", "尚未埋", "没有埋", "待埋", "还未埋", "尚未出现"))
-    if payoff or (not recovery_negative and any(k in text for k in ("已回收", "回收完成", "兑现", "揭晓", "揭示", "解开", "真相大白"))):
+    if (
+        any(k in current for k in ("已回收", "回收完成", "已兑现", "兑现完成"))
+        or status_text in {"resolved", "done", "closed", "paid_off", "payoff"}
+    ):
         return "已回收"
-    if setup or (not setup_negative and any(k in text for k in ("已埋", "埋设", "埋下", "铺垫", "伏笔已经", "线索出现"))):
+    if (
+        any(k in current for k in ("已埋", "已铺垫", "待回收", "未回收", "待兑现"))
+        or status_text in {"open", "active", "buried", "setup"}
+    ):
         return "已埋"
-    return current if current in valid_statuses else "未埋"
+    if any(k in current for k in ("未埋", "未出现", "待埋")) or status_text in {"new", "planned", "unburied"}:
+        return "未埋"
+    return "未埋"
 
 
 def _chapter_label(index, chap):
@@ -152,37 +155,6 @@ def _chapter_label(index, chap):
     if title:
         return f"第 {index} 章「{title}」"
     return f"第 {index} 章"
-
-
-def _foreshadow_chapter_progress(project, item):
-    project = project if isinstance(project, dict) else {}
-    item = item if isinstance(item, dict) else {}
-    name = str(item.get("name", "") or "").strip()
-    if not name:
-        return {}
-    aliases = _record_aliases(item, name_key="name")
-    chapters = project.get("chapters", [])
-    chapters = chapters if isinstance(chapters, list) else []
-    setup_hits = []
-    payoff_hits = []
-    setup_keywords = ("埋下", "埋设", "铺垫", "线索出现", "首次出现", "留下", "发现", "露出")
-    payoff_keywords = ("回收", "揭晓", "揭示", "兑现", "解开", "真相大白", "确认", "解释")
-    for index, chap in enumerate(chapters, 1):
-        if not isinstance(chap, dict):
-            continue
-        text = "\n".join(str(chap.get(key, "") or "") for key in ("title", "summary", "key_facts"))
-        if not any(_name_in_text(alias, text) for alias in aliases):
-            body_excerpt = _clip_context_text(_dedupe_text_lines(chap.get("text", "")), 1200, keep_tail=True)
-            if body_excerpt:
-                text = "\n".join([text, body_excerpt])
-        if not any(_name_in_text(alias, text) for alias in aliases):
-            continue
-        label = _chapter_label(index, chap)
-        if not _has_foreshadow_recovery_negative(text) and any(keyword in text for keyword in payoff_keywords):
-            payoff_hits.append(label)
-        elif any(keyword in text for keyword in setup_keywords):
-            setup_hits.append(label)
-    return {"setup": setup_hits, "payoff": payoff_hits}
 
 
 def _auto_classify_default_statuses(project, chapter_ids=None):
@@ -198,13 +170,6 @@ def _auto_classify_default_statuses(project, chapter_ids=None):
         if status != str(chap.get("status", "") or "").strip():
             chap["status"] = status
             changed["chapters"] += 1
-    for item in project.get("foreshadow_items", []) if isinstance(project.get("foreshadow_items", []), list) else []:
-        if not isinstance(item, dict):
-            continue
-        status = _infer_foreshadow_status(item)
-        if status != str(item.get("status", "") or "").strip():
-            item["status"] = status
-            changed["foreshadows"] += 1
     return changed
 
 
@@ -263,16 +228,6 @@ _CHARACTER_TITLE_WORDS = (
     "侍卫", "掌柜", "师父", "师傅", "师尊", "宗主", "阁主", "门主", "帮主", "神医",
     "先生", "夫人", "大人", "世子", "侯爷", "王", "帝", "妃", "嫔",
 )
-_NON_PERSON_EXACT_NAMES = {
-    "系统", "任务", "奖励", "惩罚", "商城", "面板", "积分", "主线", "支线", "剧情", "剧情线",
-    "剧情点", "设定", "规则", "机制", "金手指", "万人厌系统", "攻略系统", "反派系统",
-}
-_NON_PERSON_KEYWORDS = (
-    "系统", "任务", "奖励", "惩罚", "商城", "积分", "面板", "规则", "机制", "主线", "支线",
-    "剧情线", "剧情点", "世界观", "金手指",
-)
-
-
 def _clean_entity_name(name):
     return str(name or "").strip().strip("「」『』《》<>[]【】（）()：:，,。；;、 \t\r\n")
 
@@ -312,55 +267,12 @@ def _character_merge_key(item_or_name):
     return _compact_text(canonical)
 
 
-def _character_lore_type(name):
-    compact = _compact_text(name)
-    if any(key in compact for key in ("系统", "任务", "奖励", "惩罚", "商城", "积分", "面板", "规则", "机制", "金手指")):
-        return "规则"
-    if any(key in compact for key in ("主线", "支线", "剧情线", "剧情点")):
-        return "事件"
-    return "术语"
-
-
-def _is_non_person_character_candidate(item):
-    item = item if isinstance(item, dict) else {"name": item}
-    name = _clean_entity_name(item.get("name", ""))
-    compact = _compact_text(name)
-    if not compact:
-        return False
-    if compact in _NON_PERSON_EXACT_NAMES:
-        return True
-    if "系统" in compact:
-        return True
-    if any(key in compact for key in _NON_PERSON_KEYWORDS):
-        role_text = _compact_text(item.get("role", ""))
-        notes_text = _compact_text(item.get("notes", ""))
-        person_signals = ("人物", "角色", "少女", "少年", "男子", "女子", "公主", "皇子", "公子", "姑娘")
-        return not any(signal in role_text or signal in notes_text for signal in person_signals)
-    return False
-
-
-def _character_candidate_as_lore(item, default_description="AI 分析候选"):
-    item = item if isinstance(item, dict) else {"name": item}
-    name = _clean_entity_name(item.get("name", ""))
-    if not name:
-        return None
-    detail_parts = []
-    for label, field in (("身份", "role"), ("目标", "goal"), ("秘密", "secret"), ("语言", "voice"), ("备注", "notes")):
-        value = str(item.get(field, "") or "").strip()
-        if value and value not in {"AI 分析候选", "文档导入候选"}:
-            detail_parts.append(f"{label}：{value}")
-    description = "；".join(detail_parts) or default_description
-    return {"name": name, "type": _character_lore_type(name), "description": description}
-
-
 def _prepare_character_candidate(item, default_notes="AI 分析候选"):
     if not isinstance(item, dict):
         return None, None
     name = _clean_entity_name(item.get("name", ""))
     if not name:
         return None, None
-    if _is_non_person_character_candidate(item):
-        return None, _character_candidate_as_lore(item, default_description=default_notes)
     canonical_name, role_hint = _canonical_character_name_and_role(name)
     role = str(item.get("role", "") or "").strip()
     if role_hint and role_hint not in role:
@@ -597,6 +509,15 @@ def _normalize_project(data):
 def _normalize_import_candidates(data):
     data = data if isinstance(data, dict) else {}
     out = {"characters": [], "lore": [], "foreshadows": [], "project_materials": {}}
+
+    def preserve_candidate_metadata(target, source):
+        if not isinstance(target, dict) or not isinstance(source, dict):
+            return target
+        source_label = str(source.get("_source_label", "") or source.get("source_label", "") or "").strip()
+        if source_label:
+            target["_source_label"] = source_label
+        return target
+
     for key in ("characters", "lore", "foreshadows"):
         items = data.get(key, [])
         if not isinstance(items, list):
@@ -613,13 +534,16 @@ def _normalize_import_candidates(data):
                 char_item, lore_item = _prepare_character_candidate(clone, default_notes=str(clone.get("notes", "") or "AI 分析候选"))
                 if char_item:
                     char_item["notes"] = _dedupe_text_lines(char_item.get("notes", ""))
+                    preserve_candidate_metadata(char_item, clone)
                     out["characters"].append(char_item)
                 elif lore_item:
                     lore_item["description"] = _dedupe_text_lines(lore_item.get("description", ""))
+                    preserve_candidate_metadata(lore_item, clone)
                     out["lore"].append(lore_item)
             else:
                 if key in {"lore", "foreshadows"}:
                     clone["description"] = _dedupe_text_lines(clone.get("description", ""))
+                preserve_candidate_metadata(clone, item)
                 out[key].append(clone)
     materials = data.get("project_materials", {})
     if isinstance(materials, dict):
@@ -666,6 +590,42 @@ def _dedupe_text_lines(value):
     while out and out[-1] == "":
         out.pop()
     return "\n".join(out).strip()
+
+
+_LONG_TERM_CONTEXT_PLACEHOLDERS = {
+    "AI 分析候选", "文档导入候选", "后续处理", "待后续处理", "待补充", "待定", "待回收",
+}
+
+
+def _long_term_context_core(value):
+    text = str(value or "").strip()
+    previous = None
+    while previous != text:
+        previous = text
+        text = re.sub(r"^(?:补充|新增|补充说明)[：:]\s*", "", text).strip()
+    return text.strip(" \t\r\n-•")
+
+
+def _stable_long_term_context_text(value):
+    lines = []
+    for raw in str(value or "").splitlines():
+        text = _long_term_context_core(raw)
+        if not text or _compact_text(text) in {_compact_text(item) for item in _LONG_TERM_CONTEXT_PLACEHOLDERS}:
+            continue
+        lines.append(str(raw or "").strip())
+    return _dedupe_text_lines("\n".join(lines))
+
+
+def _stable_character_notes_context(value):
+    return _stable_long_term_context_text(value)
+
+
+def _stable_lore_description_context(value):
+    return _stable_long_term_context_text(value)
+
+
+def _stable_foreshadow_description_context(value):
+    return _stable_long_term_context_text(value)
 
 
 def _merge_text_lines_without_duplicates(existing, incoming, prefix="补充："):
@@ -719,7 +679,7 @@ def _clip_context_text(value, limit, keep_tail=False):
 
 
 def _compact_chapter_summary_text(value, max_chars=220, max_sentences=3):
-    text = _dedupe_text_lines(value)
+    text = _clean_empty_numbered_list_items(_dedupe_text_lines(value))
     max_chars = max(1, int(max_chars or 1))
     max_sentences = max(1, int(max_sentences or 1))
     if len(text) <= max_chars:
@@ -746,8 +706,25 @@ def _compact_chapter_summary_text(value, max_chars=220, max_sentences=3):
     return text[:max_chars].rstrip()
 
 
+def _clean_empty_numbered_list_items(value):
+    cleaned_lines = []
+    for raw in str(value or "").splitlines():
+        line = str(raw or "").strip()
+        if not line:
+            continue
+        previous = None
+        while previous != line:
+            previous = line
+            line = re.sub(r"(?:^|(?<=[。！？!?；;，,\s]))[（(]?\d{1,3}[）).、。]\s*$", "", line).strip()
+            line = re.sub(r"(?:^|(?<=[。！？!?；;，,\s]))[一二三四五六七八九十]{1,4}[、.。]\s*$", "", line).strip()
+        if not line or re.fullmatch(r"(?:[-*•]+|[（(]?\d{1,3}[）).、。]?|[一二三四五六七八九十]{1,4}[、.。]?)", line):
+            continue
+        cleaned_lines.append(line)
+    return "\n".join(cleaned_lines).strip()
+
+
 def _compact_chapter_key_facts_text(value, max_chars=360, max_items=6):
-    text = _dedupe_text_lines(value)
+    text = _clean_empty_numbered_list_items(_dedupe_text_lines(value))
     max_chars = max(1, int(max_chars or 1))
     max_items = max(1, int(max_items or 1))
     if not text:
@@ -969,7 +946,7 @@ def _infer_linked_character_names(project, chapter, extra_text=""):
 
     matched = []
     for index, char in enumerate(project.get("characters", []) if isinstance(project.get("characters", []), list) else []):
-        if not isinstance(char, dict) or _is_non_person_character_candidate(char):
+        if not isinstance(char, dict):
             continue
         name = _clean_entity_name(char.get("name", ""))
         if not name:
@@ -1005,65 +982,9 @@ def _infer_lore_names(project, chapter, extra_text=""):
         if not name:
             continue
         aliases = _record_aliases(item, name_key="name")
-        if any(_name_in_text(alias, context_text) for alias in aliases) or _text_matches_any_keyword(context_text, _lore_context_keywords(item)):
+        if any(_name_in_text(alias, context_text) for alias in aliases):
             matched.append((index, name))
     return _normalize_name_list([name for _index, name in matched])
-
-
-_LORE_CONTEXT_GROUPS = (
-    ("地点", ("王城", "王都", "都城", "京城", "宫城", "朝堂", "主舞台", "入城", "回城", "城中", "现场")),
-    ("组织", ("势力", "门派", "宗门", "朝廷", "官府", "书院", "商会", "军队")),
-    ("物品", ("信物", "遗物", "钥匙", "令牌", "虎符", "卷宗", "账册", "证据")),
-    ("规则", ("法则", "制度", "禁令", "机制", "契约", "能力", "系统")),
-    ("事件", ("旧案", "案件", "阴谋", "计划", "仪式", "战争", "审判")),
-)
-
-
-def _lore_context_keywords(item):
-    item = item if isinstance(item, dict) else {}
-    name_text = _compact_text(item.get("name", ""))
-    type_text = _compact_text(item.get("type", ""))
-    desc_text = _compact_text(item.get("description", ""))
-    keywords = set()
-    for text in (name_text, type_text, desc_text):
-        if not text:
-            continue
-        for group_label, group_keywords in _LORE_CONTEXT_GROUPS:
-            if any(keyword in text for keyword in group_keywords):
-                keywords.add(group_label)
-                keywords.update(group_keywords)
-    if "主舞台" in name_text or "主舞台" in desc_text:
-        keywords.update(("主舞台", "回到城中", "入城", "回城", "王都", "都城", "京城", "朝堂", "城中"))
-    return {keyword for keyword in keywords if keyword}
-
-
-def _text_matches_any_keyword(text, keywords):
-    text = str(text or "")
-    return any(keyword and keyword in text for keyword in keywords)
-
-
-def _lore_context_score(item, context_text):
-    item = item if isinstance(item, dict) else {}
-    context = _compact_text(context_text)
-    if not context:
-        return 0
-    lore_text = _compact_text(" ".join(str(item.get(key, "") or "") for key in ("name", "type", "description")))
-    lore_keywords = _lore_context_keywords(item)
-    if not lore_text and not lore_keywords:
-        return 0
-    score = 0
-    if _text_matches_any_keyword(context, lore_keywords):
-        score += 120
-    for type_label, keywords in _LORE_CONTEXT_GROUPS:
-        item_hits = sum(1 for keyword in keywords if keyword in lore_text)
-        context_hits = sum(1 for keyword in keywords if keyword in context)
-        if item_hits and context_hits:
-            score += 160 + min(260, (item_hits + context_hits) * 60)
-    if "主舞台" in lore_text and _text_matches_any_keyword(context, ("主舞台", "回到城中", "入城", "回城", "王都", "都城", "京城", "朝堂")):
-        score += 180
-    if score and str(item.get("description", "") or "").strip():
-        score += 30
-    return score
 
 
 _CORE_CHARACTER_DETAIL_KEYWORDS = (
@@ -1073,16 +994,6 @@ _CORE_CHARACTER_DETAIL_KEYWORDS = (
 _MINOR_CHARACTER_DETAIL_KEYWORDS = (
     "路人", "过场", "群众", "龙套", "杂兵", "店小二", "侍女", "丫鬟", "仆人", "随从",
     "士兵", "护卫", "侍卫",
-)
-_CORE_CHARACTER_CONTEXT_GROUPS = (
-    ("主角", "男主", "女主", "主人公"),
-    ("反派", "宿敌", "敌手", "boss", "最终"),
-    ("搭档", "同伴", "队友"),
-    ("爱人", "恋人", "伴侣"),
-    (
-        "关键配角", "重要配角", "主要配角", "核心配角", "关键人物",
-        "重要人物", "主要人物", "核心人物", "主线人物", "主线角色",
-    ),
 )
 _GENERIC_CHARACTER_ROLE_LABELS = {
     "主角", "男主", "男主角", "女主", "女主角", "主人公", "男主人公", "女主人公",
@@ -1097,78 +1008,13 @@ def _is_generic_character_role_label(value):
     return _compact_text(value).lower() in _GENERIC_CHARACTER_ROLE_LABELS
 
 
-def _core_character_context_score(char, context_text, include_global=False):
-    char = char if isinstance(char, dict) else {}
-    if _is_non_person_character_candidate(char):
-        return 0
-    char_text = _compact_text(" ".join(str(char.get(key, "") or "") for key in (
-        "name", "role", "goal", "secret", "voice", "notes", "description",
-    ))).lower()
-    if not char_text:
-        return 0
-    has_strong_core_signal = any(
-        keyword in char_text
-        for keyword in ("主角", "男主", "女主", "主人公", "反派", "宿敌", "敌手", "boss", "最终")
-    )
-    if (
-        any(keyword in char_text for keyword in _MINOR_CHARACTER_DETAIL_KEYWORDS)
-        and not has_strong_core_signal
-    ):
-        return 0
-
-    context = _compact_text(context_text).lower()
-    score = 0
-    for group in _CORE_CHARACTER_CONTEXT_GROUPS:
-        if not any(keyword in char_text for keyword in group):
-            continue
-        if context and any(keyword in context for keyword in group):
-            score += 420
-        elif include_global and group[0] in ("主角", "反派"):
-            score += 180
-        elif include_global:
-            score += 90
-    if score and any(str(char.get(key, "") or "").strip() for key in ("goal", "secret", "voice", "notes")):
-        score += 30
-    return score
-
-
-def _infer_core_character_names(project, chapter, extra_text="", limit=6, include_global=False):
-    project = project if isinstance(project, dict) else {}
-    chapter = chapter if isinstance(chapter, dict) else {}
-    context_text = "\n".join(
-        str(value or "")
-        for value in (
-            chapter.get("title", ""),
-            chapter.get("outline", ""),
-            chapter.get("text", ""),
-            chapter.get("summary", ""),
-            chapter.get("key_facts", ""),
-            extra_text,
-        )
-    )
-    if not _compact_text(context_text):
-        return []
-    ranked = _prioritize_named_records(
-        project.get("characters", []),
-        context_text,
-        limit=limit,
-        score_func=lambda item: _core_character_context_score(
-            item,
-            context_text,
-            include_global=include_global,
-        ),
-        min_score=120,
-    )
-    return _normalize_name_list([_clean_entity_name(char.get("name", "")) for char in ranked])
-
-
 def _character_activity_stats(project):
     project = project if isinstance(project, dict) else {}
     characters = project.get("characters", [])
     characters = characters if isinstance(characters, list) else []
     records = []
     for index, char in enumerate(characters):
-        if not isinstance(char, dict) or _is_non_person_character_candidate(char):
+        if not isinstance(char, dict):
             continue
         name = _clean_entity_name(char.get("name", ""))
         aliases = _record_aliases(char)
@@ -1190,17 +1036,11 @@ def _character_activity_stats(project):
             str(chap.get(key, "") or "")
             for key in ("title", "outline", "text", "summary", "key_facts")
         )
-        core_linked_keys = {
-            _compact_text(name)
-            for name in _infer_core_character_names(project, chap, text)
-            if str(name or "").strip()
-        }
         label = _chapter_label(chapter_index, chap)
         for _index, name, aliases in records:
             alias_keys = {_compact_text(alias) for alias in aliases}
             if (
                 (alias_keys & linked_keys)
-                or (alias_keys & core_linked_keys)
                 or any(_name_in_text(alias, text) for alias in aliases)
             ):
                 stats[name]["chapters"] += 1
@@ -1233,7 +1073,7 @@ def _lore_activity_stats(project):
         label = _chapter_label(chapter_index, chap)
         for _index, name, aliases in records:
             item = lore_items[_index]
-            if any(_name_in_text(alias, text) for alias in aliases) or _text_matches_any_keyword(text, _lore_context_keywords(item)):
+            if any(_name_in_text(alias, text) for alias in aliases):
                 stats[name]["chapters"] += 1
                 stats[name]["last_chapter"] = label
     return stats
@@ -1247,8 +1087,6 @@ def _character_detail_threshold(total_chapters):
 
 def _should_check_character_details(char, activity_count=0, total_chapters=0):
     char = char if isinstance(char, dict) else {}
-    if _is_non_person_character_candidate(char):
-        return False
     text = " ".join(str(char.get(key, "") or "") for key in ("name", "role", "notes")).lower()
     if any(keyword in text for keyword in _CORE_CHARACTER_DETAIL_KEYWORDS):
         return True
@@ -1258,6 +1096,68 @@ def _should_check_character_details(char, activity_count=0, total_chapters=0):
     return activity_count >= threshold
 
 
+def _candidate_long_term_review_reasons(project, kind, item):
+    return []
+
+
+def _sanitize_candidate_for_long_form(project, kind, item):
+    item = dict(item) if isinstance(item, dict) else {}
+    if not str(item.get("name", "") or "").strip():
+        return None, False
+    changed = False
+
+    if kind == "characters":
+        notes = _dedupe_text_lines(item.get("notes", ""))
+        stable_notes = _stable_character_notes_context(notes)
+        if notes != stable_notes:
+            item["notes"] = stable_notes
+            changed = True
+        return item, changed
+
+    if kind == "lore":
+        desc = _dedupe_text_lines(item.get("description", ""))
+        stable_desc = _stable_lore_description_context(desc)
+        if desc != stable_desc:
+            item["description"] = stable_desc
+            changed = True
+        return item, changed
+
+    if kind == "foreshadows":
+        desc = _dedupe_text_lines(item.get("description", ""))
+        stable_desc = _stable_foreshadow_description_context(desc)
+        if desc != stable_desc:
+            item["description"] = stable_desc
+            changed = True
+        return item, changed
+
+    return item, False
+
+
+def _sanitize_import_candidates_for_long_form(project, candidates):
+    candidates = candidates if isinstance(candidates, dict) else {}
+    out = {"characters": [], "lore": [], "foreshadows": [], "project_materials": {}}
+    report = {
+        "filtered": {"characters": 0, "lore": 0, "foreshadows": 0},
+        "trimmed": {"characters": 0, "lore": 0, "foreshadows": 0},
+    }
+    for kind in ("characters", "lore", "foreshadows"):
+        for item in candidates.get(kind, []) if isinstance(candidates.get(kind, []), list) else []:
+            cleaned, changed = _sanitize_candidate_for_long_form(project, kind, item)
+            if cleaned is None:
+                report["filtered"][kind] += 1
+                continue
+            if changed:
+                report["trimmed"][kind] += 1
+            out[kind].append(cleaned)
+    materials = candidates.get("project_materials", {})
+    if isinstance(materials, dict):
+        out["project_materials"] = {
+            key: str(materials.get(key, "") or "").strip()
+            for key in ("bible", "world_rules", "timeline", "summary")
+        }
+    return out, report
+
+
 def _active_character_summary_lines(project, limit=12):
     project = project if isinstance(project, dict) else {}
     characters = project.get("characters", [])
@@ -1265,7 +1165,7 @@ def _active_character_summary_lines(project, limit=12):
     activity = _character_activity_stats(project)
     ranked = []
     for index, char in enumerate(characters):
-        if not isinstance(char, dict) or _is_non_person_character_candidate(char):
+        if not isinstance(char, dict):
             continue
         name = _clean_entity_name(char.get("name", ""))
         count = int(activity.get(name, {}).get("chapters", 0) or 0)
@@ -1310,7 +1210,7 @@ def _active_lore_summary_lines(project, limit=12):
     lines = []
     for _score, _index, name, item, stat in ranked[: max(0, int(limit or 0))]:
         typ = str(item.get("type", "") or "其他").strip()
-        desc = _clip_context_text(_dedupe_text_lines(item.get("description", "")), 160)
+        desc = _clip_context_text(_stable_lore_description_context(item.get("description", "")), 160)
         last_chapter = str(stat.get("last_chapter", "") or "").strip()
         progress = f"出现 {stat.get('chapters', 0)} 章"
         if last_chapter:
@@ -1469,82 +1369,6 @@ def _alias_duplicate_pairs(records, label_prefix, name_key="name"):
     return pairs
 
 
-_FUTURE_REVEAL_SUFFIXES = (
-    "真相", "真凶", "身份", "死讯", "背叛", "和解", "失踪", "虎符", "密室", "遗物", "回收", "揭晓", "反转",
-    "身世", "血脉", "亲缘", "生父", "生母", "亲生父亲", "亲生母亲", "内鬼", "叛徒", "卧底",
-    "幕后黑手", "黑手", "凶手", "死因", "死亡", "牺牲", "复活", "叛变", "倒戈", "结局", "归宿",
-)
-
-
-def _future_reveal_markers(text):
-    text = str(text or "")
-    markers = []
-    suffix_pattern = "|".join(re.escape(suffix) for suffix in sorted(_FUTURE_REVEAL_SUFFIXES, key=len, reverse=True))
-    for marker in re.findall(
-        rf"[\u4e00-\u9fffA-Za-z0-9]{{2,24}}(?:{suffix_pattern})",
-        text,
-    ):
-        marker_text = _compact_text(marker)
-        marker_variants = [marker_text]
-        marker_core = re.sub(r"^第[一二三四五六七八九十百千万零〇\d]+[章节回卷部集场]?", "", marker_text)
-        marker_core = re.sub(
-            r"^(?:揭晓|确认|发现|知道|得知|查明|解释|公开|暴露|回收|兑现|写到|点出)+",
-            "",
-            marker_core,
-        )
-        if marker_core and marker_core != marker_text:
-            marker_variants.append(marker_core)
-        for base in tuple(marker_variants):
-            for suffix in _FUTURE_REVEAL_SUFFIXES:
-                if base.endswith(suffix) and len(base) > len(suffix) + 2:
-                    stem = base[:-len(suffix)]
-                    if stem:
-                        marker_variants.append(stem)
-                    marker_variants.append(base[-(len(suffix) + 4):])
-        markers.extend(value for value in _normalize_name_list(marker_variants) if len(value) >= 4)
-    return _normalize_name_list(markers)
-
-
-def _future_reveal_match_texts(text):
-    compact = _compact_text(text)
-    if not compact:
-        return []
-    values = [compact]
-    without_copula = re.sub(r"[是为乃即]", "", compact)
-    if without_copula and without_copula != compact:
-        values.append(without_copula)
-    return values
-
-
-def _future_boundary_candidates(chapters, current_index, near_window=4, milestone_limit=12):
-    chapters = chapters if isinstance(chapters, list) else []
-    current_index = int(current_index or 0)
-    seen = set()
-    candidates = []
-    near_end = min(len(chapters), current_index + max(1, int(near_window or 1)))
-    for future_index, future in enumerate(chapters[current_index:near_end], current_index + 1):
-        if isinstance(future, dict):
-            candidates.append((future_index, future))
-            seen.add(future_index)
-    milestone_items = []
-    for future_index, future in enumerate(chapters[near_end:], near_end + 1):
-        if not isinstance(future, dict):
-            continue
-        future_text = "\n".join(
-            str(future.get(key, "") or "")
-            for key in ("title", "outline", "summary", "key_facts")
-        )
-        if not _compact_text(future_text):
-            continue
-        if _is_timeline_milestone(future, future_text):
-            milestone_items.append((future_index, future))
-    for future_index, future in milestone_items[-max(0, int(milestone_limit or 0)):]:
-        if future_index not in seen:
-            candidates.append((future_index, future))
-            seen.add(future_index)
-    return candidates
-
-
 def _build_writing_check_text(project):
     project = project if isinstance(project, dict) else {}
     issues = []
@@ -1583,8 +1407,6 @@ def _build_writing_check_text(project):
         if not isinstance(char, dict):
             continue
         name = str(char.get("name", "") or "").strip() or f"人物 {index}"
-        if _is_non_person_character_candidate(char):
-            issues.append(f"人物「{name}」更像规则/术语，建议移到设定库。")
         activity_count = int(character_activity.get(name, {}).get("chapters", 0) or 0)
         if _should_check_character_details(char, activity_count, len(chapters)):
             if not str(char.get("goal", "") or "").strip():
@@ -1685,23 +1507,10 @@ def _build_writing_check_text(project):
             continue
         name = str(item.get("name", "") or "").strip() or f"伏笔 {index}"
         status = str(item.get("status", "") or "").strip()
-        progress = _foreshadow_chapter_progress(project, item)
         if status == "已埋" and not str(item.get("payoff_chapter", "") or "").strip():
-            payoff_hits = progress.get("payoff", []) if isinstance(progress, dict) else []
-            if payoff_hits:
-                sample = "、".join(payoff_hits[:3])
-                tail = f"等 {len(payoff_hits)} 章" if len(payoff_hits) > 3 else ""
-                issues.append(f"伏笔「{name}」可能已在{sample}{tail}回收；建议确认状态或补上回收章节。")
-            else:
-                issues.append(f"伏笔「{name}」已埋，但还没有填写回收章节。")
+            issues.append(f"伏笔「{name}」已埋，但还没有填写回收章节。")
         if status == "已回收" and not str(item.get("setup_chapter", "") or "").strip():
-            setup_hits = progress.get("setup", []) if isinstance(progress, dict) else []
-            if setup_hits:
-                sample = "、".join(setup_hits[:3])
-                tail = f"等 {len(setup_hits)} 章" if len(setup_hits) > 3 else ""
-                issues.append(f"伏笔「{name}」可能已在{sample}{tail}埋设；建议补上埋设章节。")
-            else:
-                issues.append(f"伏笔「{name}」已回收，但缺少埋设章节记录。")
+            issues.append(f"伏笔「{name}」已回收，但缺少埋设章节记录。")
 
     lore = project.get("lore", [])
     lore = lore if isinstance(lore, list) else []
@@ -1742,7 +1551,6 @@ def _build_writing_check_text(project):
             and any(str(x or "").strip() for x in chap.get("linked_characters", []))
         )
         or bool(_infer_linked_character_names(project, chap))
-        or bool(_infer_core_character_names(project, chap))
     )
     future_plan_ready = 0
     if long_form_mode:
@@ -1763,7 +1571,6 @@ def _build_writing_check_text(project):
         inheritance_gaps = []
         unlinked_chapters = []
         future_plan_ready = 0
-        possible_boundary_leaks = []
         for index, chap in enumerate(chapters, 1):
             if not isinstance(chap, dict):
                 continue
@@ -1783,7 +1590,7 @@ def _build_writing_check_text(project):
                 inheritance_gaps.append(f"第 {index} 章「{title}」")
             linked = chap.get("linked_characters", [])
             auto_linked = _normalize_name_list(
-                _infer_linked_character_names(project, chap) + _infer_core_character_names(project, chap)
+                _infer_linked_character_names(project, chap)
             )
             if (
                 (has_body or has_outline)
@@ -1791,27 +1598,6 @@ def _build_writing_check_text(project):
                 and not auto_linked
             ):
                 unlinked_chapters.append(f"第 {index} 章「{title}」")
-            body_text = str(chap.get("text", "") or "")
-            if not body_text or index >= len(chapters):
-                continue
-            body_match_texts = _future_reveal_match_texts(body_text)
-            for future_index, future in _future_boundary_candidates(chapters, index, near_window=4):
-                if not isinstance(future, dict):
-                    continue
-                future_title = str(future.get("title", "") or f"章节 {future_index}").strip()
-                future_text = "\n".join(
-                    str(future.get(key, "") or "")
-                    for key in ("outline", "summary", "key_facts")
-                )
-                if not _compact_text(future_text):
-                    continue
-                for marker in _future_reveal_markers(future_text):
-                    matched_marker = marker if marker and any(marker in body_text for body_text in body_match_texts) else ""
-                    if matched_marker:
-                        possible_boundary_leaks.append(f"第 {index} 章「{title}」可能提前写到{future_title}的「{matched_marker}」")
-                        break
-                if possible_boundary_leaks and possible_boundary_leaks[-1].startswith(f"第 {index} 章"):
-                    break
         if inheritance_gaps:
             sample = "、".join(inheritance_gaps[:5])
             tail = f"等 {len(inheritance_gaps)} 章" if len(inheritance_gaps) > 5 else ""
@@ -1819,13 +1605,9 @@ def _build_writing_check_text(project):
         if len(unlinked_chapters) >= max(4, stats["chapters"] // 3):
             sample = "、".join(unlinked_chapters[:5])
             tail = f"等 {len(unlinked_chapters)} 章" if len(unlinked_chapters) > 5 else ""
-            issues.append(f"{sample}{tail} 没有关联人物；应用 AI 提纲/正文/摘要时会自动识别已有角色并回填。")
+            issues.append(f"{sample}{tail} 没有关联人物；可用 AI 摘要按本章实际内容补齐，或手动填写。")
         if future_plan_ready < max(2, stats["chapters"] // 6) and stats["chapters"] >= 12:
             issues.append("后续章节规划较少；章节 AI 会尽量靠前文续写，但补几章粗提纲能明显降低越界和重复。")
-        if possible_boundary_leaks:
-            sample = "、".join(possible_boundary_leaks[:3])
-            tail = f"等 {len(possible_boundary_leaks)} 处" if len(possible_boundary_leaks) > 3 else ""
-            issues.append(f"{sample}{tail}；建议确认当前章是否提前兑现后续规划。")
         unresolved = [
             str(item.get("name", "") or f"伏笔 {index}").strip()
             for index, item in enumerate(foreshadow_items, 1)
@@ -2748,9 +2530,8 @@ def _build_project_timeline_draft(project):
         if line:
             linked = chap.get("linked_characters", [])
             auto_linked = _infer_linked_character_names(project, chap)
-            auto_core_linked = _infer_core_character_names(project, chap)
             linked_names = _normalize_name_list(
-                (linked if isinstance(linked, list) else []) + auto_linked + auto_core_linked
+                (linked if isinstance(linked, list) else []) + auto_linked
             )
             linked_text = "、".join(str(x) for x in linked_names if str(x).strip())
             lore_names = _infer_lore_names(project, chap)
@@ -2781,7 +2562,7 @@ def _build_foreshadow_notes_draft(project):
         group = status if status in grouped else "其他"
         setup = str(item.get("setup_chapter", "") or "").strip()
         payoff = str(item.get("payoff_chapter", "") or "").strip()
-        desc = _clip_context_text(_dedupe_text_lines(item.get("description", "")), 180)
+        desc = _clip_context_text(_stable_foreshadow_description_context(item.get("description", "")), 180)
         route = " -> ".join(x for x in (setup, payoff) if x) or "未填写章节"
         tail = f"｜{desc}" if desc else ""
         line = f"- {name}｜{route}{tail}"
@@ -2846,7 +2627,7 @@ def _open_foreshadow_queue_score(item, index, current_order=None):
             score -= 900
         elif setup_order <= current_order:
             score += 260
-    desc = _dedupe_text_lines(item.get("description", ""))
+    desc = _stable_foreshadow_description_context(item.get("description", ""))
     compact_desc = _compact_text(desc).strip("。.!！?？；;，,、")
     if compact_desc:
         score += 240 + min(220, len(compact_desc) // 2)
@@ -2861,7 +2642,7 @@ def _open_foreshadow_line(item, index, route_style="route", desc_limit=160, incl
     status = str(item.get("status", "") or "").strip()
     setup = str(item.get("setup_chapter", "") or "").strip()
     payoff = str(item.get("payoff_chapter", "") or "").strip()
-    desc = _dedupe_text_lines(item.get("description", ""))
+    desc = _stable_foreshadow_description_context(item.get("description", ""))
     desc_text = _clip_context_text(desc, desc_limit) if include_desc else ""
     if route_style == "fields":
         return f"- {name}｜{status}｜埋设：{setup}｜回收：{payoff}" + (f"｜{desc_text}" if desc_text else "")
@@ -2891,7 +2672,7 @@ def _rank_open_foreshadow_candidates(
         alias_keys = _record_alias_keys(item, name_key="name") or {_compact_text(name)}
         if selected_keys and (alias_keys & selected_keys):
             continue
-        desc = _dedupe_text_lines(item.get("description", ""))
+        desc = _stable_foreshadow_description_context(item.get("description", ""))
         compact_desc = _compact_text(desc).strip("。.!！?？；;，,、")
         if (
             skip_placeholders
@@ -2975,7 +2756,6 @@ def _recent_chapter_context(chapters, chapter_index, window=6, project=None):
             linked.extend(str(name) for name in names if str(name).strip())
         if project:
             linked.extend(_infer_linked_character_names(project, item))
-            linked.extend(_infer_core_character_names(project, item))
     return "\n".join(parts), _normalize_name_list(linked)
 
 
@@ -3151,14 +2931,8 @@ def _build_chapter_ai_context(project, chapter_index, action):
         " ".join(str(name) for name in recent_linked_characters),
     ])
     inferred_current_characters = _infer_linked_character_names(project, chap, chapter_match_text)
-    inferred_core_characters = _infer_core_character_names(
-        project,
-        chap,
-        chapter_match_text,
-        include_global=True,
-    )
     inherited_linked_characters = _normalize_name_list(
-        list(linked_characters) + inferred_current_characters + inferred_core_characters + recent_linked_characters
+        list(linked_characters) + inferred_current_characters + recent_linked_characters
     )
 
     def clean_context_text(value, limit, keep_tail=False, dedupe=True):
@@ -3184,11 +2958,15 @@ def _build_chapter_ai_context(project, chapter_index, action):
             ("语言", "voice", 180),
             ("备注", "notes", 220),
         ]
-        detail = "｜".join(
-            f"{label}：{clean_context_text(char.get(field, ''), limit)}"
-            for label, field, limit in fields
-            if str(char.get(field, "") or "").strip()
-        )
+        detail_parts = []
+        for label, field, limit in fields:
+            value = char.get(field, "")
+            if field == "notes":
+                value = _stable_character_notes_context(value)
+            value = clean_context_text(value, limit)
+            if value:
+                detail_parts.append(f"{label}：{value}")
+        detail = "｜".join(detail_parts)
         recent_state = character_recent_map.get(_compact_text(name), "")
         if recent_state:
             recent_state = "最近状态：" + clean_context_text(recent_state, 520)
@@ -3200,7 +2978,6 @@ def _build_chapter_ai_context(project, chapter_index, action):
         chapter_match_text,
         name_key="name",
         limit=28,
-        score_func=lambda item: _lore_context_score(item, chapter_match_text),
     )
     lore_recent_map = _record_recent_context_map(project, selected_lore, chapter_index, name_key="name")
     lore_lines = []
@@ -3209,7 +2986,9 @@ def _build_chapter_ai_context(project, chapter_index, action):
         if name:
             recent_state = lore_recent_map.get(_compact_text(name), "")
             recent_tail = f"｜最近状态：{clean_context_text(recent_state, 420)}" if recent_state else ""
-            lore_lines.append(f"- {name}｜{item.get('type','其他')}｜{clean_context_text(item.get('description',''), 300)}{recent_tail}")
+            desc = clean_context_text(_stable_lore_description_context(item.get("description", "")), 300)
+            desc_tail = f"｜{desc}" if desc else ""
+            lore_lines.append(f"- {name}｜{item.get('type','其他')}{desc_tail}{recent_tail}")
 
     def foreshadow_score(item):
         status = str(item.get("status", "") or "").strip()
@@ -3241,8 +3020,10 @@ def _build_chapter_ai_context(project, chapter_index, action):
         name = str(item.get("name", "") or "").strip()
         if not name:
             continue
+        desc = clean_context_text(_stable_foreshadow_description_context(item.get("description", "")), 300)
+        desc_tail = f"｜{desc}" if desc else ""
         foreshadow_lines.append(
-            f"- {name}｜{item.get('status','')}｜埋设：{item.get('setup_chapter','')}｜回收：{item.get('payoff_chapter','')}｜{clean_context_text(item.get('description',''), 300)}"
+            f"- {name}｜{item.get('status','')}｜埋设：{item.get('setup_chapter','')}｜回收：{item.get('payoff_chapter','')}{desc_tail}"
         )
     previous_summary = _build_previous_inheritance_text(chapters, chapter_index)
     continuation_text = _build_chapter_continuation_text(chapters, chapter_index)

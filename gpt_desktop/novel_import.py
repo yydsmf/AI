@@ -15,6 +15,7 @@ from .novel_utils import (
     _normalize_name_list,
     _prepare_character_candidate,
     _record_alias_keys,
+    _stable_foreshadow_description_context,
 )
 
 try:
@@ -151,7 +152,7 @@ def _extract_import_candidates(text):
         "foreshadows": [
             {
                 "name": item,
-                "status": _infer_foreshadow_status({"name": item, "description": item}, preserve_manual=False),
+                "status": "未埋",
                 "setup_chapter": "",
                 "payoff_chapter": "",
                 "description": "文档导入候选",
@@ -237,9 +238,56 @@ def _project_material_key(value):
     return ""
 
 
+_LORE_DESCRIPTION_PLACEHOLDERS = {"AI 分析候选", "文档导入候选"}
+
+
+def _lore_description_core(value):
+    text = str(value or "").strip()
+    previous = None
+    while previous != text:
+        previous = text
+        text = re.sub(r"^(?:补充|新增|补充说明)[：:]\s*", "", text).strip()
+    return text
+
+
+def _stable_lore_description_delta(value):
+    kept = []
+    placeholder_keys = {_compact_text(item) for item in _LORE_DESCRIPTION_PLACEHOLDERS}
+    for raw in str(value or "").splitlines():
+        core = _lore_description_core(raw)
+        if not core or _compact_text(core) in placeholder_keys:
+            continue
+        kept.append(str(raw or "").strip())
+    return _dedupe_text_lines("\n".join(kept))
+
+
 def _normalize_ai_candidates(data):
     data = data if isinstance(data, dict) else {}
     out = {"characters": [], "lore": [], "foreshadows": [], "project_materials": {}}
+
+    def merge_source_labels(existing, incoming):
+        labels = []
+        seen = set()
+        for value in (existing, incoming):
+            for line in str(value or "").splitlines():
+                line = line.strip()
+                if not line or line in seen:
+                    continue
+                seen.add(line)
+                labels.append(line)
+        return "\n".join(labels)
+
+    def source_label_from_item(item):
+        item = item if isinstance(item, dict) else {}
+        return str(item.get("_source_label", "") or item.get("source_label", "") or "").strip()
+
+    def attach_candidate_metadata(target, source):
+        if not isinstance(target, dict):
+            return target
+        source_label = source_label_from_item(source)
+        if source_label:
+            target["_source_label"] = merge_source_labels(target.get("_source_label", ""), source_label)
+        return target
 
     def merge_candidate_text(existing, incoming, append=False):
         old = str(existing or "").strip()
@@ -265,6 +313,9 @@ def _normalize_ai_candidates(data):
     def merge_into_group(group_key, item):
         if not isinstance(item, dict):
             return
+        if group_key == "lore":
+            item = dict(item)
+            item["description"] = _stable_lore_description_delta(item.get("description", ""))
         name = str(item.get("name", "") or "").strip()
         if not name:
             return
@@ -282,14 +333,9 @@ def _normalize_ai_candidates(data):
                 existing = candidate
                 break
         if existing is None:
+            attach_candidate_metadata(item, item)
             target.append(item)
             return
-        if group_key == "foreshadows":
-            status_probe = dict(existing)
-            for field in ("status", "setup_chapter", "payoff_chapter", "description"):
-                if str(item.get(field, "") or "").strip():
-                    status_probe[field] = item.get(field, "")
-            existing["status"] = _infer_foreshadow_status(status_probe, preserve_manual=False)
         if group_key == "characters" and name != str(existing.get("name", "") or "").strip():
             existing_name = str(existing.get("name", "") or "").strip()
             if existing_name:
@@ -301,8 +347,21 @@ def _normalize_ai_candidates(data):
         elif group_key in {"lore", "foreshadows"} and name != str(existing.get("name", "") or "").strip():
             existing["description"] = merge_candidate_text(existing.get("description", ""), f"别称：{name}", append=True)
         for field, value in item.items():
-            if field == "name" or (group_key == "foreshadows" and field == "status"):
+            if field == "name":
                 continue
+            if group_key == "foreshadows" and field == "status":
+                if item.get("_status_explicit"):
+                    existing["status"] = _infer_foreshadow_status({"status": value}, preserve_manual=False)
+                continue
+            if field in {"_source_label", "source_label"}:
+                existing["_source_label"] = merge_source_labels(existing.get("_source_label", ""), value)
+                continue
+            if field == "_status_explicit":
+                if value:
+                    existing["_status_explicit"] = True
+                continue
+            if group_key == "lore" and field == "description":
+                value = _stable_lore_description_delta(value)
             existing[field] = merge_candidate_text(
                 existing.get(field, ""),
                 value,
@@ -327,24 +386,32 @@ def _normalize_ai_candidates(data):
         }
         char_item, lore_item = _prepare_character_candidate(normalized_item, default_notes="AI 分析候选")
         if char_item:
+            attach_candidate_metadata(char_item, item)
             merge_into_group("characters", char_item)
         elif lore_item:
+            attach_candidate_metadata(lore_item, item)
             merge_into_group("lore", lore_item)
     for item, name in valid_items("lore", "设定", "设定库", "世界观设定", "资料设定", "settings"):
-        merge_into_group("lore", {
+        normalized_item = {
             "name": name,
             "type": str(_candidate_field(item, "type", "类型", "类别", "设定类型") or "其他"),
             "description": str(_candidate_field(item, "description", "说明", "描述", "设定说明", "备注", "规则") or "AI 分析候选"),
-        })
+        }
+        attach_candidate_metadata(normalized_item, item)
+        merge_into_group("lore", normalized_item)
     for item, name in valid_items("foreshadows", "伏笔", "伏笔线索", "线索", "悬念", "clues"):
+        raw_status = str(_candidate_field(item, "status", "状态", "伏笔状态") or "").strip()
         normalized = {
             "name": name,
-            "status": str(_candidate_field(item, "status", "状态", "伏笔状态") or "未埋"),
+            "status": raw_status,
             "setup_chapter": str(_candidate_field(item, "setup_chapter", "埋设章节", "铺垫章节", "出现章节", "setup") or ""),
             "payoff_chapter": str(_candidate_field(item, "payoff_chapter", "回收章节", "兑现章节", "揭晓章节", "payoff") or ""),
             "description": str(_candidate_field(item, "description", "说明", "描述", "伏笔说明", "备注") or "AI 分析候选"),
         }
-        normalized["status"] = _infer_foreshadow_status(normalized, preserve_manual=False)
+        normalized["_status_explicit"] = bool(raw_status)
+        if raw_status:
+            normalized["status"] = _infer_foreshadow_status(normalized, preserve_manual=False)
+        attach_candidate_metadata(normalized, item)
         merge_into_group("foreshadows", normalized)
     materials = _candidate_group(data, "project_materials", "项目资料", "资料草案", "项目材料", "全局资料", default={})
     material_sources = []
@@ -421,12 +488,17 @@ def _apply_import_candidates(project, candidates, checked):
             return new, True
         return old, False
 
-    def merge_item(target_item, incoming, fields, append_fields=()):
+    def merge_item(key, target_item, incoming, fields, append_fields=()):
         changed = False
         for field in fields:
+            incoming_value = incoming.get(field, "") if isinstance(incoming, dict) else ""
+            if key == "foreshadows" and field == "status" and not incoming.get("_status_explicit"):
+                continue
+            if key == "lore" and field == "description":
+                incoming_value = _stable_lore_description_delta(incoming_value)
             merged, did_change = merge_text(
                 target_item.get(field, ""),
-                incoming.get(field, "") if isinstance(incoming, dict) else "",
+                incoming_value,
                 append=field in append_fields,
             )
             if did_change:
@@ -469,6 +541,14 @@ def _apply_import_candidates(project, candidates, checked):
             keys.add(_character_merge_key(item))
         return {value for value in keys if value}
 
+    def project_record_from_candidate(item):
+        data = deepcopy(item)
+        if isinstance(data, dict):
+            for field in list(data.keys()):
+                if str(field).startswith("_") or field in {"source_label"}:
+                    data.pop(field, None)
+        return data
+
     def apply_group(key, target, fields, append_fields=(), status_infer=None):
         existing = {}
         existing_aliases = {}
@@ -506,7 +586,7 @@ def _apply_import_candidates(project, candidates, checked):
                             f"别称：{name}",
                             append=True,
                         )
-                if merge_item(existing_item, x, fields, append_fields):
+                if merge_item(key, existing_item, x, fields, append_fields):
                     merged_count += 1
                 elif alias_changed:
                     merged_count += 1
@@ -554,20 +634,13 @@ def _apply_import_candidates(project, candidates, checked):
                         alias_changed = False
                 else:
                     alias_changed = False
-                changed = merge_item(existing_item, item, fields, append_fields) or alias_changed
-                if status_infer is not None:
-                    status_probe = deepcopy(existing_item)
-                    for field in fields:
-                        if useful(item.get(field, "") if isinstance(item, dict) else ""):
-                            status_probe[field] = item.get(field, "")
-                    inferred_status = status_infer(status_probe)
-                    if inferred_status != str(existing_item.get("status", "") or "").strip():
-                        existing_item["status"] = inferred_status
-                        changed = True
+                changed = merge_item(key, existing_item, item, fields, append_fields) or alias_changed
                 if changed:
                     merged_count += 1
                 continue
-            data = deepcopy(item)
+            data = project_record_from_candidate(item)
+            if key == "lore":
+                data["description"] = _stable_lore_description_delta(data.get("description", ""))
             data.setdefault("id", uuid.uuid4().hex)
             if status_infer is not None:
                 data["status"] = status_infer(data)
@@ -664,10 +737,6 @@ def _rank_candidate_dossier_characters(project, limit=40):
             item,
             (("role", 160), ("goal", 120), ("secret", 120), ("voice", 80), ("notes", 50)),
         )
-        role_text = _compact_text(item.get("role", ""))
-        notes_text = _compact_text(item.get("notes", ""))
-        if any(key in role_text or key in notes_text for key in ("主角", "核心", "女主", "男主", "反派", "主线")):
-            score += 500
         ranked.append((-score, -count, index, item))
     ranked.sort()
     return [item for _score, _count, _index, item in ranked[: max(0, int(limit or 0))]]
@@ -688,11 +757,11 @@ def _rank_candidate_dossier_lore(project, limit=40):
         stat = activity.get(name, {})
         count = int(stat.get("chapters", 0) or 0)
         score = count * 1000
-        score += _candidate_dossier_detail_score(item, (("type", 80), ("description", 180)))
-        type_text = _compact_text(item.get("type", ""))
-        desc_text = _compact_text(item.get("description", ""))
-        if any(key in type_text or key in desc_text for key in ("主线", "核心", "规则", "地点", "组织", "法则")):
-            score += 250
+        stable_desc = _stable_lore_description_delta(item.get("description", ""))
+        score += _candidate_dossier_detail_score(
+            {"type": item.get("type", ""), "description": stable_desc},
+            (("type", 80), ("description", 180)),
+        )
         ranked.append((-score, -count, index, item))
     ranked.sort()
     return [item for _score, _count, _index, item in ranked[: max(0, int(limit or 0))]]
@@ -768,7 +837,7 @@ def _candidate_analysis_dossier_text(project):
         if not name:
             continue
         typ = str(item.get("type", "") or "其他").strip()
-        desc = _clip_context_text(_dedupe_text_lines(item.get("description", "")), 120)
+        desc = _clip_context_text(_stable_lore_description_delta(item.get("description", "")), 120)
         lore_lines.append(f"- {name}｜{typ}｜{desc}" if desc else f"- {name}｜{typ}")
     if lore_lines:
         context_parts.append("已有设定库（同名/别称请合并，不要重复新增）：\n" + "\n".join(lore_lines))
@@ -786,7 +855,7 @@ def _candidate_analysis_dossier_text(project):
             if str(item.get(key, "") or "").strip()
         )
         route = f"｜{route}" if route else ""
-        desc = _clip_context_text(_dedupe_text_lines(item.get("description", "")), 120)
+        desc = _clip_context_text(_stable_foreshadow_description_context(item.get("description", "")), 120)
         tail = f"｜{desc}" if desc else ""
         foreshadow_lines.append(f"- {name}｜{status}{route}{tail}")
     if foreshadow_lines:

@@ -76,6 +76,7 @@ from .novel_utils import (
     _chapter_dedupe_key,
     _chapter_analysis_hash,
     _chapter_list_text,
+    _candidate_long_term_review_reasons,
     _compact_chapter_key_facts_text,
     _compact_chapter_summary_text,
     _chapter_needs_analysis,
@@ -87,7 +88,6 @@ from .novel_utils import (
     _merge_text_lines_without_duplicates,
     _default_project,
     _foreshadow_list_text,
-    _infer_core_character_names,
     _infer_linked_character_names,
     _is_generic_character_role_label,
     _infer_chapter_status,
@@ -106,6 +106,7 @@ from .novel_utils import (
     _project_summary_text,
     _record_alias_keys,
     _safe_name,
+    _sanitize_import_candidates_for_long_form,
     _split_chapters_from_text,
     _split_manuscript_into_target_chapters,
 )
@@ -718,9 +719,24 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
         widget.setSizePolicy(QSizePolicy.Expanding, widget.sizePolicy().verticalPolicy())
         return widget
 
-    def _expand_text_edit(self, widget, min_height=90):
+    def _expand_text_edit(self, widget, min_height=90, bottom_scroll_padding=0):
         widget.setMinimumHeight(min_height)
         widget.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        if bottom_scroll_padding:
+            self._set_text_edit_bottom_scroll_padding(widget, bottom_scroll_padding)
+        return widget
+
+    def _set_text_edit_bottom_scroll_padding(self, widget, bottom=28):
+        try:
+            margins = widget.viewportMargins()
+            widget.setViewportMargins(
+                margins.left(),
+                margins.top(),
+                margins.right(),
+                max(margins.bottom(), int(bottom or 0)),
+            )
+        except Exception as e:
+            log_debug("章节编辑区底部留白设置失败", e)
         return widget
 
     def _ghost_button(self, text, callback=None, tooltip=""):
@@ -1088,16 +1104,16 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
         linked_layout.addWidget(linked_pick_btn)
 
         self.chapter_outline = PlainTextEdit()
-        self._expand_text_edit(self.chapter_outline, 90)
+        self._expand_text_edit(self.chapter_outline, 90, bottom_scroll_padding=32)
         self.chapter_outline.setPlaceholderText("本章目标、冲突、转折、结尾钩子。")
         self.chapter_text = PlainTextEdit()
-        self._expand_text_edit(self.chapter_text, 180)
+        self._expand_text_edit(self.chapter_text, 180, bottom_scroll_padding=36)
         self.chapter_text.setPlaceholderText("正文草稿。")
         self.chapter_summary = PlainTextEdit()
-        self._expand_text_edit(self.chapter_summary, 80)
+        self._expand_text_edit(self.chapter_summary, 80, bottom_scroll_padding=28)
         self.chapter_summary.setPlaceholderText("简短总结本章发生了什么。")
         self.chapter_key_facts = PlainTextEdit()
-        self._expand_text_edit(self.chapter_key_facts, 80)
+        self._expand_text_edit(self.chapter_key_facts, 80, bottom_scroll_padding=28)
         self.chapter_key_facts.setPlaceholderText("只记录后续必须继承的关键事实。")
         for w in (
             self.chapter_title,
@@ -2840,10 +2856,11 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
                         continue
                     row = QListWidgetItem(name)
                     row_key = self._candidate_item_check_key(kind, item, source_index)
-                    row.setCheckState(previous_checks.get(row_key, Qt.Checked))
+                    default_state = self._default_candidate_check_state(kind, item)
+                    row.setCheckState(previous_checks.get(row_key, default_state))
                     row.setData(Qt.UserRole, source_index)
                     row.setData(Qt.UserRole + 1, row_key)
-                    row.setToolTip(_candidate_detail_text(kind, item))
+                    row.setToolTip(self._candidate_detail_text_with_review(kind, item))
                     widget.addItem(row)
             finally:
                 widget.blockSignals(False)
@@ -2926,6 +2943,29 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
     def _default_candidate_material_check_state(self, key):
         return Qt.Unchecked if key in _MANUAL_PROJECT_MATERIAL_KEYS else Qt.Checked
 
+    def _candidate_review_reasons(self, kind, item):
+        project = self.current_project if isinstance(getattr(self, "current_project", None), dict) else {}
+        return _candidate_long_term_review_reasons(project, kind, item)
+
+    def _default_candidate_check_state(self, kind, item):
+        return Qt.Checked
+
+    def _candidate_detail_text_with_review(self, kind, item):
+        detail = _candidate_detail_text(kind, item)
+        reasons = self._candidate_review_reasons(kind, item)
+        source = ""
+        if isinstance(item, dict):
+            source = str(item.get("_source_label", "") or item.get("source_label", "") or "").strip()
+        header_lines = []
+        if reasons:
+            header_lines.append("建议：已默认勾选；导入时只做同名/别名合并和重复行清理。")
+            header_lines.append("原因：" + "；".join(reasons))
+        else:
+            header_lines.append("建议：已默认勾选，可导入。")
+        if source:
+            header_lines.append(f"来源：{source}")
+        return "\n".join(header_lines + (["", detail] if detail else []))
+
     def _candidate_material_labels(self, material_result=None):
         labels = (
             ("bible", "圣经"),
@@ -2987,7 +3027,7 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
             return
         if hasattr(self, "candidate_detail_box"):
             self.candidate_detail_box.setVisible(True)
-        self.candidate_detail_edit.setPlainText(_candidate_detail_text(kind, items[source_index]))
+        self.candidate_detail_edit.setPlainText(self._candidate_detail_text_with_review(kind, items[source_index]))
 
     def clear_import_candidates(self):
         self.import_candidates = {"characters": [], "lore": [], "foreshadows": [], "project_materials": {}}
@@ -3127,6 +3167,19 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
                 return new, True
             return old, False
 
+        def merge_source_labels(old, new):
+            labels = []
+            seen = set()
+            for value in (old, new):
+                for line in str(value or "").splitlines():
+                    line = line.strip()
+                    if not line or line in seen:
+                        continue
+                    seen.add(line)
+                    labels.append(line)
+            merged_text = "\n".join(labels)
+            return merged_text, merged_text != str(old or "").strip()
+
         for key in ("characters", "lore", "foreshadows"):
             target = merged.setdefault(key, [])
             if not isinstance(target, list):
@@ -3165,8 +3218,11 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
                             break
                 if existing is None:
                     clone = deepcopy(item)
-                    if key == "foreshadows":
-                        clone["status"] = _infer_foreshadow_status(clone, preserve_manual=False)
+                    if key == "foreshadows" and item.get("_status_explicit"):
+                        clone["status"] = _infer_foreshadow_status(
+                            {"status": clone.get("status", "")},
+                            preserve_manual=False,
+                        )
                     target.append(clone)
                     by_name[merge_key] = clone
                     for alias_key in alias_keys:
@@ -3204,15 +3260,21 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
                 for field, value in item.items():
                     if field == "name":
                         continue
+                    if field in {"_source_label", "source_label"}:
+                        merged_text, did_change = merge_source_labels(existing.get("_source_label", ""), value)
+                        if did_change:
+                            existing["_source_label"] = merged_text
+                        continue
                     if key == "foreshadows" and field == "status":
-                        status_probe = deepcopy(existing)
-                        status_probe["status"] = value
-                        for extra_field in ("setup_chapter", "payoff_chapter", "description"):
-                            if str(item.get(extra_field, "") or "").strip():
-                                status_probe[extra_field] = item.get(extra_field, "")
-                        inferred = _infer_foreshadow_status(status_probe, preserve_manual=False)
+                        if not item.get("_status_explicit"):
+                            continue
+                        inferred = _infer_foreshadow_status({"status": value}, preserve_manual=False)
                         if inferred != str(existing.get("status", "") or "").strip():
                             existing["status"] = inferred
+                        continue
+                    if key == "foreshadows" and field == "_status_explicit":
+                        if value:
+                            existing["_status_explicit"] = True
                         continue
                     merged_text, did_change = merge_candidate_text(
                         existing.get(field, ""),
@@ -3242,6 +3304,21 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
             int(data.get("_chunk_succeeded", 0) or 0),
         )
 
+    def _candidate_auto_cleanup_status_text(self):
+        report = getattr(self, "_last_candidate_auto_cleanup_report", {}) or {}
+        if not isinstance(report, dict):
+            return ""
+        filtered = report.get("filtered", {})
+        trimmed = report.get("trimmed", {})
+        filtered_total = sum(int(value or 0) for value in filtered.values()) if isinstance(filtered, dict) else 0
+        trimmed_total = sum(int(value or 0) for value in trimmed.values()) if isinstance(trimmed, dict) else 0
+        parts = []
+        if filtered_total:
+            parts.append(f"已忽略 {filtered_total} 条空候选")
+        if trimmed_total:
+            parts.append(f"已清理 {trimmed_total} 条重复/占位说明")
+        return "；" + "，".join(parts) if parts else ""
+
     def _apply_candidate_analysis_result(self, data):
         data = data if isinstance(data, dict) else {}
         state = _normalize_candidate_analysis_state({
@@ -3251,9 +3328,13 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
         self.failed_analysis_chunks = state.get("failed_candidate_chunks", [])
         self.pending_analysis_chapter_ids = state.get("pending_candidate_chapter_ids", [])
         if getattr(self, "_analysis_merge_with_existing", False):
-            self.import_candidates = self._merge_import_candidates(data)
+            raw_candidates = self._merge_import_candidates(data)
         else:
-            self.import_candidates = _normalize_ai_candidates(data)
+            raw_candidates = _normalize_ai_candidates(data)
+        self.import_candidates, self._last_candidate_auto_cleanup_report = _sanitize_import_candidates_for_long_form(
+            self.current_project,
+            raw_candidates,
+        )
         return self._candidate_analysis_chunk_stats(data)
 
     def _refresh_candidate_analysis_result_view(self):
@@ -4140,7 +4221,6 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
             return []
         return _normalize_name_list(
             _infer_linked_character_names(self.current_project, chapter, extra_text)
-            + _infer_core_character_names(self.current_project, chapter, extra_text)
         )
 
     def _merge_chapter_linked_names(self, names):
@@ -4159,15 +4239,16 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
         self._persist_candidate_analysis_state()
         self._refresh_candidate_analysis_result_view()
         material_hits = self._candidate_material_status_text()
+        cleanup_tail = self._candidate_auto_cleanup_status_text()
         if self.failed_analysis_chunks:
             reason = self._failed_candidate_error_summary(limit=1).replace("\n", " ")
             reason_tail = f" 原因：{reason}" if reason else ""
             self.set_status_tip(
-                f"AI 分析部分完成：成功 {succeeded}/{total} 块，失败 {len(self.failed_analysis_chunks)} 块；下次点击 AI 分析候选会优先重试失败块。{reason_tail}"
+                f"AI 分析部分完成：成功 {succeeded}/{total} 块，失败 {len(self.failed_analysis_chunks)} 块；下次点击 AI 分析候选会优先重试失败块{cleanup_tail}。{reason_tail}"
             )
         else:
             self.set_status_tip(
-                f"AI 分析完成：人物 {len(self.import_candidates['characters'])}，设定 {len(self.import_candidates['lore'])}，伏笔 {len(self.import_candidates['foreshadows'])}，资料草案 {material_hits}"
+                f"AI 分析完成：人物 {len(self.import_candidates['characters'])}，设定 {len(self.import_candidates['lore'])}，伏笔 {len(self.import_candidates['foreshadows'])}，资料草案 {material_hits}{cleanup_tail}"
             )
 
     def on_ai_candidates_partial(self, data, completed, total):
@@ -4177,12 +4258,13 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
         material_hits = self._candidate_material_status_text()
         failed_count = len(self.failed_analysis_chunks)
         tail = f"，待重试 {failed_count} 块" if failed_count else ""
+        cleanup_tail = self._candidate_auto_cleanup_status_text()
         if failed_count:
             reason = self._failed_candidate_error_summary(limit=1).replace("\n", " ")
             if reason:
                 tail += f"，原因：{reason}"
         self.set_status_tip(
-            f"AI 分析进度 {completed}/{total}：人物 {len(self.import_candidates['characters'])}，设定 {len(self.import_candidates['lore'])}，伏笔 {len(self.import_candidates['foreshadows'])}，资料草案 {material_hits}{tail}"
+            f"AI 分析进度 {completed}/{total}：人物 {len(self.import_candidates['characters'])}，设定 {len(self.import_candidates['lore'])}，伏笔 {len(self.import_candidates['foreshadows'])}，资料草案 {material_hits}{cleanup_tail}{tail}"
         )
 
     def on_ai_candidates_failed(self, err):

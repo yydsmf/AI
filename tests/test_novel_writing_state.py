@@ -171,10 +171,61 @@ class NovelWritingStateTests(unittest.TestCase):
         self.assertLessEqual(len(compacted), 160)
         self.assertIn("关键事实1", compacted)
 
+    def test_compact_chapter_key_facts_drops_empty_numbered_tail(self):
+        text = "1. 苏不欺确认对方宿主身份；2. 四六开系统已绑定苏不欺；3. 苏不欺学心猿破流血；4。"
+
+        compacted = _compact_chapter_key_facts_text(text)
+
+        self.assertIn("苏不欺确认对方宿主身份", compacted)
+        self.assertIn("四六开系统已绑定苏不欺", compacted)
+        self.assertIn("苏不欺学心猿破流血", compacted)
+        self.assertNotIn("4。", compacted)
+        self.assertNotRegex(compacted, r"(?:^|[；;\n])\s*4[.。]\s*$")
+
+    def test_compact_chapter_summary_drops_empty_numbered_tail(self):
+        compacted = _compact_chapter_summary_text("1. 赵明进入王城。2。")
+
+        self.assertEqual(compacted, "1. 赵明进入王城。")
+
     def test_plain_text_edit_is_plain_text_widget(self):
         from gpt_desktop.novel_writing_tab import PlainTextEdit
 
         self.assertTrue(issubclass(PlainTextEdit, QPlainTextEdit))
+
+    def test_text_edit_bottom_scroll_padding_keeps_existing_margins(self):
+        class Margins:
+            def __init__(self, left=1, top=2, right=3, bottom=4):
+                self._values = (left, top, right, bottom)
+
+            def left(self):
+                return self._values[0]
+
+            def top(self):
+                return self._values[1]
+
+            def right(self):
+                return self._values[2]
+
+            def bottom(self):
+                return self._values[3]
+
+        class FakeEdit:
+            def __init__(self):
+                self.applied = None
+
+            def viewportMargins(self):
+                return Margins()
+
+            def setViewportMargins(self, left, top, right, bottom):
+                self.applied = (left, top, right, bottom)
+
+        tab = NovelWritingTab.__new__(NovelWritingTab)
+        edit = FakeEdit()
+
+        returned = tab._set_text_edit_bottom_scroll_padding(edit, 28)
+
+        self.assertIs(returned, edit)
+        self.assertEqual(edit.applied, (1, 2, 3, 28))
 
     def test_indexed_records_sort_foreshadows_by_setup_and_payoff_chapter(self):
         tab = NovelWritingTab.__new__(NovelWritingTab)
@@ -425,6 +476,82 @@ class NovelWritingStateTests(unittest.TestCase):
         self.assertEqual(tab._default_candidate_material_check_state("timeline"), Qt.Checked)
         self.assertEqual(tab._default_candidate_material_check_state("summary"), Qt.Checked)
 
+    def test_candidate_auto_cleanup_keeps_ai_content_without_semantic_filtering(self):
+        tab = NovelWritingTab.__new__(NovelWritingTab)
+        chapters = []
+        for index in range(8):
+            chapter = _new_chapter(index)
+            chapter["title"] = f"第{index + 1}章"
+            chapter["summary"] = "沈慕白追查慕白资本。"
+            chapter["linked_characters"] = ["沈慕白"]
+            chapters.append(chapter)
+        tab.current_project = {
+            "characters": [
+                {"name": "沈慕白", "role": "主角", "goal": "", "secret": "", "voice": "", "notes": "核心人物"}
+            ],
+            "lore": [
+                {"name": "慕白资本", "type": "组织", "description": "核心组织"}
+            ],
+            "foreshadow_items": [
+                {"name": "旧钟声", "status": "已埋", "setup_chapter": "第一章", "payoff_chapter": "", "description": "核心伏笔"}
+            ],
+            "chapters": chapters,
+        }
+        tab.import_candidates = {"characters": [], "lore": [], "foreshadows": [], "project_materials": {}}
+        tab.pending_analysis_chapter_ids = []
+        tab._analysis_merge_with_existing = False
+
+        tab._apply_candidate_analysis_result({
+            "characters": [
+                {"name": "沈慕白", "notes": "本章沈慕白追问泄露范围。"},
+                {"name": "沈慕白", "notes": "沈慕白对信息泄露极度敏感，会优先追查责任链。"},
+            ],
+            "lore": [
+                {"name": "慕白资本", "type": "组织", "description": "本章项目资料发往慕白资本邮箱。"},
+                {"name": "琉璃塔", "type": "地点", "description": "琉璃塔保存旧案卷宗。"},
+            ],
+            "foreshadows": [
+                {"name": "旧钟声", "status": "未埋", "description": "本章又提到旧钟声。"},
+            ],
+            "_chunk_total": 1,
+            "_chunk_succeeded": 1,
+        })
+
+        self.assertEqual(len(tab.import_candidates["characters"]), 1)
+        self.assertIn("极度敏感", tab.import_candidates["characters"][0]["notes"])
+        self.assertIn("追问泄露范围", tab.import_candidates["characters"][0]["notes"])
+        self.assertEqual(len(tab.import_candidates["lore"]), 2)
+        self.assertEqual(tab.import_candidates["lore"][0]["name"], "慕白资本")
+        self.assertIn("发往慕白资本邮箱", tab.import_candidates["lore"][0]["description"])
+        self.assertEqual(tab.import_candidates["lore"][1]["name"], "琉璃塔")
+        self.assertEqual(len(tab.import_candidates["foreshadows"]), 1)
+        self.assertIn("本章又提到旧钟声", tab.import_candidates["foreshadows"][0]["description"])
+        self.assertEqual(tab._last_candidate_auto_cleanup_report["filtered"]["characters"], 0)
+        self.assertEqual(tab._last_candidate_auto_cleanup_report["trimmed"]["characters"], 0)
+        self.assertEqual(tab._last_candidate_auto_cleanup_report["filtered"]["lore"], 0)
+        self.assertEqual(tab._last_candidate_auto_cleanup_report["filtered"]["foreshadows"], 0)
+        self.assertEqual(tab._candidate_auto_cleanup_status_text(), "")
+
+    def test_candidate_detail_explains_review_reason_and_source(self):
+        tab = NovelWritingTab.__new__(NovelWritingTab)
+        tab.current_project = {
+            "characters": [
+                {"name": "沈慕白", "role": "主角", "goal": "", "secret": "", "voice": "", "notes": "核心人物"}
+            ],
+            "lore": [],
+            "foreshadow_items": [],
+            "chapters": [],
+        }
+
+        text = tab._candidate_detail_text_with_review(
+            "characters",
+            {"name": "沈慕白", "notes": "本章沈慕白追问泄露范围。", "_source_label": "第 2/5 块"},
+        )
+
+        self.assertIn("默认勾选", text)
+        self.assertNotIn("临时剧情推进", text)
+        self.assertIn("来源：第 2/5 块", text)
+
     def test_merge_import_candidates_uses_character_canonical_key(self):
         tab = NovelWritingTab.__new__(NovelWritingTab)
         tab.import_candidates = {
@@ -544,7 +671,7 @@ class NovelWritingStateTests(unittest.TestCase):
         self.assertEqual(tab.chapter_key_facts.toPlainText(), "赵明拿到旧案钥匙。")
         self.assertEqual(tab.chapter_linked.text(), "赵明")
 
-    def test_auto_chapter_summary_maps_role_label_to_existing_character(self):
+    def test_auto_chapter_summary_ignores_generic_role_label_for_existing_character(self):
         chapter = _new_chapter(0)
         chapter["outline"] = "有人进入王城。"
         chapter["text"] = "他在王城找到旧案卷宗。"
@@ -577,7 +704,7 @@ class NovelWritingStateTests(unittest.TestCase):
             "本章摘要：有人进入王城。\n本章需继承的关键事实：他拿到旧案钥匙。\n本章关联人物：主角",
         )
 
-        self.assertEqual(tab.chapter_linked.text(), "赵明")
+        self.assertEqual(tab.chapter_linked.text(), "")
         self.assertNotEqual(tab.chapter_linked.text(), "主角")
 
     def test_apply_summary_preview_infers_linked_characters(self):
@@ -619,7 +746,7 @@ class NovelWritingStateTests(unittest.TestCase):
         self.assertEqual(saved["summary"], "赵明进入王城。")
         self.assertEqual(saved["key_facts"], "迟到主角交出旧卷。")
 
-    def test_apply_summary_preview_maps_role_label_to_existing_character(self):
+    def test_apply_summary_preview_ignores_generic_role_label_for_existing_character(self):
         chapter = _new_chapter(0)
         chapter["title"] = "第一章"
         chapter["status"] = "写作中"
@@ -652,8 +779,8 @@ class NovelWritingStateTests(unittest.TestCase):
         tab.apply_chapter_ai_preview("summary")
 
         saved = tab.current_project["chapters"][0]
-        self.assertEqual(tab.chapter_linked.text(), "赵明")
-        self.assertEqual(saved["linked_characters"], ["赵明"])
+        self.assertEqual(tab.chapter_linked.text(), "")
+        self.assertEqual(saved["linked_characters"], [])
 
     def test_apply_summary_preview_does_not_put_fact_only_output_into_summary(self):
         chapter = _new_chapter(0)
@@ -723,8 +850,8 @@ class NovelWritingStateTests(unittest.TestCase):
 
         saved = tab.current_project["chapters"][0]
         self.assertEqual(saved["outline"], "主角进入王城，迟到主角交出旧卷。")
-        self.assertEqual(set(tab.chapter_linked.text().split(", ")), {"赵明", "迟到主角"})
-        self.assertEqual(set(saved["linked_characters"]), {"赵明", "迟到主角"})
+        self.assertEqual(tab.chapter_linked.text(), "迟到主角")
+        self.assertEqual(saved["linked_characters"], ["迟到主角"])
 
     def test_apply_text_preview_infers_linked_characters_before_auto_summary(self):
         chapter = _new_chapter(0)

@@ -7,6 +7,7 @@ from gpt_desktop.novel_import import (
     _normalize_ai_candidates,
 )
 from gpt_desktop.novel_utils import _new_chapter, _normalize_project
+from gpt_desktop.novel_utils import _sanitize_import_candidates_for_long_form
 
 
 class NovelImportCandidateTests(unittest.TestCase):
@@ -138,6 +139,26 @@ class NovelImportCandidateTests(unittest.TestCase):
         self.assertIn("故事主舞台", dossier)
         self.assertNotIn("普通设定44", dossier)
 
+    def test_candidate_analysis_dossier_keeps_lore_description_without_semantic_filtering(self):
+        project = {
+            "lore": [
+                {
+                    "name": "慕白资本",
+                    "type": "势力",
+                    "description": (
+                        "慕白资本控制多条融资渠道，是沈家在资本布局中的核心工具，"
+                        "本章中苏明宇将项目资料发往慕白资本邮箱，沈慕白追问泄露范围。"
+                    ),
+                }
+            ]
+        }
+
+        dossier = _candidate_analysis_dossier_text(project)
+
+        self.assertIn("慕白资本控制多条融资渠道", dossier)
+        self.assertIn("发往慕白资本邮箱", dossier)
+        self.assertIn("追问泄露范围", dossier)
+
     def test_candidate_analysis_dossier_prioritizes_open_late_foreshadow(self):
         foreshadows = [
             {
@@ -209,6 +230,79 @@ class NovelImportCandidateTests(unittest.TestCase):
         self.assertIn("别称：半枚虎符", normalized["foreshadows"][0]["description"])
         self.assertIn("补充：真相揭晓。", normalized["foreshadows"][0]["description"])
         self.assertEqual(normalized["project_materials"]["summary"].count("皇商账册缺页牵出旧案。"), 1)
+
+    def test_normalize_ai_candidates_keeps_lore_description_without_semantic_filtering(self):
+        data = {
+            "lore": [
+                {
+                    "name": "慕白资本",
+                    "type": "势力",
+                    "description": (
+                        "慕白资本控制多条融资渠道，是沈家在资本布局中的核心工具，"
+                        "本章中苏明宇将项目资料发往慕白资本邮箱，沈慕白在危机爆发后追问泄露范围。"
+                    ),
+                }
+            ],
+        }
+
+        normalized = _normalize_ai_candidates(data)
+
+        description = normalized["lore"][0]["description"]
+        self.assertIn("慕白资本控制多条融资渠道", description)
+        self.assertIn("发往慕白资本邮箱", description)
+        self.assertIn("追问泄露范围", description)
+
+    def test_long_form_candidate_cleanup_keeps_ai_content_without_semantic_filtering(self):
+        project = {
+            "characters": [
+                {"name": "沈慕白", "role": "主角", "goal": "", "secret": "", "voice": "", "notes": ""}
+            ],
+            "lore": [
+                {"name": "慕白资本", "type": "组织", "description": "核心组织"}
+            ],
+            "foreshadow_items": [
+                {"name": "旧钟声", "status": "已埋", "setup_chapter": "第一章", "payoff_chapter": "", "description": ""}
+            ],
+            "chapters": [],
+        }
+        candidates = {
+            "characters": [
+                {
+                    "name": "沈慕白",
+                    "notes": "沈慕白对信息泄露极度敏感，会优先追查责任链。\n本章沈慕白追问泄露范围。",
+                }
+            ],
+            "lore": [
+                {
+                    "name": "慕白资本",
+                    "type": "组织",
+                    "description": "慕白资本控制多条融资渠道，是沈家资本布局的核心工具。\n本章项目资料发往慕白资本邮箱。",
+                }
+            ],
+            "foreshadows": [
+                {
+                    "name": "旧钟声",
+                    "status": "未埋",
+                    "description": "旧钟声代表密室开启，已埋，待在琉璃塔章节回收。\n本章又提到旧钟声。",
+                }
+            ],
+            "project_materials": {},
+        }
+
+        cleaned, report = _sanitize_import_candidates_for_long_form(project, candidates)
+
+        self.assertEqual(len(cleaned["characters"]), 1)
+        self.assertIn("极度敏感", cleaned["characters"][0]["notes"])
+        self.assertIn("追问泄露范围", cleaned["characters"][0]["notes"])
+        self.assertEqual(len(cleaned["lore"]), 1)
+        self.assertIn("控制多条融资渠道", cleaned["lore"][0]["description"])
+        self.assertIn("发往慕白资本邮箱", cleaned["lore"][0]["description"])
+        self.assertEqual(len(cleaned["foreshadows"]), 1)
+        self.assertIn("代表密室开启", cleaned["foreshadows"][0]["description"])
+        self.assertIn("本章又提到", cleaned["foreshadows"][0]["description"])
+        self.assertEqual(report["trimmed"]["characters"], 0)
+        self.assertEqual(report["trimmed"]["lore"], 0)
+        self.assertEqual(report["trimmed"]["foreshadows"], 0)
 
     def test_normalize_ai_candidates_accepts_chinese_field_aliases(self):
         data = {
@@ -513,6 +607,39 @@ class NovelImportCandidateTests(unittest.TestCase):
         self.assertEqual(project["timeline"].count("第1章旧案重启。"), 1)
         self.assertEqual(project["draft_note"].count("重复句。"), 2)
 
+    def test_apply_import_candidates_keeps_lore_description_without_semantic_filtering(self):
+        project = {
+            "lore": [
+                {
+                    "name": "慕白资本",
+                    "type": "势力",
+                    "description": "表面体面，实际掌控多条资本渠道。",
+                }
+            ]
+        }
+        candidates = {
+            "characters": [],
+            "lore": [
+                {
+                    "name": "慕白资本",
+                    "type": "势力",
+                    "description": (
+                        "慕白资本控制多条融资渠道，是沈家在资本布局中的核心工具，"
+                        "本章中苏明宇将项目资料发往慕白资本邮箱，沈慕白追问泄露范围。"
+                    ),
+                }
+            ],
+            "foreshadows": [],
+            "project_materials": {},
+        }
+
+        _apply_import_candidates(project, candidates, {"lore": [0]})
+
+        description = project["lore"][0]["description"]
+        self.assertIn("补充：慕白资本控制多条融资渠道", description)
+        self.assertIn("发往慕白资本邮箱", description)
+        self.assertIn("追问泄露范围", description)
+
     def test_apply_import_candidates_dedupes_lore_and_foreshadow_descriptions(self):
         lore_line = "夜市只许低调经营一段时间。"
         foreshadow_line = "账册缺页后续牵出皇商。"
@@ -583,6 +710,51 @@ class NovelImportCandidateTests(unittest.TestCase):
         self.assertEqual(project["foreshadow_items"][0]["name"], "虎符失踪")
         self.assertEqual(project["foreshadow_items"][0]["payoff_chapter"], "第二十章")
         self.assertIn("补充：真相揭晓。", project["foreshadow_items"][0]["description"])
+
+    def test_apply_import_candidates_keeps_existing_foreshadow_status_without_explicit_candidate_status(self):
+        project = {
+            "foreshadow_items": [
+                {
+                    "name": "虎符失踪",
+                    "status": "已埋",
+                    "setup_chapter": "第二章",
+                    "payoff_chapter": "",
+                    "description": "半枚虎符首次出现。",
+                }
+            ]
+        }
+        candidates = _normalize_ai_candidates({
+            "foreshadows": [
+                {
+                    "name": "虎符失踪",
+                    "description": "后续牵出兵权交易。",
+                }
+            ]
+        })
+
+        _apply_import_candidates(project, candidates, {"foreshadows": [0]})
+
+        self.assertEqual(project["foreshadow_items"][0]["status"], "已埋")
+        self.assertIn("后续牵出兵权交易", project["foreshadow_items"][0]["description"])
+
+    def test_ai_foreshadow_candidate_without_status_stays_unjudged_until_new_import(self):
+        candidates = _normalize_ai_candidates({
+            "foreshadows": [
+                {
+                    "name": "半枚虎符",
+                    "description": "后续牵出兵权交易。",
+                }
+            ]
+        })
+
+        self.assertEqual(candidates["foreshadows"][0]["status"], "")
+        self.assertFalse(candidates["foreshadows"][0].get("_status_explicit"))
+
+        project = {"foreshadow_items": []}
+        _apply_import_candidates(project, candidates, {"foreshadows": [0]})
+
+        self.assertEqual(project["foreshadow_items"][0]["status"], "未埋")
+        self.assertIn("后续牵出兵权交易", project["foreshadow_items"][0]["description"])
 
 
 if __name__ == "__main__":

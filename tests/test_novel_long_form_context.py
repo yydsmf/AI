@@ -154,7 +154,7 @@ class NovelLongFormContextTests(unittest.TestCase):
         self.assertIn("不是硬性字数要求", context)
         self.assertNotIn("2970-3150字", context)
 
-    def test_chapter_context_includes_core_character_when_outline_uses_role_name(self):
+    def test_chapter_context_ignores_core_role_words_without_exact_character_name(self):
         current = _new_chapter(0)
         current["title"] = "第十二章 入城"
         current["outline"] = "主角入城调查，反派暗中设局。"
@@ -186,11 +186,14 @@ class NovelLongFormContextTests(unittest.TestCase):
         context = _build_chapter_ai_context(project, 0, "draft")
 
         self.assertIn("【本章相关人物】", context)
-        self.assertIn("关联人物：赵明, 沈砚", context)
-        self.assertIn("赵明", context)
-        self.assertIn("查清旧案", context)
-        self.assertIn("沈砚", context)
-        self.assertIn("阻止旧案翻出真相", context)
+        current_section = self._context_section(context, "当前章节")
+        character_section = self._context_section(context, "本章相关人物")
+        self.assertIn("关联人物：", current_section)
+        self.assertNotIn("关联人物：赵明", current_section)
+        self.assertNotIn("赵明", character_section)
+        self.assertNotIn("查清旧案", character_section)
+        self.assertNotIn("沈砚", character_section)
+        self.assertNotIn("阻止旧案翻出真相", character_section)
         self.assertNotIn("路人0", context)
 
     def test_chapter_context_prioritizes_relevant_lore_and_foreshadow(self):
@@ -234,7 +237,7 @@ class NovelLongFormContextTests(unittest.TestCase):
         self.assertIn("旧钟声", context)
         self.assertNotIn("旧线索0", context)
 
-    def test_chapter_context_recalls_lore_from_generic_stage_terms(self):
+    def test_chapter_context_ignores_generic_stage_terms_without_exact_lore_name(self):
         current = _new_chapter(0)
         current["title"] = "第二十一章 回城"
         current["outline"] = "主角回到主舞台，在朝堂继续调查旧案。"
@@ -252,9 +255,10 @@ class NovelLongFormContextTests(unittest.TestCase):
         context = _build_chapter_ai_context(project, 0, "draft")
 
         self.assertIn("【本章相关设定】", context)
-        self.assertIn("王城", context)
-        self.assertIn("故事主舞台", context)
-        self.assertNotIn("普通地点0", context)
+        lore_section = self._context_section(context, "本章相关设定")
+        self.assertNotIn("王城", lore_section)
+        self.assertNotIn("故事主舞台", lore_section)
+        self.assertNotIn("普通地点0", lore_section)
 
     def test_chapter_context_dedupes_reference_notes_without_touching_body_repetition(self):
         current = _new_chapter(0)
@@ -975,6 +979,48 @@ class NovelLongFormContextTests(unittest.TestCase):
         self.assertIn("虎符真相揭晓", context)
         self.assertIn("第七十一章 终局门前", context)
 
+    def test_chapter_context_keeps_saved_archive_notes_without_semantic_filtering(self):
+        current = _new_chapter(0)
+        current["title"] = "第一章 邮件泄露"
+        current["outline"] = "沈慕白追查慕白资本的泄露责任链，旧钟声只作为线索出现。"
+        project = self._project_with_current_chapter(current)
+        project["characters"] = [
+            {
+                "name": "沈慕白",
+                "role": "主角",
+                "goal": "查清泄露责任链",
+                "secret": "",
+                "voice": "",
+                "notes": "沈慕白对信息泄露极度敏感，会优先追查责任链。\n本章沈慕白追问泄露范围。",
+            }
+        ]
+        project["lore"] = [
+            {
+                "name": "慕白资本",
+                "type": "组织",
+                "description": "慕白资本控制多条融资渠道，是沈家资本布局的核心工具。\n本章项目资料发往慕白资本邮箱。",
+            }
+        ]
+        project["foreshadow_items"] = [
+            {
+                "name": "旧钟声",
+                "status": "已埋",
+                "setup_chapter": "第一章",
+                "payoff_chapter": "第十章",
+                "description": "旧钟声代表密室开启，已埋，待在琉璃塔章节回收。\n本章又提到旧钟声。\n主角看到新线索后很震惊。",
+            }
+        ]
+
+        context = _build_chapter_ai_context(project, 0, "draft")
+
+        self.assertIn("沈慕白对信息泄露极度敏感", context)
+        self.assertIn("慕白资本控制多条融资渠道", context)
+        self.assertIn("旧钟声代表密室开启", context)
+        self.assertIn("本章沈慕白追问泄露范围", context)
+        self.assertIn("本章项目资料发往慕白资本邮箱", context)
+        self.assertIn("本章又提到旧钟声", context)
+        self.assertIn("主角看到新线索后很震惊", context)
+
     def test_long_form_check_reports_context_maintenance_gaps(self):
         chapters = []
         for index in range(20):
@@ -1003,7 +1049,7 @@ class NovelLongFormContextTests(unittest.TestCase):
         self.assertIn("缺少摘要/关键事实", check_text)
         self.assertIn("应用 AI 正文后会自动补", check_text)
         self.assertIn("没有关联人物", check_text)
-        self.assertIn("应用 AI 提纲/正文/摘要时会自动识别已有角色并回填", check_text)
+        self.assertIn("可用 AI 摘要按本章实际内容补齐，或手动填写", check_text)
         self.assertIn("人物卡为空", check_text)
         self.assertIn("摘要/事实覆盖：0/20", check_text)
         self.assertIn("关联人物覆盖：0/20", check_text)
@@ -1054,7 +1100,7 @@ class NovelLongFormContextTests(unittest.TestCase):
         self.assertIn("第 1 章「第一章 旧案」标记已完成，但缺少本章摘要", check_text)
         self.assertIn("第 1 章「第一章 旧案」标记已完成，但缺少需继承的关键事实", check_text)
 
-    def test_long_form_check_warns_when_current_chapter_matches_future_reveal(self):
+    def test_long_form_check_does_not_guess_future_reveal_from_keywords(self):
         current = _new_chapter(0)
         current["title"] = "第一章 半枚虎符"
         current["text"] = "赵明提前知道虎符真相。"
@@ -1071,11 +1117,10 @@ class NovelLongFormContextTests(unittest.TestCase):
 
         check_text = _build_writing_check_text(project)
 
-        self.assertIn("可能提前写到第二章 真相的", check_text)
-        self.assertIn("虎符真相", check_text)
-        self.assertIn("提前兑现后续规划", check_text)
+        self.assertNotIn("可能提前写到第二章 真相的", check_text)
+        self.assertNotIn("提前兑现后续规划", check_text)
 
-    def test_long_form_check_warns_when_current_chapter_matches_distant_future_reveal(self):
+    def test_long_form_check_does_not_guess_distant_future_reveal_from_keywords(self):
         chapters = []
         current = _new_chapter(0)
         current["title"] = "第一章 入局"
@@ -1103,11 +1148,10 @@ class NovelLongFormContextTests(unittest.TestCase):
 
         check_text = _build_writing_check_text(project)
 
-        self.assertIn("可能提前写到第四十章 身份真相的", check_text)
-        self.assertIn("沈砚真实身份", check_text)
-        self.assertIn("提前兑现后续规划", check_text)
+        self.assertNotIn("可能提前写到第四十章 身份真相的", check_text)
+        self.assertNotIn("提前兑现后续规划", check_text)
 
-    def test_long_form_check_warns_when_current_chapter_matches_future_parentage_reveal(self):
+    def test_long_form_check_does_not_guess_future_parentage_reveal_from_keywords(self):
         chapters = []
         current = _new_chapter(0)
         current["title"] = "第一章 入局"
@@ -1135,9 +1179,8 @@ class NovelLongFormContextTests(unittest.TestCase):
 
         check_text = _build_writing_check_text(project)
 
-        self.assertIn("可能提前写到第四十章 身世夜谈的", check_text)
-        self.assertIn("沈砚亲生父亲", check_text)
-        self.assertIn("提前兑现后续规划", check_text)
+        self.assertNotIn("可能提前写到第四十章 身世夜谈的", check_text)
+        self.assertNotIn("提前兑现后续规划", check_text)
 
     def test_long_form_check_does_not_nag_outline_only_future_chapters(self):
         chapters = []
@@ -1200,7 +1243,7 @@ class NovelLongFormContextTests(unittest.TestCase):
         self.assertIn("关联人物覆盖：20/20", check_text)
         self.assertNotIn("没有关联人物", check_text)
 
-    def test_long_form_check_counts_core_role_character_links(self):
+    def test_long_form_check_ignores_core_role_words_without_exact_character_name(self):
         chapters = []
         for index in range(20):
             chapter = _new_chapter(index)
@@ -1220,8 +1263,8 @@ class NovelLongFormContextTests(unittest.TestCase):
 
         check_text = _build_writing_check_text(project)
 
-        self.assertIn("关联人物覆盖：20/20", check_text)
-        self.assertNotIn("没有关联人物", check_text)
+        self.assertIn("关联人物覆盖：0/20", check_text)
+        self.assertIn("没有关联人物", check_text)
 
     def test_long_form_check_does_not_count_global_core_character_without_chapter_signal(self):
         chapters = []
@@ -1450,7 +1493,7 @@ class NovelLongFormContextTests(unittest.TestCase):
         self.assertIn("未完成伏笔", text)
         self.assertIn("虎符失踪", text)
 
-    def test_project_summary_draft_counts_core_role_character_activity(self):
+    def test_project_summary_draft_ignores_core_role_words_without_exact_character_name(self):
         chapters = []
         for index in range(14):
             chapter = _new_chapter(index)
@@ -1475,9 +1518,8 @@ class NovelLongFormContextTests(unittest.TestCase):
 
         text = _build_project_summary_draft(project)
 
-        self.assertIn("高频人物快照", text)
-        self.assertIn("赵明", text)
-        self.assertIn("出现 14 章", text)
+        self.assertNotIn("高频人物快照", text)
+        self.assertNotIn("赵明｜出现 14 章", text)
 
     def test_project_summary_draft_keeps_mid_story_milestones_in_long_projects(self):
         chapters = []
@@ -1610,7 +1652,7 @@ class NovelLongFormContextTests(unittest.TestCase):
         self.assertIn("人物：赵明", text)
         self.assertIn("设定：王城", text)
 
-    def test_project_timeline_draft_uses_core_role_characters(self):
+    def test_project_timeline_draft_ignores_core_role_words_without_exact_character_name(self):
         first = _new_chapter(0)
         first["title"] = "第一章 旧案"
         first["summary"] = "主角发现旧案卷宗。"
@@ -1624,7 +1666,7 @@ class NovelLongFormContextTests(unittest.TestCase):
 
         text = _build_project_timeline_draft(project)
 
-        self.assertIn("人物：赵明", text)
+        self.assertNotIn("人物：赵明", text)
 
     def test_project_timeline_draft_uses_lore_alias_from_description(self):
         first = _new_chapter(0)
@@ -1641,7 +1683,7 @@ class NovelLongFormContextTests(unittest.TestCase):
 
         self.assertIn("设定：琉璃塔", text)
 
-    def test_project_timeline_draft_recalls_lore_from_generic_stage_terms(self):
+    def test_project_timeline_draft_ignores_generic_stage_terms_without_exact_lore_name(self):
         first = _new_chapter(0)
         first["title"] = "第一章 回城"
         first["outline"] = "主角回到主舞台，在朝堂继续调查旧案。"
@@ -1658,10 +1700,10 @@ class NovelLongFormContextTests(unittest.TestCase):
 
         text = _build_project_timeline_draft(project)
 
-        self.assertIn("设定：王城", text)
+        self.assertNotIn("设定：王城", text)
         self.assertNotIn("普通设定0", text)
 
-    def test_project_summary_draft_counts_lore_activity_from_generic_stage_terms(self):
+    def test_project_summary_draft_ignores_lore_activity_from_generic_stage_terms(self):
         chapters = []
         for index in range(14):
             chapter = _new_chapter(index)
@@ -1680,9 +1722,8 @@ class NovelLongFormContextTests(unittest.TestCase):
 
         text = _build_project_summary_draft(project)
 
-        self.assertIn("高频设定快照", text)
-        self.assertIn("王城", text)
-        self.assertIn("出现 14 章", text)
+        self.assertNotIn("高频设定快照", text)
+        self.assertNotIn("王城｜地点｜出现 14 章", text)
 
     def test_project_timeline_draft_compresses_long_projects_with_milestones(self):
         chapters = []
@@ -1800,7 +1841,7 @@ class NovelLongFormContextTests(unittest.TestCase):
         self.assertLess(text.index("终局密钥"), text.index("普通已埋伏笔0"))
         self.assertNotIn("普通已埋伏笔44", text)
 
-    def test_infer_foreshadow_status_keeps_unresolved_payoff_wording_open(self):
+    def test_infer_foreshadow_status_only_normalizes_explicit_status(self):
         buried = {
             "name": "虎符失踪",
             "setup_chapter": "第二章",
@@ -1814,12 +1855,16 @@ class NovelLongFormContextTests(unittest.TestCase):
             "name": "旧钟声",
             "description": "密室钟声的真相揭晓，机关已经解开。",
         }
+        explicit_buried = {"name": "虎符失踪", "status": "待回收", "description": "第十章待揭晓。"}
+        explicit_resolved = {"name": "旧钟声", "status": "已兑现", "description": "密室钟声的真相揭晓。"}
 
-        self.assertEqual(_infer_foreshadow_status(buried), "已埋")
+        self.assertEqual(_infer_foreshadow_status(buried), "未埋")
         self.assertEqual(_infer_foreshadow_status(unburied), "未埋")
-        self.assertEqual(_infer_foreshadow_status(resolved), "已回收")
+        self.assertEqual(_infer_foreshadow_status(resolved), "未埋")
+        self.assertEqual(_infer_foreshadow_status(explicit_buried), "已埋")
+        self.assertEqual(_infer_foreshadow_status(explicit_resolved), "已回收")
 
-    def test_writing_check_suggests_foreshadow_payoff_from_chapter_facts(self):
+    def test_writing_check_does_not_infer_foreshadow_payoff_from_chapter_facts(self):
         chapter = _new_chapter(19)
         chapter["title"] = "第二十章 虎符真相"
         chapter["summary"] = "虎符失踪的真相揭晓。"
@@ -1843,8 +1888,8 @@ class NovelLongFormContextTests(unittest.TestCase):
 
         text = _build_writing_check_text(project)
 
-        self.assertIn("伏笔「虎符失踪」可能已在第 1 章「第二十章 虎符真相」回收", text)
-        self.assertIn("建议确认状态或补上回收章节", text)
+        self.assertNotIn("伏笔「虎符失踪」可能已在", text)
+        self.assertIn("伏笔「虎符失踪」已埋，但还没有填写回收章节", text)
 
     def test_writing_check_does_not_treat_unresolved_payoff_wording_as_recovered(self):
         chapter = _new_chapter(9)
@@ -1873,7 +1918,7 @@ class NovelLongFormContextTests(unittest.TestCase):
         self.assertNotIn("伏笔「虎符失踪」可能已在", text)
         self.assertIn("伏笔「虎符失踪」已埋，但还没有填写回收章节", text)
 
-    def test_writing_check_suggests_foreshadow_payoff_from_unsummarized_body(self):
+    def test_writing_check_does_not_infer_foreshadow_payoff_from_unsummarized_body(self):
         chapter = _new_chapter(19)
         chapter["title"] = "第二十章 雨夜"
         chapter["text"] = "赵明终于回收虎符失踪这条线索，揭晓虎符真相，确认牵出兵权。"
@@ -1896,9 +1941,10 @@ class NovelLongFormContextTests(unittest.TestCase):
 
         text = _build_writing_check_text(project)
 
-        self.assertIn("伏笔「虎符失踪」可能已在第 1 章「第二十章 雨夜」回收", text)
+        self.assertNotIn("伏笔「虎符失踪」可能已在", text)
+        self.assertIn("伏笔「虎符失踪」已埋，但还没有填写回收章节", text)
 
-    def test_writing_check_suggests_foreshadow_setup_from_unsummarized_body(self):
+    def test_writing_check_does_not_infer_foreshadow_setup_from_unsummarized_body(self):
         chapter = _new_chapter(1)
         chapter["title"] = "第二章 雨夜"
         chapter["text"] = "赵明发现虎符失踪，暗中留下半枚虎符作为线索。"
@@ -1921,9 +1967,10 @@ class NovelLongFormContextTests(unittest.TestCase):
 
         text = _build_writing_check_text(project)
 
-        self.assertIn("伏笔「虎符失踪」可能已在第 1 章「第二章 雨夜」埋设", text)
+        self.assertNotIn("伏笔「虎符失踪」可能已在", text)
+        self.assertIn("伏笔「虎符失踪」已回收，但缺少埋设章节记录", text)
 
-    def test_writing_check_suggests_foreshadow_payoff_from_alias(self):
+    def test_writing_check_does_not_infer_foreshadow_payoff_from_alias(self):
         chapter = _new_chapter(11)
         chapter["title"] = "第十二章 密室开启"
         chapter["summary"] = "密室钟声的真相揭晓。"
@@ -1947,7 +1994,8 @@ class NovelLongFormContextTests(unittest.TestCase):
 
         text = _build_writing_check_text(project)
 
-        self.assertIn("伏笔「旧钟声」可能已在第 1 章「第十二章 密室开启」回收", text)
+        self.assertNotIn("伏笔「旧钟声」可能已在", text)
+        self.assertIn("伏笔「旧钟声」已埋，但还没有填写回收章节", text)
 
 
 if __name__ == "__main__":

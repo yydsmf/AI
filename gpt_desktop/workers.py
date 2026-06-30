@@ -334,7 +334,9 @@ class NovelAnalysisWorker(QThread):
             "长期有效的人物变化才写入已有人物 notes，例如身份、目标、秘密、阵营、称呼、关系质变、长期伤势/物品或语言风格变化；"
             "普通章节行动、临时情绪、一次性互动和只在本章成立的关系推进，不要写入人物 notes，"
             "其中只有会影响后续章节继承的全局增量，才放入 project_materials.summary 或 timeline。"
-            "设定变化写入 description，伏笔变化写入状态/章节；"
+            "稳定设定变化才写入 lore.description，例如长期有效的规则、制度、结构关系、地点/势力/物品属性、能力限制、固定渠道或所有权；"
+            "本章出现、追问、调查、发送、发现线索、谁去问谁等临时推进，不要写入 lore.description，改放 timeline/summary/foreshadows；"
+            "伏笔变化写入状态/章节；"
             "不要把已有档案里没有在本片段推进的信息当作新发现重复输出。\n"
             "如果这是长文分块的一部分，只提取本片段明确出现或能稳定判断的信息；"
             "没有明确全局增量时，project_materials 对应字段请留空字符串，不要为了填满结构写普通流水账。\n"
@@ -354,6 +356,7 @@ class NovelAnalysisWorker(QThread):
             "普通悬念、单章情绪钩子、一次性疑问、普通信息差和氛围描写不要列为伏笔。"
             "每个片段优先提取 0-3 条最重要伏笔；没有明确跨章节价值就返回空数组。\n"
             "characters.notes 要求：只写会影响后续多章的人物档案增量；如果只是本章发生了什么、短暂情绪或普通互动，就留空字符串。\n"
+            "lore.description 要求：只写后续章节需要继承的稳定设定增量；如果只是本章动作、线索推进、调查过程或临时危机，就留空字符串。\n"
             "project_materials 要求：bible 写故事核心、主线矛盾、主要人物关系和风格基调；"
             "world_rules 写世界观、势力、制度、能力/道具规则；"
             "timeline 只记录关键转折、时间顺序变化、伏笔推进/回收、重要关系或长期状态变化，控制在 1-3 条；"
@@ -628,6 +631,17 @@ class NovelAnalysisWorker(QThread):
         if not name:
             return
         target = output.setdefault(key, [])
+
+        def merge_source_label(target_item, source_label):
+            source_label = str(source_label or "").strip()
+            if not source_label:
+                return
+            old = str(target_item.get("_source_label", "") or "").strip()
+            labels = [line.strip() for line in old.splitlines() if line.strip()]
+            if source_label not in labels:
+                labels.append(source_label)
+            target_item["_source_label"] = "\n".join(labels)
+
         existing = None
         for old in target:
             if isinstance(old, dict) and str(old.get("name", "") or "").strip() == name:
@@ -635,19 +649,25 @@ class NovelAnalysisWorker(QThread):
                 break
         if existing is None:
             data = {field: str(item.get(field, "") or "") for field in ("name",) + tuple(fields)}
-            if key == "foreshadows":
-                data["status"] = _infer_foreshadow_status(data, preserve_manual=False)
+            merge_source_label(data, item.get("_source_label", ""))
+            if key == "foreshadows" and item.get("_status_explicit"):
+                data["status"] = _infer_foreshadow_status({"status": data.get("status", "")}, preserve_manual=False)
             target.append(data)
             return
 
+        merge_source_label(existing, item.get("_source_label", ""))
+
         for field in fields:
             if key == "foreshadows" and field == "status":
-                status_probe = deepcopy(existing)
-                status_probe["status"] = item.get("status", "")
-                for extra_field in ("setup_chapter", "payoff_chapter", "description"):
-                    if str(item.get(extra_field, "") or "").strip():
-                        status_probe[extra_field] = item.get(extra_field, "")
-                existing["status"] = _infer_foreshadow_status(status_probe, preserve_manual=False)
+                if item.get("_status_explicit"):
+                    existing["status"] = _infer_foreshadow_status(
+                        {"status": item.get("status", "")},
+                        preserve_manual=False,
+                    )
+                continue
+            if key == "foreshadows" and field == "_status_explicit":
+                if item.get("_status_explicit"):
+                    existing["_status_explicit"] = True
                 continue
             old = str(existing.get(field, "") or "").strip()
             new = str(item.get(field, "") or "").strip()
@@ -662,8 +682,14 @@ class NovelAnalysisWorker(QThread):
             elif field in append_fields:
                 existing[field] = f"{old}\n补充：{new}"
 
-    def _merge_analysis_result(self, output, data):
+    def _merge_analysis_result(self, output, data, source_label=""):
         data = _normalize_ai_candidates(data)
+        source_label = str(source_label or "").strip()
+        if source_label:
+            for group_key in ("characters", "lore", "foreshadows"):
+                for item in data.get(group_key, []) if isinstance(data.get(group_key, []), list) else []:
+                    if isinstance(item, dict) and not str(item.get("_source_label", "") or "").strip():
+                        item["_source_label"] = source_label
         output.setdefault("project_materials", {})
         for item in data.get("characters", []) if isinstance(data.get("characters", []), list) else []:
             self._merge_candidate_group(
@@ -790,7 +816,11 @@ class NovelAnalysisWorker(QThread):
                                 error_preview = error_preview[:160] + "..."
                             self.progress.emit(f"第 {index}/{total} 块分析失败：{error_preview}；已保留为待重试。")
                         else:
-                            self._merge_analysis_result(merged, parsed)
+                            record = chunk_records[index - 1]
+                            label = record.get("index", index)
+                            label_total = record.get("total", total) or total
+                            source_label = f"第 {label}/{label_total} 块"
+                            self._merge_analysis_result(merged, parsed, source_label=source_label)
                             succeeded += 1
                             processed += 1
                             partial = deepcopy(merged)

@@ -42,6 +42,7 @@ from .core import (
     load_json_file,
     now_str,
     open_local_file,
+    open_local_file_after_app_exit,
     safe_clear_dir,
     safe_remove_file,
     save_input_drafts,
@@ -732,14 +733,17 @@ class ProviderManagerDialog(QDialog):
             f"最新版本：{getattr(info, 'latest_version', '')}\n\n"
         )
         if asset_name:
-            text += f"已找到适合本电脑的安装包：\n{asset_name}\n\n点击“下载并打开安装包”后会自动下载安装到本地更新目录。"
+            text += (
+                f"已找到适合本电脑的安装包：\n{asset_name}\n\n"
+                "点击“下载并退出安装”后会先下载更新包。下载完成后，程序会退出并自动打开安装包。"
+            )
         else:
             text += "没有自动匹配到适合本电脑的安装包，可以打开发布页手动下载。"
         msg.setText(text)
 
         download_btn = None
         if asset_url:
-            download_btn = msg.addButton("下载并打开安装包", QMessageBox.AcceptRole)
+            download_btn = msg.addButton("下载并退出安装", QMessageBox.AcceptRole)
         release_btn = msg.addButton("打开发布页", QMessageBox.ActionRole)
         later_btn = msg.addButton("稍后", QMessageBox.RejectRole)
         msg.setDefaultButton(download_btn or release_btn)
@@ -798,13 +802,31 @@ class ProviderManagerDialog(QDialog):
         QTimer.singleShot(0, cleanup)
 
     def on_update_downloaded(self, path):
-        opened = open_local_file(path)
-        text = f"更新包已下载：\n{path}\n\n"
-        if opened:
-            text += "安装包已经打开。安装时如果提示正在运行，请先关闭当前程序后继续安装。"
-        else:
-            text += "自动打开失败，请手动打开这个文件安装。"
-        QMessageBox.information(self, "更新包已准备好", text)
+        msg = QMessageBox(self)
+        msg.setIcon(QMessageBox.Information)
+        msg.setWindowTitle("更新包已准备好")
+        msg.setText(
+            f"更新包已下载：\n{path}\n\n"
+            "继续后，程序会自动退出，并在退出完成后打开安装包。"
+        )
+        install_btn = msg.addButton("退出并打开安装包", QMessageBox.AcceptRole)
+        later_btn = msg.addButton("稍后手动安装", QMessageBox.RejectRole)
+        msg.setDefaultButton(install_btn)
+        msg.exec()
+
+        if msg.clickedButton() is not install_btn:
+            QMessageBox.information(self, "稍后安装", f"更新包保存在：\n{path}")
+            return
+
+        if not open_local_file_after_app_exit(path):
+            opened = open_local_file(path)
+            if not opened:
+                QMessageBox.warning(self, "打开失败", f"自动打开失败，请手动打开这个文件安装：\n{path}")
+                return
+
+        app = QApplication.instance()
+        if app is not None:
+            QTimer.singleShot(0, app.quit)
 
     def on_update_download_failed(self, err):
         QMessageBox.warning(

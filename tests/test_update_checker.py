@@ -1,5 +1,6 @@
 import unittest
 
+from gpt_desktop.core import _build_windows_open_after_exit_script
 from gpt_desktop.update_checker import (
     compare_versions,
     parse_github_release_page,
@@ -87,6 +88,20 @@ class UpdateCheckerTests(unittest.TestCase):
         self.assertEqual(info.latest_version, "1.2.0")
         self.assertEqual(info.asset.name, "GPTLocalToolbox_Setup_v1.2.0_windows_x64.exe")
         self.assertTrue(info.asset.url.startswith("https://github.com/"))
+
+    def test_windows_open_after_exit_script_waits_before_starting_installer(self):
+        script = _build_windows_open_after_exit_script(
+            r"C:\Users\Test User\Downloads\GPTLocalToolbox_Setup.exe",
+            1234,
+            "GPTLocalToolbox.exe",
+            max_wait_seconds=30,
+        )
+
+        self.assertIn('set "APP_PID=1234"', script)
+        self.assertIn('set "APP_PROCESS=GPTLocalToolbox.exe"', script)
+        self.assertIn('tasklist /FI "PID eq %APP_PID%"', script)
+        self.assertIn('tasklist /FI "IMAGENAME eq %APP_PROCESS%"', script)
+        self.assertIn('start "" "%TARGET%"', script)
 
 
 if __name__ == "__main__":

@@ -1,5 +1,5 @@
 #define MyAppName "GPT工具箱"
-#define MyAppVersion "1.0.6"
+#define MyAppVersion "1.0.7"
 #define MyAppExeName "GPTLocalToolbox.exe"
 
 [Setup]

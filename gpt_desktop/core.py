@@ -1350,6 +1350,93 @@ def open_local_file(path):
         return False
 
 
+def _escape_windows_batch_value(value):
+    return str(value or "").replace("%", "%%")
+
+
+def _build_windows_open_after_exit_script(target_path, current_pid, process_name, max_wait_seconds=120):
+    target_path = _escape_windows_batch_value(os.path.abspath(target_path))
+    process_name = _escape_windows_batch_value(process_name)
+    return "\r\n".join([
+        "@echo off",
+        "setlocal EnableExtensions EnableDelayedExpansion",
+        f"set \"TARGET={target_path}\"",
+        f"set \"APP_PID={int(current_pid)}\"",
+        f"set \"APP_PROCESS={process_name}\"",
+        f"set \"MAX_WAIT={int(max_wait_seconds)}\"",
+        "set /a WAITED=0",
+        ":wait_pid",
+        "tasklist /FI \"PID eq %APP_PID%\" 2>NUL | find \"%APP_PID%\" >NUL",
+        "if not errorlevel 1 (",
+        "  timeout /T 1 /NOBREAK >NUL",
+        "  set /a WAITED+=1",
+        "  if !WAITED! LSS !MAX_WAIT! goto wait_pid",
+        ")",
+        "set /a WAITED=0",
+        ":wait_process",
+        "if not \"%APP_PROCESS%\"==\"\" (",
+        "  tasklist /FI \"IMAGENAME eq %APP_PROCESS%\" 2>NUL | find /I \"%APP_PROCESS%\" >NUL",
+        "  if not errorlevel 1 (",
+        "    timeout /T 1 /NOBREAK >NUL",
+        "    set /a WAITED+=1",
+        "    if !WAITED! LSS 10 goto wait_process",
+        "  )",
+        ")",
+        "start \"\" \"%TARGET%\"",
+        "del \"%~f0\" >NUL 2>NUL",
+        "",
+    ])
+
+
+def open_local_file_after_app_exit(path):
+    try:
+        if not path or not os.path.exists(path):
+            return False
+
+        if sys.platform.startswith("win"):
+            updates_dir = os.path.join(APP_DIR, "updates")
+            os.makedirs(updates_dir, exist_ok=True)
+            script_path = os.path.join(updates_dir, f"open_update_after_exit_{os.getpid()}.cmd")
+            process_name = os.path.basename(sys.executable or "")
+            script = _build_windows_open_after_exit_script(path, os.getpid(), process_name)
+            with open(script_path, "w", encoding="utf-8", newline="") as f:
+                f.write(script)
+
+            flags = 0
+            for name in ("CREATE_NO_WINDOW", "CREATE_NEW_PROCESS_GROUP"):
+                flags |= int(getattr(subprocess, name, 0))
+            subprocess.Popen(
+                ["cmd.exe", "/c", script_path],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                close_fds=True,
+                creationflags=flags,
+            )
+            return True
+
+        if sys.platform == "darwin":
+            subprocess.Popen(
+                ["/bin/sh", "-c", "while kill -0 \"$1\" 2>/dev/null; do sleep 0.5; done; open \"$2\"", "open-after-exit", str(os.getpid()), path],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                close_fds=True,
+            )
+            return True
+
+        subprocess.Popen(
+            ["/bin/sh", "-c", "while kill -0 \"$1\" 2>/dev/null; do sleep 0.5; done; xdg-open \"$2\"", "open-after-exit", str(os.getpid()), path],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            close_fds=True,
+        )
+        return True
+    except Exception:
+        return False
+
+
 # ============================================================
 # 中文文件选择器
 # ============================================================

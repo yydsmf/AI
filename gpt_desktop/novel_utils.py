@@ -416,6 +416,18 @@ def _normalize_candidate_analysis_state(data):
         state["failed_candidate_chunks"] = failed_chunks
     if pending_ids:
         state["pending_candidate_chapter_ids"] = pending_ids
+    postprocess = data.get("candidate_postprocess", {})
+    if isinstance(postprocess, dict):
+        status = str(postprocess.get("status", "") or "").strip()
+        if status in {"pending", "failed"}:
+            item = {"status": status}
+            error = str(postprocess.get("error", "") or "").strip()
+            if error:
+                item["error"] = error
+            updated_at = str(postprocess.get("updated_at", "") or "").strip()
+            if updated_at:
+                item["updated_at"] = updated_at
+            state["candidate_postprocess"] = item
     return state
 
 

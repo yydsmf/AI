@@ -97,6 +97,8 @@ def _merge_candidate_analysis_state(primary, fallback):
         merged_state["failed_candidate_chunks"] = deepcopy(fallback_state["failed_candidate_chunks"])
     if not merged_state.get("pending_candidate_chapter_ids") and fallback_state.get("pending_candidate_chapter_ids"):
         merged_state["pending_candidate_chapter_ids"] = deepcopy(fallback_state["pending_candidate_chapter_ids"])
+    if not merged_state.get("candidate_postprocess") and fallback_state.get("candidate_postprocess"):
+        merged_state["candidate_postprocess"] = deepcopy(fallback_state["candidate_postprocess"])
     if merged_state:
         primary["analysis_state"] = merged_state
     return primary

@@ -111,7 +111,7 @@ from .novel_utils import (
     _split_manuscript_into_target_chapters,
 )
 from .widgets import ProviderModelBar, WideComboBox
-from .workers import EdgeTTSWorker, NovelAnalysisWorker, NovelWritingWorker
+from .workers import EdgeTTSWorker, NovelAnalysisWorker, NovelCandidatePostprocessWorker, NovelWritingWorker
 
 _SORT_MISSING_ORDER = 10 ** 9
 _CHINESE_NUMERAL_DIGITS = {
@@ -228,6 +228,7 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
         self.last_import_text = ""
         self.pending_analysis_chapter_ids = []
         self.failed_analysis_chunks = []
+        self.candidate_postprocess_state = {}
         self._analysis_stop_requested_by_user = False
         self._chapter_ai_stop_requested_by_user = False
         self._chapter_ai_preview_action = ""
@@ -2199,6 +2200,7 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
             analysis_state = _normalize_candidate_analysis_state(self.current_project.get("analysis_state", {}))
             self.failed_analysis_chunks = analysis_state.get("failed_candidate_chunks", [])
             self.pending_analysis_chapter_ids = analysis_state.get("pending_candidate_chapter_ids", [])
+            self.candidate_postprocess_state = analysis_state.get("candidate_postprocess", {})
             self.import_candidates = _normalize_import_candidates(self.current_project.get("import_candidates", {}))
             meta = self.current_project["meta"]
             self.title_edit.setText(meta.get("title", ""))
@@ -2826,11 +2828,17 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
             failed_count = len(getattr(self, "failed_analysis_chunks", []) or [])
             pending_count = len(getattr(self, "pending_analysis_chapter_ids", []) or [])
             failed_summary = self._failed_candidate_error_summary()
+            post_status = self._candidate_postprocess_status()
+            post_error = self._candidate_postprocess_error()
             if total:
                 material_text = "/".join(material_labels) if material_labels else "0"
                 text = f"候选：人物 {counts['characters']} · 设定 {counts['lore']} · 伏笔 {counts['foreshadows']} · 资料草案 {material_text}"
                 if failed_count:
                     text += f" · 待重试 {failed_count} 块"
+                elif post_status == "pending":
+                    text += " · 候选合并待继续"
+                elif post_status == "failed":
+                    text += " · 候选合并失败，可重试"
                 if pending_count:
                     text += f" · 待分析 {pending_count} 章"
                 self.candidate_count_label.setText(text)
@@ -2840,7 +2848,12 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
                 self.candidate_count_label.setText(f"暂无候选；有 {pending_count} 个章节等待 AI 分析。")
             else:
                 self.candidate_count_label.setText("暂无候选；可先导入 Word/TXT，或使用 AI 分析候选。")
-            self.candidate_count_label.setToolTip(failed_summary)
+            tooltip_parts = []
+            if failed_summary:
+                tooltip_parts.append(failed_summary)
+            if post_error:
+                tooltip_parts.append(f"候选合并/查重：{post_error}")
+            self.candidate_count_label.setToolTip("\n".join(tooltip_parts))
         lists = (
             (self.candidate_character_list, self.import_candidates.get("characters", []), "characters"),
             (self.candidate_lore_list, self.import_candidates.get("lore", []), "lore"),
@@ -3103,12 +3116,17 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
         if not isinstance(self.current_project, dict):
             return
         self._prune_candidate_analysis_state_to_existing_chapters()
+        postprocess_state = getattr(self, "candidate_postprocess_state", {}) or {}
+        if not isinstance(postprocess_state, dict):
+            postprocess_state = {}
         state = _normalize_candidate_analysis_state({
             "failed_candidate_chunks": getattr(self, "failed_analysis_chunks", []) or [],
             "pending_candidate_chapter_ids": getattr(self, "pending_analysis_chapter_ids", []) or [],
+            "candidate_postprocess": postprocess_state,
         })
         self.failed_analysis_chunks = state.get("failed_candidate_chunks", [])
         self.pending_analysis_chapter_ids = state.get("pending_candidate_chapter_ids", [])
+        self.candidate_postprocess_state = state.get("candidate_postprocess", {})
         if not state:
             self.current_project.pop("analysis_state", None)
             return
@@ -3127,11 +3145,13 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
     def _clear_candidate_analysis_state(self):
         self.failed_analysis_chunks = []
         self.pending_analysis_chapter_ids = []
+        self.candidate_postprocess_state = {}
         if isinstance(self.current_project, dict):
             state = self.current_project.get("analysis_state", {})
             if isinstance(state, dict):
                 state.pop("failed_candidate_chunks", None)
                 state.pop("pending_candidate_chapter_ids", None)
+                state.pop("candidate_postprocess", None)
                 if not state:
                     self.current_project.pop("analysis_state", None)
 
@@ -3319,6 +3339,35 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
             parts.append(f"已清理 {trimmed_total} 条重复/占位说明")
         return "；" + "，".join(parts) if parts else ""
 
+    def _candidate_postprocess_status(self):
+        state = getattr(self, "candidate_postprocess_state", {}) or {}
+        if not isinstance(state, dict):
+            return ""
+        return str(state.get("status", "") or "").strip()
+
+    def _candidate_postprocess_error(self):
+        state = getattr(self, "candidate_postprocess_state", {}) or {}
+        if not isinstance(state, dict):
+            return ""
+        return str(state.get("error", "") or "").strip()
+
+    def _has_candidate_postprocess_pending(self):
+        return (
+            self._candidate_postprocess_status() in {"pending", "failed"}
+            and _import_candidates_has_content(getattr(self, "import_candidates", {}))
+        )
+
+    def _set_candidate_postprocess_state(self, status="", error=""):
+        status = str(status or "").strip()
+        if status not in {"pending", "failed"}:
+            self.candidate_postprocess_state = {}
+            return
+        state = {"status": status, "updated_at": now_str()}
+        error = str(error or "").strip()
+        if error:
+            state["error"] = error
+        self.candidate_postprocess_state = state
+
     def _apply_candidate_analysis_result(self, data):
         data = data if isinstance(data, dict) else {}
         state = _normalize_candidate_analysis_state({
@@ -3336,6 +3385,14 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
             raw_candidates,
         )
         return self._candidate_analysis_chunk_stats(data)
+
+    def _apply_candidate_postprocess_result(self, data):
+        raw_candidates = _normalize_ai_candidates(data)
+        self.import_candidates, self._last_candidate_auto_cleanup_report = _sanitize_import_candidates_for_long_form(
+            self.current_project,
+            raw_candidates,
+        )
+        self._set_candidate_postprocess_state("")
 
     def _refresh_candidate_analysis_result_view(self):
         self.refresh_import_candidate_lists()
@@ -3366,6 +3423,27 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
                     seen.add(chapter_id)
         return pending
 
+    def _start_candidate_postprocess(self, provider, model):
+        self._set_candidate_postprocess_state("pending")
+        self._sync_candidate_analysis_state()
+        self.analysis_worker = NovelCandidatePostprocessWorker(
+            provider.get("base_url", ""),
+            provider.get("api_key", ""),
+            model,
+            deepcopy(self.import_candidates),
+            _candidate_analysis_dossier_text(self.current_project),
+            provider.get("proxy_url", ""),
+            self._provider_proxy_mode(provider),
+        )
+        self.analysis_worker.progress.connect(self.set_status_tip)
+        self.analysis_worker.result_ready.connect(self.on_ai_candidate_postprocess_ready)
+        self.analysis_worker.failed.connect(self.on_ai_candidate_postprocess_failed)
+        self.analysis_worker.finished.connect(self._cleanup_analysis_worker)
+        self._analysis_stop_requested_by_user = False
+        self._set_candidate_actions_enabled(False)
+        self.set_status_tip("正在进行 AI 候选合并和已有档案查重...")
+        self.analysis_worker.start()
+
     def analyze_import_candidates_with_ai(self):
         if self.analysis_worker is not None and self.analysis_worker.isRunning():
             self.set_status_tip("AI 正在分析候选，请稍等。")
@@ -3377,6 +3455,9 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
             QMessageBox.warning(self, "AI 分析失败", error)
             return
         self._flush_current_editors()
+        if self._has_candidate_postprocess_pending():
+            self._start_candidate_postprocess(provider, model)
+            return
         retry_chunk_items = [
             deepcopy(item)
             for item in (getattr(self, "failed_analysis_chunks", []) or [])
@@ -4236,6 +4317,12 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
 
     def on_ai_candidates_ready(self, data):
         total, succeeded = self._apply_candidate_analysis_result(data)
+        if self.failed_analysis_chunks:
+            self._set_candidate_postprocess_state("")
+        elif _import_candidates_has_content(self.import_candidates):
+            self._set_candidate_postprocess_state("pending")
+        else:
+            self._set_candidate_postprocess_state("")
         self._persist_candidate_analysis_state()
         self._refresh_candidate_analysis_result_view()
         self._reload_chapter_list(self.current_chapter_index)
@@ -4248,9 +4335,22 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
                 f"AI 分析部分完成：成功 {succeeded}/{total} 块，失败 {len(self.failed_analysis_chunks)} 块；下次点击 AI 分析候选会优先重试失败块{cleanup_tail}。{reason_tail}"
             )
         else:
+            if not _import_candidates_has_content(self.import_candidates):
+                self.set_status_tip(
+                    f"AI 分析完成：没有发现需要加入项目的候选内容{cleanup_tail}"
+                )
+                return
             self.set_status_tip(
-                f"AI 分析完成：人物 {len(self.import_candidates['characters'])}，设定 {len(self.import_candidates['lore'])}，伏笔 {len(self.import_candidates['foreshadows'])}，资料草案 {material_hits}{cleanup_tail}"
+                f"AI 分析完成：人物 {len(self.import_candidates['characters'])}，设定 {len(self.import_candidates['lore'])}，伏笔 {len(self.import_candidates['foreshadows'])}，资料草案 {material_hits}{cleanup_tail}；正在继续合并候选并查重..."
             )
+            provider, model, error = self._current_novel_ai_selection()
+            if error:
+                self._set_candidate_postprocess_state("failed", error)
+                self._persist_candidate_analysis_state()
+                self.refresh_import_candidate_lists()
+                self.set_status_tip(f"块分析已保存；候选合并待继续：{error}")
+                return
+            self._start_candidate_postprocess(provider, model)
 
     def on_ai_candidates_partial(self, data, completed, total):
         self._apply_candidate_analysis_result(data)
@@ -4279,6 +4379,25 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
         self.set_status_tip(f"AI 分析失败：{clean_error_text(err)[:100]}{tail}")
         QMessageBox.warning(self, "AI 分析失败", clean_error_text(err))
 
+    def on_ai_candidate_postprocess_ready(self, data):
+        self._apply_candidate_postprocess_result(data)
+        self._persist_candidate_analysis_state()
+        self._refresh_candidate_analysis_result_view()
+        self._reload_chapter_list(self.current_chapter_index)
+        material_hits = self._candidate_material_status_text()
+        cleanup_tail = self._candidate_auto_cleanup_status_text()
+        self.set_status_tip(
+            f"AI 候选合并完成：人物 {len(self.import_candidates['characters'])}，设定 {len(self.import_candidates['lore'])}，伏笔 {len(self.import_candidates['foreshadows'])}，资料草案 {material_hits}{cleanup_tail}"
+        )
+
+    def on_ai_candidate_postprocess_failed(self, err):
+        message = clean_error_text(err)
+        self._set_candidate_postprocess_state("failed", message)
+        self._persist_candidate_analysis_state()
+        self._refresh_candidate_analysis_result_view()
+        self.set_status_tip(f"候选已保存；AI 候选合并/查重失败，可再次点击 AI 分析候选继续：{message[:100]}")
+        QMessageBox.warning(self, "AI 候选合并失败", f"{message}\n\n块分析结果已保留在候选区，可再次点击“AI 分析候选”重试合并/查重。")
+
     def _cleanup_analysis_worker(self):
         worker = self.sender()
         def cleanup():
@@ -4287,7 +4406,8 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
                     self.analysis_worker = None
                 if worker is not None:
                     worker.deleteLater()
-                self._set_candidate_actions_enabled(True)
+                if self.analysis_worker is None:
+                    self._set_candidate_actions_enabled(True)
                 if getattr(self, "_analysis_stop_requested_by_user", False):
                     self._analysis_stop_requested_by_user = False
                     self._persist_candidate_analysis_state()
@@ -4328,6 +4448,7 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
                 self.pending_analysis_chapter_ids,
             )
             self.pending_analysis_chapter_ids = []
+            self._set_candidate_postprocess_state("")
         self._sync_candidate_analysis_state()
         self._sync_import_candidates_to_project()
         self.refresh_import_candidate_lists()

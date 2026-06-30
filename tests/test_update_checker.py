@@ -8,6 +8,7 @@ from gpt_desktop.core import _build_windows_open_after_exit_script
 from gpt_desktop.update_checker import (
     ReleaseAsset,
     build_windows_updater_command,
+    check_latest_release,
     compare_versions,
     copy_windows_updater_to_temp,
     default_windows_app_exe_name,
@@ -97,6 +98,28 @@ class UpdateCheckerTests(unittest.TestCase):
         self.assertEqual(info.asset.name, "GPTLocalToolbox_Setup_v1.2.0_windows_x64.exe")
         self.assertTrue(info.asset.url.startswith("https://github.com/"))
 
+    def test_check_latest_release_falls_back_to_page_when_api_assets_are_empty(self):
+        api_response = mock.Mock()
+        api_response.status_code = 200
+        api_response.json.return_value = {
+            "tag_name": "v1.2.0",
+            "html_url": "https://github.com/yydsmf/AI/releases/tag/v1.2.0",
+            "assets": [],
+        }
+        page_response = mock.Mock()
+        page_response.status_code = 200
+        page_response.url = "https://github.com/yydsmf/AI/releases/tag/v1.2.0"
+        page_response.text = """
+        <a href="/yydsmf/AI/releases/download/v1.2.0/GPTLocalToolbox_Setup_v1.2.0_windows_x64.exe">win</a>
+        """
+
+        with mock.patch("gpt_desktop.update_checker.requests.get", side_effect=[api_response, page_response]):
+            info = check_latest_release(current_version="1.0.0", platform_key="windows-x64")
+
+        self.assertTrue(info.has_update)
+        self.assertIsNotNone(info.asset)
+        self.assertEqual(info.asset.name, "GPTLocalToolbox_Setup_v1.2.0_windows_x64.exe")
+
     def test_windows_open_after_exit_script_waits_before_starting_installer(self):
         script = _build_windows_open_after_exit_script(
             r"C:\Users\Test User\Downloads\GPTLocalToolbox_Setup.exe",
@@ -159,6 +182,27 @@ class UpdateCheckerTests(unittest.TestCase):
                 os.remove(copied)
             except OSError:
                 pass
+
+    def test_copy_windows_updater_to_temp_copies_runtime_dlls(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            source = os.path.join(tmp, "GPTToolboxUpdater.exe")
+            runtime = os.path.join(tmp, "vcruntime140.dll")
+            with open(source, "wb") as f:
+                f.write(b"updater")
+            with open(runtime, "wb") as f:
+                f.write(b"runtime")
+            with mock.patch.object(sys, "platform", "win32"):
+                copied = copy_windows_updater_to_temp(source)
+
+            copied_runtime = os.path.join(os.path.dirname(copied), "vcruntime140.dll")
+            self.assertTrue(os.path.exists(copied_runtime))
+            with open(copied_runtime, "rb") as f:
+                self.assertEqual(f.read(), b"runtime")
+            for path in (copied, copied_runtime):
+                try:
+                    os.remove(path)
+                except OSError:
+                    pass
 
 
 if __name__ == "__main__":

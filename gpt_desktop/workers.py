@@ -852,6 +852,132 @@ class NovelAnalysisWorker(QThread):
             self._close_active_network_handles()
 
 
+class NovelCandidatePostprocessWorker(NovelAnalysisWorker):
+    def __init__(
+        self,
+        base_url,
+        api_key,
+        model,
+        candidates,
+        dossier,
+        proxy_url="",
+        proxy_mode="不使用代理",
+    ):
+        self.candidates = _normalize_ai_candidates(candidates)
+        super().__init__(
+            base_url,
+            api_key,
+            model,
+            "",
+            proxy_url=proxy_url,
+            proxy_mode=proxy_mode,
+            max_concurrency=1,
+            dossier=dossier,
+        )
+
+    def _postprocess_prompt(self):
+        return (
+            "你是长篇小说资料整理助手。请对已经分块提取出的候选资料做最终合并、去重和对已有项目档案查重。\n"
+            "你必须只输出一个合法 JSON 对象，不要 Markdown，不要解释，不要注释，不要尾随逗号。\n"
+            "所有字符串里的换行、引号都必须正确 JSON 转义。\n"
+            "任务：\n"
+            "1. 合并块与块之间的重复候选。同一人物、设定、伏笔只保留一条，说明要整合成完整但精炼的表达。\n"
+            "2. 对照【已有项目档案】查重。已有档案里已经稳定存在的信息，不要作为新增候选重复输出。\n"
+            "3. 只保留确实需要入库或补充到已有档案的长期信息；普通章节行动、临时情绪、一次性互动、调查过程和流水账不要进入人物备注或设定说明。\n"
+            "4. 如果候选与已有项目档案是同一对象，请使用已有档案中的规范名称；不确定是否同一对象时分开保留，不要强行合并。\n"
+            "5. 伏笔要保守：同一线索才合并；只是相似主题但回收目标不同的伏笔要分开。\n"
+            "6. 小说圣经和世界观/规则只作为查重和冲突参考，不要因为已有档案存在就自动重写；确有新增草案时才放入 project_materials。\n"
+            "7. 时间线和摘要只承接全局剧情进展，避免和人物备注、设定说明重复表达同一件事。\n"
+            "JSON 结构：{\n"
+            '  "characters": [{"name":"","role":"","goal":"","secret":"","voice":"","notes":""}],\n'
+            '  "lore": [{"name":"","type":"地点/势力/物品/规则/术语/事件/其他","description":""}],\n'
+            '  "foreshadows": [{"name":"","status":"","setup_chapter":"","payoff_chapter":"","description":""}],\n'
+            '  "project_materials": {"bible":"","world_rules":"","timeline":"","summary":""}\n'
+            "}\n"
+            "输出要求：空字段用空字符串，空列表用 []；不要输出已重复、已被已有档案覆盖、或只适合本章临时记录的内容。"
+        )
+
+    def _postprocess_user_text(self):
+        payload = {
+            "已有项目档案": self.dossier,
+            "分块候选": self.candidates,
+        }
+        return json.dumps(payload, ensure_ascii=False, indent=2)
+
+    def _chunk_user_text(self, chunk_text, chunk_index, total_chunks):
+        return str(chunk_text or "")
+
+    def _analyze_chunk_resilient(self, prompt, chunk, label, total, use_response_format):
+        response_format_supported, stream_supported = self._analysis_request_capabilities()
+        use_response_format = bool(use_response_format and response_format_supported)
+        try:
+            if stream_supported:
+                return self._post_analysis_chunk_stream(prompt, chunk, label, total, use_response_format), use_response_format
+            return self._post_analysis_chunk(prompt, chunk, label, total, use_response_format), use_response_format
+        except Exception as e:
+            msg = str(e).lower()
+            if use_response_format and ("response_format" in msg or "json_object" in msg):
+                self._set_analysis_response_format_supported(False)
+                self.progress.emit("当前接口不支持强制 JSON，已降级继续候选合并...")
+                try:
+                    if stream_supported:
+                        return self._post_analysis_chunk_stream(prompt, chunk, label, total, False), False
+                    return self._post_analysis_chunk(prompt, chunk, label, total, False), False
+                except Exception as e2:
+                    if self._is_stream_unsupported_error(e2):
+                        self._set_analysis_stream_supported(False)
+                        self.progress.emit("当前接口不支持流式候选合并，已自动退回普通请求...")
+                        return self._post_analysis_chunk(prompt, chunk, label, total, False), False
+                    if stream_supported and self._is_stream_transport_error(e2):
+                        self._set_analysis_stream_supported(False)
+                        self.progress.emit("流式候选合并连接提前结束，已切换为普通请求重试...")
+                        return self._post_analysis_chunk(prompt, chunk, label, total, False), False
+                    raise
+            if self._is_stream_unsupported_error(e):
+                self._set_analysis_stream_supported(False)
+                self.progress.emit("当前接口不支持流式候选合并，已自动退回普通请求...")
+                return self._post_analysis_chunk(prompt, chunk, label, total, use_response_format), use_response_format
+            if stream_supported and self._is_stream_transport_error(e):
+                self._set_analysis_stream_supported(False)
+                self.progress.emit("流式候选合并连接提前结束，已切换为普通请求重试...")
+                return self._post_analysis_chunk(prompt, chunk, label, total, use_response_format), use_response_format
+            raise
+
+    def run(self):
+        try:
+            if not self.base_url:
+                raise Exception("请先选择厂商。")
+            if not self.api_key:
+                raise Exception("请先设置 API Key。")
+            if not self.model:
+                raise Exception("请选择模型。")
+            if not any(self.candidates.get(key) for key in ("characters", "lore", "foreshadows")):
+                materials = self.candidates.get("project_materials", {})
+                if not isinstance(materials, dict) or not any(str(value or "").strip() for value in materials.values()):
+                    raise Exception("没有可合并的候选内容。")
+            self.progress.emit("正在进行 AI 候选合并和已有档案查重...")
+            parsed, _response_format = self._analyze_chunk_with_retries(
+                self._postprocess_prompt(),
+                self._postprocess_user_text(),
+                1,
+                1,
+                True,
+            )
+            if self._stop_requested or self.isInterruptionRequested():
+                return
+            normalized = _normalize_ai_candidates(parsed)
+            if not any(normalized.get(key) for key in ("characters", "lore", "foreshadows")):
+                materials = normalized.get("project_materials", {})
+                if not isinstance(materials, dict) or not any(str(value or "").strip() for value in materials.values()):
+                    raise Exception("AI 候选合并没有返回有效候选，已保留分块结果。")
+            self.result_ready.emit(normalized)
+        except Exception as e:
+            if not self._stop_requested and not self.isInterruptionRequested():
+                self.failed.emit(str(e))
+        finally:
+            self._close_active_network_handles()
+
+
 class NovelWritingWorker(QThread):
     chunk = Signal(str)
     result_ready = Signal(str, str)

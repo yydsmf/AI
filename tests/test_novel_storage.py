@@ -38,6 +38,10 @@ class NovelStorageTests(unittest.TestCase):
                             }
                         ],
                         "pending_candidate_chapter_ids": ["chapter-a"],
+                        "candidate_postprocess": {
+                            "status": "failed",
+                            "error": "timeout",
+                        },
                     },
                 })
                 save_json_file(last_path, {"path": project_path})
@@ -49,6 +53,7 @@ class NovelStorageTests(unittest.TestCase):
                 self.assertEqual(len(state.get("failed_candidate_chunks", [])), 1)
                 self.assertEqual(state["failed_candidate_chunks"][0]["text"], "失败块正文")
                 self.assertEqual(state.get("pending_candidate_chapter_ids"), ["chapter-a"])
+                self.assertEqual(state.get("candidate_postprocess", {}).get("status"), "failed")
             finally:
                 novel_storage.NOVEL_DRAFT_FILE = old_draft
                 novel_storage.NOVEL_LAST_FILE = old_last

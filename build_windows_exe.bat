@@ -3,6 +3,7 @@ setlocal
 
 cd /d "%~dp0"
 set "APP_NAME=GPTLocalToolbox.exe"
+set "UPDATER_NAME=GPTToolboxUpdater.exe"
 set "SETUP_NAME=GPTLocalToolbox_Setup.exe"
 set "PYTHON_CMD="
 set "ISCC_EXE="
@@ -105,8 +106,10 @@ python -m pip install --upgrade --prefer-binary --cache-dir "%PIP_CACHE_DIR%" -r
 if errorlevel 1 goto pip_fail
 
 if exist "%APP_NAME%" del "%APP_NAME%"
+if exist "%UPDATER_NAME%" del "%UPDATER_NAME%"
 if exist "%SETUP_NAME%" del "%SETUP_NAME%"
 if exist "%DIST_DIR%\%APP_NAME%" del "%DIST_DIR%\%APP_NAME%"
+if exist "%DIST_DIR%\%UPDATER_NAME%" del "%DIST_DIR%\%UPDATER_NAME%"
 
 python -m PyInstaller --clean --noconfirm --distpath "%DIST_DIR%" --workpath "%WORK_DIR%" GPTLocalToolbox_windows.spec
 if errorlevel 1 goto fail
@@ -116,7 +119,17 @@ if not exist "%DIST_DIR%\%APP_NAME%" (
     goto fail
 )
 
+python -m PyInstaller --clean --noconfirm --distpath "%DIST_DIR%" --workpath "%WORK_DIR%-updater" GPTToolboxUpdater_windows.spec
+if errorlevel 1 goto fail
+
+if not exist "%DIST_DIR%\%UPDATER_NAME%" (
+    echo Build finished, but %DIST_DIR%\%UPDATER_NAME% was not found.
+    goto fail
+)
+
 copy /Y "%DIST_DIR%\%APP_NAME%" "%CD%\%APP_NAME%" >nul
+if errorlevel 1 goto fail
+copy /Y "%DIST_DIR%\%UPDATER_NAME%" "%CD%\%UPDATER_NAME%" >nul
 if errorlevel 1 goto fail
 
 if exist "%ProgramFiles(x86)%\Inno Setup 6\ISCC.exe" set "ISCC_EXE=%ProgramFiles(x86)%\Inno Setup 6\ISCC.exe"

@@ -134,6 +134,8 @@ C:\Program Files\Python312\python.exe
 
 当前程序是 PySide6/Qt 桌面程序，PyInstaller 会把 Python、PySide6、Qt、requests、python-docx、pypdf、edge-tts、Pillow 等 Python 依赖打进 `GPTLocalToolbox.exe`。
 
+在线更新用的 `GPTToolboxUpdater.exe` 也会单独打包，并显式携带 Python 启动所需的 VC++ 运行库 DLL。这样它被复制到系统临时目录后，仍能在缺少 VC++ 运行库的 Windows 机器上启动。
+
 当前代码没有发现必须单独安装的 Node.js、.NET Runtime 或 WebView2 Runtime 依赖。
 
 少数 Windows 电脑可能缺少 Microsoft Visual C++ Redistributable。安装脚本已经预留了检测和自动安装逻辑：

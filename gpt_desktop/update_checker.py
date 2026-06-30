@@ -261,7 +261,17 @@ def check_latest_release(current_version=APP_VERSION, platform_key=None, timeout
                 platform_key=platform_key,
                 timeout=timeout,
             )
-        return parse_github_release(resp.json(), current_version=current_version, platform_key=platform_key)
+        info = parse_github_release(resp.json(), current_version=current_version, platform_key=platform_key)
+        if info.has_update and info.asset is None:
+            try:
+                return check_latest_release_page(
+                    current_version=current_version,
+                    platform_key=platform_key,
+                    timeout=timeout,
+                )
+            except Exception:
+                return info
+        return info
     except RuntimeError:
         raise
     except Exception:
@@ -358,9 +368,37 @@ def copy_windows_updater_to_temp(updater_path=None):
         os.makedirs(temp_dir, exist_ok=True)
         temp_path = os.path.join(temp_dir, f"GPTToolboxUpdater_{os.getpid()}_{uuid.uuid4().hex[:8]}.exe")
         shutil.copy2(updater_path, temp_path)
+        _copy_windows_updater_runtime_files(updater_path, temp_dir)
         return temp_path
     except Exception:
         return ""
+
+
+def _copy_windows_updater_runtime_files(updater_path, temp_dir):
+    source_dir = os.path.dirname(os.path.abspath(str(updater_path or "")))
+    temp_dir = str(temp_dir or "").strip()
+    if not source_dir or not temp_dir or not os.path.isdir(source_dir):
+        return []
+    runtime_names = (
+        "vcruntime140.dll",
+        "vcruntime140_1.dll",
+        "msvcp140.dll",
+        "msvcp140_1.dll",
+        "msvcp140_2.dll",
+        "concrt140.dll",
+    )
+    copied = []
+    for name in runtime_names:
+        src = os.path.join(source_dir, name)
+        if not os.path.exists(src):
+            continue
+        dest = os.path.join(temp_dir, name)
+        try:
+            shutil.copy2(src, dest)
+            copied.append(dest)
+        except Exception:
+            continue
+    return copied
 
 
 def build_windows_updater_command(asset, release_url="", parent_pid=None, updater_path=None, app_exe=None):

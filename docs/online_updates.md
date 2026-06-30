@@ -52,6 +52,8 @@ macOS 发布包当前面向 macOS 12 及以上系统。PySide6 6.10 及更新版
 
 Windows 安装器会在打包时下载微软官方 `VC_redist.x64.exe`，并在用户安装时检测 Microsoft Visual C++ 运行库。如果用户电脑缺少该运行库，安装器会自动静默安装。
 
+独立更新器本身也会随包携带 Python 运行所需的 VC++ DLL。这样用户在旧版本里点击在线更新时，即使本机还没安装 Microsoft Visual C++ 运行库，更新器也能先启动并打开新版安装包。
+
 当前程序没有使用 .NET Runtime、WebView2 Runtime 或 Node.js 作为运行依赖，因此不需要用户额外安装这些环境。
 
 用户仍然需要在程序设置里填写自己的 AI 服务地址、API Key 和模型名称；这些属于账号配置，不会预置在安装包里。

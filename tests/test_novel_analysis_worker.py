@@ -1,6 +1,6 @@
 import unittest
 
-from gpt_desktop.workers import NovelAnalysisWorker, NovelWritingWorker
+from gpt_desktop.workers import NovelAnalysisWorker, NovelCandidatePostprocessWorker, NovelWritingWorker
 
 
 class NovelAnalysisWorkerTests(unittest.TestCase):
@@ -277,6 +277,48 @@ class NovelAnalysisWorkerTests(unittest.TestCase):
         self.assertIn("贵族名册", merged["project_materials"]["world_rules"])
         self.assertIn("第一章旧案重启", merged["project_materials"]["timeline"])
         self.assertIn("缺页卷宗", merged["project_materials"]["summary"])
+
+    def test_candidate_postprocess_prompt_requires_dossier_dedupe(self):
+        worker = NovelCandidatePostprocessWorker(
+            "http://example.test",
+            "key",
+            "model",
+            {"characters": [{"name": "赵明", "notes": "旧案重启。"}]},
+            "【已有项目档案】\n- 赵明｜主角",
+        )
+
+        prompt = worker._postprocess_prompt()
+        user_text = worker._postprocess_user_text()
+
+        self.assertIn("最终合并、去重和对已有项目档案查重", prompt)
+        self.assertIn("已有档案里已经稳定存在的信息，不要作为新增候选重复输出", prompt)
+        self.assertIn("不确定是否同一对象时分开保留", prompt)
+        self.assertIn("伏笔要保守", prompt)
+        self.assertIn("分块候选", user_text)
+        self.assertIn("赵明", user_text)
+
+    def test_candidate_postprocess_rejects_empty_merged_result(self):
+        worker = NovelCandidatePostprocessWorker(
+            "http://example.test",
+            "key",
+            "model",
+            {"characters": [{"name": "赵明", "notes": "旧案重启。"}]},
+            "【已有项目档案】",
+        )
+        worker._analyze_chunk_with_retries = lambda *_args, **_kwargs: (
+            {"characters": [], "lore": [], "foreshadows": [], "project_materials": {}},
+            True,
+        )
+        errors = []
+        results = []
+        worker.failed.connect(errors.append)
+        worker.result_ready.connect(results.append)
+
+        worker.run()
+
+        self.assertEqual(results, [])
+        self.assertTrue(errors)
+        self.assertIn("没有返回有效候选", errors[0])
 
 
 if __name__ == "__main__":

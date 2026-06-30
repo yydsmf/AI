@@ -549,6 +549,20 @@ class NovelWritingStateTests(unittest.TestCase):
         self.assertEqual(tab.failed_analysis_chunks, [])
         self.assertNotIn("analysis_state", tab.current_project)
 
+    def test_sync_candidate_analysis_state_keeps_candidate_postprocess_state(self):
+        chapter = _new_chapter(0)
+        tab = NovelWritingTab.__new__(NovelWritingTab)
+        tab.current_project = {"chapters": [chapter]}
+        tab.pending_analysis_chapter_ids = [chapter["id"]]
+        tab.failed_analysis_chunks = []
+        tab.candidate_postprocess_state = {"status": "failed", "error": "timeout"}
+
+        tab._sync_candidate_analysis_state()
+
+        state = tab.current_project["analysis_state"]["candidate_postprocess"]
+        self.assertEqual(state["status"], "failed")
+        self.assertEqual(state["error"], "timeout")
+
     def test_merge_import_candidates_dedupes_repeated_notes_and_materials(self):
         repeated_note = "允许赵国图继续陈述，最终决定和亲从长计议。"
         repeated_summary = "皇商账册缺页牵出旧案。"
@@ -654,6 +668,46 @@ class NovelWritingStateTests(unittest.TestCase):
         self.assertEqual(tab._last_candidate_auto_cleanup_report["filtered"]["lore"], 0)
         self.assertEqual(tab._last_candidate_auto_cleanup_report["filtered"]["foreshadows"], 0)
         self.assertEqual(tab._candidate_auto_cleanup_status_text(), "")
+
+    def test_apply_candidate_analysis_result_marks_postprocess_pending_after_success(self):
+        tab = NovelWritingTab.__new__(NovelWritingTab)
+        tab.current_project = {"characters": [], "lore": [], "foreshadow_items": [], "chapters": []}
+        tab.import_candidates = {"characters": [], "lore": [], "foreshadows": [], "project_materials": {}}
+        tab.pending_analysis_chapter_ids = ["chapter-a"]
+        tab.failed_analysis_chunks = []
+        tab.candidate_postprocess_state = {}
+        tab._analysis_merge_with_existing = False
+
+        tab._apply_candidate_analysis_result({
+            "characters": [{"name": "赵明", "notes": "长期追查旧案。"}],
+            "_chunk_total": 1,
+            "_chunk_succeeded": 1,
+        })
+        tab._set_candidate_postprocess_state("pending")
+
+        self.assertTrue(tab._has_candidate_postprocess_pending())
+        self.assertEqual(tab.candidate_postprocess_state["status"], "pending")
+
+    def test_apply_candidate_postprocess_result_replaces_candidates_and_clears_state(self):
+        tab = NovelWritingTab.__new__(NovelWritingTab)
+        tab.current_project = {"characters": [], "lore": [], "foreshadow_items": [], "chapters": []}
+        tab.import_candidates = {
+            "characters": [{"name": "赵明", "notes": "旧候选"}],
+            "lore": [],
+            "foreshadows": [],
+            "project_materials": {},
+        }
+        tab.candidate_postprocess_state = {"status": "pending"}
+
+        tab._apply_candidate_postprocess_result({
+            "characters": [{"name": "赵明", "notes": "合并后的候选"}],
+            "lore": [],
+            "foreshadows": [],
+            "project_materials": {},
+        })
+
+        self.assertEqual(tab.import_candidates["characters"][0]["notes"], "合并后的候选")
+        self.assertEqual(tab.candidate_postprocess_state, {})
 
     def test_candidate_detail_explains_review_reason_and_source(self):
         tab = NovelWritingTab.__new__(NovelWritingTab)

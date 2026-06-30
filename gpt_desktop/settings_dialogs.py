@@ -83,10 +83,51 @@ class UpdateDownloadWorker(QThread):
         except Exception as e:
             self.failed.emit(str(e))
 
+
+def _get_windows_process_memory_bytes(ctypes_module=None, wintypes_module=None):
+    try:
+        if ctypes_module is None:
+            import ctypes as ctypes_module
+        if wintypes_module is None:
+            from ctypes import wintypes as wintypes_module
+
+        class PROCESS_MEMORY_COUNTERS(ctypes_module.Structure):
+            _fields_ = [
+                ("cb", wintypes_module.DWORD),
+                ("PageFaultCount", wintypes_module.DWORD),
+                ("PeakWorkingSetSize", ctypes_module.c_size_t),
+                ("WorkingSetSize", ctypes_module.c_size_t),
+                ("QuotaPeakPagedPoolUsage", ctypes_module.c_size_t),
+                ("QuotaPagedPoolUsage", ctypes_module.c_size_t),
+                ("QuotaPeakNonPagedPoolUsage", ctypes_module.c_size_t),
+                ("QuotaNonPagedPoolUsage", ctypes_module.c_size_t),
+                ("PagefileUsage", ctypes_module.c_size_t),
+                ("PeakPagefileUsage", ctypes_module.c_size_t),
+            ]
+
+        counters = PROCESS_MEMORY_COUNTERS()
+        counters.cb = ctypes_module.sizeof(PROCESS_MEMORY_COUNTERS)
+        process_handle = ctypes_module.windll.kernel32.GetCurrentProcess()
+        get_memory_info = ctypes_module.windll.psapi.GetProcessMemoryInfo
+        get_memory_info.argtypes = [
+            wintypes_module.HANDLE,
+            ctypes_module.POINTER(PROCESS_MEMORY_COUNTERS),
+            wintypes_module.DWORD,
+        ]
+        get_memory_info.restype = wintypes_module.BOOL
+        ok = get_memory_info(process_handle, ctypes_module.byref(counters), counters.cb)
+        if not ok:
+            return None
+        value = int(counters.WorkingSetSize)
+        return value if value > 0 else None
+    except Exception:
+        return None
+
+
 def get_current_process_memory_bytes():
     """
     获取当前进程 RSS 内存占用。
-    优先使用 psutil；没有 psutil 时使用系统命令 / resource 兜底。
+    优先使用 psutil；Windows 使用系统 API 兜底；其他系统使用 ps / resource 兜底。
     """
     pid = os.getpid()
 
@@ -95,6 +136,9 @@ def get_current_process_memory_bytes():
         return int(psutil.Process(pid).memory_info().rss)
     except Exception:
         pass
+
+    if sys.platform.startswith("win"):
+        return _get_windows_process_memory_bytes()
 
     try:
         out = subprocess.check_output(

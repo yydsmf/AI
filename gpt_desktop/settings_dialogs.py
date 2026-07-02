@@ -21,7 +21,7 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
 )
 
-from .update_checker import check_latest_release, download_release_asset, launch_windows_updater
+from .update_checker import check_latest_release, download_release_asset
 from .version import APP_RELEASES_URL, APP_VERSION
 from .core import (
     AGENT_HISTORY_FILE,
@@ -778,19 +778,25 @@ class ProviderManagerDialog(QDialog):
             f"最新版本：{getattr(info, 'latest_version', '')}\n\n"
         )
         if asset_name:
-            action_text = "退出并自动安装" if sys.platform.startswith("win") else "下载并退出安装"
-            text += (
-                f"已找到适合本电脑的安装包：\n{asset_name}\n\n"
-                f"点击“{action_text}”后会启动更新器。更新器会把安装包下载到系统“下载”目录，"
-                "确认主程序退出后自动打开安装包。"
-            )
+            if sys.platform.startswith("win"):
+                text += (
+                    f"已找到适合本电脑的安装包：\n{asset_name}\n\n"
+                    "点击“下载新版安装包”后，程序会保持打开并显示下载进度。"
+                    "下载完成后会再询问是否立即退出并安装。"
+                )
+            else:
+                text += (
+                    f"已找到适合本电脑的安装包：\n{asset_name}\n\n"
+                    "点击“下载并退出安装”后会把安装包下载到系统“下载”目录，"
+                    "下载完成后可退出并打开安装包。"
+                )
         else:
             text += "没有自动匹配到适合本电脑的安装包，可以打开发布页手动下载。"
         msg.setText(text)
 
         download_btn = None
         if asset_url:
-            download_text = "退出并自动安装" if sys.platform.startswith("win") else "下载并退出安装"
+            download_text = "下载新版安装包" if sys.platform.startswith("win") else "下载并退出安装"
             download_btn = msg.addButton(download_text, QMessageBox.AcceptRole)
         release_btn = msg.addButton("打开发布页", QMessageBox.ActionRole)
         later_btn = msg.addButton("稍后", QMessageBox.RejectRole)
@@ -799,10 +805,7 @@ class ProviderManagerDialog(QDialog):
 
         clicked = msg.clickedButton()
         if download_btn is not None and clicked is download_btn:
-            if sys.platform.startswith("win"):
-                self.start_windows_auto_update(asset, release_url)
-            else:
-                self.start_update_download(asset)
+            self.start_update_download(asset)
         elif clicked is release_btn:
             self._open_url(release_url)
         elif clicked is later_btn:
@@ -846,27 +849,6 @@ class ProviderManagerDialog(QDialog):
             pass
         QTimer.singleShot(300, app.quit)
 
-    def start_windows_auto_update(self, asset, release_url):
-        if asset is None:
-            QMessageBox.warning(self, "无法更新", "没有找到适合本电脑的更新包。")
-            return
-
-        started = launch_windows_updater(asset, release_url=release_url)
-        if not started:
-            QMessageBox.warning(
-                self,
-                "更新器启动失败",
-                "没有找到独立更新器，已改为旧方式下载安装包。\n\n"
-                "安装包仍会保存到系统“下载”目录。"
-            )
-            self.start_update_download(asset)
-            return
-
-        self.update_check_btn.setEnabled(False)
-        self.update_check_btn.setText("正在退出...")
-        self._prepare_parent_for_shutdown()
-        self._quit_application_soon()
-
     def on_update_download_progress(self, done, total):
         try:
             if total:
@@ -899,10 +881,10 @@ class ProviderManagerDialog(QDialog):
         msg.setIcon(QMessageBox.Information)
         msg.setWindowTitle("更新包已准备好")
         msg.setText(
-            f"更新包已下载：\n{path}\n\n"
-            "继续后，程序会自动退出，并在退出完成后打开安装包。"
+            f"新版安装包已下载到：\n{path}\n\n"
+            "是否现在退出程序并打开安装包？"
         )
-        install_btn = msg.addButton("退出并打开安装包", QMessageBox.AcceptRole)
+        install_btn = msg.addButton("立即退出并安装", QMessageBox.AcceptRole)
         later_btn = msg.addButton("稍后手动安装", QMessageBox.RejectRole)
         msg.setDefaultButton(install_btn)
         msg.exec()

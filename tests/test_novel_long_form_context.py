@@ -434,6 +434,32 @@ class NovelLongFormContextTests(unittest.TestCase):
         self.assertIn("临近回收伏笔", context)
         self.assertLess(context.index("临近回收伏笔"), context.index("普通伏笔0"))
 
+    def test_chapter_context_keeps_complete_open_foreshadow_description_units(self):
+        current = _new_chapter(9)
+        current["title"] = "第十章 雨后总部"
+        current["outline"] = "本章处理总部内斗，不直接回收伏笔。"
+        project = self._project_with_current_chapter(current)
+        project["foreshadow_items"] = [
+            {
+                "name": "旧手机匿名短信",
+                "status": "已埋",
+                "setup_chapter": "第八章",
+                "payoff_chapter": "第十二章",
+                "description": (
+                    "匿名短信不是普通威胁。"
+                    "旧手机号码会指向景辰京城总部内部泄密者。"
+                    "回收时必须确认陈景川没有按短信要求走正门。"
+                ),
+            }
+        ]
+
+        context = _build_chapter_ai_context(project, 0, "draft")
+        foreshadow_section = self._context_section(context, "本章相关伏笔")
+
+        self.assertIn("旧手机号码会指向景辰京城总部内部泄密者。", foreshadow_section)
+        self.assertIn("回收时必须确认陈景川没有按短信要求走正门。", foreshadow_section)
+        self.assertNotIn("内部泄……", foreshadow_section)
+
     def test_chapter_context_prioritizes_foreshadow_alias_from_description(self):
         current = _new_chapter(0)
         current["title"] = "第十二章 密室开启"
@@ -757,7 +783,7 @@ class NovelLongFormContextTests(unittest.TestCase):
         context = _build_chapter_ai_context(project, 0, "draft")
 
         self.assertIn("【续写承接点】", context)
-        self.assertIn("当前正文最后几段", context)
+        self.assertIn("当前正文结尾原文", context)
         self.assertIn("钥匙不在我这里", context)
         self.assertIn("优先承接【续写承接点】", context)
 
@@ -777,6 +803,45 @@ class NovelLongFormContextTests(unittest.TestCase):
         self.assertIn("上一章「第六十章 雨夜追问」结尾", context)
         self.assertIn("纸包里露出半枚虎符", context)
         self.assertIn("自然承接上一章", context)
+
+    def test_chapter_context_keeps_previous_ending_state_beyond_last_three_paragraphs(self):
+        previous = _new_chapter(0)
+        previous["title"] = "第八章 雨后赴约"
+        previous["text"] = (
+            "前文铺垫。" * 260
+            + "\n\n雨停了，路面反着冷光，雨后的长街空旷得只剩车灯。"
+            + "\n\n陈景川收起手机。"
+            + "\n\n他看向景辰京城总部的方向。"
+            + "\n\n“去。”"
+            + "\n\n他顿了顿，眼底冷意沉下去。"
+            + "\n\n“但不是按他说的去。”"
+        )
+        current = _new_chapter(1)
+        current["title"] = "第九章 京城总部"
+        current["outline"] = "陈景川赶往景辰京城总部。"
+        project = self._project_with_current_chapter(current)
+        project["chapters"] = [previous, current]
+
+        context = _build_chapter_ai_context(project, 1, "draft")
+        continuation = self._context_section(context, "续写承接点")
+
+        self.assertIn("雨停了", continuation)
+        self.assertIn("雨后的长街", continuation)
+        self.assertIn("但不是按他说的去", continuation)
+        self.assertIn("时间、天气、地点、人物位置", continuation)
+
+    def test_summary_context_requires_chapter_ending_state_in_key_facts(self):
+        current = _new_chapter(0)
+        current["title"] = "第八章 雨后赴约"
+        current["outline"] = "陈景川收到匿名短信，决定赴约。"
+        current["text"] = "陈景川收到短信。\n\n雨停了，雨后的长街空旷。\n\n他决定去，但不是按对方要求去。"
+        project = self._project_with_current_chapter(current)
+
+        context = _build_chapter_ai_context(project, 0, "summary")
+
+        self.assertIn("章节结尾的时间、天气、地点、人物位置和未完成动作", context)
+        self.assertIn("雨停", context)
+        self.assertIn("必须写入关键事实", context)
 
     def test_chapter_context_keeps_current_chapter_when_materials_are_huge(self):
         previous = _new_chapter(0)
@@ -874,6 +939,7 @@ class NovelLongFormContextTests(unittest.TestCase):
 
         self.assertIn("【长篇进度 / 节奏】", context)
         self.assertIn("项目总目标规模：20万字", context)
+        self.assertIn("当前进度字数：160000 / 200000 字，约 80.0%", context)
         self.assertIn("自动判断阶段：后段收束", context)
         self.assertIn("集中回收伏笔", context)
         self.assertIn("控制本章推进密度", context)
@@ -1546,6 +1612,24 @@ class NovelLongFormContextTests(unittest.TestCase):
         self.assertIn("虎符真相揭晓", text)
         self.assertIn("第七十章 终局门前", text)
 
+    def test_project_summary_draft_keeps_complete_key_fact_units(self):
+        chapter = _new_chapter(0)
+        chapter["title"] = "第一章 雨后"
+        chapter["summary"] = "陈景川收到匿名短信。"
+        chapter["key_facts"] = (
+            "陈景川收到匿名短信并决定赴约。"
+            "雨停了，景辰京城总部外的长街进入雨后状态。"
+            "陈景川手里仍握着匿名号码发来的旧手机。"
+        )
+        project = {"meta": {"title": "长篇测试"}, "chapters": [chapter]}
+
+        text = _build_project_summary_draft(project)
+
+        self.assertIn("雨停了，景辰京城总部外的长街进入雨后状态。", text)
+        self.assertIn("陈景川手里仍握着匿名号码发来的旧手机。", text)
+        self.assertNotIn("单条事实过长", text)
+        self.assertNotIn("已裁剪", text)
+
     def test_project_summary_draft_uses_body_excerpt_when_summary_missing(self):
         chapter = _new_chapter(0)
         chapter["title"] = "第一章 油纸包"
@@ -1745,6 +1829,28 @@ class NovelLongFormContextTests(unittest.TestCase):
         self.assertIn("第七十章 终局门前", text)
         self.assertNotIn("已平衡压缩", text)
 
+    def test_project_timeline_draft_does_not_cut_recent_fact_mid_sentence(self):
+        chapters = []
+        for index in range(60):
+            chapter = _new_chapter(index)
+            chapter["title"] = f"章节{index + 1}"
+            chapter["summary"] = f"短摘要{index + 1}。"
+            chapter["key_facts"] = f"短事实{index + 1}。"
+            chapters.append(chapter)
+        chapters[-1]["title"] = "第六十章 雨后"
+        chapters[-1]["summary"] = "陈景川抵达景辰京城总部。"
+        chapters[-1]["key_facts"] = (
+            "雨停了，景辰京城总部外的长街进入雨后状态。"
+            "陈景川没有按匿名短信要求进入正门，而是转向地下车库。"
+        )
+        project = {"chapters": chapters}
+
+        text = _build_project_timeline_draft(project)
+
+        self.assertIn("雨停了，景辰京城总部外的长街进入雨后状态。", text)
+        self.assertIn("陈景川没有按匿名短信要求进入正门，而是转向地下车库。", text)
+        self.assertNotIn("地下车", text.replace("地下车库", ""))
+
     def test_project_timeline_draft_keeps_many_short_recent_lines_by_budget(self):
         chapters = []
         for index in range(80):
@@ -1760,17 +1866,56 @@ class NovelLongFormContextTests(unittest.TestCase):
         self.assertIn("章节50", text)
         self.assertIn("章节80", text)
 
+    def test_active_snapshots_keep_complete_character_and_lore_facts(self):
+        chapters = []
+        for index in range(14):
+            chapter = _new_chapter(index)
+            chapter["title"] = f"章节{index + 1}"
+            chapter["summary"] = "陈景川在景辰京城总部推进调查。"
+            chapter["text"] = "陈景川来到景辰京城总部。"
+            chapters.append(chapter)
+        project = {
+            "chapters": chapters,
+            "characters": [
+                {
+                    "name": "陈景川",
+                    "role": "主角",
+                    "goal": "查清景辰京城总部内部泄密。雨停后必须从地下车库进入。",
+                    "secret": "匿名短信来自旧手机。这个秘密暂时不能告诉团队。",
+                    "voice": "说话克制，命令短促。",
+                    "notes": "",
+                }
+            ],
+            "lore": [
+                {
+                    "name": "景辰京城总部",
+                    "type": "地点",
+                    "description": "雨停后总部正门仍被监控覆盖。地下车库是陈景川选择的入口。",
+                }
+            ],
+        }
+
+        text = _build_project_summary_draft(project)
+
+        self.assertIn("雨停后必须从地下车库进入。", text)
+        self.assertIn("匿名短信来自旧手机。", text)
+        self.assertIn("地下车库是陈景川选择的入口。", text)
+        self.assertNotIn("地下车……", text)
+
     def test_foreshadow_notes_draft_groups_structured_items(self):
         project = {
             "foreshadow_items": [
                 {
+                    "code": "F0001",
                     "name": "虎符失踪",
                     "status": "已埋",
                     "setup_chapter": "第2章",
                     "payoff_chapter": "第20章",
                     "description": "读者以为只是偷盗。",
+                    "notes": "命中编号：F0001\n建议说明：这是给用户看的审计备注。",
                 },
                 {
+                    "code": "F0002",
                     "name": "旧钟声",
                     "status": "已回收",
                     "setup_chapter": "第3章",
@@ -1784,10 +1929,12 @@ class NovelLongFormContextTests(unittest.TestCase):
 
         self.assertIn("伏笔汇总草稿", text)
         self.assertIn("已埋：", text)
+        self.assertIn("F0001｜虎符失踪", text)
         self.assertIn("虎符失踪", text)
         self.assertIn("第2章 -> 第20章", text)
         self.assertIn("已回收：", text)
         self.assertIn("旧钟声", text)
+        self.assertNotIn("这是给用户看的审计备注", text)
 
     def test_foreshadow_notes_draft_limits_large_resolved_groups(self):
         project = {
@@ -1847,6 +1994,29 @@ class NovelLongFormContextTests(unittest.TestCase):
         self.assertIn("第十章 -> 第五十章", text)
         self.assertLess(text.index("终局密钥"), text.index("普通已埋伏笔0"))
         self.assertIn("普通已埋伏笔44", text)
+
+    def test_foreshadow_notes_draft_keeps_complete_description_units(self):
+        project = {
+            "foreshadow_items": [
+                {
+                    "name": "旧手机匿名短信",
+                    "status": "已埋",
+                    "setup_chapter": "第八章",
+                    "payoff_chapter": "第十二章",
+                    "description": (
+                        "匿名短信不是普通威胁。"
+                        "旧手机号码会指向景辰京城总部内部泄密者。"
+                        "回收时必须确认陈景川没有按短信要求走正门。"
+                    ),
+                }
+            ]
+        }
+
+        text = _build_foreshadow_notes_draft(project)
+
+        self.assertIn("旧手机号码会指向景辰京城总部内部泄密者。", text)
+        self.assertIn("回收时必须确认陈景川没有按短信要求走正门。", text)
+        self.assertNotIn("内部泄……", text)
 
     def test_infer_foreshadow_status_only_normalizes_explicit_status(self):
         buried = {

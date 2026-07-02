@@ -151,6 +151,85 @@ def _infer_foreshadow_status(item, preserve_manual=True):
     return "未埋"
 
 
+_FORESHADOW_STATUS_RANK = {"": 0, "未埋": 1, "已埋": 2, "已回收": 3, "废弃": 4}
+
+
+def _merge_foreshadow_status(existing, incoming):
+    old = _infer_foreshadow_status({"status": existing}, preserve_manual=False) if str(existing or "").strip() else ""
+    new = _infer_foreshadow_status({"status": incoming}, preserve_manual=False) if str(incoming or "").strip() else ""
+    if not new:
+        return old
+    if not old:
+        return new
+    return new if _FORESHADOW_STATUS_RANK.get(new, 0) >= _FORESHADOW_STATUS_RANK.get(old, 0) else old
+
+
+def _normalize_foreshadow_code(value):
+    text = str(value or "").strip().upper()
+    if not text:
+        return ""
+    text = re.sub(r"\s+", "", text)
+    match = re.search(r"F0*(\d{1,7})", text)
+    if not match and re.fullmatch(r"\d{1,7}", text):
+        match = re.match(r"0*(\d{1,7})", text)
+    if not match:
+        return ""
+    try:
+        number = int(match.group(1))
+    except Exception:
+        return ""
+    if number <= 0:
+        return ""
+    return f"F{number:04d}"
+
+
+def _foreshadow_code_number(value):
+    code = _normalize_foreshadow_code(value)
+    if not code:
+        return 0
+    try:
+        return int(code[1:])
+    except Exception:
+        return 0
+
+
+def _ensure_foreshadow_codes(project):
+    project = project if isinstance(project, dict) else {}
+    items = project.get("foreshadow_items", [])
+    if not isinstance(items, list):
+        return project
+    used = set()
+    max_number = 0
+    missing = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        raw_code = (
+            item.get("code", "")
+            or item.get("foreshadow_code", "")
+            or item.get("编号", "")
+            or item.get("伏笔编号", "")
+        )
+        code = _normalize_foreshadow_code(raw_code)
+        number = _foreshadow_code_number(code)
+        if not code or code in used:
+            missing.append(item)
+            item["code"] = ""
+            continue
+        item["code"] = code
+        used.add(code)
+        max_number = max(max_number, number)
+    for item in missing:
+        while True:
+            max_number += 1
+            code = f"F{max_number:04d}"
+            if code not in used:
+                break
+        item["code"] = code
+        used.add(code)
+    return project
+
+
 def _chapter_label(index, chap):
     chap = chap if isinstance(chap, dict) else {}
     title = str(chap.get("title", "") or "").strip()
@@ -379,31 +458,107 @@ def _new_lore(index):
 def _new_foreshadow(index):
     return {
         "id": uuid.uuid4().hex,
+        "code": f"F{index + 1:04d}",
         "name": f"伏笔 {index + 1}",
         "status": "未埋",
         "setup_chapter": "",
         "payoff_chapter": "",
         "description": "",
+        "notes": "",
     }
 
 
-def _normalize_candidate_analysis_state(data):
-    data = data if isinstance(data, dict) else {}
-    state = {}
+def _normalize_analysis_chunk_state(items):
     failed_chunks = []
-    for fallback_index, item in enumerate(data.get("failed_candidate_chunks", []), 1):
+    for fallback_index, item in enumerate(items if isinstance(items, list) else [], 1):
         if not isinstance(item, dict):
             continue
         text = str(item.get("text", "") or "").strip()
         if not text:
             continue
-        failed_chunks.append({
+        chunk = {
             "index": item.get("index", fallback_index),
             "total": item.get("total", 0),
             "text": text,
             "error": str(item.get("error", "") or ""),
-        })
+        }
+        chapter_id = str(item.get("chapter_id", "") or "").strip()
+        chapter_title = str(item.get("chapter_title", "") or "").strip()
+        if chapter_id:
+            chunk["chapter_id"] = chapter_id
+        if chapter_title:
+            chunk["chapter_title"] = chapter_title
+        for field in ("review_flow", "source_label", "chunk_key"):
+            value = str(item.get(field, "") or "").strip()
+            if value:
+                chunk[field] = value
+        failed_chunks.append(chunk)
     failed_chunks.sort(key=lambda item: _analysis_chunk_sort_key(item.get("index", 0)))
+    return failed_chunks
+
+
+def _normalize_foreshadow_review_observations(data):
+    data = data if isinstance(data, dict) else {}
+    out = {"characters": [], "lore": [], "foreshadows": [], "project_materials": {}}
+    items = data.get("foreshadows", [])
+    for item in items if isinstance(items, list) else []:
+        if not isinstance(item, dict):
+            continue
+        name = str(item.get("name", "") or "").strip()
+        if not name:
+            continue
+        record = {
+            "name": name,
+            "status": str(item.get("status", "") or "").strip(),
+            "setup_chapter": str(item.get("setup_chapter", "") or "").strip(),
+            "payoff_chapter": str(item.get("payoff_chapter", "") or "").strip(),
+            "description": str(item.get("description", "") or "").strip(),
+        }
+        source_label = str(item.get("_source_label", "") or item.get("source_label", "") or "").strip()
+        if source_label:
+            record["_source_label"] = source_label
+        if item.get("_status_explicit"):
+            record["_status_explicit"] = True
+        out["foreshadows"].append(record)
+    return out
+
+
+def _normalize_foreshadow_review_state(data):
+    data = data if isinstance(data, dict) else {}
+    state = {}
+    observations = _normalize_foreshadow_review_observations(data.get("observations", {}))
+    if observations.get("foreshadows"):
+        state["observations"] = observations
+
+    failed_observation_chunks = _normalize_analysis_chunk_state(data.get("failed_observation_chunks", []))
+    if failed_observation_chunks:
+        state["failed_observation_chunks"] = failed_observation_chunks
+
+    comparison = data.get("comparison", {})
+    if isinstance(comparison, dict):
+        status = str(comparison.get("status", "") or "").strip()
+        failed_comparison_chunks = _normalize_analysis_chunk_state(comparison.get("failed_chunks", []))
+        if status in {"pending", "failed"} or failed_comparison_chunks:
+            item = {"status": status if status in {"pending", "failed"} else "failed"}
+            error = str(comparison.get("error", "") or "").strip()
+            if error:
+                item["error"] = error
+            updated_at = str(comparison.get("updated_at", "") or "").strip()
+            if updated_at:
+                item["updated_at"] = updated_at
+            review_flow = str(comparison.get("review_flow", "") or "").strip()
+            if review_flow:
+                item["review_flow"] = review_flow
+            if failed_comparison_chunks:
+                item["failed_chunks"] = failed_comparison_chunks
+            state["comparison"] = item
+    return state
+
+
+def _normalize_candidate_analysis_state(data):
+    data = data if isinstance(data, dict) else {}
+    state = {}
+    failed_chunks = _normalize_analysis_chunk_state(data.get("failed_candidate_chunks", []))
     pending_ids = []
     seen_pending_ids = set()
     for item in data.get("pending_candidate_chapter_ids", []):
@@ -428,6 +583,9 @@ def _normalize_candidate_analysis_state(data):
             if updated_at:
                 item["updated_at"] = updated_at
             state["candidate_postprocess"] = item
+    foreshadow_review = _normalize_foreshadow_review_state(data.get("foreshadow_review", {}))
+    if foreshadow_review:
+        state["foreshadow_review"] = foreshadow_review
     return state
 
 
@@ -509,12 +667,14 @@ def _normalize_project(data):
     foreshadow_items = data.get("foreshadow_items", [])
     if isinstance(foreshadow_items, list):
         base["foreshadow_items"] = [c for c in foreshadow_items if isinstance(c, dict)]
+        _ensure_foreshadow_codes(base)
         for item in base["foreshadow_items"]:
             if not str(item.get("id", "") or "").strip():
                 item["id"] = uuid.uuid4().hex
-            for key in ("id", "name", "status", "setup_chapter", "payoff_chapter", "description"):
+            for key in ("id", "code", "name", "status", "setup_chapter", "payoff_chapter", "description", "notes"):
                 item[key] = _as_text(item.get(key, ""))
             item["description"] = _dedupe_text_lines(item.get("description", ""))
+            item["notes"] = _dedupe_text_lines(item.get("notes", ""))
     candidates = data.get("import_candidates", {})
     if isinstance(candidates, dict):
         normalized_candidates = _normalize_import_candidates(candidates)
@@ -682,6 +842,110 @@ def _merge_text_lines_without_duplicates(existing, incoming, prefix="补充：")
     return old, changed
 
 
+def _is_supplement_line(value):
+    return bool(re.match(r"^\s*(?:补充|新增|补充说明)[：:]", str(value or "").strip()))
+
+
+def _foreshadow_supplement_core(value):
+    return _long_term_context_core(value)
+
+
+def _foreshadow_supplement_source_label(item):
+    item = item if isinstance(item, dict) else {}
+    for key in (
+        "payoff_chapter",
+        "回收章节",
+        "兑现章节",
+        "揭晓章节",
+        "setup_chapter",
+        "埋设章节",
+        "铺垫章节",
+        "出现章节",
+        "chapter_title",
+        "_source_label",
+        "source_label",
+    ):
+        value = str(item.get(key, "") or "").strip()
+        if not value:
+            continue
+        value = value.splitlines()[0].strip()
+        value = re.sub(r"^(?:章节|当前章节标题|来源)[：:]\s*", "", value).strip()
+        if not value:
+            continue
+        if re.search(r"第\s*\d+\s*/\s*\d+\s*块", value):
+            continue
+        if "章" in value or value.startswith("章节"):
+            return value
+    return ""
+
+
+def _foreshadow_supplement_has_source(value):
+    text = _foreshadow_supplement_core(value)
+    return bool(re.match(r"^(?:第\s*[一二两三四五六七八九十百千万零〇\d]+\s*章|章节\s*[一二两三四五六七八九十百千万零〇\d]+|章\s*[一二两三四五六七八九十百千万零〇\d]+)", text))
+
+
+def _format_foreshadow_supplement(value, source_item=None):
+    core = _foreshadow_supplement_core(value)
+    if not core:
+        return ""
+    source = _foreshadow_supplement_source_label(source_item)
+    if source and not _foreshadow_supplement_has_source(core):
+        core = f"{source}：{core}"
+    return f"补充：{core}"
+
+
+def _limit_foreshadow_description_supplements(value, max_supplements=2):
+    lines = [
+        str(line or "").strip()
+        for line in _dedupe_text_lines(value).splitlines()
+        if str(line or "").strip()
+    ]
+    if not lines:
+        return ""
+    body_lines = []
+    supplement_lines = []
+    for line in lines:
+        if _is_supplement_line(line):
+            supplement_lines.append(line)
+        else:
+            body_lines.append(line)
+    if len(supplement_lines) > max_supplements:
+        supplement_lines = [supplement_lines[0], supplement_lines[-1]]
+    return "\n".join(body_lines + supplement_lines).strip()
+
+
+def _merge_foreshadow_description_without_bloat(existing, incoming, source_item=None):
+    old = _limit_foreshadow_description_supplements(existing)
+    new = _dedupe_text_lines(incoming)
+    if not new:
+        return old, old != str(existing or "").strip()
+    if not old or old in {"AI 分析候选", "文档导入候选"}:
+        merged = _limit_foreshadow_description_supplements(new)
+        return merged, merged != str(existing or "").strip()
+    old_keys = {
+        _dedupe_text_line_key(_foreshadow_supplement_core(line))
+        for line in old.splitlines()
+        if str(line or "").strip()
+    }
+    addition_parts = []
+    for line in new.splitlines():
+        core = _foreshadow_supplement_core(line)
+        if not core:
+            continue
+        key = _dedupe_text_line_key(core)
+        if key in old_keys:
+            continue
+        old_keys.add(key)
+        addition_parts.append(core)
+    if not addition_parts:
+        return old, old != str(existing or "").strip()
+    addition = _format_foreshadow_supplement("；".join(addition_parts), source_item)
+    if not addition:
+        return old, old != str(existing or "").strip()
+    merged = _limit_foreshadow_description_supplements(f"{old}\n{addition}")
+    return merged, merged != str(existing or "").strip()
+
+
 def _text_len(value):
     return len(str(value or "").strip())
 
@@ -713,7 +977,7 @@ def _clip_lines_head(lines, limit):
             if len(candidate) <= limit:
                 return candidate
             return "\n".join(kept).strip()
-        return _clip_context_text(line, limit, keep_tail=True)
+        return _clip_complete_text(line, limit, keep_tail=True)
     return "\n".join(kept).strip()
 
 
@@ -731,7 +995,7 @@ def _tail_lines_by_limit(lines, limit):
         if selected and total + line_len > limit:
             break
         if not selected and line_len > limit:
-            selected.append(_clip_context_text(line, limit, keep_tail=True))
+            selected.append(_clip_complete_text(line, limit, keep_tail=True))
             break
         selected.append(line)
         total += line_len
@@ -760,8 +1024,92 @@ def _select_lines_by_char_budget(lines, limit, omitted_label="条"):
         if selected and len("\n".join(selected + [marker]).strip()) <= limit:
             selected.append(marker)
         elif not selected:
-            selected.append(_clip_context_text(lines[0], limit, keep_tail=True))
+            selected.append(_clip_complete_text(lines[0], limit, keep_tail=True))
     return selected
+
+
+def _semantic_text_units(value):
+    text = _clean_empty_numbered_list_items(_dedupe_text_lines(value))
+    if not text:
+        return []
+    units = []
+    for raw in text.splitlines():
+        line = re.sub(r"^\s*(?:[-*•]\s+|[（(]?\d+[）).、]\s*)", "", raw).strip()
+        if not line or line in {"无", "没有", "暂无", "无新增"}:
+            continue
+        parts = [
+            part.strip()
+            for part in re.findall(r".+?(?:……|[。！？!?；;]+|$)", line)
+            if part.strip()
+        ]
+        units.extend(parts or [line])
+    out = []
+    seen = set()
+    for unit in units:
+        key = _compact_text(unit)
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        out.append(unit)
+    return out
+
+
+def _join_semantic_units(units, separator=None):
+    units = [str(unit or "").strip() for unit in (units or []) if str(unit or "").strip()]
+    if not units:
+        return ""
+    if separator is not None:
+        return str(separator).join(units).strip()
+    out = ""
+    for unit in units:
+        if not out:
+            out = unit
+            continue
+        if out[-1:] in "。！？!?；;…\n" or unit[:1] in "，,。！？!?；;…":
+            out += unit
+        else:
+            out += "；" + unit
+    return out.strip()
+
+
+def _fit_complete_units(value, limit, keep_tail=False, separator=None):
+    units = _semantic_text_units(value)
+    limit = int(limit or 0)
+    if not units:
+        return ""
+    text = _join_semantic_units(units, separator=separator)
+    if limit <= 0 or len(text) <= limit:
+        return text
+    ordered = list(reversed(units)) if keep_tail else list(units)
+    selected = []
+    for unit in ordered:
+        candidate_units = selected + [unit]
+        candidate = _join_semantic_units(candidate_units, separator=separator)
+        if selected and len(candidate) > limit:
+            break
+        if not selected and len(unit) > limit:
+            marker = "……（单条事实过长，已裁剪）……"
+            if keep_tail and limit > len(marker) + 80:
+                return marker + unit[-(limit - len(marker)):].lstrip()
+            return unit[: max(0, limit - len(marker))].rstrip() + marker
+        selected.append(unit)
+    if keep_tail:
+        selected.reverse()
+    return _join_semantic_units(selected, separator=separator)
+
+
+def _clip_complete_text(value, limit, keep_tail=False, separator=None):
+    text = _dedupe_text_lines(value)
+    limit = int(limit or 0)
+    if not text or limit <= 0 or len(text) <= limit:
+        return text
+    fitted = _fit_complete_units(text, limit, keep_tail=keep_tail, separator=separator)
+    if fitted:
+        return fitted
+    marker = "……（内容过长，已裁剪）……"
+    if keep_tail and limit > len(marker) + 80:
+        return marker + text[-(limit - len(marker)):].lstrip()
+    return text[: max(0, limit - len(marker))].rstrip() + marker
 
 
 def _clip_context_text(value, limit, keep_tail=False, preserve_lines=False):
@@ -792,12 +1140,11 @@ def _clip_context_text(value, limit, keep_tail=False, preserve_lines=False):
 def _compact_chapter_summary_text(value, max_chars=0, max_sentences=0):
     text = _clean_empty_numbered_list_items(_dedupe_text_lines(value))
     max_chars = int(max_chars or 0)
-    max_sentences = int(max_sentences or 0)
     if not text:
         return ""
-    if max_chars <= 0 and max_sentences <= 0:
+    if max_chars <= 0:
         return text
-    if max_chars > 0 and max_sentences <= 0 and len(text) <= max_chars:
+    if len(text) <= max_chars:
         return text
     parts = [
         part.strip()
@@ -808,8 +1155,6 @@ def _compact_chapter_summary_text(value, max_chars=0, max_sentences=0):
         selected = []
         total = 0
         for part in parts:
-            if max_sentences > 0 and len(selected) >= max_sentences:
-                break
             next_total = total + len(part)
             if max_chars > 0 and selected and next_total > max_chars:
                 break
@@ -845,7 +1190,6 @@ def _clean_empty_numbered_list_items(value):
 def _compact_chapter_key_facts_text(value, max_chars=0, max_items=0):
     text = _clean_empty_numbered_list_items(_dedupe_text_lines(value))
     max_chars = int(max_chars or 0)
-    max_items = int(max_items or 0)
     if not text:
         return ""
     raw_items = []
@@ -873,8 +1217,6 @@ def _compact_chapter_key_facts_text(value, max_chars=0, max_items=0):
             continue
         seen.add(key)
         items.append(item)
-        if max_items > 0 and len(items) >= max_items:
-            break
     compacted = "\n".join(items).strip()
     if max_chars <= 0 or len(compacted) <= max_chars:
         return compacted
@@ -992,14 +1334,17 @@ def _append_text_without_duplicate_overlap(existing, addition):
     return (existing + "\n\n" + addition).strip()
 
 
-def _tail_paragraphs(value, limit=1800, paragraphs=4):
+def _tail_text_window(value, limit=1800):
     text = str(value or "").strip()
     if not text:
         return ""
-    parts = [part.strip() for part in re.split(r"\n\s*\n+", text) if part.strip()]
-    if parts:
-        text = "\n\n".join(parts[-max(1, int(paragraphs or 1)):])
-    return _clip_context_text(text, limit, keep_tail=True)
+    limit = int(limit or 0)
+    if limit <= 0 or len(text) <= limit:
+        return text
+    marker = "……（前文已省略，以下为结尾原文）……\n"
+    if limit <= len(marker) + 80:
+        return text[-limit:].lstrip()
+    return marker + text[-(limit - len(marker)):].lstrip()
 
 
 def _name_in_text(name, text):
@@ -1019,7 +1364,8 @@ def _record_aliases(item, name_key="name"):
     if name:
         aliases.append(name)
         aliases.extend(_normalize_name_list(name))
-    alias_source = "\n".join(str(item.get(key, "") or "") for key in ("notes", "description"))
+    alias_fields = ("description",) if "description" in item else ("notes",)
+    alias_source = "\n".join(str(item.get(key, "") or "") for key in alias_fields)
     alias_labels = (
         "别称", "别名", "又名", "化名", "称呼", "代称", "简称",
         "绰号", "外号", "代号", "真名", "本名", "原名", "曾用名",
@@ -1334,7 +1680,7 @@ def _active_character_summary_lines(project, limit=12):
             ("秘密", "secret", 100),
             ("语言", "voice", 100),
         ):
-            value = _clip_context_text(_dedupe_text_lines(char.get(field, "")), clip_limit)
+            value = _clip_complete_text(char.get(field, ""), clip_limit)
             if value:
                 detail_parts.append(f"{label}：{value}")
         last_chapter = str(stat.get("last_chapter", "") or "").strip()
@@ -1364,7 +1710,7 @@ def _active_lore_summary_lines(project, limit=12):
     selected = ranked if limit is None or int(limit or 0) <= 0 else ranked[: int(limit or 0)]
     for _score, _index, name, item, stat in selected:
         typ = str(item.get("type", "") or "其他").strip()
-        desc = _clip_context_text(_stable_lore_description_context(item.get("description", "")), 160)
+        desc = _clip_complete_text(_stable_lore_description_context(item.get("description", "")), 160)
         last_chapter = str(stat.get("last_chapter", "") or "").strip()
         progress = f"出现 {stat.get('chapters', 0)} 章"
         if last_chapter:
@@ -1431,7 +1777,7 @@ def _long_form_progress_text(project, chapter_index):
     target_label = _target_words_label(meta.get("target_words", "")) or f"{target}字"
     return "\n".join([
         f"项目总目标规模：{target_label}",
-        f"当前正文：{stats['body_words']}字，约 {progress * 100:.1f}%",
+        f"当前进度字数：{stats['body_words']} / {target} 字，约 {progress * 100:.1f}%",
         f"当前章节：第 {chapter_index + 1}/{max(1, chapter_count)} 章",
         f"自动判断阶段：{stage}",
         f"节奏建议：控制本章推进密度，{advice}",
@@ -1940,7 +2286,6 @@ def _project_search_sources(project):
         ("小说圣经", "bible"),
         ("世界观 / 规则", "world_rules"),
         ("时间线", "timeline"),
-        ("伏笔备注", "foreshadows"),
         ("摘要 / 日志", "summary"),
     ):
         sources.append((label, label, project.get(key, "")))
@@ -1963,9 +2308,17 @@ def _project_search_sources(project):
         if not isinstance(item, dict):
             continue
         name = item.get("name") or f"伏笔 {index}"
-        text = "\n".join(str(item.get(k, "")) for k in ("name", "status", "setup_chapter", "payoff_chapter", "description"))
+        text = "\n".join(str(item.get(k, "")) for k in ("code", "name", "status", "setup_chapter", "payoff_chapter", "description"))
         sources.append(("伏笔", name, text))
 
+    chapter_search_fields = (
+        ("title", "标题"),
+        ("status", "状态"),
+        ("outline", "提纲"),
+        ("text", "正文"),
+        ("summary", "摘要"),
+        ("key_facts", "关键事实"),
+    )
     for index, chap in enumerate(project.get("chapters", []) if isinstance(project.get("chapters"), list) else [], 1):
         if not isinstance(chap, dict):
             continue
@@ -1975,30 +2328,85 @@ def _project_search_sources(project):
             linked_text = "、".join(str(x) for x in linked if str(x).strip())
         else:
             linked_text = ""
-        text = "\n".join(
-            str(chap.get(k, ""))
-            for k in ("title", "status", "outline", "text", "summary", "key_facts")
-        )
+        for key, label in chapter_search_fields:
+            text = str(chap.get(key, "") or "").strip()
+            if text:
+                sources.append((f"章节 / {label}", name, text))
         if linked_text:
-            text = f"{text}\n关联人物：{linked_text}"
-        sources.append(("章节", name, text))
+            sources.append(("章节 / 关联人物", name, linked_text))
     return sources
 
 
-def _search_excerpt(text, keyword, radius=42):
+def _search_excerpt_at_position(text, keyword, pos, radius=42):
     text = str(text or "").replace("\r", "").replace("\n", " ").strip()
     if not text:
         return ""
-    lower = text.lower()
-    key = str(keyword or "").lower()
-    pos = lower.find(key)
-    if pos < 0:
-        return text[: radius * 2].strip()
+    pos = max(0, min(int(pos or 0), len(text)))
     start = max(0, pos - radius)
     end = min(len(text), pos + len(str(keyword or "")) + radius)
     prefix = "..." if start > 0 else ""
     suffix = "..." if end < len(text) else ""
     return prefix + text[start:end].strip() + suffix
+
+
+def _search_keyword_positions(text, keyword):
+    text = str(text or "")
+    key = str(keyword or "")
+    if not text or not key:
+        return []
+    lower = text.lower()
+    key_lower = key.lower()
+    positions = []
+    start = 0
+    while True:
+        pos = lower.find(key_lower, start)
+        if pos < 0:
+            break
+        positions.append(pos)
+        start = pos + max(1, len(key_lower))
+    return positions
+
+
+def _select_search_positions(positions, max_excerpts=3):
+    positions = list(positions or [])
+    max_excerpts = max(1, int(max_excerpts or 1))
+    if len(positions) <= max_excerpts:
+        return positions
+    if max_excerpts == 1:
+        return [positions[0]]
+    if max_excerpts == 2:
+        return [positions[0], positions[-1]]
+    selected = [positions[0], positions[len(positions) // 2], positions[-1]]
+    for pos in positions:
+        if len(selected) >= max_excerpts:
+            break
+        if pos not in selected:
+            selected.append(pos)
+    return sorted(set(selected))
+
+
+def _search_excerpts(text, keyword, radius=42, max_excerpts=3):
+    clean = str(text or "").replace("\r", "").replace("\n", " ").strip()
+    if not clean:
+        return [], 0
+    positions = _search_keyword_positions(clean, keyword)
+    if not positions:
+        return [clean[: radius * 2].strip()], 0
+    excerpts = []
+    seen = set()
+    for pos in _select_search_positions(positions, max_excerpts=max_excerpts):
+        excerpt = _search_excerpt_at_position(clean, keyword, pos, radius=radius)
+        key = _compact_text(excerpt)
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        excerpts.append(excerpt)
+    return excerpts, len(positions)
+
+
+def _search_excerpt(text, keyword, radius=42):
+    excerpts, _count = _search_excerpts(text, keyword, radius=radius, max_excerpts=1)
+    return excerpts[0] if excerpts else ""
 
 
 def _build_search_result_text(project, keyword):
@@ -2010,18 +2418,22 @@ def _build_search_result_text(project, keyword):
         text = str(text or "")
         if keyword.lower() not in text.lower():
             continue
-        results.append((group, title, _search_excerpt(text, keyword)))
+        excerpts, match_count = _search_excerpts(text, keyword)
+        results.append((group, title, excerpts, match_count))
     if not results:
         return f"没有找到：{keyword}"
     group_counts = {}
-    for group, _title, _excerpt in results:
+    for group, _title, _excerpts, _match_count in results:
         group_counts[group] = group_counts.get(group, 0) + 1
     count_text = " ｜ ".join(f"{group} {count}" for group, count in group_counts.items())
     lines = [f"找到 {len(results)} 条结果：{keyword}", count_text, ""]
-    for index, (group, title, excerpt) in enumerate(results, 1):
-        lines.append(f"{index}. [{group}] {title}")
-        if excerpt:
-            lines.append(f"   {excerpt}")
+    for index, (group, title, excerpts, match_count) in enumerate(results, 1):
+        suffix = f"（共 {match_count} 处）" if match_count > 1 else ""
+        lines.append(f"{index}. [{group}] {title}{suffix}")
+        for excerpt in excerpts:
+            if excerpt:
+                prefix = "   - " if len(excerpts) > 1 else "   "
+                lines.append(f"{prefix}{excerpt}")
         lines.append("")
     return "\n".join(lines).strip()
 
@@ -2493,11 +2905,12 @@ def _lore_list_text(index, lore):
 def _foreshadow_list_text(index, item):
     item = item if isinstance(item, dict) else {}
     name = item.get("name") or f"伏笔 {index + 1}"
+    code = _normalize_foreshadow_code(item.get("code", "")) or f"F{index + 1:04d}"
     status = str(item.get("status", "") or "").strip()
     setup = str(item.get("setup_chapter", "") or "").strip()
     payoff = str(item.get("payoff_chapter", "") or "").strip()
     tail = " -> ".join(x for x in (setup, payoff) if x)
-    return "  ·  ".join(str(x) for x in (name, status, tail) if str(x).strip())
+    return "  ·  ".join(str(x) for x in (code, name, status, tail) if str(x).strip())
 
 
 def _chapter_tooltip(chap):
@@ -2531,23 +2944,15 @@ def _chapter_reference_line(
 ):
     chap = chap if isinstance(chap, dict) else {}
     title = str(chap.get("title", "") or "").strip() or f"章节 {index}"
-    summary = _clip_context_text(
-        _dedupe_text_lines(chap.get("summary", "")),
-        summary_limit,
-        preserve_lines=True,
-    )
-    key_facts = _clip_context_text(
-        _dedupe_text_lines(chap.get("key_facts", "")),
-        facts_limit,
-        preserve_lines=True,
-    )
+    summary = _clip_complete_text(chap.get("summary", ""), summary_limit)
+    key_facts = _clip_complete_text(chap.get("key_facts", ""), facts_limit)
     parts = []
     if summary:
         parts.append("摘要：" + summary)
     if key_facts:
         parts.append("关键事实：" + key_facts)
     if not parts and include_outline_fallback:
-        outline = _clip_context_text(_dedupe_text_lines(chap.get("outline", "")), 260, preserve_lines=True)
+        outline = _clip_complete_text(chap.get("outline", ""), 260)
         if outline:
             parts.append("提纲：" + outline)
     if not (summary or key_facts) and text_fallback_limit:
@@ -2699,6 +3104,7 @@ def _summary_section_lines(events, total_limit=8200):
 
 def _build_project_summary_draft(project):
     project = project if isinstance(project, dict) else {}
+    _ensure_foreshadow_codes(project)
     meta = project.get("meta", {}) if isinstance(project.get("meta"), dict) else {}
     chapters = project.get("chapters", [])
     chapters = chapters if isinstance(chapters, list) else []
@@ -2753,6 +3159,7 @@ def _build_project_summary_draft(project):
 
 def _build_project_timeline_draft(project):
     project = project if isinstance(project, dict) else {}
+    _ensure_foreshadow_codes(project)
     chapters = project.get("chapters", [])
     chapters = chapters if isinstance(chapters, list) else []
     lines = ["时间线草稿", "按章节顺序整理，后续可改成故事内真实时间。"]
@@ -2792,6 +3199,7 @@ def _build_project_timeline_draft(project):
 
 def _build_foreshadow_notes_draft(project):
     project = project if isinstance(project, dict) else {}
+    _ensure_foreshadow_codes(project)
     items = project.get("foreshadow_items", [])
     items = items if isinstance(items, list) else []
     grouped = {"未埋": [], "已埋": [], "已回收": [], "废弃": [], "其他": []}
@@ -2799,14 +3207,16 @@ def _build_foreshadow_notes_draft(project):
         if not isinstance(item, dict):
             continue
         name = str(item.get("name", "") or "").strip() or f"伏笔 {index}"
+        code = _normalize_foreshadow_code(item.get("code", ""))
+        head = f"{code}｜{name}" if code else name
         status = str(item.get("status", "") or "").strip() or "其他"
         group = status if status in grouped else "其他"
         setup = str(item.get("setup_chapter", "") or "").strip()
         payoff = str(item.get("payoff_chapter", "") or "").strip()
-        desc = _clip_context_text(_stable_foreshadow_description_context(item.get("description", "")), 180)
+        desc = _clip_complete_text(_stable_foreshadow_description_context(item.get("description", "")), 180)
         route = " -> ".join(x for x in (setup, payoff) if x) or "未填写章节"
         tail = f"｜{desc}" if desc else ""
-        line = f"- {name}｜{route}{tail}"
+        line = f"- {head}｜{route}{tail}"
         if group in {"未埋", "已埋"}:
             score, tie_index = _open_foreshadow_queue_score(item, index)
             grouped[group].append((-score, tie_index, line))
@@ -2876,16 +3286,18 @@ def _open_foreshadow_queue_score(item, index, current_order=None):
 def _open_foreshadow_line(item, index, route_style="route", desc_limit=160, include_desc=True):
     item = item if isinstance(item, dict) else {}
     name = str(item.get("name", "") or "").strip() or f"伏笔 {index}"
+    code = _normalize_foreshadow_code(item.get("code", ""))
+    head = f"{code}｜{name}" if code else name
     status = str(item.get("status", "") or "").strip()
     setup = str(item.get("setup_chapter", "") or "").strip()
     payoff = str(item.get("payoff_chapter", "") or "").strip()
     desc = _stable_foreshadow_description_context(item.get("description", ""))
-    desc_text = _clip_context_text(desc, desc_limit) if include_desc else ""
+    desc_text = _clip_complete_text(desc, desc_limit) if include_desc else ""
     if route_style == "fields":
-        return f"- {name}｜{status}｜埋设：{setup}｜回收：{payoff}" + (f"｜{desc_text}" if desc_text else "")
+        return f"- {head}｜{status}｜埋设：{setup}｜回收：{payoff}" + (f"｜{desc_text}" if desc_text else "")
     route = " -> ".join(x for x in (setup, payoff) if x) or "未填写章节"
     tail = f"｜{desc_text}" if desc_text else ""
-    return f"- {name}｜{status}｜{route}{tail}"
+    return f"- {head}｜{status}｜{route}{tail}"
 
 
 def _rank_open_foreshadow_candidates(
@@ -3097,19 +3509,26 @@ def _build_future_plan_text(chapters, chapter_index, window=4):
 def _build_chapter_continuation_text(chapters, chapter_index):
     chapters = chapters if isinstance(chapters, list) else []
     parts = []
+    has_current_text = False
+    if 0 <= chapter_index < len(chapters) and isinstance(chapters[chapter_index], dict):
+        has_current_text = bool(_compact_text(chapters[chapter_index].get("text", "")))
     if 0 <= chapter_index - 1 < len(chapters):
         prev = chapters[chapter_index - 1]
         if isinstance(prev, dict):
-            prev_tail = _tail_paragraphs(prev.get("text", ""), limit=1600, paragraphs=3)
+            prev_limit = 1800 if has_current_text else 4200
+            prev_tail = _tail_text_window(prev.get("text", ""), limit=prev_limit)
             if prev_tail:
                 title = str(prev.get("title", "") or f"章节 {chapter_index}").strip()
-                parts.append(f"上一章「{title}」结尾：\n{prev_tail}")
+                parts.append(
+                    f"上一章「{title}」结尾原文（重点继承时间、天气、地点、人物位置、情绪和未完成动作）：\n"
+                    + prev_tail
+                )
     if 0 <= chapter_index < len(chapters):
         current = chapters[chapter_index]
         if isinstance(current, dict):
-            current_tail = _tail_paragraphs(current.get("text", ""), limit=2000, paragraphs=4)
+            current_tail = _tail_text_window(current.get("text", ""), limit=3400)
             if current_tail:
-                parts.append("当前正文最后几段（续写应从这里自然接上，不要重复）：\n" + current_tail)
+                parts.append("当前正文结尾原文（续写应从这里自然接上，不要重复）：\n" + current_tail)
     return "\n\n".join(parts)
 
 
@@ -3146,6 +3565,7 @@ def _chapter_reference_score(value, chapter_index, chapter_title):
 
 def _build_chapter_ai_context(project, chapter_index, action):
     project = project if isinstance(project, dict) else {}
+    _ensure_foreshadow_codes(project)
     chapters = project.get("chapters", [])
     if chapter_index < 0 or chapter_index >= len(chapters):
         raise ValueError("请先选择一个章节。")
@@ -3172,7 +3592,7 @@ def _build_chapter_ai_context(project, chapter_index, action):
 
     def clean_context_text(value, limit, keep_tail=False, dedupe=True):
         text = _dedupe_text_lines(value) if dedupe else str(value or "").strip()
-        return _clip_context_text(text, limit, keep_tail=keep_tail)
+        return _clip_complete_text(text, limit, keep_tail=keep_tail)
 
     selected_characters = _prioritize_named_records(
         project.get("characters", []),
@@ -3255,10 +3675,12 @@ def _build_chapter_ai_context(project, chapter_index, action):
         name = str(item.get("name", "") or "").strip()
         if not name:
             continue
+        code = _normalize_foreshadow_code(item.get("code", ""))
+        head = f"{code}｜{name}" if code else name
         desc = clean_context_text(_stable_foreshadow_description_context(item.get("description", "")), 300)
         desc_tail = f"｜{desc}" if desc else ""
         foreshadow_lines.append(
-            f"- {name}｜{item.get('status','')}｜埋设：{item.get('setup_chapter','')}｜回收：{item.get('payoff_chapter','')}{desc_tail}"
+            f"- {head}｜{item.get('status','')}｜埋设：{item.get('setup_chapter','')}｜回收：{item.get('payoff_chapter','')}{desc_tail}"
         )
     previous_summary = _build_previous_inheritance_text(chapters, chapter_index)
     continuation_text = _build_chapter_continuation_text(chapters, chapter_index)
@@ -3272,11 +3694,15 @@ def _build_chapter_ai_context(project, chapter_index, action):
     draft_words_remaining_label = f"{draft_words_remaining}字" if draft_words_remaining else ""
     draft_task = (
         "请根据当前章节的章节提纲和已有正文草稿续写正文。正文草稿已有内容时，只输出可以直接接在草稿末尾的新正文，"
-        "不要重复、概括或改写已有正文；开头要优先承接【续写承接点】里的当前正文最后几段。"
+        "不要重复、概括或改写已有正文；开头要优先承接【续写承接点】里的当前正文结尾原文。"
+        "必须继承承接点里的时间、天气、地点、人物位置、情绪和未完成动作；如果上一章写明雨已停或场景已变化，"
+        "不要在下一章开头改成仍在下雨或回到旧场景，除非本章提纲明确发生了新的天气/场景变化。"
         "优先参考本章需继承的关键事实，其次参考本章摘要、前文摘要、人物目标、语言风格和世界规则。"
         "参考【本章写作长度】安排详略，但不要为了贴字数牺牲完整场景、冲突收束和正文质量；只输出正文内容。"
         if has_current_text else
         "请根据当前章节的章节提纲生成正文草稿。若有上一章结尾，请让开篇自然承接上一章的情绪、场景或悬念。"
+        "必须继承上一章结尾的时间、天气、地点、人物位置、情绪和未完成动作；如果上一章写明雨已停或场景已变化，"
+        "不要在本章开头改成仍在下雨或回到旧场景，除非本章提纲明确发生了新的天气/场景变化。"
         "优先参考本章需继承的关键事实，其次参考本章摘要、前文摘要、人物目标、语言风格和世界规则。"
         "参考【本章写作长度】安排详略，但不要为了贴字数牺牲完整场景、冲突收束和正文质量；只输出正文内容。"
     )
@@ -3292,7 +3718,9 @@ def _build_chapter_ai_context(project, chapter_index, action):
         "summary": (
             "请根据当前章节正文草稿提炼本章摘要与本章需继承的关键事实；章节提纲只作辅助，正文没有写到的内容不要写入摘要或关键事实。"
             "摘要用于简短记录发生了什么；关键事实只记录后续必须继承的事实，"
-            "包括人物关系、线索、伏笔、伤势、物品、地点变化和情绪关系变化。不要评价，不要写创作建议。"
+            "包括人物关系、线索、伏笔、伤势、物品、地点变化、情绪关系变化，以及章节结尾的时间、天气、地点、人物位置和未完成动作。"
+            "如果正文收尾写明雨停、雨后、天亮、转场、离开、抵达、昏迷、受伤、持有/交出物品等状态，必须写入关键事实。"
+            "不要评价，不要写创作建议。"
             "关键事实条数不固定，按完整事实逐条写；不要因为压缩或固定条数删掉会影响后文连续性的变化。"
             "请严格按以下格式输出三段内容：\n"
             "本章摘要：...\n"
@@ -3327,6 +3755,7 @@ def _build_chapter_ai_context(project, chapter_index, action):
         "继承优先级：本章需继承的关键事实 > 时间线 > 前文继承摘要 > 人物卡 > 小说圣经/世界规则 > 设定库。",
         "不得改写已发生事实；如果资料冲突，优先保留更具体、更新、更接近当前章节的记录。",
         "续写时要继承人物目标、秘密、称呼、语言风格，以及伤势、物品、地点、关系和情绪变化。",
+        "跨章开头必须继承上一章结尾状态：时间、天气、地点、人物位置、人物手中物品、身体状态和未完成动作不能凭空回退。",
         "伏笔只在合适章节推进；已回收伏笔不要重复当新线索。缺资料时保持克制，不要补出会影响后文的新设定。",
     ]
     if reverse_from_body:
@@ -3409,7 +3838,6 @@ def _build_chapter_ai_context(project, chapter_index, action):
     )
     foreshadow_context = context_parts(
         "\n".join(foreshadow_lines),
-        project.get("foreshadows", ""),
         open_foreshadows,
     )
     long_form_progress = _long_form_progress_text(project, chapter_index)

@@ -30,8 +30,17 @@ from .core import (
     save_base64_to_image,
     save_bytes_to_image,
 )
-from .novel_utils import _infer_foreshadow_status
-from .novel_import import _normalize_ai_candidates
+from .novel_utils import (
+    _infer_foreshadow_status,
+    _merge_foreshadow_description_without_bloat,
+    _merge_foreshadow_status,
+)
+from .novel_import import (
+    _foreshadow_candidate_is_terminal_review,
+    _foreshadow_terminal_review_description,
+    _foreshadow_terminal_review_should_replace,
+    _normalize_ai_candidates,
+)
 
 
 def post_json(session, url, headers, payload, timeout, proxies=None):
@@ -48,15 +57,37 @@ def post_json(session, url, headers, payload, timeout, proxies=None):
 
 
 class ModelListWorker(QThread):
-    result_ready = Signal(list)
-    failed = Signal(str)
+    result_ready = Signal(str, str, list)
+    failed = Signal(str, str, str)
 
-    def __init__(self, base_url, api_key, proxy_url="", proxy_mode="不使用代理"):
+    def __init__(self, base_url, api_key, proxy_url="", proxy_mode="不使用代理", provider_id="", request_id=""):
         super().__init__()
         self.base_url = base_url
         self.api_key = api_key
         self.proxy_url = str(proxy_url or "").strip()
         self.proxy_mode = str(proxy_mode or "不使用代理").strip()
+        self.provider_id = str(provider_id or "").strip()
+        self.request_id = str(request_id or "").strip()
+        self._stop_requested = False
+        self._response = None
+        self._session = None
+
+    def stop(self):
+        self._stop_requested = True
+        try:
+            self.requestInterruption()
+        except Exception:
+            pass
+        try:
+            if self._response is not None:
+                self._response.close()
+        except Exception:
+            pass
+        try:
+            if self._session is not None:
+                self._session.close()
+        except Exception:
+            pass
 
     def _proxies(self):
         if self.proxy_mode == "提交和下载":
@@ -76,9 +107,11 @@ class ModelListWorker(QThread):
                 "Content-Type": "application/json",
             }
             session = requests.Session()
+            self._session = session
             session.trust_env = False
             try:
-                r = session.get(url, headers=headers, timeout=60, proxies=self._proxies())
+                r = session.get(url, headers=headers, timeout=10, proxies=self._proxies())
+                self._response = r
                 try:
                     if r.status_code >= 400:
                         raise Exception(f"接口错误 {r.status_code}：{extract_api_error(r)}")
@@ -96,9 +129,15 @@ class ModelListWorker(QThread):
             models = sorted({item.get("id") for item in data.get("data", []) if item.get("id")})
             if not models:
                 raise Exception("接口没有返回可用模型。")
-            self.result_ready.emit(models)
+            if self._stop_requested or self.isInterruptionRequested():
+                return
+            self.result_ready.emit(self.provider_id, self.request_id, models)
         except Exception as e:
-            self.failed.emit(str(e))
+            if not self._stop_requested and not self.isInterruptionRequested():
+                self.failed.emit(self.provider_id, self.request_id, str(e))
+        finally:
+            self._response = None
+            self._session = None
 
 
 class NovelAnalysisWorker(QThread):
@@ -150,17 +189,36 @@ class NovelAnalysisWorker(QThread):
                 text = str(item.get("text", "") or "").strip()
                 label = item.get("index", fallback_index)
                 total = item.get("total", 0)
+                chapter_title = str(item.get("chapter_title", "") or "").strip()
+                chapter_id = str(item.get("chapter_id", "") or "").strip()
+                review_flow = str(item.get("review_flow", "") or "").strip()
+                source_label = str(item.get("source_label", "") or "").strip()
+                chunk_key = str(item.get("chunk_key", "") or "").strip()
             else:
                 text = str(item or "").strip()
                 label = fallback_index
                 total = 0
+                chapter_title = ""
+                chapter_id = ""
+                review_flow = ""
+                source_label = ""
+                chunk_key = ""
             if not text:
                 continue
-            records.append({
+            record = {
                 "text": text,
                 "index": label if str(label or "").strip() else len(records) + 1,
                 "total": total,
-            })
+                "chapter_title": chapter_title,
+                "chapter_id": chapter_id,
+            }
+            if review_flow:
+                record["review_flow"] = review_flow
+            if source_label:
+                record["source_label"] = source_label
+            if chunk_key:
+                record["chunk_key"] = chunk_key
+            records.append(record)
         batch_total = len(records)
         for record in records:
             try:
@@ -169,6 +227,55 @@ class NovelAnalysisWorker(QThread):
                 record_total = 0
             record["total"] = record_total if record_total > 0 else batch_total
         return records
+
+    def _normalize_chapter_ref_value(self, value, chapter_title):
+        text = str(value or "").strip()
+        chapter_title = str(chapter_title or "").strip()
+        if not text or not chapter_title:
+            return text
+        patterns = (
+            r"本片段前文",
+            r"本片段后文",
+            r"本片段",
+            r"当前片段",
+            r"本块",
+            r"本章",
+            r"当前章节",
+            r"当前章",
+            r"第\s*\d+\s*/\s*\d+\s*个文本片段前文",
+            r"第\s*\d+\s*/\s*\d+\s*个文本片段后文",
+            r"第\s*\d+\s*/\s*\d+\s*个文本片段",
+            r"片段\s*\d+",
+            r"第\s*\d+\s*/\s*\d+\s*块前文",
+            r"第\s*\d+\s*/\s*\d+\s*块后文",
+            r"第\s*\d+\s*/\s*\d+\s*块",
+            r"第\s*\d+\s*块前文",
+            r"第\s*\d+\s*块后文",
+            r"第\s*\d+\s*块",
+        )
+        pattern = "|".join(f"(?:{part})" for part in patterns)
+        return re.sub(pattern, chapter_title, text).strip()
+
+    def _normalize_result_chapter_refs(self, data, record):
+        if not isinstance(data, dict) or not isinstance(record, dict):
+            return data
+        chapter_title = str(record.get("chapter_title", "") or "").strip()
+        if not chapter_title:
+            return data
+        for key in ("foreshadows", "伏笔", "伏笔线索", "线索", "悬念", "clues"):
+            items = data.get(key)
+            if not isinstance(items, list):
+                continue
+            for item in items:
+                if not isinstance(item, dict):
+                    continue
+                for field in ("setup_chapter", "埋设章节", "铺垫章节", "出现章节", "setup"):
+                    if field in item:
+                        item[field] = self._normalize_chapter_ref_value(item.get(field, ""), chapter_title)
+                for field in ("payoff_chapter", "回收章节", "兑现章节", "揭晓章节", "payoff"):
+                    if field in item:
+                        item[field] = self._normalize_chapter_ref_value(item.get(field, ""), chapter_title)
+        return data
 
     def _analysis_request_capabilities(self):
         with self._capability_lock:
@@ -267,6 +374,31 @@ class NovelAnalysisWorker(QThread):
         flush()
         return chunks
 
+    def _split_retry_chunk_once(self, text, max_parts=3):
+        text = str(text or "").strip()
+        if not text:
+            return []
+        try:
+            max_parts = int(max_parts or 3)
+        except Exception:
+            max_parts = 3
+        max_parts = max(2, min(3, max_parts))
+        if len(text) <= 1800:
+            return [text]
+        target = max(900, (len(text) + max_parts - 1) // max_parts)
+        raw_parts = self._split_text_chunks(
+            text,
+            target_chars=target,
+            max_chars=max(1200, target + 300),
+        )
+        if len(raw_parts) <= max_parts:
+            return raw_parts
+        packed = raw_parts[:max_parts - 1]
+        tail = "\n\n".join(part for part in raw_parts[max_parts - 1:] if str(part or "").strip()).strip()
+        if tail:
+            packed.append(tail)
+        return packed
+
     def _split_long_analysis_block(self, text, max_chars):
         text = str(text or "").strip()
         if len(text) <= max_chars:
@@ -336,7 +468,9 @@ class NovelAnalysisWorker(QThread):
             "其中只有会影响后续章节继承的全局增量，才放入 project_materials.summary 或 timeline。"
             "稳定设定变化才写入 lore.description，例如长期有效的规则、制度、结构关系、地点/势力/物品属性、能力限制、固定渠道或所有权；"
             "本章出现、追问、调查、发送、发现线索、谁去问谁等临时推进，不要写入 lore.description，改放 timeline/summary/foreshadows；"
-            "伏笔变化写入状态/章节；"
+            "伏笔变化写入状态/章节；对【已有项目档案】中的未埋/已埋伏笔，如果本片段明确推进、回收、揭晓、解释或作废，"
+            "必须用已有伏笔名称输出到 foreshadows，并写明新的 status、setup_chapter/payoff_chapter 和判断依据；"
+            "如果只是普通提及、氛围呼应或没有实质推进，不要输出该伏笔。\n"
             "不要把已有档案里没有在本片段推进的信息当作新发现重复输出。\n"
             "如果这是长文分块的一部分，只提取本片段明确出现或能稳定判断的信息；"
             "没有明确全局增量时，project_materials 对应字段请留空字符串，不要为了填满结构写普通流水账。\n"
@@ -349,11 +483,14 @@ class NovelAnalysisWorker(QThread):
             "foreshadows.status 判定：只提出未来可能用到但尚未在片段中埋下的线索填“未埋”；"
             "片段中已经出现线索、异常、铺垫或悬念填“已埋”；片段中已经兑现、揭示、解释或回收填“已回收”；"
             "明确作废或不再使用的线索填“废弃”。能判断章节/分集标题时填写 setup_chapter/payoff_chapter。\n"
+            "已有伏笔复核：同一伏笔从“已埋”推进到“已回收/废弃”时，必须保留已有规范名称，不要另起相似名称；"
+            "payoff_chapter 优先填写本片段实际章节标题；只能判断推进但未回收时，status 仍填“已埋”，说明里写清推进内容。\n"
             "设定和伏笔不要原文重复：同一内容如果只是规则、制度、物品用途或客观设定，只放入 lore；"
             "如果它同时是规则和后续承诺，lore 写规则本身，foreshadows 改写成待验证/待回收的问题或结果，"
             "名称不要与 lore 完全相同，例如“试用条件”进设定，“能否完成试用条件”进伏笔。\n"
             "foreshadows 要求：只提取会跨章节影响后文的明确线索、承诺、谜题或待回收信息；"
-            "普通悬念、单章情绪钩子、一次性疑问、普通信息差和氛围描写不要列为伏笔。"
+            "普通悬念、单章情绪钩子、一次性疑问、普通阶段剧情、爽点节点、临时情绪钩子、单章疑问、普通信息差、氛围描写、已经在本章完成的小悬念不要列为伏笔，"
+            "改写入 timeline/summary。"
             "每个片段优先提取最重要的跨章节伏笔；数量不固定，没有明确跨章节价值就返回空数组，"
             "不要为了凑数写普通悬念，也不要因为条数限制丢掉明确会影响后文的伏笔。\n"
             "characters.notes 要求：只写会影响后续多章的人物档案增量；如果只是本章发生了什么、短暂情绪或普通互动，就留空字符串。\n"
@@ -369,6 +506,8 @@ class NovelAnalysisWorker(QThread):
         user_text = (
             f"这是第 {chunk_index}/{total_chunks} 个文本片段。"
             "请只根据本片段提取候选，不要臆测其它片段。"
+            "如果片段里提供了“当前章节标题”，setup_chapter/payoff_chapter 必须优先填写该真实章节标题，"
+            "不要填写“本片段”“本章”或“第几块”。"
         )
         if self.dossier:
             user_text += "\n\n" + self.dossier
@@ -543,7 +682,7 @@ class NovelAnalysisWorker(QThread):
         )
         return any(marker in msg for marker in transport_markers)
 
-    def _analyze_chunk_resilient(self, prompt, chunk, label, total, use_response_format):
+    def _analyze_chunk_resilient(self, prompt, chunk, label, total, use_response_format, split_depth=0):
         response_format_supported, stream_supported = self._analysis_request_capabilities()
         use_response_format = bool(use_response_format and response_format_supported)
         try:
@@ -577,23 +716,28 @@ class NovelAnalysisWorker(QThread):
                 self._set_analysis_stream_supported(False)
                 self.progress.emit("流式候选分析连接提前结束，已切换为普通请求重试...")
                 return self._post_analysis_chunk(prompt, chunk, label, total, use_response_format), use_response_format
-            if self._is_retryable_analysis_error(e) and len(chunk) > 1800:
-                parts = self._split_text_chunks(chunk, target_chars=max(1200, len(chunk) // 2), max_chars=max(1600, len(chunk) // 2 + 300))
+            if split_depth <= 0 and self._is_retryable_analysis_error(e) and len(chunk) > 1800:
+                parts = self._split_retry_chunk_once(chunk, max_parts=3)
                 if len(parts) > 1:
                     merged = {"characters": [], "lore": [], "foreshadows": [], "project_materials": {}}
-                    self.progress.emit(f"第 {label}/{total} 块响应过慢，已自动拆成 {len(parts)} 小块重试...")
+                    self.progress.emit(f"第 {label}/{total} 块响应过慢，已自动拆成 {len(parts)} 小块重试；子块失败后将保留为待重试。")
                     current_response_format = use_response_format
                     for sub_index, part in enumerate(parts, 1):
                         if self._stop_requested or self.isInterruptionRequested():
                             return merged, current_response_format
                         self.progress.emit(f"正在分析候选 {label}/{total} 的小块 {sub_index}/{len(parts)}...")
-                        parsed, current_response_format = self._analyze_chunk_resilient(
-                            prompt,
-                            part,
-                            f"{label}.{sub_index}",
-                            total,
-                            current_response_format,
-                        )
+                        try:
+                            parsed, current_response_format = self._analyze_chunk_resilient(
+                                prompt,
+                                part,
+                                f"{label}.{sub_index}",
+                                total,
+                                current_response_format,
+                                split_depth + 1,
+                            )
+                        except Exception as sub_error:
+                            setattr(sub_error, "_analysis_split_failed", True)
+                            raise
                         self._merge_analysis_result(merged, parsed)
                     return merged, current_response_format
             raise
@@ -612,10 +756,11 @@ class NovelAnalysisWorker(QThread):
                     label,
                     total,
                     current_response_format,
+                    0,
                 )
             except Exception as e:
                 last_error = e
-                if attempt >= attempts or not self._is_retryable_analysis_error(e):
+                if getattr(e, "_analysis_split_failed", False) or attempt >= attempts or not self._is_retryable_analysis_error(e):
                     raise
                 wait_seconds = min(8, 2 * attempt)
                 self.progress.emit(f"第 {label}/{total} 块暂时失败，{wait_seconds} 秒后自动重试 {attempt + 1}/{attempts}...")
@@ -652,20 +797,33 @@ class NovelAnalysisWorker(QThread):
         if existing is None:
             data = {field: str(item.get(field, "") or "") for field in ("name",) + tuple(fields)}
             merge_source_label(data, item.get("_source_label", ""))
+            if key == "foreshadows" and _foreshadow_candidate_is_terminal_review(item):
+                data["description"] = _foreshadow_terminal_review_description(data.get("description", ""))
             if key == "foreshadows" and item.get("_status_explicit"):
                 data["status"] = _infer_foreshadow_status({"status": data.get("status", "")}, preserve_manual=False)
+                data["_status_explicit"] = True
             target.append(data)
             return
 
         merge_source_label(existing, item.get("_source_label", ""))
+        if key == "foreshadows" and _foreshadow_candidate_is_terminal_review(existing):
+            if _foreshadow_terminal_review_should_replace(existing, item):
+                data = {field: str(item.get(field, "") or "") for field in ("name",) + tuple(fields)}
+                merge_source_label(data, item.get("_source_label", ""))
+                data["description"] = _foreshadow_terminal_review_description(data.get("description", ""))
+                if item.get("_status_explicit"):
+                    data["status"] = _infer_foreshadow_status({"status": data.get("status", "")}, preserve_manual=False)
+                    data["_status_explicit"] = True
+                existing.clear()
+                existing.update(data)
+            return
+        incoming_terminal = key == "foreshadows" and _foreshadow_candidate_is_terminal_review(item)
 
         for field in fields:
             if key == "foreshadows" and field == "status":
                 if item.get("_status_explicit"):
-                    existing["status"] = _infer_foreshadow_status(
-                        {"status": item.get("status", "")},
-                        preserve_manual=False,
-                    )
+                    existing["status"] = _merge_foreshadow_status(existing.get("status", ""), item.get("status", ""))
+                    existing["_status_explicit"] = True
                 continue
             if key == "foreshadows" and field == "_status_explicit":
                 if item.get("_status_explicit"):
@@ -675,12 +833,20 @@ class NovelAnalysisWorker(QThread):
             new = str(item.get(field, "") or "").strip()
             if not new:
                 continue
+            if incoming_terminal and field == "description":
+                cleaned = _foreshadow_terminal_review_description(new)
+                if cleaned and cleaned != old:
+                    existing[field] = cleaned
+                continue
             if not old:
                 existing[field] = new
             elif new == old or new in old:
                 continue
             elif old in new:
                 existing[field] = new
+            elif key == "foreshadows" and field == "description" and field in append_fields:
+                merged, _did_change = _merge_foreshadow_description_without_bloat(old, new, item)
+                existing[field] = merged
             elif field in append_fields:
                 existing[field] = f"{old}\n补充：{new}"
 
@@ -730,9 +896,15 @@ class NovelAnalysisWorker(QThread):
                 output,
                 "foreshadows",
                 item,
-                ("status", "setup_chapter", "payoff_chapter", "description"),
+                ("status", "setup_chapter", "payoff_chapter", "description", "_target_code", "_merge_target"),
                 append_fields=("description",),
             )
+
+    def _source_label_for_record(self, record, index, total):
+        record = record if isinstance(record, dict) else {}
+        label = record.get("index", index)
+        label_total = record.get("total", total) or total
+        return f"第 {label}/{label_total} 块"
 
     def run(self):
         try:
@@ -799,12 +971,19 @@ class NovelAnalysisWorker(QThread):
                             continue
                         try:
                             parsed, _response_format = future.result()
+                            record = chunk_records[index - 1]
+                            parsed = self._normalize_result_chapter_refs(parsed, record)
                         except Exception as e:
                             record = chunk_records[index - 1]
                             failed_chunks.append({
                                 "index": record.get("index", index),
                                 "total": record.get("total", total) or total,
                                 "text": record.get("text", chunks[index - 1]),
+                                "chapter_id": record.get("chapter_id", ""),
+                                "chapter_title": record.get("chapter_title", ""),
+                                "review_flow": record.get("review_flow", ""),
+                                "source_label": record.get("source_label", ""),
+                                "chunk_key": record.get("chunk_key", ""),
                                 "error": str(e),
                             })
                             processed += 1
@@ -818,10 +997,7 @@ class NovelAnalysisWorker(QThread):
                                 error_preview = error_preview[:160] + "..."
                             self.progress.emit(f"第 {index}/{total} 块分析失败：{error_preview}；已保留为待重试。")
                         else:
-                            record = chunk_records[index - 1]
-                            label = record.get("index", index)
-                            label_total = record.get("total", total) or total
-                            source_label = f"第 {label}/{label_total} 块"
+                            source_label = self._source_label_for_record(record, index, total)
                             self._merge_analysis_result(merged, parsed, source_label=source_label)
                             succeeded += 1
                             processed += 1
@@ -882,12 +1058,17 @@ class NovelCandidatePostprocessWorker(NovelAnalysisWorker):
             "所有字符串里的换行、引号都必须正确 JSON 转义。\n"
             "任务：\n"
             "1. 合并块与块之间的重复候选。同一人物、设定、伏笔只保留一条，说明要整合成完整但精炼的表达。\n"
-            "2. 对照【已有项目档案】查重。已有档案里已经稳定存在的信息，不要作为新增候选重复输出。\n"
+            "2. 对照【已有项目档案】查重。已有档案里已经稳定存在的信息，不要作为新增候选重复输出；"
+            "但已有伏笔的状态/章节发生变化时必须保留为候选，用于更新旧档案。\n"
             "3. 只保留确实需要入库或补充到已有档案的长期信息；普通章节行动、临时情绪、一次性互动、调查过程和流水账不要进入人物备注或设定说明。\n"
             "4. 如果候选与已有项目档案是同一对象，请使用已有档案中的规范名称；不确定是否同一对象时分开保留，不要强行合并。\n"
             "5. 伏笔要保守：同一线索才合并；只是相似主题但回收目标不同的伏笔要分开。\n"
-            "6. 小说圣经和世界观/规则只作为查重和冲突参考，不要因为已有档案存在就自动重写；确有新增草案时才放入 project_materials。\n"
-            "7. 时间线和摘要只承接全局剧情进展，避免和人物备注、设定说明重复表达同一件事。\n"
+            "6. 对照已有伏笔逐条复核：如果分块候选或本次片段已经明确兑现、揭示、解释、回收某个已有未埋/已埋伏笔，"
+            "必须保留该伏笔并把 status 写成“已回收”，payoff_chapter 写真实章节标题；明确作废写“废弃”。"
+            "如果只是推进但未回收，status 保持“已埋”，说明写清推进；没有实质变化则不要输出。\n"
+            "7. 状态不能倒退：已回收/废弃不要改回已埋或未埋；已埋不要改回未埋。\n"
+            "8. 小说圣经和世界观/规则只作为查重和冲突参考，不要因为已有档案存在就自动重写；确有新增草案时才放入 project_materials。\n"
+            "9. 时间线和摘要只承接全局剧情进展，避免和人物备注、设定说明重复表达同一件事。\n"
             "JSON 结构：{\n"
             '  "characters": [{"name":"","role":"","goal":"","secret":"","voice":"","notes":""}],\n'
             '  "lore": [{"name":"","type":"地点/势力/物品/规则/术语/事件/其他","description":""}],\n'
@@ -907,7 +1088,7 @@ class NovelCandidatePostprocessWorker(NovelAnalysisWorker):
     def _chunk_user_text(self, chunk_text, chunk_index, total_chunks):
         return str(chunk_text or "")
 
-    def _analyze_chunk_resilient(self, prompt, chunk, label, total, use_response_format):
+    def _analyze_chunk_resilient(self, prompt, chunk, label, total, use_response_format, split_depth=0):
         response_format_supported, stream_supported = self._analysis_request_capabilities()
         use_response_format = bool(use_response_format and response_format_supported)
         try:
@@ -971,6 +1152,451 @@ class NovelCandidatePostprocessWorker(NovelAnalysisWorker):
                 if not isinstance(materials, dict) or not any(str(value or "").strip() for value in materials.values()):
                     raise Exception("AI 候选合并没有返回有效候选，已保留分块结果。")
             self.result_ready.emit(normalized)
+        except Exception as e:
+            if not self._stop_requested and not self.isInterruptionRequested():
+                self.failed.emit(str(e))
+        finally:
+            self._close_active_network_handles()
+
+
+class NovelForeshadowReviewWorker(NovelAnalysisWorker):
+    def __init__(
+        self,
+        base_url,
+        api_key,
+        model,
+        dossier,
+        proxy_url="",
+        proxy_mode="不使用代理",
+        max_concurrency=3,
+        chunks=None,
+    ):
+        super().__init__(
+            base_url,
+            api_key,
+            model,
+            "",
+            proxy_url=proxy_url,
+            proxy_mode=proxy_mode,
+            max_concurrency=max_concurrency,
+            chunks=chunks,
+            dossier=dossier,
+        )
+
+    def _analysis_prompt(self):
+        return (
+            "你是长篇小说伏笔观察编辑。请只阅读当前章节完整正文，提取本章出现的伏笔线索、推进、解释、兑现或作废证据，供后续按章比对使用。\n"
+            "你必须只输出一个合法 JSON 对象，不要 Markdown，不要解释，不要注释，不要尾随逗号。\n"
+            "本阶段不要查看、引用或匹配现有伏笔列表；不要判断某条观察对应旧伏笔的最终状态。\n"
+            "只根据当前章节正文判断，不要引用摘要、关键事实或未提供的其它章节内容。\n"
+            "质量优先：不要凭关键词猜测；短期悬念、单章内已经完成的小钩子可以记录为“短期/已完成”，但要写清不确定性，交给后续按章比对决定是否忽略。\n"
+            "提取原则：\n"
+            "1. 记录可能影响后续章节的线索、异常、承诺、谜题、未解释信息、人物隐瞒、规则限制、物品去向。\n"
+            "2. 记录本章对旧线索的明确解释、兑现、揭晓、作废证据；只要正文里有证据就记录，不要因为不知道旧伏笔名而丢弃。\n"
+            "3. name 使用本章正文里的短线索名或概括名，不要求等同旧伏笔名；description 写完整证据和上下文。\n"
+            "4. status 只能在正文证据非常明确时写“已埋”“已回收”“废弃”，不确定时留空。\n"
+            "5. setup_chapter/payoff_chapter 必须用真实章节标题，不要写“本章/本片段/第几块”。\n"
+            "输出结构：{\n"
+            '  "foreshadows": [{"name":"","status":"","setup_chapter":"","payoff_chapter":"","description":"","review_action":"","merge_target":"","review_reason":"","evidence":""}]\n'
+            "}\n"
+            "字段说明：review_action 固定写“观察待比对”；review_reason 写一句为什么值得后续比对；evidence 写相关章节标题，可多个。"
+        )
+
+    def _chunk_user_text(self, chunk_text, chunk_index, total_chunks):
+        user_text = (
+            f"这是第 {chunk_index}/{total_chunks} 个章节正文块。"
+            "请只根据本章完整正文提取伏笔观察记录，不要匹配现有伏笔列表，不要臆测其它章节。"
+        )
+        return user_text + "\n\n【本章完整正文】\n" + str(chunk_text or "")
+
+    def _merge_analysis_result(self, output, data, source_label=""):
+        foreshadow_only = _normalize_ai_candidates(data)
+        foreshadow_only["characters"] = []
+        foreshadow_only["lore"] = []
+        foreshadow_only["project_materials"] = {"bible": "", "world_rules": "", "timeline": "", "summary": ""}
+        super()._merge_analysis_result(output, foreshadow_only, source_label=source_label)
+
+    def _source_label_for_record(self, record, index, total):
+        title = str(record.get("chapter_title", "") or "").strip() if isinstance(record, dict) else ""
+        if title:
+            return f"章节：{title}"
+        return super()._source_label_for_record(record, index, total)
+
+
+class NovelForeshadowReviewPostprocessWorker(NovelAnalysisWorker):
+    def __init__(
+        self,
+        base_url,
+        api_key,
+        model,
+        candidates,
+        dossier,
+        proxy_url="",
+        proxy_mode="不使用代理",
+        max_concurrency=3,
+        chunks=None,
+    ):
+        self.candidates = _normalize_ai_candidates(candidates)
+        chunk_records = deepcopy(chunks) if chunks is not None else self._build_observation_chunks(self.candidates, dossier)
+        super().__init__(
+            base_url,
+            api_key,
+            model,
+            "",
+            proxy_url=proxy_url,
+            proxy_mode=proxy_mode,
+            max_concurrency=max_concurrency,
+            chunks=chunk_records,
+            dossier=dossier,
+        )
+
+    @staticmethod
+    def _observation_record(item):
+        item = item if isinstance(item, dict) else {}
+        record = {
+            "name": str(item.get("name", "") or "").strip(),
+            "status": str(item.get("status", "") or "").strip(),
+            "setup_chapter": str(item.get("setup_chapter", "") or "").strip(),
+            "payoff_chapter": str(item.get("payoff_chapter", "") or "").strip(),
+            "description": str(item.get("description", "") or "").strip(),
+        }
+        source_label = str(item.get("_source_label", "") or item.get("source_label", "") or "").strip()
+        if source_label:
+            record["source_label"] = source_label
+        return record
+
+    @classmethod
+    def _build_observation_chunks(cls, candidates, dossier="", target_total_chars=30000):
+        observations = []
+        for item in candidates.get("foreshadows", []) if isinstance(candidates, dict) else []:
+            record = cls._observation_record(item)
+            if record.get("name") and record.get("description"):
+                observations.append(record)
+        if not observations:
+            return []
+        dossier_len = len(str(dossier or ""))
+        target_chars = max(5000, min(12000, int(target_total_chars or 30000) - dossier_len))
+        max_chars = max(target_chars + 2000, 6500)
+        groups = []
+        current = []
+        current_chars = 0
+        for record in observations:
+            record_text = json.dumps(record, ensure_ascii=False, separators=(",", ":"))
+            record_chars = len(record_text)
+            if current and current_chars + record_chars > target_chars:
+                groups.append(current)
+                current = []
+                current_chars = 0
+            current.append(record)
+            current_chars += record_chars
+            if current_chars >= max_chars:
+                groups.append(current)
+                current = []
+                current_chars = 0
+        if current:
+            groups.append(current)
+        total = len(groups)
+        return [
+            {
+                "text": json.dumps(group, ensure_ascii=False, indent=2),
+                "index": index,
+                "total": total,
+                "review_flow": "foreshadow_review_chapter_compare",
+            }
+            for index, group in enumerate(groups, 1)
+        ]
+
+    def _analysis_prompt(self):
+        return (
+            "你是长篇小说伏笔连续性总编辑。请把当前章节或当前小批次的伏笔观察记录与现有伏笔列表做按章比对，生成需要用户确认的伏笔更新/清理候选。\n"
+            "你必须只输出一个合法 JSON 对象，不要 Markdown，不要解释，不要注释，不要尾随逗号。\n"
+            "任务：\n"
+            "1. 对照【现有伏笔列表】判断观察记录命中了哪个旧伏笔；命中时 name 必须使用旧伏笔规范名称。\n"
+            "2. 同一旧伏笔在本批只输出一条候选，description 整合本批观察里最关键的章节依据；不在本批观察中的内容不要臆测。\n"
+            "3. 状态不能倒退：已回收/废弃不要改回已埋或未埋；已埋不要改回未埋。\n"
+            "4. 如果观察记录明确解释、揭晓、兑现旧伏笔，status 写“已回收”，payoff_chapter 写最明确的真实章节标题，review_action 写“更新状态”。\n"
+            "5. 如果观察记录只是推进但未回收，status 保持“已埋”，review_action 写“补充推进”，description 写清推进章节和推进内容。\n"
+            "6. 如果观察记录证明某个旧伏笔只是短期悬念、单章内完成、或不应继续作为长期伏笔，status 写“废弃”，review_action 写“移出伏笔”。\n"
+            "7. 多条旧伏笔明显重复时，输出需要合并的旧伏笔名，merge_target 写规范名称，并在 description 中写“别称：规范名称”。\n"
+            "8. 观察记录里确有长期价值但现有列表缺漏的线索，可以作为新增伏笔候选输出；不确定时不要新增。\n"
+            "9. 如果能识别旧伏笔，请优先填写 target_code/命中编号（例如 F0007）；无法确定编号时再用 merge_target。\n"
+            "JSON 结构：{\n"
+            '  "foreshadows": [{"name":"","status":"","setup_chapter":"","payoff_chapter":"","description":"","review_action":"","merge_target":"","target_code":"","review_reason":"","evidence":""}]\n'
+            "}\n"
+            "只输出需要用户确认处理的伏笔；没有变化的伏笔不要输出。"
+        )
+
+    def _chunk_user_text(self, chunk_text, chunk_index, total_chunks):
+        try:
+            observations = json.loads(str(chunk_text or "[]"))
+        except Exception:
+            observations = str(chunk_text or "")
+        payload = {
+            "已有项目档案": self.dossier,
+            "本批逐章伏笔观察": observations,
+        }
+        return json.dumps(payload, ensure_ascii=False, indent=2)
+
+    def _merge_analysis_result(self, output, data, source_label=""):
+        foreshadow_only = _normalize_ai_candidates(data)
+        foreshadow_only["characters"] = []
+        foreshadow_only["lore"] = []
+        foreshadow_only["project_materials"] = {"bible": "", "world_rules": "", "timeline": "", "summary": ""}
+        super()._merge_analysis_result(output, foreshadow_only, source_label=source_label)
+
+    def _source_label_for_record(self, record, index, total):
+        record = record if isinstance(record, dict) else {}
+        title = str(record.get("chapter_title", "") or record.get("source_label", "") or "").strip()
+        if title:
+            return f"伏笔按章比对：{title}"
+        return f"伏笔按章比对：第 {record.get('index', index)}/{record.get('total', total) or total} 块"
+
+    def run(self):
+        if not self.input_chunk_records:
+            self.failed.emit("没有可比对的伏笔观察。")
+            return
+        super().run()
+
+
+class NovelChapterTitleWorker(NovelAnalysisWorker):
+    result_ready = Signal(list)
+    failed = Signal(str)
+    progress = Signal(str)
+
+    def __init__(
+        self,
+        base_url,
+        api_key,
+        model,
+        project_title,
+        genre,
+        style,
+        chapters,
+        proxy_url="",
+        proxy_mode="不使用代理",
+    ):
+        super().__init__(
+            base_url,
+            api_key,
+            model,
+            "",
+            proxy_url=proxy_url,
+            proxy_mode=proxy_mode,
+            max_concurrency=1,
+        )
+        self.project_title = str(project_title or "").strip()
+        self.genre = str(genre or "").strip()
+        self.style = str(style or "").strip()
+        self.chapters = [deepcopy(chap) for chap in chapters if isinstance(chap, dict)]
+        self.retry_attempts = 2
+
+    def _title_prompt(self):
+        return (
+            "你是长篇小说章节标题编辑。请为拆分后的章节批量生成适合读者阅读的中文章节名。\n"
+            "必须只输出一个合法 JSON 对象，不要 Markdown，不要解释，不要注释。\n"
+            "任务边界：只起标题，不改正文，不补剧情，不总结成大纲。\n"
+            "标题要求：贴合本章核心事件、冲突或情绪转折；简洁、有小说感；避免剧透后文；"
+            "每个标题 5-20 个中文字；不要使用“本章”“章节”“无题”“续”“上”“下”等占位词；同一批内标题不能重复。\n"
+            "title 字段只写标题正文，不要带“第几章”和序号。\n"
+            '输出结构：{"titles":[{"index":1,"title":"会议室里的选择"}]}\n'
+            "titles 数量必须与输入章节数量完全一致，index 必须与输入一致。"
+        )
+
+    def _analysis_prompt(self):
+        return self._title_prompt()
+
+    def _chapter_excerpt(self, text, edge_chars=500):
+        text = re.sub(r"\s+", "\n", str(text or "").strip())
+        if len(text) <= edge_chars * 2:
+            return text
+        return text[:edge_chars].rstrip() + "\n...\n" + text[-edge_chars:].lstrip()
+
+    def _title_batches(self, max_chars=18000, max_count=16):
+        items = []
+        for index, chap in enumerate(self.chapters, 1):
+            text = str(chap.get("text", "") or "").strip()
+            if not text:
+                continue
+            item = {
+                "index": index,
+                "current_title": str(chap.get("title", "") or f"第 {index} 章").strip(),
+                "excerpt": self._chapter_excerpt(text),
+            }
+            items.append(item)
+        batches = []
+        current = []
+        current_size = 0
+        for item in items:
+            item_size = len(json.dumps(item, ensure_ascii=False))
+            if current and (len(current) >= max_count or current_size + item_size > max_chars):
+                batches.append(current)
+                current = []
+                current_size = 0
+            current.append(item)
+            current_size += item_size
+        if current:
+            batches.append(current)
+        return batches
+
+    def _user_text_for_batch(self, batch):
+        payload = {
+            "作品信息": {
+                "书名": self.project_title,
+                "类型": self.genre,
+                "风格": self.style,
+            },
+            "待命名章节": batch,
+        }
+        return json.dumps(payload, ensure_ascii=False, indent=2)
+
+    def _chunk_user_text(self, chunk_text, chunk_index, total_chunks):
+        return str(chunk_text or "")
+
+    def _parse_json_result(self, content):
+        content = str(content or "").strip()
+        if content.startswith("```"):
+            content = content.strip()
+            if content.startswith("```json"):
+                content = content[7:].strip()
+            elif content.startswith("```"):
+                content = content[3:].strip()
+            if content.endswith("```"):
+                content = content[:-3].strip()
+        start = content.find("{")
+        end = content.rfind("}")
+        if start >= 0 and end > start:
+            content = content[start:end + 1]
+        try:
+            data = json.loads(content)
+        except json.JSONDecodeError as e:
+            preview = content[:240].replace("\n", " ")
+            raise ValueError(
+                "AI 返回的章节标题不是合法 JSON。"
+                f"\n解析位置：第 {e.lineno} 行，第 {e.colno} 列。"
+                f"\n返回预览：{preview}"
+            )
+        if not isinstance(data, dict):
+            raise ValueError("AI 返回的章节标题不是 JSON 对象。")
+        return data
+
+    def _clean_generated_title(self, value):
+        title = str(value or "").strip()
+        title = title.strip(" \t\r\n\"'“”‘’《》「」『』【】[]()（）")
+        title = re.sub(r"^\s*第\s*[\d一二三四五六七八九十百千万零〇两]+\s*[章节回集卷部]\s*[:：、.\-—]*\s*", "", title)
+        title = re.sub(r"^\s*[\d一二三四五六七八九十百千万零〇两]+\s*[、.．]\s*", "", title)
+        title = re.sub(r"\s+", "", title)
+        title = title.strip(" \t\r\n\"'“”‘’《》「」『』【】[]()（）：:，,。；;、")
+        return title.strip()
+
+    def _title_char_count(self, title):
+        return len(re.sub(r"\s+", "", str(title or "")))
+
+    def _titles_by_index_from_response(self, data, expected_indices):
+        data = data if isinstance(data, dict) else {}
+        titles = data.get("titles", [])
+        if not isinstance(titles, list):
+            raise ValueError("AI 返回缺少 titles 列表。")
+        expected = [int(index) for index in expected_indices]
+        by_index = {}
+        for item in titles:
+            if not isinstance(item, dict):
+                continue
+            try:
+                index = int(item.get("index", 0) or 0)
+            except Exception:
+                index = 0
+            if index not in expected:
+                continue
+            title = self._clean_generated_title(item.get("title", ""))
+            if title:
+                by_index[index] = title
+        return by_index
+
+    def _normalize_titles_response(self, data, expected_indices):
+        expected = [int(index) for index in expected_indices]
+        by_index = self._titles_by_index_from_response(data, expected)
+        missing = [index for index in expected if not by_index.get(index)]
+        if missing:
+            raise ValueError("AI 没有为这些章节返回有效标题：" + "、".join(str(index) for index in missing))
+        return [by_index[index] for index in expected]
+
+    def _request_title_batch_once(self, batch, label, total):
+        response_format_supported, _stream_supported = self._analysis_request_capabilities()
+        parsed, _response_format = self._analyze_chunk_with_retries(
+            self._title_prompt(),
+            self._user_text_for_batch(batch),
+            label,
+            total,
+            response_format_supported,
+        )
+        return self._titles_by_index_from_response(parsed, [item["index"] for item in batch])
+
+    def _retry_missing_title_items(self, missing_items, label, total):
+        if not missing_items:
+            return {}
+        missing_label = f"{label}.补缺"
+        self.progress.emit(f"第 {label}/{total} 批有 {len(missing_items)} 个标题缺失，正在单独重试缺失章节...")
+        titles = self._request_title_batch_once(missing_items, missing_label, total)
+        missing_indices = [item["index"] for item in missing_items if not titles.get(item["index"])]
+        if missing_indices:
+            raise ValueError("AI 没有为这些章节返回有效标题：" + "、".join(str(index) for index in missing_indices))
+        return titles
+
+    def _request_title_batch_with_retries(self, batch, label, total):
+        last_error = None
+        for attempt in range(1, 3):
+            if self._stop_requested or self.isInterruptionRequested():
+                return []
+            try:
+                titles_by_index = self._request_title_batch_once(batch, label, total)
+            except Exception as e:
+                last_error = e
+                msg = str(e).lower()
+                response_format_supported, stream_supported = self._analysis_request_capabilities()
+                if stream_supported and ("不是合法 json" in msg or "not valid json" in msg or "jsondecodeerror" in msg):
+                    self._set_analysis_stream_supported(False)
+                    self.progress.emit(f"第 {label}/{total} 批章节标题返回格式异常，已切换普通请求重试...")
+                    try:
+                        titles_by_index = self._request_title_batch_once(batch, label, total)
+                    except Exception as e2:
+                        last_error = e2
+                    else:
+                        missing_items = [item for item in batch if not titles_by_index.get(item["index"])]
+                        titles_by_index.update(self._retry_missing_title_items(missing_items, label, total))
+                        return [titles_by_index[item["index"]] for item in batch]
+                if attempt < 2:
+                    self.progress.emit(f"第 {label}/{total} 批章节标题生成失败，正在自动重试 2/2...")
+                    continue
+                break
+            else:
+                missing_items = [item for item in batch if not titles_by_index.get(item["index"])]
+                titles_by_index.update(self._retry_missing_title_items(missing_items, label, total))
+                return [titles_by_index[item["index"]] for item in batch]
+        raise last_error or Exception("章节标题生成失败。")
+
+    def run(self):
+        try:
+            if not self.base_url:
+                raise Exception("请先选择厂商。")
+            if not self.api_key:
+                raise Exception("请先设置 API Key。")
+            if not self.model:
+                raise Exception("请选择模型。")
+            if not self.chapters:
+                raise Exception("没有可命名的拆分章节。")
+            batches = self._title_batches()
+            if not batches:
+                raise Exception("没有可命名的拆分章节。")
+            total = len(batches)
+            all_titles = []
+            for index, batch in enumerate(batches, 1):
+                if self._stop_requested or self.isInterruptionRequested():
+                    return
+                self.progress.emit(f"正在生成拆分章节标题：{index}/{total}...")
+                all_titles.extend(self._request_title_batch_with_retries(batch, index, total))
+            if len(all_titles) != len(self.chapters):
+                raise Exception(f"章节标题数量不一致：需要 {len(self.chapters)} 个，实际 {len(all_titles)} 个。")
+            self.result_ready.emit(all_titles)
         except Exception as e:
             if not self._stop_requested and not self.isInterruptionRequested():
                 self.failed.emit(str(e))
@@ -1046,6 +1672,42 @@ class NovelWritingWorker(QThread):
             return 1200
         return 0
 
+    def _stream_finished_normally(self, done_received, finish_reason):
+        reason = str(finish_reason or "").strip().lower()
+        if reason in {"length", "max_tokens", "token_limit"}:
+            return False
+        normal_reasons = {"stop", "end_turn", "complete", "completed", "eos", "eos_token"}
+        if reason and reason not in normal_reasons:
+            return False
+        return bool(done_received or reason in normal_reasons)
+
+    def _incomplete_stream_error(self, finish_reason):
+        reason = str(finish_reason or "").strip().lower()
+        action_label = {
+            "draft": "正文",
+            "outline": "提纲",
+            "summary": "摘要",
+            "script_to_novel": "小说正文",
+            "novel_to_script": "剧本",
+            "novel_to_storyboard": "分镜脚本",
+            "script_to_storyboard": "分镜脚本",
+        }.get(self.action, "内容")
+        if reason in {"length", "max_tokens", "token_limit"}:
+            return f"AI 输出达到长度上限，已保留当前预览内容，可点续写{action_label}继续。"
+        if reason:
+            return f"AI 输出未正常完成（finish_reason={finish_reason}），已保留当前预览内容，可点续写{action_label}继续。"
+        reason_text = f" finish_reason={finish_reason}" if finish_reason else ""
+        return f"AI 输出未完整结束，已保留当前预览内容，可点续写{action_label}继续。{reason_text}".strip()
+
+    def _draft_ending_looks_complete(self, content):
+        text = str(content or "").strip()
+        if not text:
+            return False
+        text = text.rstrip(" \t\r\n\"'”’」』》）)]】")
+        if not text:
+            return False
+        return text[-1] in "。！？!?…."
+
     def _initial_progress_text(self):
         return {
             "draft": "正在扩写正文...",
@@ -1098,6 +1760,8 @@ class NovelWritingWorker(QThread):
                 "\n摘要要求：只提炼已经在正文中发生、后续必须继承的事实。"
                 "语言短而明确，不评价、不解释创作意图，不新增正文里没有发生的设定或伏笔。"
                 "本章摘要保持简短，关键事实按完整事实逐条写；只保留会影响后文续写的变化。"
+                "章节结尾的时间、天气、地点、人物位置、身体状态、持有物品和未完成动作属于必须继承的信息；"
+                "如果正文收尾写明雨停、雨后、天亮、转场、离开、抵达、昏迷、受伤、持有/交出物品等状态，必须写入关键事实。"
                 "不要为了固定句数或条数删掉人物关系、伤势、物品、地点、线索、伏笔状态等必须继承的信息。"
             )
         return common + (
@@ -1123,6 +1787,8 @@ class NovelWritingWorker(QThread):
                 "如果资料里已有正文草稿，只输出接在草稿末尾的新正文，不要重复、概括或重写已有正文；"
                 "如果正文草稿为空，输出完整正文草稿；"
                 "看到【续写承接点】时，优先从承接点的最后情绪、动作、场景和悬念自然接上；"
+                "必须继承承接点里的时间、天气、地点、人物位置、身体状态、持有物品和未完成动作；"
+                "如果上一章写明雨已停、雨后或场景已变化，不要在下一章开头改成仍在下雨或回到旧场景，除非本章提纲明确发生新的天气/场景变化；"
                 "严格继承资料中的关键事实、时间线、人物目标、语言风格、伏笔状态和世界规则；"
                 "只有【本章相关伏笔】里被本章标题、提纲或正文目标命中的伏笔，才可以在本章推进或回收；"
                 "【开放伏笔队列】只用于提醒不要遗忘，除非当前章节明确安排，否则不要提前兑现或解释队列里的伏笔；"
@@ -1138,6 +1804,8 @@ class NovelWritingWorker(QThread):
                 "包括人物关系、线索、伏笔、伤势、物品、地点变化和情绪关系变化；不要评价。"
                 "本章摘要保持简短，只概括核心事件和情绪转折。"
                 "关键事实逐条写，每条只写一个可继承事实，删掉背景解释、重复信息和创作建议；"
+                "章节结尾的时间、天气、地点、人物位置、身体状态、持有物品和未完成动作必须进入关键事实，"
+                "尤其是雨停/雨后、天亮/入夜、离开/抵达、受伤/昏迷、物品交接等会影响下一章开头的状态；"
                 "条数不固定，重要连续性事实必须保留，不要为了压缩删掉会影响后文的变化。"
                 "请严格输出三段：本章摘要：...；本章需继承的关键事实：...；"
                 "本章关联人物：人物A、人物B（只列本章实际出现或被直接推动的人物；优先使用人物卡里的具体姓名，不要只写主角/反派/配角；没有则写无）"
@@ -1210,6 +1878,7 @@ class NovelWritingWorker(QThread):
 
             full = ""
             finish_reason = ""
+            done_received = False
             r.encoding = "utf-8"
             for raw_line in r.iter_lines(decode_unicode=False):
                 if self._stop_requested or self.isInterruptionRequested():
@@ -1225,6 +1894,7 @@ class NovelWritingWorker(QThread):
                     continue
                 data_str = line[5:].strip()
                 if data_str == "[DONE]":
+                    done_received = True
                     break
                 try:
                     data = json.loads(data_str)
@@ -1255,12 +1925,17 @@ class NovelWritingWorker(QThread):
                     self.chunk.emit(piece)
 
             content = full.strip()
+            stopped = bool(self._stop_requested or self.isInterruptionRequested())
             if not content:
-                if self._stop_requested or self.isInterruptionRequested():
+                if stopped:
                     self.result_ready.emit(self.action, "")
                     return
                 reason_text = f" finish_reason={finish_reason}" if finish_reason else ""
                 raise Exception(f"AI 没有返回有效内容。{reason_text}".strip())
+            if not stopped and not self._stream_finished_normally(done_received, finish_reason):
+                raise Exception(self._incomplete_stream_error(finish_reason))
+            if self.action == "draft" and not stopped and not self._draft_ending_looks_complete(content):
+                raise Exception("AI 正文似乎还没有写完，已保留当前预览内容，可点续写正文继续。")
             self.result_ready.emit(self.action, content)
         except Exception as e:
             if self._stop_requested or self.isInterruptionRequested():

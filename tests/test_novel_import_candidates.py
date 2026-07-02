@@ -4,6 +4,9 @@ from gpt_desktop.novel_import import (
     _apply_import_candidates,
     _candidate_analysis_dossier_text,
     _candidate_analysis_text,
+    _foreshadow_review_chapter_chunks,
+    _foreshadow_review_context,
+    _foreshadow_review_dossier_text,
     _normalize_ai_candidates,
 )
 from gpt_desktop.novel_utils import _new_chapter, _normalize_project
@@ -23,6 +26,41 @@ class NovelImportCandidateTests(unittest.TestCase):
 
         self.assertIn("关联人物", text)
         self.assertIn("赵明、迟到主角", text)
+
+    def test_foreshadow_review_uses_existing_items_and_full_chapter_body(self):
+        chapter = _new_chapter(0)
+        chapter["title"] = "第二章 真相"
+        chapter["text"] = "赵明在内库发现调包记录，虎符失踪已经解释清楚。"
+        chapter["summary"] = "赵明查明虎符失踪真相。"
+        chapter["key_facts"] = "虎符失踪已经由内库调包解释清楚。"
+        project = {
+            "meta": {"title": "长篇测试"},
+            "foreshadow_items": [
+                {
+                    "name": "虎符失踪",
+                    "status": "已埋",
+                    "setup_chapter": "第一章 旧案",
+                    "payoff_chapter": "",
+                    "description": "半枚虎符首次出现。",
+                }
+            ],
+            "chapters": [chapter],
+        }
+
+        dossier = _foreshadow_review_dossier_text(project)
+        chunks = _foreshadow_review_chapter_chunks(project)
+        context = _foreshadow_review_context(project)
+
+        self.assertIn("【现有伏笔列表】", dossier)
+        self.assertIn("虎符失踪", dossier)
+        self.assertEqual(len(chunks), 1)
+        self.assertIn("当前章节标题：第二章 真相", chunks[0]["text"])
+        self.assertNotIn("【现有伏笔列表】", chunks[0]["text"])
+        self.assertIn("赵明在内库发现调包记录", chunks[0]["text"])
+        self.assertNotIn("摘要：", chunks[0]["text"])
+        self.assertNotIn("关键事实：", chunks[0]["text"])
+        self.assertIn("【章节正文】", context)
+        self.assertIn("赵明在内库发现调包记录", context)
 
     def test_candidate_analysis_text_includes_existing_project_dossier(self):
         chapter = _new_chapter(0)
@@ -675,6 +713,39 @@ class NovelImportCandidateTests(unittest.TestCase):
         self.assertEqual(project["foreshadow_items"][0]["description"].count(foreshadow_line), 1)
         self.assertIn("补充：牵出兵权交易。", project["foreshadow_items"][0]["description"])
 
+    def test_apply_import_candidates_limits_foreshadow_description_supplements(self):
+        project = {
+            "foreshadow_items": [
+                {
+                    "name": "旧钟声",
+                    "status": "已埋",
+                    "setup_chapter": "第一章",
+                    "payoff_chapter": "",
+                    "description": "钟声提示旧案未结。\n补充：第一章：钟声在夜里响起。\n补充：第二章：钟声又在王城出现。",
+                }
+            ],
+        }
+        candidates = {
+            "characters": [],
+            "lore": [],
+            "foreshadows": [
+                {
+                    "name": "旧钟声",
+                    "payoff_chapter": "第三章",
+                    "description": "赵明确认钟声来自旧案密室。\n章节依据：第三章打开密室。",
+                }
+            ],
+            "project_materials": {},
+        }
+
+        _apply_import_candidates(project, candidates, {"foreshadows": [0]})
+
+        description = project["foreshadow_items"][0]["description"]
+        self.assertEqual(description.count("补充："), 2)
+        self.assertIn("补充：第一章：钟声在夜里响起。", description)
+        self.assertIn("补充：第三章：赵明确认钟声来自旧案密室。；章节依据：第三章打开密室。", description)
+        self.assertNotIn("第二章：钟声又在王城出现。", description)
+
     def test_apply_import_candidates_merges_lore_and_foreshadow_by_alias(self):
         project = {
             "lore": [
@@ -709,7 +780,7 @@ class NovelImportCandidateTests(unittest.TestCase):
         self.assertEqual(len(project["foreshadow_items"]), 1)
         self.assertEqual(project["foreshadow_items"][0]["name"], "虎符失踪")
         self.assertEqual(project["foreshadow_items"][0]["payoff_chapter"], "第二十章")
-        self.assertIn("补充：真相揭晓。", project["foreshadow_items"][0]["description"])
+        self.assertIn("补充：第二十章：真相揭晓。", project["foreshadow_items"][0]["description"])
 
     def test_apply_import_candidates_keeps_existing_foreshadow_status_without_explicit_candidate_status(self):
         project = {
@@ -737,6 +808,306 @@ class NovelImportCandidateTests(unittest.TestCase):
         self.assertEqual(project["foreshadow_items"][0]["status"], "已埋")
         self.assertIn("后续牵出兵权交易", project["foreshadow_items"][0]["description"])
 
+    def test_apply_import_candidates_updates_explicit_foreshadow_recovery(self):
+        project = {
+            "foreshadow_items": [
+                {
+                    "name": "虎符失踪",
+                    "status": "已埋",
+                    "setup_chapter": "第二章",
+                    "payoff_chapter": "",
+                    "description": "半枚虎符首次出现。",
+                }
+            ]
+        }
+        candidates = _normalize_ai_candidates({
+            "foreshadows": [
+                {
+                    "name": "虎符失踪",
+                    "status": "已回收",
+                    "payoff_chapter": "第十二章 真相",
+                    "description": "本章揭晓虎符失踪真相，确认牵出兵权交易。",
+                }
+            ]
+        })
+
+        _apply_import_candidates(project, candidates, {"foreshadows": [0]})
+
+        self.assertEqual(project["foreshadow_items"][0]["status"], "已回收")
+        self.assertEqual(project["foreshadow_items"][0]["payoff_chapter"], "第十二章 真相")
+        self.assertIn("揭晓虎符失踪真相", project["foreshadow_items"][0]["description"])
+
+    def test_apply_import_candidates_updates_foreshadow_by_review_merge_target(self):
+        project = {
+            "foreshadow_items": [
+                {
+                    "code": "F0007",
+                    "name": "雨后状态",
+                    "status": "已埋",
+                    "setup_chapter": "第八章",
+                    "payoff_chapter": "",
+                    "description": "第八章结尾已经进入雨后。",
+                }
+            ]
+        }
+        candidates = _normalize_ai_candidates({
+            "foreshadows": [
+                {
+                    "name": "第九章不应再次下雨",
+                    "status": "已回收",
+                    "payoff_chapter": "第九章",
+                    "description": "第九章开头重复写雨水，应按第八章雨后状态修正。",
+                    "merge_target": "雨后状态",
+                    "review_action": "更新状态",
+                    "review_reason": "命中旧伏笔的天气连续性。",
+                }
+            ]
+        })
+
+        result = _apply_import_candidates(project, candidates, {"foreshadows": [0]})
+
+        self.assertEqual(len(project["foreshadow_items"]), 1)
+        self.assertEqual(project["foreshadow_items"][0]["name"], "雨后状态")
+        self.assertEqual(project["foreshadow_items"][0]["status"], "已回收")
+        self.assertEqual(project["foreshadow_items"][0]["payoff_chapter"], "")
+        self.assertEqual(project["foreshadow_items"][0]["description"], "第八章结尾已经进入雨后。")
+        self.assertNotIn("重复写雨水", project["foreshadow_items"][0]["description"])
+        self.assertNotIn("别称：第九章不应再次下雨", project["foreshadow_items"][0]["description"])
+        self.assertEqual(result["added"]["foreshadows"], 0)
+        self.assertEqual(result["merged"]["foreshadows"], 1)
+        self.assertEqual(result["removed_candidates"], 1)
+        self.assertIn("命中编号：F0007", project["foreshadow_items"][0]["notes"])
+        self.assertIn("原伏笔标题：雨后状态", project["foreshadow_items"][0]["notes"])
+        self.assertIn("建议状态：已回收", project["foreshadow_items"][0]["notes"])
+        self.assertIn("建议说明：第九章开头重复写雨水", project["foreshadow_items"][0]["notes"])
+
+    def test_apply_import_candidates_keeps_unmatched_review_target_as_candidate(self):
+        project = {
+            "foreshadow_items": [
+                {
+                    "name": "虎符失踪",
+                    "status": "已埋",
+                    "setup_chapter": "第二章",
+                    "payoff_chapter": "",
+                    "description": "半枚虎符首次出现。",
+                }
+            ]
+        }
+        candidates = _normalize_ai_candidates({
+            "foreshadows": [
+                {
+                    "name": "陌生线索",
+                    "status": "已回收",
+                    "description": "AI 认为应更新旧伏笔，但目标名当前不存在。",
+                    "merge_target": "不存在的旧伏笔",
+                    "review_action": "更新状态",
+                }
+            ]
+        })
+
+        result = _apply_import_candidates(project, candidates, {"foreshadows": [0]})
+
+        self.assertEqual(len(project["foreshadow_items"]), 1)
+        self.assertEqual(project["foreshadow_items"][0]["name"], "虎符失踪")
+        self.assertEqual(len(candidates["foreshadows"]), 1)
+        self.assertEqual(result["added"]["foreshadows"], 0)
+        self.assertEqual(result["merged"]["foreshadows"], 0)
+        self.assertEqual(result["removed_candidates"], 0)
+        self.assertEqual(result["skipped"]["foreshadows"], 1)
+
+    def test_apply_import_candidates_updates_foreshadow_by_target_code(self):
+        project = {
+            "foreshadow_items": [
+                {
+                    "code": "F0007",
+                    "name": "雨后状态",
+                    "status": "已埋",
+                    "setup_chapter": "第八章",
+                    "payoff_chapter": "",
+                    "description": "第八章结尾已经进入雨后。",
+                }
+            ]
+        }
+        candidates = _normalize_ai_candidates({
+            "foreshadows": [
+                {
+                    "name": "第九章不应再次下雨",
+                    "status": "已回收",
+                    "payoff_chapter": "第九章",
+                    "description": "第九章开头重复写雨水，应按编号命中旧伏笔修正。",
+                    "target_code": "F0007",
+                    "review_action": "更新状态",
+                }
+            ]
+        })
+
+        _apply_import_candidates(project, candidates, {"foreshadows": [0]})
+
+        self.assertEqual(project["foreshadow_items"][0]["status"], "已回收")
+        self.assertEqual(project["foreshadow_items"][0]["payoff_chapter"], "")
+        self.assertEqual(project["foreshadow_items"][0]["description"], "第八章结尾已经进入雨后。")
+        self.assertIn("命中编号：F0007", project["foreshadow_items"][0]["notes"])
+        self.assertIn("原伏笔标题：雨后状态", project["foreshadow_items"][0]["notes"])
+
+    def test_apply_import_candidates_keeps_terminal_review_note_to_first_batch(self):
+        project = {
+            "foreshadow_items": [
+                {
+                    "code": "F0055",
+                    "name": "陈景川与陈远山景辰总部正面交锋",
+                    "status": "已埋",
+                    "setup_chapter": "章节 4",
+                    "payoff_chapter": "",
+                    "description": "预设二人在景辰总部正面交锋。",
+                }
+            ]
+        }
+        candidates = _normalize_ai_candidates({
+            "foreshadows": [
+                {
+                    "name": "陈景川与陈远山景辰总部正面交锋",
+                    "status": "废弃",
+                    "description": (
+                        "原伏笔预设交锋场域为景辰京城总部，但正文实际推进为陈家老宅家族会议。\n"
+                        "体检建议：移出伏笔\n"
+                        "合并目标：陈家老宅权限边界会议\n"
+                        "判断依据：旧伏笔与 F0065 明显重复且场域已被正文修正。\n"
+                        "章节依据：章节 7 与章节 8。\n"
+                        "补充：体检建议：更新状态\n"
+                        "补充：命中编号：F0065\n"
+                        "补充：判断依据：章节 8 中另一个规范伏笔已经回收。"
+                    ),
+                    "target_code": "F0055",
+                    "review_action": "移出伏笔",
+                    "merge_target": "陈家老宅权限边界会议",
+                }
+            ]
+        })
+
+        _apply_import_candidates(project, candidates, {"foreshadows": [0]})
+
+        notes = project["foreshadow_items"][0]["notes"]
+        self.assertEqual(project["foreshadow_items"][0]["status"], "废弃")
+        self.assertIn("命中编号：F0055", notes)
+        self.assertIn("建议状态：废弃", notes)
+        self.assertIn("体检建议：移出伏笔", notes)
+        self.assertIn("合并目标：陈家老宅权限边界会议", notes)
+        self.assertNotIn("命中编号：F0065", notes)
+        self.assertNotIn("另一个规范伏笔已经回收", notes)
+
+    def test_foreshadow_move_out_review_action_defaults_to_discard_status(self):
+        project = {
+            "foreshadow_items": [
+                {
+                    "code": "F0021",
+                    "name": "旧总部交锋",
+                    "status": "已埋",
+                    "setup_chapter": "章节 3",
+                    "payoff_chapter": "",
+                    "description": "原计划在总部发生正面交锋。",
+                }
+            ]
+        }
+        candidates = _normalize_ai_candidates({
+            "foreshadows": [
+                {
+                    "name": "旧总部交锋",
+                    "description": "正文已经改为陈家老宅会议，不再作为长期伏笔保留。",
+                    "target_code": "F0021",
+                    "review_action": "移出伏笔",
+                }
+            ]
+        })
+
+        item = candidates["foreshadows"][0]
+        self.assertEqual(item["status"], "废弃")
+        self.assertTrue(item.get("_status_explicit"))
+
+        _apply_import_candidates(project, candidates, {"foreshadows": [0]})
+
+        target = project["foreshadow_items"][0]
+        self.assertEqual(target["status"], "废弃")
+        self.assertEqual(target["description"], "原计划在总部发生正面交锋。")
+        self.assertIn("命中编号：F0021", target["notes"])
+        self.assertIn("建议状态：废弃", target["notes"])
+        self.assertIn("体检建议：移出伏笔", target["notes"])
+
+    def test_apply_import_candidates_skips_closed_foreshadow_review_target(self):
+        for closed_status in ("已回收", "废弃"):
+            with self.subTest(closed_status=closed_status):
+                project = {
+                    "foreshadow_items": [
+                        {
+                            "code": "F0007",
+                            "name": "雨后状态",
+                            "status": closed_status,
+                            "setup_chapter": "第八章",
+                            "payoff_chapter": "第九章",
+                            "description": "第八章结尾已经进入雨后。",
+                        }
+                    ]
+                }
+                candidates = _normalize_ai_candidates({
+                    "foreshadows": [
+                        {
+                            "name": "第十章又写雨水",
+                            "status": "已回收",
+                            "description": "第十章再次命中旧伏笔，但该伏笔已经关闭。",
+                            "target_code": "F0007",
+                            "review_action": "更新状态",
+                        }
+                    ]
+                })
+
+                result = _apply_import_candidates(project, candidates, {"foreshadows": [0]})
+
+                item = project["foreshadow_items"][0]
+                self.assertEqual(item["status"], closed_status)
+                self.assertEqual(item["description"], "第八章结尾已经进入雨后。")
+                self.assertNotIn("notes", item)
+                self.assertEqual(len(candidates["foreshadows"]), 0)
+                self.assertEqual(result["merged"]["foreshadows"], 0)
+                self.assertEqual(result["removed_candidates"], 1)
+
+    def test_foreshadow_review_dossier_uses_stable_codes(self):
+        project = {
+            "foreshadow_items": [
+                {"code": "F0007", "name": "雨后状态", "status": "已埋", "description": "雨后。"}
+            ]
+        }
+        dossier = _foreshadow_review_dossier_text(project)
+
+        self.assertIn("编号：F0007", dossier)
+        self.assertIn("名称：雨后状态", dossier)
+        self.assertNotIn("1.", dossier)
+
+    def test_apply_import_candidates_does_not_downgrade_recovered_foreshadow(self):
+        project = {
+            "foreshadow_items": [
+                {
+                    "name": "虎符失踪",
+                    "status": "已回收",
+                    "setup_chapter": "第二章",
+                    "payoff_chapter": "第十二章",
+                    "description": "真相已经揭晓。",
+                }
+            ]
+        }
+        candidates = _normalize_ai_candidates({
+            "foreshadows": [
+                {
+                    "name": "虎符失踪",
+                    "status": "已埋",
+                    "description": "再次提到虎符。",
+                }
+            ]
+        })
+
+        _apply_import_candidates(project, candidates, {"foreshadows": [0]})
+
+        self.assertEqual(project["foreshadow_items"][0]["status"], "已回收")
+        self.assertIn("再次提到虎符", project["foreshadow_items"][0]["description"])
+
     def test_ai_foreshadow_candidate_without_status_stays_unjudged_until_new_import(self):
         candidates = _normalize_ai_candidates({
             "foreshadows": [
@@ -755,6 +1126,83 @@ class NovelImportCandidateTests(unittest.TestCase):
 
         self.assertEqual(project["foreshadow_items"][0]["status"], "未埋")
         self.assertIn("后续牵出兵权交易", project["foreshadow_items"][0]["description"])
+
+    def test_foreshadow_review_metadata_is_kept_in_candidate_description(self):
+        candidates = _normalize_ai_candidates({
+            "foreshadows": [
+                {
+                    "name": "虎符失踪",
+                    "status": "已回收",
+                    "payoff_chapter": "第二章 真相",
+                    "description": "真相已经揭晓。",
+                    "review_action": "更新状态",
+                    "review_reason": "正文已解释虎符失踪原因。",
+                    "evidence": "第二章 真相",
+                }
+            ]
+        })
+
+        item = candidates["foreshadows"][0]
+
+        self.assertEqual(item["status"], "已回收")
+        self.assertTrue(item.get("_status_explicit"))
+        self.assertIn("体检建议：更新状态", item["description"])
+        self.assertIn("判断依据：正文已解释虎符失踪原因。", item["description"])
+        self.assertIn("章节依据：第二章 真相", item["description"])
+
+    def test_foreshadow_review_target_code_prevents_cross_target_candidate_merge(self):
+        candidates = _normalize_ai_candidates({
+            "foreshadows": [
+                {
+                    "name": "陈景川与陈远山景辰总部正面交锋",
+                    "status": "废弃",
+                    "description": "总部交锋场域已被正文修正。",
+                    "target_code": "F0055",
+                    "merge_target": "陈家老宅权限边界会议",
+                    "review_action": "移出伏笔",
+                },
+                {
+                    "name": "陈家老宅权限边界会议",
+                    "status": "已回收",
+                    "description": "家族会议已正式发生。",
+                    "target_code": "F0065",
+                    "review_action": "更新状态",
+                },
+            ]
+        })
+
+        self.assertEqual(len(candidates["foreshadows"]), 2)
+        by_code = {item.get("_target_code"): item for item in candidates["foreshadows"]}
+        self.assertIn("F0055", by_code)
+        self.assertIn("F0065", by_code)
+        self.assertNotIn("家族会议已正式发生", by_code["F0055"]["description"])
+
+    def test_foreshadow_review_keeps_earliest_terminal_chapter(self):
+        candidates = _normalize_ai_candidates({
+            "foreshadows": [
+                {
+                    "name": "陈景川与陈远山景辰总部正面交锋",
+                    "status": "废弃",
+                    "description": "第九章后续再次提到该旧线索。",
+                    "target_code": "F0055",
+                    "review_action": "移出伏笔",
+                    "evidence": "第九章",
+                },
+                {
+                    "name": "陈景川与陈远山景辰总部正面交锋",
+                    "status": "废弃",
+                    "description": "章节 7 首次证明总部交锋场域已被正文修正。",
+                    "target_code": "F0055",
+                    "review_action": "移出伏笔",
+                    "evidence": "章节 7 陈家老宅通知",
+                },
+            ]
+        })
+
+        self.assertEqual(len(candidates["foreshadows"]), 1)
+        item = candidates["foreshadows"][0]
+        self.assertIn("章节 7", item["description"])
+        self.assertNotIn("第九章后续", item["description"])
 
 
 if __name__ == "__main__":

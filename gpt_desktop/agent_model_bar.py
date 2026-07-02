@@ -1,6 +1,5 @@
-from PySide6.QtCore import QTimer
-
-from .core import clean_error_text, get_provider, now_str, save_config
+from .core import clean_error_text, now_str, save_config
+from .model_list_loader import ModelListRequestPool
 from .workers import ModelListWorker
 
 
@@ -11,6 +10,7 @@ class AgentModelBarMixin:
         "gpt-5.5", "gpt-5.5-mini", "gpt-4o", "gpt-4o-mini",
         "gpt-4.1", "gpt-4.1-mini", "gpt-4-turbo", "gpt-3.5-turbo",
     ]
+    MODEL_REQUEST_KEY = "agent_model_bar"
 
     def refresh_providers(self):
         current = self.config.get("agent", {}).get("provider_id", "")
@@ -56,28 +56,43 @@ class AgentModelBarMixin:
         except Exception:
             pass
 
-    def load_models(self):
-        if self.model_worker is not None and self.model_worker.isRunning():
-            self._pending_model_reload = True
-            return
+    def _stop_running_model_worker(self):
+        self._model_loader().stop(self.MODEL_REQUEST_KEY)
 
-        provider = get_provider(self.config, self.bar.current_provider_id())
-        if not provider:
-            self.bar.set_models([], "")
-            self.bar.set_status("未选择厂商")
-            return
+    def _model_loader(self):
+        loader = getattr(self, "_model_list_loader", None)
+        if loader is None:
+            loader = ModelListRequestPool(
+                self.config,
+                owner=self,
+                worker_attr="model_worker",
+                worker_factory=ModelListWorker,
+            )
+            self._model_list_loader = loader
+        return loader
+
+    def load_models(self):
+        provider_id = self.bar.current_provider_id()
+        self._pending_model_reload = False
+        self._model_loader().start(
+            provider_id,
+            key=self.MODEL_REQUEST_KEY,
+            replace=True,
+            on_started=self._on_model_request_started,
+            on_loaded=self.on_models_loaded,
+            on_failed=self.on_models_failed,
+            on_missing_provider=self._on_model_provider_missing,
+        )
+
+    def _on_model_request_started(self, provider_id, request_id):
+        self._model_request_id = request_id
         self.bar.set_models_loading()
         self.bar.set_status("正在加载模型列表...")
-        self.model_worker = ModelListWorker(
-            provider.get("base_url", ""),
-            provider.get("api_key", ""),
-            provider.get("proxy_url", ""),
-            provider.get("proxy_mode", "提交和下载" if provider.get("proxy_url") else "不使用代理"),
-        )
-        self.model_worker.result_ready.connect(self.on_models_loaded)
-        self.model_worker.failed.connect(self.on_models_failed)
-        self.model_worker.finished.connect(self._cleanup_model_worker)
-        self.model_worker.start()
+
+    def _on_model_provider_missing(self, provider_id):
+        self._model_request_id = ""
+        self.bar.set_models([], "")
+        self.bar.set_status("未选择厂商")
 
     def _desired_model_for_bar(self):
         try:
@@ -94,7 +109,20 @@ class AgentModelBarMixin:
         self._pending_agent_session_model = ""
         self._restoring_agent_session_model_config = False
 
-    def on_models_loaded(self, models):
+    def _is_current_model_request(self, provider_id, request_id):
+        return self._model_loader().is_current(
+            self.MODEL_REQUEST_KEY, provider_id, request_id
+        ) or (
+            str(provider_id or "") == str(self.bar.current_provider_id() or "")
+            and str(request_id or "") == str(getattr(self, "_model_request_id", "") or "")
+        )
+
+    def on_models_loaded(self, provider_id, request_id, models):
+        if not self._is_current_model_request(provider_id, request_id):
+            return
+        cache = self.config.setdefault("model_cache", {})
+        cache[provider_id] = [str(model) for model in (models or []) if str(model).strip()]
+        save_config(self.config)
         try:
             self.bar.set_models(models, self._desired_model_for_bar())
             self.bar.set_status(f"已加载 {len(models)} 个模型")
@@ -108,7 +136,9 @@ class AgentModelBarMixin:
         finally:
             self._finish_model_restore()
 
-    def on_models_failed(self, err):
+    def on_models_failed(self, provider_id, request_id, err):
+        if not self._is_current_model_request(provider_id, request_id):
+            return
         err = clean_error_text(err)
         try:
             self.bar.set_models(self.FALLBACK_MODELS, self._desired_model_for_bar())
@@ -122,23 +152,6 @@ class AgentModelBarMixin:
                 pass
         finally:
             self._finish_model_restore()
-
-    def _cleanup_model_worker(self):
-        worker = self.sender()
-
-        def cleanup():
-            try:
-                if self.model_worker is worker:
-                    self.model_worker = None
-                if worker is not None:
-                    worker.deleteLater()
-            except Exception:
-                pass
-            if self._pending_model_reload:
-                self._pending_model_reload = False
-                QTimer.singleShot(0, self.load_models)
-
-        QTimer.singleShot(0, cleanup)
 
     def current_bar_provider_model(self):
         """

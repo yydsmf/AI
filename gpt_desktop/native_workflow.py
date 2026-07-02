@@ -55,6 +55,7 @@ from .image_history_store import (
     iter_image_items as iter_image_history_items,
     migrate_json_history_once,
 )
+from .model_list_loader import ModelListRequestPool
 from .widgets import WideComboBox, show_image_preview
 from .workers import ImageWorker, ModelListWorker, VideoWorker
 
@@ -1428,13 +1429,28 @@ class WorkflowNodeItem(QGraphicsItem):
 
 
 class NodeConfigDialog(QDialog):
+    MODEL_REQUEST_KEY = "node_config_dialog"
+
     def __init__(self, config, node, parent=None):
         super().__init__(parent)
         self.config = config or {}
         self.node = node
         self.model_worker = None
+        self._model_request_id = ""
         self._build_ui()
         self._load_providers()
+
+    def _model_loader(self):
+        loader = getattr(self, "_model_list_loader", None)
+        if loader is None:
+            loader = ModelListRequestPool(
+                self.config,
+                owner=self,
+                worker_attr="model_worker",
+                worker_factory=ModelListWorker,
+            )
+            self._model_list_loader = loader
+        return loader
 
     def _build_ui(self):
         self.setWindowTitle("节点配置")
@@ -1483,6 +1499,8 @@ class NodeConfigDialog(QDialog):
         node_type = self.node.data.get("type")
         if node_type in ("text_to_image", "image_to_image"):
             return self.config.get("image", {}).get("provider_id", "")
+        if node_type == "image_to_video":
+            return self.config.get("video", {}).get("provider_id", "")
         if node_type == "prompt_optimize":
             return self.config.get("agent", {}).get("provider_id", "")
         return ""
@@ -1508,30 +1526,40 @@ class NodeConfigDialog(QDialog):
         self.model_combo.addItem(current_model or "")
         self.model_combo.setCurrentText(current_model or "")
 
-        if self.model_worker is not None and self.model_worker.isRunning():
-            return
-
-        self.refresh_btn.setEnabled(False)
-        self.model_worker = ModelListWorker(
-            provider.get("base_url", ""),
-            provider.get("api_key", ""),
-            provider.get("proxy_url", ""),
-            provider.get("proxy_mode", "提交和下载" if provider.get("proxy_url") else "不使用代理"),
+        self._model_loader().start(
+            provider.get("id", ""),
+            key=self.MODEL_REQUEST_KEY,
+            replace=True,
+            on_started=self._on_models_started,
+            on_loaded=self.on_models_loaded,
+            on_failed=self.on_models_failed,
         )
-        self.model_worker.result_ready.connect(self.on_models_loaded)
-        self.model_worker.failed.connect(self.on_models_failed)
-        self.model_worker.finished.connect(self._cleanup_worker)
-        self.model_worker.start()
+
+    def _on_models_started(self, _provider_id, request_id):
+        self._model_request_id = request_id
+        self.refresh_btn.setEnabled(False)
 
     def _default_model(self):
         node_type = self.node.data.get("type")
         if node_type in ("text_to_image", "image_to_image"):
             return self.config.get("image", {}).get("model", "")
+        if node_type == "image_to_video":
+            return self.config.get("video", {}).get("model", "")
         if node_type == "prompt_optimize":
             return self.config.get("agent", {}).get("model", "")
         return ""
 
-    def on_models_loaded(self, models):
+    def _fallback_models(self):
+        node_type = self.node.data.get("type")
+        if node_type in ("text_to_image", "image_to_image"):
+            return IMAGE_FALLBACK_MODELS
+        if node_type == "image_to_video":
+            return VIDEO_FALLBACK_MODELS
+        return AGENT_FALLBACK_MODELS
+
+    def on_models_loaded(self, provider_id, request_id, models):
+        if not self._model_loader().is_current(self.MODEL_REQUEST_KEY, provider_id, request_id):
+            return
         current = self.model_combo.currentText().strip()
         self.model_combo.blockSignals(True)
         self.model_combo.clear()
@@ -1544,13 +1572,27 @@ class NodeConfigDialog(QDialog):
         self.model_combo.blockSignals(False)
         self.refresh_btn.setEnabled(True)
 
-    def on_models_failed(self, err):
+    def on_models_failed(self, provider_id, request_id, err):
+        if not self._model_loader().is_current(self.MODEL_REQUEST_KEY, provider_id, request_id):
+            return
+        current = self.model_combo.currentText().strip()
+        self.model_combo.blockSignals(True)
+        self.model_combo.clear()
+        for model in self._fallback_models():
+            self.model_combo.addItem(model)
+        if current:
+            self.model_combo.setCurrentText(current)
+        elif self.model_combo.count() > 0:
+            self.model_combo.setCurrentIndex(0)
+        self.model_combo.blockSignals(False)
         self.refresh_btn.setEnabled(True)
-        self.model_combo.setCurrentText(self.model_combo.currentText())
 
-    def _cleanup_worker(self):
-        self.refresh_btn.setEnabled(True)
-        self.model_worker = None
+    def closeEvent(self, event):
+        try:
+            self._model_loader().stop(self.MODEL_REQUEST_KEY)
+        except Exception:
+            pass
+        super().closeEvent(event)
 
     def selected_provider(self):
         return self.current_provider()
@@ -1564,11 +1606,17 @@ class NodeConfigDialog(QDialog):
 class WorkflowScene(QGraphicsScene):
     def __init__(self, config=None, status_callback=None, parent=None, load_defaults=True):
         super().__init__(parent)
-        self.config = config or {}
+        self.config = config if config is not None else {}
         self.status_callback = status_callback
         self.changed_callback = None
         self.workers = {}
         self.model_workers = {}
+        self.model_loader = ModelListRequestPool(
+            self.config,
+            owner=self,
+            worker_map_attr="model_workers",
+            worker_factory=ModelListWorker,
+        )
         self.model_cache = dict((self.config.get("model_cache", {}) or {}))
         self.model_waiting_nodes = {}
         self.nodes = {}
@@ -1665,23 +1713,14 @@ class WorkflowScene(QGraphicsScene):
             return
 
         self.model_waiting_nodes.setdefault(provider_id, set()).add(node.data.get("id", ""))
-        if provider_id in self.model_workers:
-            return
-
-        provider = get_provider(self.config, provider_id)
-        if not provider:
-            return
-        worker = ModelListWorker(
-            provider.get("base_url", ""),
-            provider.get("api_key", ""),
-            provider.get("proxy_url", ""),
-            provider.get("proxy_mode", "提交和下载" if provider.get("proxy_url") else "不使用代理"),
+        self.model_loader.start(
+            provider_id,
+            key=provider_id,
+            replace=False,
+            on_loaded=lambda pid, _request_id, models: self.on_node_models_loaded(pid, models),
+            on_failed=lambda pid, _request_id, _err: self.on_node_models_failed(pid),
+            on_missing_provider=self.on_node_models_failed,
         )
-        self.model_workers[provider_id] = worker
-        worker.result_ready.connect(lambda models, pid=provider_id: self.on_node_models_loaded(pid, models))
-        worker.failed.connect(lambda _err, pid=provider_id: self.on_node_models_failed(pid))
-        worker.finished.connect(lambda pid=provider_id: self.cleanup_model_worker(pid))
-        worker.start()
 
     def on_node_models_loaded(self, provider_id, models):
         models = [str(model).strip() for model in (models or []) if str(model).strip()]
@@ -1695,6 +1734,7 @@ class WorkflowScene(QGraphicsScene):
                 updated += 1
         if updated:
             self.notify(f"模型列表已刷新，共 {len(models)} 个模型。")
+        self.model_waiting_nodes.pop(provider_id, None)
 
     def on_node_models_failed(self, provider_id):
         updated = 0
@@ -1715,9 +1755,7 @@ class WorkflowScene(QGraphicsScene):
         self.model_waiting_nodes.pop(provider_id, None)
 
     def cleanup_model_worker(self, provider_id):
-        worker = self.model_workers.pop(provider_id, None)
-        if worker is not None:
-            worker.deleteLater()
+        self.model_loader.stop(provider_id)
         self.model_waiting_nodes.pop(provider_id, None)
 
     def upstream_edges(self, node, target_port_id=None):

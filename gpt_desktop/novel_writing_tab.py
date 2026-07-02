@@ -43,6 +43,15 @@ from .novel_import import (
     _candidate_analysis_dossier_text,
     _candidate_detail_text,
     _extract_import_candidates,
+    _foreshadow_candidate_identity_keys,
+    _foreshadow_candidate_is_terminal_review,
+    _foreshadow_candidate_target_code_keys,
+    _foreshadow_candidate_target_keys,
+    _foreshadow_terminal_review_description,
+    _foreshadow_terminal_review_should_replace,
+    _foreshadow_review_context,
+    _foreshadow_review_chapter_chunks,
+    _foreshadow_review_dossier_text,
     _normalize_ai_candidates,
     _read_docx_text,
     _read_txt_text,
@@ -83,11 +92,16 @@ from .novel_utils import (
     _chapter_tooltip,
     _dedupe_chapters,
     _dedupe_text_lines,
+    _ensure_foreshadow_codes,
+    _foreshadow_code_number,
     _import_candidates_has_content,
     _mark_chapters_analyzed,
+    _merge_foreshadow_description_without_bloat,
     _merge_text_lines_without_duplicates,
+    _merge_foreshadow_status,
     _default_project,
     _foreshadow_list_text,
+    _normalize_foreshadow_code,
     _infer_linked_character_names,
     _is_generic_character_role_label,
     _infer_chapter_status,
@@ -98,6 +112,7 @@ from .novel_utils import (
     _new_foreshadow,
     _new_lore,
     _normalize_candidate_analysis_state,
+    _normalize_foreshadow_review_observations,
     _normalize_import_candidates,
     _normalize_name_list,
     _normalize_project,
@@ -111,7 +126,7 @@ from .novel_utils import (
     _split_manuscript_into_target_chapters,
 )
 from .widgets import ProviderModelBar, WideComboBox
-from .workers import EdgeTTSWorker, NovelAnalysisWorker, NovelCandidatePostprocessWorker, NovelWritingWorker
+from .workers import EdgeTTSWorker, NovelAnalysisWorker, NovelCandidatePostprocessWorker, NovelChapterTitleWorker, NovelForeshadowReviewPostprocessWorker, NovelForeshadowReviewWorker, NovelWritingWorker
 
 _SORT_MISSING_ORDER = 10 ** 9
 _CHINESE_NUMERAL_DIGITS = {
@@ -210,12 +225,19 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
         self.model_worker = None
         self.analysis_worker = None
         self.writing_worker = None
+        self.chapter_title_worker = None
         self.auto_summary_worker = None
         self.auto_outline_worker = None
+        self.foreshadow_review_worker = None
+        self.failed_foreshadow_review_chunks = []
+        self.foreshadow_review_postprocess_pending = False
+        self.foreshadow_review_observations = {"characters": [], "lore": [], "foreshadows": [], "project_materials": {}}
+        self.foreshadow_review_comparison_state = {}
         self.chapter_ai_stream_text = ""
         self.chapter_ai_action_buttons = []
         self._chapter_ai_buttons_by_action = {}
         self.candidate_action_buttons = []
+        self.foreshadow_action_buttons = []
         self._pending_model_reload = False
         self._loading = False
         self._dirty = False
@@ -242,6 +264,7 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
         self._chapter_ai_sequence_started_outline = ""
         self._chapter_ai_provider = {}
         self._chapter_ai_model = ""
+        self._pending_split_export = {}
         self.current_character_index = -1
         self.current_lore_index = -1
         self.current_foreshadow_index = -1
@@ -669,12 +692,12 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
         SimpleModelBarMixin.on_model_changed(self, model)
         self.refresh_ai_settings_summary()
 
-    def on_models_loaded(self, models):
-        SimpleModelBarMixin.on_models_loaded(self, models)
+    def on_models_loaded(self, provider_id, request_id, models):
+        SimpleModelBarMixin.on_models_loaded(self, provider_id, request_id, models)
         self.refresh_ai_settings_summary()
 
-    def on_models_failed(self, err):
-        SimpleModelBarMixin.on_models_failed(self, err)
+    def on_models_failed(self, provider_id, request_id, err):
+        SimpleModelBarMixin.on_models_failed(self, provider_id, request_id, err)
         self.refresh_ai_settings_summary()
 
     def _scroll_page(self, widget):
@@ -757,14 +780,17 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
             row.addWidget(self._ghost_button(text, callback, tooltip))
         return row
 
-    def _button_grid(self, actions, columns=3):
+    def _button_grid(self, actions, columns=3, button_store=None):
         grid = QGridLayout()
         grid.setHorizontalSpacing(6)
         grid.setVerticalSpacing(6)
         for index, action in enumerate(actions):
             text, callback = action[:2]
             tooltip = action[2] if len(action) > 2 else ""
-            grid.addWidget(self._ghost_button(text, callback, tooltip), index // columns, index % columns)
+            btn = self._ghost_button(text, callback, tooltip)
+            grid.addWidget(btn, index // columns, index % columns)
+            if button_store is not None:
+                button_store.append(btn)
         return grid
 
     def _project_button_grid(self, actions, columns=2):
@@ -938,7 +964,6 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
         edit = PlainTextEdit()
         placeholder = {
             "timeline_edit": "按时间顺序记录关键事件，避免长篇写作前后矛盾。",
-            "foreshadows_edit": "记录埋下的伏笔、触发条件、回收章节和当前状态。",
             "summary_edit": "记录阶段总结、已发生事实、后续调整日志。",
         }.get(attr_name, "")
         edit.setPlaceholderText(placeholder)
@@ -1018,7 +1043,10 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
         self.foreshadow_list = QListWidget()
         self.foreshadow_list.currentRowChanged.connect(self._on_foreshadow_selected)
         left_layout.addWidget(self.foreshadow_list, 1)
-        left_layout.addLayout(self._button_row((("新增", self.add_foreshadow), ("删除", self.delete_foreshadow))))
+        left_layout.addLayout(self._button_grid((
+            ("新增", self.add_foreshadow),
+            ("删除", self.delete_foreshadow),
+        ), button_store=self.foreshadow_action_buttons))
 
         right = QFrame()
         right_layout = QVBoxLayout(right)
@@ -1029,42 +1057,44 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
         form = QFormLayout(form_box)
         self._setup_form(form)
         self.foreshadow_name = QLineEdit()
+        self.foreshadow_code = QLineEdit()
         self.foreshadow_status = WideComboBox()
         self.foreshadow_status.addItems(["未埋", "已埋", "已回收", "废弃"])
         self.foreshadow_setup = QLineEdit()
         self.foreshadow_payoff = QLineEdit()
         self.foreshadow_desc = PlainTextEdit()
+        self.foreshadow_notes = PlainTextEdit()
         for w in (
+            self.foreshadow_code,
             self.foreshadow_name,
             self.foreshadow_status,
             self.foreshadow_setup,
             self.foreshadow_payoff,
             self.foreshadow_desc,
+            self.foreshadow_notes,
         ):
             self._wide_field(w)
+        self.foreshadow_code.setReadOnly(True)
+        self.foreshadow_code.setPlaceholderText("自动编号，如 F0001")
         self.foreshadow_desc.setPlaceholderText("写清这个伏笔是什么、读者看到什么、真正含义是什么。")
+        self.foreshadow_notes.setPlaceholderText("体检/合并时的命中编号、建议状态、建议说明，仅供查看，不进上下文。")
         self.foreshadow_name.setPlaceholderText("例如：虎符失踪、世子装傻、旧案真凶。")
         self.foreshadow_setup.setPlaceholderText("例如：第3章")
         self.foreshadow_payoff.setPlaceholderText("例如：第28章")
+        self.foreshadow_code.textChanged.connect(self._mark_foreshadow_dirty)
         self.foreshadow_name.textChanged.connect(self._mark_foreshadow_dirty)
         self.foreshadow_status.currentTextChanged.connect(self._mark_foreshadow_dirty)
         self.foreshadow_setup.textChanged.connect(self._mark_foreshadow_dirty)
         self.foreshadow_payoff.textChanged.connect(self._mark_foreshadow_dirty)
         self.foreshadow_desc.textChanged.connect(self._mark_foreshadow_dirty)
+        form.addRow("编号", self.foreshadow_code)
         form.addRow("名称", self.foreshadow_name)
         form.addRow("状态", self.foreshadow_status)
         form.addRow("埋设章节", self.foreshadow_setup)
         form.addRow("回收章节", self.foreshadow_payoff)
         form.addRow("说明", self.foreshadow_desc)
-        right_layout.addWidget(form_box, 2)
-
-        note_label = QLabel("伏笔备注")
-        note_label.setObjectName("field_label")
-        right_layout.addWidget(note_label)
-        self.foreshadows_edit = PlainTextEdit()
-        self.foreshadows_edit.setPlaceholderText("保留自由备注；结构化伏笔建议填到上面的列表里。")
-        self.foreshadows_edit.textChanged.connect(self._mark_dirty)
-        right_layout.addWidget(self.foreshadows_edit, 1)
+        form.addRow("备注", self.foreshadow_notes)
+        right_layout.addWidget(form_box, 1)
 
         return self._two_pane_tab(left, right)
 
@@ -1630,13 +1660,13 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
         self.current_project["bible"] = self.bible_edit.toPlainText()
         self.current_project["world_rules"] = self.world_rules_edit.toPlainText()
         self.current_project["timeline"] = self.timeline_edit.toPlainText()
-        self.current_project["foreshadows"] = self.foreshadows_edit.toPlainText()
         self.current_project["summary"] = self.summary_edit.toPlainText()
         chapters, removed = _dedupe_chapters(self.current_project.get("chapters", []))
         if removed:
             self.current_project["chapters"] = chapters
             if self.current_chapter_index >= len(chapters):
                 self.current_chapter_index = len(chapters) - 1
+        _ensure_foreshadow_codes(self.current_project)
 
     def _refresh_project_material_editors(self):
         pairs = (
@@ -1700,11 +1730,13 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
         if index >= len(items):
             return
         item = items[index]
+        item["code"] = _normalize_foreshadow_code(self.foreshadow_code.text().strip()) or item.get("code", "")
         item["name"] = self.foreshadow_name.text().strip()
         item["status"] = self.foreshadow_status.currentText().strip()
         item["setup_chapter"] = self.foreshadow_setup.text().strip()
         item["payoff_chapter"] = self.foreshadow_payoff.text().strip()
         item["description"] = self.foreshadow_desc.toPlainText().strip()
+        item["notes"] = self.foreshadow_notes.toPlainText().strip()
         self._refresh_foreshadow_item(index)
 
     def _save_chapter_from_editor(self):
@@ -1841,14 +1873,9 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
             name = str(item.get("name", "") or "")
             return (order, typ, source_index, name)
         if group_key == "foreshadows":
-            setup = _story_order_from_text(item.get("setup_chapter", ""))
-            payoff = _story_order_from_text(item.get("payoff_chapter", ""))
-            if setup == _SORT_MISSING_ORDER:
-                setup = _story_order_from_text(_record_text_for_sort(item, ("name", "description")))
-            primary = setup if setup != _SORT_MISSING_ORDER else payoff
-            status_rank = {"未埋": 0, "已埋": 1, "已回收": 2, "废弃": 3}.get(str(item.get("status", "") or ""), 4)
+            code_number = _foreshadow_code_number(item.get("code", ""))
             name = str(item.get("name", "") or "")
-            return (primary, payoff, status_rank, source_index, name)
+            return (code_number <= 0, code_number or source_index + 1, source_index, name)
         return (source_index,)
 
     def _sorted_indexed_records(self, group_key, items):
@@ -2048,20 +2075,24 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
         self._loading = True
         try:
             if row is None or row < 0 or row >= len(self.current_project.get("foreshadow_items", [])):
+                self.foreshadow_code.clear()
                 self.foreshadow_name.clear()
                 self.foreshadow_status.setCurrentIndex(0)
                 self.foreshadow_setup.clear()
                 self.foreshadow_payoff.clear()
                 self.foreshadow_desc.clear()
+                self.foreshadow_notes.clear()
                 self.current_foreshadow_index = -1
                 return
             item = self.current_project["foreshadow_items"][row]
+            self.foreshadow_code.setText(item.get("code", ""))
             self.foreshadow_name.setText(item.get("name", ""))
             idx = self.foreshadow_status.findText(item.get("status", "未埋"))
             self.foreshadow_status.setCurrentIndex(idx if idx >= 0 else 0)
             self.foreshadow_setup.setText(item.get("setup_chapter", ""))
             self.foreshadow_payoff.setText(item.get("payoff_chapter", ""))
             self.foreshadow_desc.setPlainText(item.get("description", ""))
+            self.foreshadow_notes.setPlainText(item.get("notes", ""))
             self.current_foreshadow_index = row
         finally:
             self._loading = was_loading
@@ -2138,10 +2169,85 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
     def delete_foreshadow(self):
         self._delete_indexed_item("foreshadow_items", self.current_foreshadow_index, "伏笔", "name", self._reload_foreshadow_list)
 
+    def review_foreshadows_with_ai(self):
+        if self.foreshadow_review_worker is not None and self.foreshadow_review_worker.isRunning():
+            self.set_status_tip("AI 伏笔体检正在进行，请稍等。")
+            return
+        if self.analysis_worker is not None and self.analysis_worker.isRunning():
+            self.set_status_tip("AI 分析候选正在进行，请稍后再做伏笔体检。")
+            return
+        self._flush_current_editors()
+        items = self.current_project.get("foreshadow_items", [])
+        items = items if isinstance(items, list) else []
+        if not any(isinstance(item, dict) and str(item.get("name", "") or "").strip() for item in items):
+            QMessageBox.information(self, "AI 伏笔体检", "当前没有可体检的结构化伏笔。")
+            return
+        provider, model, error = self._current_novel_ai_selection()
+        if error:
+            self.set_ai_settings_expanded(True)
+            self.set_status_tip(f"AI 伏笔体检失败：{error}")
+            QMessageBox.warning(self, "AI 伏笔体检失败", error)
+            return
+        if (
+            getattr(self, "foreshadow_review_comparison_state", {})
+            and str(self.foreshadow_review_comparison_state.get("status", "") or "") in {"pending", "failed"}
+            and not (self.failed_foreshadow_review_chunks or [])
+            and self.foreshadow_review_observations.get("foreshadows")
+        ):
+            self._start_foreshadow_review_comparison(provider, model)
+            return
+        retry_chunk_items = [
+            deepcopy(item)
+            for item in (getattr(self, "failed_foreshadow_review_chunks", []) or [])
+            if isinstance(item, dict) and str(item.get("text", "") or "").strip()
+        ]
+        if retry_chunk_items:
+            review_chunks = retry_chunk_items
+        else:
+            review_chunks = _foreshadow_review_chapter_chunks(self.current_project)
+        if not review_chunks:
+            QMessageBox.information(self, "AI 伏笔体检", "没有可用于体检的章节正文。")
+            return
+        concurrency = self._candidate_analysis_concurrency()
+        fresh_start = not retry_chunk_items and not (
+            isinstance(self.foreshadow_review_comparison_state, dict)
+            and str(self.foreshadow_review_comparison_state.get("status", "") or "") in {"pending", "failed"}
+        )
+        if fresh_start:
+            self.foreshadow_review_observations = {"characters": [], "lore": [], "foreshadows": [], "project_materials": {}}
+            self.foreshadow_review_comparison_state = {}
+            self.failed_foreshadow_review_chunks = []
+            self.foreshadow_review_postprocess_pending = False
+        self._set_candidate_actions_enabled(False)
+        self._set_foreshadow_actions_enabled(False)
+        self.foreshadow_review_worker = NovelForeshadowReviewWorker(
+            provider.get("base_url", ""),
+            provider.get("api_key", ""),
+            model,
+            "",
+            provider.get("proxy_url", ""),
+            self._provider_proxy_mode(provider),
+            concurrency,
+            chunks=review_chunks,
+        )
+        self.foreshadow_review_worker.progress.connect(self.set_status_tip)
+        self.foreshadow_review_worker.result_ready.connect(self.on_foreshadow_review_ready)
+        self.foreshadow_review_worker.partial_ready.connect(self.on_foreshadow_review_partial)
+        self.foreshadow_review_worker.failed.connect(self.on_foreshadow_review_failed)
+        self.foreshadow_review_worker.finished.connect(self._cleanup_foreshadow_review_worker)
+        if retry_chunk_items:
+            self.set_status_tip(f"正在重试 AI 伏笔体检失败章节：共 {len(retry_chunk_items)} 章，并发 {concurrency}...")
+        else:
+            self.set_status_tip(f"正在按章提取 AI 伏笔观察：共 {len(review_chunks)} 章，并发 {concurrency}...")
+        self.foreshadow_review_worker.start()
+
     def delete_chapter(self):
         self._delete_indexed_item("chapters", self.current_chapter_index, "章节", "title", self._reload_chapter_list)
 
     def split_current_chapter(self):
+        if self.chapter_title_worker is not None and self.chapter_title_worker.isRunning():
+            self.set_status_tip("正在生成拆分章节标题，请稍等。")
+            return
         self._save_chapter_from_editor()
         chapters = self.current_project.get("chapters", [])
         chapters = chapters if isinstance(chapters, list) else []
@@ -2168,11 +2274,84 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
             QMessageBox.information(self, "拆分提示", "没有可导出的正文内容。")
             return
         title = self._project_title()
+        provider, model, error = self._current_novel_ai_selection()
+        if error:
+            self.set_ai_settings_expanded(True)
+            message = f"章节标题生成失败，请重试。\n\n失败原因：{error}"
+            self.set_status_tip("章节标题生成失败，已停止拆分导出。")
+            QMessageBox.warning(self, "章节标题生成失败", message)
+            return
+        self._pending_split_export = {
+            "title": title,
+            "target_words": target_words,
+            "chapters": deepcopy(split_chapters),
+        }
+        self.chapter_title_worker = NovelChapterTitleWorker(
+            provider.get("base_url", ""),
+            provider.get("api_key", ""),
+            model,
+            title,
+            self.genre_edit.text().strip() if hasattr(self, "genre_edit") else "",
+            self.style_edit.text().strip() if hasattr(self, "style_edit") else "",
+            split_chapters,
+            provider.get("proxy_url", ""),
+            self._provider_proxy_mode(provider),
+        )
+        self.chapter_title_worker.progress.connect(self.set_status_tip)
+        self.chapter_title_worker.result_ready.connect(self.on_split_chapter_titles_ready)
+        self.chapter_title_worker.failed.connect(self.on_split_chapter_titles_failed)
+        self.chapter_title_worker.finished.connect(self._cleanup_chapter_title_worker)
+        self.set_status_tip(f"正在为 {len(split_chapters)} 个拆分章节生成标题...")
+        self.chapter_title_worker.start()
+
+    def on_split_chapter_titles_ready(self, titles):
+        pending = getattr(self, "_pending_split_export", {}) or {}
+        split_chapters = deepcopy(pending.get("chapters", []))
+        title = str(pending.get("title", "") or self._project_title()).strip() or "未命名小说"
+        target_words = int(pending.get("target_words", 0) or 0)
+        titles = [str(item or "").strip() for item in (titles or [])]
+        if not split_chapters or len(titles) != len(split_chapters):
+            err = f"标题数量不一致：需要 {len(split_chapters)} 个，实际 {len(titles)} 个。"
+            self.on_split_chapter_titles_failed(err)
+            return
+        for index, chap in enumerate(split_chapters, 1):
+            chap["title"] = f"第 {index} 章 {titles[index - 1]}"
         path = self._get_export_path("导出拆分 Word", f"{title}_按{target_words}字拆分", "docx", "Word 文档 (*.docx)")
         if not path:
+            self._pending_split_export = {}
+            self.set_status_tip("已生成拆分章节标题，已取消导出。")
             return
-        _write_docx_text(path, title, split_chapters, center_chapter_headings=True)
-        self.set_status_tip(f"已按约{target_words}字拆分为 {len(split_chapters)} 章并导出 Word：{os.path.basename(path)}")
+        try:
+            _write_docx_text(path, title, split_chapters, center_chapter_headings=True)
+        except Exception as e:
+            QMessageBox.warning(self, "导出失败", str(e))
+            self._pending_split_export = {}
+            self.set_status_tip(f"拆分章节标题已生成，但导出失败：{clean_error_text(e)[:80]}")
+            return
+        self._pending_split_export = {}
+        self.set_status_tip(f"已生成章节标题，并按约{target_words}字拆分为 {len(split_chapters)} 章导出 Word：{os.path.basename(path)}")
+
+    def on_split_chapter_titles_failed(self, err):
+        err_text = clean_error_text(err)
+        self.set_status_tip(f"章节标题生成失败，已停止拆分导出：{err_text[:80]}")
+        QMessageBox.warning(
+            self,
+            "章节标题生成失败",
+            f"章节标题生成失败，请重试。\n\n失败原因：{err_text}",
+        )
+        self._pending_split_export = {}
+
+    def _cleanup_chapter_title_worker(self):
+        worker = self.sender()
+        def cleanup():
+            try:
+                if self.chapter_title_worker is worker:
+                    self.chapter_title_worker = None
+                if worker is not None:
+                    worker.deleteLater()
+            except Exception as e:
+                log_debug("拆分章节标题线程清理失败", e)
+        QTimer.singleShot(0, cleanup)
 
     def _move_chapter(self, offset):
         index = self.current_chapter_index
@@ -2201,6 +2380,14 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
             self.failed_analysis_chunks = analysis_state.get("failed_candidate_chunks", [])
             self.pending_analysis_chapter_ids = analysis_state.get("pending_candidate_chapter_ids", [])
             self.candidate_postprocess_state = analysis_state.get("candidate_postprocess", {})
+            foreshadow_review_state = analysis_state.get("foreshadow_review", {}) if isinstance(analysis_state, dict) else {}
+            self.foreshadow_review_observations = foreshadow_review_state.get(
+                "observations",
+                {"characters": [], "lore": [], "foreshadows": [], "project_materials": {}},
+            ) if isinstance(foreshadow_review_state, dict) else {"characters": [], "lore": [], "foreshadows": [], "project_materials": {}}
+            self.failed_foreshadow_review_chunks = foreshadow_review_state.get("failed_observation_chunks", []) if isinstance(foreshadow_review_state, dict) else []
+            self.foreshadow_review_comparison_state = foreshadow_review_state.get("comparison", {}) if isinstance(foreshadow_review_state, dict) else {}
+            self.foreshadow_review_postprocess_pending = str(self.foreshadow_review_comparison_state.get("status", "") or "") in {"pending", "failed"}
             self.import_candidates = _normalize_import_candidates(self.current_project.get("import_candidates", {}))
             meta = self.current_project["meta"]
             self.title_edit.setText(meta.get("title", ""))
@@ -2215,7 +2402,6 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
             self.bible_edit.setPlainText(self.current_project.get("bible", ""))
             self.world_rules_edit.setPlainText(self.current_project.get("world_rules", ""))
             self.timeline_edit.setPlainText(self.current_project.get("timeline", ""))
-            self.foreshadows_edit.setPlainText(self.current_project.get("foreshadows", ""))
             self.summary_edit.setPlainText(self.current_project.get("summary", ""))
             self._reload_character_list()
             self._reload_lore_list()
@@ -2825,6 +3011,11 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
         material_hits = len(material_labels)
         if hasattr(self, "candidate_count_label"):
             total = sum(counts.values()) + material_hits
+            observation_draft_count = sum(
+                1
+                for item in self.import_candidates.get("foreshadows", [])
+                if self._is_foreshadow_observation_draft(item)
+            )
             failed_count = len(getattr(self, "failed_analysis_chunks", []) or [])
             pending_count = len(getattr(self, "pending_analysis_chapter_ids", []) or [])
             failed_summary = self._failed_candidate_error_summary()
@@ -2833,6 +3024,8 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
             if total:
                 material_text = "/".join(material_labels) if material_labels else "0"
                 text = f"候选：人物 {counts['characters']} · 设定 {counts['lore']} · 伏笔 {counts['foreshadows']} · 资料草案 {material_text}"
+                if observation_draft_count:
+                    text += f" · 观察草稿 {observation_draft_count}"
                 if failed_count:
                     text += f" · 待重试 {failed_count} 块"
                 elif post_status == "pending":
@@ -2867,7 +3060,10 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
                     name = str(item.get("name", "") if isinstance(item, dict) else item).strip()
                     if not name:
                         continue
-                    row = QListWidgetItem(name)
+                    row_text = name
+                    if kind == "foreshadows" and self._is_foreshadow_observation_draft(item):
+                        row_text = f"观察草稿｜{name}"
+                    row = QListWidgetItem(row_text)
                     row_key = self._candidate_item_check_key(kind, item, source_index)
                     default_state = self._default_candidate_check_state(kind, item)
                     row.setCheckState(previous_checks.get(row_key, default_state))
@@ -2904,6 +3100,9 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
             return f"{kind}:{fallback}"
         item = item if isinstance(item, dict) else {}
         name = str(item.get("name", "") or fallback or "").strip()
+        if kind == "foreshadows" and self._is_foreshadow_observation_draft(item):
+            source = str(item.get("_source_label", "") or item.get("source_label", "") or fallback or "").strip()
+            return f"{kind}:observation:{name}:{source}"
         return f"{kind}:{name}"
 
     def _candidate_check_state_snapshot(self):
@@ -2961,6 +3160,8 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
         return _candidate_long_term_review_reasons(project, kind, item)
 
     def _default_candidate_check_state(self, kind, item):
+        if kind == "foreshadows" and self._is_foreshadow_observation_draft(item):
+            return Qt.Unchecked
         return Qt.Checked
 
     def _candidate_detail_text_with_review(self, kind, item):
@@ -2970,11 +3171,23 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
         if isinstance(item, dict):
             source = str(item.get("_source_label", "") or item.get("source_label", "") or "").strip()
         header_lines = []
-        if reasons:
+        if kind == "foreshadows" and self._is_foreshadow_observation_draft(item):
+            header_lines.append("建议：这是逐章伏笔观察草稿，已默认不勾选；等待按章比对后会生成正式处理建议。")
+            header_lines.append("用途：先让你看到每章已提取出的伏笔观察，避免按章比对失败时看不到第一步成果。")
+        elif reasons:
             header_lines.append("建议：已默认勾选；导入时只做同名/别名合并和重复行清理。")
             header_lines.append("原因：" + "；".join(reasons))
         else:
             header_lines.append("建议：已默认勾选，可导入。")
+        if kind == "foreshadows" and isinstance(item, dict) and item.get("_status_explicit"):
+            status = str(item.get("status", "") or "").strip()
+            desc = str(item.get("description", "") or "")
+            if "体检建议" in desc or "判断依据" in desc or "章节依据" in desc:
+                header_lines.append("伏笔体检：这是 AI 对已有伏笔的清理建议；确认后才会更新原伏笔。")
+            if status in {"已回收", "废弃"}:
+                header_lines.append(f"伏笔复核：AI 判断该伏笔应更新为“{status}”；确认后会按同名/别名合并到已有伏笔。")
+            elif status == "已埋":
+                header_lines.append("伏笔复核：AI 判断该伏笔本章有推进但尚未回收；确认后会补充到已有伏笔。")
         if source:
             header_lines.append(f"来源：{source}")
         return "\n".join(header_lines + (["", detail] if detail else []))
@@ -3086,11 +3299,16 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
     def _set_candidate_actions_enabled(self, enabled):
         for btn in getattr(self, "candidate_action_buttons", []):
             btn.setEnabled(bool(enabled))
+        for btn in getattr(self, "foreshadow_action_buttons", []):
+            btn.setEnabled(bool(enabled))
         if hasattr(self, "candidate_concurrency_combo"):
             self.candidate_concurrency_combo.setEnabled(bool(enabled))
         if hasattr(self, "candidate_analysis_stop_btn"):
             self.candidate_analysis_stop_btn.setVisible(not bool(enabled))
             self.candidate_analysis_stop_btn.setEnabled(not bool(enabled))
+
+    def _set_foreshadow_actions_enabled(self, enabled):
+        self._set_candidate_actions_enabled(enabled)
 
     def _prune_candidate_analysis_state_to_existing_chapters(self):
         if not isinstance(self.current_project, dict):
@@ -3112,21 +3330,165 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
             self.failed_analysis_chunks = []
         self.pending_analysis_chapter_ids = new_pending
 
+    def _prune_foreshadow_review_state_to_existing_chapters(self):
+        if not isinstance(self.current_project, dict):
+            return
+        chapters = self.current_project.get("chapters", [])
+        chapters = chapters if isinstance(chapters, list) else []
+        existing_ids = {
+            str(chap.get("id", "") or "")
+            for chap in chapters
+            if isinstance(chap, dict) and str(chap.get("id", "") or "")
+        }
+        if not existing_ids:
+            self.failed_foreshadow_review_chunks = []
+            self.foreshadow_review_comparison_state = {}
+            return
+        failed_chunks = []
+        for item in getattr(self, "failed_foreshadow_review_chunks", []) or []:
+            if not isinstance(item, dict):
+                continue
+            chapter_id = str(item.get("chapter_id", "") or "").strip()
+            if chapter_id and chapter_id not in existing_ids:
+                continue
+            failed_chunks.append(item)
+        self.failed_foreshadow_review_chunks = failed_chunks
+
+    def _split_foreshadow_observation_records(self, observations=None, target_chars=12000):
+        observations = observations if isinstance(observations, dict) else getattr(self, "foreshadow_review_observations", {})
+        items = observations.get("foreshadows", []) if isinstance(observations, dict) else []
+
+        def source_labels(item):
+            labels = []
+            raw = str(item.get("_source_label", "") or item.get("source_label", "") or "").strip()
+            for line in raw.splitlines():
+                line = str(line or "").strip()
+                if line and line not in labels:
+                    labels.append(line)
+            if labels:
+                return labels
+            for key in ("setup_chapter", "payoff_chapter", "evidence"):
+                value = str(item.get(key, "") or "").strip()
+                if value:
+                    label = value if value.startswith("章节") else f"章节：{value}"
+                    return [label]
+            return ["未标记章节"]
+
+        grouped = {}
+        group_order = {}
+        for item in items if isinstance(items, list) else []:
+            if not isinstance(item, dict):
+                continue
+            name = str(item.get("name", "") or "").strip()
+            description = str(item.get("description", "") or "").strip()
+            if not name and not description:
+                continue
+            base_record = {
+                "name": name,
+                "status": str(item.get("status", "") or "").strip(),
+                "setup_chapter": str(item.get("setup_chapter", "") or "").strip(),
+                "payoff_chapter": str(item.get("payoff_chapter", "") or "").strip(),
+                "description": description,
+                "review_action": str(item.get("review_action", "") or "").strip(),
+                "merge_target": str(item.get("merge_target", "") or "").strip(),
+                "review_reason": str(item.get("review_reason", "") or "").strip(),
+                "evidence": str(item.get("evidence", "") or "").strip(),
+            }
+            for label in source_labels(item):
+                record = deepcopy(base_record)
+                record["_source_label"] = label
+                grouped.setdefault(label, []).append(record)
+                group_order.setdefault(label, (len(group_order), _story_order_from_text(label)))
+        if not grouped:
+            return []
+        limit = max(5000, int(target_chars or 24000))
+        grouped_items = sorted(
+            grouped.items(),
+            key=lambda pair: (group_order.get(pair[0], (0, _SORT_MISSING_ORDER))[1], group_order.get(pair[0], (0,))[0]),
+        )
+        chunks = []
+        for label, records in grouped_items:
+            current = []
+            current_chars = 0
+            part_index = 1
+            for record in records:
+                record_text = json.dumps(record, ensure_ascii=False, separators=(",", ":"))
+                record_chars = len(record_text)
+                if current and current_chars + record_chars > limit:
+                    chunks.append((label, part_index, current))
+                    part_index += 1
+                    current = []
+                    current_chars = 0
+                current.append(record)
+                current_chars += record_chars
+            if current:
+                chunks.append((label, part_index, current))
+        total = len(chunks)
+        out = []
+        for index, (label, part_index, group) in enumerate(chunks, 1):
+            title = label if part_index <= 1 else f"{label} 第 {part_index} 批"
+            out.append({
+                "text": json.dumps(group, ensure_ascii=False, indent=2),
+                "index": index,
+                "total": total,
+                "chapter_title": title,
+                "review_flow": "foreshadow_review_chapter_compare",
+                "source_label": label,
+                "chunk_key": f"{label}#{part_index}",
+            })
+        return out
+
+    def _foreshadow_review_comparison_retry_chunks(self, state=None):
+        state = state if isinstance(state, dict) else getattr(self, "foreshadow_review_comparison_state", {})
+        if not isinstance(state, dict):
+            return []
+        retry_chunks = []
+        for item in state.get("failed_chunks", []) if isinstance(state.get("failed_chunks", []), list) else []:
+            if not isinstance(item, dict) or not str(item.get("text", "") or "").strip():
+                continue
+            if str(item.get("review_flow", "") or "").strip() != "foreshadow_review_chapter_compare":
+                continue
+            retry_chunks.append(deepcopy(item))
+        return retry_chunks
+
     def _sync_candidate_analysis_state(self):
         if not isinstance(self.current_project, dict):
             return
         self._prune_candidate_analysis_state_to_existing_chapters()
+        self._prune_foreshadow_review_state_to_existing_chapters()
         postprocess_state = getattr(self, "candidate_postprocess_state", {}) or {}
+        foreshadow_state = getattr(self, "foreshadow_review_comparison_state", {}) or {}
         if not isinstance(postprocess_state, dict):
             postprocess_state = {}
+        if not isinstance(foreshadow_state, dict):
+            foreshadow_state = {}
         state = _normalize_candidate_analysis_state({
             "failed_candidate_chunks": getattr(self, "failed_analysis_chunks", []) or [],
             "pending_candidate_chapter_ids": getattr(self, "pending_analysis_chapter_ids", []) or [],
             "candidate_postprocess": postprocess_state,
+            "foreshadow_review": {
+                "observations": getattr(self, "foreshadow_review_observations", {}) or {},
+                "comparison": foreshadow_state,
+                "failed_observation_chunks": getattr(self, "failed_foreshadow_review_chunks", []) or [],
+            },
         })
         self.failed_analysis_chunks = state.get("failed_candidate_chunks", [])
         self.pending_analysis_chapter_ids = state.get("pending_candidate_chapter_ids", [])
         self.candidate_postprocess_state = state.get("candidate_postprocess", {})
+        foreshadow_review_state = state.get("foreshadow_review", {})
+        if isinstance(foreshadow_review_state, dict):
+            self.foreshadow_review_observations = foreshadow_review_state.get(
+                "observations",
+                getattr(self, "foreshadow_review_observations", {"characters": [], "lore": [], "foreshadows": [], "project_materials": {}}),
+            )
+            self.foreshadow_review_comparison_state = foreshadow_review_state.get(
+                "comparison",
+                getattr(self, "foreshadow_review_comparison_state", {}),
+            )
+            self.failed_foreshadow_review_chunks = foreshadow_review_state.get(
+                "failed_observation_chunks",
+                getattr(self, "failed_foreshadow_review_chunks", []),
+            )
         if not state:
             self.current_project.pop("analysis_state", None)
             return
@@ -3146,12 +3508,16 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
         self.failed_analysis_chunks = []
         self.pending_analysis_chapter_ids = []
         self.candidate_postprocess_state = {}
+        self.foreshadow_review_observations = {"characters": [], "lore": [], "foreshadows": [], "project_materials": {}}
+        self.foreshadow_review_comparison_state = {}
+        self.failed_foreshadow_review_chunks = []
         if isinstance(self.current_project, dict):
             state = self.current_project.get("analysis_state", {})
             if isinstance(state, dict):
                 state.pop("failed_candidate_chunks", None)
                 state.pop("pending_candidate_chapter_ids", None)
                 state.pop("candidate_postprocess", None)
+                state.pop("foreshadow_review", None)
                 if not state:
                     self.current_project.pop("analysis_state", None)
 
@@ -3217,6 +3583,8 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
                 alias_keys = _record_alias_keys(item, name_key="name")
                 if key == "characters":
                     alias_keys.add(_character_merge_key(item))
+                elif key == "foreshadows":
+                    alias_keys = _foreshadow_candidate_identity_keys(item)
                 for alias_key in alias_keys:
                     if alias_key:
                         by_alias[alias_key] = item
@@ -3228,16 +3596,28 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
                     continue
                 merge_key = _character_merge_key(item) if key == "characters" else name
                 alias_keys = _record_alias_keys(item, name_key="name")
+                target_code_keys = _foreshadow_candidate_target_code_keys(item) if key == "foreshadows" else set()
+                target_keys = set() if target_code_keys else (_foreshadow_candidate_target_keys(item) if key == "foreshadows" else set())
                 if key == "characters":
                     alias_keys.add(merge_key)
+                elif key == "foreshadows":
+                    alias_keys = _foreshadow_candidate_identity_keys(item)
                 existing = by_name.get(merge_key)
+                matched_by_target = False
+                matched_by_code = False
                 if existing is None:
-                    for alias_key in alias_keys:
+                    for alias_key in list(target_code_keys) + list(target_keys) + [
+                        value for value in alias_keys if value not in target_keys and value not in target_code_keys
+                    ]:
                         existing = by_alias.get(alias_key)
                         if existing is not None:
+                            matched_by_target = alias_key in target_keys
+                            matched_by_code = alias_key in target_code_keys
                             break
                 if existing is None:
                     clone = deepcopy(item)
+                    if key == "foreshadows" and _foreshadow_candidate_is_terminal_review(clone):
+                        clone["description"] = _foreshadow_terminal_review_description(clone.get("description", ""))
                     if key == "foreshadows" and item.get("_status_explicit"):
                         clone["status"] = _infer_foreshadow_status(
                             {"status": clone.get("status", "")},
@@ -3249,6 +3629,14 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
                         if alias_key:
                             by_alias[alias_key] = clone
                     continue
+                if key == "foreshadows" and _foreshadow_candidate_is_terminal_review(existing):
+                    if _foreshadow_terminal_review_should_replace(existing, item):
+                        replacement = deepcopy(item)
+                        replacement["description"] = _foreshadow_terminal_review_description(replacement.get("description", ""))
+                        existing.clear()
+                        existing.update(replacement)
+                    continue
+                incoming_terminal = key == "foreshadows" and _foreshadow_candidate_is_terminal_review(item)
                 if key == "characters" and name != str(existing.get("name", "") or "").strip():
                     existing_name = str(existing.get("name", "") or "").strip()
                     if existing_name:
@@ -3270,13 +3658,14 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
                         if did_change:
                             existing["notes"] = merged_notes
                 elif key in {"lore", "foreshadows"} and name != str(existing.get("name", "") or "").strip():
-                    merged_desc, did_change = merge_candidate_text(
-                        existing.get("description", ""),
-                        f"别称：{name}",
-                        append=True,
-                    )
-                    if did_change:
-                        existing["description"] = merged_desc
+                    if not (key == "foreshadows" and (matched_by_target or matched_by_code)):
+                        merged_desc, did_change = merge_candidate_text(
+                            existing.get("description", ""),
+                            f"别称：{name}",
+                            append=True,
+                        )
+                        if did_change:
+                            existing["description"] = merged_desc
                 for field, value in item.items():
                     if field == "name":
                         continue
@@ -3288,7 +3677,7 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
                     if key == "foreshadows" and field == "status":
                         if not item.get("_status_explicit"):
                             continue
-                        inferred = _infer_foreshadow_status({"status": value}, preserve_manual=False)
+                        inferred = _merge_foreshadow_status(existing.get("status", ""), value)
                         if inferred != str(existing.get("status", "") or "").strip():
                             existing["status"] = inferred
                         continue
@@ -3296,11 +3685,27 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
                         if value:
                             existing["_status_explicit"] = True
                         continue
-                    merged_text, did_change = merge_candidate_text(
-                        existing.get(field, ""),
-                        value,
-                        append=field in {"notes", "description"},
-                    )
+                    if key == "foreshadows" and field in {"_target_code", "target_code", "merge_target_code", "foreshadow_code", "命中编号", "伏笔编号", "目标编号"}:
+                        if value and not existing.get("_target_code"):
+                            existing["_target_code"] = _normalize_foreshadow_code(value)
+                        continue
+                    if incoming_terminal and field == "description":
+                        cleaned = _foreshadow_terminal_review_description(value)
+                        if cleaned != str(existing.get(field, "") or "").strip():
+                            existing[field] = cleaned
+                        continue
+                    if key == "foreshadows" and field == "description":
+                        merged_text, did_change = _merge_foreshadow_description_without_bloat(
+                            existing.get(field, ""),
+                            value,
+                            item,
+                        )
+                    else:
+                        merged_text, did_change = merge_candidate_text(
+                            existing.get(field, ""),
+                            value,
+                            append=field in {"notes", "description"},
+                        )
                     if did_change:
                         existing[field] = merged_text
         target_materials = merged.setdefault("project_materials", {})
@@ -3316,6 +3721,148 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
             if did_change:
                 target_materials[key] = merged_text
         return merged
+
+    def _merge_foreshadow_review_observations(self, incoming):
+        incoming = _normalize_foreshadow_review_observations(incoming)
+        merged = deepcopy(self.foreshadow_review_observations if isinstance(self.foreshadow_review_observations, dict) else {})
+        if not isinstance(merged, dict):
+            merged = {"characters": [], "lore": [], "foreshadows": [], "project_materials": {}}
+        merged.setdefault("foreshadows", [])
+        by_name = {
+            str(item.get("name", "") or "").strip(): item
+            for item in merged.get("foreshadows", [])
+            if isinstance(item, dict) and str(item.get("name", "") or "").strip()
+        }
+        for item in incoming.get("foreshadows", []) if isinstance(incoming, dict) else []:
+            if not isinstance(item, dict):
+                continue
+            name = str(item.get("name", "") or "").strip()
+            if not name:
+                continue
+            existing = by_name.get(name)
+            if existing is None:
+                clone = deepcopy(item)
+                if str(clone.get("description", "") or "").strip():
+                    clone["description"], _did_change = _merge_foreshadow_description_without_bloat(
+                        "",
+                        clone.get("description", ""),
+                        clone,
+                    )
+                merged["foreshadows"].append(clone)
+                by_name[name] = clone
+                continue
+            for field in ("status", "setup_chapter", "payoff_chapter", "description", "review_action", "merge_target", "review_reason", "evidence", "_source_label"):
+                new = str(item.get(field, "") or "").strip()
+                if not new:
+                    continue
+                old = str(existing.get(field, "") or "").strip()
+                if field == "description":
+                    merged_desc, did_change = _merge_foreshadow_description_without_bloat(old, new, item)
+                    if did_change:
+                        existing[field] = merged_desc
+                    continue
+                if not old:
+                    existing[field] = new
+                elif new == old or new in old:
+                    continue
+                elif old in new:
+                    existing[field] = new
+                else:
+                    existing[field] = f"{old}\n补充：{new}"
+        merged["project_materials"] = {"bible": "", "world_rules": "", "timeline": "", "summary": ""}
+        return merged
+
+    def _is_foreshadow_observation_draft(self, item):
+        item = item if isinstance(item, dict) else {}
+        stage = str(item.get("_review_stage", "") or "").strip()
+        action = str(item.get("review_action", "") or item.get("体检建议", "") or "").strip()
+        description = str(item.get("description", "") or "")
+        return (
+            stage == "observation_draft"
+            or action == "观察待比对"
+            or "体检建议：观察待比对" in description
+        )
+
+    def _foreshadow_observation_draft_candidates(self, observations=None):
+        observations = _normalize_foreshadow_review_observations(
+            observations if isinstance(observations, dict) else getattr(self, "foreshadow_review_observations", {})
+        )
+        drafts = []
+        for item in observations.get("foreshadows", []) if isinstance(observations, dict) else []:
+            if not isinstance(item, dict):
+                continue
+            name = str(item.get("name", "") or "").strip()
+            description = str(item.get("description", "") or "").strip()
+            if not name or not description:
+                continue
+            clone = deepcopy(item)
+            clone["name"] = name
+            clone["description"] = _dedupe_text_lines(
+                "\n".join(
+                    part
+                    for part in (
+                        description,
+                        "体检建议：观察待比对" if "体检建议：观察待比对" not in description else "",
+                        "阶段：逐章伏笔观察草稿，等待按章比对。",
+                    )
+                    if str(part or "").strip()
+                )
+            )
+            clone["review_action"] = "观察待比对"
+            clone["_review_stage"] = "observation_draft"
+            clone.pop("_target_code", None)
+            clone.pop("_status_explicit", None)
+            drafts.append(clone)
+        return drafts
+
+    def _sync_foreshadow_observations_to_import_candidates(self):
+        candidates = _normalize_import_candidates(getattr(self, "import_candidates", {}))
+        foreshadows = [
+            item
+            for item in candidates.get("foreshadows", [])
+            if not self._is_foreshadow_observation_draft(item)
+        ]
+        foreshadows.extend(self._foreshadow_observation_draft_candidates())
+        candidates["foreshadows"] = foreshadows
+        self.import_candidates, self._last_candidate_auto_cleanup_report = _sanitize_import_candidates_for_long_form(
+            getattr(self, "current_project", {}) if isinstance(getattr(self, "current_project", {}), dict) else {},
+            candidates,
+        )
+        return len(self._foreshadow_observation_draft_candidates())
+
+    def _drop_foreshadow_observation_draft_candidates(self):
+        candidates = _normalize_import_candidates(getattr(self, "import_candidates", {}))
+        candidates["foreshadows"] = [
+            item
+            for item in candidates.get("foreshadows", [])
+            if not self._is_foreshadow_observation_draft(item)
+        ]
+        self.import_candidates = candidates
+
+    def _apply_foreshadow_review_postprocess_candidates(self, data, keep_observation_drafts=False):
+        observation_drafts = self._foreshadow_observation_draft_candidates() if keep_observation_drafts else []
+        self._drop_foreshadow_observation_draft_candidates()
+        raw_candidates = self._merge_import_candidates(data)
+        self.import_candidates, self._last_candidate_auto_cleanup_report = _sanitize_import_candidates_for_long_form(
+            self.current_project,
+            raw_candidates,
+        )
+        if not observation_drafts:
+            return
+        candidates = _normalize_import_candidates(self.import_candidates)
+        existing_names = {
+            str(item.get("name", "") or "").strip()
+            for item in candidates.get("foreshadows", [])
+            if isinstance(item, dict) and not self._is_foreshadow_observation_draft(item)
+        }
+        for item in observation_drafts:
+            name = str(item.get("name", "") or "").strip()
+            if name and name not in existing_names:
+                candidates.setdefault("foreshadows", []).append(item)
+        self.import_candidates, self._last_candidate_auto_cleanup_report = _sanitize_import_candidates_for_long_form(
+            self.current_project,
+            candidates,
+        )
 
     def _candidate_analysis_chunk_stats(self, data):
         data = data if isinstance(data, dict) else {}
@@ -3467,8 +4014,10 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
         if retrying_failed_chunks:
             chapter_ids = list(self.pending_analysis_chapter_ids or self._pending_candidate_analysis_chapter_ids())
             text = "\n\n".join(str(item.get("text", "") or "").strip() for item in retry_chunk_items)
+            analysis_chunks = retry_chunk_items
         else:
             chapter_ids = self._pending_candidate_analysis_chapter_ids()
+            analysis_chunks = None
             text = _candidate_analysis_text(self.current_project, "", chapter_ids, include_dossier=False)
         if not text:
             if getattr(self, "failed_analysis_chunks", None):
@@ -3499,7 +4048,7 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
             provider.get("proxy_url", ""),
             self._provider_proxy_mode(provider),
             concurrency,
-            chunks=retry_chunk_items if retrying_failed_chunks else None,
+            chunks=analysis_chunks,
             dossier=_candidate_analysis_dossier_text(self.current_project),
         )
         self.analysis_worker.progress.connect(self.set_status_tip)
@@ -4398,6 +4947,199 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
         self.set_status_tip(f"候选已保存；AI 候选合并/查重失败，可再次点击 AI 分析候选继续：{message[:100]}")
         QMessageBox.warning(self, "AI 候选合并失败", f"{message}\n\n块分析结果已保留在候选区，可再次点击“AI 分析候选”重试合并/查重。")
 
+    def on_foreshadow_review_ready(self, data):
+        self.foreshadow_review_observations = self._merge_foreshadow_review_observations(data)
+        draft_count = self._sync_foreshadow_observations_to_import_candidates()
+        self.failed_foreshadow_review_chunks = [
+            deepcopy(item)
+            for item in data.get("_failed_chunks", [])
+            if isinstance(item, dict) and str(item.get("text", "") or "").strip()
+        ] if isinstance(data, dict) else []
+        self._sync_candidate_analysis_state()
+        self._mark_dirty()
+        total = int(data.get("_chunk_total", 0) or 0) if isinstance(data, dict) else 0
+        succeeded = int(data.get("_chunk_succeeded", 0) or 0) if isinstance(data, dict) else 0
+        if self.failed_foreshadow_review_chunks:
+            reason = clean_error_text(self.failed_foreshadow_review_chunks[0].get("error", "") or "").replace("\n", " ")
+            reason_tail = f" 原因：{reason[:120]}" if reason else ""
+            self.foreshadow_review_comparison_state = {}
+            self.foreshadow_review_postprocess_pending = False
+            self._persist_candidate_analysis_state()
+            self._refresh_candidate_analysis_result_view()
+            self.set_status_tip(
+                f"AI 伏笔观察部分完成：成功 {succeeded}/{total} 章，已显示 {draft_count} 条观察草稿，失败 {len(self.failed_foreshadow_review_chunks)} 章；下次点击会优先重试失败章。{reason_tail}"
+            )
+            return
+        self._persist_candidate_analysis_state()
+        self._refresh_candidate_analysis_result_view()
+        provider, model, error = self._current_novel_ai_selection()
+        if error:
+            self.foreshadow_review_comparison_state = {
+                "status": "failed",
+                "error": error,
+                "review_flow": "foreshadow_review_chapter_compare",
+                "updated_at": now_str(),
+            }
+            self.foreshadow_review_postprocess_pending = True
+            self._persist_candidate_analysis_state()
+            self.set_status_tip(f"逐章伏笔观察已保存；按章比对待继续：{error}")
+            return
+        self._start_foreshadow_review_comparison(provider, model)
+
+    def on_foreshadow_review_partial(self, data, completed, total):
+        self.foreshadow_review_observations = self._merge_foreshadow_review_observations(data)
+        draft_count = self._sync_foreshadow_observations_to_import_candidates()
+        self.failed_foreshadow_review_chunks = [
+            deepcopy(item)
+            for item in data.get("_failed_chunks", [])
+            if isinstance(item, dict) and str(item.get("text", "") or "").strip()
+        ] if isinstance(data, dict) else []
+        self._sync_candidate_analysis_state()
+        self._sync_import_candidates_to_project()
+        self._refresh_candidate_analysis_result_view()
+        self._persist_candidate_analysis_draft_state()
+        failed_tail = f"，待重试 {len(self.failed_foreshadow_review_chunks)} 章" if self.failed_foreshadow_review_chunks else ""
+        self.set_status_tip(
+            f"AI 伏笔观察进度 {completed}/{total}：已提取 {len(self.foreshadow_review_observations.get('foreshadows', []))} 条观察，候选区已显示 {draft_count} 条草稿{failed_tail}"
+        )
+
+    def _start_foreshadow_review_comparison(self, provider, model):
+        observations = self.foreshadow_review_observations if isinstance(self.foreshadow_review_observations, dict) else {}
+        state = self.foreshadow_review_comparison_state if isinstance(self.foreshadow_review_comparison_state, dict) else {}
+        retry_chunks = self._foreshadow_review_comparison_retry_chunks(state)
+        comparison_chunks = retry_chunks or self._split_foreshadow_observation_records(observations)
+        if not comparison_chunks:
+            self.foreshadow_review_comparison_state = {}
+            self.foreshadow_review_postprocess_pending = False
+            self.set_status_tip("AI 伏笔观察完成：没有可继续比对的长期线索。")
+            return
+        self.foreshadow_review_comparison_state = {
+            "status": "pending",
+            "review_flow": "foreshadow_review_chapter_compare",
+            "updated_at": now_str(),
+        }
+        self.foreshadow_review_postprocess_pending = True
+        self.foreshadow_review_worker = NovelForeshadowReviewPostprocessWorker(
+            provider.get("base_url", ""),
+            provider.get("api_key", ""),
+            model,
+            deepcopy(observations),
+            _foreshadow_review_dossier_text(self.current_project),
+            provider.get("proxy_url", ""),
+            self._provider_proxy_mode(provider),
+            self._candidate_analysis_concurrency(),
+            chunks=comparison_chunks,
+        )
+        self.foreshadow_review_worker.progress.connect(self.set_status_tip)
+        self.foreshadow_review_worker.result_ready.connect(self.on_foreshadow_review_postprocess_ready)
+        self.foreshadow_review_worker.partial_ready.connect(self.on_foreshadow_review_postprocess_partial)
+        self.foreshadow_review_worker.failed.connect(self.on_foreshadow_review_postprocess_failed)
+        self.foreshadow_review_worker.finished.connect(self._cleanup_foreshadow_review_worker)
+        self._set_candidate_actions_enabled(False)
+        self._set_foreshadow_actions_enabled(False)
+        prefix = "正在重试 AI 伏笔按章比对失败块" if retry_chunks else "正在按章比对伏笔观察"
+        self.set_status_tip(f"{prefix}：共 {len(comparison_chunks)} 批，并发 {self._candidate_analysis_concurrency()}...")
+        self.foreshadow_review_worker.start()
+
+    def on_foreshadow_review_postprocess_partial(self, data, completed, total):
+        failed_chunks = [
+            deepcopy(item)
+            for item in data.get("_failed_chunks", [])
+            if isinstance(item, dict) and str(item.get("text", "") or "").strip()
+        ] if isinstance(data, dict) else []
+        self._apply_foreshadow_review_postprocess_candidates(data, keep_observation_drafts=True)
+        state = {
+            "status": "pending",
+            "review_flow": "foreshadow_review_chapter_compare",
+            "updated_at": now_str(),
+        }
+        if failed_chunks:
+            state["failed_chunks"] = failed_chunks
+        self.foreshadow_review_comparison_state = state
+        self._sync_candidate_analysis_state()
+        self._sync_import_candidates_to_project()
+        self._refresh_candidate_analysis_result_view()
+        self._persist_candidate_analysis_draft_state()
+        failed_tail = f"，待重试 {len(failed_chunks)} 批" if failed_chunks else ""
+        self.set_status_tip(
+            f"AI 伏笔按章比对进度 {completed}/{total}：已生成 {len(self.import_candidates.get('foreshadows', []))} 条候选{failed_tail}"
+        )
+
+    def on_foreshadow_review_postprocess_ready(self, data):
+        failed_chunks = [
+            deepcopy(item)
+            for item in data.get("_failed_chunks", [])
+            if isinstance(item, dict) and str(item.get("text", "") or "").strip()
+        ] if isinstance(data, dict) else []
+        self._apply_foreshadow_review_postprocess_candidates(data, keep_observation_drafts=bool(failed_chunks))
+        self.failed_foreshadow_review_chunks = []
+        if failed_chunks:
+            self.foreshadow_review_comparison_state = {
+                "status": "failed",
+                "error": str(failed_chunks[0].get("error", "") or ""),
+                "failed_chunks": failed_chunks,
+                "review_flow": "foreshadow_review_chapter_compare",
+                "updated_at": now_str(),
+            }
+            self.foreshadow_review_postprocess_pending = True
+        else:
+            self.foreshadow_review_observations = {"characters": [], "lore": [], "foreshadows": [], "project_materials": {}}
+            self.foreshadow_review_comparison_state = {}
+            self.foreshadow_review_postprocess_pending = False
+        self._sync_import_candidates_to_project()
+        self._sync_candidate_analysis_state()
+        self._clear_candidate_detail_view()
+        self._refresh_candidate_analysis_result_view()
+        self._mark_dirty()
+        self._persist_candidate_analysis_state()
+        count = len(self.import_candidates.get("foreshadows", []))
+        if failed_chunks:
+            reason = clean_error_text(failed_chunks[0].get("error", "") or "").replace("\n", " ")
+            reason_tail = f" 原因：{reason[:120]}" if reason else ""
+            self.set_status_tip(
+                f"AI 伏笔体检部分完成：已生成 {count} 条候选，失败 {len(failed_chunks)} 个按章比对块；下次点击会优先重试失败块。{reason_tail}"
+            )
+        else:
+            self.set_status_tip(f"AI 伏笔体检完成：已生成 {count} 条伏笔处理候选，请在候选区确认后再加入项目。")
+
+    def on_foreshadow_review_postprocess_failed(self, err):
+        message = clean_error_text(err)
+        self.foreshadow_review_comparison_state = {
+            "status": "failed",
+            "error": message,
+            "review_flow": "foreshadow_review_chapter_compare",
+            "updated_at": now_str(),
+        }
+        self.foreshadow_review_postprocess_pending = True
+        self._sync_candidate_analysis_state()
+        self._sync_import_candidates_to_project()
+        self._mark_dirty()
+        self._refresh_candidate_analysis_result_view()
+        self._persist_candidate_analysis_state()
+        self.set_status_tip(f"伏笔观察已保存；按章比对失败，可再次点击继续：{message[:100]}")
+        QMessageBox.warning(self, "AI 伏笔体检失败", f"{message}\n\n逐章伏笔观察已保留，可再次点击“AI 伏笔体检”继续按章比对。")
+
+    def on_foreshadow_review_failed(self, err):
+        message = clean_error_text(err)
+        self.set_status_tip(f"AI 伏笔体检失败：{message[:100]}")
+        QMessageBox.warning(self, "AI 伏笔体检失败", message)
+
+    def _cleanup_foreshadow_review_worker(self):
+        worker = self.sender()
+        def cleanup():
+            try:
+                if self.foreshadow_review_worker is worker:
+                    self.foreshadow_review_worker = None
+                if worker is not None:
+                    worker.deleteLater()
+                active_foreshadow_worker = self.foreshadow_review_worker is not None
+                if self.analysis_worker is None and not active_foreshadow_worker:
+                    self._set_candidate_actions_enabled(True)
+                    self._set_foreshadow_actions_enabled(True)
+            except Exception as e:
+                log_debug("小说伏笔体检线程清理失败", e)
+        QTimer.singleShot(0, cleanup)
+
     def _cleanup_analysis_worker(self):
         worker = self.sender()
         def cleanup():
@@ -4419,13 +5161,29 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
 
     def apply_import_candidates(self):
         self._clear_candidate_detail_view()
+        raw_foreshadow_indexes = self._checked_candidate_indexes(self.candidate_foreshadow_list)
+        foreshadow_items = self.import_candidates.get("foreshadows", [])
+        skipped_observation_drafts = [
+            index
+            for index in raw_foreshadow_indexes
+            if isinstance(index, int)
+            and 0 <= index < len(foreshadow_items)
+            and self._is_foreshadow_observation_draft(foreshadow_items[index])
+        ]
         checked = {
             "characters": self._checked_candidate_indexes(self.candidate_character_list),
             "lore": self._checked_candidate_indexes(self.candidate_lore_list),
-            "foreshadows": self._checked_candidate_indexes(self.candidate_foreshadow_list),
+            "foreshadows": [
+                index
+                for index in raw_foreshadow_indexes
+                if index not in skipped_observation_drafts
+            ],
             "project_materials": self._checked_candidate_material_keys(),
         }
         if not any(checked.values()) and not self.pending_analysis_chapter_ids:
+            if skipped_observation_drafts:
+                self.set_status_tip("逐章伏笔观察草稿需等待按章比对后再加入项目。")
+                return
             self.set_status_tip("请先勾选要加入项目的候选内容。")
             return
         result = _apply_import_candidates(self.current_project, self.import_candidates, checked)

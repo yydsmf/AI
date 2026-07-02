@@ -1,6 +1,8 @@
+import json
 import unittest
 import tempfile
 from pathlib import Path
+from unittest.mock import patch
 
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import QPlainTextEdit
@@ -9,6 +11,7 @@ from gpt_desktop.novel_import import Document as DocxDocument, WD_ALIGN_PARAGRAP
 from gpt_desktop.novel_utils import (
     CHAPTER_ANALYSIS_HASH_VERSION,
     _append_text_without_duplicate_overlap,
+    _build_search_result_text,
     _chapter_analysis_hash,
     _chapter_analysis_legacy_hash,
     _chapter_list_text,
@@ -47,6 +50,20 @@ class NovelWritingStateTests(unittest.TestCase):
 
         self.assertIn("draft_words", chapter)
         self.assertEqual(chapter["draft_words"], "")
+
+    def test_normalize_project_assigns_stable_foreshadow_codes(self):
+        project = _normalize_project({
+            "foreshadow_items": [
+                {"name": "旧伏笔一", "code": ""},
+                {"name": "旧伏笔二", "code": "F0001"},
+                {"name": "旧伏笔三", "code": "F0001"},
+            ],
+        })
+
+        codes = [item["code"] for item in project["foreshadow_items"]]
+        self.assertEqual(len(codes), len(set(codes)))
+        self.assertEqual(codes[1], "F0001")
+        self.assertTrue(all(code.startswith("F") for code in codes))
 
     def test_normalize_project_preserves_chapter_draft_words(self):
         project = _normalize_project({
@@ -114,6 +131,22 @@ class NovelWritingStateTests(unittest.TestCase):
         self.assertIn("正文 4/100", text)
         self.assertIn("大纲 4", text)
         self.assertIn("摘要/事实 9", text)
+
+    def test_search_results_show_chapter_field_matches(self):
+        chapter = _new_chapter(0)
+        chapter["title"] = "第八章 赴约"
+        chapter["outline"] = "雨夜抵达老宅。"
+        chapter["text"] = "京城入夜后下了一场短雨。\n\n陈景川望着前方，雨后的长街空旷。"
+        chapter["key_facts"] = "陈景川望着前方，雨后的长街空旷，决定赴京郊南仓。"
+        project = {"chapters": [chapter]}
+
+        text = _build_search_result_text(project, "雨")
+
+        self.assertIn("[章节 / 提纲] 第八章 赴约", text)
+        self.assertIn("[章节 / 正文] 第八章 赴约", text)
+        self.assertIn("[章节 / 关键事实] 第八章 赴约", text)
+        self.assertIn("雨后的长街空旷", text)
+        self.assertIn("共 2 处", text)
 
     def test_update_stats_label_uses_project_title_not_import_filename(self):
         tab = NovelWritingTab.__new__(NovelWritingTab)
@@ -200,13 +233,13 @@ class NovelWritingStateTests(unittest.TestCase):
         self.assertIn("第二章正文", chapter_text)
         self.assertNotIn("第一章正文", chapter_text)
 
-    def test_compact_chapter_summary_limits_long_output(self):
+    def test_compact_chapter_summary_ignores_sentence_limit(self):
         text = "赵明进入王城，确认旧案卷宗藏在礼部档案房。" * 12 + "他因此决定夜探档案房。"
 
         compacted = _compact_chapter_summary_text(text, max_chars=120, max_sentences=2)
 
         self.assertLessEqual(len(compacted), 120)
-        self.assertLessEqual(compacted.count("。"), 2)
+        self.assertIn("礼部档案房", compacted)
 
     def test_compact_chapter_summary_keeps_all_text_by_default(self):
         text = "\n".join(f"摘要短句{index}。" for index in range(1, 9))
@@ -216,14 +249,13 @@ class NovelWritingStateTests(unittest.TestCase):
         self.assertEqual(compacted, text)
         self.assertIn("摘要短句8。", compacted)
 
-    def test_compact_chapter_key_facts_limits_items(self):
+    def test_compact_chapter_key_facts_ignores_item_limit(self):
         text = "\n".join(f"{index}. 关键事实{index}会影响后文。" for index in range(1, 10))
 
-        compacted = _compact_chapter_key_facts_text(text, max_chars=160, max_items=4)
+        compacted = _compact_chapter_key_facts_text(text, max_items=4)
 
-        self.assertLessEqual(len(compacted.splitlines()), 4)
-        self.assertLessEqual(len(compacted), 160)
         self.assertIn("关键事实1", compacted)
+        self.assertIn("关键事实9", compacted)
 
     def test_compact_chapter_key_facts_drops_empty_numbered_tail(self):
         text = "1. 苏不欺确认对方宿主身份；2. 四六开系统已绑定苏不欺；3. 苏不欺学心猿破流血；4。"
@@ -314,14 +346,14 @@ class NovelWritingStateTests(unittest.TestCase):
         self.assertIs(returned, edit)
         self.assertEqual(edit.applied, (1, 2, 3, 28))
 
-    def test_indexed_records_sort_foreshadows_by_setup_and_payoff_chapter(self):
+    def test_indexed_records_sort_foreshadows_by_stable_code(self):
         tab = NovelWritingTab.__new__(NovelWritingTab)
         tab.current_project = {"chapters": []}
         items = [
-            {"name": "后期伏笔", "status": "已埋", "setup_chapter": "第十章", "payoff_chapter": ""},
-            {"name": "前期伏笔", "status": "已埋", "setup_chapter": "第二章", "payoff_chapter": ""},
-            {"name": "只有回收", "status": "已回收", "setup_chapter": "", "payoff_chapter": "第八集"},
-            {"name": "无章节", "status": "未埋", "setup_chapter": "", "payoff_chapter": ""},
+            {"code": "F0010", "name": "后期伏笔", "status": "已埋", "setup_chapter": "第十章", "payoff_chapter": ""},
+            {"code": "F0002", "name": "前期伏笔", "status": "已埋", "setup_chapter": "第二章", "payoff_chapter": ""},
+            {"code": "F0008", "name": "只有回收", "status": "已回收", "setup_chapter": "", "payoff_chapter": "第八集"},
+            {"code": "F0015", "name": "无章节", "status": "未埋", "setup_chapter": "", "payoff_chapter": ""},
         ]
 
         ordered = [item["name"] for _index, item in tab._sorted_indexed_records("foreshadows", items)]
@@ -350,8 +382,8 @@ class NovelWritingStateTests(unittest.TestCase):
         tab = NovelWritingTab.__new__(NovelWritingTab)
         tab.current_project = {"chapters": []}
         items = [
-            {"name": "第十章伏笔", "status": "已埋", "setup_chapter": "第十章"},
-            {"name": "第二章伏笔", "status": "已埋", "setup_chapter": "第二章"},
+            {"code": "F0010", "name": "第十章伏笔", "status": "已埋", "setup_chapter": "第十章"},
+            {"code": "F0002", "name": "第二章伏笔", "status": "已埋", "setup_chapter": "第二章"},
         ]
 
         ordered_indexes = [index for index, _item in tab._sorted_indexed_records("foreshadows", items)]
@@ -436,6 +468,79 @@ class NovelWritingStateTests(unittest.TestCase):
 
         self.assertEqual(tab._pending_candidate_analysis_chapter_ids(), [chapter["id"]])
 
+    def test_ai_candidate_analysis_lets_worker_split_normal_text(self):
+        chapter = _new_chapter(0)
+        chapter["title"] = "第一章"
+        chapter["text"] = "赵明进入王城。" * 1200
+        project = {
+            "meta": {},
+            "chapters": [chapter],
+            "characters": [],
+            "lore": [],
+            "foreshadow_items": [],
+        }
+        captured = {}
+
+        class FakeSignal:
+            def connect(self, _callback):
+                return None
+
+        class FakeWorker:
+            def __init__(
+                self,
+                _base_url,
+                _api_key,
+                _model,
+                text,
+                _proxy_url="",
+                _proxy_mode="不使用代理",
+                _max_concurrency=3,
+                chunks=None,
+                dossier="",
+            ):
+                captured["text"] = text
+                captured["chunks"] = chunks
+                captured["dossier"] = dossier
+                self.progress = FakeSignal()
+                self.partial_ready = FakeSignal()
+                self.result_ready = FakeSignal()
+                self.failed = FakeSignal()
+                self.finished = FakeSignal()
+
+            def start(self):
+                captured["started"] = True
+
+        tab = NovelWritingTab.__new__(NovelWritingTab)
+        tab.analysis_worker = None
+        tab.failed_analysis_chunks = []
+        tab.pending_analysis_chapter_ids = []
+        tab.current_project = project
+        tab.candidate_postprocess_state = {}
+        tab._analysis_stop_requested_by_user = False
+        tab._current_novel_ai_selection = lambda: (
+            {"base_url": "http://example.test", "api_key": "key", "proxy_url": ""},
+            "model",
+            "",
+        )
+        tab._flush_current_editors = lambda: None
+        tab._has_candidate_postprocess_pending = lambda: False
+        tab._pending_candidate_analysis_chapter_ids = lambda: [chapter["id"]]
+        tab._sync_candidate_analysis_state = lambda: None
+        tab._candidate_analysis_concurrency = lambda: 3
+        tab._provider_proxy_mode = lambda _provider: "不使用代理"
+        tab._set_candidate_actions_enabled = lambda _enabled: None
+        tab.set_status_tip = lambda _text: None
+
+        with patch("gpt_desktop.novel_writing_tab.NovelAnalysisWorker", FakeWorker):
+            tab.analyze_import_candidates_with_ai()
+
+        self.assertIsNone(captured["chunks"])
+        self.assertIn("第一章\n正文：", captured["text"])
+        self.assertIn("赵明进入王城", captured["text"])
+        self.assertTrue(captured["started"])
+        self.assertEqual(tab.pending_analysis_chapter_ids, [chapter["id"]])
+        self.assertFalse(tab._analysis_merge_with_existing)
+
     def test_split_manuscript_into_target_chapters_uses_natural_boundaries(self):
         project = {
             "chapters": [
@@ -473,6 +578,64 @@ class NovelWritingStateTests(unittest.TestCase):
         headings = [para for para in doc.paragraphs if para.text.strip() in {"书名", "第 1 章", "第 2 章"}]
         self.assertGreaterEqual(len(headings), 2)
         self.assertTrue(all(para.alignment == WD_ALIGN_PARAGRAPH.CENTER for para in headings))
+
+    def test_split_chapter_titles_ready_exports_with_generated_titles(self):
+        chapter_one = _new_chapter(0)
+        chapter_one["text"] = "第一章正文。"
+        chapter_two = _new_chapter(1)
+        chapter_two["text"] = "第二章正文。"
+        tab = NovelWritingTab.__new__(NovelWritingTab)
+        tab.current_project = {"meta": {"title": "书名"}, "chapters": []}
+        tab._pending_split_export = {
+            "title": "书名",
+            "target_words": 1000,
+            "chapters": [chapter_one, chapter_two],
+        }
+        exported = []
+        tab._get_export_path = lambda *_args: "/tmp/split.docx"
+        tab._project_title = lambda: "书名"
+        tab.set_status_tip = lambda text: exported.append(("status", text))
+
+        import gpt_desktop.novel_writing_tab as writing_tab
+        original_write = writing_tab._write_docx_text
+        try:
+            writing_tab._write_docx_text = lambda path, title, chapters, center_chapter_headings=False: exported.append(
+                (path, title, [chap["title"] for chap in chapters], center_chapter_headings)
+            )
+            tab.on_split_chapter_titles_ready(["会议室里的选择", "沉默的副创始人"])
+        finally:
+            writing_tab._write_docx_text = original_write
+
+        self.assertIn(("/tmp/split.docx", "书名", ["第 1 章 会议室里的选择", "第 2 章 沉默的副创始人"], True), exported)
+        self.assertEqual(tab._pending_split_export, {})
+
+    def test_split_chapter_titles_failure_does_not_export(self):
+        tab = NovelWritingTab.__new__(NovelWritingTab)
+        tab.current_project = {"meta": {"title": "书名"}, "chapters": []}
+        tab._pending_split_export = {
+            "title": "书名",
+            "target_words": 1000,
+            "chapters": [{"title": "第 1 章", "text": "正文。"}],
+        }
+        tab._get_export_path = lambda *_args: self.fail("标题失败时不应选择导出路径")
+        statuses = []
+        warnings = []
+        tab.set_status_tip = lambda text: statuses.append(text)
+
+        import gpt_desktop.novel_writing_tab as writing_tab
+        original_warning = writing_tab.QMessageBox.warning
+        try:
+            writing_tab.QMessageBox.warning = lambda _parent, title, text: warnings.append((title, text))
+            tab.on_split_chapter_titles_ready([])
+        finally:
+            writing_tab.QMessageBox.warning = original_warning
+
+        self.assertEqual(tab._pending_split_export, {})
+        self.assertTrue(warnings)
+        self.assertEqual(warnings[-1][0], "章节标题生成失败")
+        self.assertIn("请重试", warnings[-1][1])
+        self.assertIn("标题数量不一致", warnings[-1][1])
+        self.assertIn("已停止拆分导出", statuses[-1])
 
     def test_pending_candidate_analysis_keeps_legacy_hash_without_forced_rerun(self):
         chapter = _new_chapter(0)
@@ -556,12 +719,219 @@ class NovelWritingStateTests(unittest.TestCase):
         tab.pending_analysis_chapter_ids = [chapter["id"]]
         tab.failed_analysis_chunks = []
         tab.candidate_postprocess_state = {"status": "failed", "error": "timeout"}
+        tab.foreshadow_review_observations = {"characters": [], "lore": [], "foreshadows": [{"name": "雨后伏笔", "description": "收尾里提到雨后。"}], "project_materials": {}}
+        tab.foreshadow_review_comparison_state = {"status": "pending", "updated_at": "2026-07-02 10:00:00"}
+        tab.failed_foreshadow_review_chunks = [{"index": 1, "total": 2, "text": "观察块", "error": "timeout"}]
 
         tab._sync_candidate_analysis_state()
 
         state = tab.current_project["analysis_state"]["candidate_postprocess"]
         self.assertEqual(state["status"], "failed")
         self.assertEqual(state["error"], "timeout")
+        foreshadow_state = tab.current_project["analysis_state"]["foreshadow_review"]
+        self.assertEqual(len(foreshadow_state["observations"]["foreshadows"]), 1)
+        self.assertEqual(foreshadow_state["comparison"]["status"], "pending")
+        self.assertEqual(len(foreshadow_state["failed_observation_chunks"]), 1)
+
+    def test_foreshadow_review_observations_sync_to_visible_candidate_drafts(self):
+        tab = NovelWritingTab.__new__(NovelWritingTab)
+        tab.current_project = {"chapters": [], "foreshadow_items": []}
+        tab.import_candidates = {
+            "characters": [],
+            "lore": [],
+            "foreshadows": [{"name": "正式候选", "description": "已经完成全局比对。"}],
+            "project_materials": {},
+        }
+        tab.foreshadow_review_observations = {
+            "characters": [],
+            "lore": [],
+            "foreshadows": [
+                {
+                    "name": "雨后状态",
+                    "status": "已埋",
+                    "setup_chapter": "第八章",
+                    "description": "第八章结尾已经进入雨后。",
+                    "_source_label": "章节：第八章",
+                }
+            ],
+            "project_materials": {},
+        }
+
+        count = tab._sync_foreshadow_observations_to_import_candidates()
+
+        self.assertEqual(count, 1)
+        self.assertEqual(len(tab.import_candidates["foreshadows"]), 2)
+        draft = tab.import_candidates["foreshadows"][1]
+        self.assertEqual(draft["name"], "雨后状态")
+        self.assertEqual(draft["_review_stage"], "observation_draft")
+        self.assertEqual(draft["review_action"], "观察待比对")
+        self.assertIn("体检建议：观察待比对", draft["description"])
+        self.assertIn("逐章伏笔观察草稿", draft["description"])
+        self.assertNotIn("_status_explicit", draft)
+
+        tab._drop_foreshadow_observation_draft_candidates()
+
+        self.assertEqual([item["name"] for item in tab.import_candidates["foreshadows"]], ["正式候选"])
+
+    def test_foreshadow_observation_drafts_default_unchecked_and_explained(self):
+        tab = NovelWritingTab.__new__(NovelWritingTab)
+        item = {
+            "name": "雨后状态",
+            "description": "第八章结尾已经进入雨后。\n体检建议：观察待比对",
+            "_review_stage": "observation_draft",
+        }
+
+        self.assertEqual(tab._default_candidate_check_state("foreshadows", item), Qt.Unchecked)
+        detail = tab._candidate_detail_text_with_review("foreshadows", item)
+        self.assertIn("逐章伏笔观察草稿", detail)
+        self.assertIn("默认不勾选", detail)
+
+    def test_foreshadow_observations_split_by_chapter_for_comparison(self):
+        tab = NovelWritingTab.__new__(NovelWritingTab)
+        observations = {
+            "foreshadows": [
+                {
+                    "name": "雨后状态",
+                    "description": "第八章结尾已经进入雨后。",
+                    "_source_label": "章节：第八章",
+                },
+                {
+                    "name": "总部交锋",
+                    "description": "第九章推进总部交锋。",
+                    "_source_label": "章节：第九章",
+                },
+                {
+                    "name": "雨后追问",
+                    "description": "第八章继续写雨后追问。",
+                    "_source_label": "章节：第八章",
+                },
+            ]
+        }
+
+        chunks = tab._split_foreshadow_observation_records(observations)
+
+        self.assertEqual(len(chunks), 2)
+        self.assertEqual([chunk["source_label"] for chunk in chunks], ["章节：第八章", "章节：第九章"])
+        self.assertTrue(all(chunk["review_flow"] == "foreshadow_review_chapter_compare" for chunk in chunks))
+        first_records = json.loads(chunks[0]["text"])
+        second_records = json.loads(chunks[1]["text"])
+        self.assertEqual([item["name"] for item in first_records], ["雨后状态", "雨后追问"])
+        self.assertEqual([item["name"] for item in second_records], ["总部交锋"])
+
+    def test_foreshadow_comparison_retry_ignores_legacy_global_failed_chunks(self):
+        tab = NovelWritingTab.__new__(NovelWritingTab)
+        state = {
+            "status": "failed",
+            "failed_chunks": [
+                {"index": 1, "total": 2, "text": "旧全局失败块", "error": "timeout"},
+                {
+                    "index": 2,
+                    "total": 2,
+                    "text": "新按章失败块",
+                    "review_flow": "foreshadow_review_chapter_compare",
+                    "chapter_title": "章节：第八章",
+                },
+            ],
+        }
+
+        chunks = tab._foreshadow_review_comparison_retry_chunks(state)
+
+        self.assertEqual(len(chunks), 1)
+        self.assertEqual(chunks[0]["text"], "新按章失败块")
+
+    def test_foreshadow_review_partial_publishes_observations_to_candidates(self):
+        tab = NovelWritingTab.__new__(NovelWritingTab)
+        tab.current_project = {"chapters": [], "foreshadow_items": []}
+        tab.import_candidates = {"characters": [], "lore": [], "foreshadows": [], "project_materials": {}}
+        tab.foreshadow_review_observations = {"characters": [], "lore": [], "foreshadows": [], "project_materials": {}}
+        tab.failed_foreshadow_review_chunks = []
+        tab.pending_analysis_chapter_ids = []
+        tab.failed_analysis_chunks = []
+        tab.candidate_postprocess_state = {}
+        tab.foreshadow_review_comparison_state = {}
+        tab._last_candidate_auto_cleanup_report = {}
+        refreshed = []
+        persisted = []
+        statuses = []
+        tab._refresh_candidate_analysis_result_view = lambda: refreshed.append(True)
+        tab._persist_candidate_analysis_draft_state = lambda: persisted.append(True)
+        tab.set_status_tip = lambda text: statuses.append(text)
+
+        tab.on_foreshadow_review_partial(
+            {
+                "foreshadows": [
+                    {
+                        "name": "雨后状态",
+                        "status": "已埋",
+                        "setup_chapter": "第八章",
+                        "description": "第八章结尾已经进入雨后。",
+                        "_source_label": "章节：第八章",
+                    }
+                ],
+                "_chunk_total": 2,
+                "_chunk_succeeded": 1,
+            },
+            1,
+            2,
+        )
+
+        self.assertEqual(len(tab.import_candidates["foreshadows"]), 1)
+        self.assertEqual(tab.import_candidates["foreshadows"][0]["_review_stage"], "observation_draft")
+        self.assertEqual(tab.current_project["import_candidates"]["foreshadows"][0]["name"], "雨后状态")
+        self.assertTrue(refreshed)
+        self.assertTrue(persisted)
+        self.assertIn("候选区已显示 1 条草稿", statuses[-1])
+
+    def test_foreshadow_postprocess_keeps_unmatched_observation_drafts_until_complete(self):
+        tab = NovelWritingTab.__new__(NovelWritingTab)
+        tab.current_project = {"chapters": [], "foreshadow_items": []}
+        tab.import_candidates = {"characters": [], "lore": [], "foreshadows": [], "project_materials": {}}
+        tab.foreshadow_review_observations = {
+            "characters": [],
+            "lore": [],
+            "foreshadows": [
+                {"name": "雨后状态", "description": "第八章结尾已经进入雨后。"},
+                {"name": "旧总部交锋", "description": "总部交锋场域已经变化。"},
+            ],
+            "project_materials": {},
+        }
+        tab._sync_foreshadow_observations_to_import_candidates()
+
+        tab._apply_foreshadow_review_postprocess_candidates(
+            {
+                "foreshadows": [
+                    {
+                        "name": "雨后状态",
+                        "status": "已回收",
+                        "description": "全局比对确认雨后状态已回收。",
+                        "review_action": "更新状态",
+                    }
+                ]
+            },
+            keep_observation_drafts=True,
+        )
+
+        items = tab.import_candidates["foreshadows"]
+        self.assertEqual(len(items), 2)
+        by_name = {item["name"]: item for item in items}
+        self.assertFalse(tab._is_foreshadow_observation_draft(by_name["雨后状态"]))
+        self.assertTrue(tab._is_foreshadow_observation_draft(by_name["旧总部交锋"]))
+
+        tab._apply_foreshadow_review_postprocess_candidates(
+            {
+                "foreshadows": [
+                    {
+                        "name": "雨后状态",
+                        "status": "已回收",
+                        "description": "全局比对确认雨后状态已回收。",
+                        "review_action": "更新状态",
+                    }
+                ]
+            },
+            keep_observation_drafts=False,
+        )
+
+        self.assertEqual([item["name"] for item in tab.import_candidates["foreshadows"]], ["雨后状态"])
 
     def test_merge_import_candidates_dedupes_repeated_notes_and_materials(self):
         repeated_note = "允许赵国图继续陈述，最终决定和亲从长计议。"
@@ -798,7 +1168,176 @@ class NovelWritingStateTests(unittest.TestCase):
         self.assertEqual(len(merged["foreshadows"]), 1)
         self.assertEqual(merged["foreshadows"][0]["name"], "虎符失踪")
         self.assertEqual(merged["foreshadows"][0]["payoff_chapter"], "第二十章")
-        self.assertIn("补充：真相揭晓。", merged["foreshadows"][0]["description"])
+        self.assertIn("补充：第二十章：真相揭晓。", merged["foreshadows"][0]["description"])
+
+    def test_merge_import_candidates_limits_foreshadow_description_supplements(self):
+        tab = NovelWritingTab.__new__(NovelWritingTab)
+        tab.import_candidates = {
+            "characters": [],
+            "lore": [],
+            "foreshadows": [
+                {
+                    "name": "旧钟声",
+                    "status": "已埋",
+                    "setup_chapter": "第一章",
+                    "payoff_chapter": "",
+                    "description": "钟声提示旧案未结。\n补充：第一章：钟声在夜里响起。\n补充：第二章：钟声又在王城出现。",
+                }
+            ],
+            "project_materials": {},
+        }
+
+        merged = tab._merge_import_candidates({
+            "foreshadows": [
+                {
+                    "name": "旧钟声",
+                    "payoff_chapter": "第三章",
+                    "description": "赵明确认钟声来自旧案密室。\n章节依据：第三章打开密室。",
+                }
+            ],
+        })
+
+        description = merged["foreshadows"][0]["description"]
+        self.assertEqual(description.count("补充："), 2)
+        self.assertIn("补充：第一章：钟声在夜里响起。", description)
+        self.assertIn("补充：第三章：赵明确认钟声来自旧案密室。；章节依据：第三章打开密室。", description)
+        self.assertNotIn("第二章：钟声又在王城出现。", description)
+
+    def test_merge_foreshadow_review_observations_limits_description_supplements(self):
+        tab = NovelWritingTab.__new__(NovelWritingTab)
+        tab.foreshadow_review_observations = {
+            "characters": [],
+            "lore": [],
+            "foreshadows": [
+                {
+                    "name": "旧钟声",
+                    "status": "已埋",
+                    "description": "钟声提示旧案未结。\n补充：第一章：钟声在夜里响起。\n补充：第二章：钟声又在王城出现。",
+                }
+            ],
+            "project_materials": {},
+        }
+
+        merged = tab._merge_foreshadow_review_observations({
+            "foreshadows": [
+                {
+                    "name": "旧钟声",
+                    "payoff_chapter": "第三章",
+                    "description": "赵明确认钟声来自旧案密室。\n章节依据：第三章打开密室。",
+                }
+            ],
+        })
+
+        description = merged["foreshadows"][0]["description"]
+        self.assertEqual(description.count("补充："), 2)
+        self.assertIn("补充：第一章：钟声在夜里响起。", description)
+        self.assertIn("补充：第三章：赵明确认钟声来自旧案密室。；章节依据：第三章打开密室。", description)
+        self.assertNotIn("第二章：钟声又在王城出现。", description)
+
+    def test_merge_import_candidates_uses_foreshadow_review_merge_target(self):
+        tab = NovelWritingTab.__new__(NovelWritingTab)
+        tab.import_candidates = {
+            "characters": [],
+            "lore": [],
+            "foreshadows": [
+                {
+                    "name": "雨后状态",
+                    "status": "已埋",
+                    "setup_chapter": "第八章",
+                    "payoff_chapter": "",
+                    "description": "第八章结尾已经进入雨后。",
+                }
+            ],
+            "project_materials": {},
+        }
+
+        merged = tab._merge_import_candidates({
+            "foreshadows": [
+                {
+                    "name": "第九章不应再次下雨",
+                    "status": "已回收",
+                    "payoff_chapter": "第九章",
+                    "description": "第九章开头重复写雨水，应按第八章雨后状态修正。",
+                    "merge_target": "雨后状态",
+                    "review_action": "更新状态",
+                }
+            ],
+        })
+
+        self.assertEqual(len(merged["foreshadows"]), 1)
+        self.assertEqual(merged["foreshadows"][0]["name"], "雨后状态")
+        self.assertEqual(merged["foreshadows"][0]["status"], "已回收")
+        self.assertEqual(merged["foreshadows"][0]["payoff_chapter"], "第九章")
+        self.assertIn("重复写雨水", merged["foreshadows"][0]["description"])
+        self.assertNotIn("别称：第九章不应再次下雨", merged["foreshadows"][0]["description"])
+
+    def test_merge_import_candidates_does_not_append_after_terminal_foreshadow_review(self):
+        tab = NovelWritingTab.__new__(NovelWritingTab)
+        tab.import_candidates = {
+            "characters": [],
+            "lore": [],
+            "foreshadows": [
+                {
+                    "name": "陈景川与陈远山景辰总部正面交锋",
+                    "status": "废弃",
+                    "description": "体检建议：移出伏笔\n判断依据：场域已被正文修正。",
+                    "_target_code": "F0055",
+                    "_status_explicit": True,
+                }
+            ],
+            "project_materials": {},
+        }
+
+        merged = tab._merge_import_candidates({
+            "foreshadows": [
+                {
+                    "name": "陈景川与陈远山景辰总部正面交锋",
+                    "status": "已回收",
+                    "description": "体检建议：更新状态\n命中编号：F0055\n判断依据：后续章节再次提到。",
+                    "target_code": "F0055",
+                    "_status_explicit": True,
+                }
+            ],
+        })
+
+        self.assertEqual(len(merged["foreshadows"]), 1)
+        self.assertEqual(merged["foreshadows"][0]["status"], "废弃")
+        self.assertIn("移出伏笔", merged["foreshadows"][0]["description"])
+        self.assertNotIn("后续章节再次提到", merged["foreshadows"][0]["description"])
+
+    def test_merge_import_candidates_replaces_terminal_review_with_earlier_chapter(self):
+        tab = NovelWritingTab.__new__(NovelWritingTab)
+        tab.import_candidates = {
+            "characters": [],
+            "lore": [],
+            "foreshadows": [
+                {
+                    "name": "陈景川与陈远山景辰总部正面交锋",
+                    "status": "废弃",
+                    "description": "第九章后续再次提到该旧线索。\n章节依据：第九章",
+                    "_target_code": "F0055",
+                    "_status_explicit": True,
+                }
+            ],
+            "project_materials": {},
+        }
+
+        merged = tab._merge_import_candidates({
+            "foreshadows": [
+                {
+                    "name": "陈景川与陈远山景辰总部正面交锋",
+                    "status": "废弃",
+                    "description": "章节 7 首次证明总部交锋场域已被正文修正。",
+                    "target_code": "F0055",
+                    "review_action": "移出伏笔",
+                    "evidence": "章节 7 陈家老宅通知",
+                }
+            ],
+        })
+
+        self.assertEqual(len(merged["foreshadows"]), 1)
+        self.assertIn("章节 7", merged["foreshadows"][0]["description"])
+        self.assertNotIn("第九章后续", merged["foreshadows"][0]["description"])
 
     def test_has_manuscript_body_requires_chapter_text(self):
         tab = NovelWritingTab.__new__(NovelWritingTab)
@@ -1392,6 +1931,42 @@ class NovelWritingStateTests(unittest.TestCase):
         self.assertEqual(tab.chapter_ai_preview.toPlainText(), "断线前正文")
         self.assertTrue(tab._has_partial_draft_preview())
         self.assertEqual(button.text, "续写正文")
+
+    def test_failed_sequence_draft_keeps_partial_preview_out_of_chapter_text(self):
+        chapter = _new_chapter(0)
+        chapter["text"] = "原正文"
+        tab = NovelWritingTab.__new__(NovelWritingTab)
+        tab.current_project = {"chapters": [chapter], "characters": []}
+        tab.current_chapter_index = 0
+        tab.chapter_ai_preview = _FakePlainTextEdit("")
+        tab.chapter_text = _FakePlainTextEdit("原正文")
+        tab.chapter_ai_stream_text = "断线半截正文"
+        tab._chapter_ai_running_action = "draft"
+        tab._chapter_ai_preview_is_partial = False
+        tab._chapter_ai_preview_action = ""
+        tab._chapter_ai_preview_chapter_id = ""
+        tab._chapter_ai_sequence_active = True
+        tab._chapter_ai_sequence_chapter_id = chapter["id"]
+        tab._chapter_ai_sequence_pending_action = "draft"
+        tab._chapter_ai_sequence_started_outline = ""
+        button = _FakeButton()
+        tab._chapter_ai_buttons_by_action = {"draft": button}
+        statuses = []
+        tab.set_status_tip = lambda text: statuses.append(text)
+
+        import gpt_desktop.novel_writing_tab as writing_tab
+        original_warning = writing_tab.QMessageBox.warning
+        try:
+            writing_tab.QMessageBox.warning = lambda *_args, **_kwargs: None
+            tab.on_chapter_ai_failed("AI 输出未完整结束，已保留当前预览内容，可点续写正文继续。")
+        finally:
+            writing_tab.QMessageBox.warning = original_warning
+
+        self.assertEqual(tab.chapter_text.toPlainText(), "原正文")
+        self.assertEqual(tab.chapter_ai_preview.toPlainText(), "断线半截正文")
+        self.assertTrue(tab._has_partial_draft_preview())
+        self.assertEqual(button.text, "续写正文")
+        self.assertIn("可点续写正文继续", statuses[-1])
 
     def test_failed_outline_without_preview_still_changes_button_to_continue(self):
         chapter = _new_chapter(0)

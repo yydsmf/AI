@@ -42,11 +42,15 @@ from .novel_import import (
     _candidate_analysis_text,
     _candidate_analysis_dossier_text,
     _candidate_detail_text,
+    _chapter_source_label_map,
     _extract_import_candidates,
     _foreshadow_candidate_identity_keys,
     _foreshadow_candidate_is_terminal_review,
     _foreshadow_candidate_target_code_keys,
     _foreshadow_candidate_target_keys,
+    _foreshadow_chapter_field_source_item,
+    _foreshadow_chapter_update_text,
+    _foreshadow_source_item,
     _foreshadow_terminal_review_description,
     _foreshadow_terminal_review_should_replace,
     _foreshadow_review_context,
@@ -116,6 +120,7 @@ from .novel_utils import (
     _normalize_import_candidates,
     _normalize_name_list,
     _normalize_project,
+    _project_without_private_notes,
     _project_summary_record_text,
     _project_meta_text,
     _project_summary_text,
@@ -124,9 +129,10 @@ from .novel_utils import (
     _sanitize_import_candidates_for_long_form,
     _split_chapters_from_text,
     _split_manuscript_into_target_chapters,
+    _target_words,
 )
 from .widgets import ProviderModelBar, WideComboBox
-from .workers import EdgeTTSWorker, NovelAnalysisWorker, NovelCandidatePostprocessWorker, NovelChapterTitleWorker, NovelForeshadowReviewPostprocessWorker, NovelForeshadowReviewWorker, NovelWritingWorker
+from .workers import EdgeTTSWorker, NovelAnalysisWorker, NovelCandidatePostprocessWorker, NovelChapterPlanWorker, NovelChapterTitleWorker, NovelForeshadowReviewPostprocessWorker, NovelForeshadowReviewWorker, NovelWritingWorker
 
 _SORT_MISSING_ORDER = 10 ** 9
 _CHINESE_NUMERAL_DIGITS = {
@@ -225,6 +231,7 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
         self.model_worker = None
         self.analysis_worker = None
         self.writing_worker = None
+        self.chapter_plan_worker = None
         self.chapter_title_worker = None
         self.auto_summary_worker = None
         self.auto_outline_worker = None
@@ -264,6 +271,7 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
         self._chapter_ai_sequence_started_outline = ""
         self._chapter_ai_provider = {}
         self._chapter_ai_model = ""
+        self._pending_chapter_plan = {}
         self._pending_split_export = {}
         self.current_character_index = -1
         self.current_lore_index = -1
@@ -485,6 +493,7 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
             ("检查", "写作检查", self._build_check_tab()),
             ("搜索", "全局搜索", self._build_search_tab()),
             ("候选", "导入候选", self._build_import_candidates_tab()),
+            ("备注", "全局备注", self._build_simple_text_tab("draft_note_edit", "全局备注")),
         ]
         for short_name, full_name, page in pages:
             page_index = self.tabs.addWidget(page)
@@ -965,6 +974,7 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
         placeholder = {
             "timeline_edit": "按时间顺序记录关键事件，避免长篇写作前后矛盾。",
             "summary_edit": "记录阶段总结、已发生事实、后续调整日志。",
+            "draft_note_edit": "仅自己可见的长篇提醒，不会自动进入 AI 写作上下文。",
         }.get(attr_name, "")
         edit.setPlaceholderText(placeholder)
         edit.textChanged.connect(self._mark_dirty)
@@ -1103,13 +1113,25 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
         self.chapter_list = QListWidget()
         self.chapter_list.currentRowChanged.connect(self._on_chapter_selected)
         left_layout.addWidget(self.chapter_list, 1)
-        left_layout.addLayout(self._button_grid((
-            ("新增", self.add_chapter),
-            ("上移", self.move_chapter_up),
-            ("下移", self.move_chapter_down),
-            ("删除", self.delete_chapter),
-            ("拆分导出", self.split_current_chapter, "按整本小说正文重切为约定字数的章节并导出 Word"),
-        ), columns=3))
+        chapter_action_grid = QGridLayout()
+        chapter_action_grid.setHorizontalSpacing(6)
+        chapter_action_grid.setVerticalSpacing(6)
+        chapter_action_buttons = (
+            (0, 0, self._ghost_button("新增", self.add_chapter)),
+            (0, 1, self._ghost_button(
+                "AI生成章节规划",
+                self.generate_chapter_plan,
+                "根据项目信息、圣经、世界观、人物、设定、时间线和伏笔生成章节名与章节提纲；生成后先预览，确认后再写入章节列表。",
+            )),
+            (1, 0, self._ghost_button("删除", self.delete_chapter)),
+            (1, 1, self._ghost_button("拆分导出", self.split_current_chapter, "按整本小说正文重切为约定字数的章节并导出 Word")),
+        )
+        for row, column, btn in chapter_action_buttons:
+            chapter_action_grid.addWidget(btn, row, column)
+            if btn.text() == "AI生成章节规划":
+                self.chapter_plan_btn = btn
+                self.chapter_ai_action_buttons.append(btn)
+        left_layout.addLayout(chapter_action_grid)
 
         right = QFrame()
         right_layout = QVBoxLayout(right)
@@ -1244,6 +1266,13 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
         self.chapter_ai_preview.setMinimumHeight(145)
         self.chapter_ai_preview.setPlaceholderText("AI 结果会显示在这里，生成完成后自动应用到当前章节。")
         ai_body_layout.addWidget(self.chapter_ai_preview, 1)
+        plan_action_row = QHBoxLayout()
+        plan_action_row.addStretch()
+        self.chapter_plan_apply_btn = self._ghost_button("应用章节规划", self.apply_chapter_plan)
+        self.chapter_plan_apply_btn.setToolTip("把预览中的章节规划追加写入章节列表。")
+        self.chapter_plan_apply_btn.setVisible(False)
+        plan_action_row.addWidget(self.chapter_plan_apply_btn)
+        ai_body_layout.addLayout(plan_action_row)
 
         ai_layout.addWidget(self.chapter_ai_body, 1)
         self.set_chapter_ai_panel_expanded(True)
@@ -1330,7 +1359,7 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
 
         row = QHBoxLayout()
         self.search_input = QLineEdit()
-        self.search_input.setPlaceholderText("输入关键词，搜索人物、设定、章节、伏笔和小说资料。")
+        self.search_input.setPlaceholderText("输入关键词，搜索当前项目的全部内容。")
         self.search_input.returnPressed.connect(self.run_global_search)
         row.addWidget(self.search_input, 1)
 
@@ -1635,6 +1664,9 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
         data["updated_at"] = now_str()
         return data
 
+    def _ai_project_snapshot(self):
+        return _project_without_private_notes(self.current_project)
+
     def get_current_project_snapshot(self):
         return self._current_project_to_data(), self.current_project_path or ""
 
@@ -1661,6 +1693,7 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
         self.current_project["world_rules"] = self.world_rules_edit.toPlainText()
         self.current_project["timeline"] = self.timeline_edit.toPlainText()
         self.current_project["summary"] = self.summary_edit.toPlainText()
+        self.current_project["draft_note"] = self.draft_note_edit.toPlainText()
         chapters, removed = _dedupe_chapters(self.current_project.get("chapters", []))
         if removed:
             self.current_project["chapters"] = chapters
@@ -1674,6 +1707,7 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
             ("world_rules", self.world_rules_edit),
             ("timeline", self.timeline_edit),
             ("summary", self.summary_edit),
+            ("draft_note", self.draft_note_edit),
         )
         for key, widget in pairs:
             self._set_text_without_signals(widget, self.current_project.get(key, ""))
@@ -2204,7 +2238,7 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
         if retry_chunk_items:
             review_chunks = retry_chunk_items
         else:
-            review_chunks = _foreshadow_review_chapter_chunks(self.current_project)
+            review_chunks = _foreshadow_review_chapter_chunks(self._ai_project_snapshot())
         if not review_chunks:
             QMessageBox.information(self, "AI 伏笔体检", "没有可用于体检的章节正文。")
             return
@@ -2353,23 +2387,6 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
                 log_debug("拆分章节标题线程清理失败", e)
         QTimer.singleShot(0, cleanup)
 
-    def _move_chapter(self, offset):
-        index = self.current_chapter_index
-        chaps = self.current_project.setdefault("chapters", [])
-        new_index = index + offset
-        if index < 0 or new_index < 0 or index >= len(chaps) or new_index >= len(chaps):
-            return
-        self._save_chapter_from_editor()
-        chaps[index], chaps[new_index] = chaps[new_index], chaps[index]
-        self._reload_chapter_list(new_index)
-        self._mark_dirty()
-
-    def move_chapter_up(self):
-        self._move_chapter(-1)
-
-    def move_chapter_down(self):
-        self._move_chapter(1)
-
     def _load_project_data(self, data, path="", defer_helpers=False):
         self._loading = True
         try:
@@ -2403,6 +2420,7 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
             self.world_rules_edit.setPlainText(self.current_project.get("world_rules", ""))
             self.timeline_edit.setPlainText(self.current_project.get("timeline", ""))
             self.summary_edit.setPlainText(self.current_project.get("summary", ""))
+            self.draft_note_edit.setPlainText(self.current_project.get("draft_note", ""))
             self._reload_character_list()
             self._reload_lore_list()
             self._reload_foreshadow_list()
@@ -2706,10 +2724,6 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
             else:
                 self.read_aloud_pending_segment = (index, bool(autoplay), int(start_position or 0))
             return
-        if self.read_aloud_retired_workers:
-            self.read_aloud_pending_segment = (index, bool(autoplay), int(start_position or 0))
-            self.set_status_tip("正在等待上一段语音生成线程结束...")
-            return
         try:
             path = self._segment_audio_path()
         except Exception as e:
@@ -2722,12 +2736,18 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
         segment["start_position"] = int(start_position or 0)
         self.read_aloud_worker_index = index
         self.read_aloud_worker = EdgeTTSWorker(segment.get("text", ""), path, rate="+0%")
-        self.read_aloud_worker.progress.connect(self.set_status_tip)
+        self.read_aloud_worker.progress.connect(self._on_read_aloud_progress)
         self.read_aloud_worker.result_ready.connect(self._on_read_aloud_segment_ready)
         self.read_aloud_worker.failed.connect(self._on_read_aloud_error)
         self.read_aloud_worker.finished.connect(self._cleanup_read_aloud_worker)
         self.set_status_tip(f"正在生成第 {index + 1}/{len(self.read_aloud_segments)} 段语音...")
         self.read_aloud_worker.start()
+
+    def _on_read_aloud_progress(self, message):
+        worker = self.sender()
+        if worker is not None and self.read_aloud_worker is not worker:
+            return
+        self.set_status_tip(message)
 
     def _on_read_aloud_segment_ready(self, path):
         worker = self.sender()
@@ -2856,7 +2876,7 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
                 worker.deleteLater()
         except Exception:
             pass
-        if self.read_aloud_worker is None and not self.read_aloud_retired_workers and self.read_aloud_pending_segment:
+        if self.read_aloud_worker is None and self.read_aloud_pending_segment:
             index, autoplay, start_position = self.read_aloud_pending_segment
             self.read_aloud_pending_segment = None
             QTimer.singleShot(0, lambda: self._ensure_read_aloud_segment(index, autoplay=autoplay, start_position=start_position))
@@ -2906,7 +2926,10 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
         if worker not in self.read_aloud_retired_workers:
             self.read_aloud_retired_workers.append(worker)
         try:
-            worker.requestInterruption()
+            if hasattr(worker, "stop"):
+                worker.stop()
+            else:
+                worker.requestInterruption()
         except Exception as e:
             log_debug("小说 Edge TTS 中止失败", e)
 
@@ -2990,6 +3013,7 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
             return
         keyword = self.search_input.text().strip()
         self._flush_current_editors()
+        self._sync_import_candidates_to_project()
         self.search_result_edit.setPlainText(_build_search_result_text(self.current_project, keyword))
 
     def clear_global_search(self):
@@ -3535,6 +3559,7 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
     def _merge_import_candidates(self, incoming):
         incoming = _normalize_ai_candidates(incoming)
         merged = deepcopy(self.import_candidates if isinstance(self.import_candidates, dict) else {})
+        chapter_labels = _chapter_source_label_map(getattr(self, "current_project", {}))
 
         def merge_candidate_text(old, new, append=False):
             old = str(old or "").strip()
@@ -3669,6 +3694,14 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
                 for field, value in item.items():
                     if field == "name":
                         continue
+                    field_source_item = item
+                    if key == "foreshadows" and field in {"setup_chapter", "payoff_chapter"}:
+                        field_source_item, value = _foreshadow_chapter_field_source_item(
+                            item,
+                            field,
+                            value,
+                            chapter_labels,
+                        )
                     if field in {"_source_label", "source_label"}:
                         merged_text, did_change = merge_source_labels(existing.get("_source_label", ""), value)
                         if did_change:
@@ -3695,10 +3728,11 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
                             existing[field] = cleaned
                         continue
                     if key == "foreshadows" and field == "description":
+                        source_item = _foreshadow_source_item(item, chapter_labels, value)
                         merged_text, did_change = _merge_foreshadow_description_without_bloat(
                             existing.get(field, ""),
                             value,
-                            item,
+                            source_item,
                         )
                     else:
                         merged_text, did_change = merge_candidate_text(
@@ -3708,6 +3742,16 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
                         )
                     if did_change:
                         existing[field] = merged_text
+                        if key == "foreshadows" and field in {"setup_chapter", "payoff_chapter"}:
+                            update_text = _foreshadow_chapter_update_text(field, merged_text)
+                            if update_text:
+                                merged_desc, desc_changed = _merge_foreshadow_description_without_bloat(
+                                    existing.get("description", ""),
+                                    update_text,
+                                    field_source_item,
+                                )
+                                if desc_changed:
+                                    existing["description"] = merged_desc
         target_materials = merged.setdefault("project_materials", {})
         if not isinstance(target_materials, dict):
             target_materials = {}
@@ -3727,6 +3771,7 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
         merged = deepcopy(self.foreshadow_review_observations if isinstance(self.foreshadow_review_observations, dict) else {})
         if not isinstance(merged, dict):
             merged = {"characters": [], "lore": [], "foreshadows": [], "project_materials": {}}
+        chapter_labels = _chapter_source_label_map(getattr(self, "current_project", {}))
         merged.setdefault("foreshadows", [])
         by_name = {
             str(item.get("name", "") or "").strip(): item
@@ -3755,18 +3800,48 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
                 new = str(item.get(field, "") or "").strip()
                 if not new:
                     continue
+                field_source_item = item
+                if field in {"setup_chapter", "payoff_chapter"}:
+                    field_source_item, new = _foreshadow_chapter_field_source_item(
+                        item,
+                        field,
+                        new,
+                        chapter_labels,
+                    )
                 old = str(existing.get(field, "") or "").strip()
                 if field == "description":
-                    merged_desc, did_change = _merge_foreshadow_description_without_bloat(old, new, item)
+                    merged_desc, did_change = _merge_foreshadow_description_without_bloat(
+                        old,
+                        new,
+                        _foreshadow_source_item(item, chapter_labels, new),
+                    )
                     if did_change:
                         existing[field] = merged_desc
                     continue
                 if not old:
                     existing[field] = new
+                    update_text = _foreshadow_chapter_update_text(field, new)
+                    if update_text:
+                        merged_desc, did_change = _merge_foreshadow_description_without_bloat(
+                            existing.get("description", ""),
+                            update_text,
+                            field_source_item,
+                        )
+                        if did_change:
+                            existing["description"] = merged_desc
                 elif new == old or new in old:
                     continue
                 elif old in new:
                     existing[field] = new
+                    update_text = _foreshadow_chapter_update_text(field, new)
+                    if update_text:
+                        merged_desc, did_change = _merge_foreshadow_description_without_bloat(
+                            existing.get("description", ""),
+                            update_text,
+                            field_source_item,
+                        )
+                        if did_change:
+                            existing["description"] = merged_desc
                 else:
                     existing[field] = f"{old}\n补充：{new}"
         merged["project_materials"] = {"bible": "", "world_rules": "", "timeline": "", "summary": ""}
@@ -3881,7 +3956,7 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
         trimmed_total = sum(int(value or 0) for value in trimmed.values()) if isinstance(trimmed, dict) else 0
         parts = []
         if filtered_total:
-            parts.append(f"已忽略 {filtered_total} 条空候选")
+            parts.append(f"已忽略 {filtered_total} 条空/无效候选")
         if trimmed_total:
             parts.append(f"已清理 {trimmed_total} 条重复/占位说明")
         return "；" + "，".join(parts) if parts else ""
@@ -3964,6 +4039,8 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
             chapter_id = str(chap.get("id", "") or "")
             if not chapter_id or chapter_id in seen:
                 continue
+            if not str(chap.get("text", "") or "").strip():
+                continue
             if chapter_id in wanted or _chapter_needs_analysis(chap):
                 if _chapter_analysis_hash(chap):
                     pending.append(chapter_id)
@@ -3978,7 +4055,7 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
             provider.get("api_key", ""),
             model,
             deepcopy(self.import_candidates),
-            _candidate_analysis_dossier_text(self.current_project),
+            _candidate_analysis_dossier_text(self._ai_project_snapshot()),
             provider.get("proxy_url", ""),
             self._provider_proxy_mode(provider),
         )
@@ -4018,7 +4095,7 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
         else:
             chapter_ids = self._pending_candidate_analysis_chapter_ids()
             analysis_chunks = None
-            text = _candidate_analysis_text(self.current_project, "", chapter_ids, include_dossier=False)
+            text = _candidate_analysis_text(self._ai_project_snapshot(), "", chapter_ids, include_dossier=False)
         if not text:
             if getattr(self, "failed_analysis_chunks", None):
                 message = "有失败块记录，但没有可重试的文本内容。请重新导入或重新分析相关章节。"
@@ -4049,7 +4126,7 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
             self._provider_proxy_mode(provider),
             concurrency,
             chunks=analysis_chunks,
-            dossier=_candidate_analysis_dossier_text(self.current_project),
+            dossier=_candidate_analysis_dossier_text(self._ai_project_snapshot()),
         )
         self.analysis_worker.progress.connect(self.set_status_tip)
         self.analysis_worker.partial_ready.connect(self.on_ai_candidates_partial)
@@ -4088,9 +4165,383 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
             return
         self.set_chapter_ai_panel_expanded(True)
 
+    def _chapter_plan_default_average_words(self):
+        try:
+            value = int(self.config.setdefault("novel", {}).get("chapter_plan_average_words", 3000) or 3000)
+        except Exception:
+            value = 3000
+        return max(1000, min(20000, value))
+
+    def _chapter_plan_counts(self, target_words, average_chapter_words, existing_count=0):
+        try:
+            target_words = int(target_words or 0)
+        except Exception:
+            target_words = 0
+        try:
+            average_chapter_words = int(average_chapter_words or 0)
+        except Exception:
+            average_chapter_words = 0
+        target_words = max(1, target_words)
+        average_chapter_words = max(1, average_chapter_words)
+        total_count = max(1, (target_words + average_chapter_words - 1) // average_chapter_words)
+        remaining_count = max(1, total_count - max(0, int(existing_count or 0)))
+        return total_count, remaining_count
+
+    def _chapter_plan_clip_text(self, value, limit, keep_tail=False):
+        text = str(value or "").replace("\r\n", "\n").replace("\r", "\n").strip()
+        if not text or len(text) <= limit:
+            return text
+        limit = max(20, int(limit or 20))
+        marker = "\n...[已压缩]...\n"
+        if limit <= len(marker) + 20:
+            return text[-limit:] if keep_tail else text[:limit]
+        available = limit - len(marker)
+        if keep_tail:
+            head = max(10, available // 3)
+            tail = max(10, available - head)
+            return text[:head].rstrip() + marker + text[-tail:].lstrip()
+        return text[:available].rstrip() + marker
+
+    def _chapter_plan_records(self, items, fields, max_items, field_limit=500, keep_tail_fields=None):
+        keep_tail_fields = set(keep_tail_fields or [])
+        records = []
+        for item in (items if isinstance(items, list) else [])[:max_items]:
+            if not isinstance(item, dict):
+                continue
+            record = {}
+            for field in fields:
+                value = item.get(field, "")
+                if isinstance(value, list):
+                    record[field] = _normalize_name_list(value)
+                else:
+                    record[field] = self._chapter_plan_clip_text(value, field_limit, field in keep_tail_fields)
+            records.append(record)
+        return records
+
+    def _chapter_plan_project_context(self, target_words, average_chapter_words, total_chapter_count, requested_chapter_count):
+        project = self._ai_project_snapshot()
+        meta = project.get("meta", {}) if isinstance(project.get("meta", {}), dict) else {}
+        chapters = project.get("chapters", [])
+        chapters = chapters if isinstance(chapters, list) else []
+        existing_chapters = []
+        for index, chap in enumerate(chapters, 1):
+            if not isinstance(chap, dict):
+                continue
+            existing_chapters.append({
+                "index": index,
+                "title": self._chapter_plan_clip_text(chap.get("title", ""), 80),
+                "status": self._chapter_plan_clip_text(chap.get("status", ""), 40),
+                "target_words": self._chapter_plan_clip_text(chap.get("draft_words", ""), 40),
+                "outline": self._chapter_plan_clip_text(chap.get("outline", ""), 1200),
+                "summary": self._chapter_plan_clip_text(chap.get("summary", ""), 900),
+                "key_facts": self._chapter_plan_clip_text(chap.get("key_facts", ""), 1200),
+                "linked_characters": _normalize_name_list(chap.get("linked_characters", [])),
+                "body_tail": self._chapter_plan_clip_text(chap.get("text", ""), 900, keep_tail=True),
+            })
+        payload = {
+            "task": (
+                "生成可以追加到当前项目章节列表的长篇章节规划。"
+                "如果已有章节，请从已有章节之后继续规划，保持前文事实、节奏和伏笔连续。"
+            ),
+            "target": {
+                "target_words": int(target_words or 0),
+                "average_chapter_words": int(average_chapter_words or 0),
+                "estimated_total_chapters": int(total_chapter_count or 0),
+                "existing_chapter_count": len(chapters),
+                "requested_new_chapters": int(requested_chapter_count or 0),
+            },
+            "meta": {
+                "title": meta.get("title", ""),
+                "genre": meta.get("genre", ""),
+                "style": meta.get("style", ""),
+                "pov": meta.get("pov", ""),
+                "target_words": meta.get("target_words", ""),
+                "status": meta.get("status", ""),
+                "premise": self._chapter_plan_clip_text(meta.get("premise", ""), 3000),
+            },
+            "project_materials": {
+                "bible": self._chapter_plan_clip_text(project.get("bible", ""), 5000),
+                "world_rules": self._chapter_plan_clip_text(project.get("world_rules", ""), 4500),
+                "timeline": self._chapter_plan_clip_text(project.get("timeline", ""), 5000, keep_tail=True),
+                "summary": self._chapter_plan_clip_text(project.get("summary", ""), 5000, keep_tail=True),
+            },
+            "characters": self._chapter_plan_records(
+                project.get("characters", []),
+                ("name", "role", "goal", "secret", "voice", "notes"),
+                120,
+                700,
+                keep_tail_fields={"notes"},
+            ),
+            "settings": self._chapter_plan_records(
+                project.get("lore", []),
+                ("name", "type", "description"),
+                160,
+                900,
+                keep_tail_fields={"description"},
+            ),
+            "foreshadows": self._chapter_plan_records(
+                project.get("foreshadow_items", []),
+                ("code", "name", "status", "setup_chapter", "payoff_chapter", "description"),
+                180,
+                900,
+                keep_tail_fields={"description"},
+            ),
+            "existing_chapters": existing_chapters,
+        }
+        return (
+            "请根据以下 JSON 项目档案生成章节规划。只规划 requested_new_chapters 指定数量的新章节；"
+            "不要重写已有章节，不要输出正文。\n\n"
+            + json.dumps(payload, ensure_ascii=False, indent=2)
+        )
+
+    def _format_chapter_plan_preview(self, plan):
+        plan = plan if isinstance(plan, dict) else {}
+        chapters = plan.get("chapters", [])
+        chapters = chapters if isinstance(chapters, list) else []
+        lines = [
+            "章节规划预览",
+            f"目标总字数：约{int(plan.get('target_words', 0) or 0)}字",
+            f"单章目标：约{int(plan.get('average_chapter_words', 0) or 0)}字",
+            f"本次生成：{len(chapters)}章",
+        ]
+        summary = str(plan.get("summary", "") or "").strip()
+        if summary:
+            lines.extend(["", "全书/阶段规划：", summary])
+        for fallback_index, item in enumerate(chapters, 1):
+            if not isinstance(item, dict):
+                continue
+            index = item.get("index", fallback_index)
+            title = str(item.get("title", "") or f"章节 {index}").strip()
+            target_words = str(item.get("target_words", "") or "").strip()
+            heading = f"第{index}章 {title}"
+            if target_words:
+                heading += f"（约{target_words}字）"
+            lines.extend(["", heading])
+            outline = str(item.get("outline", "") or "").strip()
+            if outline:
+                lines.append(outline)
+            for label, key in (
+                ("相关人物", "characters"),
+                ("相关设定", "settings"),
+                ("相关伏笔", "foreshadows"),
+            ):
+                values = _normalize_name_list(item.get(key, []))
+                if values:
+                    lines.append(f"{label}：" + "、".join(values))
+            ending_hook = str(item.get("ending_hook", "") or "").strip()
+            if ending_hook:
+                lines.append(f"结尾钩子：{ending_hook}")
+            forbidden = str(item.get("forbidden", "") or "").strip()
+            if forbidden:
+                lines.append(f"禁止/边界：{forbidden}")
+        return "\n".join(lines).strip()
+
+    def _chapter_plan_outline_for_item(self, item):
+        item = item if isinstance(item, dict) else {}
+        parts = [str(item.get("outline", "") or "").strip()]
+        for label, key in (
+            ("本章涉及设定", "settings"),
+            ("本章伏笔动作", "foreshadows"),
+        ):
+            values = _normalize_name_list(item.get(key, []))
+            if values:
+                parts.append(f"{label}：" + "、".join(values))
+        ending_hook = str(item.get("ending_hook", "") or "").strip()
+        if ending_hook:
+            parts.append(f"结尾钩子：{ending_hook}")
+        forbidden = str(item.get("forbidden", "") or "").strip()
+        if forbidden:
+            parts.append(f"禁止/边界：{forbidden}")
+        return "\n\n".join(part for part in parts if part).strip()
+
+    def generate_chapter_plan(self):
+        if self.writing_worker is not None and self.writing_worker.isRunning():
+            self.set_status_tip("AI 写作助手正在生成，请稍等。")
+            return
+        chapter_plan_worker = getattr(self, "chapter_plan_worker", None)
+        if chapter_plan_worker is not None and chapter_plan_worker.isRunning():
+            self.set_status_tip("章节规划正在生成，请稍等。")
+            return
+        provider, model, error = self._current_novel_ai_selection()
+        if error:
+            self.set_ai_settings_expanded(True)
+            self.set_status_tip(f"章节规划生成失败：{error}")
+            QMessageBox.warning(self, "章节规划生成失败", error)
+            return
+        self._flush_current_editors()
+        meta = self.current_project.get("meta", {}) if isinstance(self.current_project, dict) else {}
+        target_words = _target_words(meta)
+        if target_words <= 0:
+            target_words, ok = QInputDialog.getInt(
+                self,
+                "AI 生成章节规划",
+                "目标总字数：",
+                200000,
+                10000,
+                3000000,
+                10000,
+            )
+            if not ok:
+                return
+        average_chapter_words, ok = QInputDialog.getInt(
+            self,
+            "AI 生成章节规划",
+            "单章目标字数：",
+            self._chapter_plan_default_average_words(),
+            1000,
+            20000,
+            500,
+        )
+        if not ok:
+            return
+        self.config.setdefault("novel", {})["chapter_plan_average_words"] = int(average_chapter_words)
+        try:
+            save_config(self.config)
+        except Exception as e:
+            log_debug("章节规划单章字数设置保存失败", e)
+        chapters = self.current_project.get("chapters", []) if isinstance(self.current_project, dict) else []
+        existing_count = len(chapters if isinstance(chapters, list) else [])
+        total_chapter_count, requested_chapter_count = self._chapter_plan_counts(
+            target_words,
+            average_chapter_words,
+            existing_count,
+        )
+        if requested_chapter_count > 120:
+            QMessageBox.information(
+                self,
+                "AI 生成章节规划",
+                "一次最多生成 120 章规划。当前目标拆得太细，请提高单章目标字数，或按分季/分卷分批规划。",
+            )
+            return
+        context = self._chapter_plan_project_context(
+            target_words,
+            average_chapter_words,
+            total_chapter_count,
+            requested_chapter_count,
+        )
+        self.set_chapter_ai_panel_expanded(True)
+        if hasattr(self, "chapter_plan_apply_btn"):
+            self.chapter_plan_apply_btn.setVisible(False)
+            self.chapter_plan_apply_btn.setEnabled(False)
+        self._pending_chapter_plan = {}
+        self.chapter_ai_stream_text = ""
+        self.chapter_ai_preview.setPlainText(
+            f"正在生成章节规划：预计整本约 {total_chapter_count} 章，当前已有 {existing_count} 章，本次规划 {requested_chapter_count} 章..."
+        )
+        self.chapter_plan_worker = NovelChapterPlanWorker(
+            provider.get("base_url", ""),
+            provider.get("api_key", ""),
+            model,
+            context,
+            target_words,
+            average_chapter_words,
+            requested_chapter_count,
+            provider.get("proxy_url", ""),
+            self._provider_proxy_mode(provider),
+        )
+        self.chapter_plan_worker.progress.connect(self.set_status_tip)
+        self.chapter_plan_worker.result_ready.connect(self.on_chapter_plan_ready)
+        self.chapter_plan_worker.failed.connect(self.on_chapter_plan_failed)
+        self.chapter_plan_worker.finished.connect(self._cleanup_chapter_plan_worker)
+        self._chapter_ai_stop_requested_by_user = False
+        self._set_chapter_ai_actions_enabled(False)
+        self.set_status_tip(f"正在生成章节规划：本次 {requested_chapter_count} 章...")
+        self.chapter_plan_worker.start()
+
+    def on_chapter_plan_ready(self, plan):
+        chapters = (plan or {}).get("chapters", []) if isinstance(plan, dict) else []
+        if not chapters:
+            self.on_chapter_plan_failed("AI 没有返回可用章节规划。")
+            return
+        self._pending_chapter_plan = deepcopy(plan)
+        self.chapter_ai_preview.setPlainText(self._format_chapter_plan_preview(plan))
+        if hasattr(self, "chapter_plan_apply_btn"):
+            self.chapter_plan_apply_btn.setVisible(True)
+            self.chapter_plan_apply_btn.setEnabled(True)
+        self.set_status_tip(f"章节规划已生成：{len(chapters)} 章。预览确认后可应用到章节列表。")
+
+    def on_chapter_plan_failed(self, err):
+        if getattr(self, "_chapter_ai_stop_requested_by_user", False):
+            self.set_status_tip("章节规划生成已中止。")
+            return
+        err_text = clean_error_text(err)
+        self._pending_chapter_plan = {}
+        if hasattr(self, "chapter_plan_apply_btn"):
+            self.chapter_plan_apply_btn.setVisible(False)
+            self.chapter_plan_apply_btn.setEnabled(False)
+        self.set_status_tip(f"章节规划生成失败：{err_text[:100]}")
+        QMessageBox.warning(self, "章节规划生成失败", err_text)
+
+    def _cleanup_chapter_plan_worker(self):
+        worker = self.sender()
+
+        def cleanup():
+            try:
+                was_current = self.chapter_plan_worker is worker
+                if was_current:
+                    self.chapter_plan_worker = None
+                if worker is not None:
+                    worker.deleteLater()
+                if was_current:
+                    self._set_chapter_ai_actions_enabled(True)
+                    if getattr(self, "_chapter_ai_stop_requested_by_user", False):
+                        self.set_status_tip("章节规划生成已中止。")
+                    self._chapter_ai_stop_requested_by_user = False
+            except Exception as e:
+                log_debug("小说章节规划线程清理失败", e)
+
+        QTimer.singleShot(0, cleanup)
+
+    def apply_chapter_plan(self):
+        plan = deepcopy(getattr(self, "_pending_chapter_plan", {}) or {})
+        chapters_plan = plan.get("chapters", []) if isinstance(plan, dict) else []
+        chapters_plan = [item for item in chapters_plan if isinstance(item, dict)]
+        if not chapters_plan:
+            self.set_status_tip("没有可应用的章节规划。")
+            return
+        self._flush_current_editors()
+        chapters = self.current_project.setdefault("chapters", [])
+        if not isinstance(chapters, list):
+            chapters = []
+            self.current_project["chapters"] = chapters
+        existing_count = len(chapters)
+        if existing_count:
+            ret = QMessageBox.question(
+                self,
+                "应用章节规划",
+                f"当前已有 {existing_count} 章。将把这 {len(chapters_plan)} 章追加到章节列表后面，不会覆盖已有章节。继续吗？",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.Yes,
+            )
+            if ret != QMessageBox.Yes:
+                self.set_status_tip("已取消应用章节规划。")
+                return
+        first_new_index = len(chapters)
+        for item in chapters_plan:
+            chapter = _new_chapter(len(chapters))
+            title = str(item.get("title", "") or "").strip()
+            if title:
+                chapter["title"] = title
+            target_words = str(item.get("target_words", "") or "").strip()
+            if target_words:
+                chapter["draft_words"] = target_words
+            chapter["outline"] = self._chapter_plan_outline_for_item(item)
+            chapter["linked_characters"] = _normalize_name_list(item.get("characters", []))
+            chapter["status"] = "大纲"
+            chapters.append(chapter)
+        self._pending_chapter_plan = {}
+        if hasattr(self, "chapter_plan_apply_btn"):
+            self.chapter_plan_apply_btn.setVisible(False)
+            self.chapter_plan_apply_btn.setEnabled(False)
+        self.chapter_ai_preview.clear()
+        self._dirty = True
+        self._reload_chapter_list(first_new_index)
+        self._schedule_refresh(include_manuscript=True)
+        self.set_status_tip(f"已追加 {len(chapters_plan)} 章章节规划，可从第一章新规划开始逐章扩写。")
+
     def _chapter_ai_context(self, action):
         self._flush_current_editors()
-        return _build_chapter_ai_context(self.current_project, self.current_chapter_index, action)
+        return _build_chapter_ai_context(self._ai_project_snapshot(), self.current_chapter_index, action)
 
     def _has_partial_chapter_ai_preview(self, action=None):
         preview_action = getattr(self, "_chapter_ai_preview_action", "")
@@ -4112,11 +4563,11 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
     def _chapter_ai_context_with_preview(self, action):
         self._flush_current_editors()
         if action != "draft" or not self._has_partial_draft_preview():
-            return _build_chapter_ai_context(self.current_project, self.current_chapter_index, action)
-        project = deepcopy(self.current_project)
+            return _build_chapter_ai_context(self._ai_project_snapshot(), self.current_chapter_index, action)
+        project = self._ai_project_snapshot()
         chapters = project.get("chapters", [])
         if not isinstance(chapters, list) or self.current_chapter_index < 0 or self.current_chapter_index >= len(chapters):
-            return _build_chapter_ai_context(self.current_project, self.current_chapter_index, action)
+            return _build_chapter_ai_context(self._ai_project_snapshot(), self.current_chapter_index, action)
         chap = chapters[self.current_chapter_index]
         if isinstance(chap, dict):
             preview_text = self.chapter_ai_preview.toPlainText().strip()
@@ -4161,6 +4612,7 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
         self._chapter_ai_sequence_chapter_id = ""
         self._chapter_ai_sequence_pending_action = ""
         self._chapter_ai_sequence_started_outline = ""
+        self._chapter_ai_sequence_skipped_outline = False
 
     def _start_chapter_ai_worker(self, action, context, status_text="", resume_prefix=""):
         self.set_chapter_ai_panel_expanded(True)
@@ -4246,6 +4698,10 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
         if self.writing_worker is not None and self.writing_worker.isRunning():
             self.set_status_tip("AI 写作助手正在生成，请稍等。")
             return
+        chapter_plan_worker = getattr(self, "chapter_plan_worker", None)
+        if chapter_plan_worker is not None and chapter_plan_worker.isRunning():
+            self.set_status_tip("章节规划正在生成，请稍等。")
+            return
         partial_action = ""
         if action == "draft" and self._has_partial_chapter_ai_preview():
             partial_action = getattr(self, "_chapter_ai_preview_action", "")
@@ -4280,6 +4736,7 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
             self._chapter_ai_sequence_active = True
             self._chapter_ai_sequence_chapter_id = self._current_chapter_id()
             self._chapter_ai_sequence_pending_action = "draft"
+            self._chapter_ai_sequence_started_outline = self.chapter_outline.toPlainText().strip()
         try:
             context = self._chapter_ai_context_with_preview(action)
         except Exception as e:
@@ -4302,15 +4759,22 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
 
     def stop_chapter_ai_action(self):
         worker = self.writing_worker
-        if worker is None:
+        plan_worker = getattr(self, "chapter_plan_worker", None)
+        if (worker is None or not worker.isRunning()) and (plan_worker is None or not plan_worker.isRunning()):
             return
         self._chapter_ai_stop_requested_by_user = True
         self.set_status_tip("正在中止 AI 辅助生成...")
         try:
-            if hasattr(worker, "stop"):
-                worker.stop()
-            else:
-                worker.requestInterruption()
+            if worker is not None and worker.isRunning():
+                if hasattr(worker, "stop"):
+                    worker.stop()
+                else:
+                    worker.requestInterruption()
+            if plan_worker is not None and plan_worker.isRunning():
+                if hasattr(plan_worker, "stop"):
+                    plan_worker.stop()
+                else:
+                    plan_worker.requestInterruption()
         except Exception as e:
             log_debug("小说章节 AI 中止失败", e)
 
@@ -4374,14 +4838,22 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
                 if action == "draft":
                     self.chapter_ai_preview.setPlainText(final_text)
                     self.apply_chapter_ai_preview("text")
-                    self._continue_chapter_ai_sequence("outline")
+                    if str(getattr(self, "_chapter_ai_sequence_started_outline", "") or "").strip():
+                        self._chapter_ai_sequence_skipped_outline = True
+                        self._continue_chapter_ai_sequence("summary")
+                    else:
+                        self._continue_chapter_ai_sequence("outline")
                     return
                 if action == "summary":
                     self.on_auto_chapter_summary_ready("summary", final_text)
                     self.chapter_ai_preview.clear()
+                    skipped_outline = bool(getattr(self, "_chapter_ai_sequence_skipped_outline", False))
                     self._reset_chapter_ai_sequence()
                     self.set_chapter_ai_panel_expanded(False)
-                    self.set_status_tip("章节 AI 已完成：正文、提纲、摘要/关键事实已按顺序更新。")
+                    if skipped_outline:
+                        self.set_status_tip("章节 AI 已完成：正文已写入，已保留原章节提纲，并补摘要/关键事实。")
+                    else:
+                        self.set_status_tip("章节 AI 已完成：正文、提纲、摘要/关键事实已按顺序更新。")
                     return
             self.apply_chapter_ai_preview(target)
         else:
@@ -5024,7 +5496,7 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
             provider.get("api_key", ""),
             model,
             deepcopy(observations),
-            _foreshadow_review_dossier_text(self.current_project),
+            _foreshadow_review_dossier_text(self._ai_project_snapshot()),
             provider.get("proxy_url", ""),
             self._provider_proxy_mode(provider),
             self._candidate_analysis_concurrency(),

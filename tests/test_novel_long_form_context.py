@@ -124,6 +124,18 @@ class NovelLongFormContextTests(unittest.TestCase):
         self.assertIn("项目总目标字数：20万字", context)
         self.assertIn("不要把项目总字数当作单章输出字数", context)
 
+    def test_global_note_is_private_and_not_in_chapter_ai_context(self):
+        current = _new_chapter(0)
+        current["title"] = "第一章 入城"
+        current["outline"] = "主角入城调查旧案。"
+        project = self._project_with_current_chapter(current)
+        project["draft_note"] = "仅自己可见提醒：不要让这句进入 AI 写作上下文。"
+
+        context = _build_chapter_ai_context(project, 0, "draft")
+
+        self.assertNotIn("仅自己可见提醒", context)
+        self.assertNotIn("不要让这句进入 AI 写作上下文", context)
+
     def test_blank_chapter_draft_words_does_not_expand_to_project_total(self):
         current = _new_chapter(0)
         current["title"] = "第一章 入城"
@@ -967,6 +979,76 @@ class NovelLongFormContextTests(unittest.TestCase):
         self.assertIn("虎符来源", context)
         self.assertIn("远期回收/转折锚点", context)
         self.assertIn("虎符真相", context)
+        timeline_section = context.split("【时间线】", 1)[1].split("\n\n【", 1)[0]
+        self.assertNotIn("第二章继续追查虎符来源", timeline_section)
+
+    def test_chapter_context_does_not_treat_prior_outline_only_plan_as_occurred(self):
+        first = _new_chapter(0)
+        first["title"] = "第一章 雨后入城"
+        first["text"] = "赵明在雨停后进入王城。"
+        first["summary"] = "赵明雨后入城。"
+        planned = _new_chapter(1)
+        planned["title"] = "第二章 计划夜探"
+        planned["outline"] = "AI 章节规划：第二章韩乌会在老宅偷听，并拿走密信。"
+        current = _new_chapter(2)
+        current["title"] = "第三章 当前写作"
+        current["outline"] = "赵明继续调查旧案。"
+        project = self._project_with_current_chapter(current)
+        project["chapters"] = [first, planned, current]
+
+        context = _build_chapter_ai_context(project, 2, "draft")
+
+        recent_section = self._context_section(context, "近几章连续性")
+        previous_section = self._context_section(context, "前文继承摘要")
+        timeline_section = self._context_section(context, "时间线")
+        summary_section = self._context_section(context, "全局摘要 / 日志")
+        self.assertIn("雨后入城", recent_section)
+        self.assertNotIn("韩乌会在老宅偷听", recent_section)
+        self.assertNotIn("拿走密信", previous_section)
+        self.assertNotIn("拿走密信", timeline_section)
+        self.assertNotIn("拿走密信", summary_section)
+
+    def test_character_recent_state_ignores_prior_outline_only_plan(self):
+        planned = _new_chapter(0)
+        planned["title"] = "第一章 计划韩乌"
+        planned["outline"] = "AI 章节规划：韩乌在老宅偷听，并拿走密信。"
+        current = _new_chapter(1)
+        current["title"] = "第二章 当前写作"
+        current["outline"] = "韩乌正式出场。"
+        current["linked_characters"] = ["韩乌"]
+        project = self._project_with_current_chapter(current)
+        project["chapters"] = [planned, current]
+        project["characters"] = [
+            {"name": "韩乌", "role": "暗线人物", "goal": "查清旧案", "secret": "", "voice": "", "notes": ""}
+        ]
+
+        context = _build_chapter_ai_context(project, 1, "draft")
+
+        character_section = self._context_section(context, "本章相关人物")
+        self.assertIn("韩乌", character_section)
+        self.assertNotIn("最近状态", character_section)
+        self.assertNotIn("老宅偷听", context)
+        self.assertNotIn("拿走密信", context)
+
+    def test_lore_recent_state_ignores_prior_outline_only_plan(self):
+        planned = _new_chapter(0)
+        planned["title"] = "第一章 计划地点"
+        planned["outline"] = "AI 章节规划：琉璃塔将在本章坍塌，密室钟声被毁。"
+        current = _new_chapter(1)
+        current["title"] = "第二章 当前写作"
+        current["outline"] = "主角进入琉璃塔。"
+        project = self._project_with_current_chapter(current)
+        project["chapters"] = [planned, current]
+        project["lore"] = [
+            {"name": "琉璃塔", "type": "地点", "description": "旧案档案被藏在塔顶。"}
+        ]
+
+        context = _build_chapter_ai_context(project, 1, "draft")
+
+        lore_section = self._context_section(context, "本章相关设定")
+        self.assertIn("琉璃塔", lore_section)
+        self.assertNotIn("最近状态", lore_section)
+        self.assertNotIn("密室钟声被毁", context)
 
     def test_chapter_context_future_boundary_keeps_final_milestone(self):
         current = _new_chapter(0)
@@ -1678,7 +1760,7 @@ class NovelLongFormContextTests(unittest.TestCase):
         self.assertIn("第五十章", text)
         self.assertLess(text.index("终局密钥"), text.index("普通伏笔0"))
 
-    def test_project_timeline_draft_collects_chapter_order_and_linked_characters(self):
+    def test_project_timeline_draft_collects_written_chapter_order_and_linked_characters(self):
         first = _new_chapter(0)
         first["title"] = "第一章 旧案"
         first["summary"] = "主角发现旧案卷宗。"
@@ -1695,8 +1777,8 @@ class NovelLongFormContextTests(unittest.TestCase):
         self.assertIn("第一章 旧案", text)
         self.assertIn("卷宗缺少最后一页", text)
         self.assertIn("人物：赵明", text)
-        self.assertIn("第二章 入城", text)
-        self.assertIn("提纲：主角入城", text)
+        self.assertNotIn("第二章 入城", text)
+        self.assertNotIn("提纲：主角入城", text)
 
     def test_project_timeline_draft_uses_body_excerpt_when_summary_missing(self):
         first = _new_chapter(0)

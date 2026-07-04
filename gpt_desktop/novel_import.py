@@ -19,6 +19,7 @@ from .novel_utils import (
     _normalize_foreshadow_code,
     _normalize_name_list,
     _prepare_character_candidate,
+    _project_without_private_notes,
     _record_alias_keys,
     _select_lines_by_char_budget,
     _stable_foreshadow_description_context,
@@ -267,6 +268,121 @@ _LOW_VALUE_DOSSIER_TEXTS = {
 }
 _FORESHADOW_MERGE_TARGET_LABELS = ("合并目标", "合并到", "目标伏笔")
 _FORESHADOW_TARGET_CODE_LABELS = ("命中编号", "伏笔编号", "目标编号", "target_code", "merge_target_code")
+
+
+def _chapter_ref_lookup_key(value):
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    text = text.splitlines()[0].strip()
+    for _i in range(4):
+        cleaned = re.sub(r"^(?:伏笔按章比对|章节|当前章节标题|来源)[：:]\s*", "", text).strip()
+        if cleaned == text:
+            break
+        text = cleaned
+    text = re.sub(r"^第\s*[一二两三四五六七八九十百千万零〇\d]+\s*章\s*[：:、.\-—]?\s*", "", text).strip()
+    return _compact_text(text)
+
+
+def _chapter_source_label_map(project):
+    project = project if isinstance(project, dict) else {}
+    chapters = project.get("chapters", [])
+    chapters = chapters if isinstance(chapters, list) else []
+    labels = {}
+    for index, chapter in enumerate(chapters, 1):
+        if not isinstance(chapter, dict):
+            continue
+        title = str(chapter.get("title", "") or "").strip()
+        if not title:
+            continue
+        label = title if re.search(r"第\s*[一二两三四五六七八九十百千万零〇\d]+\s*章", title) else f"第{index}章：{title}"
+        for key in {title, label, _chapter_ref_lookup_key(title), _chapter_ref_lookup_key(label)}:
+            compact = _compact_text(key)
+            if compact and compact not in labels:
+                labels[compact] = label
+    return labels
+
+
+def _foreshadow_resolved_chapter_label(item, chapter_labels=None, fallback_value=""):
+    item = item if isinstance(item, dict) else {}
+    chapter_labels = chapter_labels if isinstance(chapter_labels, dict) else {}
+    for key in (
+        "_resolved_chapter_label",
+        "payoff_chapter",
+        "回收章节",
+        "兑现章节",
+        "揭晓章节",
+        "setup_chapter",
+        "埋设章节",
+        "铺垫章节",
+        "出现章节",
+        "evidence",
+        "依据章节",
+        "章节依据",
+        "chapter_title",
+        "_source_label",
+        "source_label",
+    ):
+        raw = str(item.get(key, "") or "").strip()
+        if not raw:
+            continue
+        for line in raw.splitlines():
+            label = _foreshadow_resolved_chapter_label_from_text(line, chapter_labels)
+            if label:
+                return label
+    return _foreshadow_resolved_chapter_label_from_text(fallback_value, chapter_labels)
+
+
+def _foreshadow_resolved_chapter_label_from_text(value, chapter_labels=None):
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    text = text.splitlines()[0].strip()
+    for _i in range(4):
+        cleaned = re.sub(r"^(?:伏笔按章比对|章节|当前章节标题|来源)[：:]\s*", "", text).strip()
+        if cleaned == text:
+            break
+        text = cleaned
+    compact = _compact_text(text)
+    lookup_key = _chapter_ref_lookup_key(text)
+    for key in (compact, lookup_key):
+        if key and key in (chapter_labels or {}):
+            return chapter_labels[key]
+    if re.search(r"第\s*[一二两三四五六七八九十百千万零〇\d]+\s*章", text):
+        return text
+    return ""
+
+
+def _foreshadow_source_item(item, chapter_labels=None, fallback_value=""):
+    item = item if isinstance(item, dict) else {}
+    source = _foreshadow_resolved_chapter_label(item, chapter_labels, fallback_value)
+    if not source:
+        return item
+    copy = dict(item)
+    copy["_resolved_chapter_label"] = source
+    return copy
+
+
+def _foreshadow_chapter_field_source_item(item, field, value, chapter_labels=None):
+    item = item if isinstance(item, dict) else {}
+    source = ""
+    if field in {"setup_chapter", "payoff_chapter"}:
+        source = _foreshadow_resolved_chapter_label_from_text(value, chapter_labels)
+    if not source:
+        return item, str(value or "").strip()
+    copy = dict(item)
+    copy["_resolved_chapter_label"] = source
+    return copy, source
+
+
+def _foreshadow_chapter_update_text(field, value):
+    value = str(value or "").strip()
+    if not value:
+        return ""
+    label = "埋设章节" if field == "setup_chapter" else "回收章节" if field == "payoff_chapter" else ""
+    if not label:
+        return ""
+    return f"{label}更新为：{value}"
 
 
 def _is_low_value_dossier_text(value):
@@ -748,6 +864,7 @@ def _apply_import_candidates(project, candidates, checked):
     chars = project.setdefault("characters", [])
     lore = project.setdefault("lore", [])
     foreshadows = project.setdefault("foreshadow_items", [])
+    chapter_labels = _chapter_source_label_map(project)
 
     def useful(value):
         text = str(value or "").strip()
@@ -781,6 +898,17 @@ def _apply_import_candidates(project, candidates, checked):
         changed = False
         for field in fields:
             incoming_value = incoming.get(field, "") if isinstance(incoming, dict) else ""
+            incoming_source = incoming
+            if key == "foreshadows":
+                if field in {"setup_chapter", "payoff_chapter"}:
+                    incoming_source, incoming_value = _foreshadow_chapter_field_source_item(
+                        incoming,
+                        field,
+                        incoming_value,
+                        chapter_labels,
+                    )
+                else:
+                    incoming_source = _foreshadow_source_item(incoming, chapter_labels, incoming_value)
             if key == "foreshadows" and field == "status":
                 if not incoming.get("_status_explicit"):
                     continue
@@ -795,7 +923,7 @@ def _apply_import_candidates(project, candidates, checked):
                 merged, did_change = _merge_foreshadow_description_without_bloat(
                     target_item.get(field, ""),
                     incoming_value,
-                    incoming,
+                    incoming_source,
                 )
             else:
                 merged, did_change = merge_text(
@@ -806,6 +934,17 @@ def _apply_import_candidates(project, candidates, checked):
             if did_change:
                 target_item[field] = merged
                 changed = True
+                if key == "foreshadows" and field in {"setup_chapter", "payoff_chapter"}:
+                    update_text = _foreshadow_chapter_update_text(field, merged)
+                    if update_text:
+                        merged_desc, desc_changed = _merge_foreshadow_description_without_bloat(
+                            target_item.get("description", ""),
+                            update_text,
+                            incoming_source,
+                        )
+                        if desc_changed:
+                            target_item["description"] = merged_desc
+                            changed = True
         return changed
 
     def replace_linked_character(old_name, new_name):
@@ -1190,7 +1329,7 @@ def _rank_candidate_dossier_foreshadows(project, limit=60):
 
 
 def _candidate_analysis_dossier_text(project):
-    project = project if isinstance(project, dict) else {}
+    project = _project_without_private_notes(project)
     _ensure_foreshadow_codes(project)
     context_parts = []
     meta = project.get("meta", {}) if isinstance(project.get("meta"), dict) else {}
@@ -1276,7 +1415,7 @@ def _candidate_analysis_text(project, last_import_text="", chapter_ids=None, inc
     text = str(last_import_text or "").strip()
     if text and chapter_ids is None:
         return text
-    project = project if isinstance(project, dict) else {}
+    project = _project_without_private_notes(project)
     parts = []
     if include_dossier:
         dossier = _candidate_analysis_dossier_text(project)
@@ -1289,6 +1428,9 @@ def _candidate_analysis_text(project, last_import_text="", chapter_ids=None, inc
             continue
         if ids is not None and str(chap.get("id", "") or "") not in ids:
             continue
+        text_body = str(chap.get("text", "") or "").strip()
+        if not text_body:
+            continue
         parts.append(str(chap.get("title", "") or ""))
         outline = str(chap.get("outline", "") or "").strip()
         if outline:
@@ -1297,9 +1439,7 @@ def _candidate_analysis_text(project, last_import_text="", chapter_ids=None, inc
         linked_names = _normalize_name_list(linked if isinstance(linked, list) else str(linked or ""))
         if linked_names:
             parts.append("关联人物：\n" + "、".join(linked_names))
-        text_body = str(chap.get("text", "") or "").strip()
-        if text_body:
-            parts.append("正文：\n" + text_body)
+        parts.append("正文：\n" + text_body)
         summary = str(chap.get("summary", "") or "").strip()
         if summary:
             parts.append("摘要：\n" + summary)
@@ -1310,7 +1450,7 @@ def _candidate_analysis_text(project, last_import_text="", chapter_ids=None, inc
 
 
 def _foreshadow_review_dossier_text(project):
-    project = project if isinstance(project, dict) else {}
+    project = _project_without_private_notes(project)
     _ensure_foreshadow_codes(project)
     parts = []
     meta = project.get("meta", {}) if isinstance(project.get("meta"), dict) else {}
@@ -1347,7 +1487,7 @@ def _foreshadow_review_dossier_text(project):
 
 
 def _foreshadow_review_chapter_chunks(project, chapter_ids=None):
-    project = project if isinstance(project, dict) else {}
+    project = _project_without_private_notes(project)
     chapters = project.get("chapters", [])
     chapters = chapters if isinstance(chapters, list) else []
     ids = {str(x) for x in chapter_ids} if chapter_ids is not None else None

@@ -18,6 +18,7 @@ class NovelImportCandidateTests(unittest.TestCase):
         chapter = _new_chapter(0)
         chapter["title"] = "第一章 旧案"
         chapter["outline"] = "赵明进入王城。"
+        chapter["text"] = "赵明进入王城，开始追查旧案。"
         chapter["linked_characters"] = ["赵明", "迟到主角"]
         chapter["summary"] = "两人开始调查旧案。"
         project = {"chapters": [chapter]}
@@ -26,6 +27,23 @@ class NovelImportCandidateTests(unittest.TestCase):
 
         self.assertIn("关联人物", text)
         self.assertIn("赵明、迟到主角", text)
+
+    def test_candidate_analysis_text_skips_outline_only_planned_chapters(self):
+        planned = _new_chapter(0)
+        planned["title"] = "第一章 规划"
+        planned["outline"] = "这是 AI 章节规划生成的提纲，还没有正文。"
+        written = _new_chapter(1)
+        written["title"] = "第二章 正文"
+        written["outline"] = "已有正文的章节可以进入候选分析。"
+        written["text"] = "赵明进入王城，发现旧案告示。"
+        project = {"chapters": [planned, written]}
+
+        text = _candidate_analysis_text(project, "", [planned["id"], written["id"]], include_dossier=False)
+
+        self.assertNotIn("第一章 规划", text)
+        self.assertNotIn("还没有正文", text)
+        self.assertIn("第二章 正文", text)
+        self.assertIn("赵明进入王城", text)
 
     def test_foreshadow_review_uses_existing_items_and_full_chapter_body(self):
         chapter = _new_chapter(0)
@@ -101,6 +119,35 @@ class NovelImportCandidateTests(unittest.TestCase):
         self.assertIn("第二章 入城", body_only)
         self.assertIn("【已有项目档案】", dossier)
         self.assertIn("虎符失踪", dossier)
+
+    def test_ai_analysis_materials_do_not_include_private_global_note(self):
+        chapter = _new_chapter(0)
+        chapter["title"] = "第一章 入城"
+        chapter["outline"] = "赵明进入王城。"
+        chapter["text"] = "赵明在王城看见旧案告示。"
+        project = {
+            "meta": {"title": "长篇测试", "premise": "旧案重启。"},
+            "draft_note": "私有备注锚点：这句话不能交给 AI。",
+            "bible": "核心设定：旧案牵动三代人。",
+            "summary": "赵明已经入城。",
+            "foreshadow_items": [
+                {"name": "虎符失踪", "status": "已埋", "description": "半枚虎符首次出现。"},
+            ],
+            "chapters": [chapter],
+        }
+
+        candidate_text = _candidate_analysis_text(project, "", [chapter["id"]])
+        candidate_dossier = _candidate_analysis_dossier_text(project)
+        foreshadow_dossier = _foreshadow_review_dossier_text(project)
+        foreshadow_chunks = _foreshadow_review_chapter_chunks(project)
+        foreshadow_context = _foreshadow_review_context(project)
+
+        self.assertNotIn("私有备注锚点", candidate_text)
+        self.assertNotIn("私有备注锚点", candidate_dossier)
+        self.assertNotIn("私有备注锚点", foreshadow_dossier)
+        self.assertNotIn("私有备注锚点", foreshadow_context)
+        self.assertTrue(foreshadow_chunks)
+        self.assertNotIn("私有备注锚点", foreshadow_chunks[0]["text"])
 
     def test_candidate_analysis_dossier_prioritizes_active_late_character(self):
         characters = [
@@ -745,6 +792,53 @@ class NovelImportCandidateTests(unittest.TestCase):
         self.assertIn("补充：第一章：钟声在夜里响起。", description)
         self.assertIn("补充：第三章：赵明确认钟声来自旧案密室。；章节依据：第三章打开密室。", description)
         self.assertNotIn("第二章：钟声又在王城出现。", description)
+
+    def test_apply_import_candidates_adds_chapter_source_to_foreshadow_updates(self):
+        project = {
+            "chapters": [
+                {"title": "五行缺五行，系统缺大德"},
+                {"title": "破庙请神，神也想跑路"},
+            ],
+            "foreshadow_items": [
+                {
+                    "name": "系统来源",
+                    "status": "已埋",
+                    "setup_chapter": "",
+                    "payoff_chapter": "",
+                    "description": "本季结尾需揭示系统真正来源。",
+                }
+            ],
+        }
+        candidates = {
+            "characters": [],
+            "lore": [],
+            "foreshadows": [
+                {
+                    "name": "系统来源",
+                    "setup_chapter": "五行缺五行，系统缺大德",
+                    "description": "四大开系统首次绑定苏不孝时出现异常乱码。",
+                }
+            ],
+            "project_materials": {},
+        }
+
+        _apply_import_candidates(project, candidates, {"foreshadows": [0]})
+
+        item = project["foreshadow_items"][0]
+        self.assertEqual(item["setup_chapter"], "第1章：五行缺五行，系统缺大德")
+        self.assertIn("补充：第1章：五行缺五行，系统缺大德：埋设章节更新为：第1章：五行缺五行，系统缺大德", item["description"])
+        self.assertIn("补充：第1章：五行缺五行，系统缺大德：四大开系统首次绑定苏不孝时出现异常乱码。", item["description"])
+
+        candidates["foreshadows"] = [
+            {
+                "name": "系统来源",
+                "payoff_chapter": "破庙请神，神也想跑路",
+                "description": "",
+            }
+        ]
+        _apply_import_candidates(project, candidates, {"foreshadows": [0]})
+
+        self.assertEqual(item["payoff_chapter"], "第2章：破庙请神，神也想跑路")
 
     def test_apply_import_candidates_merges_lore_and_foreshadow_by_alias(self):
         project = {

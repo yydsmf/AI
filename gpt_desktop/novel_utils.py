@@ -414,6 +414,27 @@ def _default_project():
     }
 
 
+_PRIVATE_PROJECT_NOTE_KEYS = {"draft_note"}
+
+
+def _project_without_private_notes(project):
+    if not isinstance(project, dict):
+        return {}
+
+    def scrub(value):
+        if isinstance(value, dict):
+            return {
+                key: scrub(child)
+                for key, child in value.items()
+                if str(key) not in _PRIVATE_PROJECT_NOTE_KEYS
+            }
+        if isinstance(value, list):
+            return [scrub(item) for item in value]
+        return value
+
+    return scrub(project)
+
+
 def _new_character(index):
     return {
         "id": uuid.uuid4().hex,
@@ -853,6 +874,9 @@ def _foreshadow_supplement_core(value):
 def _foreshadow_supplement_source_label(item):
     item = item if isinstance(item, dict) else {}
     for key in (
+        "_resolved_chapter_label",
+        "resolved_chapter_label",
+        "chapter_source_label",
         "payoff_chapter",
         "回收章节",
         "兑现章节",
@@ -865,17 +889,24 @@ def _foreshadow_supplement_source_label(item):
         "_source_label",
         "source_label",
     ):
-        value = str(item.get(key, "") or "").strip()
-        if not value:
+        raw = str(item.get(key, "") or "").strip()
+        if not raw:
             continue
-        value = value.splitlines()[0].strip()
-        value = re.sub(r"^(?:章节|当前章节标题|来源)[：:]\s*", "", value).strip()
-        if not value:
-            continue
-        if re.search(r"第\s*\d+\s*/\s*\d+\s*块", value):
-            continue
-        if "章" in value or value.startswith("章节"):
-            return value
+        for value in raw.splitlines():
+            value = str(value or "").strip()
+            if not value:
+                continue
+            for _i in range(4):
+                cleaned = re.sub(r"^(?:伏笔按章比对|章节|当前章节标题|来源)[：:]\s*", "", value).strip()
+                if cleaned == value:
+                    break
+                value = cleaned
+            if not value:
+                continue
+            if re.search(r"第\s*\d+\s*/\s*\d+\s*块", value):
+                continue
+            if "章" in value or value.startswith("章节"):
+                return value
     return ""
 
 
@@ -2272,68 +2303,177 @@ def _build_manuscript_text(project):
     return "\n".join(parts).strip()
 
 
+_PROJECT_SEARCH_FIELD_LABELS = {
+    "title": "书名",
+    "genre": "类型",
+    "style": "风格",
+    "pov": "视角",
+    "target_words": "目标字数",
+    "status": "状态",
+    "premise": "核心设定",
+    "bible": "小说圣经",
+    "world_rules": "世界观 / 规则",
+    "timeline": "时间线",
+    "foreshadows": "伏笔汇总",
+    "summary": "摘要 / 日志",
+    "draft_note": "全局备注",
+    "name": "名称",
+    "role": "身份",
+    "goal": "目标",
+    "secret": "秘密",
+    "voice": "语言",
+    "notes": "备注",
+    "type": "类型",
+    "description": "说明",
+    "code": "编号",
+    "setup_chapter": "埋设章节",
+    "payoff_chapter": "回收章节",
+    "unit_type": "章节类型",
+    "outline": "提纲",
+    "text": "正文",
+    "key_facts": "关键事实",
+    "draft_words": "扩写字数",
+    "linked_characters": "关联人物",
+    "source_label": "来源",
+    "_source_label": "来源",
+}
+
+_PROJECT_SEARCH_SKIP_KEYS = {
+    "id",
+    "updated_at",
+    "analysis_state",
+    "analysis_hash",
+    "analysis_hash_version",
+    "analysis_analyzed_at",
+    "analysis_baseline",
+    "analysis_linked_hash",
+    "adaptation_source_hash",
+    "adapted_at",
+}
+
+
+def _project_search_field_label(key, field_labels=None):
+    key = str(key or "").strip()
+    if not key:
+        return "内容"
+    if isinstance(field_labels, dict) and key in field_labels:
+        return field_labels[key]
+    return _PROJECT_SEARCH_FIELD_LABELS.get(key, key.lstrip("_") or key)
+
+
+def _iter_project_search_texts(value, path="", field_labels=None):
+    if isinstance(value, dict):
+        for key, child in value.items():
+            key = str(key or "").strip()
+            if not key or key in _PROJECT_SEARCH_SKIP_KEYS or key.startswith("__"):
+                continue
+            label = _project_search_field_label(key, field_labels=field_labels)
+            child_path = f"{path} / {label}" if path else label
+            yield from _iter_project_search_texts(child, child_path, field_labels=field_labels)
+        return
+    if isinstance(value, list):
+        scalar_values = [
+            str(item).strip()
+            for item in value
+            if not isinstance(item, (dict, list)) and str(item or "").strip()
+        ]
+        if scalar_values:
+            yield path or "内容", "、".join(scalar_values)
+        for index, item in enumerate(value, 1):
+            if isinstance(item, (dict, list)):
+                child_path = f"{path} / {index}" if path else str(index)
+                yield from _iter_project_search_texts(item, child_path, field_labels=field_labels)
+        return
+    text = str(value or "").strip()
+    if text:
+        yield path or "内容", text
+
+
+def _append_project_search_sources(sources, group_prefix, title, record, field_labels=None):
+    for path, text in _iter_project_search_texts(record, field_labels=field_labels):
+        leaf = str(path or "内容").split(" / ")[-1] or "内容"
+        sources.append((f"{group_prefix} / {leaf}", title, text))
+
+
 def _project_search_sources(project):
     project = project if isinstance(project, dict) else {}
     sources = []
     meta = project.get("meta", {}) if isinstance(project.get("meta"), dict) else {}
-    sources.append(("项目", "基础信息", "\n".join([
-        str(meta.get("title", "")),
-        str(meta.get("genre", "")),
-        str(meta.get("style", "")),
-        str(meta.get("premise", "")),
-    ])))
-    for label, key in (
-        ("小说圣经", "bible"),
-        ("世界观 / 规则", "world_rules"),
-        ("时间线", "timeline"),
-        ("摘要 / 日志", "summary"),
-    ):
-        sources.append((label, label, project.get(key, "")))
+    _append_project_search_sources(sources, "项目", "基础信息", meta, field_labels={"title": "书名"})
+
+    for key in ("bible", "world_rules", "timeline", "foreshadows", "summary", "draft_note"):
+        text = str(project.get(key, "") or "").strip()
+        if text:
+            label = _project_search_field_label(key)
+            sources.append((label, label, text))
 
     for index, char in enumerate(project.get("characters", []) if isinstance(project.get("characters"), list) else [], 1):
         if not isinstance(char, dict):
             continue
-        name = char.get("name") or f"人物 {index}"
-        text = "\n".join(str(char.get(k, "")) for k in ("name", "role", "goal", "secret", "voice", "notes"))
-        sources.append(("人物卡", name, text))
+        name = str(char.get("name") or f"人物 {index}").strip()
+        _append_project_search_sources(sources, "人物卡", name, char, field_labels={"name": "姓名"})
 
     for index, lore in enumerate(project.get("lore", []) if isinstance(project.get("lore"), list) else [], 1):
         if not isinstance(lore, dict):
             continue
-        name = lore.get("name") or f"设定 {index}"
-        text = "\n".join(str(lore.get(k, "")) for k in ("name", "type", "description"))
-        sources.append(("设定库", name, text))
+        name = str(lore.get("name") or f"设定 {index}").strip()
+        _append_project_search_sources(sources, "设定库", name, lore)
 
     for index, item in enumerate(project.get("foreshadow_items", []) if isinstance(project.get("foreshadow_items"), list) else [], 1):
         if not isinstance(item, dict):
             continue
-        name = item.get("name") or f"伏笔 {index}"
-        text = "\n".join(str(item.get(k, "")) for k in ("code", "name", "status", "setup_chapter", "payoff_chapter", "description"))
-        sources.append(("伏笔", name, text))
+        name = str(item.get("name") or f"伏笔 {index}").strip()
+        _append_project_search_sources(sources, "伏笔", name, item)
 
-    chapter_search_fields = (
-        ("title", "标题"),
-        ("status", "状态"),
-        ("outline", "提纲"),
-        ("text", "正文"),
-        ("summary", "摘要"),
-        ("key_facts", "关键事实"),
-    )
     for index, chap in enumerate(project.get("chapters", []) if isinstance(project.get("chapters"), list) else [], 1):
         if not isinstance(chap, dict):
             continue
-        name = chap.get("title") or f"章节 {index}"
-        linked = chap.get("linked_characters", [])
-        if isinstance(linked, list):
-            linked_text = "、".join(str(x) for x in linked if str(x).strip())
-        else:
-            linked_text = ""
-        for key, label in chapter_search_fields:
-            text = str(chap.get(key, "") or "").strip()
-            if text:
-                sources.append((f"章节 / {label}", name, text))
-        if linked_text:
-            sources.append(("章节 / 关联人物", name, linked_text))
+        name = str(chap.get("title") or f"章节 {index}").strip()
+        _append_project_search_sources(sources, "章节", name, chap, field_labels={"title": "标题", "summary": "摘要"})
+
+    candidates = project.get("import_candidates", {})
+    if isinstance(candidates, dict):
+        candidate_groups = (
+            ("characters", "候选人物", "候选人物"),
+            ("lore", "候选设定", "候选设定"),
+            ("foreshadows", "候选伏笔", "候选伏笔"),
+        )
+        for key, group_prefix, fallback_title in candidate_groups:
+            items = candidates.get(key, [])
+            for index, item in enumerate(items if isinstance(items, list) else [], 1):
+                if not isinstance(item, dict):
+                    continue
+                title = str(item.get("name") or f"{fallback_title} {index}").strip()
+                _append_project_search_sources(sources, group_prefix, title, item)
+        materials = candidates.get("project_materials", {})
+        if isinstance(materials, dict):
+            for key, value in materials.items():
+                text = str(value or "").strip()
+                if text:
+                    label = _project_search_field_label(key)
+                    sources.append(("候选资料", label, text))
+
+    handled = {
+        "meta",
+        "bible",
+        "world_rules",
+        "timeline",
+        "foreshadows",
+        "summary",
+        "draft_note",
+        "characters",
+        "lore",
+        "foreshadow_items",
+        "chapters",
+        "import_candidates",
+    }
+    for key, value in project.items():
+        if key in handled or key in _PROJECT_SEARCH_SKIP_KEYS or str(key).startswith("__"):
+            continue
+        label = _project_search_field_label(key)
+        for path, text in _iter_project_search_texts(value, label):
+            leaf = str(path or label).split(" / ")[-1] or label
+            sources.append((f"项目 / {leaf}", label, text))
     return sources
 
 
@@ -2705,6 +2845,15 @@ def _chapter_analysis_hash_text(chap, include_linked=True):
     return "\n".join(parts)
 
 
+def _chapter_has_analysis_body(chap):
+    return bool(str((chap if isinstance(chap, dict) else {}).get("text", "") or "").strip())
+
+
+def _chapter_has_occurred_content(chap):
+    chap = chap if isinstance(chap, dict) else {}
+    return any(str(chap.get(key, "") or "").strip() for key in ("text", "summary", "key_facts"))
+
+
 def _chapter_analysis_hash(chap):
     text = _chapter_analysis_hash_text(chap, include_linked=True)
     return hashlib.sha1(text.encode("utf-8")).hexdigest() if text.strip() else ""
@@ -2772,6 +2921,8 @@ def _chapter_analysis_small_change_ratio(chap):
 
 def _chapter_analysis_is_small_change(chap):
     chap = chap if isinstance(chap, dict) else {}
+    if not _chapter_has_analysis_body(chap):
+        return False
     current = _chapter_analysis_hash(chap)
     if not current or not _chapter_analysis_has_saved_current_version(chap):
         return False
@@ -2785,6 +2936,8 @@ def _chapter_analysis_is_small_change(chap):
 
 
 def _chapter_needs_analysis(chap):
+    if not _chapter_has_analysis_body(chap):
+        return False
     current = _chapter_analysis_hash(chap)
     if not current:
         return False
@@ -2804,6 +2957,8 @@ def _chapter_needs_analysis(chap):
 
 
 def _chapter_analysis_is_current(chap):
+    if not _chapter_has_analysis_body(chap):
+        return False
     current = _chapter_analysis_hash(chap)
     if not current:
         return False
@@ -2821,6 +2976,8 @@ def _mark_chapters_analyzed(chapters, chapter_ids):
         if not isinstance(chap, dict):
             continue
         if str(chap.get("id", "") or "") not in ids:
+            continue
+        if not _chapter_has_analysis_body(chap):
             continue
         current = _chapter_analysis_hash(chap)
         if not current:
@@ -3172,7 +3329,7 @@ def _build_project_timeline_draft(project):
             chap,
             summary_limit=180,
             facts_limit=260,
-            include_outline_fallback=True,
+            include_outline_fallback=False,
             text_fallback_limit=240,
         )
         if line:
@@ -3388,12 +3545,14 @@ def _recent_chapter_context(chapters, chapter_index, window=6, project=None):
     for index, item in enumerate(chapters[start:chapter_index], start + 1):
         if not isinstance(item, dict):
             continue
+        if not _chapter_has_occurred_content(item):
+            continue
         line = _chapter_reference_line(
             index,
             item,
             summary_limit=260,
             facts_limit=420,
-            include_outline_fallback=True,
+            include_outline_fallback=False,
             text_fallback_limit=320,
         )
         if line:
@@ -3427,6 +3586,8 @@ def _record_recent_context_map(project, records, before_index, name_key="name", 
             chap = chapters[index]
             if not isinstance(chap, dict):
                 continue
+            if not _chapter_has_occurred_content(chap):
+                continue
             linked = chap.get("linked_characters", [])
             linked_keys = {
                 _compact_text(item)
@@ -3435,7 +3596,7 @@ def _record_recent_context_map(project, records, before_index, name_key="name", 
             }
             text = "\n".join(
                 str(chap.get(field, "") or "")
-                for field in ("title", "outline", "summary", "key_facts", "text")
+                for field in ("title", "summary", "key_facts", "text")
             )
             if not ((alias_keys & linked_keys) or any(_name_in_text(alias, text) for alias in aliases)):
                 continue
@@ -3444,7 +3605,7 @@ def _record_recent_context_map(project, records, before_index, name_key="name", 
                 chap,
                 summary_limit=140,
                 facts_limit=220,
-                include_outline_fallback=True,
+                include_outline_fallback=False,
                 text_fallback_limit=180,
             )
             if line:
@@ -3564,7 +3725,7 @@ def _chapter_reference_score(value, chapter_index, chapter_title):
 
 
 def _build_chapter_ai_context(project, chapter_index, action):
-    project = project if isinstance(project, dict) else {}
+    project = _project_without_private_notes(project)
     _ensure_foreshadow_codes(project)
     chapters = project.get("chapters", [])
     if chapter_index < 0 or chapter_index >= len(chapters):

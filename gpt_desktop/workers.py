@@ -458,6 +458,13 @@ class NovelAnalysisWorker(QThread):
             "你必须只输出一个合法 JSON 对象，不要 Markdown，不要解释，不要注释，不要尾随逗号。\n"
             "所有字符串里的换行、引号都必须正确 JSON 转义。\n"
             "要求：不要把一次性路人或普通名词过度提取；不确定就少提取。\n"
+            "人物提取不要只保留主角：本章实际出场并直接推动剧情的人物、冲突/追杀/审问/交易/救援/试探对象、"
+            "造成主角资源、去向、身份判断或后续事实变化的人物，即使当前只出现一章，也应进入 characters 候选；"
+            "characters.name 必须是具体姓名、可复用称谓或可稳定追踪的单个人物身份；"
+            "可以保留“黑衣人”“蒙面女子”“白发老者”“苏家管事”等能在后文继续追踪的单个人物称谓；"
+            "复数无名群体排除规则高于主要行动人物保留规则，不要把“王六的两名同伙”“几名手下”“众人”“围观者”等无名群体/复数路人当成人物候选，"
+            "即使他们推动了本章剧情，也只把他们造成的剧情影响放入 timeline、summary 或 foreshadows.description；"
+            "没有名字、没有独立行动、只围观/传话/完成一次普通动作且不影响后续的人物可以不提取。\n"
             "不要为了压缩结果而丢失会影响后续剧情、人物关系、地点道具、伏笔线索的信息。\n"
             "请按 20 万字左右长篇小说的连续性需求提取：优先保留后续章节必须继承的事实、"
             "人物目标/秘密/关系变化、地点/势力/物品规则、时间顺序和未回收伏笔；"
@@ -493,7 +500,11 @@ class NovelAnalysisWorker(QThread):
             "改写入 timeline/summary。"
             "每个片段优先提取最重要的跨章节伏笔；数量不固定，没有明确跨章节价值就返回空数组，"
             "不要为了凑数写普通悬念，也不要因为条数限制丢掉明确会影响后文的伏笔。\n"
-            "characters.notes 要求：只写会影响后续多章的人物档案增量；如果只是本章发生了什么、短暂情绪或普通互动，就留空字符串。\n"
+            "characters 要求：在满足具体人物或可复用单人称谓的前提下，本章主要行动人物、冲突人物、造成长期结果的人物要保留为候选；"
+            "复数无名群体排除规则高于主要行动人物保留规则，不要输出无名群体/复数路人，例如“王六的两名同伙”“几名手下”“围观者”；"
+            "删除人物候选时不能丢失剧情作用，需把该群体造成的围堵、袭击、传话、误判、资源变化等后果移入 timeline、summary 或 foreshadows.description；"
+            "notes 只写会帮助后续识别和继承的身份、关系、冲突作用、造成的后果或可复用特征，"
+            "不要把完整章节流水账塞进 notes。如果只是本章发生了什么、短暂情绪或普通互动，就留空字符串。\n"
             "lore.description 要求：只写后续章节需要继承的稳定设定增量；如果只是本章动作、线索推进、调查过程或临时危机，就留空字符串。\n"
             "project_materials 要求：bible 写故事核心、主线矛盾、主要人物关系和风格基调；"
             "world_rules 写世界观、势力、制度、能力/道具规则；"
@@ -512,6 +523,12 @@ class NovelAnalysisWorker(QThread):
         if self.dossier:
             user_text += "\n\n" + self.dossier
         return user_text + "\n\n【本片段】\n" + str(chunk_text or "")
+
+    def _analysis_progress_label(self):
+        return "候选分析"
+
+    def _allow_retry_chunk_split(self):
+        return True
 
     def _post_analysis_chunk(self, prompt, chunk_text, chunk_index, total_chunks, use_response_format=True):
         url = api_url(self.base_url, "/v1/chat/completions")
@@ -619,7 +636,7 @@ class NovelAnalysisWorker(QThread):
                 if piece:
                     if not first_piece:
                         first_piece = True
-                        self.progress.emit(f"正在接收候选分析 {chunk_index}/{total_chunks} 的流式结果...")
+                        self.progress.emit(f"正在接收{self._analysis_progress_label()} {chunk_index}/{total_chunks} 的流式结果...")
                     full += piece
             if not full.strip():
                 raise Exception("AI 没有返回有效候选内容。")
@@ -716,7 +733,7 @@ class NovelAnalysisWorker(QThread):
                 self._set_analysis_stream_supported(False)
                 self.progress.emit("流式候选分析连接提前结束，已切换为普通请求重试...")
                 return self._post_analysis_chunk(prompt, chunk, label, total, use_response_format), use_response_format
-            if split_depth <= 0 and self._is_retryable_analysis_error(e) and len(chunk) > 1800:
+            if self._allow_retry_chunk_split() and split_depth <= 0 and self._is_retryable_analysis_error(e) and len(chunk) > 1800:
                 parts = self._split_retry_chunk_once(chunk, max_parts=3)
                 if len(parts) > 1:
                     merged = {"characters": [], "lore": [], "foreshadows": [], "project_materials": {}}
@@ -1060,7 +1077,16 @@ class NovelCandidatePostprocessWorker(NovelAnalysisWorker):
             "1. 合并块与块之间的重复候选。同一人物、设定、伏笔只保留一条，说明要整合成完整但精炼的表达。\n"
             "2. 对照【已有项目档案】查重。已有档案里已经稳定存在的信息，不要作为新增候选重复输出；"
             "但已有伏笔的状态/章节发生变化时必须保留为候选，用于更新旧档案。\n"
-            "3. 只保留确实需要入库或补充到已有档案的长期信息；普通章节行动、临时情绪、一次性互动、调查过程和流水账不要进入人物备注或设定说明。\n"
+            "3. 只保留确实需要入库或补充到已有档案的长期信息；但不要把本章主要行动人物、冲突人物、造成长期结果的人物当作普通流水账删掉。"
+            "普通章节行动、临时情绪、一次性互动、调查过程和流水账不要进入人物备注或设定说明。\n"
+            "3a. characters 中应保留本章直接推动剧情的人、和主角发生冲突/追杀/审问/交易/救援/试探的人、"
+            "影响主角资源/去向/身份判断/后续事实的人；但 name 必须是具体人物或可复用单人称谓。"
+            "可以保留“黑衣人”“蒙面女子”“白发老者”“苏家管事”等能在后文继续追踪的单个人物称谓；"
+            "复数无名群体排除规则高于主要行动人物保留规则。"
+            "删除“王六的两名同伙”“几名手下”“众人”“围观者”等无名群体/复数路人，"
+            "也删除只围观、传话、无姓名、无独立行动、无后续影响的路人。\n"
+            "3b. 最终输出前逐条检查 characters.name：如果是复数无名群体，必须从 characters 删除；"
+            "删除人物候选时不能丢失剧情作用，需把该群体造成的围堵、袭击、传话、误判、资源变化等后果保留到 timeline、summary 或 foreshadows.description。\n"
             "4. 如果候选与已有项目档案是同一对象，请使用已有档案中的规范名称；不确定是否同一对象时分开保留，不要强行合并。\n"
             "5. 伏笔要保守：同一线索才合并；只是相似主题但回收目标不同的伏笔要分开。\n"
             "6. 对照已有伏笔逐条复核：如果分块候选或本次片段已经明确兑现、揭示、解释、回收某个已有未埋/已埋伏笔，"
@@ -1389,6 +1415,7 @@ class NovelChapterTitleWorker(NovelAnalysisWorker):
         self.style = str(style or "").strip()
         self.chapters = [deepcopy(chap) for chap in chapters if isinstance(chap, dict)]
         self.retry_attempts = 2
+        self._title_context_previous_titles = []
 
     def _title_prompt(self):
         return (
@@ -1397,6 +1424,10 @@ class NovelChapterTitleWorker(NovelAnalysisWorker):
             "任务边界：只起标题，不改正文，不补剧情，不总结成大纲。\n"
             "标题要求：贴合本章核心事件、冲突或情绪转折；简洁、有小说感；避免剧透后文；"
             "每个标题 5-20 个中文字；不要使用“本章”“章节”“无题”“续”“上”“下”等占位词；同一批内标题不能重复。\n"
+            "标题风格必须有变化：事件型、冲突型、人物抉择型、悬念型、意象型可以交替使用；"
+            "相邻章节不要使用同一语法模板、同一尾词或同一意象，不要连续写成“X里的Y”“X前的Y”“X之下的Y”“X与Y”等同款结构。\n"
+            "每个输入章节会提供 style_hint，它只是帮助你打散标题样式；输出 title 不要写出 style_hint 标签。\n"
+            "如果用户内容提供了 previous_titles，请避免与这些标题同词、同结构、同节奏，尤其不要让跨批次相邻标题像同一模板改词。\n"
             "title 字段只写标题正文，不要带“第几章”和序号。\n"
             '输出结构：{"titles":[{"index":1,"title":"会议室里的选择"}]}\n'
             "titles 数量必须与输入章节数量完全一致，index 必须与输入一致。"
@@ -1411,6 +1442,20 @@ class NovelChapterTitleWorker(NovelAnalysisWorker):
             return text
         return text[:edge_chars].rstrip() + "\n...\n" + text[-edge_chars:].lstrip()
 
+    def _title_style_hint(self, index):
+        hints = (
+            "事件型：抓本章最关键动作或事件，不要写成地点+抽象名词。",
+            "冲突型：突出本章对抗、压力或矛盾升级。",
+            "人物抉择型：突出人物做出的选择、立场或关系变化。",
+            "悬念型：突出本章留下的疑问或危险信号，但不要剧透后文。",
+            "意象型：用本章独特物件、场景或情绪意象命名，避免空泛。",
+        )
+        try:
+            index = int(index or 1)
+        except Exception:
+            index = 1
+        return hints[(max(1, index) - 1) % len(hints)]
+
     def _title_batches(self, max_chars=18000, max_count=16):
         items = []
         for index, chap in enumerate(self.chapters, 1):
@@ -1420,6 +1465,7 @@ class NovelChapterTitleWorker(NovelAnalysisWorker):
             item = {
                 "index": index,
                 "current_title": str(chap.get("title", "") or f"第 {index} 章").strip(),
+                "style_hint": self._title_style_hint(index),
                 "excerpt": self._chapter_excerpt(text),
             }
             items.append(item)
@@ -1439,12 +1485,23 @@ class NovelChapterTitleWorker(NovelAnalysisWorker):
         return batches
 
     def _user_text_for_batch(self, batch):
+        previous_titles = [
+            str(title or "").strip()
+            for title in getattr(self, "_title_context_previous_titles", [])
+            if str(title or "").strip()
+        ]
         payload = {
             "作品信息": {
                 "书名": self.project_title,
                 "类型": self.genre,
                 "风格": self.style,
             },
+            "previous_titles": previous_titles[-8:],
+            "标题差异化要求": [
+                "优先让标题体现本章独有事件、冲突、抉择、悬念或意象。",
+                "相邻标题不要使用同一结构；如果上一章是“X里的Y”，下一章就换成动作型、抉择型或悬念型。",
+                "不要为了统一风格把每章都写成相同字数、相同尾词或相同语气。",
+            ],
             "待命名章节": batch,
         }
         return json.dumps(payload, ensure_ascii=False, indent=2)
@@ -1592,6 +1649,7 @@ class NovelChapterTitleWorker(NovelAnalysisWorker):
             for index, batch in enumerate(batches, 1):
                 if self._stop_requested or self.isInterruptionRequested():
                     return
+                self._title_context_previous_titles = list(all_titles[-8:])
                 self.progress.emit(f"正在生成拆分章节标题：{index}/{total}...")
                 all_titles.extend(self._request_title_batch_with_retries(batch, index, total))
             if len(all_titles) != len(self.chapters):
@@ -1957,12 +2015,42 @@ class EdgeTTSWorker(QThread):
         self.output_path = str(output_path or "")
         self.voice = str(voice or "zh-CN-XiaoxiaoNeural")
         self.rate = str(rate or "+0%")
+        self._stop_requested = False
+
+    def stop(self):
+        self._stop_requested = True
+        try:
+            self.requestInterruption()
+        except Exception:
+            pass
+
+    def _should_stop(self):
+        return bool(self._stop_requested or self.isInterruptionRequested())
 
     async def _save_audio(self):
         import edge_tts
 
-        communicate = edge_tts.Communicate(self.text, self.voice, rate=self.rate)
-        await communicate.save(self.output_path)
+        communicate = edge_tts.Communicate(self.text, self.voice, rate=self.rate, receive_timeout=10)
+        with open(self.output_path, "wb") as audio_file:
+            async for chunk in communicate.stream():
+                if self._should_stop():
+                    return False
+                if isinstance(chunk, dict):
+                    chunk_type = chunk.get("type")
+                    data = chunk.get("data")
+                else:
+                    chunk_type = getattr(chunk, "type", "")
+                    data = getattr(chunk, "data", None)
+                if chunk_type == "audio" and data:
+                    audio_file.write(data)
+        return not self._should_stop()
+
+    def _remove_partial_output(self):
+        try:
+            if self.output_path and os.path.exists(self.output_path):
+                os.remove(self.output_path)
+        except Exception:
+            pass
 
     def run(self):
         try:
@@ -1971,14 +2059,199 @@ class EdgeTTSWorker(QThread):
             if not self.output_path:
                 raise Exception("没有可用的音频临时路径。")
             self.progress.emit("正在生成 Edge TTS 语音...")
-            asyncio.run(self._save_audio())
+            completed = asyncio.run(self._save_audio())
+            if not completed or self._should_stop():
+                self._remove_partial_output()
+                return
             if not os.path.exists(self.output_path) or os.path.getsize(self.output_path) <= 0:
                 raise Exception("Edge TTS 没有生成有效音频。")
+            if self._should_stop():
+                self._remove_partial_output()
+                return
             self.result_ready.emit(self.output_path)
         except ModuleNotFoundError:
-            self.failed.emit("缺少 edge-tts 依赖，请先安装 edge-tts。")
+            if self._should_stop():
+                self._remove_partial_output()
+            else:
+                self.failed.emit("缺少 edge-tts 依赖，请先安装 edge-tts。")
         except Exception as e:
-            self.failed.emit(str(e))
+            if self._should_stop():
+                self._remove_partial_output()
+            else:
+                self.failed.emit(str(e))
+
+
+class NovelChapterPlanWorker(NovelAnalysisWorker):
+    result_ready = Signal(dict)
+
+    def __init__(
+        self,
+        base_url,
+        api_key,
+        model,
+        project_context,
+        target_words,
+        average_chapter_words,
+        chapter_count,
+        proxy_url="",
+        proxy_mode="不使用代理",
+    ):
+        super().__init__(
+            base_url,
+            api_key,
+            model,
+            str(project_context or ""),
+            proxy_url=proxy_url,
+            proxy_mode=proxy_mode,
+            max_concurrency=1,
+        )
+        self.target_words = max(1, int(target_words or 1))
+        self.average_chapter_words = max(1, int(average_chapter_words or 3000))
+        self.chapter_count = max(1, int(chapter_count or 1))
+
+    def _analysis_prompt(self):
+        return (
+            "你是长篇小说总纲与章节规划编辑。请根据用户提供的项目档案，为整本小说生成章节规划。\n"
+            "必须只输出一个合法 JSON 对象，不要 Markdown，不要解释，不要注释，不要尾随逗号。\n"
+            "规划目标：先保证主线可控、章节功能明确、伏笔分配合理，再兼顾标题吸引力。\n"
+            f"目标总字数约 {self.target_words} 字，单章目标约 {self.average_chapter_words} 字，"
+            f"请输出 {self.chapter_count} 章。若剧情结构需要微调，仍尽量贴近该章节数量。\n"
+            "每章都要有明确作用，避免重复水章节；不要提前回收后期伏笔，不要擅自推翻小说圣经和世界规则。\n"
+            "title 只写章节名，不要带“第几章”和序号；target_words 写数字字符串。\n"
+            "outline 要写成可直接用于扩写正文的章节提纲，包含本章目标、必须发生、冲突转折、伏笔动作和结尾钩子。\n"
+            "characters/settings/foreshadows 只填本章实际相关项，没有则用空数组。\n"
+            'JSON 结构：{"summary":"","chapters":[{"index":1,"title":"","target_words":"3000","outline":"","characters":[],"settings":[],"foreshadows":[],"ending_hook":"","forbidden":""}]}\n'
+            "chapters 数量必须尽量等于请求章节数，index 从 1 连续递增。"
+        )
+
+    def _chunk_user_text(self, chunk_text, chunk_index, total_chunks):
+        return str(chunk_text or "")
+
+    def _analysis_progress_label(self):
+        return "章节规划"
+
+    def _allow_retry_chunk_split(self):
+        return False
+
+    def _clean_title(self, value, fallback):
+        title = str(value or "").strip()
+        title = title.strip(" \t\r\n\"'“”‘’《》「」『』【】[]()（）")
+        title = re.sub(r"^\s*第\s*[\d一二三四五六七八九十百千万零〇两]+\s*[章节回集卷部]\s*[:：、.\-—]*\s*", "", title)
+        title = re.sub(r"^\s*[\d一二三四五六七八九十百千万零〇两]+\s*[、.．]\s*", "", title)
+        title = re.sub(r"\s+", "", title)
+        title = title.strip(" \t\r\n\"'“”‘’《》「」『』【】[]()（）：:，,。；;、")
+        return title or fallback
+
+    def _string_list(self, value):
+        if isinstance(value, list):
+            return [str(item).strip() for item in value if str(item or "").strip()]
+        text = str(value or "").strip()
+        if not text:
+            return []
+        return [item.strip() for item in re.split(r"[、,，;\n；]+", text) if item.strip()]
+
+    def _target_words_text(self, value):
+        match = re.search(r"\d{2,7}", str(value or ""))
+        if match:
+            return match.group(0)
+        return str(self.average_chapter_words)
+
+    def _outline_from_item(self, item):
+        item = item if isinstance(item, dict) else {}
+        outline = str(item.get("outline", "") or "").strip()
+        if outline:
+            return outline
+        parts = []
+        field_labels = (
+            ("本章目标", "goal"),
+            ("核心事件", "main_event"),
+            ("核心冲突", "conflict"),
+            ("转折", "turning_point"),
+            ("情绪变化", "emotional_shift"),
+            ("结尾钩子", "ending_hook"),
+            ("禁止提前", "forbidden"),
+        )
+        for label, key in field_labels:
+            value = str(item.get(key, "") or "").strip()
+            if value:
+                parts.append(f"{label}：{value}")
+        for label, key in (
+            ("必须发生", "required_events"),
+            ("伏笔动作", "foreshadows"),
+            ("出场人物", "characters"),
+            ("涉及设定", "settings"),
+        ):
+            values = self._string_list(item.get(key, []))
+            if values:
+                parts.append(label + "：\n" + "\n".join(f"- {value}" for value in values))
+        return "\n\n".join(parts).strip()
+
+    def _normalize_plan(self, data):
+        data = data if isinstance(data, dict) else {}
+        chapters = data.get("chapters", [])
+        if not isinstance(chapters, list) or not chapters:
+            raise ValueError("AI 没有返回章节规划列表。")
+        normalized = []
+        for fallback_index, item in enumerate(chapters, 1):
+            if not isinstance(item, dict):
+                continue
+            try:
+                index = int(item.get("index", fallback_index) or fallback_index)
+            except Exception:
+                index = fallback_index
+            title = self._clean_title(item.get("title", ""), f"章节 {index}")
+            outline = self._outline_from_item(item)
+            if not outline:
+                outline = f"本章目标：推进「{title}」相关剧情。\n\n结尾钩子：为下一章留下明确推进点。"
+            normalized.append({
+                "index": index,
+                "title": title,
+                "target_words": self._target_words_text(item.get("target_words", "")),
+                "outline": outline,
+                "characters": self._string_list(item.get("characters", [])),
+                "settings": self._string_list(item.get("settings", [])),
+                "foreshadows": self._string_list(item.get("foreshadows", [])),
+                "ending_hook": str(item.get("ending_hook", "") or "").strip(),
+                "forbidden": str(item.get("forbidden", "") or "").strip(),
+            })
+        normalized.sort(key=lambda item: item.get("index", 0))
+        if not normalized:
+            raise ValueError("AI 返回的章节规划为空。")
+        for index, item in enumerate(normalized, 1):
+            item["index"] = index
+        return {
+            "summary": str(data.get("summary", "") or data.get("reason", "") or "").strip(),
+            "target_words": self.target_words,
+            "average_chapter_words": self.average_chapter_words,
+            "chapter_count": self.chapter_count,
+            "chapters": normalized,
+        }
+
+    def run(self):
+        try:
+            if not self.base_url:
+                raise Exception("请先选择厂商。")
+            if not self.api_key:
+                raise Exception("请先设置 API Key。")
+            if not self.model:
+                raise Exception("请选择模型。")
+            if not self.text.strip():
+                raise Exception("没有可用于生成章节规划的项目资料。")
+            self.progress.emit("正在生成章节规划...")
+            response_format_supported, _stream_supported = self._analysis_request_capabilities()
+            parsed, _response_format = self._analyze_chunk_with_retries(
+                self._analysis_prompt(),
+                self.text,
+                1,
+                1,
+                response_format_supported,
+            )
+            if self._stop_requested or self.isInterruptionRequested():
+                return
+            self.result_ready.emit(self._normalize_plan(parsed))
+        except Exception as e:
+            if not self._stop_requested and not self.isInterruptionRequested():
+                self.failed.emit(str(e))
 
 
 class ImageWorker(QThread):

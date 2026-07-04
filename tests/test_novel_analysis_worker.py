@@ -4,6 +4,7 @@ import unittest
 from gpt_desktop.workers import (
     NovelAnalysisWorker,
     NovelCandidatePostprocessWorker,
+    NovelChapterPlanWorker,
     NovelChapterTitleWorker,
     NovelForeshadowReviewPostprocessWorker,
     NovelForeshadowReviewWorker,
@@ -12,6 +13,88 @@ from gpt_desktop.workers import (
 
 
 class NovelAnalysisWorkerTests(unittest.TestCase):
+    def test_chapter_plan_worker_normalizes_structured_plan(self):
+        worker = NovelChapterPlanWorker("http://example.test", "key", "model", "context", 200000, 3000, 2)
+
+        plan = worker._normalize_plan({
+            "summary": "第一卷先立主线。",
+            "chapters": [
+                {
+                    "index": 2,
+                    "title": "第2章：风雨入城",
+                    "target_words": "3200字",
+                    "outline": "本章目标：主角进入京城。",
+                    "characters": "陈景川、林晚",
+                    "settings": ["景辰总部"],
+                    "foreshadows": "F0001 风雨信号",
+                    "ending_hook": "旧案卷宗出现。",
+                    "forbidden": "不要提前揭晓幕后人。",
+                },
+                {
+                    "index": 1,
+                    "title": "第一章 初到",
+                    "goal": "建立主角处境",
+                    "required_events": ["收到通知"],
+                },
+            ],
+        })
+
+        self.assertEqual(plan["chapter_count"], 2)
+        self.assertEqual([chapter["index"] for chapter in plan["chapters"]], [1, 2])
+        self.assertEqual(plan["chapters"][0]["title"], "初到")
+        self.assertIn("收到通知", plan["chapters"][0]["outline"])
+        self.assertEqual(plan["chapters"][1]["title"], "风雨入城")
+        self.assertEqual(plan["chapters"][1]["target_words"], "3200")
+        self.assertEqual(plan["chapters"][1]["characters"], ["陈景川", "林晚"])
+
+    def test_chapter_plan_prompt_requires_json_and_chapter_count(self):
+        worker = NovelChapterPlanWorker("http://example.test", "key", "model", "context", 200000, 3000, 67)
+
+        prompt = worker._analysis_prompt()
+
+        self.assertIn("必须只输出一个合法 JSON 对象", prompt)
+        self.assertIn("请输出 67 章", prompt)
+        self.assertIn("不要擅自推翻小说圣经和世界规则", prompt)
+        self.assertIn("outline 要写成可直接用于扩写正文的章节提纲", prompt)
+
+    def test_chapter_plan_retry_does_not_split_context(self):
+        context = "项目资料" * 1000
+        worker = NovelChapterPlanWorker("http://example.test", "key", "model", context, 200000, 3000, 1)
+        worker.retry_attempts = 2
+        worker._set_analysis_stream_supported(False)
+        calls = []
+        progress = []
+        worker.progress.connect(progress.append)
+
+        def fail_split(_text, max_parts=3):
+            raise AssertionError("章节规划不应该自动拆小块重试")
+
+        def fake_post(_prompt, chunk, label, total, use_response_format):
+            calls.append((chunk, label, total, use_response_format))
+            if len(calls) == 1:
+                raise RuntimeError("Response ended prematurely")
+            return {
+                "summary": "第一卷开局。",
+                "chapters": [
+                    {
+                        "index": 1,
+                        "title": "风起京城",
+                        "outline": "本章目标：建立主角处境。",
+                    }
+                ],
+            }
+
+        worker._split_retry_chunk_once = fail_split
+        worker._post_analysis_chunk = fake_post
+
+        parsed, _response_format = worker._analyze_chunk_with_retries("prompt", context, 1, 1, True)
+
+        self.assertEqual(len(calls), 2)
+        self.assertEqual([call[0] for call in calls], [context, context])
+        self.assertEqual([call[1] for call in calls], [1, 1])
+        self.assertEqual(parsed["chapters"][0]["title"], "风起京城")
+        self.assertFalse(any("自动拆成" in text for text in progress))
+
     def test_summary_prompt_requires_linked_characters_section(self):
         worker = NovelWritingWorker("http://example.test", "key", "model", "summary", "context")
 
@@ -229,6 +312,46 @@ class NovelAnalysisWorkerTests(unittest.TestCase):
 
         self.assertEqual(titles, ["会议室里的选择", "沉默的副创始人"])
 
+    def test_chapter_title_prompt_requires_style_diversity(self):
+        worker = NovelChapterTitleWorker(
+            "http://example.test",
+            "key",
+            "model",
+            "书名",
+            "都市",
+            "轻喜剧",
+            [{"title": "第 1 章", "text": "正文一。"}],
+        )
+
+        prompt = worker._title_prompt()
+
+        self.assertIn("标题风格必须有变化", prompt)
+        self.assertIn("事件型、冲突型、人物抉择型、悬念型、意象型", prompt)
+        self.assertIn("相邻章节不要使用同一语法模板", prompt)
+        self.assertIn("previous_titles", prompt)
+
+    def test_chapter_title_batch_includes_style_hints_and_previous_titles(self):
+        worker = NovelChapterTitleWorker(
+            "http://example.test",
+            "key",
+            "model",
+            "书名",
+            "都市",
+            "轻喜剧",
+            [{"title": "第 1 章", "text": "正文一。"}, {"title": "第 2 章", "text": "正文二。"}],
+        )
+        worker._title_context_previous_titles = ["会议室里的选择", "沉默的副创始人"]
+
+        batches = worker._title_batches(max_chars=5000, max_count=10)
+        text = worker._user_text_for_batch(batches[0])
+
+        self.assertIn("style_hint", text)
+        self.assertIn("事件型", text)
+        self.assertIn("冲突型", text)
+        self.assertIn("previous_titles", text)
+        self.assertIn("会议室里的选择", text)
+        self.assertIn("相邻标题不要使用同一结构", text)
+
     def test_chapter_title_worker_requires_missing_titles_but_allows_quality_variation(self):
         worker = NovelChapterTitleWorker(
             "http://example.test",
@@ -420,10 +543,24 @@ class NovelAnalysisWorkerTests(unittest.TestCase):
         self.assertIn("已有项目档案", prompt)
         self.assertIn("同名、别称或同一线索不要重复新增", prompt)
         self.assertIn("长期有效的人物变化才写入已有人物 notes", prompt)
+        self.assertIn("人物提取不要只保留主角", prompt)
+        self.assertIn("本章实际出场并直接推动剧情的人物", prompt)
+        self.assertIn("造成主角资源、去向、身份判断或后续事实变化的人物", prompt)
+        self.assertIn("characters.name 必须是具体姓名、可复用称谓或可稳定追踪的单个人物身份", prompt)
+        self.assertIn("黑衣人", prompt)
+        self.assertIn("苏家管事", prompt)
+        self.assertIn("复数无名群体排除规则高于主要行动人物保留规则", prompt)
+        self.assertIn("王六的两名同伙", prompt)
+        self.assertIn("无名群体/复数路人", prompt)
+        self.assertIn("即使他们推动了本章剧情，也只把他们造成的剧情影响放入 timeline、summary 或 foreshadows.description", prompt)
+        self.assertIn("只围观/传话/完成一次普通动作且不影响后续的人物可以不提取", prompt)
         self.assertIn("普通章节行动、临时情绪、一次性互动", prompt)
         self.assertIn("稳定设定变化才写入 lore.description", prompt)
         self.assertIn("本章出现、追问、调查、发送、发现线索、谁去问谁等临时推进", prompt)
-        self.assertIn("characters.notes 要求：只写会影响后续多章的人物档案增量", prompt)
+        self.assertIn("characters 要求：在满足具体人物或可复用单人称谓的前提下", prompt)
+        self.assertIn("不要输出无名群体/复数路人", prompt)
+        self.assertIn("删除人物候选时不能丢失剧情作用", prompt)
+        self.assertIn("不要把完整章节流水账塞进 notes", prompt)
         self.assertIn("lore.description 要求：只写后续章节需要继承的稳定设定增量", prompt)
         self.assertIn("没有明确全局增量时，project_materials 对应字段请留空字符串", prompt)
         self.assertIn("timeline 只记录关键转折、时间顺序变化、伏笔推进/回收", prompt)
@@ -436,6 +573,22 @@ class NovelAnalysisWorkerTests(unittest.TestCase):
         self.assertIn("普通悬念、单章情绪钩子、一次性疑问", prompt)
         self.assertIn("不要为了凑数写普通悬念", prompt)
         self.assertIn("不要把已有档案里没有在本片段推进的信息当作新发现重复输出", prompt)
+
+    def test_candidate_postprocess_prompt_keeps_major_chapter_characters(self):
+        worker = NovelCandidatePostprocessWorker("http://example.test", "key", "model", {"characters": [{"name": "王六"}]}, "dossier")
+
+        prompt = worker._postprocess_prompt()
+
+        self.assertIn("不要把本章主要行动人物、冲突人物、造成长期结果的人物当作普通流水账删掉", prompt)
+        self.assertIn("和主角发生冲突/追杀/审问/交易/救援/试探的人", prompt)
+        self.assertIn("影响主角资源/去向/身份判断/后续事实的人", prompt)
+        self.assertIn("黑衣人", prompt)
+        self.assertIn("复数无名群体排除规则高于主要行动人物保留规则", prompt)
+        self.assertIn("王六的两名同伙", prompt)
+        self.assertIn("无名群体/复数路人", prompt)
+        self.assertIn("最终输出前逐条检查 characters.name", prompt)
+        self.assertIn("删除人物候选时不能丢失剧情作用", prompt)
+        self.assertIn("删除只围观、传话、无姓名、无独立行动、无后续影响的路人", prompt)
 
     def test_draft_prompt_distinguishes_relevant_and_open_foreshadows(self):
         worker = NovelWritingWorker("http://example.test", "key", "model", "draft", "context")

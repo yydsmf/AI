@@ -51,6 +51,7 @@ class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self._shutdown_prepared = False
+        self._skip_windows_force_exit = False
         self.setWindowTitle(f"{APP_NAME} v{APP_VERSION}")
         fit_window_to_screen(self, 1320, 880)
         self.setMinimumSize(720, 420)
@@ -179,7 +180,9 @@ class MainWindow(QMainWindow):
             except Exception as e:
                 log_debug(f"退出时停止 {name} 失败", e)
 
-    def prepare_for_shutdown(self):
+    def prepare_for_shutdown(self, skip_force_exit=False):
+        if skip_force_exit:
+            self._skip_windows_force_exit = True
         if self._shutdown_prepared:
             return
         self._shutdown_prepared = True
@@ -254,7 +257,8 @@ class MainWindow(QMainWindow):
     def closeEvent(self, event):
         try:
             self.prepare_for_shutdown()
-            schedule_windows_process_force_exit(delay_seconds=8)
+            if not self._skip_windows_force_exit:
+                schedule_windows_process_force_exit(delay_seconds=8)
         except Exception as e:
             log_debug("主窗口退出清理失败", e)
         super().closeEvent(event)

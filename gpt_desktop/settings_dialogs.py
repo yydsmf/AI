@@ -21,7 +21,7 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
 )
 
-from .update_checker import check_latest_release, download_release_asset
+from .update_checker import check_latest_release, download_release_asset, launch_windows_updater
 from .version import APP_RELEASES_URL, APP_VERSION
 from .core import (
     AGENT_HISTORY_FILE,
@@ -781,8 +781,8 @@ class ProviderManagerDialog(QDialog):
             if sys.platform.startswith("win"):
                 text += (
                     f"已找到适合本电脑的安装包：\n{asset_name}\n\n"
-                    "点击“下载新版安装包”后，程序会保持打开并显示下载进度。"
-                    "下载完成后会再询问是否立即退出并安装。"
+                    "点击“打开独立更新器”后，会由更新器下载并安装，"
+                    "更新器会显示下载进度，并在主程序退出后打开安装包。"
                 )
             else:
                 text += (
@@ -796,7 +796,7 @@ class ProviderManagerDialog(QDialog):
 
         download_btn = None
         if asset_url:
-            download_text = "下载新版安装包" if sys.platform.startswith("win") else "下载并退出安装"
+            download_text = "打开独立更新器" if sys.platform.startswith("win") else "下载并退出安装"
             download_btn = msg.addButton(download_text, QMessageBox.AcceptRole)
         release_btn = msg.addButton("打开发布页", QMessageBox.ActionRole)
         later_btn = msg.addButton("稍后", QMessageBox.RejectRole)
@@ -805,7 +805,10 @@ class ProviderManagerDialog(QDialog):
 
         clicked = msg.clickedButton()
         if download_btn is not None and clicked is download_btn:
-            self.start_update_download(asset)
+            if sys.platform.startswith("win"):
+                self.start_windows_update(asset, release_url)
+            else:
+                self.start_update_download(asset)
         elif clicked is release_btn:
             self._open_url(release_url)
         elif clicked is later_btn:
@@ -828,13 +831,34 @@ class ProviderManagerDialog(QDialog):
         self.update_download_worker.finished.connect(self.cleanup_update_download_worker)
         self.update_download_worker.start()
 
-    def _prepare_parent_for_shutdown(self):
+    def start_windows_update(self, asset, release_url=""):
+        if asset is None:
+            QMessageBox.warning(self, "无法更新", "没有找到适合本电脑的更新包。")
+            return
+        if not launch_windows_updater(asset, release_url=release_url):
+            QMessageBox.warning(
+                self,
+                "启动更新器失败",
+                "没有成功打开独立更新器。\n\n"
+                "请确认安装目录中存在 GPTToolboxUpdater.exe，或点击“打开发布页”手动下载安装包。"
+            )
+            return
+        QMessageBox.information(
+            self,
+            "更新器已启动",
+            "独立更新器已打开。请在更新器窗口中查看下载进度。\n\n"
+            "主程序将退出，更新器会在主程序退出后打开安装包。"
+        )
+        self._prepare_parent_for_shutdown(skip_force_exit=True)
+        self._quit_application_soon()
+
+    def _prepare_parent_for_shutdown(self, **kwargs):
         try:
             parent = self.parent()
             while parent is not None and not hasattr(parent, "prepare_for_shutdown"):
                 parent = parent.parent()
             if parent is not None:
-                parent.prepare_for_shutdown()
+                parent.prepare_for_shutdown(**kwargs)
         except Exception:
             pass
 

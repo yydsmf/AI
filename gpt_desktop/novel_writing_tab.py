@@ -3,6 +3,7 @@ import tempfile
 import hashlib
 import re
 import json
+import time
 from copy import deepcopy
 
 from PySide6.QtCore import QFileSystemWatcher, QSize, QUrl, Qt, QTimer, Signal
@@ -34,7 +35,7 @@ from PySide6.QtWidgets import (
     QSizePolicy,
 )
 
-from .core import clean_error_text, get_provider, load_json_file, log_debug, now_str, save_config, save_json_file
+from .core import HISTORY_DIR, clean_error_text, get_provider, load_json_file, log_debug, now_str, save_config, save_json_file
 from .model_bar_mixin import SimpleModelBarMixin
 from .novel_import import (
     _MANUAL_PROJECT_MATERIAL_KEYS,
@@ -133,6 +134,13 @@ from .novel_utils import (
 )
 from .widgets import ProviderModelBar, WideComboBox
 from .workers import EdgeTTSWorker, NovelAnalysisWorker, NovelCandidatePostprocessWorker, NovelChapterPlanWorker, NovelChapterTitleWorker, NovelForeshadowReviewPostprocessWorker, NovelForeshadowReviewWorker, NovelWritingWorker
+
+NOVEL_PERF_LOG_ENABLED = str(os.environ.get("GPT_NOVEL_PERF_LOG", "") or "").strip().lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
 
 _SORT_MISSING_ORDER = 10 ** 9
 _CHINESE_NUMERAL_DIGITS = {
@@ -248,7 +256,12 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
         self._pending_model_reload = False
         self._loading = False
         self._dirty = False
+        self._project_file_dirty = False
         self._draft_saved_once = False
+        self._dirty_generation = 0
+        self._last_failed_autosave_generation = -1
+        self._autosave_in_progress = False
+        self._chapter_order_search_cache = None
         self._field_refresh_pending = False
         self._opening_project = False
         self.current_project_path = ""
@@ -858,6 +871,61 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
         meta = self.current_project.get("meta", {}) if isinstance(self.current_project, dict) else {}
         title_edit_text = self.title_edit.text() if hasattr(self, "title_edit") else ""
         return str(meta.get("title") or title_edit_text or "未命名小说").strip() or "未命名小说"
+
+    def _novel_perf_enabled(self):
+        return NOVEL_PERF_LOG_ENABLED
+
+    def _novel_perf_summary(self, project=None):
+        if not self._novel_perf_enabled():
+            return {}
+        project = project if isinstance(project, dict) else getattr(self, "current_project", {})
+        project = project if isinstance(project, dict) else {}
+        chapters = project.get("chapters", []) if isinstance(project.get("chapters"), list) else []
+        characters = project.get("characters", []) if isinstance(project.get("characters"), list) else []
+        lore = project.get("lore", []) if isinstance(project.get("lore"), list) else []
+        foreshadows = project.get("foreshadow_items", []) if isinstance(project.get("foreshadow_items"), list) else []
+        candidates = project.get("import_candidates", {}) if isinstance(project.get("import_candidates"), dict) else {}
+        body_chars = sum(len(str(chap.get("text", "") or "")) for chap in chapters if isinstance(chap, dict))
+        candidate_count = 0
+        for key in ("characters", "lore", "foreshadows"):
+            values = candidates.get(key, []) if isinstance(candidates, dict) else []
+            if isinstance(values, list):
+                candidate_count += len(values)
+        return {
+            "chapters": len(chapters),
+            "body_chars": body_chars,
+            "characters": len(characters),
+            "lore": len(lore),
+            "foreshadows": len(foreshadows),
+            "candidates": candidate_count,
+        }
+
+    def _log_novel_perf(self, name, start_time, threshold_ms=80, **details):
+        try:
+            elapsed = (time.perf_counter() - start_time) * 1000
+            if not self._novel_perf_enabled():
+                return elapsed
+            if elapsed < float(threshold_ms or 0):
+                return elapsed
+            parts = [f"{elapsed:.1f}ms"]
+            for key, value in details.items():
+                if value is None or value == "":
+                    continue
+                parts.append(f"{key}={value}")
+            message = f"小说性能｜{name}｜" + "｜".join(parts)
+            log_debug(message)
+            try:
+                os.makedirs(HISTORY_DIR, exist_ok=True)
+                perf_log_path = os.path.join(HISTORY_DIR, "novel_perf.log")
+                if os.path.exists(perf_log_path) and os.path.getsize(perf_log_path) > 2 * 1024 * 1024:
+                    os.replace(perf_log_path, f"{perf_log_path}.1")
+                with open(perf_log_path, "a", encoding="utf-8") as f:
+                    f.write(f"{now_str()} {message}\n")
+            except Exception:
+                pass
+            return elapsed
+        except Exception:
+            return 0
 
     def _get_export_path(self, dialog_title, suggested_name, default_ext, file_filter):
         safe_title = _safe_name(suggested_name) or "novel"
@@ -1533,10 +1601,26 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
         self._refresh_pending_helpers = False
         self._autosave_draft()
 
+    def _note_project_dirty(self):
+        self._dirty = True
+        self._project_file_dirty = True
+        self._chapter_order_search_cache = None
+        try:
+            self._dirty_generation = int(getattr(self, "_dirty_generation", 0) or 0) + 1
+        except Exception:
+            self._dirty_generation = 1
+        self._last_failed_autosave_generation = -1
+
+    def _has_unsaved_current_work(self):
+        return bool(
+            getattr(self, "_dirty", False)
+            or getattr(self, "_project_file_dirty", False)
+        )
+
     def _mark_dirty(self):
         if self._loading:
             return
-        self._dirty = True
+        self._note_project_dirty()
         self._save_current_fields()
         self.refresh_project_summary_label()
         self._schedule_refresh()
@@ -1544,32 +1628,34 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
     def _mark_character_dirty(self):
         if self._loading:
             return
-        self._dirty = True
+        self._note_project_dirty()
         self._save_character_from_editor()
         self._schedule_refresh()
 
     def _mark_lore_dirty(self):
         if self._loading:
             return
-        self._dirty = True
+        self._note_project_dirty()
         self._save_lore_from_editor()
         self._schedule_refresh()
 
     def _mark_foreshadow_dirty(self):
         if self._loading:
             return
-        self._dirty = True
+        self._note_project_dirty()
         self._save_foreshadow_from_editor()
         self._schedule_refresh()
 
     def _mark_chapter_dirty(self):
         if self._loading:
             return
-        self._dirty = True
+        self._note_project_dirty()
         self._save_chapter_from_editor()
         self._schedule_refresh(include_manuscript=True)
 
     def _save_current_work(self, reason="自动保存", refresh_project_list=True, preserve_project_mtime=False):
+        perf_start = time.perf_counter()
+        summary = self._novel_perf_summary()
         try:
             self._flush_current_editors()
             self._sync_candidate_analysis_state()
@@ -1583,13 +1669,38 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
                 if refresh_project_list:
                     self._notify_project_store_changed()
                 self._dirty = False
+                self._project_file_dirty = False
                 self._update_stats_label()
+                self._log_novel_perf(
+                    f"保存当前项目-{reason}",
+                    perf_start,
+                    threshold_ms=120,
+                    path=os.path.basename(current_path),
+                    chapters=summary.get("chapters"),
+                    body=summary.get("body_chars"),
+                    refresh_list=refresh_project_list,
+                )
                 return current_path
             self._save_draft_snapshot()
             self._dirty = False
+            self._project_file_dirty = False
             self._update_stats_label()
+            self._log_novel_perf(
+                f"保存当前草稿-{reason}",
+                perf_start,
+                threshold_ms=120,
+                chapters=summary.get("chapters"),
+                body=summary.get("body_chars"),
+            )
             return NOVEL_DRAFT_FILE
         except Exception as e:
+            self._log_novel_perf(
+                f"保存当前项目失败-{reason}",
+                perf_start,
+                threshold_ms=0,
+                chapters=summary.get("chapters"),
+                body=summary.get("body_chars"),
+            )
             log_debug(f"小说项目{reason}失败", e)
             return ""
 
@@ -1608,6 +1719,7 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
                 self._save_draft_snapshot()
                 self._notify_project_store_changed()
                 self._dirty = False
+                self._project_file_dirty = False
                 self._update_stats_label()
                 return "已保存到原项目。"
             self._save_draft_snapshot()
@@ -1871,6 +1983,27 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
         source_index = widget.item(row).data(Qt.UserRole)
         return source_index if isinstance(source_index, int) else row
 
+    def _chapter_order_search_texts(self):
+        chapters = self.current_project.get("chapters", []) if isinstance(self.current_project, dict) else []
+        chapters = chapters if isinstance(chapters, list) else []
+        cached = getattr(self, "_chapter_order_search_cache", None)
+        if cached and cached.get("chapters") is chapters:
+            return cached.get("texts", [])
+        texts = []
+        for index, chap in enumerate(chapters):
+            if not isinstance(chap, dict):
+                texts.append((index, ""))
+                continue
+            linked = chap.get("linked_characters", [])
+            linked_text = " ".join(str(value or "") for value in (linked if isinstance(linked, list) else [linked]))
+            chapter_text = "\n".join(
+                str(chap.get(field, "") or "")
+                for field in ("title", "outline", "summary", "key_facts", "text")
+            )
+            texts.append((index, re.sub(r"\s+", "", f"{linked_text}\n{chapter_text}")))
+        self._chapter_order_search_cache = {"chapters": chapters, "texts": texts}
+        return texts
+
     def _first_record_appearance_order(self, item, fields):
         item = item if isinstance(item, dict) else {}
         aliases = _record_alias_keys(item, name_key="name")
@@ -1879,18 +2012,7 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
             aliases.add(_character_merge_key(item) if "role" in item else re.sub(r"\s+", "", name))
         aliases = {alias for alias in aliases if alias}
         if aliases:
-            chapters = self.current_project.get("chapters", []) if isinstance(self.current_project, dict) else []
-            chapters = chapters if isinstance(chapters, list) else []
-            for index, chap in enumerate(chapters):
-                if not isinstance(chap, dict):
-                    continue
-                linked = chap.get("linked_characters", [])
-                linked_text = " ".join(str(value or "") for value in (linked if isinstance(linked, list) else [linked]))
-                chapter_text = "\n".join(
-                    str(chap.get(field, "") or "")
-                    for field in ("title", "outline", "summary", "key_facts", "text")
-                )
-                compact = re.sub(r"\s+", "", f"{linked_text}\n{chapter_text}")
+            for index, compact in self._chapter_order_search_texts():
                 if any(alias in compact for alias in aliases):
                     return index + 1
         return _story_order_from_text(_record_text_for_sort(item, fields))
@@ -2388,10 +2510,33 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
         QTimer.singleShot(0, cleanup)
 
     def _load_project_data(self, data, path="", defer_helpers=False):
+        perf_start = time.perf_counter()
+        source_name = os.path.basename(str(path or "")) or "草稿"
+        file_size = ""
+        if path and os.path.exists(path):
+            try:
+                file_size = os.path.getsize(path)
+            except Exception:
+                file_size = ""
         self._loading = True
         try:
+            step_start = time.perf_counter()
             self.current_project = _normalize_project(data)
+            self._log_novel_perf(
+                "加载项目-规范化",
+                step_start,
+                threshold_ms=80,
+                path=source_name,
+                file_size=file_size,
+            )
+            step_start = time.perf_counter()
             status_changes = _auto_classify_default_statuses(self.current_project)
+            self._log_novel_perf(
+                "加载项目-自动分类",
+                step_start,
+                threshold_ms=80,
+                path=source_name,
+            )
             self.current_project_path = path
             analysis_state = _normalize_candidate_analysis_state(self.current_project.get("analysis_state", {}))
             self.failed_analysis_chunks = analysis_state.get("failed_candidate_chunks", [])
@@ -2421,11 +2566,20 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
             self.timeline_edit.setPlainText(self.current_project.get("timeline", ""))
             self.summary_edit.setPlainText(self.current_project.get("summary", ""))
             self.draft_note_edit.setPlainText(self.current_project.get("draft_note", ""))
+            step_start = time.perf_counter()
             self._reload_character_list()
             self._reload_lore_list()
             self._reload_foreshadow_list()
             self._reload_chapter_list()
+            self._log_novel_perf(
+                "加载项目-刷新结构列表",
+                step_start,
+                threshold_ms=80,
+                path=source_name,
+                **self._novel_perf_summary(),
+            )
             self._dirty = any(status_changes.values())
+            self._project_file_dirty = self._dirty
         finally:
             self._loading = False
         self.refresh_project_summary_label()
@@ -2437,17 +2591,35 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
             self.refresh_manuscript()
             self.refresh_writing_check()
             self.refresh_import_candidate_lists()
+        self._log_novel_perf(
+            "加载项目-总计",
+            perf_start,
+            threshold_ms=0,
+            path=source_name,
+            defer_helpers=defer_helpers,
+            file_size=file_size,
+            **self._novel_perf_summary(),
+        )
 
     def refresh_manuscript(self):
         if not hasattr(self, "manuscript_edit") or self._loading or self._refreshing_helpers:
             return
+        perf_start = time.perf_counter()
         try:
             self._refreshing_helpers = True
             self._flush_current_editors()
             text = _build_manuscript_text(self.current_project)
             self._set_text_without_signals(self.manuscript_edit, text)
             self._refresh_read_aloud_scope_combo()
+            self._log_novel_perf(
+                "刷新完整书稿",
+                perf_start,
+                threshold_ms=80,
+                text_len=len(text),
+                **self._novel_perf_summary(),
+            )
         except Exception as e:
+            self._log_novel_perf("刷新完整书稿失败", perf_start, threshold_ms=0)
             log_debug("小说书稿刷新失败", e)
         finally:
             self._refreshing_helpers = False
@@ -2999,11 +3171,21 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
     def refresh_writing_check(self):
         if not hasattr(self, "check_edit") or self._loading or self._refreshing_helpers:
             return
+        perf_start = time.perf_counter()
         try:
             self._refreshing_helpers = True
             self._flush_current_editors()
-            self._set_text_without_signals(self.check_edit, _build_writing_check_text(self.current_project))
+            text = _build_writing_check_text(self.current_project)
+            self._set_text_without_signals(self.check_edit, text)
+            self._log_novel_perf(
+                "刷新写作检查",
+                perf_start,
+                threshold_ms=80,
+                text_len=len(text),
+                **self._novel_perf_summary(),
+            )
         except Exception as e:
+            self._log_novel_perf("刷新写作检查失败", perf_start, threshold_ms=0)
             log_debug("小说写作检查刷新失败", e)
         finally:
             self._refreshing_helpers = False
@@ -3011,10 +3193,20 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
     def run_global_search(self):
         if not hasattr(self, "search_result_edit"):
             return
+        perf_start = time.perf_counter()
         keyword = self.search_input.text().strip()
         self._flush_current_editors()
         self._sync_import_candidates_to_project()
-        self.search_result_edit.setPlainText(_build_search_result_text(self.current_project, keyword))
+        text = _build_search_result_text(self.current_project, keyword)
+        self.search_result_edit.setPlainText(text)
+        self._log_novel_perf(
+            "全局搜索",
+            perf_start,
+            threshold_ms=80,
+            keyword=keyword,
+            result_len=len(text),
+            **self._novel_perf_summary(),
+        )
 
     def clear_global_search(self):
         if hasattr(self, "search_input"):
@@ -3025,6 +3217,7 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
     def refresh_import_candidate_lists(self):
         if not hasattr(self, "candidate_character_list"):
             return
+        perf_start = time.perf_counter()
         previous_checks = self._candidate_check_state_snapshot()
         counts = {
             "characters": len(self.import_candidates.get("characters", [])),
@@ -3112,6 +3305,15 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
                     self.candidate_material_list.addItem(row)
             finally:
                 self.candidate_material_list.blockSignals(False)
+        self._log_novel_perf(
+            "刷新候选区",
+            perf_start,
+            threshold_ms=80,
+            characters=counts.get("characters"),
+            lore=counts.get("lore"),
+            foreshadows=counts.get("foreshadows"),
+            materials=material_hits,
+        )
 
     def _clear_candidate_detail_view(self):
         if hasattr(self, "candidate_detail_edit"):
@@ -3548,11 +3750,13 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
     def _persist_candidate_analysis_state(self):
         self._sync_candidate_analysis_state()
         self._sync_import_candidates_to_project()
-        self._dirty = True
+        self._note_project_dirty()
         try:
             self.current_project["updated_at"] = now_str()
             self._save_draft_snapshot()
             self._save_current_project_snapshot_if_named()
+            self._dirty = False
+            self._project_file_dirty = False
         except Exception as e:
             log_debug("小说候选分析状态保存失败", e)
 
@@ -4050,12 +4254,26 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
     def _start_candidate_postprocess(self, provider, model):
         self._set_candidate_postprocess_state("pending")
         self._sync_candidate_analysis_state()
+        perf_start = time.perf_counter()
+        dossier = _candidate_analysis_dossier_text(self._ai_project_snapshot())
+        self._log_novel_perf(
+            "AI候选合并-构建档案输入",
+            perf_start,
+            threshold_ms=80,
+            dossier_len=len(dossier),
+            candidate_items=sum(
+                len(self.import_candidates.get(key, []))
+                for key in ("characters", "lore", "foreshadows")
+                if isinstance(self.import_candidates.get(key, []), list)
+            ),
+            **self._novel_perf_summary(),
+        )
         self.analysis_worker = NovelCandidatePostprocessWorker(
             provider.get("base_url", ""),
             provider.get("api_key", ""),
             model,
             deepcopy(self.import_candidates),
-            _candidate_analysis_dossier_text(self._ai_project_snapshot()),
+            dossier,
             provider.get("proxy_url", ""),
             self._provider_proxy_mode(provider),
         )
@@ -4095,7 +4313,16 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
         else:
             chapter_ids = self._pending_candidate_analysis_chapter_ids()
             analysis_chunks = None
+            perf_start = time.perf_counter()
             text = _candidate_analysis_text(self._ai_project_snapshot(), "", chapter_ids, include_dossier=False)
+            self._log_novel_perf(
+                "AI分析候选-构建正文输入",
+                perf_start,
+                threshold_ms=80,
+                pending_chapters=len(chapter_ids),
+                text_len=len(text),
+                **self._novel_perf_summary(),
+            )
         if not text:
             if getattr(self, "failed_analysis_chunks", None):
                 message = "有失败块记录，但没有可重试的文本内容。请重新导入或重新分析相关章节。"
@@ -4117,6 +4344,15 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
             self._analysis_merge_with_existing = False
         self._sync_candidate_analysis_state()
         concurrency = self._candidate_analysis_concurrency()
+        perf_start = time.perf_counter()
+        dossier = _candidate_analysis_dossier_text(self._ai_project_snapshot())
+        self._log_novel_perf(
+            "AI分析候选-构建档案输入",
+            perf_start,
+            threshold_ms=80,
+            dossier_len=len(dossier),
+            **self._novel_perf_summary(),
+        )
         self.analysis_worker = NovelAnalysisWorker(
             provider.get("base_url", ""),
             provider.get("api_key", ""),
@@ -4126,7 +4362,7 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
             self._provider_proxy_mode(provider),
             concurrency,
             chunks=analysis_chunks,
-            dossier=_candidate_analysis_dossier_text(self._ai_project_snapshot()),
+            dossier=dossier,
         )
         self.analysis_worker.progress.connect(self.set_status_tip)
         self.analysis_worker.partial_ready.connect(self.on_ai_candidates_partial)
@@ -4589,14 +4825,25 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
             self.chapter_plan_apply_btn.setVisible(False)
             self.chapter_plan_apply_btn.setEnabled(False)
         self.chapter_ai_preview.clear()
-        self._dirty = True
+        self._note_project_dirty()
         self._reload_chapter_list(first_new_index)
         self._schedule_refresh(include_manuscript=True)
         self.set_status_tip(f"已追加 {len(chapters_plan)} 章章节规划，可从第一章新规划开始逐章扩写。")
 
     def _chapter_ai_context(self, action):
+        perf_start = time.perf_counter()
         self._flush_current_editors()
-        return _build_chapter_ai_context(self._ai_project_snapshot(), self.current_chapter_index, action)
+        context = _build_chapter_ai_context(self._ai_project_snapshot(), self.current_chapter_index, action)
+        self._log_novel_perf(
+            "AI写作-构建上下文",
+            perf_start,
+            threshold_ms=80,
+            action=action,
+            chapter=self.current_chapter_index + 1,
+            context_len=len(context),
+            **self._novel_perf_summary(),
+        )
+        return context
 
     def _has_partial_chapter_ai_preview(self, action=None):
         preview_action = getattr(self, "_chapter_ai_preview_action", "")
@@ -4616,18 +4863,52 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
         return self._has_partial_chapter_ai_preview("draft")
 
     def _chapter_ai_context_with_preview(self, action):
+        perf_start = time.perf_counter()
         self._flush_current_editors()
         if action != "draft" or not self._has_partial_draft_preview():
-            return _build_chapter_ai_context(self._ai_project_snapshot(), self.current_chapter_index, action)
+            context = _build_chapter_ai_context(self._ai_project_snapshot(), self.current_chapter_index, action)
+            self._log_novel_perf(
+                "AI写作-构建上下文",
+                perf_start,
+                threshold_ms=80,
+                action=action,
+                chapter=self.current_chapter_index + 1,
+                context_len=len(context),
+                preview=False,
+                **self._novel_perf_summary(),
+            )
+            return context
         project = self._ai_project_snapshot()
         chapters = project.get("chapters", [])
         if not isinstance(chapters, list) or self.current_chapter_index < 0 or self.current_chapter_index >= len(chapters):
-            return _build_chapter_ai_context(self._ai_project_snapshot(), self.current_chapter_index, action)
+            context = _build_chapter_ai_context(self._ai_project_snapshot(), self.current_chapter_index, action)
+            self._log_novel_perf(
+                "AI写作-构建上下文",
+                perf_start,
+                threshold_ms=80,
+                action=action,
+                chapter=self.current_chapter_index + 1,
+                context_len=len(context),
+                preview=False,
+                **self._novel_perf_summary(),
+            )
+            return context
         chap = chapters[self.current_chapter_index]
         if isinstance(chap, dict):
             preview_text = self.chapter_ai_preview.toPlainText().strip()
             chap["text"] = _append_text_without_duplicate_overlap(chap.get("text", ""), preview_text)
-        return _build_chapter_ai_context(project, self.current_chapter_index, action)
+        context = _build_chapter_ai_context(project, self.current_chapter_index, action)
+        self._log_novel_perf(
+            "AI写作-构建上下文",
+            perf_start,
+            threshold_ms=80,
+            action=action,
+            chapter=self.current_chapter_index + 1,
+            context_len=len(context),
+            preview=True,
+            **self._novel_perf_summary(),
+        )
+        return context
 
     def _set_partial_chapter_ai_preview_state(self, enabled, action="draft"):
         self._chapter_ai_preview_is_partial = bool(enabled)
@@ -5779,14 +6060,42 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
             return
         if not self._dirty and self._draft_saved_once:
             return
+        if getattr(self, "_autosave_in_progress", False):
+            return
+        current_generation = int(getattr(self, "_dirty_generation", 0) or 0)
+        if getattr(self, "_last_failed_autosave_generation", -1) == current_generation:
+            return
+        self._autosave_in_progress = True
+        perf_start = time.perf_counter()
+        summary = self._novel_perf_summary()
         try:
             self._flush_current_editors()
             self._sync_candidate_analysis_state()
             self._sync_import_candidates_to_project()
             self.current_project["updated_at"] = now_str()
             self._save_draft_snapshot()
+            self._dirty = False
+            self._last_failed_autosave_generation = -1
+            self._log_novel_perf(
+                "自动保存草稿",
+                perf_start,
+                threshold_ms=120,
+                chapters=summary.get("chapters"),
+                body=summary.get("body_chars"),
+                project_dirty=getattr(self, "_project_file_dirty", False),
+            )
         except Exception as e:
+            self._last_failed_autosave_generation = current_generation
+            self._log_novel_perf(
+                "自动保存草稿失败",
+                perf_start,
+                threshold_ms=0,
+                chapters=summary.get("chapters"),
+                body=summary.get("body_chars"),
+            )
             log_debug("小说草稿自动保存失败", e)
+        finally:
+            self._autosave_in_progress = False
 
     def _save_draft_snapshot(self):
         save_draft_project(self.current_project)
@@ -5798,14 +6107,16 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
             return
         save_project_file(path, self.current_project)
         self._remember_project_path(path)
+        self._project_file_dirty = False
 
     def _persist_candidate_analysis_draft_state(self):
         self._sync_candidate_analysis_state()
         self._sync_import_candidates_to_project()
-        self._dirty = True
+        self._note_project_dirty()
         try:
             self.current_project["updated_at"] = now_str()
             self._save_draft_snapshot()
+            self._dirty = False
         except Exception as e:
             log_debug("小说候选分析草稿保存失败", e)
 
@@ -5824,6 +6135,7 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
             self._save_draft_snapshot()
             self._notify_project_store_changed()
             self._dirty = False
+            self._project_file_dirty = False
             self._update_stats_label()
             return True
         except Exception as e:
@@ -5855,6 +6167,7 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
             self.current_project_path = path
             self._update_stats_label()
             self._dirty = False
+            self._project_file_dirty = False
             self._notify_project_store_changed()
             self.set_status_tip(f"已保存：{name}")
             return True
@@ -5898,19 +6211,46 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
         if os.path.abspath(path) == os.path.abspath(str(self.current_project_path or "")):
             self.set_status_tip(f"已打开：{os.path.basename(path)}")
             return
+        perf_start = time.perf_counter()
+        source_name = os.path.basename(path)
+        file_size = ""
+        if os.path.exists(path):
+            try:
+                file_size = os.path.getsize(path)
+            except Exception:
+                file_size = ""
         self._opening_project = True
         try:
+            step_start = time.perf_counter()
             data = load_json_file(path, None)
+            self._log_novel_perf(
+                "切换小说-读取文件",
+                step_start,
+                threshold_ms=80,
+                path=source_name,
+                file_size=file_size,
+            )
             if not isinstance(data, dict):
                 QMessageBox.warning(self, "打开失败", "项目文件无效。")
                 return
             self.set_status_tip(f"正在打开：{os.path.basename(path)}")
-            self._save_current_work("打开前保存", refresh_project_list=False, preserve_project_mtime=True)
+            saved_before_open = self._has_unsaved_current_work()
+            if saved_before_open:
+                self._save_current_work("打开前保存", refresh_project_list=False, preserve_project_mtime=True)
             self._load_project_data(data, path, defer_helpers=True)
             self._remember_project_path(path)
             self._save_draft_snapshot()
             self._select_project_list_path(path)
             self.set_status_tip(f"已打开：{os.path.basename(path)}")
+            self._log_novel_perf(
+                "切换小说-总计",
+                perf_start,
+                threshold_ms=0,
+                path=source_name,
+                file_size=file_size,
+                saved_before_open=saved_before_open,
+                **self._novel_perf_summary(),
+            )
         finally:
             self._opening_project = False
 
@@ -5943,6 +6283,7 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
             return
         self._reset_to_empty_draft()
         self._dirty = False
+        self._project_file_dirty = False
         self.set_status_tip("已清空当前草稿。")
 
     def _reset_to_empty_draft(self, title="未命名小说"):
@@ -6143,6 +6484,7 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
         self.tabs.setCurrentWidget(self.import_candidates_tab)
         self._notify_project_store_changed()
         self._dirty = False
+        self._project_file_dirty = False
         self._update_stats_label()
         self._set_import_done_status(source_label, import_type, len(chapters), 0, "已创建并保存为新项目。")
 

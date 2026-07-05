@@ -309,6 +309,21 @@ _CHARACTER_TITLE_WORDS = (
     "侍卫", "掌柜", "师父", "师傅", "师尊", "宗主", "阁主", "门主", "帮主", "神医",
     "先生", "夫人", "大人", "世子", "侯爷", "王", "帝", "妃", "嫔",
 )
+_CHARACTER_TITLE_PATTERN = "|".join(
+    re.escape(title) for title in sorted(_CHARACTER_TITLE_WORDS, key=len, reverse=True)
+)
+_COMMON_CHINESE_SURNAME_CHARS = re.escape(_COMMON_CHINESE_SURNAMES)
+_CHARACTER_PAREN_ROLE_RE = re.compile(r"^([\u4e00-\u9fff]{2,4})[（(]([^（）()]{1,12})[）)]$")
+_CHARACTER_TITLE_SINGLE_SURNAME_RE = re.compile(
+    rf"^(.{{0,10}}?(?:{_CHARACTER_TITLE_PATTERN}))"
+    rf"([{_COMMON_CHINESE_SURNAME_CHARS}][\u4e00-\u9fff]{{1,3}})$"
+)
+_CHARACTER_TITLE_COMPOUND_SURNAME_RE_LIST = tuple(
+    re.compile(rf"^(.{{0,10}}?(?:{_CHARACTER_TITLE_PATTERN}))({re.escape(surname)}[\u4e00-\u9fff]{{1,2}})$")
+    for surname in _COMMON_COMPOUND_SURNAMES
+)
+
+
 def _clean_entity_name(name):
     return str(name or "").strip().strip("「」『』《》<>[]【】（）()：:，,。；;、 \t\r\n")
 
@@ -324,16 +339,14 @@ def _canonical_character_name_and_role(name):
     raw = _clean_entity_name(name)
     if not raw:
         return "", ""
-    paren_match = re.match(r"^([\u4e00-\u9fff]{2,4})[（(]([^（）()]{1,12})[）)]$", raw)
+    paren_match = _CHARACTER_PAREN_ROLE_RE.match(raw)
     if paren_match and _looks_like_chinese_person_name(paren_match.group(1)):
         return paren_match.group(1), paren_match.group(2).strip()
-    title_pattern = "|".join(re.escape(title) for title in sorted(_CHARACTER_TITLE_WORDS, key=len, reverse=True))
-    surname_chars = re.escape(_COMMON_CHINESE_SURNAMES)
-    match = re.match(rf"^(.{{0,10}}?(?:{title_pattern}))([{surname_chars}][\u4e00-\u9fff]{{1,3}})$", raw)
+    match = _CHARACTER_TITLE_SINGLE_SURNAME_RE.match(raw)
     if match and _looks_like_chinese_person_name(match.group(2)):
         return match.group(2), match.group(1).strip()
-    for surname in _COMMON_COMPOUND_SURNAMES:
-        match = re.match(rf"^(.{{0,10}}?(?:{title_pattern}))({re.escape(surname)}[\u4e00-\u9fff]{{1,2}})$", raw)
+    for pattern in _CHARACTER_TITLE_COMPOUND_SURNAME_RE_LIST:
+        match = pattern.match(raw)
         if match and _looks_like_chinese_person_name(match.group(2)):
             return match.group(2), match.group(1).strip()
     return raw, ""
@@ -2887,6 +2900,8 @@ def _chapter_analysis_diff_ratio(old_text, new_text):
     if old_text == new_text:
         return 0.0
     length_delta_ratio = abs(len(new_text) - len(old_text)) / max(len(old_text), len(new_text), 1)
+    if length_delta_ratio > CHAPTER_ANALYSIS_SMALL_CHANGE_RATIO:
+        return length_delta_ratio
     prefix = 0
     shortest = min(len(old_text), len(new_text))
     while prefix < shortest and old_text[prefix] == new_text[prefix]:
@@ -3861,6 +3876,22 @@ def _build_chapter_ai_context(project, chapter_index, action):
         "必须继承承接点里的时间、天气、地点、人物位置、情绪和未完成动作；如果上一章写明雨已停或场景已变化，"
         "不要在下一章开头改成仍在下雨或回到旧场景，除非本章提纲明确发生了新的天气/场景变化。"
         "优先参考本章需继承的关键事实，其次参考本章摘要、前文摘要、人物目标、语言风格和世界规则。"
+        "正文风格：口语化、自然、有网文阅读感，不要太工整、太书面、太像范文。"
+        "句子长短混用，允许短句、停顿、反问和不完全对称的表达。"
+        "少用排比、四字词堆叠、抽象情绪词和模板化反应。"
+        "人物情绪优先通过对白、具体动作和选择体现。保持剧情高密度推进，但不要写成流水账。"
+        "去 AI 味要求：少写段尾总结、抽象情绪判断和万能反应动作；"
+        "不要频繁使用“沉默、皱眉、冷意、压迫感、空气安静、所有人愣住、下一秒”等模板化表达。"
+        "对白要有真人说话的不完整感，可以短句、停顿、反问、打断。"
+        "场景描写优先用具体物件、动作和细节承载情绪，不要总用氛围词概括。"
+        "人物心理不要解释过满，能让读者从动作和对白看懂的，就不要再总结一遍。"
+        "少用解释型旁白，不要频繁替人物总结动机、立场和成长。"
+        "少写金句式、总结式、标语式句子，不要刻意拔高主题；章节结尾优先用具体动作、对白、信息变化或悬念收住。"
+        "段落结构要有变化，不要连续使用“动作描写 + 心理解释 + 氛围总结”的固定结构。"
+        "对白不要每句都完整、漂亮、逻辑闭合；不同人物说话要有信息差、情绪偏差和表达习惯，可以含糊、逃避、反问或只说半句。"
+        "场景细节要克制：只在能强化冲突、人物状态或信息变化时，少量加入具体物件、声音、动作痕迹和环境反馈。"
+        "不要写无意义生活噪声，不要让细节拖慢剧情。"
+        "写每一场时优先让人物在具体环境里做事、被打断、受阻、临时反应，不要只用旁白解释情绪和局势。"
         "参考【本章写作长度】安排详略，但不要为了贴字数牺牲完整场景、冲突收束和正文质量；只输出正文内容。"
         if has_current_text else
         "请根据当前章节的章节提纲生成正文草稿。若有上一章结尾，请让开篇自然承接上一章的情绪、场景或悬念。"
@@ -3869,6 +3900,22 @@ def _build_chapter_ai_context(project, chapter_index, action):
         "必须继承上一章结尾的时间、天气、地点、人物位置、情绪和未完成动作；如果上一章写明雨已停或场景已变化，"
         "不要在本章开头改成仍在下雨或回到旧场景，除非本章提纲明确发生了新的天气/场景变化。"
         "优先参考本章需继承的关键事实，其次参考本章摘要、前文摘要、人物目标、语言风格和世界规则。"
+        "正文风格：口语化、自然、有网文阅读感，不要太工整、太书面、太像范文。"
+        "句子长短混用，允许短句、停顿、反问和不完全对称的表达。"
+        "少用排比、四字词堆叠、抽象情绪词和模板化反应。"
+        "人物情绪优先通过对白、具体动作和选择体现。保持剧情高密度推进，但不要写成流水账。"
+        "去 AI 味要求：少写段尾总结、抽象情绪判断和万能反应动作；"
+        "不要频繁使用“沉默、皱眉、冷意、压迫感、空气安静、所有人愣住、下一秒”等模板化表达。"
+        "对白要有真人说话的不完整感，可以短句、停顿、反问、打断。"
+        "场景描写优先用具体物件、动作和细节承载情绪，不要总用氛围词概括。"
+        "人物心理不要解释过满，能让读者从动作和对白看懂的，就不要再总结一遍。"
+        "少用解释型旁白，不要频繁替人物总结动机、立场和成长。"
+        "少写金句式、总结式、标语式句子，不要刻意拔高主题；章节结尾优先用具体动作、对白、信息变化或悬念收住。"
+        "段落结构要有变化，不要连续使用“动作描写 + 心理解释 + 氛围总结”的固定结构。"
+        "对白不要每句都完整、漂亮、逻辑闭合；不同人物说话要有信息差、情绪偏差和表达习惯，可以含糊、逃避、反问或只说半句。"
+        "场景细节要克制：只在能强化冲突、人物状态或信息变化时，少量加入具体物件、声音、动作痕迹和环境反馈。"
+        "不要写无意义生活噪声，不要让细节拖慢剧情。"
+        "写每一场时优先让人物在具体环境里做事、被打断、受阻、临时反应，不要只用旁白解释情绪和局势。"
         "参考【本章写作长度】安排详略，但不要为了贴字数牺牲完整场景、冲突收束和正文质量；只输出正文内容。"
     )
     task_map = {

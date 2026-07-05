@@ -12,6 +12,7 @@ from gpt_desktop.novel_utils import (
     CHAPTER_ANALYSIS_HASH_VERSION,
     _append_text_without_duplicate_overlap,
     _build_search_result_text,
+    _chapter_analysis_diff_ratio,
     _chapter_analysis_hash,
     _chapter_analysis_legacy_hash,
     _chapter_list_text,
@@ -123,6 +124,15 @@ class NovelWritingStateTests(unittest.TestCase):
 
         self.assertIn("小改", text)
         self.assertNotIn("待AI分析", text)
+
+    def test_chapter_analysis_diff_returns_fast_when_length_delta_exceeds_small_change(self):
+        old_text = "旧正文" * 3000
+        new_text = old_text + ("新增正文" * 500)
+
+        ratio = _chapter_analysis_diff_ratio(old_text, new_text)
+
+        self.assertGreater(ratio, 0.10)
+        self.assertAlmostEqual(ratio, (len(new_text) - len(old_text)) / len(new_text))
 
     def test_project_meta_text_includes_summary_fact_words(self):
         chapter = _new_chapter(0)
@@ -2555,11 +2565,59 @@ class NovelWritingStateTests(unittest.TestCase):
         self.assertEqual(tab.project_list.current_row, 1)
         self.assertFalse(tab.project_list.signals_blocked)
 
+    def test_open_project_file_skips_opening_save_when_current_project_is_clean(self):
+        tab = NovelWritingTab.__new__(NovelWritingTab)
+        tab._opening_project = False
+        tab.current_project_path = "/tmp/current.json"
+        tab._dirty = False
+        tab._project_file_dirty = False
+        saves = []
+        loaded = []
+        tab._save_current_work = lambda *args, **kwargs: saves.append((args, kwargs))
+        tab._load_project_data = lambda data, path, defer_helpers=False: loaded.append((data, path, defer_helpers))
+        tab._remember_project_path = lambda _path: None
+        tab._save_draft_snapshot = lambda: None
+        tab._select_project_list_path = lambda _path: None
+        tab.set_status_tip = lambda _text: None
+
+        import gpt_desktop.novel_writing_tab as writing_tab
+        with patch.object(writing_tab, "load_json_file", return_value={"meta": {"title": "新项目"}}):
+            tab.open_project_file("/tmp/new.json")
+
+        self.assertEqual(saves, [])
+        self.assertEqual(loaded, [({"meta": {"title": "新项目"}}, "/tmp/new.json", True)])
+        self.assertFalse(tab._opening_project)
+
+    def test_open_project_file_saves_when_project_file_is_dirty_after_draft_autosave(self):
+        tab = NovelWritingTab.__new__(NovelWritingTab)
+        tab._opening_project = False
+        tab.current_project_path = "/tmp/current.json"
+        tab._dirty = False
+        tab._project_file_dirty = True
+        saves = []
+        tab._save_current_work = lambda *args, **kwargs: saves.append((args, kwargs))
+        tab._load_project_data = lambda data, path, defer_helpers=False: None
+        tab._remember_project_path = lambda _path: None
+        tab._save_draft_snapshot = lambda: None
+        tab._select_project_list_path = lambda _path: None
+        tab.set_status_tip = lambda _text: None
+
+        import gpt_desktop.novel_writing_tab as writing_tab
+        with patch.object(writing_tab, "load_json_file", return_value={"meta": {"title": "新项目"}}):
+            tab.open_project_file("/tmp/new.json")
+
+        self.assertEqual(len(saves), 1)
+        args, kwargs = saves[0]
+        self.assertEqual(args[0], "打开前保存")
+        self.assertFalse(kwargs["refresh_project_list"])
+        self.assertTrue(kwargs["preserve_project_mtime"])
+
     def test_save_current_work_can_avoid_project_list_refresh_when_switching_projects(self):
         tab = NovelWritingTab.__new__(NovelWritingTab)
         tab.current_project = {"meta": {"title": "当前项目"}, "chapters": []}
         tab.current_project_path = "/tmp/current.json"
         tab._dirty = True
+        tab._project_file_dirty = True
         tab._flush_current_editors = lambda: None
         tab._sync_candidate_analysis_state = lambda: None
         tab._sync_import_candidates_to_project = lambda: None
@@ -2582,6 +2640,81 @@ class NovelWritingStateTests(unittest.TestCase):
         self.assertEqual(calls, [("/tmp/current.json", True)])
         self.assertEqual(refreshed, [])
         self.assertFalse(tab._dirty)
+        self.assertFalse(tab._project_file_dirty)
+
+    def test_autosave_draft_clears_dirty_flag_after_success(self):
+        tab = NovelWritingTab.__new__(NovelWritingTab)
+        tab._loading = False
+        tab._dirty = True
+        tab._project_file_dirty = True
+        tab._draft_saved_once = True
+        tab.current_project = {"meta": {"title": "当前项目"}, "chapters": []}
+        tab._flush_current_editors = lambda: None
+        tab._sync_candidate_analysis_state = lambda: None
+        tab._sync_import_candidates_to_project = lambda: None
+        saves = []
+        tab._save_draft_snapshot = lambda: saves.append(True)
+
+        tab._autosave_draft()
+
+        self.assertEqual(saves, [True])
+        self.assertFalse(tab._dirty)
+        self.assertTrue(tab._project_file_dirty)
+        self.assertIn("updated_at", tab.current_project)
+
+    def test_autosave_draft_does_not_retry_same_failed_generation(self):
+        tab = NovelWritingTab.__new__(NovelWritingTab)
+        tab._loading = False
+        tab._dirty = True
+        tab._project_file_dirty = True
+        tab._draft_saved_once = True
+        tab._dirty_generation = 4
+        tab._last_failed_autosave_generation = -1
+        tab._autosave_in_progress = False
+        tab.current_project = {"meta": {"title": "当前项目"}, "chapters": []}
+        tab._flush_current_editors = lambda: None
+        tab._sync_candidate_analysis_state = lambda: None
+        tab._sync_import_candidates_to_project = lambda: None
+        attempts = []
+
+        def fail_save():
+            attempts.append(True)
+            raise RuntimeError("save failed")
+
+        tab._save_draft_snapshot = fail_save
+
+        tab._autosave_draft()
+        tab._autosave_draft()
+
+        self.assertEqual(len(attempts), 1)
+        self.assertTrue(tab._dirty)
+        self.assertTrue(tab._project_file_dirty)
+        self.assertEqual(tab._last_failed_autosave_generation, 4)
+
+        tab._dirty_generation = 5
+        tab._last_failed_autosave_generation = -1
+        tab._autosave_draft()
+
+        self.assertEqual(len(attempts), 2)
+
+    def test_persist_candidate_analysis_draft_state_clears_dirty_after_success(self):
+        tab = NovelWritingTab.__new__(NovelWritingTab)
+        tab.current_project = {"meta": {"title": "当前项目"}, "chapters": []}
+        tab._dirty = False
+        tab._project_file_dirty = False
+        tab._dirty_generation = 0
+        tab._last_failed_autosave_generation = -1
+        tab._sync_candidate_analysis_state = lambda: None
+        tab._sync_import_candidates_to_project = lambda: None
+        saves = []
+        tab._save_draft_snapshot = lambda: saves.append(True)
+
+        tab._persist_candidate_analysis_draft_state()
+
+        self.assertEqual(saves, [True])
+        self.assertFalse(tab._dirty)
+        self.assertTrue(tab._project_file_dirty)
+        self.assertEqual(tab._dirty_generation, 1)
 
     def test_infer_linked_character_names_uses_existing_character_cards(self):
         chapter = _new_chapter(0)

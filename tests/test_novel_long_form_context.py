@@ -124,6 +124,32 @@ class NovelLongFormContextTests(unittest.TestCase):
         self.assertIn("项目总目标字数：20万字", context)
         self.assertIn("不要把项目总字数当作单章输出字数", context)
 
+    def test_chapter_draft_context_obeys_planned_stage_fields(self):
+        current = _new_chapter(0)
+        current["title"] = "第一章 风雨入城"
+        current["outline"] = (
+            "所属阶段：强钩子阶段\n"
+            "本章功能：开局爆点\n"
+            "冲突强度：高\n"
+            "铺垫比例：低，只允许事件中带出\n"
+            "人物任务：快速建立主角行动风格\n"
+            "主线任务：进入京城主线冲突\n"
+            "伏笔任务：埋下风雨信号\n"
+            "结尾钩子：旧案卷宗出现。\n\n"
+            "本章目标：主角进入京城。"
+        )
+        project = self._project_with_current_chapter(current)
+
+        context = _build_chapter_ai_context(project, 0, "draft")
+
+        self.assertIn("必须优先按这些章节规划字段执行", context)
+        self.assertIn("阶段规则只控制节奏、密度和钩子", context)
+        self.assertIn("所属阶段：强钩子阶段", context)
+        self.assertIn("本章功能：开局爆点", context)
+        self.assertIn("冲突强度：高", context)
+        self.assertIn("人物任务：快速建立主角行动风格", context)
+        self.assertIn("伏笔任务：埋下风雨信号", context)
+
     def test_global_note_is_private_and_not_in_chapter_ai_context(self):
         current = _new_chapter(0)
         current["title"] = "第一章 入城"
@@ -854,6 +880,9 @@ class NovelLongFormContextTests(unittest.TestCase):
         self.assertIn("章节结尾的时间、天气、地点、人物位置和未完成动作", context)
         self.assertIn("雨停", context)
         self.assertIn("必须写入关键事实", context)
+        self.assertIn("连续性备忘录", context)
+        self.assertIn("不写剧情复述", context)
+        self.assertIn("事实完整、表达短", context)
 
     def test_chapter_context_keeps_current_chapter_when_materials_are_huge(self):
         previous = _new_chapter(0)

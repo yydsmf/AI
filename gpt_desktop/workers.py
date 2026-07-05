@@ -471,8 +471,11 @@ class NovelAnalysisWorker(QThread):
             "弱化一次性描写、普通动作和不会影响后文的临时信息。\n"
             "如果用户内容含有【已有项目档案】，它只作为合并和去重参考：同名、别称或同一线索不要重复新增，"
             "长期有效的人物变化才写入已有人物 notes，例如身份、目标、秘密、阵营、称呼、关系质变、长期伤势/物品或语言风格变化；"
+            "主角或高频人物的 notes 更要克制：如果只是本章行动、临时判断、短暂情绪、重复性性格表现或已经存在于人物卡的特征，不要输出 notes 更新；"
+            "只有确实改变长期人物档案的新状态才输出。"
             "普通章节行动、临时情绪、一次性互动和只在本章成立的关系推进，不要写入人物 notes，"
-            "其中只有会影响后续章节继承的全局增量，才放入 project_materials.summary 或 timeline。"
+            "也不要转写到本章需继承事实；其中只有会影响全局连续性的长期变化，才放入 project_materials.summary 或 timeline。"
+            "章节事实只由正文后的摘要/事实流程负责，AI 分析候选不要追加或改写本章需继承事实。"
             "稳定设定变化才写入 lore.description，例如长期有效的规则、制度、结构关系、地点/势力/物品属性、能力限制、固定渠道或所有权；"
             "本章出现、追问、调查、发送、发现线索、谁去问谁等临时推进，不要写入 lore.description，改放 timeline/summary/foreshadows；"
             "伏笔变化写入状态/章节；对【已有项目档案】中的未埋/已埋伏笔，如果本片段明确推进、回收、揭晓、解释或作废，"
@@ -504,7 +507,8 @@ class NovelAnalysisWorker(QThread):
             "复数无名群体排除规则高于主要行动人物保留规则，不要输出无名群体/复数路人，例如“王六的两名同伙”“几名手下”“围观者”；"
             "删除人物候选时不能丢失剧情作用，需把该群体造成的围堵、袭击、传话、误判、资源变化等后果移入 timeline、summary 或 foreshadows.description；"
             "notes 只写会帮助后续识别和继承的身份、关系、冲突作用、造成的后果或可复用特征，"
-            "不要把完整章节流水账塞进 notes。如果只是本章发生了什么、短暂情绪或普通互动，就留空字符串。\n"
+            "不要把完整章节流水账塞进 notes。如果是已有主角/高频人物，notes 只写新增且长期有效的档案变化；"
+            "如果只是本章发生了什么、短暂情绪、普通互动、重复性性格表现或已有备注的同义复述，就留空字符串。\n"
             "lore.description 要求：只写后续章节需要继承的稳定设定增量；如果只是本章动作、线索推进、调查过程或临时危机，就留空字符串。\n"
             "project_materials 要求：bible 写故事核心、主线矛盾、主要人物关系和风格基调；"
             "world_rules 写世界观、势力、制度、能力/道具规则；"
@@ -1079,6 +1083,8 @@ class NovelCandidatePostprocessWorker(NovelAnalysisWorker):
             "但已有伏笔的状态/章节发生变化时必须保留为候选，用于更新旧档案。\n"
             "3. 只保留确实需要入库或补充到已有档案的长期信息；但不要把本章主要行动人物、冲突人物、造成长期结果的人物当作普通流水账删掉。"
             "普通章节行动、临时情绪、一次性互动、调查过程和流水账不要进入人物备注或设定说明。\n"
+            "对于已有主角/高频人物，characters.notes 只允许保留新增且长期有效的人物档案变化；"
+            "如果候选只是本章行动、临时判断、短暂情绪、重复性性格表现，或已有备注/身份/目标/秘密/语言风格的同义复述，必须清空 notes 或删除该人物候选。\n"
             "3a. characters 中应保留本章直接推动剧情的人、和主角发生冲突/追杀/审问/交易/救援/试探的人、"
             "影响主角资源/去向/身份判断/后续事实的人；但 name 必须是具体人物或可复用单人称谓。"
             "可以保留“黑衣人”“蒙面女子”“白发老者”“苏家管事”等能在后文继续追踪的单个人物称谓；"
@@ -1095,6 +1101,7 @@ class NovelCandidatePostprocessWorker(NovelAnalysisWorker):
             "7. 状态不能倒退：已回收/废弃不要改回已埋或未埋；已埋不要改回未埋。\n"
             "8. 小说圣经和世界观/规则只作为查重和冲突参考，不要因为已有档案存在就自动重写；确有新增草案时才放入 project_materials。\n"
             "9. 时间线和摘要只承接全局剧情进展，避免和人物备注、设定说明重复表达同一件事。\n"
+            "10. 不要把人物备注里的临时内容转写进“本章需继承事实”；章节事实只由正文后的摘要/事实流程负责。\n"
             "JSON 结构：{\n"
             '  "characters": [{"name":"","role":"","goal":"","secret":"","voice":"","notes":""}],\n'
             '  "lore": [{"name":"","type":"地点/势力/物品/规则/术语/事件/其他","description":""}],\n'
@@ -1422,11 +1429,11 @@ class NovelChapterTitleWorker(NovelAnalysisWorker):
             "你是长篇小说章节标题编辑。请为拆分后的章节批量生成适合读者阅读的中文章节名。\n"
             "必须只输出一个合法 JSON 对象，不要 Markdown，不要解释，不要注释。\n"
             "任务边界：只起标题，不改正文，不补剧情，不总结成大纲。\n"
-            "标题要求：贴合本章核心事件、冲突或情绪转折；简洁、有小说感；避免剧透后文；"
-            "每个标题 5-20 个中文字；不要使用“本章”“章节”“无题”“续”“上”“下”等占位词；同一批内标题不能重复。\n"
-            "标题风格必须有变化：事件型、冲突型、人物抉择型、悬念型、意象型可以交替使用；"
-            "相邻章节不要使用同一语法模板、同一尾词或同一意象，不要连续写成“X里的Y”“X前的Y”“X之下的Y”“X与Y”等同款结构。\n"
-            "每个输入章节会提供 style_hint，它只是帮助你打散标题样式；输出 title 不要写出 style_hint 标签。\n"
+            "标题要求：优先根据本章正文里最有辨识度的事件、冲突、选择、转折或线索自然起名；简洁、可读，避免剧透后文；"
+            "每个标题 5-20 个中文字左右，允许在标题中间使用一个中文逗号，让标题像一句自然短句；"
+            "不要使用“本章”“章节”“无题”“续”“上”“下”等占位词；同一批内标题不能重复。\n"
+            "不要刻意押韵、对仗、凑四字词、凑文学感，也不要把标题都写成同一种句式或同一种尾词。\n"
+            "相邻章节不要使用同一语法模板、同一尾词或同一意象；如果正文适合直白标题，就优先直白准确。\n"
             "如果用户内容提供了 previous_titles，请避免与这些标题同词、同结构、同节奏，尤其不要让跨批次相邻标题像同一模板改词。\n"
             "title 字段只写标题正文，不要带“第几章”和序号。\n"
             '输出结构：{"titles":[{"index":1,"title":"会议室里的选择"}]}\n'
@@ -1442,20 +1449,6 @@ class NovelChapterTitleWorker(NovelAnalysisWorker):
             return text
         return text[:edge_chars].rstrip() + "\n...\n" + text[-edge_chars:].lstrip()
 
-    def _title_style_hint(self, index):
-        hints = (
-            "事件型：抓本章最关键动作或事件，不要写成地点+抽象名词。",
-            "冲突型：突出本章对抗、压力或矛盾升级。",
-            "人物抉择型：突出人物做出的选择、立场或关系变化。",
-            "悬念型：突出本章留下的疑问或危险信号，但不要剧透后文。",
-            "意象型：用本章独特物件、场景或情绪意象命名，避免空泛。",
-        )
-        try:
-            index = int(index or 1)
-        except Exception:
-            index = 1
-        return hints[(max(1, index) - 1) % len(hints)]
-
     def _title_batches(self, max_chars=18000, max_count=16):
         items = []
         for index, chap in enumerate(self.chapters, 1):
@@ -1465,7 +1458,6 @@ class NovelChapterTitleWorker(NovelAnalysisWorker):
             item = {
                 "index": index,
                 "current_title": str(chap.get("title", "") or f"第 {index} 章").strip(),
-                "style_hint": self._title_style_hint(index),
                 "excerpt": self._chapter_excerpt(text),
             }
             items.append(item)
@@ -1498,9 +1490,9 @@ class NovelChapterTitleWorker(NovelAnalysisWorker):
             },
             "previous_titles": previous_titles[-8:],
             "标题差异化要求": [
-                "优先让标题体现本章独有事件、冲突、抉择、悬念或意象。",
-                "相邻标题不要使用同一结构；如果上一章是“X里的Y”，下一章就换成动作型、抉择型或悬念型。",
-                "不要为了统一风格把每章都写成相同字数、相同尾词或相同语气。",
+                "优先让标题来自本章正文独有内容，不要套固定标题模板。",
+                "相邻标题不要使用同一结构、同一尾词、同一意象或同一语气。",
+                "不要为了统一风格把每章都写成押韵、对仗、同字数或同款文学化标题。",
             ],
             "待命名章节": batch,
         }
@@ -1817,10 +1809,12 @@ class NovelWritingWorker(QThread):
             return common + (
                 "\n摘要要求：只提炼已经在正文中发生、后续必须继承的事实。"
                 "语言短而明确，不评价、不解释创作意图，不新增正文里没有发生的设定或伏笔。"
-                "本章摘要保持简短，关键事实按完整事实逐条写；只保留会影响后文续写的变化。"
+                "本章摘要保持简短，只概括核心事件和情绪转折；本章需继承的关键事实写成连续性备忘录，不写剧情复述。"
+                "必须保留所有会影响后文续写的变化，包括人物关系、伤势、物品归属、地点、线索、伏笔状态和情绪关系变化。"
                 "章节结尾的时间、天气、地点、人物位置、身体状态、持有物品和未完成动作属于必须继承的信息；"
                 "如果正文收尾写明雨停、雨后、天亮、转场、离开、抵达、昏迷、受伤、持有/交出物品等状态，必须写入关键事实。"
-                "不要为了固定句数或条数删掉人物关系、伤势、物品、地点、线索、伏笔状态等必须继承的信息。"
+                "同一件事的背景、判断、结果尽量合并成一条完整事实；删掉过程描写、氛围描述、重复解释和创作建议。"
+                "不设固定条数，不因为压缩删除重要事实；目标是事实完整、表达短。"
             )
         return common + (
             "\n改编要求：保留原内容的核心事件、情绪推进、人物动机、空间关系和因果链；"
@@ -1858,13 +1852,14 @@ class NovelWritingWorker(QThread):
             ),
             "summary": (
                 "你是长篇小说连续性编辑。请基于当前章节正文提炼本章摘要。\n"
-                "要求：同时参考当前章节提纲和正文草稿；记录已经发生且后续必须继承的事实，"
+                "要求：章节提纲只作辅助，必须以正文草稿为事实来源；记录已经发生且后续必须继承的事实，"
                 "包括人物关系、线索、伏笔、伤势、物品、地点变化和情绪关系变化；不要评价。"
                 "本章摘要保持简短，只概括核心事件和情绪转折。"
-                "关键事实逐条写，每条只写一个可继承事实，删掉背景解释、重复信息和创作建议；"
+                "本章需继承的关键事实写成连续性备忘录，不写剧情复述；"
+                "同一件事的背景、判断、结果尽量合并成一条完整事实，删掉过程描写、氛围描述、重复解释和创作建议；"
                 "章节结尾的时间、天气、地点、人物位置、身体状态、持有物品和未完成动作必须进入关键事实，"
                 "尤其是雨停/雨后、天亮/入夜、离开/抵达、受伤/昏迷、物品交接等会影响下一章开头的状态；"
-                "条数不固定，重要连续性事实必须保留，不要为了压缩删掉会影响后文的变化。"
+                "不设固定条数，重要连续性事实必须保留，不要为了压缩删掉会影响后文的变化；目标是事实完整、表达短。"
                 "请严格输出三段：本章摘要：...；本章需继承的关键事实：...；"
                 "本章关联人物：人物A、人物B（只列本章实际出现或被直接推动的人物；优先使用人物卡里的具体姓名，不要只写主角/反派/配角；没有则写无）"
             ),
@@ -2093,6 +2088,8 @@ class NovelChapterPlanWorker(NovelAnalysisWorker):
         target_words,
         average_chapter_words,
         chapter_count,
+        total_chapter_count=None,
+        existing_chapter_count=0,
         proxy_url="",
         proxy_mode="不使用代理",
     ):
@@ -2108,6 +2105,8 @@ class NovelChapterPlanWorker(NovelAnalysisWorker):
         self.target_words = max(1, int(target_words or 1))
         self.average_chapter_words = max(1, int(average_chapter_words or 3000))
         self.chapter_count = max(1, int(chapter_count or 1))
+        self.total_chapter_count = max(1, int(total_chapter_count or self.chapter_count))
+        self.existing_chapter_count = max(0, int(existing_chapter_count or 0))
 
     def _analysis_prompt(self):
         return (
@@ -2115,12 +2114,18 @@ class NovelChapterPlanWorker(NovelAnalysisWorker):
             "必须只输出一个合法 JSON 对象，不要 Markdown，不要解释，不要注释，不要尾随逗号。\n"
             "规划目标：先保证主线可控、章节功能明确、伏笔分配合理，再兼顾标题吸引力。\n"
             f"目标总字数约 {self.target_words} 字，单章目标约 {self.average_chapter_words} 字，"
-            f"请输出 {self.chapter_count} 章。若剧情结构需要微调，仍尽量贴近该章节数量。\n"
+            f"全书预计约 {self.total_chapter_count} 章，已有 {self.existing_chapter_count} 章，"
+            f"本次请输出 {self.chapter_count} 章。若剧情结构需要微调，仍尽量贴近该章节数量。\n"
             "每章都要有明确作用，避免重复水章节；不要提前回收后期伏笔，不要擅自推翻小说圣经和世界规则。\n"
+            "请按规划出的总章节数分三阶段控制节奏：前 10% 章节为“强钩子阶段”，必须全程高能、快速立人设、抛冲突、留悬念，禁止低效铺垫；"
+            "中间 70% 章节为“主线扩展阶段”，保持高密度推进，扩展主线、人物关系、势力结构、世界规则和伏笔；"
+            "后 20% 章节为“收束升级阶段”，减少无关新增，优先推进已有主线、回收伏笔、兑现人物选择、升级最终冲突。\n"
             "title 只写章节名，不要带“第几章”和序号；target_words 写数字字符串。\n"
             "outline 要写成可直接用于扩写正文的章节提纲，包含本章目标、必须发生、冲突转折、伏笔动作和结尾钩子。\n"
+            "每章必须填写 narrative_stage/chapter_function/conflict_intensity/setup_ratio/character_task/mainline_task/foreshadow_task/ending_hook。"
+            "narrative_stage 只能从“强钩子阶段”“主线扩展阶段”“收束升级阶段”中选择。\n"
             "characters/settings/foreshadows 只填本章实际相关项，没有则用空数组。\n"
-            'JSON 结构：{"summary":"","chapters":[{"index":1,"title":"","target_words":"3000","outline":"","characters":[],"settings":[],"foreshadows":[],"ending_hook":"","forbidden":""}]}\n'
+            'JSON 结构：{"summary":"","chapters":[{"index":1,"title":"","target_words":"3000","narrative_stage":"","chapter_function":"","conflict_intensity":"","setup_ratio":"","character_task":"","mainline_task":"","foreshadow_task":"","outline":"","characters":[],"settings":[],"foreshadows":[],"ending_hook":"","forbidden":""}]}\n'
             "chapters 数量必须尽量等于请求章节数，index 从 1 连续递增。"
         )
 
@@ -2156,6 +2161,31 @@ class NovelChapterPlanWorker(NovelAnalysisWorker):
             return match.group(0)
         return str(self.average_chapter_words)
 
+    def _stage_for_index(self, index):
+        try:
+            index = int(index or 1)
+        except Exception:
+            index = 1
+        absolute_index = max(1, self.existing_chapter_count + index)
+        total = max(1, self.total_chapter_count)
+        opening_end = max(1, int(total * 0.10 + 0.9999))
+        expansion_end = max(opening_end, int(total * 0.80 + 0.9999))
+        if absolute_index <= opening_end:
+            return "强钩子阶段"
+        if absolute_index <= expansion_end:
+            return "主线扩展阶段"
+        return "收束升级阶段"
+
+    def _normalize_stage_text(self, value, index):
+        text = str(value or "").strip()
+        if "强钩子" in text or "开局" in text:
+            return "强钩子阶段"
+        if "收束" in text or "升级" in text or "高潮" in text:
+            return "收束升级阶段"
+        if "扩展" in text or "主线" in text or "中段" in text:
+            return "主线扩展阶段"
+        return self._stage_for_index(index)
+
     def _outline_from_item(self, item):
         item = item if isinstance(item, dict) else {}
         outline = str(item.get("outline", "") or "").strip()
@@ -2163,6 +2193,13 @@ class NovelChapterPlanWorker(NovelAnalysisWorker):
             return outline
         parts = []
         field_labels = (
+            ("所属阶段", "narrative_stage"),
+            ("本章功能", "chapter_function"),
+            ("冲突强度", "conflict_intensity"),
+            ("铺垫比例", "setup_ratio"),
+            ("人物任务", "character_task"),
+            ("主线任务", "mainline_task"),
+            ("伏笔任务", "foreshadow_task"),
             ("本章目标", "goal"),
             ("核心事件", "main_event"),
             ("核心冲突", "conflict"),
@@ -2203,10 +2240,18 @@ class NovelChapterPlanWorker(NovelAnalysisWorker):
             outline = self._outline_from_item(item)
             if not outline:
                 outline = f"本章目标：推进「{title}」相关剧情。\n\n结尾钩子：为下一章留下明确推进点。"
+            narrative_stage = self._normalize_stage_text(item.get("narrative_stage", "") or item.get("stage", "") or item.get("所属阶段", ""), index)
             normalized.append({
                 "index": index,
                 "title": title,
                 "target_words": self._target_words_text(item.get("target_words", "")),
+                "narrative_stage": narrative_stage,
+                "chapter_function": str(item.get("chapter_function", "") or item.get("本章功能", "") or "").strip(),
+                "conflict_intensity": str(item.get("conflict_intensity", "") or item.get("冲突强度", "") or "").strip(),
+                "setup_ratio": str(item.get("setup_ratio", "") or item.get("铺垫比例", "") or "").strip(),
+                "character_task": str(item.get("character_task", "") or item.get("人物任务", "") or "").strip(),
+                "mainline_task": str(item.get("mainline_task", "") or item.get("主线任务", "") or "").strip(),
+                "foreshadow_task": str(item.get("foreshadow_task", "") or item.get("伏笔任务", "") or "").strip(),
                 "outline": outline,
                 "characters": self._string_list(item.get("characters", [])),
                 "settings": self._string_list(item.get("settings", [])),
@@ -2224,6 +2269,8 @@ class NovelChapterPlanWorker(NovelAnalysisWorker):
             "target_words": self.target_words,
             "average_chapter_words": self.average_chapter_words,
             "chapter_count": self.chapter_count,
+            "total_chapter_count": self.total_chapter_count,
+            "existing_chapter_count": self.existing_chapter_count,
             "chapters": normalized,
         }
 

@@ -4249,6 +4249,23 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
                 "estimated_total_chapters": int(total_chapter_count or 0),
                 "existing_chapter_count": len(chapters),
                 "requested_new_chapters": int(requested_chapter_count or 0),
+                "stage_rules": [
+                    {
+                        "range": "前10%",
+                        "stage": "强钩子阶段",
+                        "rule": "全程高能，快速立人设、抛冲突、留悬念，禁止低效铺垫。",
+                    },
+                    {
+                        "range": "中间70%",
+                        "stage": "主线扩展阶段",
+                        "rule": "保持高密度推进，扩展主线、人物关系、势力结构、世界规则和伏笔。",
+                    },
+                    {
+                        "range": "后20%",
+                        "stage": "收束升级阶段",
+                        "rule": "减少无关新增，优先推进已有主线、回收伏笔、兑现人物选择、升级最终冲突。",
+                    },
+                ],
             },
             "meta": {
                 "title": meta.get("title", ""),
@@ -4290,7 +4307,8 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
         }
         return (
             "请根据以下 JSON 项目档案生成章节规划。只规划 requested_new_chapters 指定数量的新章节；"
-            "不要重写已有章节，不要输出正文。\n\n"
+            "不要重写已有章节，不要输出正文。"
+            "必须按 target.stage_rules 和 estimated_total_chapters 判断每章所属阶段，并把阶段任务写入每章规划字段。\n\n"
             + json.dumps(payload, ensure_ascii=False, indent=2)
         )
 
@@ -4317,6 +4335,18 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
             if target_words:
                 heading += f"（约{target_words}字）"
             lines.extend(["", heading])
+            for label, key in (
+                ("所属阶段", "narrative_stage"),
+                ("本章功能", "chapter_function"),
+                ("冲突强度", "conflict_intensity"),
+                ("铺垫比例", "setup_ratio"),
+                ("人物任务", "character_task"),
+                ("主线任务", "mainline_task"),
+                ("伏笔任务", "foreshadow_task"),
+            ):
+                value = str(item.get(key, "") or "").strip()
+                if value:
+                    lines.append(f"{label}：{value}")
             outline = str(item.get("outline", "") or "").strip()
             if outline:
                 lines.append(outline)
@@ -4338,7 +4368,22 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
 
     def _chapter_plan_outline_for_item(self, item):
         item = item if isinstance(item, dict) else {}
-        parts = [str(item.get("outline", "") or "").strip()]
+        parts = []
+        for label, key in (
+            ("所属阶段", "narrative_stage"),
+            ("本章功能", "chapter_function"),
+            ("冲突强度", "conflict_intensity"),
+            ("铺垫比例", "setup_ratio"),
+            ("人物任务", "character_task"),
+            ("主线任务", "mainline_task"),
+            ("伏笔任务", "foreshadow_task"),
+        ):
+            value = str(item.get(key, "") or "").strip()
+            if value:
+                parts.append(f"{label}：{value}")
+        outline = str(item.get("outline", "") or "").strip()
+        if outline:
+            parts.append(outline)
         for label, key in (
             ("本章涉及设定", "settings"),
             ("本章伏笔动作", "foreshadows"),
@@ -4436,6 +4481,8 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
             target_words,
             average_chapter_words,
             requested_chapter_count,
+            total_chapter_count,
+            existing_count,
             provider.get("proxy_url", ""),
             self._provider_proxy_mode(provider),
         )
@@ -4529,6 +4576,14 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
             chapter["linked_characters"] = _normalize_name_list(item.get("characters", []))
             chapter["status"] = "大纲"
             chapters.append(chapter)
+        plan_summary = str(plan.get("summary", "") or "").strip()
+        if plan_summary:
+            note_block = f"全书/阶段规划：\n{plan_summary}"
+            current_note = str(self.current_project.get("draft_note", "") or "").strip()
+            if plan_summary not in current_note:
+                self.current_project["draft_note"] = f"{current_note}\n\n{note_block}".strip() if current_note else note_block
+                if hasattr(self, "draft_note_edit"):
+                    self.draft_note_edit.setPlainText(self.current_project["draft_note"])
         self._pending_chapter_plan = {}
         if hasattr(self, "chapter_plan_apply_btn"):
             self.chapter_plan_apply_btn.setVisible(False)

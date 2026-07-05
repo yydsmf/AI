@@ -90,7 +90,14 @@ class NovelImportCandidateTests(unittest.TestCase):
             "timeline": "第一章旧案重启。",
             "summary": "赵明已经拿到缺页卷宗。",
             "characters": [
-                {"name": "赵明", "role": "主角", "goal": "查清旧案", "secret": "", "voice": "克制"},
+                {
+                    "name": "赵明",
+                    "role": "主角",
+                    "goal": "查清旧案",
+                    "secret": "",
+                    "voice": "克制",
+                    "notes": "长期追查旧案，不轻易暴露真实判断。\nAI 分析候选",
+                },
             ],
             "lore": [
                 {"name": "王城", "type": "地点", "description": "故事主舞台。"},
@@ -106,6 +113,9 @@ class NovelImportCandidateTests(unittest.TestCase):
         self.assertIn("【已有项目档案】", text)
         self.assertIn("已有主要人物", text)
         self.assertIn("赵明", text)
+        self.assertIn("已有长期备注", text)
+        self.assertIn("长期追查旧案", text)
+        self.assertNotIn("AI 分析候选", text)
         self.assertIn("已有设定库", text)
         self.assertIn("王城", text)
         self.assertIn("已有伏笔", text)

@@ -22,6 +22,7 @@ from .novel_utils import (
     _project_without_private_notes,
     _record_alias_keys,
     _select_lines_by_char_budget,
+    _stable_character_notes_context,
     _stable_foreshadow_description_context,
     _story_order_from_text,
 )
@@ -1361,6 +1362,9 @@ def _candidate_analysis_dossier_text(project):
             for key in ("role", "goal", "secret", "voice")
             if str(item.get(key, "") or "").strip()
         )
+        notes = _clip_context_text(_stable_character_notes_context(item.get("notes", "")), 180)
+        if notes:
+            detail = f"{detail}｜已有长期备注：{notes}" if detail else f"已有长期备注：{notes}"
         character_lines.append(f"- {name}｜{detail}" if detail else f"- {name}")
     if character_lines:
         context_parts.append(

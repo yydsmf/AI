@@ -2706,13 +2706,21 @@ class NovelWritingStateTests(unittest.TestCase):
         existing = _new_chapter(0)
         existing["title"] = "旧第一章"
         tab = NovelWritingTab.__new__(NovelWritingTab)
-        tab.current_project = {"chapters": [existing]}
+        tab.current_project = {"chapters": [existing], "draft_note": "旧全局备注"}
         tab.current_chapter_index = 0
         tab._pending_chapter_plan = {
+            "summary": "第一卷先立住主线，前十章持续高能推进。",
             "chapters": [
                 {
                     "title": "风雨入城",
                     "target_words": "3200",
+                    "narrative_stage": "强钩子阶段",
+                    "chapter_function": "开局爆点",
+                    "conflict_intensity": "高",
+                    "setup_ratio": "低，只允许事件中带出",
+                    "character_task": "快速建立陈景川行动风格",
+                    "mainline_task": "进入京城主线冲突",
+                    "foreshadow_task": "埋下风雨信号",
                     "outline": "本章目标：主角进入京城。",
                     "characters": ["陈景川"],
                     "settings": ["景辰总部"],
@@ -2724,6 +2732,7 @@ class NovelWritingStateTests(unittest.TestCase):
         }
         tab.chapter_plan_apply_btn = _FakeButton()
         tab.chapter_ai_preview = _FakePlainTextEdit("规划预览")
+        tab.draft_note_edit = _FakePlainTextEdit("旧全局备注")
         selected = []
         scheduled = []
         statuses = []
@@ -2741,11 +2750,22 @@ class NovelWritingStateTests(unittest.TestCase):
         self.assertEqual(appended["title"], "风雨入城")
         self.assertEqual(appended["draft_words"], "3200")
         self.assertEqual(appended["linked_characters"], ["陈景川"])
+        self.assertIn("所属阶段：强钩子阶段", appended["outline"])
+        self.assertIn("本章功能：开局爆点", appended["outline"])
+        self.assertIn("冲突强度：高", appended["outline"])
+        self.assertIn("铺垫比例：低，只允许事件中带出", appended["outline"])
+        self.assertIn("人物任务：快速建立陈景川行动风格", appended["outline"])
+        self.assertIn("主线任务：进入京城主线冲突", appended["outline"])
+        self.assertIn("伏笔任务：埋下风雨信号", appended["outline"])
         self.assertIn("本章目标：主角进入京城。", appended["outline"])
         self.assertIn("本章涉及设定：景辰总部", appended["outline"])
         self.assertIn("本章伏笔动作：F0001 风雨信号", appended["outline"])
         self.assertIn("结尾钩子：旧案卷宗出现。", appended["outline"])
         self.assertIn("禁止/边界：不要提前揭晓幕后人。", appended["outline"])
+        self.assertIn("旧全局备注", tab.current_project["draft_note"])
+        self.assertIn("全书/阶段规划：", tab.current_project["draft_note"])
+        self.assertIn("第一卷先立住主线", tab.current_project["draft_note"])
+        self.assertEqual(tab.draft_note_edit.toPlainText(), tab.current_project["draft_note"])
         self.assertEqual(selected, [1])
         self.assertEqual(scheduled, [True])
         self.assertFalse(tab.chapter_plan_apply_btn.visible)
@@ -2772,6 +2792,11 @@ class NovelWritingStateTests(unittest.TestCase):
         self.assertEqual(requested_count, 66)
         self.assertIn('"existing_chapter_count": 1', context)
         self.assertIn('"requested_new_chapters": 66', context)
+        self.assertIn('"stage_rules"', context)
+        self.assertIn("强钩子阶段", context)
+        self.assertIn("主线扩展阶段", context)
+        self.assertIn("收束升级阶段", context)
+        self.assertIn("必须按 target.stage_rules", context)
         self.assertIn("雨后，众人离开总部。", context)
         self.assertIn("不要重写已有章节", context)
         self.assertNotIn("私有备注锚点", context)

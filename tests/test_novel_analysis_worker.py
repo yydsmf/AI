@@ -14,7 +14,7 @@ from gpt_desktop.workers import (
 
 class NovelAnalysisWorkerTests(unittest.TestCase):
     def test_chapter_plan_worker_normalizes_structured_plan(self):
-        worker = NovelChapterPlanWorker("http://example.test", "key", "model", "context", 200000, 3000, 2)
+        worker = NovelChapterPlanWorker("http://example.test", "key", "model", "context", 200000, 3000, 2, 20)
 
         plan = worker._normalize_plan({
             "summary": "第一卷先立主线。",
@@ -40,15 +40,18 @@ class NovelAnalysisWorkerTests(unittest.TestCase):
         })
 
         self.assertEqual(plan["chapter_count"], 2)
+        self.assertEqual(plan["total_chapter_count"], 20)
+        self.assertEqual(plan["existing_chapter_count"], 0)
         self.assertEqual([chapter["index"] for chapter in plan["chapters"]], [1, 2])
         self.assertEqual(plan["chapters"][0]["title"], "初到")
+        self.assertEqual(plan["chapters"][0]["narrative_stage"], "强钩子阶段")
         self.assertIn("收到通知", plan["chapters"][0]["outline"])
         self.assertEqual(plan["chapters"][1]["title"], "风雨入城")
         self.assertEqual(plan["chapters"][1]["target_words"], "3200")
         self.assertEqual(plan["chapters"][1]["characters"], ["陈景川", "林晚"])
 
     def test_chapter_plan_prompt_requires_json_and_chapter_count(self):
-        worker = NovelChapterPlanWorker("http://example.test", "key", "model", "context", 200000, 3000, 67)
+        worker = NovelChapterPlanWorker("http://example.test", "key", "model", "context", 200000, 3000, 67, 67)
 
         prompt = worker._analysis_prompt()
 
@@ -56,6 +59,42 @@ class NovelAnalysisWorkerTests(unittest.TestCase):
         self.assertIn("请输出 67 章", prompt)
         self.assertIn("不要擅自推翻小说圣经和世界规则", prompt)
         self.assertIn("outline 要写成可直接用于扩写正文的章节提纲", prompt)
+        self.assertIn("前 10%", prompt)
+        self.assertIn("中间 70%", prompt)
+        self.assertIn("后 20%", prompt)
+        self.assertIn("narrative_stage", prompt)
+        self.assertIn("chapter_function", prompt)
+
+    def test_chapter_plan_stage_uses_existing_chapters_when_appending(self):
+        worker = NovelChapterPlanWorker(
+            "http://example.test",
+            "key",
+            "model",
+            "context",
+            300000,
+            3000,
+            1,
+            total_chapter_count=100,
+            existing_chapter_count=85,
+        )
+
+        plan = worker._normalize_plan({
+            "chapters": [
+                {
+                    "index": 1,
+                    "title": "终局前夜",
+                    "outline": "主角进入最终对抗前夜。",
+                    "chapter_function": "终局压力升级",
+                    "conflict_intensity": "极高",
+                }
+            ],
+        })
+
+        self.assertEqual(plan["total_chapter_count"], 100)
+        self.assertEqual(plan["existing_chapter_count"], 85)
+        self.assertEqual(plan["chapters"][0]["narrative_stage"], "收束升级阶段")
+        self.assertEqual(plan["chapters"][0]["chapter_function"], "终局压力升级")
+        self.assertEqual(plan["chapters"][0]["conflict_intensity"], "极高")
 
     def test_chapter_plan_retry_does_not_split_context(self):
         context = "项目资料" * 1000
@@ -106,7 +145,10 @@ class NovelAnalysisWorkerTests(unittest.TestCase):
         self.assertIn("具体姓名", prompt)
         self.assertIn("不要只写主角/反派/配角", prompt)
         self.assertIn("成熟的商业小说作者兼责任编辑", prompt)
-        self.assertIn("条数不固定", prompt)
+        self.assertIn("连续性备忘录", prompt)
+        self.assertIn("不写剧情复述", prompt)
+        self.assertIn("不设固定条数", prompt)
+        self.assertIn("事实完整、表达短", prompt)
         self.assertIn("重要连续性事实必须保留", prompt)
         self.assertIn("章节结尾的时间、天气、地点、人物位置", prompt)
         self.assertIn("雨停/雨后", prompt)
@@ -312,7 +354,7 @@ class NovelAnalysisWorkerTests(unittest.TestCase):
 
         self.assertEqual(titles, ["会议室里的选择", "沉默的副创始人"])
 
-    def test_chapter_title_prompt_requires_style_diversity(self):
+    def test_chapter_title_prompt_avoids_overstyled_templates(self):
         worker = NovelChapterTitleWorker(
             "http://example.test",
             "key",
@@ -325,12 +367,32 @@ class NovelAnalysisWorkerTests(unittest.TestCase):
 
         prompt = worker._title_prompt()
 
-        self.assertIn("标题风格必须有变化", prompt)
-        self.assertIn("事件型、冲突型、人物抉择型、悬念型、意象型", prompt)
+        self.assertIn("最有辨识度的事件、冲突、选择、转折或线索", prompt)
+        self.assertIn("允许在标题中间使用一个中文逗号", prompt)
+        self.assertIn("不要刻意押韵、对仗", prompt)
+        self.assertIn("直白准确", prompt)
         self.assertIn("相邻章节不要使用同一语法模板", prompt)
         self.assertIn("previous_titles", prompt)
 
-    def test_chapter_title_batch_includes_style_hints_and_previous_titles(self):
+    def test_chapter_title_keeps_sentence_comma_inside_title(self):
+        worker = NovelChapterTitleWorker(
+            "http://example.test",
+            "key",
+            "model",
+            "书名",
+            "玄幻",
+            "轻松",
+            [{"title": "第 1 章", "text": "正文一。"}],
+        )
+
+        titles = worker._normalize_titles_response(
+            {"titles": [{"index": 1, "title": "他要进山，先过这一关"}]},
+            [1],
+        )
+
+        self.assertEqual(titles, ["他要进山，先过这一关"])
+
+    def test_chapter_title_batch_omits_style_hints_and_includes_previous_titles(self):
         worker = NovelChapterTitleWorker(
             "http://example.test",
             "key",
@@ -345,12 +407,13 @@ class NovelAnalysisWorkerTests(unittest.TestCase):
         batches = worker._title_batches(max_chars=5000, max_count=10)
         text = worker._user_text_for_batch(batches[0])
 
-        self.assertIn("style_hint", text)
-        self.assertIn("事件型", text)
-        self.assertIn("冲突型", text)
+        self.assertNotIn("style_hint", text)
+        self.assertNotIn("事件型", text)
+        self.assertNotIn("冲突型", text)
         self.assertIn("previous_titles", text)
         self.assertIn("会议室里的选择", text)
-        self.assertIn("相邻标题不要使用同一结构", text)
+        self.assertIn("不要套固定标题模板", text)
+        self.assertIn("押韵、对仗", text)
 
     def test_chapter_title_worker_requires_missing_titles_but_allows_quality_variation(self):
         worker = NovelChapterTitleWorker(
@@ -543,6 +606,9 @@ class NovelAnalysisWorkerTests(unittest.TestCase):
         self.assertIn("已有项目档案", prompt)
         self.assertIn("同名、别称或同一线索不要重复新增", prompt)
         self.assertIn("长期有效的人物变化才写入已有人物 notes", prompt)
+        self.assertIn("主角或高频人物的 notes 更要克制", prompt)
+        self.assertIn("只有确实改变长期人物档案的新状态才输出", prompt)
+        self.assertIn("也不要转写到本章需继承事实", prompt)
         self.assertIn("人物提取不要只保留主角", prompt)
         self.assertIn("本章实际出场并直接推动剧情的人物", prompt)
         self.assertIn("造成主角资源、去向、身份判断或后续事实变化的人物", prompt)
@@ -555,6 +621,9 @@ class NovelAnalysisWorkerTests(unittest.TestCase):
         self.assertIn("即使他们推动了本章剧情，也只把他们造成的剧情影响放入 timeline、summary 或 foreshadows.description", prompt)
         self.assertIn("只围观/传话/完成一次普通动作且不影响后续的人物可以不提取", prompt)
         self.assertIn("普通章节行动、临时情绪、一次性互动", prompt)
+        self.assertIn("已有主角/高频人物", prompt)
+        self.assertIn("已有备注的同义复述", prompt)
+        self.assertIn("章节事实只由正文后的摘要/事实流程负责", prompt)
         self.assertIn("稳定设定变化才写入 lore.description", prompt)
         self.assertIn("本章出现、追问、调查、发送、发现线索、谁去问谁等临时推进", prompt)
         self.assertIn("characters 要求：在满足具体人物或可复用单人称谓的前提下", prompt)

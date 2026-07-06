@@ -66,7 +66,7 @@ class WindowsUpdateWorker(QThread):
             return
         try:
             subprocess.run(
-                ["taskkill", "/F", "/T", "/PID", str(self.parent_pid)],
+                ["taskkill", "/F", "/PID", str(self.parent_pid)],
                 capture_output=True,
                 timeout=10,
                 creationflags=int(getattr(subprocess, "CREATE_NO_WINDOW", 0)),
@@ -82,7 +82,7 @@ class WindowsUpdateWorker(QThread):
             return
         try:
             subprocess.run(
-                ["taskkill", "/F", "/T", "/IM", app_exe],
+                ["taskkill", "/F", "/IM", app_exe],
                 capture_output=True,
                 timeout=10,
                 creationflags=int(getattr(subprocess, "CREATE_NO_WINDOW", 0)),

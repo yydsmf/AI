@@ -4532,19 +4532,14 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
                 900,
                 keep_tail_fields={"description"},
             ),
-            "foreshadows": self._chapter_plan_records(
-                project.get("foreshadow_items", []),
-                ("code", "name", "status", "setup_chapter", "payoff_chapter", "description"),
-                180,
-                900,
-                keep_tail_fields={"description"},
-            ),
             "existing_chapters": existing_chapters,
         }
         return (
             "请根据以下 JSON 项目档案生成章节规划。只规划 requested_new_chapters 指定数量的新章节；"
             "不要重写已有章节，不要输出正文。"
             "必须按 target.stage_rules 和 estimated_total_chapters 判断每章所属阶段，并把阶段任务写入每章规划字段。\n\n"
+            "注意：章节规划只安排主线、人物任务、阶段节奏和结尾钩子，不要按伏笔编号或现有伏笔列表固定安排伏笔埋设、推进、回收；"
+            "伏笔由扩写正文时根据当时的开放伏笔动态调度。\n\n"
             + json.dumps(payload, ensure_ascii=False, indent=2)
         )
 
@@ -4578,7 +4573,6 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
                 ("铺垫比例", "setup_ratio"),
                 ("人物任务", "character_task"),
                 ("主线任务", "mainline_task"),
-                ("伏笔任务", "foreshadow_task"),
             ):
                 value = str(item.get(key, "") or "").strip()
                 if value:
@@ -4589,7 +4583,6 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
             for label, key in (
                 ("相关人物", "characters"),
                 ("相关设定", "settings"),
-                ("相关伏笔", "foreshadows"),
             ):
                 values = _normalize_name_list(item.get(key, []))
                 if values:
@@ -4612,7 +4605,6 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
             ("铺垫比例", "setup_ratio"),
             ("人物任务", "character_task"),
             ("主线任务", "mainline_task"),
-            ("伏笔任务", "foreshadow_task"),
         ):
             value = str(item.get(key, "") or "").strip()
             if value:
@@ -4622,7 +4614,6 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
             parts.append(outline)
         for label, key in (
             ("本章涉及设定", "settings"),
-            ("本章伏笔动作", "foreshadows"),
         ):
             values = _normalize_name_list(item.get(key, []))
             if values:

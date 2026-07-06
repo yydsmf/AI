@@ -2889,10 +2889,10 @@ class NovelWritingStateTests(unittest.TestCase):
         self.assertIn("铺垫比例：低，只允许事件中带出", appended["outline"])
         self.assertIn("人物任务：快速建立陈景川行动风格", appended["outline"])
         self.assertIn("主线任务：进入京城主线冲突", appended["outline"])
-        self.assertIn("伏笔任务：埋下风雨信号", appended["outline"])
+        self.assertNotIn("伏笔任务：埋下风雨信号", appended["outline"])
         self.assertIn("本章目标：主角进入京城。", appended["outline"])
         self.assertIn("本章涉及设定：景辰总部", appended["outline"])
-        self.assertIn("本章伏笔动作：F0001 风雨信号", appended["outline"])
+        self.assertNotIn("本章伏笔动作：F0001 风雨信号", appended["outline"])
         self.assertIn("结尾钩子：旧案卷宗出现。", appended["outline"])
         self.assertIn("禁止/边界：不要提前揭晓幕后人。", appended["outline"])
         self.assertIn("旧全局备注", tab.current_project["draft_note"])
@@ -2915,6 +2915,9 @@ class NovelWritingStateTests(unittest.TestCase):
             "bible": "小说圣经",
             "world_rules": "世界规则",
             "draft_note": "私有备注锚点：不能交给 AI。",
+            "foreshadow_items": [
+                {"code": "F0001", "name": "风雨信号", "status": "已埋", "description": "旧固定伏笔。"}
+            ],
             "chapters": [chapter],
         }
 
@@ -2930,8 +2933,10 @@ class NovelWritingStateTests(unittest.TestCase):
         self.assertIn("主线扩展阶段", context)
         self.assertIn("收束升级阶段", context)
         self.assertIn("必须按 target.stage_rules", context)
+        self.assertIn("不要按伏笔编号或现有伏笔列表固定安排伏笔", context)
         self.assertIn("雨后，众人离开总部。", context)
         self.assertIn("不要重写已有章节", context)
+        self.assertNotIn("风雨信号", context)
         self.assertNotIn("私有备注锚点", context)
 
 

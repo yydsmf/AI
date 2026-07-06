@@ -2,6 +2,7 @@ import os
 import sys
 import tempfile
 import unittest
+from types import SimpleNamespace
 from unittest import mock
 
 from gpt_desktop.core import _build_windows_open_after_exit_script
@@ -203,6 +204,66 @@ class UpdateCheckerTests(unittest.TestCase):
                     os.remove(path)
                 except OSError:
                     pass
+
+    def test_launch_windows_updater_uses_detached_process_flag(self):
+        asset = ReleaseAsset(name="setup.exe", url="https://download.test/setup.exe")
+        popen_calls = []
+
+        def fake_popen(*args, **kwargs):
+            popen_calls.append((args, kwargs))
+
+            class Proc:
+                pass
+
+            return Proc()
+
+        with mock.patch.object(sys, "platform", "win32"), \
+                mock.patch("gpt_desktop.update_checker.windows_updater_executable_path", return_value=r"C:\App\GPTToolboxUpdater.exe"), \
+                mock.patch("gpt_desktop.update_checker.copy_windows_updater_to_temp", return_value=r"C:\Temp\GPTToolboxUpdater.exe"), \
+                mock.patch("gpt_desktop.update_checker.os.path.exists", return_value=True), \
+                mock.patch("gpt_desktop.update_checker.subprocess.Popen", side_effect=fake_popen), \
+                mock.patch("gpt_desktop.update_checker.subprocess.CREATE_NEW_PROCESS_GROUP", 0x200, create=True), \
+                mock.patch("gpt_desktop.update_checker.subprocess.DETACHED_PROCESS", 0x8, create=True):
+            from gpt_desktop.update_checker import launch_windows_updater
+
+            self.assertTrue(launch_windows_updater(asset, parent_pid=1234))
+
+        self.assertEqual(len(popen_calls), 1)
+        _args, kwargs = popen_calls[0]
+        self.assertEqual(kwargs["creationflags"] & 0x200, 0x200)
+        self.assertEqual(kwargs["creationflags"] & 0x8, 0x8)
+
+    def test_windows_updater_kills_parent_without_killing_child_tree(self):
+        from gpt_desktop.windows_updater_app import WindowsUpdateWorker
+
+        worker = SimpleNamespace(parent_pid=1234)
+        calls = []
+
+        with mock.patch.object(sys, "platform", "win32"), \
+                mock.patch("gpt_desktop.windows_updater_app.subprocess.run", side_effect=lambda *args, **kwargs: calls.append((args, kwargs))), \
+                mock.patch("gpt_desktop.windows_updater_app.subprocess.CREATE_NO_WINDOW", 0x8000000, create=True):
+            WindowsUpdateWorker._kill_parent(worker)
+
+        self.assertEqual(len(calls), 1)
+        cmd = calls[0][0][0]
+        self.assertEqual(cmd, ["taskkill", "/F", "/PID", "1234"])
+        self.assertNotIn("/T", cmd)
+
+    def test_windows_updater_kills_app_name_without_killing_child_tree(self):
+        from gpt_desktop.windows_updater_app import WindowsUpdateWorker
+
+        worker = SimpleNamespace(app_exe="GPTLocalToolbox.exe")
+        calls = []
+
+        with mock.patch.object(sys, "platform", "win32"), \
+                mock.patch("gpt_desktop.windows_updater_app.subprocess.run", side_effect=lambda *args, **kwargs: calls.append((args, kwargs))), \
+                mock.patch("gpt_desktop.windows_updater_app.subprocess.CREATE_NO_WINDOW", 0x8000000, create=True):
+            WindowsUpdateWorker._kill_app_name(worker)
+
+        self.assertEqual(len(calls), 1)
+        cmd = calls[0][0][0]
+        self.assertEqual(cmd, ["taskkill", "/F", "/IM", "GPTLocalToolbox.exe"])
+        self.assertNotIn("/T", cmd)
 
 
 if __name__ == "__main__":

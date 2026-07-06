@@ -3106,6 +3106,43 @@ def _chapter_tooltip(chap):
     return "\n\n".join(parts)
 
 
+_STATIC_FORESHADOW_OUTLINE_LABELS = (
+    "伏笔任务",
+    "伏笔动作",
+    "本章伏笔动作",
+    "相关伏笔",
+    "本章相关伏笔",
+)
+
+
+def _strip_static_foreshadow_outline_fields(value):
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    lines = []
+    skip_list = False
+    for raw_line in text.splitlines():
+        stripped = raw_line.strip()
+        compact = re.sub(r"\s+", "", stripped)
+        is_static_label = any(
+            compact.startswith(f"{label}：") or compact.startswith(f"{label}:")
+            for label in _STATIC_FORESHADOW_OUTLINE_LABELS
+        )
+        if is_static_label:
+            tail = re.split(r"[:：]", stripped, maxsplit=1)[1] if re.search(r"[:：]", stripped) else ""
+            skip_list = not tail.strip()
+            continue
+        if skip_list:
+            if not stripped:
+                skip_list = False
+                continue
+            if stripped.startswith(("-", "•", "*", "·")) or re.match(r"^\d+[.)、．]\s*", stripped):
+                continue
+            skip_list = False
+        lines.append(raw_line)
+    return "\n".join(lines).strip()
+
+
 def _chapter_reference_line(
     index,
     chap,
@@ -3124,7 +3161,7 @@ def _chapter_reference_line(
     if key_facts:
         parts.append("关键事实：" + key_facts)
     if not parts and include_outline_fallback:
-        outline = _clip_complete_text(chap.get("outline", ""), 260)
+        outline = _clip_complete_text(_strip_static_foreshadow_outline_fields(chap.get("outline", "")), 260)
         if outline:
             parts.append("提纲：" + outline)
     if not (summary or key_facts) and text_fallback_limit:
@@ -3548,7 +3585,12 @@ def _build_open_foreshadow_queue(project, selected_items=None, limit=0, current_
     lines = _select_lines_by_char_budget(raw_lines, budget if budget > 0 else 2400, omitted_label="开放伏笔")
     if not lines:
         return ""
-    return "开放伏笔队列（未被本章命中，仅提醒，避免遗忘；不要无计划回收）：\n" + "\n".join(lines)
+    guide = (
+        "动态伏笔调度参考（开放伏笔队列；不是硬任务）：\n"
+        "请结合当前章节提纲、已发生事实、后续近章边界和人物动机，自行判断每条伏笔本章应“推进 / 回收 / 暂不处理”。\n"
+        "只有与本章核心事件自然相连时才推进或回收；不要为了凑回收率强行解释、提前揭底或改写本章主线。"
+    )
+    return guide + "\n" + "\n".join(lines)
 
 
 def _recent_chapter_context(chapters, chapter_index, window=6, project=None):
@@ -3747,13 +3789,18 @@ def _build_chapter_ai_context(project, chapter_index, action):
         raise ValueError("请先选择一个章节。")
     meta = project.get("meta", {})
     chap = chapters[chapter_index]
+    raw_chapter_outline = str(chap.get("outline", "") or "")
+    chapter_outline_for_context = (
+        _strip_static_foreshadow_outline_fields(raw_chapter_outline)
+        if action == "draft" else raw_chapter_outline
+    )
     linked_characters = chap.get("linked_characters", [])
     if not isinstance(linked_characters, list):
         linked_characters = []
     recent_context_text, recent_linked_characters = _recent_chapter_context(chapters, chapter_index, window=6, project=project)
     chapter_match_text = "\n".join([
         str(chap.get("title", "") or ""),
-        str(chap.get("outline", "") or ""),
+        chapter_outline_for_context,
         str(chap.get("text", "") or ""),
         str(chap.get("summary", "") or ""),
         str(chap.get("key_facts", "") or ""),
@@ -3871,8 +3918,10 @@ def _build_chapter_ai_context(project, chapter_index, action):
     draft_task = (
         "请根据当前章节的章节提纲和已有正文草稿续写正文。正文草稿已有内容时，只输出可以直接接在草稿末尾的新正文，"
         "不要重复、概括或改写已有正文；开头要优先承接【续写承接点】里的当前正文结尾原文。"
-        "如果章节提纲包含“所属阶段/本章功能/冲突强度/铺垫比例/人物任务/主线任务/伏笔任务/结尾钩子”，"
+        "如果章节提纲包含“所属阶段/本章功能/冲突强度/铺垫比例/人物任务/主线任务/结尾钩子”，"
         "必须优先按这些章节规划字段执行；阶段规则只控制节奏、密度和钩子，不得改写本章提纲核心事件。"
+        "旧提纲中若残留固定伏笔编号、伏笔任务或伏笔动作，只作历史文本参考，不能当作本章硬任务；"
+        "伏笔推进与回收以动态伏笔调度参考和正文自然性为准。"
         "必须继承承接点里的时间、天气、地点、人物位置、情绪和未完成动作；如果上一章写明雨已停或场景已变化，"
         "不要在下一章开头改成仍在下雨或回到旧场景，除非本章提纲明确发生了新的天气/场景变化。"
         "优先参考本章需继承的关键事实，其次参考本章摘要、前文摘要、人物目标、语言风格和世界规则。"
@@ -3895,8 +3944,10 @@ def _build_chapter_ai_context(project, chapter_index, action):
         "参考【本章写作长度】安排详略，但不要为了贴字数牺牲完整场景、冲突收束和正文质量；只输出正文内容。"
         if has_current_text else
         "请根据当前章节的章节提纲生成正文草稿。若有上一章结尾，请让开篇自然承接上一章的情绪、场景或悬念。"
-        "如果章节提纲包含“所属阶段/本章功能/冲突强度/铺垫比例/人物任务/主线任务/伏笔任务/结尾钩子”，"
+        "如果章节提纲包含“所属阶段/本章功能/冲突强度/铺垫比例/人物任务/主线任务/结尾钩子”，"
         "必须优先按这些章节规划字段执行；阶段规则只控制节奏、密度和钩子，不得改写本章提纲核心事件。"
+        "旧提纲中若残留固定伏笔编号、伏笔任务或伏笔动作，只作历史文本参考，不能当作本章硬任务；"
+        "伏笔推进与回收以动态伏笔调度参考和正文自然性为准。"
         "必须继承上一章结尾的时间、天气、地点、人物位置、情绪和未完成动作；如果上一章写明雨已停或场景已变化，"
         "不要在本章开头改成仍在下雨或回到旧场景，除非本章提纲明确发生了新的天气/场景变化。"
         "优先参考本章需继承的关键事实，其次参考本章摘要、前文摘要、人物目标、语言风格和世界规则。"
@@ -3989,7 +4040,7 @@ def _build_chapter_ai_context(project, chapter_index, action):
     if reverse_from_body:
         current_lines.append("章节提纲：已省略；本次必须仅根据正文草稿反向整理，避免旧提纲或后续规划影响结果。")
     else:
-        current_lines.append(f"章节提纲：{clean_context_text(chap.get('outline', ''), 6000)}")
+        current_lines.append(f"章节提纲：{clean_context_text(chapter_outline_for_context, 6000)}")
     current_lines.append(f"正文草稿：{_clip_context_text(chap.get('text', ''), current_text_limit, keep_tail=True)}")
     if reverse_from_body:
         current_lines.extend([

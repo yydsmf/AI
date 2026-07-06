@@ -169,7 +169,9 @@ class NovelLongFormContextTests(unittest.TestCase):
         self.assertIn("本章功能：开局爆点", context)
         self.assertIn("冲突强度：高", context)
         self.assertIn("人物任务：快速建立主角行动风格", context)
-        self.assertIn("伏笔任务：埋下风雨信号", context)
+        self.assertIn("旧提纲中若残留固定伏笔编号、伏笔任务或伏笔动作", context)
+        self.assertIn("动态伏笔调度参考", context)
+        self.assertNotIn("伏笔任务：埋下风雨信号", context)
 
     def test_global_note_is_private_and_not_in_chapter_ai_context(self):
         current = _new_chapter(0)
@@ -489,7 +491,8 @@ class NovelLongFormContextTests(unittest.TestCase):
         context = _build_chapter_ai_context(project, 0, "draft")
 
         self.assertIn("开放伏笔队列", context)
-        self.assertIn("不要无计划回收", context)
+        self.assertIn("动态伏笔调度参考", context)
+        self.assertIn("不要为了凑回收率强行解释", context)
         self.assertIn("临近回收伏笔", context)
         self.assertLess(context.index("临近回收伏笔"), context.index("普通伏笔0"))
 

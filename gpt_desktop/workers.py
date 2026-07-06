@@ -1842,8 +1842,8 @@ class NovelWritingWorker(QThread):
                 "必须继承承接点里的时间、天气、地点、人物位置、身体状态、持有物品和未完成动作；"
                 "如果上一章写明雨已停、雨后或场景已变化，不要在下一章开头改成仍在下雨或回到旧场景，除非本章提纲明确发生新的天气/场景变化；"
                 "严格继承资料中的关键事实、时间线、人物目标、语言风格、伏笔状态和世界规则；"
-                "只有【本章相关伏笔】里被本章标题、提纲或正文目标命中的伏笔，才可以在本章推进或回收；"
-                "【开放伏笔队列】只用于提醒不要遗忘，除非当前章节明确安排，否则不要提前兑现或解释队列里的伏笔；"
+                "参考【本章相关伏笔】里的已命中伏笔和动态伏笔调度参考，由你判断本章可自然推进、回收或暂不处理的伏笔；"
+                "开放伏笔队列不是硬任务，不要为了回收而破坏本章提纲、当前场景和人物动机；后段收束时应优先减少自然可回收的悬置伏笔；"
                 "参考【长篇进度 / 节奏】控制本章推进密度，避免开篇过早揭底、中段原地反复、后段新增大坑；"
                 "参考【本章写作长度】里的本次新增正文目标安排详略，它是质量优先的参考目标，不是硬性字数要求；"
                 "优先保证完整小场景、冲突收束和正文质量，不要为了贴字数截断或省略关键结尾；"
@@ -2112,20 +2112,22 @@ class NovelChapterPlanWorker(NovelAnalysisWorker):
         return (
             "你是长篇小说总纲与章节规划编辑。请根据用户提供的项目档案，为整本小说生成章节规划。\n"
             "必须只输出一个合法 JSON 对象，不要 Markdown，不要解释，不要注释，不要尾随逗号。\n"
-            "规划目标：先保证主线可控、章节功能明确、伏笔分配合理，再兼顾标题吸引力。\n"
+            "规划目标：先保证主线可控、章节功能明确、阶段节奏清楚，再兼顾标题吸引力。\n"
             f"目标总字数约 {self.target_words} 字，单章目标约 {self.average_chapter_words} 字，"
             f"全书预计约 {self.total_chapter_count} 章，已有 {self.existing_chapter_count} 章，"
             f"本次请输出 {self.chapter_count} 章。若剧情结构需要微调，仍尽量贴近该章节数量。\n"
             "每章都要有明确作用，避免重复水章节；不要提前回收后期伏笔，不要擅自推翻小说圣经和世界规则。\n"
+            "不要按伏笔编号、旧伏笔列表或现有早期伏笔为章节固定安排埋设、推进或回收；"
+            "伏笔由后续扩写正文和正文分析根据实际内容动态处理。若需要悬念，只写自然剧情信息变化，不写固定伏笔任务。\n"
             "请按规划出的总章节数分三阶段控制节奏：前 10% 章节为“强钩子阶段”，必须全程高能、快速立人设、抛冲突、留悬念，禁止低效铺垫；"
             "中间 70% 章节为“主线扩展阶段”，保持高密度推进，扩展主线、人物关系、势力结构、世界规则和伏笔；"
             "后 20% 章节为“收束升级阶段”，减少无关新增，优先推进已有主线、回收伏笔、兑现人物选择、升级最终冲突。\n"
             "title 只写章节名，不要带“第几章”和序号；target_words 写数字字符串。\n"
-            "outline 要写成可直接用于扩写正文的章节提纲，包含本章目标、必须发生、冲突转折、伏笔动作和结尾钩子。\n"
-            "每章必须填写 narrative_stage/chapter_function/conflict_intensity/setup_ratio/character_task/mainline_task/foreshadow_task/ending_hook。"
+            "outline 要写成可直接用于扩写正文的章节提纲，包含本章目标、必须发生、冲突转折和结尾钩子，不写固定伏笔编号或伏笔动作。\n"
+            "每章必须填写 narrative_stage/chapter_function/conflict_intensity/setup_ratio/character_task/mainline_task/ending_hook。"
             "narrative_stage 只能从“强钩子阶段”“主线扩展阶段”“收束升级阶段”中选择。\n"
-            "characters/settings/foreshadows 只填本章实际相关项，没有则用空数组。\n"
-            'JSON 结构：{"summary":"","chapters":[{"index":1,"title":"","target_words":"3000","narrative_stage":"","chapter_function":"","conflict_intensity":"","setup_ratio":"","character_task":"","mainline_task":"","foreshadow_task":"","outline":"","characters":[],"settings":[],"foreshadows":[],"ending_hook":"","forbidden":""}]}\n'
+            "characters/settings 只填本章实际相关项，没有则用空数组。\n"
+            'JSON 结构：{"summary":"","chapters":[{"index":1,"title":"","target_words":"3000","narrative_stage":"","chapter_function":"","conflict_intensity":"","setup_ratio":"","character_task":"","mainline_task":"","outline":"","characters":[],"settings":[],"ending_hook":"","forbidden":""}]}\n'
             "chapters 数量必须尽量等于请求章节数，index 从 1 连续递增。"
         )
 
@@ -2199,7 +2201,6 @@ class NovelChapterPlanWorker(NovelAnalysisWorker):
             ("铺垫比例", "setup_ratio"),
             ("人物任务", "character_task"),
             ("主线任务", "mainline_task"),
-            ("伏笔任务", "foreshadow_task"),
             ("本章目标", "goal"),
             ("核心事件", "main_event"),
             ("核心冲突", "conflict"),
@@ -2214,7 +2215,6 @@ class NovelChapterPlanWorker(NovelAnalysisWorker):
                 parts.append(f"{label}：{value}")
         for label, key in (
             ("必须发生", "required_events"),
-            ("伏笔动作", "foreshadows"),
             ("出场人物", "characters"),
             ("涉及设定", "settings"),
         ):
@@ -2251,11 +2251,11 @@ class NovelChapterPlanWorker(NovelAnalysisWorker):
                 "setup_ratio": str(item.get("setup_ratio", "") or item.get("铺垫比例", "") or "").strip(),
                 "character_task": str(item.get("character_task", "") or item.get("人物任务", "") or "").strip(),
                 "mainline_task": str(item.get("mainline_task", "") or item.get("主线任务", "") or "").strip(),
-                "foreshadow_task": str(item.get("foreshadow_task", "") or item.get("伏笔任务", "") or "").strip(),
+                "foreshadow_task": "",
                 "outline": outline,
                 "characters": self._string_list(item.get("characters", [])),
                 "settings": self._string_list(item.get("settings", [])),
-                "foreshadows": self._string_list(item.get("foreshadows", [])),
+                "foreshadows": [],
                 "ending_hook": str(item.get("ending_hook", "") or "").strip(),
                 "forbidden": str(item.get("forbidden", "") or "").strip(),
             })

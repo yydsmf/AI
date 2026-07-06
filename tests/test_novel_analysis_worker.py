@@ -49,6 +49,8 @@ class NovelAnalysisWorkerTests(unittest.TestCase):
         self.assertEqual(plan["chapters"][1]["title"], "风雨入城")
         self.assertEqual(plan["chapters"][1]["target_words"], "3200")
         self.assertEqual(plan["chapters"][1]["characters"], ["陈景川", "林晚"])
+        self.assertEqual(plan["chapters"][1]["foreshadow_task"], "")
+        self.assertEqual(plan["chapters"][1]["foreshadows"], [])
 
     def test_chapter_plan_prompt_requires_json_and_chapter_count(self):
         worker = NovelChapterPlanWorker("http://example.test", "key", "model", "context", 200000, 3000, 67, 67)
@@ -59,11 +61,15 @@ class NovelAnalysisWorkerTests(unittest.TestCase):
         self.assertIn("请输出 67 章", prompt)
         self.assertIn("不要擅自推翻小说圣经和世界规则", prompt)
         self.assertIn("outline 要写成可直接用于扩写正文的章节提纲", prompt)
+        self.assertIn("不写固定伏笔编号或伏笔动作", prompt)
+        self.assertIn("伏笔由后续扩写正文和正文分析根据实际内容动态处理", prompt)
         self.assertIn("前 10%", prompt)
         self.assertIn("中间 70%", prompt)
         self.assertIn("后 20%", prompt)
         self.assertIn("narrative_stage", prompt)
         self.assertIn("chapter_function", prompt)
+        self.assertNotIn('"foreshadow_task"', prompt)
+        self.assertNotIn('"foreshadows"', prompt)
 
     def test_chapter_plan_stage_uses_existing_chapters_when_appending(self):
         worker = NovelChapterPlanWorker(
@@ -664,9 +670,9 @@ class NovelAnalysisWorkerTests(unittest.TestCase):
 
         prompt = worker._action_prompt()
 
-        self.assertIn("只有【本章相关伏笔】里被本章标题、提纲或正文目标命中的伏笔", prompt)
-        self.assertIn("【开放伏笔队列】只用于提醒不要遗忘", prompt)
-        self.assertIn("不要提前兑现或解释队列里的伏笔", prompt)
+        self.assertIn("参考【本章相关伏笔】里的已命中伏笔和动态伏笔调度参考", prompt)
+        self.assertIn("开放伏笔队列不是硬任务", prompt)
+        self.assertIn("不要为了回收而破坏本章提纲", prompt)
 
     def test_analysis_chunk_user_text_injects_dossier_outside_fragment(self):
         worker = NovelAnalysisWorker(

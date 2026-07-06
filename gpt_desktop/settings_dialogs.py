@@ -843,14 +843,25 @@ class ProviderManagerDialog(QDialog):
                 "请确认安装目录中存在 GPTToolboxUpdater.exe，或点击“打开发布页”手动下载安装包。"
             )
             return
-        QMessageBox.information(
-            self,
-            "更新器已启动",
-            "独立更新器已打开。请在更新器窗口中查看下载进度。\n\n"
-            "主程序将退出，更新器会在主程序退出后打开安装包。"
-        )
+        try:
+            self.update_check_btn.setEnabled(False)
+            self.update_check_btn.setText("更新器已启动")
+        except Exception:
+            pass
         self._prepare_parent_for_shutdown(skip_force_exit=True)
+        self._close_settings_for_update()
         self._quit_application_soon()
+
+    def _close_settings_for_update(self):
+        try:
+            self.accept()
+            return
+        except Exception:
+            pass
+        try:
+            self.close()
+        except Exception:
+            pass
 
     def _prepare_parent_for_shutdown(self, **kwargs):
         try:

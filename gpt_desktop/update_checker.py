@@ -445,7 +445,7 @@ def launch_windows_updater(asset, release_url="", parent_pid=None):
     )
     try:
         flags = 0
-        for name in ("CREATE_NEW_PROCESS_GROUP",):
+        for name in ("CREATE_NEW_PROCESS_GROUP", "DETACHED_PROCESS"):
             flags |= int(getattr(subprocess, name, 0))
         subprocess.Popen(
             cmd,

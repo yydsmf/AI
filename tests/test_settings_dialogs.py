@@ -125,21 +125,22 @@ class WindowsUpdateFlowTests(unittest.TestCase):
         dialog = ProviderManagerDialog.__new__(ProviderManagerDialog)
         prepared = []
         quit_called = []
+        closed = []
         dialog._prepare_parent_for_shutdown = lambda **kwargs: prepared.append(kwargs)
+        dialog._close_settings_for_update = lambda: closed.append(True)
         dialog._quit_application_soon = lambda: quit_called.append(True)
-        infos = []
         warnings = []
 
         with mock.patch.object(settings_dialogs, "launch_windows_updater", return_value=True) as launch_mock, \
-                mock.patch.object(settings_dialogs.QMessageBox, "information", side_effect=lambda *args: infos.append(args)), \
+                mock.patch.object(settings_dialogs.QMessageBox, "information", side_effect=AssertionError("不应弹出阻塞提示框")), \
                 mock.patch.object(settings_dialogs.QMessageBox, "warning", side_effect=lambda *args: warnings.append(args)):
             asset = ReleaseAsset(name="setup.exe", url="https://download.test/setup.exe")
             dialog.start_windows_update(asset, "https://release.test")
 
         launch_mock.assert_called_once_with(asset, release_url="https://release.test")
         self.assertEqual(prepared, [{"skip_force_exit": True}])
+        self.assertEqual(closed, [True])
         self.assertEqual(quit_called, [True])
-        self.assertEqual(len(infos), 1)
         self.assertEqual(warnings, [])
 
     def test_start_windows_update_warns_when_updater_missing(self):

@@ -394,6 +394,7 @@ def default_config():
         },
         "agent": {"provider_id": "", "model": ""},
         "novel": {"provider_id": "", "model": ""},
+        "blender": {"path": "", "width": "1280", "height": "720"},
     }
 
 
@@ -454,6 +455,8 @@ def normalize_config(cfg):
         cfg["agent"] = {}
     if not isinstance(cfg.get("novel"), dict):
         cfg["novel"] = {}
+    if not isinstance(cfg.get("blender"), dict):
+        cfg["blender"] = {}
     cfg["image"].setdefault("provider_id", "")
     cfg["image"].setdefault("model", "")
     cfg["image"].setdefault("mode", "文生图")
@@ -476,6 +479,9 @@ def normalize_config(cfg):
     cfg["novel"].setdefault("model", cfg["agent"].get("model", ""))
     cfg["novel"].setdefault("candidate_analysis_concurrency", 3)
     cfg["novel"].setdefault("read_aloud_rate", "+0%")
+    cfg["blender"].setdefault("path", "")
+    cfg["blender"].setdefault("width", "1280")
+    cfg["blender"].setdefault("height", "720")
     return cfg
 
 

@@ -448,6 +448,54 @@ class NovelImportCandidateTests(unittest.TestCase):
         self.assertIn("第一章旧案重启", normalized["project_materials"]["timeline"])
         self.assertIn("缺页卷宗", normalized["project_materials"]["summary"])
 
+    def test_normalize_ai_candidates_formats_numeric_foreshadow_chapters(self):
+        normalized = _normalize_ai_candidates({
+            "伏笔": [
+                {
+                    "伏笔名": "钥匙失踪",
+                    "状态": "已埋",
+                    "埋设章节": "7",
+                    "回收章节": "14",
+                    "说明": "钥匙后续揭示密室入口。",
+                }
+            ]
+        })
+
+        item = normalized["foreshadows"][0]
+        self.assertEqual(item["setup_chapter"], "第7章")
+        self.assertEqual(item["payoff_chapter"], "第14章")
+
+    def test_normalize_project_formats_numeric_foreshadow_chapters(self):
+        project = _normalize_project({
+            "foreshadow_items": [
+                {
+                    "name": "钥匙失踪",
+                    "status": "已埋",
+                    "setup_chapter": "7",
+                    "payoff_chapter": "14",
+                    "description": "钥匙后续揭示密室入口。",
+                }
+            ],
+            "import_candidates": {
+                "foreshadows": [
+                    {
+                        "name": "旧钟声",
+                        "status": "已埋",
+                        "setup_chapter": "3",
+                        "payoff_chapter": "12",
+                        "description": "钟声牵出旧案。",
+                    }
+                ]
+            },
+        })
+
+        item = project["foreshadow_items"][0]
+        candidate = project["import_candidates"]["foreshadows"][0]
+        self.assertEqual(item["setup_chapter"], "第7章")
+        self.assertEqual(item["payoff_chapter"], "第14章")
+        self.assertEqual(candidate["setup_chapter"], "第3章")
+        self.assertEqual(candidate["payoff_chapter"], "第12章")
+
     def test_normalize_ai_candidates_accepts_chinese_top_level_groups(self):
         data = {
             "人物": [
@@ -1136,8 +1184,70 @@ class NovelImportCandidateTests(unittest.TestCase):
         self.assertIn("建议状态：废弃", target["notes"])
         self.assertIn("体检建议：移出伏笔", target["notes"])
 
+    def test_foreshadow_no_need_review_action_updates_status(self):
+        project = {
+            "foreshadow_items": [
+                {
+                    "code": "F0022",
+                    "name": "白兔挂件去向",
+                    "status": "已埋",
+                    "setup_chapter": "第三章",
+                    "payoff_chapter": "",
+                    "description": "白兔挂件被短暂提到。",
+                }
+            ]
+        }
+        candidates = _normalize_ai_candidates({
+            "foreshadows": [
+                {
+                    "name": "白兔挂件去向",
+                    "description": "第十章主线已经收束，该挂件不影响主谜题、人物命运或情绪闭环。",
+                    "target_code": "F0022",
+                    "review_action": "无需回收",
+                    "evidence": "第十章 终局",
+                    "review_reason": "低价值道具线，不需要继续占用后文注意力。",
+                }
+            ]
+        })
+
+        item = candidates["foreshadows"][0]
+        self.assertEqual(item["status"], "无需回收")
+        self.assertTrue(item.get("_status_explicit"))
+
+        _apply_import_candidates(project, candidates, {"foreshadows": [0]})
+
+        target = project["foreshadow_items"][0]
+        self.assertEqual(target["status"], "无需回收")
+        self.assertEqual(target["description"], "白兔挂件被短暂提到。")
+        self.assertIn("命中编号：F0022", target["notes"])
+        self.assertIn("建议状态：无需回收", target["notes"])
+        self.assertIn("体检建议：无需回收", target["notes"])
+        self.assertIn("章节依据：第十章 终局", target["notes"])
+        self.assertIn("判断依据：低价值道具线", target["notes"])
+
+    def test_foreshadow_suggested_status_and_evidence_aliases_are_parsed(self):
+        candidates = _normalize_ai_candidates({
+            "foreshadows": [
+                {
+                    "name": "陌生短信发送者身份",
+                    "建议状态": "无需回收",
+                    "description": "短信只推动苏念转向自保，不影响主谜题闭合。",
+                    "target_code": "F0013",
+                    "证据章节": "第八章 她说不想死",
+                    "判断依据": "一次性催化线，不需要继续占用后文伏笔空间。",
+                }
+            ]
+        })
+
+        item = candidates["foreshadows"][0]
+        self.assertEqual(item["status"], "无需回收")
+        self.assertEqual(item["_target_code"], "F0013")
+        self.assertTrue(item.get("_status_explicit"))
+        self.assertIn("章节依据：第八章 她说不想死", item["description"])
+        self.assertIn("判断依据：一次性催化线", item["description"])
+
     def test_apply_import_candidates_skips_closed_foreshadow_review_target(self):
-        for closed_status in ("已回收", "废弃"):
+        for closed_status in ("已回收", "无需回收", "废弃"):
             with self.subTest(closed_status=closed_status):
                 project = {
                     "foreshadow_items": [

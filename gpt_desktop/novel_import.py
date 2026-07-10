@@ -16,6 +16,7 @@ from .novel_utils import (
     _lore_activity_stats,
     _merge_foreshadow_description_without_bloat,
     _merge_text_lines_without_duplicates,
+    _normalize_foreshadow_chapter_ref,
     _normalize_foreshadow_code,
     _normalize_name_list,
     _prepare_character_candidate,
@@ -265,6 +266,7 @@ _LOW_VALUE_DOSSIER_TEXTS = {
     "暂不影响主线",
     "已处理",
     "已回收",
+    "无需回收",
     "处理完毕",
 }
 _FORESHADOW_MERGE_TARGET_LABELS = ("合并目标", "合并到", "目标伏笔")
@@ -366,6 +368,7 @@ def _foreshadow_source_item(item, chapter_labels=None, fallback_value=""):
 
 def _foreshadow_chapter_field_source_item(item, field, value, chapter_labels=None):
     item = item if isinstance(item, dict) else {}
+    value = _normalize_foreshadow_chapter_ref(value)
     source = ""
     if field in {"setup_chapter", "payoff_chapter"}:
         source = _foreshadow_resolved_chapter_label_from_text(value, chapter_labels)
@@ -495,6 +498,8 @@ def _foreshadow_status_from_review_action(action):
     action = re.sub(r"\s+", "", str(action or ""))
     if not action:
         return ""
+    if any(term in action for term in ("无需回收", "不必回收", "不用回收", "无须回收", "不需要回收", "无需追踪")):
+        return "无需回收"
     if any(term in action for term in ("移出伏笔", "移除伏笔", "废弃", "弃用", "作废")):
         return "废弃"
     if any(term in action for term in ("已回收", "回收完成", "兑现完成")):
@@ -515,7 +520,7 @@ def _foreshadow_candidate_is_terminal_review(item):
     status = _foreshadow_status_from_review_action(status_text) or (
         _infer_foreshadow_status({"status": status_text}, preserve_manual=False) if status_text else ""
     )
-    if status in {"已回收", "废弃"}:
+    if status in {"已回收", "无需回收", "废弃"}:
         return True
     return bool(_foreshadow_status_from_review_action(_foreshadow_review_action_text(item)))
 
@@ -774,7 +779,7 @@ def _normalize_ai_candidates(data):
         attach_candidate_metadata(normalized_item, item)
         merge_into_group("lore", normalized_item)
     for item, name in valid_items("foreshadows", "伏笔", "伏笔线索", "线索", "悬念", "clues"):
-        raw_status = str(_candidate_field(item, "status", "状态", "伏笔状态") or "").strip()
+        raw_status = str(_candidate_field(item, "status", "状态", "伏笔状态", "建议状态", "suggested_status") or "").strip()
         review_action = str(_candidate_field(item, "review_action", "体检建议", "处理建议", "建议动作", "action") or "").strip()
         action_status = _foreshadow_status_from_review_action(raw_status) or _foreshadow_status_from_review_action(
             review_action or _foreshadow_review_action_text(item)
@@ -792,7 +797,7 @@ def _normalize_ai_candidates(data):
             "伏笔编号",
             "目标编号",
         ) or "").strip()
-        evidence = str(_candidate_field(item, "evidence", "依据章节", "证据", "章节依据") or "").strip()
+        evidence = str(_candidate_field(item, "evidence", "依据章节", "证据", "章节依据", "证据章节") or "").strip()
         description = str(_candidate_field(item, "description", "说明", "描述", "伏笔说明", "备注") or "AI 分析候选")
         for label, value in (
             ("体检建议", review_action),
@@ -805,8 +810,12 @@ def _normalize_ai_candidates(data):
         normalized = {
             "name": name,
             "status": normalized_status,
-            "setup_chapter": str(_candidate_field(item, "setup_chapter", "埋设章节", "铺垫章节", "出现章节", "setup") or ""),
-            "payoff_chapter": str(_candidate_field(item, "payoff_chapter", "回收章节", "兑现章节", "揭晓章节", "payoff") or ""),
+            "setup_chapter": _normalize_foreshadow_chapter_ref(
+                _candidate_field(item, "setup_chapter", "埋设章节", "铺垫章节", "出现章节", "setup")
+            ),
+            "payoff_chapter": _normalize_foreshadow_chapter_ref(
+                _candidate_field(item, "payoff_chapter", "回收章节", "兑现章节", "揭晓章节", "payoff")
+            ),
             "description": description,
         }
         if merge_target:
@@ -1025,7 +1034,7 @@ def _apply_import_candidates(project, candidates, checked):
 
     def is_closed_foreshadow_status(value):
         status = _infer_foreshadow_status({"status": value}, preserve_manual=False) if str(value or "").strip() else ""
-        return status in {"已回收", "废弃"}
+        return status in {"已回收", "无需回收", "废弃"}
 
     skipped_candidate_indexes = {}
 
@@ -1303,7 +1312,7 @@ def _rank_candidate_dossier_foreshadows(project, limit=60):
     items = project.get("foreshadow_items", [])
     items = items if isinstance(items, list) else []
     ranked = []
-    status_weight = {"已埋": 5000, "未埋": 4500, "其他": 2400, "已回收": 900, "废弃": 0}
+    status_weight = {"已埋": 5000, "未埋": 4500, "其他": 2400, "已回收": 900, "无需回收": 120, "废弃": 0}
     for index, item in enumerate(items):
         if not isinstance(item, dict):
             continue
@@ -1320,7 +1329,7 @@ def _rank_candidate_dossier_foreshadows(project, limit=60):
         desc_text = _compact_text(item.get("description", ""))
         if desc_text in {"AI分析候选", "文档导入候选", "后续处理", "待后续处理", "待回收"}:
             score -= 500
-        if status in {"已回收", "废弃"} and _is_low_value_dossier_text(desc_text):
+        if status in {"已回收", "无需回收", "废弃"} and _is_low_value_dossier_text(desc_text):
             continue
         ranked.append((-score, index if status in {"未埋", "已埋"} else -index, item))
     ranked.sort()

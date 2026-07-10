@@ -2,7 +2,13 @@ import os
 from copy import deepcopy
 
 from .core import HISTORY_DIR, load_json_file, now_str, save_json_file
-from .novel_utils import _default_project, _normalize_candidate_analysis_state, _normalize_project, _safe_name
+from .novel_utils import (
+    _body_display_len,
+    _default_project,
+    _normalize_candidate_analysis_state,
+    _normalize_project,
+    _safe_name,
+)
 
 
 NOVEL_DIR = os.path.join(HISTORY_DIR, "novel_projects")
@@ -70,7 +76,7 @@ def list_project_summaries(include_empty=False):
         for chap in chapters:
             if not isinstance(chap, dict):
                 continue
-            body_words += len(str(chap.get("text", "") or "").strip())
+            body_words += _body_display_len(chap.get("text", ""))
         records.append(
             {
                 "mtime": mtime,

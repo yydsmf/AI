@@ -3,7 +3,11 @@ import gc
 import json
 import mimetypes
 import os
+import platform
 import re
+import shutil
+import subprocess
+import tempfile
 import threading
 import time
 import uuid
@@ -15,7 +19,9 @@ import requests
 from PySide6.QtCore import QThread, Signal
 
 from .core import (
+    IMAGE_DIR,
     VIDEO_DIR,
+    _dated_image_dir,
     api_url,
     ensure_thumbnail_cache,
     extract_api_error,
@@ -42,6 +48,8 @@ from .novel_import import (
     _normalize_ai_candidates,
 )
 
+_BLENDER_PROBE_CACHE = {}
+
 
 def post_json(session, url, headers, payload, timeout, proxies=None):
     r = session.post(url, headers=headers, json=payload, timeout=timeout, proxies=proxies)
@@ -54,6 +62,932 @@ def post_json(session, url, headers, payload, timeout, proxies=None):
             r.close()
         except Exception:
             pass
+
+
+def _blender_candidate_paths(path=""):
+    candidates = []
+
+    def add_raw(raw_path):
+        raw_path = str(raw_path or "").strip().strip('"')
+        if not raw_path:
+            return
+        candidates.append(raw_path)
+        if raw_path.lower().endswith(".app") or os.path.isdir(raw_path):
+            candidates.append(os.path.join(raw_path, "Contents", "MacOS", "Blender"))
+            candidates.append(os.path.join(raw_path, "Contents", "MacOS", "blender"))
+            candidates.append(os.path.join(raw_path, "blender"))
+            candidates.append(os.path.join(raw_path, "blender.exe"))
+
+    add_raw(path)
+    add_raw(os.environ.get("BLENDER_PATH", ""))
+
+    app_roots = [
+        "/Applications",
+        os.path.expanduser("~/Applications"),
+    ]
+    for root in app_roots:
+        if not os.path.isdir(root):
+            continue
+        try:
+            app_names = sorted(os.listdir(root), reverse=True)
+        except Exception:
+            continue
+        for name in app_names:
+            if "blender" not in name.lower() or not name.lower().endswith(".app"):
+                continue
+            app_path = os.path.join(root, name)
+            candidates.append(os.path.join(app_path, "Contents", "MacOS", "Blender"))
+            candidates.append(os.path.join(app_path, "Contents", "MacOS", "blender"))
+
+    which_path = shutil.which("blender")
+    if which_path:
+        candidates.append(which_path)
+
+    if os.name == "nt":
+        program_files = [
+            os.environ.get("ProgramFiles", r"C:\Program Files"),
+            os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)"),
+        ]
+        for root in program_files:
+            if not root:
+                continue
+            blender_root = os.path.join(root, "Blender Foundation")
+            if not os.path.isdir(blender_root):
+                continue
+            try:
+                for name in sorted(os.listdir(blender_root), reverse=True):
+                    candidates.append(os.path.join(blender_root, name, "blender.exe"))
+            except Exception:
+                pass
+
+    seen = set()
+    result = []
+    for candidate in candidates:
+        candidate = os.path.abspath(os.path.expanduser(str(candidate or "").strip()))
+        if not candidate or candidate in seen:
+            continue
+        seen.add(candidate)
+        result.append(candidate)
+    return result
+
+
+def _probe_blender_executable(path):
+    if not path or not os.path.isfile(path) or not os.access(path, os.X_OK):
+        return False, "文件不存在或没有执行权限。"
+    cache_key = os.path.abspath(os.path.expanduser(path))
+    if cache_key in _BLENDER_PROBE_CACHE:
+        return _BLENDER_PROBE_CACHE[cache_key]
+    try:
+        result = subprocess.run(
+            [path, "--version"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=8,
+        )
+        if result.returncode == 0:
+            unstable_reason = _known_unstable_blender_reason(result.stdout or result.stderr or "")
+            if unstable_reason:
+                outcome = (False, unstable_reason)
+                _BLENDER_PROBE_CACHE[cache_key] = outcome
+                return outcome
+            ok, reason = _probe_blender_background_startup(path)
+            outcome = (ok, reason)
+            _BLENDER_PROBE_CACHE[cache_key] = outcome
+            return outcome
+        detail = "\n".join((result.stderr or result.stdout or "").splitlines()[-4:]).strip()
+        outcome = (False, detail or f"Blender 启动失败，退出码 {result.returncode}。")
+        _BLENDER_PROBE_CACHE[cache_key] = outcome
+        return outcome
+    except subprocess.TimeoutExpired:
+        outcome = (True, "")
+        _BLENDER_PROBE_CACHE[cache_key] = outcome
+        return outcome
+    except OSError as e:
+        outcome = (False, str(e))
+        _BLENDER_PROBE_CACHE[cache_key] = outcome
+        return outcome
+    except Exception as e:
+        outcome = (False, str(e))
+        _BLENDER_PROBE_CACHE[cache_key] = outcome
+        return outcome
+
+
+def _probe_blender_background_startup(path):
+    if platform.system() != "Darwin":
+        return True, ""
+    try:
+        result = subprocess.run(
+            [
+                path,
+                "--background",
+                "--factory-startup",
+                "--disable-crash-handler",
+                "--python-expr",
+                'print("BLENDER_PROBE_OK")',
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=12,
+        )
+    except subprocess.TimeoutExpired:
+        return False, "Blender 后台启动自检超时。"
+    except OSError as e:
+        return False, str(e)
+    except Exception as e:
+        return False, str(e)
+    if result.returncode == 0 and "BLENDER_PROBE_OK" in (result.stdout or ""):
+        return True, ""
+    detail = "\n".join((result.stderr or result.stdout or "").splitlines()[-8:]).strip()
+    reason = detail or f"Blender 后台启动自检失败，退出码 {result.returncode}。"
+    if result.returncode in (-11, 139):
+        reason = f"Blender 后台启动时崩溃。\n{reason}"
+    return False, reason
+
+
+def _parse_blender_version(version_text):
+    match = re.search(r"Blender\s+(\d+)\.(\d+)(?:\.(\d+))?", str(version_text or ""))
+    if not match:
+        return ()
+    return tuple(int(part or 0) for part in match.groups())
+
+
+def _mac_display_summary():
+    if platform.system() != "Darwin":
+        return ""
+    try:
+        result = subprocess.run(
+            ["system_profiler", "SPDisplaysDataType"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=3,
+        )
+    except Exception:
+        return ""
+    if result.returncode != 0:
+        return ""
+    lines = []
+    for line in result.stdout.splitlines():
+        stripped = line.strip()
+        if stripped.startswith(("Chipset Model:", "Metal:")):
+            lines.append(stripped)
+    return "\n".join(lines)
+
+
+def _known_unstable_blender_reason(version_text):
+    version = _parse_blender_version(version_text)
+    if not version:
+        return ""
+    if platform.system() != "Darwin" or platform.machine().lower() not in ("x86_64", "amd64"):
+        return ""
+    display = _mac_display_summary()
+    display_lower = display.lower()
+    older_intel_gpu = any(name in display_lower for name in ("intel hd graphics", "intel iris"))
+    if version >= (4, 2, 0) and older_intel_gpu:
+        version_label = ".".join(str(part) for part in version)
+        return (
+            f"当前 Blender {version_label} 在这台 Intel Mac 的图形环境下容易在 Metal 初始化阶段崩溃。\n"
+            f"{display}\n"
+            "建议安装 Blender 2.93.18 LTS 的 macOS x64/Intel 版本后再渲染分镜。"
+        )
+    return ""
+
+
+def _blender_cpu_hint(reason):
+    text = str(reason or "").lower()
+    if "bad cpu type" not in text:
+        return ""
+    machine = platform.machine().lower()
+    if machine in ("x86_64", "amd64"):
+        return "当前电脑是 Intel/x64 架构，但这个 Blender 看起来是 Apple Silicon/arm64 版。请下载 macOS x64/Intel 版本。"
+    if machine in ("arm64", "aarch64"):
+        return "当前电脑是 Apple Silicon/arm64 架构，但这个 Blender 不能在当前环境运行。请下载 macOS arm64 版本，或安装 Rosetta 后使用 x64 版本。"
+    return "这个 Blender 的架构和当前电脑不匹配，请下载对应电脑芯片的版本。"
+
+
+def _is_usable_blender_executable(path):
+    ok, _ = _probe_blender_executable(path)
+    return ok
+
+
+def blender_detection_issue(path=""):
+    for candidate in _blender_candidate_paths(path):
+        if not os.path.exists(candidate):
+            continue
+        ok, reason = _probe_blender_executable(candidate)
+        if ok:
+            continue
+        hint = _blender_cpu_hint(reason)
+        if hint:
+            reason = f"{reason}\n{hint}"
+        return f"已找到 Blender，但无法启动：\n{candidate}\n\n原因：{reason}"
+    return ""
+
+
+def resolve_blender_executable(path=""):
+    for candidate in _blender_candidate_paths(path):
+        if _is_usable_blender_executable(candidate):
+            return candidate
+    return ""
+
+
+def _blender_storyboard_script(prompt, output_path, width, height):
+    config = {
+        "prompt": str(prompt or ""),
+        "output_path": str(output_path or ""),
+        "width": int(width or 1280),
+        "height": int(height or 720),
+    }
+    config_json = json.dumps(config, ensure_ascii=False)
+    return f"""# -*- coding: utf-8 -*-
+import json
+import math
+import os
+
+import bpy
+from mathutils import Vector
+
+CONFIG = json.loads({config_json!r})
+PROMPT = str(CONFIG.get("prompt") or "")
+OUTPUT_PATH = str(CONFIG.get("output_path") or "")
+WIDTH = int(CONFIG.get("width") or 1280)
+HEIGHT = int(CONFIG.get("height") or 720)
+
+
+def has_any(words):
+    return any(word in PROMPT for word in words)
+
+
+def make_mat(name, color):
+    mat = bpy.data.materials.new(name)
+    mat.diffuse_color = color
+    return mat
+
+
+def set_mat(obj, mat):
+    obj.data.materials.append(mat)
+    return obj
+
+
+def add_cube(name, loc, scale, mat):
+    bpy.ops.mesh.primitive_cube_add(size=1, location=loc)
+    obj = bpy.context.object
+    obj.name = name
+    obj.scale = scale
+    set_mat(obj, mat)
+    return obj
+
+
+def add_cylinder(name, loc, radius, depth, mat, rotation=(0, 0, 0)):
+    bpy.ops.mesh.primitive_cylinder_add(vertices=32, radius=radius, depth=depth, location=loc, rotation=rotation)
+    obj = bpy.context.object
+    obj.name = name
+    set_mat(obj, mat)
+    return obj
+
+
+def add_sphere(name, loc, radius, mat):
+    bpy.ops.mesh.primitive_uv_sphere_add(segments=32, ring_count=16, radius=radius, location=loc)
+    obj = bpy.context.object
+    obj.name = name
+    set_mat(obj, mat)
+    return obj
+
+
+def add_label(text, loc):
+    bpy.ops.object.text_add(location=loc, rotation=(math.radians(75), 0, 0))
+    obj = bpy.context.object
+    obj.name = "角色标记 " + text
+    obj.data.body = text
+    obj.data.align_x = "CENTER"
+    obj.data.align_y = "CENTER"
+    obj.data.size = 0.28
+    set_mat(obj, MAT_DARK)
+    return obj
+
+
+def make_person(label, x, y, mat):
+    add_cylinder(label + " 身体", (x, y, 1.18), 0.22, 1.2, mat)
+    add_sphere(label + " 头部", (x, y, 1.92), 0.23, MAT_SKIN)
+    add_cylinder(label + " 左臂", (x - 0.34, y, 1.34), 0.055, 0.75, mat, rotation=(0, math.radians(72), 0))
+    add_cylinder(label + " 右臂", (x + 0.34, y, 1.34), 0.055, 0.75, mat, rotation=(0, math.radians(-72), 0))
+    add_cylinder(label + " 左腿", (x - 0.11, y, 0.42), 0.07, 0.84, MAT_DARK)
+    add_cylinder(label + " 右腿", (x + 0.11, y, 0.42), 0.07, 0.84, MAT_DARK)
+    add_label(label, (x, y - 0.42, 2.36))
+
+
+def look_at(obj, target):
+    direction = Vector(target) - obj.location
+    obj.rotation_euler = direction.to_track_quat("-Z", "Y").to_euler()
+
+
+bpy.ops.object.select_all(action="SELECT")
+bpy.ops.object.delete()
+
+scene = bpy.context.scene
+try:
+    scene.render.engine = "CYCLES"
+    scene.cycles.device = "CPU"
+    scene.cycles.samples = 16
+    scene.cycles.preview_samples = 8
+except Exception:
+    try:
+        scene.render.engine = "BLENDER_EEVEE"
+    except Exception:
+        scene.render.engine = "BLENDER_WORKBENCH"
+
+scene.render.resolution_x = WIDTH
+scene.render.resolution_y = HEIGHT
+scene.render.film_transparent = False
+scene.render.filepath = OUTPUT_PATH
+try:
+    scene.eevee.taa_render_samples = 32
+except Exception:
+    pass
+try:
+    scene.view_settings.view_transform = "Filmic"
+    scene.view_settings.look = "Medium High Contrast"
+    scene.view_settings.exposure = 0
+    scene.view_settings.gamma = 1
+except Exception:
+    pass
+
+MAT_FLOOR = make_mat("冷灰地面", (0.32, 0.35, 0.38, 1))
+MAT_WALL = make_mat("背景墙", (0.18, 0.22, 0.27, 1))
+MAT_TABLE = make_mat("桌面", (0.30, 0.20, 0.13, 1))
+MAT_BLUE = make_mat("角色A 蓝", (0.10, 0.38, 0.86, 1))
+MAT_RED = make_mat("角色B 红", (0.78, 0.18, 0.15, 1))
+MAT_GREEN = make_mat("角色C 绿", (0.12, 0.55, 0.28, 1))
+MAT_PURPLE = make_mat("角色D 紫", (0.46, 0.26, 0.72, 1))
+MAT_GOLD = make_mat("角色E 金", (0.90, 0.62, 0.12, 1))
+MAT_SKIN = make_mat("头部", (0.88, 0.70, 0.55, 1))
+MAT_DARK = make_mat("深色标记", (0.04, 0.05, 0.07, 1))
+
+add_cube("地面", (0, 0, -0.03), (4.8, 4.2, 0.03), MAT_FLOOR)
+add_cube("后墙", (0, 2.1, 1.55), (4.8, 0.05, 1.6), MAT_WALL)
+add_cube("左侧景片", (-2.4, 0, 1.05), (0.05, 2.1, 1.1), MAT_WALL)
+
+is_meeting = has_any(["会议", "桌", "办公室", "审讯", "谈判", "董事会"])
+is_door = has_any(["门口", "推门", "进门", "门"])
+if is_meeting:
+    add_cube("会议桌", (0, 0.45, 0.62), (1.5, 0.58, 0.12), MAT_TABLE)
+    add_cube("桌脚一", (-1.1, 0.1, 0.28), (0.08, 0.08, 0.28), MAT_DARK)
+    add_cube("桌脚二", (1.1, 0.1, 0.28), (0.08, 0.08, 0.28), MAT_DARK)
+if is_door:
+    add_cube("门框", (-1.95, 1.92, 1.15), (0.34, 0.08, 1.15), MAT_TABLE)
+
+count = 2
+if has_any(["独自", "一个人", "单人"]):
+    count = 1
+elif has_any(["三人", "三名", "三个人", "三位"]):
+    count = 3
+elif has_any(["四人", "四名", "四个人", "四位"]):
+    count = 4
+elif has_any(["众人", "多人", "人群", "两侧", "会议室"]):
+    count = 5
+
+positions = [(-0.85, -0.4), (0.85, -0.25), (0.0, 0.8), (-1.45, 0.65), (1.45, 0.65)]
+materials = [MAT_BLUE, MAT_RED, MAT_GREEN, MAT_PURPLE, MAT_GOLD]
+for idx in range(count):
+    x, y = positions[idx]
+    make_person(chr(ord("A") + idx), x, y, materials[idx])
+
+if has_any(["对峙", "冲突", "压迫", "审讯", "质问"]):
+    add_cube("冲突焦点线", (0, -0.05, 0.04), (1.7, 0.025, 0.025), MAT_GOLD)
+
+bpy.ops.object.light_add(type="AREA", location=(0, -2.3, 4.2))
+light = bpy.context.object
+light.name = "主光"
+light.data.energy = 550
+light.data.size = 4
+
+bpy.ops.object.camera_add(location=(0, -6.4, 2.45))
+camera = bpy.context.object
+if has_any(["低角度", "仰拍", "压迫感"]):
+    camera.location = (0, -6.2, 1.25)
+    camera.data.lens = 30
+elif has_any(["俯拍", "顶拍"]):
+    camera.location = (0, -4.8, 6.2)
+    camera.data.lens = 28
+elif has_any(["侧面", "侧拍"]):
+    camera.location = (4.8, -3.2, 2.2)
+    camera.data.lens = 36
+else:
+    camera.data.lens = 34
+look_at(camera, (0, 0.1, 1.15))
+scene.camera = camera
+
+os.makedirs(os.path.dirname(OUTPUT_PATH), exist_ok=True)
+bpy.ops.render.render(write_still=True)
+"""
+
+
+class BlenderStoryboardWorker(QThread):
+    progress = Signal(str)
+    result_ready = Signal(dict)
+    failed = Signal(str)
+    REQUEST_TIMEOUT = 300
+
+    def __init__(self, blender_path, prompt, width=1280, height=720):
+        super().__init__()
+        self.blender_path = str(blender_path or "").strip()
+        self.prompt = str(prompt or "").strip()
+        self.width = int(width or 1280)
+        self.height = int(height or 720)
+        self._stop_requested = False
+        self._process = None
+        self._output_path = ""
+
+    def stop(self):
+        self._stop_requested = True
+        try:
+            self.requestInterruption()
+        except Exception:
+            pass
+        proc = self._process
+        if proc is not None:
+            try:
+                proc.terminate()
+            except Exception:
+                pass
+
+    def _raise_if_stopped(self):
+        if self._stop_requested or self.isInterruptionRequested():
+            raise Exception("任务已中止")
+
+    def _render_storyboard(self):
+        executable = resolve_blender_executable(self.blender_path)
+        if not executable:
+            raise Exception("没有找到 Blender。请先安装 Blender，或在节点运行时选择 blender.exe / Blender 可执行文件。")
+        if not self.prompt:
+            raise Exception("请先输入镜头描述。")
+
+        output_dir = _dated_image_dir()
+        os.makedirs(output_dir or IMAGE_DIR, exist_ok=True)
+        output_path = os.path.join(output_dir or IMAGE_DIR, f"blender_storyboard_{uuid.uuid4().hex}.png")
+        self._output_path = output_path
+
+        script_path = ""
+        try:
+            with tempfile.NamedTemporaryFile("w", suffix=".py", encoding="utf-8", delete=False) as f:
+                script_path = f.name
+                f.write(_blender_storyboard_script(self.prompt, output_path, self.width, self.height))
+
+            self.progress.emit("正在启动 Blender 后台渲染分镜...")
+            cmd = [executable, "--background", "--factory-startup", "--python", script_path]
+            started_at = time.monotonic()
+            proc = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+            )
+            self._process = proc
+            stdout = ""
+            stderr = ""
+            while True:
+                self._raise_if_stopped()
+                try:
+                    stdout, stderr = proc.communicate(timeout=0.2)
+                    break
+                except subprocess.TimeoutExpired:
+                    pass
+                if time.monotonic() - started_at > self.REQUEST_TIMEOUT:
+                    try:
+                        proc.terminate()
+                    except Exception:
+                        pass
+                    raise Exception("Blender 渲染超时，请降低分辨率或检查场景资源。")
+            self._process = None
+            if proc.returncode != 0:
+                combined = "\n".join(part for part in (stdout, stderr) if part)
+                tail = "\n".join(combined.splitlines()[-18:]).strip()
+                raise Exception(f"Blender 渲染失败：{tail or '未知错误'}")
+            self._raise_if_stopped()
+            if not os.path.exists(output_path) or os.path.getsize(output_path) <= 0:
+                tail = "\n".join((stderr or stdout or "").splitlines()[-8:]).strip()
+                raise Exception(f"Blender 没有输出分镜图片。{tail}")
+            return output_path
+        finally:
+            self._process = None
+            if script_path:
+                safe_remove_file(script_path)
+
+    def run(self):
+        try:
+            path = self._render_storyboard()
+            self.progress.emit("Blender 分镜参考图已生成。")
+            self.result_ready.emit({
+                "time": now_str(),
+                "prompt": self.prompt,
+                "refs": [],
+                "images": [path],
+                "model": "Blender 本地分镜",
+                "size": f"{self.width}x{self.height}",
+                "quality": "本地预览",
+                "n": "1",
+                "blender_path": resolve_blender_executable(self.blender_path),
+            })
+        except Exception as e:
+            if self._stop_requested or self.isInterruptionRequested():
+                self.failed.emit("任务已中止")
+            else:
+                self.failed.emit(str(e))
+
+
+def _blender_director_script(plan, output_path, width, height):
+    config = {
+        "plan": plan if isinstance(plan, dict) else {},
+        "output_path": str(output_path or ""),
+        "width": int(width or 1280),
+        "height": int(height or 720),
+    }
+    config_json = json.dumps(config, ensure_ascii=False)
+    return f"""# -*- coding: utf-8 -*-
+import json
+import math
+import os
+
+import bpy
+from mathutils import Vector
+
+CONFIG = json.loads({config_json!r})
+PLAN = CONFIG.get("plan") or {{}}
+OUTPUT_PATH = str(CONFIG.get("output_path") or "")
+WIDTH = int(CONFIG.get("width") or 1280)
+HEIGHT = int(CONFIG.get("height") or 720)
+
+
+def text_for(*keys):
+    parts = []
+    for key in keys:
+        value = PLAN.get(key)
+        if isinstance(value, list):
+            parts.extend(str(item) for item in value if str(item).strip())
+        elif str(value or "").strip():
+            parts.append(str(value).strip())
+    return "\\n".join(parts)
+
+
+SCENE_TEXT = text_for("scene_prompt", "render_prompt")
+CHARACTER_TEXT = text_for("character_prompt")
+CAMERA_TEXT = text_for("camera_prompt", "render_prompt")
+ALL_TEXT = "\\n".join([SCENE_TEXT, CHARACTER_TEXT, CAMERA_TEXT])
+
+
+def has_any(words, text=None):
+    text = ALL_TEXT if text is None else text
+    return any(word in text for word in words)
+
+
+def make_mat(name, color):
+    mat = bpy.data.materials.new(name)
+    mat.diffuse_color = color
+    return mat
+
+
+def set_mat(obj, mat):
+    try:
+        obj.data.materials.append(mat)
+    except Exception:
+        pass
+    return obj
+
+
+def add_cube(name, loc, scale, mat):
+    bpy.ops.mesh.primitive_cube_add(size=1, location=loc)
+    obj = bpy.context.object
+    obj.name = name
+    obj.scale = scale
+    set_mat(obj, mat)
+    return obj
+
+
+def add_cylinder(name, loc, radius, depth, mat, rotation=(0, 0, 0)):
+    bpy.ops.mesh.primitive_cylinder_add(vertices=24, radius=radius, depth=depth, location=loc, rotation=rotation)
+    obj = bpy.context.object
+    obj.name = name
+    set_mat(obj, mat)
+    return obj
+
+
+def add_sphere(name, loc, radius, mat):
+    bpy.ops.mesh.primitive_uv_sphere_add(segments=24, ring_count=12, radius=radius, location=loc)
+    obj = bpy.context.object
+    obj.name = name
+    set_mat(obj, mat)
+    return obj
+
+
+def look_at(obj, target):
+    direction = Vector(target) - obj.location
+    obj.rotation_euler = direction.to_track_quat("-Z", "Y").to_euler()
+
+
+def make_person(label, x, y, mat):
+    add_cylinder(label + " 身体", (x, y, 1.08), 0.20, 1.1, mat)
+    add_sphere(label + " 头部", (x, y, 1.76), 0.22, MAT_SKIN)
+    add_cylinder(label + " 左臂", (x - 0.31, y, 1.24), 0.045, 0.68, mat, rotation=(0, math.radians(68), 0))
+    add_cylinder(label + " 右臂", (x + 0.31, y, 1.24), 0.045, 0.68, mat, rotation=(0, math.radians(-68), 0))
+    add_cylinder(label + " 左腿", (x - 0.10, y, 0.38), 0.06, 0.76, MAT_DARK)
+    add_cylinder(label + " 右腿", (x + 0.10, y, 0.38), 0.06, 0.76, MAT_DARK)
+
+
+def scene_objects_from_import():
+    return [obj for obj in bpy.context.scene.objects if obj.type not in {"CAMERA", "LIGHT"}]
+
+
+def normalize_imported_objects(objects, target_location, target_height=1.7):
+    mesh_like = [obj for obj in objects if obj.type in {"MESH", "CURVE", "SURFACE", "ARMATURE", "EMPTY"}]
+    if not mesh_like:
+        return
+    corners = []
+    for obj in mesh_like:
+        try:
+            for corner in obj.bound_box:
+                corners.append(obj.matrix_world @ Vector(corner))
+        except Exception:
+            pass
+    if not corners:
+        for obj in mesh_like:
+            obj.location = target_location
+        return
+    min_v = Vector((min(v.x for v in corners), min(v.y for v in corners), min(v.z for v in corners)))
+    max_v = Vector((max(v.x for v in corners), max(v.y for v in corners), max(v.z for v in corners)))
+    center = (min_v + max_v) * 0.5
+    height = max(0.01, max_v.z - min_v.z)
+    scale = min(1.8, max(0.05, target_height / height))
+    target = Vector(target_location)
+    selected = set(mesh_like)
+    roots = [obj for obj in mesh_like if obj.parent not in selected]
+    for obj in roots:
+        obj.location = (obj.location - center) * scale + target
+        obj.scale = obj.scale * scale
+
+
+def import_asset(path, index):
+    ext = os.path.splitext(path)[1].lower()
+    before = set(bpy.data.objects)
+    try:
+        if ext in {".glb", ".gltf"}:
+            bpy.ops.import_scene.gltf(filepath=path)
+        elif ext == ".fbx":
+            bpy.ops.import_scene.fbx(filepath=path)
+        elif ext == ".obj":
+            if hasattr(bpy.ops, "wm") and hasattr(bpy.ops.wm, "obj_import"):
+                bpy.ops.wm.obj_import(filepath=path)
+            else:
+                bpy.ops.import_scene.obj(filepath=path)
+        else:
+            return False
+    except Exception as exc:
+        print("导入模型失败:", path, exc)
+        return False
+    imported = [obj for obj in bpy.data.objects if obj not in before]
+    positions = [(-0.9, -0.25, 0.0), (0.9, -0.25, 0.0), (0.0, 0.75, 0.0), (-1.6, 0.55, 0.0), (1.6, 0.55, 0.0)]
+    normalize_imported_objects(imported, positions[index % len(positions)], 1.65)
+    return True
+
+
+bpy.ops.object.select_all(action="SELECT")
+bpy.ops.object.delete()
+
+scene = bpy.context.scene
+try:
+    scene.render.engine = "CYCLES"
+    scene.cycles.device = "CPU"
+    scene.cycles.samples = 16
+    scene.cycles.preview_samples = 8
+except Exception:
+    try:
+        scene.render.engine = "BLENDER_EEVEE"
+    except Exception:
+        pass
+scene.render.resolution_x = WIDTH
+scene.render.resolution_y = HEIGHT
+scene.render.film_transparent = bool(PLAN.get("transparent"))
+scene.render.filepath = OUTPUT_PATH
+try:
+    scene.display.shading.light = "STUDIO"
+    scene.display.shading.color_type = "MATERIAL"
+except Exception:
+    pass
+
+MAT_FLOOR = make_mat("地面冷灰", (0.30, 0.33, 0.36, 1))
+MAT_WALL = make_mat("背景墙", (0.18, 0.21, 0.26, 1))
+MAT_ROAD = make_mat("街道路面", (0.08, 0.09, 0.10, 1))
+MAT_LINE = make_mat("道路标线", (0.88, 0.78, 0.38, 1))
+MAT_STAGE = make_mat("舞台", (0.22, 0.15, 0.18, 1))
+MAT_TABLE = make_mat("道具木色", (0.30, 0.20, 0.12, 1))
+MAT_BLUE = make_mat("角色蓝", (0.10, 0.38, 0.86, 1))
+MAT_RED = make_mat("角色红", (0.78, 0.18, 0.15, 1))
+MAT_GREEN = make_mat("角色绿", (0.12, 0.55, 0.28, 1))
+MAT_SKIN = make_mat("头部肤色", (0.86, 0.68, 0.52, 1))
+MAT_DARK = make_mat("深色", (0.04, 0.05, 0.07, 1))
+
+if has_any(["街道", "路口", "马路", "巷子", "城市"], SCENE_TEXT):
+    add_cube("街道路面", (0, 0, -0.03), (4.8, 4.2, 0.03), MAT_ROAD)
+    add_cube("道路中线", (0, 0, 0.005), (0.05, 4.0, 0.01), MAT_LINE)
+    add_cube("左侧建筑", (-2.25, 0.6, 1.1), (0.32, 1.8, 1.1), MAT_WALL)
+    add_cube("右侧建筑", (2.25, 0.6, 1.1), (0.32, 1.8, 1.1), MAT_WALL)
+elif has_any(["舞台", "演出", "发布会", "聚光灯"], SCENE_TEXT):
+    add_cube("舞台地台", (0, 0.15, 0.12), (2.4, 1.35, 0.12), MAT_STAGE)
+    add_cube("舞台背景", (0, 1.55, 1.45), (3.8, 0.06, 1.45), MAT_WALL)
+    add_cube("左幕布", (-1.9, 1.45, 1.35), (0.18, 0.08, 1.35), MAT_RED)
+    add_cube("右幕布", (1.9, 1.45, 1.35), (0.18, 0.08, 1.35), MAT_RED)
+else:
+    add_cube("房间地面", (0, 0, -0.03), (4.8, 4.2, 0.03), MAT_FLOOR)
+    add_cube("后墙", (0, 2.05, 1.45), (4.8, 0.05, 1.45), MAT_WALL)
+    add_cube("左墙", (-2.4, 0.2, 1.1), (0.05, 1.9, 1.1), MAT_WALL)
+    if has_any(["会议", "办公室", "审讯", "谈判", "桌"], SCENE_TEXT):
+        add_cube("会议桌", (0, 0.45, 0.58), (1.45, 0.55, 0.10), MAT_TABLE)
+        add_cube("文件道具", (-0.35, 0.2, 0.66), (0.22, 0.15, 0.015), MAT_LINE)
+
+asset_paths = [str(path) for path in PLAN.get("asset_paths", []) if str(path).strip()]
+imported_count = 0
+for idx, path in enumerate(asset_paths):
+    if os.path.exists(path) and import_asset(path, idx):
+        imported_count += 1
+
+if imported_count <= 0:
+    count = 2
+    if has_any(["独自", "单人", "一个人"], CHARACTER_TEXT):
+        count = 1
+    elif has_any(["三人", "三名", "三位"], CHARACTER_TEXT):
+        count = 3
+    elif has_any(["多人", "众人", "人群", "会议"], CHARACTER_TEXT + SCENE_TEXT):
+        count = 3
+    positions = [(-0.8, -0.35), (0.8, -0.25), (0.0, 0.75)]
+    mats = [MAT_BLUE, MAT_RED, MAT_GREEN]
+    for idx in range(count):
+        x, y = positions[idx]
+        make_person("角色" + str(idx + 1), x, y, mats[idx])
+
+if has_any(["门", "门口", "进门"], SCENE_TEXT + CHARACTER_TEXT):
+    add_cube("门框", (-1.95, 1.9, 1.05), (0.30, 0.08, 1.05), MAT_TABLE)
+if has_any(["沙发"], SCENE_TEXT):
+    add_cube("沙发", (0.65, 0.9, 0.35), (0.75, 0.32, 0.22), MAT_TABLE)
+
+bpy.ops.object.light_add(type="AREA", location=(0, -2.4, 4.2))
+key_light = bpy.context.object
+key_light.name = "主光"
+key_light.data.energy = 450
+key_light.data.size = 5
+bpy.ops.object.camera_add(location=(0, -5.0, 2.0), rotation=(math.radians(68), 0, 0))
+camera = bpy.context.object
+
+target = (0, 0.25, 1.2)
+camera.data.lens = 35
+if has_any(["近景", "特写", "半身"], CAMERA_TEXT):
+    camera.location = (0, -3.0, 1.55)
+    camera.data.lens = 55
+    target = (0, -0.15, 1.45)
+elif has_any(["远景", "全景", "大全景"], CAMERA_TEXT):
+    camera.location = (0, -6.4, 2.4)
+    camera.data.lens = 26
+elif has_any(["俯拍", "高角度"], CAMERA_TEXT):
+    camera.location = (0, -4.2, 4.2)
+    camera.data.lens = 32
+    target = (0, 0.25, 0.75)
+elif has_any(["仰拍", "低角度"], CAMERA_TEXT):
+    camera.location = (0, -4.2, 0.85)
+    camera.data.lens = 34
+    target = (0, 0.15, 1.55)
+if has_any(["侧面", "侧拍"], CAMERA_TEXT):
+    camera.location = (4.0, -2.6, 1.85)
+if has_any(["推镜", "推近", "推进"], CAMERA_TEXT):
+    camera.data.lens = max(camera.data.lens, 45)
+look_at(camera, target)
+scene.camera = camera
+
+os.makedirs(os.path.dirname(OUTPUT_PATH), exist_ok=True)
+bpy.ops.render.render(write_still=True)
+"""
+
+
+class BlenderDirectorWorker(QThread):
+    progress = Signal(str)
+    result_ready = Signal(dict)
+    failed = Signal(str)
+    REQUEST_TIMEOUT = 300
+
+    def __init__(self, blender_path, plan, width=1280, height=720):
+        super().__init__()
+        self.blender_path = str(blender_path or "").strip()
+        self.plan = plan if isinstance(plan, dict) else {}
+        self.width = int(width or 1280)
+        self.height = int(height or 720)
+        self._stop_requested = False
+        self._process = None
+        self._output_path = ""
+
+    def stop(self):
+        self._stop_requested = True
+        try:
+            self.requestInterruption()
+        except Exception:
+            pass
+        proc = self._process
+        if proc is not None:
+            try:
+                proc.terminate()
+            except Exception:
+                pass
+
+    def _raise_if_stopped(self):
+        if self._stop_requested or self.isInterruptionRequested():
+            raise Exception("任务已中止")
+
+    def _render_director_frame(self):
+        executable = resolve_blender_executable(self.blender_path)
+        if not executable:
+            issue = blender_detection_issue(self.blender_path)
+            raise Exception(issue or "没有找到可用的 Blender。")
+
+        output_dir = _dated_image_dir()
+        os.makedirs(output_dir or IMAGE_DIR, exist_ok=True)
+        output_path = os.path.join(output_dir or IMAGE_DIR, f"blender_director_{uuid.uuid4().hex}.png")
+        self._output_path = output_path
+
+        script_path = ""
+        try:
+            with tempfile.NamedTemporaryFile("w", suffix=".py", encoding="utf-8", delete=False) as f:
+                script_path = f.name
+                f.write(_blender_director_script(self.plan, output_path, self.width, self.height))
+
+            self.progress.emit("正在启动 Blender 后台渲染导演台参考图...")
+            cmd = [executable, "--background", "--factory-startup", "--python", script_path]
+            started_at = time.monotonic()
+            proc = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+            )
+            self._process = proc
+            stdout = ""
+            stderr = ""
+            while True:
+                self._raise_if_stopped()
+                try:
+                    stdout, stderr = proc.communicate(timeout=0.2)
+                    break
+                except subprocess.TimeoutExpired:
+                    pass
+                if time.monotonic() - started_at > self.REQUEST_TIMEOUT:
+                    try:
+                        proc.terminate()
+                    except Exception:
+                        pass
+                    raise Exception("Blender 渲染超时，请降低分辨率或简化场景。")
+            self._process = None
+            if proc.returncode != 0:
+                combined = "\n".join(part for part in (stdout, stderr) if part)
+                tail = "\n".join(combined.splitlines()[-18:]).strip()
+                raise Exception(f"Blender 导演台渲染失败：{tail or '未知错误'}")
+            self._raise_if_stopped()
+            if not os.path.exists(output_path) or os.path.getsize(output_path) <= 0:
+                tail = "\n".join((stderr or stdout or "").splitlines()[-8:]).strip()
+                raise Exception(f"Blender 没有输出导演台图片。{tail}")
+            return output_path
+        finally:
+            self._process = None
+            if script_path:
+                safe_remove_file(script_path)
+
+    def run(self):
+        try:
+            path = self._render_director_frame()
+            self.progress.emit("Blender 导演台参考图已生成。")
+            self.result_ready.emit({
+                "time": now_str(),
+                "prompt": self.plan.get("render_prompt") or self.plan.get("scene_prompt") or "",
+                "refs": [path for path in self.plan.get("asset_paths", []) if isinstance(path, str) and os.path.exists(path)],
+                "images": [path],
+                "model": "Blender 本地导演台",
+                "size": f"{self.width}x{self.height}",
+                "quality": "本地预览",
+                "n": "1",
+                "blender_path": resolve_blender_executable(self.blender_path),
+                "blender_plan": self.plan,
+            })
+        except Exception as e:
+            if self._stop_requested or self.isInterruptionRequested():
+                self.failed.emit("任务已中止")
+            else:
+                self.failed.emit(str(e))
 
 
 class ModelListWorker(QThread):
@@ -479,7 +1413,8 @@ class NovelAnalysisWorker(QThread):
             "稳定设定变化才写入 lore.description，例如长期有效的规则、制度、结构关系、地点/势力/物品属性、能力限制、固定渠道或所有权；"
             "本章出现、追问、调查、发送、发现线索、谁去问谁等临时推进，不要写入 lore.description，改放 timeline/summary/foreshadows；"
             "伏笔变化写入状态/章节；对【已有项目档案】中的未埋/已埋伏笔，如果本片段明确推进、回收、揭晓、解释或作废，"
-            "必须用已有伏笔名称输出到 foreshadows，并写明新的 status、setup_chapter/payoff_chapter 和判断依据；"
+            "必须用已有伏笔名称输出到 foreshadows，并尽量填写旧伏笔编号 target_code/命中编号，同时写明新的 status、setup_chapter/payoff_chapter、evidence 和 review_reason；"
+            "如果本片段能证明某条旧伏笔只是短期悬念、低价值道具、一次性催化线，或已经不需要继续牵引后文，status 写“无需回收”，review_action 写“无需回收”；"
             "如果只是普通提及、氛围呼应或没有实质推进，不要输出该伏笔。\n"
             "不要把已有档案里没有在本片段推进的信息当作新发现重复输出。\n"
             "如果这是长文分块的一部分，只提取本片段明确出现或能稳定判断的信息；"
@@ -487,13 +1422,15 @@ class NovelAnalysisWorker(QThread):
             "JSON 结构：{\n"
             '  "characters": [{"name":"","role":"","goal":"","secret":"","voice":"","notes":""}],\n'
             '  "lore": [{"name":"","type":"地点/势力/物品/规则/术语/事件/其他","description":""}],\n'
-            '  "foreshadows": [{"name":"","status":"","setup_chapter":"","payoff_chapter":"","description":""}],\n'
+            '  "foreshadows": [{"name":"","status":"","setup_chapter":"","payoff_chapter":"","description":"","target_code":"","review_action":"","review_reason":"","evidence":""}],\n'
             '  "project_materials": {"bible":"","world_rules":"","timeline":"","summary":""}\n'
             "}\n"
             "foreshadows.status 判定：只提出未来可能用到但尚未在片段中埋下的线索填“未埋”；"
             "片段中已经出现线索、异常、铺垫或悬念填“已埋”；片段中已经兑现、揭示、解释或回收填“已回收”；"
-            "明确作废或不再使用的线索填“废弃”。能判断章节/分集标题时填写 setup_chapter/payoff_chapter。\n"
-            "已有伏笔复核：同一伏笔从“已埋”推进到“已回收/废弃”时，必须保留已有规范名称，不要另起相似名称；"
+            "明确不是必须回收、不会影响主线/人物/反转/情绪闭环、且不需要继续占用后文注意力的旧伏笔填“无需回收”；"
+            "明确作废、冲突、弃用或不再使用的线索填“废弃”。能判断章节/分集标题时填写 setup_chapter/payoff_chapter。\n"
+            "已有伏笔复核：同一伏笔从“已埋”推进到“已回收/无需回收/废弃”时，必须保留已有规范名称，不要另起相似名称；"
+            "能识别旧伏笔编号时必须填写 target_code；description/review_reason 写清证据章节和判断依据；"
             "payoff_chapter 优先填写本片段实际章节标题；只能判断推进但未回收时，status 仍填“已埋”，说明里写清推进内容。\n"
             "设定和伏笔不要原文重复：同一内容如果只是规则、制度、物品用途或客观设定，只放入 lore；"
             "如果它同时是规则和后续承诺，lore 写规则本身，foreshadows 改写成待验证/待回收的问题或结果，"
@@ -660,6 +1597,8 @@ class NovelAnalysisWorker(QThread):
                 pass
 
     def _is_retryable_analysis_error(self, error):
+        if self._is_analysis_rate_limit_error(error):
+            return True
         msg = str(error or "").lower()
         retry_markers = (
             "524",
@@ -682,6 +1621,31 @@ class NovelAnalysisWorker(QThread):
         )
         return any(marker in msg for marker in retry_markers)
 
+    def _is_analysis_rate_limit_error(self, error):
+        msg = str(error or "").lower()
+        retry_markers = (
+            "concurrency limit",
+            "rate limit",
+            "too many requests",
+            "please retry later",
+            "429",
+            "并发",
+            "限流",
+            "请求过多",
+            "稍后重试",
+        )
+        return any(marker in msg for marker in retry_markers)
+
+    def _analysis_retry_wait_seconds(self, error, attempt):
+        if self._is_analysis_rate_limit_error(error):
+            return 10
+        return min(8, 2 * attempt)
+
+    def _analysis_retry_progress_text(self, error, label, total, wait_seconds, next_attempt, attempts):
+        if self._is_analysis_rate_limit_error(error):
+            return f"第 {label}/{total} 块遇到接口并发限制，{wait_seconds} 秒后自动重试 {next_attempt}/{attempts}..."
+        return f"第 {label}/{total} 块暂时失败，{wait_seconds} 秒后自动重试 {next_attempt}/{attempts}..."
+
     def _is_stream_unsupported_error(self, error):
         msg = str(error or "").lower()
         return "stream" in msg and (
@@ -702,6 +1666,16 @@ class NovelAnalysisWorker(QThread):
             "protocolerror",
         )
         return any(marker in msg for marker in transport_markers)
+
+    def _is_stream_json_error(self, error):
+        msg = str(error or "").lower()
+        return (
+            "ai 返回内容不是合法 json" in msg
+            or "ai 返回不是 json 对象" in msg
+            or "jsondecodeerror" in msg
+            or "expecting ',' delimiter" in msg
+            or "unterminated string" in msg
+        )
 
     def _analyze_chunk_resilient(self, prompt, chunk, label, total, use_response_format, split_depth=0):
         response_format_supported, stream_supported = self._analysis_request_capabilities()
@@ -737,7 +1711,17 @@ class NovelAnalysisWorker(QThread):
                 self._set_analysis_stream_supported(False)
                 self.progress.emit("流式候选分析连接提前结束，已切换为普通请求重试...")
                 return self._post_analysis_chunk(prompt, chunk, label, total, use_response_format), use_response_format
-            if self._allow_retry_chunk_split() and split_depth <= 0 and self._is_retryable_analysis_error(e) and len(chunk) > 1800:
+            if stream_supported and self._is_stream_json_error(e):
+                self._set_analysis_stream_supported(False)
+                self.progress.emit("流式候选分析返回不完整 JSON，已切换为普通请求重试...")
+                return self._post_analysis_chunk(prompt, chunk, label, total, use_response_format), use_response_format
+            if (
+                self._allow_retry_chunk_split()
+                and split_depth <= 0
+                and self._is_retryable_analysis_error(e)
+                and not self._is_analysis_rate_limit_error(e)
+                and len(chunk) > 1800
+            ):
                 parts = self._split_retry_chunk_once(chunk, max_parts=3)
                 if len(parts) > 1:
                     merged = {"characters": [], "lore": [], "foreshadows": [], "project_materials": {}}
@@ -783,8 +1767,10 @@ class NovelAnalysisWorker(QThread):
                 last_error = e
                 if getattr(e, "_analysis_split_failed", False) or attempt >= attempts or not self._is_retryable_analysis_error(e):
                     raise
-                wait_seconds = min(8, 2 * attempt)
-                self.progress.emit(f"第 {label}/{total} 块暂时失败，{wait_seconds} 秒后自动重试 {attempt + 1}/{attempts}...")
+                wait_seconds = self._analysis_retry_wait_seconds(e, attempt)
+                self.progress.emit(
+                    self._analysis_retry_progress_text(e, label, total, wait_seconds, attempt + 1, attempts)
+                )
                 deadline = time.time() + wait_seconds
                 while time.time() < deadline:
                     if self._stop_requested or self.isInterruptionRequested():
@@ -1096,16 +2082,22 @@ class NovelCandidatePostprocessWorker(NovelAnalysisWorker):
             "4. 如果候选与已有项目档案是同一对象，请使用已有档案中的规范名称；不确定是否同一对象时分开保留，不要强行合并。\n"
             "5. 伏笔要保守：同一线索才合并；只是相似主题但回收目标不同的伏笔要分开。\n"
             "6. 对照已有伏笔逐条复核：如果分块候选或本次片段已经明确兑现、揭示、解释、回收某个已有未埋/已埋伏笔，"
-            "必须保留该伏笔并把 status 写成“已回收”，payoff_chapter 写真实章节标题；明确作废写“废弃”。"
+            "必须保留该伏笔并把 status 写成“已回收”，payoff_chapter 写真实章节标题；"
+            "如果确认它只是短期悬念、低价值道具、一次性催化线，或已不需要继续牵引后文，status 写“无需回收”；明确作废写“废弃”。"
+            "命中旧伏笔时尽量填写 target_code/命中编号，并在 description、evidence、review_reason 写清证据章节和判断依据。"
             "如果只是推进但未回收，status 保持“已埋”，说明写清推进；没有实质变化则不要输出。\n"
-            "7. 状态不能倒退：已回收/废弃不要改回已埋或未埋；已埋不要改回未埋。\n"
+            "6a. 重要：仅当候选明确填写了已有伏笔编号 target_code/命中编号，且 status 为“已回收”“无需回收”“废弃”时，"
+            "它是旧伏笔状态更新，不是新增重复资料；不同 target_code/命中编号 的终态更新必须分别保留，"
+            "只能合并同一个编号的多条候选，不能因为同属同一案件、同一章节、同一证据链或同一大事件而合并删除。"
+            "没有 target_code/命中编号 的新增伏笔仍按普通候选规则去重、合并或删除。\n"
+            "7. 状态不能倒退：已回收/无需回收/废弃不要改回已埋或未埋；已埋不要改回未埋。\n"
             "8. 小说圣经和世界观/规则只作为查重和冲突参考，不要因为已有档案存在就自动重写；确有新增草案时才放入 project_materials。\n"
             "9. 时间线和摘要只承接全局剧情进展，避免和人物备注、设定说明重复表达同一件事。\n"
             "10. 不要把人物备注里的临时内容转写进“本章需继承事实”；章节事实只由正文后的摘要/事实流程负责。\n"
             "JSON 结构：{\n"
             '  "characters": [{"name":"","role":"","goal":"","secret":"","voice":"","notes":""}],\n'
             '  "lore": [{"name":"","type":"地点/势力/物品/规则/术语/事件/其他","description":""}],\n'
-            '  "foreshadows": [{"name":"","status":"","setup_chapter":"","payoff_chapter":"","description":""}],\n'
+            '  "foreshadows": [{"name":"","status":"","setup_chapter":"","payoff_chapter":"","description":"","target_code":"","review_action":"","review_reason":"","evidence":""}],\n'
             '  "project_materials": {"bible":"","world_rules":"","timeline":"","summary":""}\n'
             "}\n"
             "输出要求：空字段用空字符串，空列表用 []；不要输出已重复、已被已有档案覆盖、或只适合本章临时记录的内容。"
@@ -1155,6 +2147,10 @@ class NovelCandidatePostprocessWorker(NovelAnalysisWorker):
                 self._set_analysis_stream_supported(False)
                 self.progress.emit("流式候选合并连接提前结束，已切换为普通请求重试...")
                 return self._post_analysis_chunk(prompt, chunk, label, total, use_response_format), use_response_format
+            if stream_supported and self._is_stream_json_error(e):
+                self._set_analysis_stream_supported(False)
+                self.progress.emit("流式候选合并返回不完整 JSON，已切换为普通请求重试...")
+                return self._post_analysis_chunk(prompt, chunk, label, total, use_response_format), use_response_format
             raise
 
     def run(self):
@@ -1183,8 +2179,226 @@ class NovelCandidatePostprocessWorker(NovelAnalysisWorker):
             if not any(normalized.get(key) for key in ("characters", "lore", "foreshadows")):
                 materials = normalized.get("project_materials", {})
                 if not isinstance(materials, dict) or not any(str(value or "").strip() for value in materials.values()):
-                    raise Exception("AI 候选合并没有返回有效候选，已保留分块结果。")
+                    normalized["_postprocess_empty"] = True
             self.result_ready.emit(normalized)
+        except Exception as e:
+            if not self._stop_requested and not self.isInterruptionRequested():
+                self.failed.emit(str(e))
+        finally:
+            self._close_active_network_handles()
+
+
+class NovelFrameworkImportWorker(NovelAnalysisWorker):
+    result_ready = Signal(dict)
+
+    def __init__(
+        self,
+        base_url,
+        api_key,
+        model,
+        framework_text,
+        project_context="",
+        proxy_url="",
+        proxy_mode="不使用代理",
+    ):
+        self.framework_text = str(framework_text or "")
+        self.project_context = str(project_context or "")
+        super().__init__(
+            base_url,
+            api_key,
+            model,
+            "",
+            proxy_url=proxy_url,
+            proxy_mode=proxy_mode,
+            max_concurrency=1,
+        )
+
+    def _analysis_prompt(self):
+        return (
+            "你是长篇小说框架整理编辑。请把用户导入的小说框架/大纲按正式项目分类整理。\n"
+            "必须只输出一个合法 JSON 对象，不要 Markdown，不要解释，不要注释，不要尾随逗号。\n"
+            "只根据【导入框架原文】明确写出的内容分类，不要扩写正文，不要生成新的剧情，不要补全原文没有的设定。\n"
+            "不要把整段框架原文原样塞进 bible/world_rules/summary/timeline；这些字段只写精炼、长期有效、方便人工查阅和后续写作的内容。\n"
+            "如果内容不确定属于哪一类，优先放入 bible 的“全书阶段规划 / 框架参考”，不要硬塞人物/设定/伏笔。\n"
+            "重要：导入框架里的全书走向、阶段规划、结局方向、未来剧情安排，不要写入 timeline 或 summary；"
+            "这些不是正文已经发生的事实，应归入 bible。timeline 只保留正文已经发生的时间顺序事实；"
+            "summary 只保留正文已经写出的全局阶段总结。导入框架通常还没有正文，timeline 和 summary 默认留空。\n"
+            "人物只保留主角、重要配角、反派、长期角色和有明确后续作用的人；路人、无名群体、一次性称谓不要进入人物。\n"
+            "设定只保留地点、组织、物品、规则、术语、制度、能力限制等稳定信息；普通剧情动作不要写入设定。\n"
+            "伏笔只保留长期悬念、关键秘密、明确待回收承诺；普通冲突、短期疑问、章节钩子不要当长期伏笔。\n"
+            "章节规划只提取原文已经明确写出的章节/分卷/阶段安排；不要凭空生成完整章节规划。\n"
+            "JSON 结构：{\n"
+            '  "meta": {"title":"","genre":"","style":"","pov":"","target_words":"","status":"","premise":""},\n'
+            '  "project_materials": {"bible":"","world_rules":"","timeline":"","summary":""},\n'
+            '  "characters": [{"name":"","role":"","goal":"","secret":"","voice":"","notes":""}],\n'
+            '  "lore": [{"name":"","type":"地点/势力/物品/规则/术语/事件/其他","description":""}],\n'
+            '  "foreshadows": [{"name":"","status":"未埋/已埋/已回收/无需回收/废弃","setup_chapter":"","payoff_chapter":"","description":""}],\n'
+            '  "chapter_plan": {"summary":"","chapters":[{"index":1,"title":"","target_words":"","narrative_stage":"","chapter_function":"","conflict_intensity":"","setup_ratio":"","character_task":"","mainline_task":"","outline":"","characters":[],"settings":[],"ending_hook":"","forbidden":""}]}\n'
+            "}\n"
+            "空字段用空字符串，空列表用 []。"
+        )
+
+    def _framework_user_text(self):
+        payload = {
+            "已有项目档案": self.project_context,
+            "导入框架原文": self.framework_text,
+        }
+        return json.dumps(payload, ensure_ascii=False, indent=2)
+
+    def _chunk_user_text(self, chunk_text, chunk_index, total_chunks):
+        return str(chunk_text or "")
+
+    def _analysis_progress_label(self):
+        return "框架分类"
+
+    def _allow_retry_chunk_split(self):
+        return False
+
+    def _string_list(self, value):
+        if isinstance(value, list):
+            return [str(item).strip() for item in value if str(item or "").strip()]
+        text = str(value or "").strip()
+        if not text:
+            return []
+        return [item.strip() for item in re.split(r"[、,，;\n；]+", text) if item.strip()]
+
+    def _clean_title(self, value, fallback):
+        title = str(value or "").strip()
+        title = title.strip(" \t\r\n\"'“”‘’《》「」『』【】[]()（）")
+        title = re.sub(r"^\s*第\s*[\d一二三四五六七八九十百千万零〇两]+\s*[章节回集卷部]\s*[:：、.\-—]*\s*", "", title)
+        title = re.sub(r"^\s*[\d一二三四五六七八九十百千万零〇两]+\s*[、.．]\s*", "", title)
+        title = re.sub(r"\s+", "", title)
+        title = title.strip(" \t\r\n\"'“”‘’《》「」『』【】[]()（）：:，,。；;、")
+        return title or fallback
+
+    def _target_words_text(self, value):
+        match = re.search(r"\d{2,7}", str(value or ""))
+        return match.group(0) if match else str(value or "").strip()
+
+    def _project_target_words_text(self, value):
+        text = str(value or "").replace(",", "").strip()
+        match = re.search(r"\d+(?:\.\d+)?", text)
+        if not match:
+            return text
+        try:
+            number = float(match.group(0))
+        except Exception:
+            return match.group(0).strip()
+        if "万" not in text and number >= 1000:
+            number = number / 10000
+        number_text = f"{number:.2f}".rstrip("0").rstrip(".")
+        return number_text or match.group(0).strip()
+
+    def _outline_from_item(self, item):
+        item = item if isinstance(item, dict) else {}
+        outline = str(item.get("outline", "") or item.get("提纲", "") or item.get("剧情", "") or "").strip()
+        parts = []
+        for label, key in (
+            ("所属阶段", "narrative_stage"),
+            ("本章功能", "chapter_function"),
+            ("冲突强度", "conflict_intensity"),
+            ("铺垫比例", "setup_ratio"),
+            ("人物任务", "character_task"),
+            ("主线任务", "mainline_task"),
+        ):
+            value = str(item.get(key, "") or "").strip()
+            if value and value not in outline:
+                parts.append(f"{label}：{value}")
+        if outline:
+            parts.append(outline)
+        ending_hook = str(item.get("ending_hook", "") or "").strip()
+        if ending_hook:
+            parts.append(f"结尾钩子：{ending_hook}")
+        forbidden = str(item.get("forbidden", "") or "").strip()
+        if forbidden:
+            parts.append(f"禁止/边界：{forbidden}")
+        return "\n\n".join(part for part in parts if part).strip()
+
+    def _normalize_chapter_plan(self, data):
+        data = data if isinstance(data, dict) else {}
+        plan = data.get("chapter_plan", {})
+        if isinstance(plan, list):
+            plan = {"chapters": plan}
+        plan = plan if isinstance(plan, dict) else {}
+        chapters = plan.get("chapters", [])
+        normalized = []
+        for fallback_index, item in enumerate(chapters if isinstance(chapters, list) else [], 1):
+            if not isinstance(item, dict):
+                continue
+            title = self._clean_title(item.get("title", "") or item.get("章节名", ""), f"章节 {fallback_index}")
+            outline = self._outline_from_item(item)
+            if not outline:
+                continue
+            try:
+                index = int(item.get("index", fallback_index) or fallback_index)
+            except Exception:
+                index = fallback_index
+            normalized.append({
+                "index": index,
+                "title": title,
+                "target_words": self._target_words_text(item.get("target_words", "") or item.get("字数", "")),
+                "narrative_stage": str(item.get("narrative_stage", "") or "").strip(),
+                "chapter_function": str(item.get("chapter_function", "") or "").strip(),
+                "conflict_intensity": str(item.get("conflict_intensity", "") or "").strip(),
+                "setup_ratio": str(item.get("setup_ratio", "") or "").strip(),
+                "character_task": str(item.get("character_task", "") or "").strip(),
+                "mainline_task": str(item.get("mainline_task", "") or "").strip(),
+                "outline": outline,
+                "characters": self._string_list(item.get("characters", [])),
+                "settings": self._string_list(item.get("settings", [])),
+                "ending_hook": str(item.get("ending_hook", "") or "").strip(),
+                "forbidden": str(item.get("forbidden", "") or "").strip(),
+            })
+        normalized.sort(key=lambda item: item.get("index", 0))
+        for index, item in enumerate(normalized, 1):
+            item["index"] = index
+        return {
+            "summary": str(plan.get("summary", "") or data.get("summary", "") or "").strip(),
+            "chapters": normalized,
+        }
+
+    def _normalize_framework_result(self, data):
+        data = data if isinstance(data, dict) else {}
+        candidates = _normalize_ai_candidates(data)
+        meta_source = data.get("meta") or data.get("project_info") or data.get("项目信息") or {}
+        meta_source = meta_source if isinstance(meta_source, dict) else {}
+        meta = {}
+        for key in ("title", "genre", "style", "pov", "target_words", "status", "premise"):
+            value = str(meta_source.get(key, "") or "").strip()
+            if key == "target_words":
+                value = self._project_target_words_text(value)
+            meta[key] = value
+        return {
+            "meta": meta,
+            "project_materials": candidates.get("project_materials", {}),
+            "characters": candidates.get("characters", []),
+            "lore": candidates.get("lore", []),
+            "foreshadows": candidates.get("foreshadows", []),
+            "chapter_plan": self._normalize_chapter_plan(data),
+        }
+
+    def run(self):
+        try:
+            if not self.base_url:
+                raise Exception("请先选择厂商。")
+            if not self.api_key:
+                raise Exception("请先设置 API Key。")
+            if not self.model:
+                raise Exception("请选择模型。")
+            if not self.framework_text.strip():
+                raise Exception("没有可分类的框架内容。")
+            self.progress.emit("正在用 AI 分类导入框架...")
+            response_format_supported, _stream_supported = self._analysis_request_capabilities()
+            parsed, _response_format = self._analyze_chunk_with_retries(
+                self._analysis_prompt(),
+                self._framework_user_text(),
+                1,
+                1,
+                response_format_supported,
+            )
+            if self._stop_requested or self.isInterruptionRequested():
+                return
+            self.result_ready.emit(self._normalize_framework_result(parsed))
         except Exception as e:
             if not self._stop_requested and not self.isInterruptionRequested():
                 self.failed.emit(str(e))
@@ -1227,7 +2441,7 @@ class NovelForeshadowReviewWorker(NovelAnalysisWorker):
             "1. 记录可能影响后续章节的线索、异常、承诺、谜题、未解释信息、人物隐瞒、规则限制、物品去向。\n"
             "2. 记录本章对旧线索的明确解释、兑现、揭晓、作废证据；只要正文里有证据就记录，不要因为不知道旧伏笔名而丢弃。\n"
             "3. name 使用本章正文里的短线索名或概括名，不要求等同旧伏笔名；description 写完整证据和上下文。\n"
-            "4. status 只能在正文证据非常明确时写“已埋”“已回收”“废弃”，不确定时留空。\n"
+            "4. status 只能在正文证据非常明确时写“已埋”“已回收”“无需回收”“废弃”，不确定时留空。\n"
             "5. setup_chapter/payoff_chapter 必须用真实章节标题，不要写“本章/本片段/第几块”。\n"
             "输出结构：{\n"
             '  "foreshadows": [{"name":"","status":"","setup_chapter":"","payoff_chapter":"","description":"","review_action":"","merge_target":"","review_reason":"","evidence":""}]\n'
@@ -1346,10 +2560,11 @@ class NovelForeshadowReviewPostprocessWorker(NovelAnalysisWorker):
             "任务：\n"
             "1. 对照【现有伏笔列表】判断观察记录命中了哪个旧伏笔；命中时 name 必须使用旧伏笔规范名称。\n"
             "2. 同一旧伏笔在本批只输出一条候选，description 整合本批观察里最关键的章节依据；不在本批观察中的内容不要臆测。\n"
-            "3. 状态不能倒退：已回收/废弃不要改回已埋或未埋；已埋不要改回未埋。\n"
+            "3. 状态不能倒退：已回收/无需回收/废弃不要改回已埋或未埋；已埋不要改回未埋。\n"
             "4. 如果观察记录明确解释、揭晓、兑现旧伏笔，status 写“已回收”，payoff_chapter 写最明确的真实章节标题，review_action 写“更新状态”。\n"
             "5. 如果观察记录只是推进但未回收，status 保持“已埋”，review_action 写“补充推进”，description 写清推进章节和推进内容。\n"
-            "6. 如果观察记录证明某个旧伏笔只是短期悬念、单章内完成、或不应继续作为长期伏笔，status 写“废弃”，review_action 写“移出伏笔”。\n"
+            "6. 如果观察记录证明某个旧伏笔只是短期悬念、低价值道具、一次性催化线，或不需要继续牵引后文，status 写“无需回收”，review_action 写“无需回收”；"
+            "如果旧伏笔已与正文冲突、明确作废或应清理，status 写“废弃”，review_action 写“移出伏笔”。\n"
             "7. 多条旧伏笔明显重复时，输出需要合并的旧伏笔名，merge_target 写规范名称，并在 description 中写“别称：规范名称”。\n"
             "8. 观察记录里确有长期价值但现有列表缺漏的线索，可以作为新增伏笔候选输出；不确定时不要新增。\n"
             "9. 如果能识别旧伏笔，请优先填写 target_code/命中编号（例如 F0007）；无法确定编号时再用 merge_target。\n"
@@ -2306,6 +3521,10 @@ class ImageWorker(QThread):
     result_ready = Signal(dict)
     failed = Signal(str)
     REQUEST_TIMEOUT = 600
+    TOAPIS_TASK_INITIAL_WAIT_SECONDS = 2
+    TOAPIS_TASK_POLL_SECONDS = 3
+    TOAPIS_TASK_MAX_SECONDS = 600
+    TOAPIS_TASK_PROGRESS_HEARTBEAT_SECONDS = 30
 
     SIZE_MAP = {
         "自动": "auto",
@@ -2323,6 +3542,21 @@ class ImageWorker(QThread):
         "1024*1024": "1024x1024",
     }
     QUALITY_MAP = {"自动": "auto", "低": "low", "中": "medium", "高": "high"}
+    TOAPIS_OFFICIAL_SIZE_MAP = {
+        "自动": ("1:1", "1k"),
+        "4096*4096": ("1:1", "4k"),
+        "3840*3840（4K）": ("1:1", "4k"),
+        "3840*2160（横屏4K）": ("16:9", "4k"),
+        "3840*1920（2:1 4K）": ("2:1", "4k"),
+        "2160*3840（竖屏4K）": ("9:16", "4k"),
+        "2880*2880": ("1:1", "2k"),
+        "2048*2048": ("1:1", "2k"),
+        "2560*1440": ("16:9", "2k"),
+        "2048*1024": ("2:1", "2k"),
+        "1024*1536（竖屏）": ("2:3", "1k"),
+        "1536*1024（横屏）": ("3:2", "1k"),
+        "1024*1024": ("1:1", "1k"),
+    }
 
     def __init__(self, base_url, api_key, model, size, quality, n, prompt, refs, proxy_url="", upload_optimization="高质量", proxy_mode="仅下载图片"):
         super().__init__()
@@ -2341,6 +3575,7 @@ class ImageWorker(QThread):
         self._session = requests.Session()
         self._session.trust_env = False
         self._response = None
+        self._last_image_api_request = None
 
     def stop(self):
         self._stop_requested = True
@@ -2395,6 +3630,49 @@ class ImageWorker(QThread):
         self._raise_if_stopped()
         return self._response
 
+    def _set_last_image_api_request(self, method, url, started_at, resp=None, error=None):
+        elapsed = None
+        if started_at:
+            try:
+                elapsed = max(0.0, time.monotonic() - started_at)
+            except Exception:
+                elapsed = None
+        status_code = None
+        response_text = ""
+        if resp is not None:
+            status_code = getattr(resp, "status_code", None)
+            response_text = safe_response_text(resp)
+            if len(response_text) > 1000:
+                response_text = response_text[:1000] + "..."
+        self._last_image_api_request = {
+            "method": str(method or "").upper(),
+            "url": str(url or ""),
+            "elapsed": elapsed,
+            "status_code": status_code,
+            "response_text": response_text,
+            "error": str(error or ""),
+        }
+
+    def _emit_last_image_api_diagnostics(self):
+        info = self._last_image_api_request or {}
+        if not info:
+            return
+        method = info.get("method") or "请求"
+        url = info.get("url") or "未知接口"
+        elapsed = info.get("elapsed")
+        elapsed_text = ""
+        if isinstance(elapsed, (int, float)):
+            elapsed_text = f"，耗时 {elapsed:.1f} 秒"
+        status = info.get("status_code")
+        status_text = f"，HTTP {status}" if status not in (None, "") else ""
+        self.progress.emit(f"接口诊断：{method} {url}{status_text}{elapsed_text}")
+        response_text = str(info.get("response_text") or "").strip()
+        if response_text:
+            self.progress.emit(f"接口返回片段：{response_text}")
+        error_text = str(info.get("error") or "").strip()
+        if error_text:
+            self.progress.emit(f"接口异常：{error_text}")
+
     def _response_format_not_supported(self, resp):
         if resp is None or resp.status_code != 400:
             return False
@@ -2411,14 +3689,21 @@ class ImageWorker(QThread):
         )
 
     def _post_json_image_request(self, url, headers, payload):
-        return self._request(
-            "POST",
-            url,
-            headers={**headers, "Content-Type": "application/json"},
-            json=payload,
-            timeout=self.REQUEST_TIMEOUT,
-            proxies=self._submit_proxies(),
-        )
+        started_at = time.monotonic()
+        try:
+            resp = self._request(
+                "POST",
+                url,
+                headers={**headers, "Content-Type": "application/json"},
+                json=payload,
+                timeout=self.REQUEST_TIMEOUT,
+                proxies=self._submit_proxies(),
+            )
+            self._set_last_image_api_request("POST", url, started_at, resp=resp)
+            return resp
+        except Exception as e:
+            self._set_last_image_api_request("POST", url, started_at, error=e)
+            raise
 
     def _post_multipart_image_request(self, url, headers, data):
         files = []
@@ -2435,15 +3720,22 @@ class ImageWorker(QThread):
                 f = open(upload_path, "rb")
                 opened.append(f)
                 files.append(("image[]", (os.path.basename(upload_path), f, mime)))
-            return self._request(
-                "POST",
-                url,
-                headers=headers,
-                data=data,
-                files=files,
-                timeout=self.REQUEST_TIMEOUT,
-                proxies=self._submit_proxies(),
-            )
+            started_at = time.monotonic()
+            try:
+                resp = self._request(
+                    "POST",
+                    url,
+                    headers=headers,
+                    data=data,
+                    files=files,
+                    timeout=self.REQUEST_TIMEOUT,
+                    proxies=self._submit_proxies(),
+                )
+                self._set_last_image_api_request("POST", url, started_at, resp=resp)
+                return resp
+            except Exception as e:
+                self._set_last_image_api_request("POST", url, started_at, error=e)
+                raise
         finally:
             for f in opened:
                 try:
@@ -2479,6 +3771,254 @@ class ImageWorker(QThread):
         retry_payload.pop("response_format", None)
         self.progress.emit("接口不支持 response_format，已自动移除该参数重试...")
         return post_func(retry_payload)
+
+    def _is_toapis_gpt_image_2_official(self):
+        model = str(self.model or "").strip().lower()
+        base_url = str(self.base_url or "").strip().lower()
+        if model not in {"gpt-image-2", "gpt-image-2-vip"}:
+            return False
+        return "toapis.com" in base_url
+
+    def _toapis_official_size_payload(self):
+        size, resolution = self.TOAPIS_OFFICIAL_SIZE_MAP.get(
+            str(self.size or "").strip(),
+            self.TOAPIS_OFFICIAL_SIZE_MAP["自动"],
+        )
+        return size, resolution
+
+    def _toapis_upload_reference_image(self, ref, headers, index, total):
+        text = str(ref or "").strip()
+        if not text:
+            return ""
+        if text.startswith(("http://", "https://")):
+            return text
+        if text.lower().startswith("data:image/"):
+            raise Exception("官方渠道图生图不支持直接传 base64 图片，请使用本地图片或公网图片 URL。")
+        if not os.path.exists(text):
+            raise Exception(f"参考图不存在：{text}")
+
+        upload_path, mime, cleanup, message = prepare_image_upload_file(text, self.upload_optimization)
+        opened = None
+        try:
+            if message:
+                self.progress.emit(f"已压缩参考图上传副本：{message}")
+            self.progress.emit(f"正在上传参考图 {index}/{total}...")
+            opened = open(upload_path, "rb")
+            files = {
+                "file": (
+                    os.path.basename(upload_path),
+                    opened,
+                    mime or mimetypes.guess_type(upload_path or "")[0] or "image/png",
+                )
+            }
+            resp = self._request(
+                "POST",
+                api_url(self.base_url, "/v1/uploads/images"),
+                headers=headers,
+                files=files,
+                timeout=self.REQUEST_TIMEOUT,
+                proxies=self._submit_proxies(),
+            )
+            if resp.status_code >= 400:
+                raise Exception(f"参考图上传失败 {resp.status_code}：{extract_api_error(resp)}")
+            data = resp.json()
+            try:
+                resp.close()
+            except Exception:
+                pass
+            candidates = []
+            if isinstance(data, dict):
+                candidates.extend([
+                    data.get("url"),
+                    data.get("image_url"),
+                ])
+                nested = data.get("data")
+                if isinstance(nested, dict):
+                    candidates.extend([
+                        nested.get("url"),
+                        nested.get("image_url"),
+                    ])
+            for value in candidates:
+                value = str(value or "").strip()
+                if value.startswith(("http://", "https://")):
+                    return value
+            raise Exception("参考图已上传，但接口没有返回可用图片 URL。")
+        finally:
+            try:
+                if opened is not None:
+                    opened.close()
+            except Exception:
+                pass
+            if cleanup:
+                safe_remove_file(upload_path)
+
+    def _toapis_reference_image_urls(self, headers):
+        urls = []
+        refs = list(self.refs or [])
+        if len(refs) > 16:
+            raise Exception("官方渠道最多支持 16 张参考图。")
+        for index, ref in enumerate(refs, 1):
+            self._raise_if_stopped()
+            url = self._toapis_upload_reference_image(ref, headers, index, len(refs))
+            if url:
+                urls.append(url)
+        if refs and not urls:
+            raise Exception("图生图参考图无效。请使用本地图片或可访问的公网图片 URL。")
+        return urls
+
+    def _post_toapis_official_image_task(self, headers):
+        size, resolution = self._toapis_official_size_payload()
+        payload = {
+            "model": self.model,
+            "prompt": self.prompt,
+            "n": int(self.n),
+            "size": size,
+            "resolution": resolution,
+            "response_format": "url",
+        }
+        quality = self.QUALITY_MAP.get(self.quality, "auto")
+        if quality and quality != "auto":
+            payload["quality"] = quality
+
+        if self.refs:
+            image_urls = self._toapis_reference_image_urls(headers)
+            if image_urls:
+                payload["image_urls"] = image_urls
+
+        return self._post_json_image_request(
+            api_url(self.base_url, "/v1/images/generations"),
+            headers,
+            payload,
+        )
+
+    def _toapis_task_id(self, data):
+        if not isinstance(data, dict):
+            return ""
+        for key in ("id", "task_id", "taskId"):
+            value = str(data.get(key, "") or "").strip()
+            if value:
+                return value
+        nested = data.get("data")
+        if isinstance(nested, dict):
+            for key in ("id", "task_id", "taskId"):
+                value = str(nested.get(key, "") or "").strip()
+                if value:
+                    return value
+        return ""
+
+    def _toapis_task_status(self, data):
+        if not isinstance(data, dict):
+            return ""
+        status = str(data.get("status", "") or "").strip().lower()
+        if status:
+            return status
+        nested = data.get("data")
+        if isinstance(nested, dict):
+            return str(nested.get("status", "") or "").strip().lower()
+        return ""
+
+    def _toapis_task_result_items(self, data):
+        if not isinstance(data, dict):
+            return []
+        result = data.get("result")
+        if not isinstance(result, dict):
+            nested = data.get("data")
+            if isinstance(nested, dict):
+                result = nested.get("result")
+        if isinstance(result, dict):
+            items = result.get("data")
+            if isinstance(items, list):
+                return items
+            if isinstance(result.get("url"), str):
+                return [result]
+        items = data.get("data")
+        if isinstance(items, list):
+            return items
+        return []
+
+    def _toapis_task_error_text(self, data, fallback="图片生成失败"):
+        if not isinstance(data, dict):
+            return fallback
+        candidates = [
+            data.get("error"),
+            data.get("message"),
+            data.get("failed_reason"),
+            data.get("failure_reason"),
+        ]
+        nested = data.get("data")
+        if isinstance(nested, dict):
+            candidates.extend([
+                nested.get("error"),
+                nested.get("message"),
+                nested.get("failed_reason"),
+                nested.get("failure_reason"),
+            ])
+        for value in candidates:
+            if isinstance(value, dict):
+                text = value.get("message") or value.get("error") or value.get("code")
+            else:
+                text = value
+            text = str(text or "").strip()
+            if text:
+                return text
+        return fallback
+
+    def _poll_toapis_official_task(self, task_id, headers):
+        task_id = str(task_id or "").strip()
+        if not task_id:
+            raise Exception("官方渠道没有返回任务 ID。")
+        self.progress.emit(f"任务已提交：{task_id}")
+        deadline = time.monotonic() + self.TOAPIS_TASK_MAX_SECONDS
+        first_wait = True
+        last_progress_key = None
+        last_progress_emit_at = 0
+        while True:
+            self._raise_if_stopped()
+            wait_seconds = self.TOAPIS_TASK_INITIAL_WAIT_SECONDS if first_wait else self.TOAPIS_TASK_POLL_SECONDS
+            first_wait = False
+            end_wait = time.monotonic() + wait_seconds
+            while time.monotonic() < end_wait:
+                self._raise_if_stopped()
+                time.sleep(min(0.2, max(0.0, end_wait - time.monotonic())))
+
+            resp = self._request(
+                "GET",
+                api_url(self.base_url, f"/v1/images/generations/{task_id}"),
+                headers=headers,
+                timeout=self.REQUEST_TIMEOUT,
+                proxies=self._submit_proxies(),
+            )
+            if resp.status_code >= 400:
+                raise Exception(f"任务查询失败 {resp.status_code}：{extract_api_error(resp)}")
+            data = resp.json()
+            try:
+                resp.close()
+            except Exception:
+                pass
+
+            status = self._toapis_task_status(data)
+            progress = ""
+            if isinstance(data, dict) and data.get("progress") not in (None, ""):
+                progress = f" {data.get('progress')}%"
+            progress_key = (status or "未知", progress)
+            now = time.monotonic()
+            if (
+                progress_key != last_progress_key
+                or now - last_progress_emit_at >= self.TOAPIS_TASK_PROGRESS_HEARTBEAT_SECONDS
+            ):
+                prefix = "任务状态" if progress_key != last_progress_key else "任务仍在生成中"
+                self.progress.emit(f"{prefix}：{status or '未知'}{progress}")
+                last_progress_key = progress_key
+                last_progress_emit_at = now
+            if status in {"completed", "succeeded", "success"}:
+                items = self._toapis_task_result_items(data)
+                if not items:
+                    raise Exception("任务完成，但没有返回图片结果。")
+                return items
+            if status in {"failed", "cancelled", "canceled", "error"}:
+                raise Exception(f"图片生成失败：{self._toapis_task_error_text(data, status)}")
+            if time.monotonic() >= deadline:
+                raise Exception("图片生成任务超时，请稍后重试或到任务记录中查看。")
 
     def _is_agnes_image_21_flash(self):
         model = str(self.model or "").strip().lower()
@@ -2604,6 +4144,9 @@ class ImageWorker(QThread):
         return ""
 
     def _post_image_request(self, headers):
+        if self._is_toapis_gpt_image_2_official():
+            return self._post_toapis_official_image_task(headers)
+
         if self._is_agnes_image_21_flash():
             return self._post_agnes_image_21_flash_request(headers)
 
@@ -2662,9 +4205,12 @@ class ImageWorker(QThread):
                 pass
 
             images = []
-            data_items = resp.get("data", [])
-            if not isinstance(data_items, list):
-                data_items = []
+            if self._is_toapis_gpt_image_2_official():
+                data_items = self._poll_toapis_official_task(self._toapis_task_id(resp), headers)
+            else:
+                data_items = resp.get("data", [])
+                if not isinstance(data_items, list):
+                    data_items = []
 
             for idx, item in enumerate(data_items, start=1):
                 self._raise_if_stopped()
@@ -2710,6 +4256,7 @@ class ImageWorker(QThread):
             if self._stop_requested or self.isInterruptionRequested():
                 self.failed.emit("任务已中止")
             else:
+                self._emit_last_image_api_diagnostics()
                 self.failed.emit(str(e))
         finally:
             self._close_network_handles()

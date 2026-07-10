@@ -7,7 +7,19 @@ from difflib import SequenceMatcher
 from .core import now_str
 
 CHAPTER_ANALYSIS_HASH_VERSION = "2"
+CHAPTER_ANALYSIS_STATUS_VERSION = "1"
 CHAPTER_ANALYSIS_SMALL_CHANGE_RATIO = 0.10
+CHAPTER_ANALYSIS_STATUS_CURRENT = "current"
+CHAPTER_ANALYSIS_STATUS_SMALL_CHANGE = "small_change"
+CHAPTER_ANALYSIS_STATUS_PENDING = "pending"
+CHAPTER_ANALYSIS_STATUS_UNWRITTEN = "unwritten"
+CHAPTER_ANALYSIS_QUICK_SIMILARITY_LOCAL_RATIO_LIMIT = 0.50
+CHAPTER_ANALYSIS_STATUS_LABELS = {
+    CHAPTER_ANALYSIS_STATUS_CURRENT: "已AI分析",
+    CHAPTER_ANALYSIS_STATUS_SMALL_CHANGE: "小改",
+    CHAPTER_ANALYSIS_STATUS_PENDING: "待AI分析",
+    CHAPTER_ANALYSIS_STATUS_UNWRITTEN: "未写正文",
+}
 _STORY_ORDER_MISSING = 10 ** 9
 _CHINESE_NUMERAL_DIGITS = {
     "零": 0,
@@ -126,7 +138,7 @@ def _has_foreshadow_recovery_negative(text):
 def _infer_foreshadow_status(item, preserve_manual=True):
     item = item if isinstance(item, dict) else {}
     current = str(item.get("status", "") or "").strip()
-    valid_statuses = {"未埋", "已埋", "已回收", "废弃"}
+    valid_statuses = {"未埋", "已埋", "已回收", "无需回收", "废弃"}
     if current in valid_statuses:
         return current
 
@@ -134,6 +146,8 @@ def _infer_foreshadow_status(item, preserve_manual=True):
     # Narrative text such as "揭晓/确认/解释" is too easy to misread and
     # should stay as AI/user-reviewed content, not become an automatic status.
     status_text = current.lower()
+    if any(k in current for k in ("无需回收", "不必回收", "不用回收", "无须回收", "不需要回收", "无需继续回收", "无需追踪")):
+        return "无需回收"
     if any(k in current for k in ("废弃", "作废", "弃用", "不再使用")):
         return "废弃"
     if (
@@ -151,7 +165,7 @@ def _infer_foreshadow_status(item, preserve_manual=True):
     return "未埋"
 
 
-_FORESHADOW_STATUS_RANK = {"": 0, "未埋": 1, "已埋": 2, "已回收": 3, "废弃": 4}
+_FORESHADOW_STATUS_RANK = {"": 0, "未埋": 1, "已埋": 2, "无需回收": 3, "已回收": 4, "废弃": 5}
 
 
 def _merge_foreshadow_status(existing, incoming):
@@ -181,6 +195,20 @@ def _normalize_foreshadow_code(value):
     if number <= 0:
         return ""
     return f"F{number:04d}"
+
+
+def _normalize_foreshadow_chapter_ref(value):
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    if re.fullmatch(r"\d{1,4}", text):
+        try:
+            number = int(text)
+        except Exception:
+            return text
+        if number > 0:
+            return f"第{number}章"
+    return text
 
 
 def _foreshadow_code_number(value):
@@ -422,12 +450,13 @@ def _default_project():
         "foreshadows": "",
         "summary": "",
         "draft_note": "",
+        "imported_chapter_plan_reference": {},
         "import_candidates": {"characters": [], "lore": [], "foreshadows": [], "project_materials": {}},
         "updated_at": now_str(),
     }
 
 
-_PRIVATE_PROJECT_NOTE_KEYS = {"draft_note"}
+_PRIVATE_PROJECT_NOTE_KEYS = {"draft_note", "imported_chapter_plan_reference"}
 
 
 def _project_without_private_notes(project):
@@ -477,6 +506,9 @@ def _new_chapter(index):
         "analysis_analyzed_at": "",
         "analysis_baseline": "",
         "analysis_linked_hash": "",
+        "analysis_status": CHAPTER_ANALYSIS_STATUS_UNWRITTEN,
+        "analysis_status_hash": "",
+        "analysis_status_version": CHAPTER_ANALYSIS_STATUS_VERSION,
     }
 
 
@@ -647,6 +679,39 @@ def _normalize_project(data):
         base[key] = value if isinstance(value, str) else str(value or "")
     for key in ("bible", "world_rules", "timeline", "foreshadows", "summary"):
         base[key] = _dedupe_text_lines(base.get(key, ""))
+    plan_reference = data.get("imported_chapter_plan_reference", {})
+    if isinstance(plan_reference, dict):
+        normalized_reference = {}
+        for key in ("summary", "source_title", "source_label", "imported_at"):
+            value = str(plan_reference.get(key, "") or "").strip()
+            if value:
+                normalized_reference[key] = value
+        chapters = []
+        for item in plan_reference.get("chapters", []) if isinstance(plan_reference.get("chapters", []), list) else []:
+            if not isinstance(item, dict):
+                continue
+            chapter = {
+                "index": _as_text(item.get("index", "")),
+                "title": _as_text(item.get("title", "")),
+                "target_words": _as_text(item.get("target_words", "")),
+                "narrative_stage": _as_text(item.get("narrative_stage", "")),
+                "chapter_function": _as_text(item.get("chapter_function", "")),
+                "conflict_intensity": _as_text(item.get("conflict_intensity", "")),
+                "setup_ratio": _as_text(item.get("setup_ratio", "")),
+                "character_task": _as_text(item.get("character_task", "")),
+                "mainline_task": _as_text(item.get("mainline_task", "")),
+                "outline": _as_text(item.get("outline", "")),
+                "characters": _normalize_name_list(item.get("characters", [])),
+                "settings": _normalize_name_list(item.get("settings", [])),
+                "ending_hook": _as_text(item.get("ending_hook", "")),
+                "forbidden": _as_text(item.get("forbidden", "")),
+            }
+            if any(str(value or "").strip() for value in chapter.values() if not isinstance(value, list)) or chapter["characters"] or chapter["settings"]:
+                chapters.append(chapter)
+        if chapters:
+            normalized_reference["chapters"] = chapters
+        if normalized_reference.get("summary") or normalized_reference.get("chapters"):
+            base["imported_chapter_plan_reference"] = normalized_reference
     chars = data.get("characters", [])
     if isinstance(chars, list):
         base["characters"] = [c for c in chars if isinstance(c, dict)]
@@ -688,6 +753,9 @@ def _normalize_project(data):
                     "analysis_analyzed_at",
                     "analysis_baseline",
                     "analysis_linked_hash",
+                    "analysis_status",
+                    "analysis_status_hash",
+                    "analysis_status_version",
                     "adaptation_mode",
                     "adaptation_optimization",
                     "adaptation_source_hash",
@@ -707,6 +775,8 @@ def _normalize_project(data):
                 item["id"] = uuid.uuid4().hex
             for key in ("id", "code", "name", "status", "setup_chapter", "payoff_chapter", "description", "notes"):
                 item[key] = _as_text(item.get(key, ""))
+            item["setup_chapter"] = _normalize_foreshadow_chapter_ref(item.get("setup_chapter", ""))
+            item["payoff_chapter"] = _normalize_foreshadow_chapter_ref(item.get("payoff_chapter", ""))
             item["description"] = _dedupe_text_lines(item.get("description", ""))
             item["notes"] = _dedupe_text_lines(item.get("notes", ""))
     candidates = data.get("import_candidates", {})
@@ -758,6 +828,9 @@ def _normalize_import_candidates(data):
             else:
                 if key in {"lore", "foreshadows"}:
                     clone["description"] = _dedupe_text_lines(clone.get("description", ""))
+                if key == "foreshadows":
+                    clone["setup_chapter"] = _normalize_foreshadow_chapter_ref(clone.get("setup_chapter", ""))
+                    clone["payoff_chapter"] = _normalize_foreshadow_chapter_ref(clone.get("payoff_chapter", ""))
                 preserve_candidate_metadata(clone, item)
                 out[key].append(clone)
     materials = data.get("project_materials", {})
@@ -992,6 +1065,10 @@ def _merge_foreshadow_description_without_bloat(existing, incoming, source_item=
 
 def _text_len(value):
     return len(str(value or "").strip())
+
+
+def _body_display_len(value):
+    return len(re.sub(r"\s+", "", str(value or "")))
 
 
 def _line_join_length(lines):
@@ -1770,7 +1847,7 @@ def _project_stats(data):
     characters = data.get("characters") if isinstance(data.get("characters"), list) else []
     lore = data.get("lore") if isinstance(data.get("lore"), list) else []
     foreshadow_items = data.get("foreshadow_items") if isinstance(data.get("foreshadow_items"), list) else []
-    body_words = sum(_text_len(chap.get("text", "")) for chap in chapters if isinstance(chap, dict))
+    body_words = sum(_body_display_len(chap.get("text", "")) for chap in chapters if isinstance(chap, dict))
     outline_words = sum(_text_len(chap.get("outline", "")) for chap in chapters if isinstance(chap, dict))
     summary_facts_words = sum(
         _text_len("\n".join([str(chap.get("summary", "") or ""), str(chap.get("key_facts", "") or "")]))
@@ -2288,7 +2365,8 @@ SCENE_TITLE_RE = re.compile(
     r"^\s*(?:[#＃]+\s*)?((?:第\s*[一二三四五六七八九十百千万零〇\d]+\s*场|场景\s*[一二三四五六七八九十百千万零〇\d]+|Scene\s+\d+|S\d{1,3}|INT\.|EXT\.|内景|外景)(?:\s*[:：\-—、.·]\s*.*|.*)?)\s*$",
     re.IGNORECASE,
 )
-IMPORT_TYPE_OPTIONS = ["小说", "短剧 / 分集剧本", "电影 / 长剧剧本", "自由文本"]
+FRAMEWORK_IMPORT_TYPE = "小说框架 / 大纲"
+IMPORT_TYPE_OPTIONS = [FRAMEWORK_IMPORT_TYPE, "小说", "短剧 / 分集剧本", "电影 / 长剧剧本", "自由文本"]
 UNIT_TYPE_LABELS = {
     "chapter": "章",
     "episode": "集",
@@ -2360,8 +2438,12 @@ _PROJECT_SEARCH_SKIP_KEYS = {
     "analysis_analyzed_at",
     "analysis_baseline",
     "analysis_linked_hash",
+    "analysis_status",
+    "analysis_status_hash",
+    "analysis_status_version",
     "adaptation_source_hash",
     "adapted_at",
+    "imported_chapter_plan_reference",
 }
 
 
@@ -2620,6 +2702,9 @@ def _split_chapters_from_text(text, import_type="小说"):
             "analysis_analyzed_at": "",
             "analysis_baseline": "",
             "analysis_linked_hash": "",
+            "analysis_status": CHAPTER_ANALYSIS_STATUS_UNWRITTEN,
+            "analysis_status_hash": "",
+            "analysis_status_version": CHAPTER_ANALYSIS_STATUS_VERSION,
         }
         chap["status"] = _infer_chapter_status(chap, preserve_manual=False)
         return [chap] if body else []
@@ -2648,6 +2733,9 @@ def _split_chapters_from_text(text, import_type="小说"):
                 "analysis_analyzed_at": "",
                 "analysis_baseline": "",
                 "analysis_linked_hash": "",
+                "analysis_status": CHAPTER_ANALYSIS_STATUS_UNWRITTEN,
+                "analysis_status_hash": "",
+                "analysis_status_version": CHAPTER_ANALYSIS_STATUS_VERSION,
             }
             chap["status"] = _infer_chapter_status(chap, preserve_manual=False)
             chapters.append(chap)
@@ -2681,6 +2769,9 @@ def _split_chapters_from_text(text, import_type="小说"):
             "analysis_analyzed_at": "",
             "analysis_baseline": "",
             "analysis_linked_hash": "",
+            "analysis_status": CHAPTER_ANALYSIS_STATUS_UNWRITTEN,
+            "analysis_status_hash": "",
+            "analysis_status_version": CHAPTER_ANALYSIS_STATUS_VERSION,
         }
         chap["status"] = _infer_chapter_status(chap, preserve_manual=False)
         chapters.append(chap)
@@ -2794,6 +2885,9 @@ def _split_manuscript_into_target_chapters(project, target_words):
                 "analysis_analyzed_at": "",
                 "analysis_baseline": "",
                 "analysis_linked_hash": "",
+                "analysis_status": CHAPTER_ANALYSIS_STATUS_UNWRITTEN,
+                "analysis_status_hash": "",
+                "analysis_status_version": CHAPTER_ANALYSIS_STATUS_VERSION,
             })
         current_units = []
         current_chars = 0
@@ -2894,7 +2988,23 @@ def _chapter_analysis_has_saved_current_version(chap):
     )
 
 
-def _chapter_analysis_diff_ratio(old_text, new_text):
+def _chapter_analysis_status_cache_hash(chap):
+    chap = chap if isinstance(chap, dict) else {}
+    current = _chapter_analysis_hash(chap)
+    if not current:
+        return ""
+    saved = str(chap.get("analysis_hash", "") or "").strip()
+    saved_version = str(chap.get("analysis_hash_version", "") or "").strip()
+    baseline = str(chap.get("analysis_baseline", "") or "").strip()
+    baseline_hash = hashlib.sha1(baseline.encode("utf-8")).hexdigest() if baseline else ""
+    saved_linked = str(chap.get("analysis_linked_hash", "") or "").strip()
+    linked = _chapter_analysis_linked_hash(chap)
+    return hashlib.sha1(
+        f"{current}\n{saved}\n{saved_version}\n{baseline_hash}\n{saved_linked}\n{linked}".encode("utf-8")
+    ).hexdigest()
+
+
+def _chapter_analysis_diff_ratio(old_text, new_text, allow_similarity=True):
     old_text = str(old_text or "").strip()
     new_text = str(new_text or "").strip()
     if old_text == new_text:
@@ -2915,15 +3025,18 @@ def _chapter_analysis_diff_ratio(old_text, new_text):
     changed_old = len(old_text) - prefix - suffix
     changed_new = len(new_text) - prefix - suffix
     local_ratio = max(changed_old, changed_new) / max(len(old_text), len(new_text), 1)
-    if length_delta_ratio <= CHAPTER_ANALYSIS_SMALL_CHANGE_RATIO and local_ratio <= CHAPTER_ANALYSIS_SMALL_CHANGE_RATIO:
-        return local_ratio
-    if max(len(old_text), len(new_text)) > 12000:
+    if local_ratio <= CHAPTER_ANALYSIS_SMALL_CHANGE_RATIO:
         return max(length_delta_ratio, local_ratio)
-    similarity = SequenceMatcher(None, old_text, new_text, autojunk=False).ratio()
-    return max(length_delta_ratio, 1.0 - similarity)
+    if (
+        allow_similarity
+        and local_ratio <= CHAPTER_ANALYSIS_QUICK_SIMILARITY_LOCAL_RATIO_LIMIT
+    ):
+        similarity = SequenceMatcher(None, old_text, new_text, autojunk=True).quick_ratio()
+        return max(length_delta_ratio, 1.0 - similarity)
+    return max(length_delta_ratio, local_ratio)
 
 
-def _chapter_analysis_small_change_ratio(chap):
+def _chapter_analysis_small_change_ratio(chap, allow_similarity=True):
     chap = chap if isinstance(chap, dict) else {}
     baseline = str(chap.get("analysis_baseline", "") or "").strip()
     if not baseline:
@@ -2931,10 +3044,10 @@ def _chapter_analysis_small_change_ratio(chap):
     current_text = _chapter_analysis_content_text(chap)
     if not current_text:
         return None
-    return _chapter_analysis_diff_ratio(baseline, current_text)
+    return _chapter_analysis_diff_ratio(baseline, current_text, allow_similarity=allow_similarity)
 
 
-def _chapter_analysis_is_small_change(chap):
+def _chapter_analysis_is_small_change(chap, allow_similarity=True):
     chap = chap if isinstance(chap, dict) else {}
     if not _chapter_has_analysis_body(chap):
         return False
@@ -2946,11 +3059,11 @@ def _chapter_analysis_is_small_change(chap):
     saved_linked_hash = str(chap.get("analysis_linked_hash", "") or "").strip()
     if "analysis_linked_hash" in chap and saved_linked_hash != _chapter_analysis_linked_hash(chap):
         return False
-    ratio = _chapter_analysis_small_change_ratio(chap)
+    ratio = _chapter_analysis_small_change_ratio(chap, allow_similarity=allow_similarity)
     return ratio is not None and ratio <= CHAPTER_ANALYSIS_SMALL_CHANGE_RATIO
 
 
-def _chapter_needs_analysis(chap):
+def _chapter_needs_analysis(chap, allow_similarity=True):
     if not _chapter_has_analysis_body(chap):
         return False
     current = _chapter_analysis_hash(chap)
@@ -2966,7 +3079,7 @@ def _chapter_needs_analysis(chap):
         and saved == _chapter_analysis_legacy_hash(chap)
     ):
         return False
-    if _chapter_analysis_is_small_change(chap):
+    if _chapter_analysis_is_small_change(chap, allow_similarity=allow_similarity):
         return False
     return True
 
@@ -2982,6 +3095,54 @@ def _chapter_analysis_is_current(chap):
         current == str(chap.get("analysis_hash", "") or "").strip()
         and str(chap.get("analysis_hash_version", "") or "").strip() == CHAPTER_ANALYSIS_HASH_VERSION
     )
+
+
+def _compute_chapter_analysis_status(chap, allow_similarity=True):
+    if not _chapter_has_analysis_body(chap):
+        return CHAPTER_ANALYSIS_STATUS_UNWRITTEN
+    current = _chapter_analysis_hash(chap)
+    if not current:
+        return CHAPTER_ANALYSIS_STATUS_UNWRITTEN
+    chap = chap if isinstance(chap, dict) else {}
+    saved = str(chap.get("analysis_hash", "") or "").strip()
+    saved_version = str(chap.get("analysis_hash_version", "") or "").strip()
+    if current == saved:
+        return CHAPTER_ANALYSIS_STATUS_CURRENT
+    if saved_version != CHAPTER_ANALYSIS_HASH_VERSION and saved and saved == _chapter_analysis_legacy_hash(chap):
+        return CHAPTER_ANALYSIS_STATUS_CURRENT
+    if not _chapter_analysis_has_saved_current_version(chap):
+        return CHAPTER_ANALYSIS_STATUS_PENDING
+    saved_linked_hash = str(chap.get("analysis_linked_hash", "") or "").strip()
+    if "analysis_linked_hash" in chap and saved_linked_hash != _chapter_analysis_linked_hash(chap):
+        return CHAPTER_ANALYSIS_STATUS_PENDING
+    ratio = _chapter_analysis_small_change_ratio(chap, allow_similarity=allow_similarity)
+    if ratio is not None and ratio <= CHAPTER_ANALYSIS_SMALL_CHANGE_RATIO:
+        return CHAPTER_ANALYSIS_STATUS_SMALL_CHANGE
+    return CHAPTER_ANALYSIS_STATUS_PENDING
+
+
+def _update_chapter_analysis_status_cache(chap, allow_similarity=True):
+    if not isinstance(chap, dict):
+        return CHAPTER_ANALYSIS_STATUS_UNWRITTEN
+    status = _compute_chapter_analysis_status(chap, allow_similarity=allow_similarity)
+    chap["analysis_status"] = status
+    chap["analysis_status_hash"] = _chapter_analysis_status_cache_hash(chap)
+    chap["analysis_status_version"] = CHAPTER_ANALYSIS_STATUS_VERSION
+    return status
+
+
+def _chapter_analysis_status(chap):
+    if not isinstance(chap, dict):
+        return CHAPTER_ANALYSIS_STATUS_UNWRITTEN
+    cache_hash = _chapter_analysis_status_cache_hash(chap)
+    status = str(chap.get("analysis_status", "") or "").strip()
+    if (
+        status in CHAPTER_ANALYSIS_STATUS_LABELS
+        and str(chap.get("analysis_status_version", "") or "").strip() == CHAPTER_ANALYSIS_STATUS_VERSION
+        and str(chap.get("analysis_status_hash", "") or "").strip() == cache_hash
+    ):
+        return status
+    return _update_chapter_analysis_status_cache(chap)
 
 
 def _mark_chapters_analyzed(chapters, chapter_ids):
@@ -3002,6 +3163,7 @@ def _mark_chapters_analyzed(chapters, chapter_ids):
         chap["analysis_analyzed_at"] = now_str()
         chap["analysis_baseline"] = _chapter_analysis_content_text(chap)
         chap["analysis_linked_hash"] = _chapter_analysis_linked_hash(chap)
+        _update_chapter_analysis_status_cache(chap)
         count += 1
     return count
 
@@ -3046,16 +3208,9 @@ def _chapter_list_text(index, chap):
     chap = chap if isinstance(chap, dict) else {}
     title = chap.get("title") or f"章节 {index + 1}"
     status = chap.get("status") or "大纲"
-    words = _text_len(chap.get("text", ""))
+    words = _body_display_len(chap.get("text", ""))
     unit = UNIT_TYPE_LABELS.get(str(chap.get("unit_type", "chapter") or "chapter"), "章")
-    if _chapter_analysis_is_current(chap):
-        analysis_status = "已AI分析"
-    elif _chapter_analysis_is_small_change(chap):
-        analysis_status = "小改"
-    elif _chapter_needs_analysis(chap):
-        analysis_status = "待AI分析"
-    else:
-        analysis_status = "未写正文"
+    analysis_status = CHAPTER_ANALYSIS_STATUS_LABELS.get(_chapter_analysis_status(chap), "未写正文")
     parts = [f"{index + 1}. {unit}｜{title}", status, f"{words}字", analysis_status]
     return "  ·  ".join(parts)
 
@@ -3411,7 +3566,7 @@ def _build_foreshadow_notes_draft(project):
     _ensure_foreshadow_codes(project)
     items = project.get("foreshadow_items", [])
     items = items if isinstance(items, list) else []
-    grouped = {"未埋": [], "已埋": [], "已回收": [], "废弃": [], "其他": []}
+    grouped = {"未埋": [], "已埋": [], "已回收": [], "无需回收": [], "废弃": [], "其他": []}
     for index, item in enumerate(items, 1):
         if not isinstance(item, dict):
             continue
@@ -3429,16 +3584,16 @@ def _build_foreshadow_notes_draft(project):
         if group in {"未埋", "已埋"}:
             score, tie_index = _open_foreshadow_queue_score(item, index)
             grouped[group].append((-score, tie_index, line))
-        elif group in {"已回收", "废弃"}:
+        elif group in {"已回收", "无需回收", "废弃"}:
             grouped[group].append((0, -index, line))
         else:
             grouped[group].append((0, index, line))
     if not any(grouped.values()):
         return ""
 
-    budgets = {"未埋": 2600, "已埋": 4200, "已回收": 1800, "废弃": 800, "其他": 1400}
+    budgets = {"未埋": 2600, "已埋": 4200, "已回收": 1800, "无需回收": 700, "废弃": 800, "其他": 1400}
     lines = ["伏笔汇总草稿"]
-    for status in ("未埋", "已埋", "已回收", "废弃", "其他"):
+    for status in ("未埋", "已埋", "已回收", "无需回收", "废弃", "其他"):
         group_items = grouped[status]
         if not group_items:
             continue
@@ -3750,6 +3905,29 @@ def _build_chapter_continuation_text(chapters, chapter_index):
     return "\n\n".join(parts)
 
 
+def _build_next_chapter_anchor_text(chapters, chapter_index, limit=500):
+    chapters = chapters if isinstance(chapters, list) else []
+    if not (0 <= chapter_index < len(chapters)):
+        return ""
+    current = chapters[chapter_index]
+    if not isinstance(current, dict) or _compact_text(current.get("text", "")):
+        return ""
+    next_index = chapter_index + 1
+    if not (0 <= next_index < len(chapters)):
+        return ""
+    next_chapter = chapters[next_index]
+    if not isinstance(next_chapter, dict):
+        return ""
+    next_head = _clip_complete_text(next_chapter.get("text", ""), int(limit or 500))
+    if not next_head:
+        return ""
+    title = str(next_chapter.get("title", "") or f"章节 {next_index + 1}").strip()
+    return (
+        f"下一章「{title}」开头原文（只用于当前章结尾对齐，不要复述、改写或提前写完下一章）：\n"
+        + next_head
+    )
+
+
 def _chapter_reference_score(value, chapter_index, chapter_title):
     text = _compact_text(value)
     if not text:
@@ -3881,7 +4059,7 @@ def _build_chapter_ai_context(project, chapter_index, action):
                 score += 140
         if status in {"未埋", "已埋"}:
             score += 80
-        if status == "已回收":
+        if status in {"已回收", "无需回收", "废弃"}:
             score -= 20
         return score
 
@@ -3907,6 +4085,7 @@ def _build_chapter_ai_context(project, chapter_index, action):
         )
     previous_summary = _build_previous_inheritance_text(chapters, chapter_index)
     continuation_text = _build_chapter_continuation_text(chapters, chapter_index)
+    next_chapter_anchor_text = _build_next_chapter_anchor_text(chapters, chapter_index)
     future_plan_text = _build_future_plan_text(chapters, chapter_index)
     has_current_text = bool(_compact_text(chap.get("text", "")))
     reverse_from_body = action in {"outline", "summary"} and has_current_text
@@ -3950,6 +4129,8 @@ def _build_chapter_ai_context(project, chapter_index, action):
         "伏笔推进与回收以动态伏笔调度参考和正文自然性为准。"
         "必须继承上一章结尾的时间、天气、地点、人物位置、情绪和未完成动作；如果上一章写明雨已停或场景已变化，"
         "不要在本章开头改成仍在下雨或回到旧场景，除非本章提纲明确发生了新的天气/场景变化。"
+        "如果有【后章衔接点】，本章结尾必须自然接到下一章开头的时间、地点、人物状态、动作和悬念；"
+        "后章衔接点只用于对齐当前章结尾，不要复述、改写或提前写完下一章正文。"
         "优先参考本章需继承的关键事实，其次参考本章摘要、前文摘要、人物目标、语言风格和世界规则。"
         "正文风格：口语化、自然、有网文阅读感，不要太工整、太书面、太像范文。"
         "句子长短混用，允许短句、停顿、反问和不完全对称的表达。"
@@ -4021,7 +4202,7 @@ def _build_chapter_ai_context(project, chapter_index, action):
         "不得改写已发生事实；如果资料冲突，优先保留更具体、更新、更接近当前章节的记录。",
         "续写时要继承人物目标、秘密、称呼、语言风格，以及伤势、物品、地点、关系和情绪变化。",
         "跨章开头必须继承上一章结尾状态：时间、天气、地点、人物位置、人物手中物品、身体状态和未完成动作不能凭空回退。",
-        "伏笔只在合适章节推进；已回收伏笔不要重复当新线索。缺资料时保持克制，不要补出会影响后文的新设定。",
+        "伏笔只在合适章节推进；已回收/无需回收/废弃伏笔不要重复当新线索。缺资料时保持克制，不要补出会影响后文的新设定。",
     ]
     if reverse_from_body:
         inheritance_rule_lines.append("本次是正文后的资料回填：提纲、摘要和关键事实都只能记录正文草稿中已经发生的内容，不要补写后续规划。")
@@ -4148,6 +4329,8 @@ def _build_chapter_ai_context(project, chapter_index, action):
         ]
     if action == "draft":
         knowledge_sections.insert(4, ("后续规划 / 边界", future_plan_text, 3600, True))
+        if next_chapter_anchor_text:
+            knowledge_sections.insert(5, ("后章衔接点", next_chapter_anchor_text, 900, False))
     current_section_item = (
         "当前章节",
         current_section,

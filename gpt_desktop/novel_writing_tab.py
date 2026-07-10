@@ -85,8 +85,10 @@ from .novel_utils import (
     _build_search_result_text,
     _build_writing_check_text,
     _auto_classify_default_statuses,
+    _body_display_len,
     _character_merge_key,
     _character_list_text,
+    _update_chapter_analysis_status_cache,
     _chapter_dedupe_key,
     _chapter_analysis_hash,
     _chapter_list_text,
@@ -122,6 +124,7 @@ from .novel_utils import (
     _normalize_name_list,
     _normalize_project,
     _project_without_private_notes,
+    _project_list_text,
     _project_summary_record_text,
     _project_meta_text,
     _project_summary_text,
@@ -131,9 +134,10 @@ from .novel_utils import (
     _split_chapters_from_text,
     _split_manuscript_into_target_chapters,
     _target_words,
+    FRAMEWORK_IMPORT_TYPE,
 )
 from .widgets import ProviderModelBar, WideComboBox
-from .workers import EdgeTTSWorker, NovelAnalysisWorker, NovelCandidatePostprocessWorker, NovelChapterPlanWorker, NovelChapterTitleWorker, NovelForeshadowReviewPostprocessWorker, NovelForeshadowReviewWorker, NovelWritingWorker
+from .workers import EdgeTTSWorker, NovelAnalysisWorker, NovelCandidatePostprocessWorker, NovelChapterPlanWorker, NovelChapterTitleWorker, NovelForeshadowReviewPostprocessWorker, NovelForeshadowReviewWorker, NovelFrameworkImportWorker, NovelWritingWorker
 
 NOVEL_PERF_LOG_ENABLED = str(os.environ.get("GPT_NOVEL_PERF_LOG", "") or "").strip().lower() in {
     "1",
@@ -240,6 +244,7 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
         self.analysis_worker = None
         self.writing_worker = None
         self.chapter_plan_worker = None
+        self.framework_import_worker = None
         self.chapter_title_worker = None
         self.auto_summary_worker = None
         self.auto_outline_worker = None
@@ -292,6 +297,8 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
         self.current_chapter_index = -1
         self._refreshing_helpers = False
         self._pending_manuscript_refresh = False
+        self._manuscript_stale = False
+        self._writing_check_stale = False
         self.read_aloud_worker = None
         self.read_aloud_retired_workers = []
         self.read_aloud_pending_segment = None
@@ -971,6 +978,17 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
         page_index = item.data(Qt.UserRole) if item is not None else row
         if isinstance(page_index, int):
             self.tabs.setCurrentIndex(page_index)
+            self._refresh_visible_helper_page(page_index)
+
+    def _refresh_visible_helper_page(self, page_index=None):
+        if not hasattr(self, "page_indexes"):
+            return
+        if page_index is None and hasattr(self, "tabs"):
+            page_index = self.tabs.currentIndex()
+        if page_index == self.page_indexes.get("书稿"):
+            self.ensure_manuscript_fresh()
+        elif page_index == self.page_indexes.get("检查"):
+            self.ensure_writing_check_fresh()
 
     def _nav_row_for_page_index(self, page_index):
         if not hasattr(self, "nav_list"):
@@ -1137,7 +1155,7 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
         self.foreshadow_name = QLineEdit()
         self.foreshadow_code = QLineEdit()
         self.foreshadow_status = WideComboBox()
-        self.foreshadow_status.addItems(["未埋", "已埋", "已回收", "废弃"])
+        self.foreshadow_status.addItems(["未埋", "已埋", "已回收", "无需回收", "废弃"])
         self.foreshadow_setup = QLineEdit()
         self.foreshadow_payoff = QLineEdit()
         self.foreshadow_desc = PlainTextEdit()
@@ -1333,6 +1351,7 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
         self.chapter_ai_preview = PlainTextEdit()
         self.chapter_ai_preview.setMinimumHeight(145)
         self.chapter_ai_preview.setPlaceholderText("AI 结果会显示在这里，生成完成后自动应用到当前章节。")
+        self.chapter_ai_preview.textChanged.connect(self._on_chapter_ai_preview_text_changed)
         ai_body_layout.addWidget(self.chapter_ai_preview, 1)
         plan_action_row = QHBoxLayout()
         plan_action_row.addStretch()
@@ -1601,6 +1620,28 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
         self._refresh_pending_helpers = False
         self._autosave_draft()
 
+    def _schedule_autosave_only(self):
+        if self._loading:
+            return
+        self._update_stats_label()
+        timer = getattr(self, "_refresh_timer", None)
+        if timer is not None:
+            timer.start()
+
+    def _mark_helper_pages_stale(self, manuscript=True, writing_check=True):
+        if manuscript:
+            self._manuscript_stale = True
+        if writing_check:
+            self._writing_check_stale = True
+
+    def ensure_manuscript_fresh(self):
+        if getattr(self, "_manuscript_stale", False):
+            self.refresh_manuscript()
+
+    def ensure_writing_check_fresh(self):
+        if getattr(self, "_writing_check_stale", False):
+            self.refresh_writing_check()
+
     def _note_project_dirty(self):
         self._dirty = True
         self._project_file_dirty = True
@@ -1623,6 +1664,7 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
         self._note_project_dirty()
         self._save_current_fields()
         self.refresh_project_summary_label()
+        self._refresh_current_project_list_item_from_memory()
         self._schedule_refresh()
 
     def _mark_character_dirty(self):
@@ -1651,7 +1693,9 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
             return
         self._note_project_dirty()
         self._save_chapter_from_editor()
-        self._schedule_refresh(include_manuscript=True)
+        self._refresh_current_project_list_item_from_memory()
+        self._mark_helper_pages_stale()
+        self._schedule_autosave_only()
 
     def _save_current_work(self, reason="自动保存", refresh_project_list=True, preserve_project_mtime=False):
         perf_start = time.perf_counter()
@@ -1751,6 +1795,27 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
                 self.project_list.blockSignals(False)
         if hasattr(self, "project_hint"):
             self.project_hint.setText("当前没有已保存项目；点击“保存项目”可保存当前草稿。" if not records else "单击列表可打开已保存小说。")
+
+    def _refresh_current_project_list_item_from_memory(self):
+        if not hasattr(self, "project_list"):
+            return False
+        current_path = str(self.current_project_path or "").strip()
+        if not current_path or current_path == NOVEL_DRAFT_FILE:
+            return False
+        target = os.path.abspath(current_path)
+        fallback_title = os.path.splitext(os.path.basename(current_path))[0]
+        text = _project_list_text(self.current_project, fallback_title)
+        for row in range(self.project_list.count()):
+            item = self.project_list.item(row)
+            if item is None:
+                continue
+            item_path = os.path.abspath(str(item.data(Qt.UserRole) or ""))
+            if item_path != target:
+                continue
+            item.setText(text)
+            item.setToolTip(current_path)
+            return True
+        return False
 
     def _select_project_list_path(self, path):
         if not hasattr(self, "project_list"):
@@ -1913,6 +1978,7 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
         chap["text"] = self.chapter_text.toPlainText().strip()
         chap["summary"] = self.chapter_summary.toPlainText().strip()
         chap["key_facts"] = self.chapter_key_facts.toPlainText().strip()
+        _update_chapter_analysis_status_cache(chap, allow_similarity=False)
         inferred_status = _infer_chapter_status(chap)
         if inferred_status != chap["status"]:
             chap["status"] = inferred_status
@@ -2408,7 +2474,7 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
         chapters = self.current_project.get("chapters", [])
         chapters = chapters if isinstance(chapters, list) else []
         body_chapters = [chap for chap in chapters if isinstance(chap, dict) and str(chap.get("text", "") or "").strip()]
-        body_words = sum(len(str(chap.get("text", "") or "").strip()) for chap in body_chapters)
+        body_words = sum(_body_display_len(chap.get("text", "")) for chap in body_chapters)
         if body_words <= 0:
             QMessageBox.information(self, "拆分提示", "当前没有可导出的章节正文。")
             return
@@ -2585,8 +2651,8 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
         self.refresh_project_summary_label()
         self._update_stats_label()
         if defer_helpers:
-            self._pending_manuscript_refresh = True
-            self._refresh_timer.start()
+            self._mark_helper_pages_stale()
+            self._refresh_visible_helper_page()
         else:
             self.refresh_manuscript()
             self.refresh_writing_check()
@@ -2611,6 +2677,7 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
             text = _build_manuscript_text(self.current_project)
             self._set_text_without_signals(self.manuscript_edit, text)
             self._refresh_read_aloud_scope_combo()
+            self._manuscript_stale = False
             self._log_novel_perf(
                 "刷新完整书稿",
                 perf_start,
@@ -2639,7 +2706,8 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
                 QMessageBox.information(self, "复制提示", "当前没有可复制的章节正文。")
                 return
             text = _build_manuscript_text(self.current_project)
-            self.manuscript_edit.setPlainText(text)
+            self._set_text_without_signals(self.manuscript_edit, text)
+            self._manuscript_stale = False
             from PySide6.QtWidgets import QApplication
             QApplication.clipboard().setText(text)
             self.set_status_tip("完整书稿已复制。")
@@ -2727,7 +2795,7 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
         if error:
             QMessageBox.information(self, "朗读提示", error)
             return
-        self.manuscript_edit.setPlainText(text)
+        self._set_text_without_signals(self.manuscript_edit, text)
         text_hash = self._read_aloud_hash(text)
         if self._can_resume_read_aloud(text_hash):
             self._set_read_aloud_running(True)
@@ -3177,6 +3245,7 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
             self._flush_current_editors()
             text = _build_writing_check_text(self.current_project)
             self._set_text_without_signals(self.check_edit, text)
+            self._writing_check_stale = False
             self._log_novel_perf(
                 "刷新写作检查",
                 perf_start,
@@ -3410,7 +3479,7 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
             desc = str(item.get("description", "") or "")
             if "体检建议" in desc or "判断依据" in desc or "章节依据" in desc:
                 header_lines.append("伏笔体检：这是 AI 对已有伏笔的清理建议；确认后才会更新原伏笔。")
-            if status in {"已回收", "废弃"}:
+            if status in {"已回收", "无需回收", "废弃"}:
                 header_lines.append(f"伏笔复核：AI 判断该伏笔应更新为“{status}”；确认后会按同名/别名合并到已有伏笔。")
             elif status == "已埋":
                 header_lines.append("伏笔复核：AI 判断该伏笔本章有推进但尚未回收；确认后会补充到已有伏笔。")
@@ -4213,12 +4282,17 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
         return self._candidate_analysis_chunk_stats(data)
 
     def _apply_candidate_postprocess_result(self, data):
+        if isinstance(data, dict) and data.get("_postprocess_empty"):
+            self._last_candidate_auto_cleanup_report = {}
+            self._set_candidate_postprocess_state("")
+            return False
         raw_candidates = _normalize_ai_candidates(data)
         self.import_candidates, self._last_candidate_auto_cleanup_report = _sanitize_import_candidates_for_long_form(
             self.current_project,
             raw_candidates,
         )
         self._set_candidate_postprocess_state("")
+        return True
 
     def _refresh_candidate_analysis_result_view(self):
         self.refresh_import_candidate_lists()
@@ -4454,6 +4528,43 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
             records.append(record)
         return records
 
+    def _chapter_plan_reference_context(self):
+        reference = self.current_project.get("imported_chapter_plan_reference", {}) if isinstance(self.current_project, dict) else {}
+        if not isinstance(reference, dict):
+            return {}
+        chapters = []
+        items = reference.get("chapters", [])
+        items = items if isinstance(items, list) else []
+        for fallback_index, item in enumerate(items[:160], 1):
+            if not isinstance(item, dict):
+                continue
+            record = {
+                "index": self._chapter_plan_clip_text(item.get("index", fallback_index), 20),
+                "title": self._chapter_plan_clip_text(item.get("title", ""), 80),
+                "target_words": self._chapter_plan_clip_text(item.get("target_words", ""), 40),
+                "narrative_stage": self._chapter_plan_clip_text(item.get("narrative_stage", ""), 80),
+                "chapter_function": self._chapter_plan_clip_text(item.get("chapter_function", ""), 240),
+                "conflict_intensity": self._chapter_plan_clip_text(item.get("conflict_intensity", ""), 120),
+                "setup_ratio": self._chapter_plan_clip_text(item.get("setup_ratio", ""), 120),
+                "character_task": self._chapter_plan_clip_text(item.get("character_task", ""), 300),
+                "mainline_task": self._chapter_plan_clip_text(item.get("mainline_task", ""), 300),
+                "outline": self._chapter_plan_clip_text(item.get("outline", ""), 1000),
+                "characters": _normalize_name_list(item.get("characters", [])),
+                "settings": _normalize_name_list(item.get("settings", [])),
+                "ending_hook": self._chapter_plan_clip_text(item.get("ending_hook", ""), 240),
+                "forbidden": self._chapter_plan_clip_text(item.get("forbidden", ""), 240),
+            }
+            if any(str(value or "").strip() for value in record.values() if not isinstance(value, list)) or record["characters"] or record["settings"]:
+                chapters.append(record)
+        summary = self._chapter_plan_clip_text(reference.get("summary", ""), 5000)
+        if not summary and not chapters:
+            return {}
+        return {
+            "usage": "这是导入框架时识别到的原始章节规划参考，只用于本次 AI 章节规划；不要把它当作已经存在的正式章节。",
+            "summary": summary,
+            "chapters": chapters,
+        }
+
     def _chapter_plan_project_context(self, target_words, average_chapter_words, total_chapter_count, requested_chapter_count):
         project = self._ai_project_snapshot()
         meta = project.get("meta", {}) if isinstance(project.get("meta", {}), dict) else {}
@@ -4534,10 +4645,14 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
             ),
             "existing_chapters": existing_chapters,
         }
+        imported_reference = self._chapter_plan_reference_context()
+        if imported_reference:
+            payload["imported_chapter_plan_reference"] = imported_reference
         return (
             "请根据以下 JSON 项目档案生成章节规划。只规划 requested_new_chapters 指定数量的新章节；"
             "不要重写已有章节，不要输出正文。"
             "必须按 target.stage_rules 和 estimated_total_chapters 判断每章所属阶段，并把阶段任务写入每章规划字段。\n\n"
+            "若存在 imported_chapter_plan_reference，请把它作为用户原始章节方向参考，仍按长篇章节规划标准生成正式规划。\n\n"
             "注意：章节规划只安排主线、人物任务、阶段节奏和结尾钩子，不要按伏笔编号或现有伏笔列表固定安排伏笔埋设、推进、回收；"
             "伏笔由扩写正文时根据当时的开放伏笔动态调度。\n\n"
             + json.dumps(payload, ensure_ascii=False, indent=2)
@@ -4811,6 +4926,7 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
                 self.current_project["draft_note"] = f"{current_note}\n\n{note_block}".strip() if current_note else note_block
                 if hasattr(self, "draft_note_edit"):
                     self.draft_note_edit.setPlainText(self.current_project["draft_note"])
+        self.current_project.pop("imported_chapter_plan_reference", None)
         self._pending_chapter_plan = {}
         if hasattr(self, "chapter_plan_apply_btn"):
             self.chapter_plan_apply_btn.setVisible(False)
@@ -4852,6 +4968,9 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
 
     def _has_partial_draft_preview(self):
         return self._has_partial_chapter_ai_preview("draft")
+
+    def _on_chapter_ai_preview_text_changed(self):
+        self._refresh_chapter_ai_action_labels()
 
     def _chapter_ai_context_with_preview(self, action):
         perf_start = time.perf_counter()
@@ -4920,6 +5039,14 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
         btn = getattr(self, "_chapter_ai_buttons_by_action", {}).get("draft")
         if btn is None:
             return
+        if (
+            getattr(self, "_chapter_ai_preview_is_partial", False)
+            and getattr(self, "_chapter_ai_preview_action", "") == "draft"
+            and not str(self.chapter_ai_preview.toPlainText() or "").strip()
+        ):
+            self._chapter_ai_preview_is_partial = False
+            self._chapter_ai_preview_action = ""
+            self._chapter_ai_preview_chapter_id = ""
         partial_action = getattr(self, "_chapter_ai_preview_action", "") if self._has_partial_chapter_ai_preview() else ""
         partial_labels = {
             "draft": ("续写正文", "从当前保留的正文预览继续生成，完成后自动应用并补提纲和摘要/关键事实"),
@@ -5196,6 +5323,8 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
             self._set_partial_chapter_ai_preview_state(True, action)
         elif action in {"outline", "summary"}:
             self._set_partial_chapter_ai_preview_state(True, action)
+        else:
+            self._refresh_chapter_ai_action_labels()
         self._reset_chapter_ai_sequence()
         action_label = {"draft": "正文", "outline": "提纲", "summary": "摘要"}.get(action, "正文")
         err_text = clean_error_text(err)
@@ -5205,7 +5334,11 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
             status = f"正文已写入，补摘要/关键事实失败，可继续补摘要：{err_text[:80]}"
         else:
             kept_hint = "已保留预览，" if kept_preview else ""
-            status = f"AI 写作失败，{kept_hint}可点续写{action_label}继续：{err_text[:80]}"
+            if kept_preview or action in {"outline", "summary"}:
+                action_text = f"可点续写{action_label}继续"
+            else:
+                action_text = "可重新扩写正文" if action == "draft" else f"可重新生成{action_label}"
+            status = f"AI 写作失败，{kept_hint}{action_text}：{err_text[:80]}"
         self.set_status_tip(status)
         QMessageBox.warning(self, "AI 写作失败", err_text)
 
@@ -5728,12 +5861,15 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
         QMessageBox.warning(self, "AI 分析失败", clean_error_text(err))
 
     def on_ai_candidate_postprocess_ready(self, data):
-        self._apply_candidate_postprocess_result(data)
+        replaced_candidates = self._apply_candidate_postprocess_result(data)
         self._persist_candidate_analysis_state()
         self._refresh_candidate_analysis_result_view()
         self._reload_chapter_list(self.current_chapter_index)
         material_hits = self._candidate_material_status_text()
         cleanup_tail = self._candidate_auto_cleanup_status_text()
+        if not replaced_candidates:
+            self.set_status_tip("AI 候选合并完成：没有新的候选需要加入，已保留分块候选供查看。")
+            return
         self.set_status_tip(
             f"AI 候选合并完成：人物 {len(self.import_candidates['characters'])}，设定 {len(self.import_candidates['lore'])}，伏笔 {len(self.import_candidates['foreshadows'])}，资料草案 {material_hits}{cleanup_tail}"
         )
@@ -6372,12 +6508,15 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
             import_type, ok = self._get_combo_choice("选择导入类型", "请选择这份文档的内容类型：", IMPORT_TYPE_OPTIONS, 0)
             if not ok:
                 return
+            if import_type == FRAMEWORK_IMPORT_TYPE:
+                self._import_framework_text(text, path, source_label)
+                return
             chapters = _split_chapters_from_text(text, import_type)
             if not chapters:
                 QMessageBox.warning(self, "导入失败", "没有拆出可导入的章节。")
                 return
 
-            import_mode, ok = self._get_combo_choice("选择导入方式", "请选择导入方式：", ["追加到当前项目", "创建为新项目"], 0)
+            import_mode, ok = self._get_combo_choice("选择导入方式", "请选择导入方式：", ["创建为新项目", "追加到当前项目"], 0)
             if not ok:
                 return
 
@@ -6404,6 +6543,329 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
                 self._import_script_append(text, chapters, title, source_label, import_type)
         except Exception as e:
             QMessageBox.warning(self, "导入失败", str(e))
+
+    def _import_framework_text(self, text, path, source_label):
+        worker = getattr(self, "framework_import_worker", None)
+        if worker is not None and worker.isRunning():
+            self.set_status_tip("框架正在 AI 分类，请稍等。")
+            return
+        import_mode, ok = self._get_combo_choice("选择导入方式", "请选择导入方式：", ["创建为新项目", "追加到当前项目"], 0)
+        if not ok:
+            return
+        classify_mode, ok = self._get_combo_choice("选择框架处理方式", "请选择框架导入处理方式：", ["直接导入", "AI 智能分类"], 0)
+        if not ok:
+            return
+        if classify_mode == "AI 智能分类":
+            provider, model, error = self._current_novel_ai_selection()
+            if error:
+                self.set_ai_settings_expanded(True)
+                self.set_status_tip(f"框架导入失败：{error}")
+                QMessageBox.warning(self, "框架导入失败", error)
+                return
+        else:
+            provider, model = None, ""
+
+        title = self._prepare_framework_import_project(text, path, source_label, import_mode)
+        if classify_mode == "AI 智能分类":
+            self._start_framework_import_worker(provider, model, text, title, source_label, import_mode)
+        else:
+            self._apply_direct_framework_import(text, title, source_label)
+
+    def _prepare_framework_import_project(self, text, path, source_label, import_mode):
+        self.last_import_text = text
+        title = os.path.splitext(os.path.basename(path))[0]
+        if import_mode == "创建为新项目":
+            self._clear_candidate_detail_view()
+            self._save_current_work(f"{source_label}框架导入新项目前保存")
+            data = _default_project()
+            safe_title = _safe_name(title) or "未命名小说"
+            data["meta"]["title"] = safe_title
+            data["updated_at"] = now_str()
+            project_path = unique_project_path(safe_title)
+            save_project_file(project_path, data)
+            self._load_project_data(data, project_path)
+            self._remember_project_path(project_path)
+            self._save_draft_snapshot()
+            self._notify_project_store_changed()
+            self._dirty = False
+            self._project_file_dirty = False
+        else:
+            if not self._has_saved_project_path():
+                self._save_current_work(f"{source_label}框架导入前保存")
+            self._flush_current_editors()
+        return title
+
+    def _framework_bible_reference_block(self, text, title="", source_label=""):
+        text = str(text or "").strip()
+        if not text:
+            return ""
+        title = str(title or "").strip() or "未命名框架"
+        source_label = str(source_label or "").strip() or "导入"
+        return f"导入框架原文（{source_label}：{title}）：\n{text}"
+
+    def _append_framework_reference_to_bible(self, text, title="", source_label=""):
+        block = self._framework_bible_reference_block(text, title, source_label)
+        if not block:
+            return False
+        old = str(self.current_project.get("bible", "") or "").strip()
+        if block in old:
+            return False
+        self.current_project["bible"] = f"{old}\n\n{block}".strip() if old else block
+        return True
+
+    def _apply_direct_framework_import(self, text, title, source_label):
+        changed = self._append_framework_reference_to_bible(text, title, source_label)
+        self._refresh_project_material_editors()
+        self._update_stats_label()
+        if hasattr(self, "nav_list") and hasattr(self, "page_indexes"):
+            self.nav_list.setCurrentRow(self.page_indexes.get("圣经", 0))
+        self._note_project_dirty()
+        save_message = self._save_after_import()
+        status = "框架已直接导入到小说圣经。"
+        if not changed:
+            status = "框架原文已存在，未重复写入。"
+        self.set_status_tip(f"{status}{save_message}")
+
+    def _framework_ai_materials_for_project(self, data):
+        materials = deepcopy(data.get("project_materials", {})) if isinstance(data, dict) else {}
+        materials = materials if isinstance(materials, dict) else {}
+        moved_parts = []
+        for key, label in (("timeline", "框架时间线 / 阶段走向"), ("summary", "框架摘要 / 全书走向")):
+            value = str(materials.get(key, "") or "").strip()
+            if value:
+                moved_parts.append(f"{label}：\n{value}")
+            materials[key] = ""
+        plan = data.get("chapter_plan", {}) if isinstance(data, dict) else {}
+        plan = plan if isinstance(plan, dict) else {}
+        if moved_parts:
+            bible = str(materials.get("bible", "") or "").strip()
+            framework_block = "全书阶段规划 / 框架参考：\n" + "\n\n".join(moved_parts)
+            materials["bible"] = f"{bible}\n\n{framework_block}".strip() if bible else framework_block
+        return materials
+
+    def _refresh_after_framework_import(self):
+        self.import_candidates = {"characters": [], "lore": [], "foreshadows": [], "project_materials": {}}
+        self.pending_analysis_chapter_ids = []
+        self.failed_analysis_chunks = []
+        self._set_candidate_postprocess_state("")
+        self._sync_candidate_analysis_state()
+        self._sync_import_candidates_to_project()
+        self._refresh_project_meta_editors()
+        self._refresh_project_material_editors()
+        self._reload_character_list()
+        self._reload_lore_list()
+        self._reload_foreshadow_list()
+        self._reload_chapter_list()
+        self.refresh_writing_check()
+        self.refresh_manuscript()
+        self._update_stats_label()
+
+    def _start_framework_import_worker(self, provider, model, text, source_title, source_label, import_mode):
+        if not provider:
+            return
+        context = _candidate_analysis_dossier_text(self._ai_project_snapshot())
+        self._framework_import_context = {
+            "source_title": str(source_title or "").strip(),
+            "source_label": str(source_label or "").strip(),
+            "import_mode": str(import_mode or "").strip(),
+        }
+        self.framework_import_worker = NovelFrameworkImportWorker(
+            provider.get("base_url", ""),
+            provider.get("api_key", ""),
+            model,
+            text,
+            context,
+            provider.get("proxy_url", ""),
+            self._provider_proxy_mode(provider),
+        )
+        self.framework_import_worker.progress.connect(self.set_status_tip)
+        self.framework_import_worker.result_ready.connect(self.on_framework_import_ready)
+        self.framework_import_worker.failed.connect(self.on_framework_import_failed)
+        self.framework_import_worker.finished.connect(self._cleanup_framework_import_worker)
+        self.set_status_tip("正在用 AI 分类导入框架...")
+        self.framework_import_worker.start()
+
+    def _set_combo_text_without_signals(self, widget, value):
+        if widget is None:
+            return
+        text = str(value or "").strip()
+        if not text:
+            return
+        widget.blockSignals(True)
+        try:
+            index = widget.findText(text)
+            if index >= 0:
+                widget.setCurrentIndex(index)
+        finally:
+            widget.blockSignals(False)
+
+    def _refresh_project_meta_editors(self):
+        meta = self.current_project.get("meta", {}) if isinstance(self.current_project, dict) else {}
+        if hasattr(self, "title_edit"):
+            self._set_line_text_without_signals(self.title_edit, meta.get("title", ""))
+        if hasattr(self, "genre_edit"):
+            self._set_line_text_without_signals(self.genre_edit, meta.get("genre", ""))
+        if hasattr(self, "style_edit"):
+            self._set_line_text_without_signals(self.style_edit, meta.get("style", ""))
+        if hasattr(self, "target_words_edit"):
+            self._set_line_text_without_signals(self.target_words_edit, meta.get("target_words", ""))
+        if hasattr(self, "premise_edit"):
+            self._set_text_without_signals(self.premise_edit, meta.get("premise", ""))
+        if hasattr(self, "pov_combo"):
+            self._set_combo_text_without_signals(self.pov_combo, meta.get("pov", ""))
+        if hasattr(self, "status_combo"):
+            self._set_combo_text_without_signals(self.status_combo, meta.get("status", ""))
+
+    def _merge_framework_meta(self, meta_updates, source_title="", import_mode=""):
+        meta_updates = meta_updates if isinstance(meta_updates, dict) else {}
+        meta = self.current_project.setdefault("meta", {})
+        new_project = import_mode == "创建为新项目"
+        source_title = str(source_title or "").strip()
+        changed = 0
+        for key in ("title", "genre", "style", "pov", "target_words", "status"):
+            value = str(meta_updates.get(key, "") or "").strip()
+            if not value:
+                continue
+            current = str(meta.get(key, "") or "").strip()
+            can_replace = (
+                new_project
+                or not current
+                or current in {"未命名小说", "草稿"}
+                or (key == "title" and source_title and current == source_title)
+            )
+            if can_replace and current != value:
+                meta[key] = value
+                changed += 1
+        premise = str(meta_updates.get("premise", "") or "").strip()
+        if premise:
+            current = str(meta.get("premise", "") or "").strip()
+            if not current or new_project:
+                if current != premise:
+                    meta["premise"] = premise
+                    changed += 1
+            elif premise not in current:
+                merged, did_change = _merge_text_lines_without_duplicates(current, premise)
+                if did_change:
+                    meta["premise"] = merged
+                    changed += 1
+        return changed
+
+    def _normalize_imported_chapter_plan_reference(self, plan, source_title="", source_label=""):
+        plan = plan if isinstance(plan, dict) else {}
+        items = plan.get("chapters", [])
+        items = items if isinstance(items, list) else []
+        chapters = []
+        for fallback_index, item in enumerate(items, 1):
+            if not isinstance(item, dict):
+                continue
+            outline = self._chapter_plan_outline_for_item(item)
+            title = str(item.get("title", "") or "").strip()
+            if not title and not outline:
+                continue
+            chapters.append({
+                "index": str(item.get("index", fallback_index) or fallback_index),
+                "title": title,
+                "target_words": str(item.get("target_words", "") or "").strip(),
+                "narrative_stage": str(item.get("narrative_stage", "") or "").strip(),
+                "chapter_function": str(item.get("chapter_function", "") or "").strip(),
+                "conflict_intensity": str(item.get("conflict_intensity", "") or "").strip(),
+                "setup_ratio": str(item.get("setup_ratio", "") or "").strip(),
+                "character_task": str(item.get("character_task", "") or "").strip(),
+                "mainline_task": str(item.get("mainline_task", "") or "").strip(),
+                "outline": outline,
+                "characters": _normalize_name_list(item.get("characters", [])),
+                "settings": _normalize_name_list(item.get("settings", [])),
+                "ending_hook": str(item.get("ending_hook", "") or "").strip(),
+                "forbidden": str(item.get("forbidden", "") or "").strip(),
+            })
+        summary = str(plan.get("summary", "") or "").strip()
+        if not summary and not chapters:
+            return {}
+        return {
+            "summary": summary,
+            "chapters": chapters,
+            "source_title": str(source_title or "").strip(),
+            "source_label": str(source_label or "").strip(),
+            "imported_at": now_str(),
+        }
+
+    def _store_imported_chapter_plan_reference(self, plan, source_title="", source_label=""):
+        reference = self._normalize_imported_chapter_plan_reference(plan, source_title, source_label)
+        if not reference:
+            self.current_project.pop("imported_chapter_plan_reference", None)
+            return 0
+        self.current_project["imported_chapter_plan_reference"] = reference
+        return len(reference.get("chapters", []) if isinstance(reference.get("chapters", []), list) else [])
+
+    def _apply_framework_import_result(self, data):
+        data = data if isinstance(data, dict) else {}
+        self._flush_current_editors()
+        context = getattr(self, "_framework_import_context", {}) or {}
+        meta_changed = self._merge_framework_meta(
+            data.get("meta", {}),
+            context.get("source_title", ""),
+            context.get("import_mode", ""),
+        )
+        candidates = _normalize_ai_candidates({
+            "characters": data.get("characters", []),
+            "lore": data.get("lore", []),
+            "foreshadows": data.get("foreshadows", []),
+            "project_materials": self._framework_ai_materials_for_project(data),
+        })
+        checked = {
+            "characters": list(range(len(candidates.get("characters", [])))),
+            "lore": list(range(len(candidates.get("lore", [])))),
+            "foreshadows": list(range(len(candidates.get("foreshadows", [])))),
+            "project_materials": ["bible", "world_rules", "timeline", "summary"],
+        }
+        apply_result = _apply_import_candidates(self.current_project, candidates, checked)
+        plan_added = self._store_imported_chapter_plan_reference(
+            data.get("chapter_plan", {}),
+            context.get("source_title", ""),
+            context.get("source_label", ""),
+        )
+        self._refresh_after_framework_import()
+        self._note_project_dirty()
+        save_message = self._save_after_import()
+        return apply_result, meta_changed, plan_added, save_message
+
+    def on_framework_import_ready(self, data):
+        try:
+            result, meta_changed, plan_added, save_message = self._apply_framework_import_result(data)
+            added = result.get("added", {}) if isinstance(result, dict) else {}
+            merged = result.get("merged", {}) if isinstance(result, dict) else {}
+            materials = result.get("materials", {}) if isinstance(result, dict) else {}
+            if hasattr(self, "nav_list") and hasattr(self, "page_indexes"):
+                self.nav_list.setCurrentRow(self.page_indexes.get("圣经", 0))
+            material_count = sum(1 for value in materials.values() if value) if isinstance(materials, dict) else 0
+            self.set_status_tip(
+                "框架 AI 分类完成："
+                f"项目信息 {meta_changed} 项，"
+                f"新增 人物 {added.get('characters', 0)} / 设定 {added.get('lore', 0)} / 伏笔 {added.get('foreshadows', 0)}，"
+                f"补充 人物 {merged.get('characters', 0)} / 设定 {merged.get('lore', 0)} / 伏笔 {merged.get('foreshadows', 0)}，"
+                f"资料分类 {material_count} 项，章节规划参考 {plan_added} 章。{save_message}"
+            )
+        except Exception as e:
+            self.on_framework_import_failed(str(e))
+
+    def on_framework_import_failed(self, err):
+        message = clean_error_text(err)
+        self.set_status_tip(f"框架 AI 分类失败：{message[:100]}")
+        QMessageBox.warning(self, "框架 AI 分类失败", message)
+
+    def _cleanup_framework_import_worker(self):
+        worker = self.sender()
+
+        def cleanup():
+            try:
+                if self.framework_import_worker is worker:
+                    self.framework_import_worker = None
+                if worker is not None:
+                    worker.deleteLater()
+            except Exception as e:
+                log_debug("小说框架导入线程清理失败", e)
+
+        QTimer.singleShot(0, cleanup)
 
     def _import_script_append(self, text, chapters, title, source_label, import_type):
         self._clear_candidate_detail_view()

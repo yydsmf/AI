@@ -80,7 +80,7 @@ class ImageGeneratorTab(SimpleModelBarMixin, QWidget):
     QUALITY_OPTIONS = ["自动", "低", "中", "高"]
     COUNT_OPTIONS = ["1", "2", "3"]
     UPLOAD_OPTIMIZATION_OPTIONS = ["高质量", "标准", "关闭"]
-    FALLBACK_MODELS = ["gpt-image-1", "dall-e-3", "dall-e-2"]
+    FALLBACK_MODELS = ["gpt-image-2", "gpt-image-2-vip", "gpt-image-1", "dall-e-3", "dall-e-2"]
     IMAGE_EXTS = (".png", ".jpg", ".jpeg", ".webp", ".bmp")
     MAX_TASK_LOG_ITEMS = 300
     TASK_LOG_RENDER_ITEMS = 30

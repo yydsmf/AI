@@ -465,6 +465,35 @@ class NovelLongFormContextTests(unittest.TestCase):
         self.assertIn("关系最终真相", context)
         self.assertLess(context.index("终局密钥"), context.index("背景待处理0"))
 
+    def test_chapter_context_excludes_no_need_foreshadows_from_open_queue(self):
+        current = _new_chapter(0)
+        current["title"] = "第十章 暂避锋芒"
+        current["outline"] = "本章处理人物关系，不直接回收伏笔。"
+        project = self._project_with_current_chapter(current)
+        project["foreshadow_items"] = [
+            {
+                "name": "白兔挂件去向",
+                "status": "无需回收",
+                "setup_chapter": "第三章",
+                "payoff_chapter": "",
+                "description": "低价值道具线，不影响主线。",
+            },
+            {
+                "name": "终局密钥",
+                "status": "已埋",
+                "setup_chapter": "第九章",
+                "payoff_chapter": "第二十五章",
+                "description": "关系最终真相，不能遗忘。",
+            },
+        ]
+
+        context = _build_chapter_ai_context(project, 0, "draft")
+        foreshadow_section = self._context_section(context, "本章相关伏笔")
+
+        self.assertIn("开放伏笔队列", foreshadow_section)
+        self.assertIn("终局密钥", foreshadow_section)
+        self.assertNotIn("白兔挂件去向", foreshadow_section)
+
     def test_chapter_context_prioritizes_due_open_foreshadow_queue(self):
         current = _new_chapter(39)
         current["title"] = "第四十章 风雪夜谈"
@@ -865,6 +894,58 @@ class NovelLongFormContextTests(unittest.TestCase):
         self.assertIn("上一章「第六十章 雨夜追问」结尾", context)
         self.assertIn("纸包里露出半枚虎符", context)
         self.assertIn("自然承接上一章", context)
+
+    def test_chapter_context_includes_next_chapter_head_when_rewriting_empty_middle_chapter(self):
+        previous = _new_chapter(0)
+        previous["title"] = "第一章 任务开启"
+        previous["text"] = "系统面板弹出，赵明看见第一个任务。"
+        current = _new_chapter(1)
+        current["title"] = "第二章 NPC任务窗口开业"
+        current["outline"] = "赵明完成任务窗口开业，结尾接到第三章的抢首杀。"
+        next_chapter = _new_chapter(2)
+        next_chapter["title"] = "第三章 校花刷好感"
+        next_chapter["text"] = "清晨，校门口已经围满了人。校花林雪站在人群外，盯着赵明刚亮起的NPC任务窗口。"
+        project = self._project_with_current_chapter(current)
+        project["chapters"] = [previous, current, next_chapter]
+
+        context = _build_chapter_ai_context(project, 1, "draft")
+        anchor = self._context_section(context, "后章衔接点")
+
+        self.assertIn("下一章「第三章 校花刷好感」开头原文", anchor)
+        self.assertIn("校花林雪站在人群外", anchor)
+        self.assertIn("只用于当前章结尾对齐", anchor)
+        self.assertIn("本章结尾必须自然接到下一章开头", context)
+
+    def test_chapter_context_skips_next_chapter_head_when_current_body_exists(self):
+        current = _new_chapter(0)
+        current["title"] = "第二章 已有正文"
+        current["outline"] = "继续写任务窗口。"
+        current["text"] = "赵明已经把任务窗口打开。"
+        next_chapter = _new_chapter(1)
+        next_chapter["title"] = "第三章 后续"
+        next_chapter["text"] = "第三章开头不应进入续写中的第二章上下文。"
+        project = self._project_with_current_chapter(current)
+        project["chapters"] = [current, next_chapter]
+
+        context = _build_chapter_ai_context(project, 0, "draft")
+
+        self.assertNotIn("【后章衔接点】", context)
+
+    def test_outline_and_summary_do_not_include_next_chapter_anchor(self):
+        current = _new_chapter(0)
+        current["title"] = "第二章 空正文"
+        current["outline"] = "补第二章。"
+        next_chapter = _new_chapter(1)
+        next_chapter["title"] = "第三章 后续"
+        next_chapter["text"] = "第三章开头只给扩写正文参考。"
+        project = self._project_with_current_chapter(current)
+        project["chapters"] = [current, next_chapter]
+
+        outline_context = _build_chapter_ai_context(project, 0, "outline")
+        summary_context = _build_chapter_ai_context(project, 0, "summary")
+
+        self.assertNotIn("【后章衔接点】", outline_context)
+        self.assertNotIn("【后章衔接点】", summary_context)
 
     def test_chapter_context_keeps_previous_ending_state_beyond_last_three_paragraphs(self):
         previous = _new_chapter(0)
@@ -2169,12 +2250,14 @@ class NovelLongFormContextTests(unittest.TestCase):
         }
         explicit_buried = {"name": "虎符失踪", "status": "待回收", "description": "第十章待揭晓。"}
         explicit_resolved = {"name": "旧钟声", "status": "已兑现", "description": "密室钟声的真相揭晓。"}
+        explicit_no_need = {"name": "白兔挂件", "status": "不必回收", "description": "低价值道具线。"}
 
         self.assertEqual(_infer_foreshadow_status(buried), "未埋")
         self.assertEqual(_infer_foreshadow_status(unburied), "未埋")
         self.assertEqual(_infer_foreshadow_status(resolved), "未埋")
         self.assertEqual(_infer_foreshadow_status(explicit_buried), "已埋")
         self.assertEqual(_infer_foreshadow_status(explicit_resolved), "已回收")
+        self.assertEqual(_infer_foreshadow_status(explicit_no_need), "无需回收")
 
     def test_writing_check_does_not_infer_foreshadow_payoff_from_chapter_facts(self):
         chapter = _new_chapter(19)

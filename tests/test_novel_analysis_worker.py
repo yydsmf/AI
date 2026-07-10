@@ -1,11 +1,15 @@
 import json
 import unittest
+from unittest.mock import patch
+
+import gpt_desktop.workers as workers_module
 
 from gpt_desktop.workers import (
     NovelAnalysisWorker,
     NovelCandidatePostprocessWorker,
     NovelChapterPlanWorker,
     NovelChapterTitleWorker,
+    NovelFrameworkImportWorker,
     NovelForeshadowReviewPostprocessWorker,
     NovelForeshadowReviewWorker,
     NovelWritingWorker,
@@ -139,6 +143,44 @@ class NovelAnalysisWorkerTests(unittest.TestCase):
         self.assertEqual([call[1] for call in calls], [1, 1])
         self.assertEqual(parsed["chapters"][0]["title"], "风起京城")
         self.assertFalse(any("自动拆成" in text for text in progress))
+
+    def test_rate_limit_error_retries_after_ten_seconds(self):
+        worker = NovelAnalysisWorker("http://example.test", "key", "model", "正文")
+        worker.retry_attempts = 2
+        calls = []
+        progress = []
+        worker.progress.connect(progress.append)
+
+        def fake_resilient(prompt, chunk, label, total, use_response_format, split_depth=0):
+            calls.append((prompt, chunk, label, total, use_response_format, split_depth))
+            if len(calls) == 1:
+                raise RuntimeError("Concurrency limit exceeded for user, please retry later")
+            return {"characters": [], "lore": [], "foreshadows": [], "project_materials": {}}, use_response_format
+
+        worker._analyze_chunk_resilient = fake_resilient
+        with patch.object(workers_module.time, "time", side_effect=[0, 11]), patch.object(workers_module.time, "sleep"):
+            parsed, _response_format = worker._analyze_chunk_with_retries("prompt", "正文", 1, 1, True)
+
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(parsed["characters"], [])
+        self.assertTrue(any("接口并发限制" in text and "10 秒后自动重试 2/2" in text for text in progress))
+
+    def test_rate_limit_error_does_not_split_large_chunk(self):
+        worker = NovelAnalysisWorker("http://example.test", "key", "model", "正文")
+        worker._set_analysis_stream_supported(False)
+        large_chunk = "正文" * 1000
+
+        def fail_post(*_args, **_kwargs):
+            raise RuntimeError("Concurrency limit exceeded for user, please retry later")
+
+        def fail_split(*_args, **_kwargs):
+            raise AssertionError("并发限制不应该拆小块重试")
+
+        worker._post_analysis_chunk = fail_post
+        worker._split_retry_chunk_once = fail_split
+
+        with self.assertRaisesRegex(RuntimeError, "Concurrency limit exceeded"):
+            worker._analyze_chunk_resilient("prompt", large_chunk, 1, 1, True)
 
     def test_summary_prompt_requires_linked_characters_section(self):
         worker = NovelWritingWorker("http://example.test", "key", "model", "summary", "context")
@@ -648,6 +690,10 @@ class NovelAnalysisWorkerTests(unittest.TestCase):
         self.assertIn("普通悬念、单章情绪钩子、一次性疑问", prompt)
         self.assertIn("不要为了凑数写普通悬念", prompt)
         self.assertIn("不要把已有档案里没有在本片段推进的信息当作新发现重复输出", prompt)
+        self.assertIn("target_code/命中编号", prompt)
+        self.assertIn("无需回收", prompt)
+        self.assertIn("review_reason", prompt)
+        self.assertIn("evidence", prompt)
 
     def test_candidate_postprocess_prompt_keeps_major_chapter_characters(self):
         worker = NovelCandidatePostprocessWorker("http://example.test", "key", "model", {"characters": [{"name": "王六"}]}, "dossier")
@@ -1045,10 +1091,128 @@ class NovelAnalysisWorkerTests(unittest.TestCase):
         self.assertIn("已有档案里已经稳定存在的信息，不要作为新增候选重复输出", prompt)
         self.assertIn("不确定是否同一对象时分开保留", prompt)
         self.assertIn("伏笔要保守", prompt)
+        self.assertIn("状态更新，不是新增重复资料", prompt)
+        self.assertIn("不同 target_code/命中编号 的终态更新必须分别保留", prompt)
+        self.assertIn("没有 target_code/命中编号 的新增伏笔仍按普通候选规则去重", prompt)
+        self.assertIn("target_code", prompt)
         self.assertIn("分块候选", user_text)
         self.assertIn("赵明", user_text)
 
-    def test_candidate_postprocess_rejects_empty_merged_result(self):
+    def test_framework_import_prompt_and_normalization(self):
+        worker = NovelFrameworkImportWorker(
+            "http://example.test",
+            "key",
+            "model",
+            "主角：赵明\n第一章：旧案重启",
+            "已有项目档案",
+        )
+
+        prompt = worker._analysis_prompt()
+        user_text = worker._framework_user_text()
+        normalized = worker._normalize_framework_result({
+            "meta": {"title": "旧案录", "genre": "悬疑", "target_words": "约50000字", "premise": "旧案牵动三代人"},
+            "project_materials": {"bible": "主线复仇", "world_rules": "卷宗不可外传"},
+            "characters": [{"name": "赵明", "role": "主角", "notes": "追查旧案"}],
+            "lore": [{"name": "旧案卷宗", "type": "物品", "description": "缺页卷宗"}],
+            "foreshadows": [{"name": "缺页真相", "status": "未埋", "description": "卷宗缺页待揭示"}],
+            "chapter_plan": {
+                "summary": "前三章建立旧案。",
+                "chapters": [
+                    {
+                        "index": 1,
+                        "title": "第一章 旧案重启",
+                        "outline": "赵明收到缺页卷宗。",
+                        "characters": "赵明",
+                        "settings": ["旧案卷宗"],
+                    }
+                ],
+            },
+        })
+
+        self.assertIn("只根据【导入框架原文】明确写出的内容分类", prompt)
+        self.assertIn("不要把整段框架原文原样塞进", prompt)
+        self.assertIn("全书阶段规划 / 框架参考", prompt)
+        self.assertIn("timeline 和 summary 默认留空", prompt)
+        self.assertIn("不要凭空生成完整章节规划", prompt)
+        self.assertIn("导入框架原文", user_text)
+        self.assertEqual(normalized["meta"]["title"], "旧案录")
+        self.assertEqual(normalized["meta"]["target_words"], "5")
+        self.assertEqual(normalized["characters"][0]["name"], "赵明")
+        self.assertEqual(normalized["lore"][0]["name"], "旧案卷宗")
+        self.assertEqual(normalized["foreshadows"][0]["name"], "缺页真相")
+        self.assertEqual(normalized["chapter_plan"]["chapters"][0]["title"], "旧案重启")
+        self.assertIn("赵明收到缺页卷宗", normalized["chapter_plan"]["chapters"][0]["outline"])
+
+    def test_framework_import_normalizes_project_target_words_to_wan_unit(self):
+        worker = NovelFrameworkImportWorker(
+            "http://example.test",
+            "key",
+            "model",
+            "目标字数：20万",
+        )
+
+        cases = {
+            "约5万字": "5",
+            "50000字": "5",
+            "200000字": "20",
+            "12.5万": "12.5",
+        }
+        for raw, expected in cases.items():
+            with self.subTest(raw=raw):
+                normalized = worker._normalize_framework_result({"meta": {"target_words": raw}})
+                self.assertEqual(normalized["meta"]["target_words"], expected)
+
+    def test_analysis_stream_json_error_falls_back_to_non_stream_request(self):
+        worker = NovelAnalysisWorker("http://example.test", "key", "model", "context")
+        calls = []
+
+        def fake_stream(*_args, **_kwargs):
+            calls.append("stream")
+            raise ValueError("AI 返回内容不是合法 JSON。解析位置：第 1 行，第 20 列。")
+
+        def fake_post(*_args, **_kwargs):
+            calls.append("post")
+            return {"characters": [], "lore": [], "foreshadows": [], "project_materials": {}}
+
+        worker._post_analysis_chunk_stream = fake_stream
+        worker._post_analysis_chunk = fake_post
+
+        parsed, response_format = worker._analyze_chunk_resilient("prompt", "正文", 1, 1, True)
+
+        self.assertEqual(calls, ["stream", "post"])
+        self.assertEqual(parsed["foreshadows"], [])
+        self.assertTrue(response_format)
+        self.assertFalse(worker._analysis_request_capabilities()[1])
+
+    def test_candidate_postprocess_stream_json_error_falls_back_to_non_stream_request(self):
+        worker = NovelCandidatePostprocessWorker(
+            "http://example.test",
+            "key",
+            "model",
+            {"foreshadows": [{"name": "虎符失踪", "status": "已回收"}]},
+            "【已有项目档案】",
+        )
+        calls = []
+
+        def fake_stream(*_args, **_kwargs):
+            calls.append("stream")
+            raise ValueError("AI 返回内容不是合法 JSON。解析位置：第 1 行，第 20 列。")
+
+        def fake_post(*_args, **_kwargs):
+            calls.append("post")
+            return {"characters": [], "lore": [], "foreshadows": [{"name": "虎符失踪", "status": "已回收"}], "project_materials": {}}
+
+        worker._post_analysis_chunk_stream = fake_stream
+        worker._post_analysis_chunk = fake_post
+
+        parsed, response_format = worker._analyze_chunk_resilient("prompt", "候选", 1, 1, True)
+
+        self.assertEqual(calls, ["stream", "post"])
+        self.assertEqual(parsed["foreshadows"][0]["status"], "已回收")
+        self.assertTrue(response_format)
+        self.assertFalse(worker._analysis_request_capabilities()[1])
+
+    def test_candidate_postprocess_accepts_empty_merged_result(self):
         worker = NovelCandidatePostprocessWorker(
             "http://example.test",
             "key",
@@ -1067,9 +1231,10 @@ class NovelAnalysisWorkerTests(unittest.TestCase):
 
         worker.run()
 
-        self.assertEqual(results, [])
-        self.assertTrue(errors)
-        self.assertIn("没有返回有效候选", errors[0])
+        self.assertEqual(errors, [])
+        self.assertTrue(results)
+        self.assertTrue(results[0].get("_postprocess_empty"))
+        self.assertEqual(results[0]["characters"], [])
 
     def test_candidate_postprocess_retry_entry_accepts_split_depth_argument(self):
         worker = NovelCandidatePostprocessWorker(
@@ -1235,6 +1400,7 @@ class NovelAnalysisWorkerTests(unittest.TestCase):
 
         self.assertIn("target_code", prompt)
         self.assertIn("命中编号", prompt)
+        self.assertIn("无需回收", prompt)
 
     def test_foreshadow_review_postprocess_merge_stops_after_terminal_candidate(self):
         worker = NovelForeshadowReviewPostprocessWorker(

@@ -1,11 +1,29 @@
 # -*- mode: python ; coding: utf-8 -*-
 
+from pathlib import Path
+
+
+project_dir = Path(SPECPATH).resolve()
+icon_file = project_dir / "app_icon_trimmed.icns"
+blender_resources_dir = project_dir / "gpt_desktop" / "resources" / "blender"
+blender_resource_names = (
+    "modern_furniture_pack_293.blend",
+    "wooden_mannequin_rigged_293.blend",
+    "MODERN_FURNITURE_ATTRIBUTION.md",
+    "WOODEN_MANNEQUIN_ATTRIBUTION.md",
+)
+datas = []
+for resource_name in blender_resource_names:
+    resource_path = blender_resources_dir / resource_name
+    if resource_path.is_file():
+        datas.append((str(resource_path), "gpt_desktop/resources/blender"))
+
 
 a = Analysis(
-    ['/Users/wanglibo/Desktop/GPT/factory_main.py'],
-    pathex=[],
+    [str(project_dir / "factory_main.py")],
+    pathex=[str(project_dir)],
     binaries=[],
-    datas=[],
+    datas=datas,
     hiddenimports=[],
     hookspath=[],
     hooksconfig={},
@@ -32,7 +50,7 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
-    icon=['/Users/wanglibo/Desktop/GPT/app_icon_trimmed.icns'],
+    icon=str(icon_file) if icon_file.exists() else None,
 )
 coll = COLLECT(
     exe,
@@ -46,6 +64,6 @@ coll = COLLECT(
 app = BUNDLE(
     coll,
     name='GPTLocalToolboxFactory.app',
-    icon='/Users/wanglibo/Desktop/GPT/app_icon_trimmed.icns',
+    icon=str(icon_file) if icon_file.exists() else None,
     bundle_identifier=None,
 )

@@ -1,0 +1,1539 @@
+import re
+import uuid
+from copy import deepcopy
+
+from .novel_v2_utils import (
+    _canonicalize_character_record,
+    _character_activity_stats,
+    _character_merge_key,
+    _clip_complete_text,
+    _clip_context_text,
+    _compact_text,
+    _dedupe_text_lines,
+    _ensure_foreshadow_codes,
+    _infer_foreshadow_status,
+    _merge_foreshadow_status,
+    _lore_activity_stats,
+    _merge_foreshadow_description_without_bloat,
+    _merge_text_lines_without_duplicates,
+    _normalize_foreshadow_chapter_ref,
+    _normalize_foreshadow_code,
+    _normalize_name_list,
+    _prepare_character_candidate,
+    _project_without_private_notes,
+    _record_alias_keys,
+    _select_lines_by_char_budget,
+    _stable_character_notes_context,
+    _stable_foreshadow_description_context,
+    _story_order_from_text,
+)
+
+try:
+    from docx import Document
+    from docx.enum.text import WD_ALIGN_PARAGRAPH
+except Exception:
+    Document = None
+    WD_ALIGN_PARAGRAPH = None
+
+
+def _read_docx_text(path):
+    if Document is None:
+        raise RuntimeError("当前环境缺少 python-docx，无法导入 Word 文档。")
+    doc = Document(path)
+    lines = []
+    for para in doc.paragraphs:
+        text = str(para.text or "").strip()
+        if text:
+            lines.append(text)
+    for table in doc.tables:
+        for row in table.rows:
+            cells = []
+            for cell in row.cells:
+                cell_text = "\n".join(
+                    str(para.text or "").strip()
+                    for para in cell.paragraphs
+                    if str(para.text or "").strip()
+                )
+                if cell_text:
+                    cells.append(cell_text)
+            if cells:
+                lines.append("\n".join(cells))
+    return "\n".join(lines)
+
+
+def _read_txt_text(path):
+    last_error = None
+    for encoding in ("utf-8", "utf-8-sig", "gb18030", "utf-16", "utf-16-le", "utf-16-be"):
+        try:
+            with open(path, "r", encoding=encoding) as f:
+                return f.read()
+        except UnicodeDecodeError as e:
+            last_error = e
+            continue
+    if last_error:
+        raise last_error
+    with open(path, "r", encoding="utf-8") as f:
+        return f.read()
+
+
+def _write_docx_text(path, title, chapters, center_chapter_headings=False):
+    if Document is None:
+        raise RuntimeError("当前环境缺少 python-docx，无法导出 Word 文档。")
+    doc = Document()
+    title_para = doc.add_heading(str(title or "未命名小说"), 0)
+    if center_chapter_headings and WD_ALIGN_PARAGRAPH is not None:
+        title_para.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    for index, chap in enumerate(chapters if isinstance(chapters, list) else [], 1):
+        if not isinstance(chap, dict):
+            continue
+        text = str(chap.get("text", "") or "").strip()
+        if not text:
+            continue
+        heading = str(chap.get("title", "") or f"第 {index} 章").strip()
+        heading_para = doc.add_heading(heading, level=1)
+        if center_chapter_headings and WD_ALIGN_PARAGRAPH is not None:
+            heading_para.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        for para in text.splitlines():
+            para = para.strip()
+            if para:
+                doc.add_paragraph(para)
+    doc.save(path)
+
+
+def _unique_keep_order(values, limit=80):
+    seen = set()
+    out = []
+    for value in values:
+        value = str(value or "").strip()
+        if not value or value in seen:
+            continue
+        seen.add(value)
+        out.append(value)
+        if len(out) >= limit:
+            break
+    return out
+
+
+def _extract_import_candidates(text):
+    text = str(text or "")
+    compact = re.sub(r"\s+", "", text)
+    common_words = {
+        "他们", "我们", "你们", "自己", "这个", "那个", "什么", "没有", "不是", "已经", "突然", "只是",
+        "时候", "地方", "事情", "眼前", "身后", "面前", "声音", "所有", "一个", "一种",
+    }
+    names = []
+    for match in re.findall(r"[\u4e00-\u9fff]{2,4}", compact):
+        if match in common_words:
+            continue
+        if match.endswith(("说道", "看着", "知道", "觉得", "起来", "下去", "里面", "这里", "那里")):
+            continue
+        names.append(match)
+
+    place_keywords = "府|宫|城|镇|村|山|宗|门|阁|楼|院|司|部|军|营|帮|派|国|朝|殿|寺|谷|湖|江|河"
+    lore = []
+    for match in re.findall(rf"[\u4e00-\u9fff]{{2,8}}(?:{place_keywords})", compact):
+        lore.append(match)
+    for match in re.findall(r"[\u4e00-\u9fff]{1,6}(?:令|符|剑|刀|玉|珠|书|卷|印|冠|甲|丹|药)", compact):
+        lore.append(match)
+
+    foreshadows = []
+    for sentence in re.split(r"[。！？!?；;]\s*", text):
+        s = sentence.strip()
+        if not s:
+            continue
+        if any(k in s for k in ("秘密", "真相", "失踪", "旧案", "线索", "疑点", "隐藏", "身份", "遗物", "谜")):
+            foreshadows.append(s[:60])
+
+    character_candidates = []
+    lore_candidates = [{"name": name, "type": "其他", "description": "文档导入候选"} for name in _unique_keep_order(lore, 40)]
+    for name in _unique_keep_order(names, 40):
+        char_item, lore_item = _prepare_character_candidate(
+            {"name": name, "role": "", "goal": "", "secret": "", "voice": "", "notes": "文档导入候选"},
+            default_notes="文档导入候选",
+        )
+        if char_item:
+            character_candidates.append(char_item)
+        elif lore_item:
+            lore_candidates.append(lore_item)
+
+    return {
+        "characters": character_candidates,
+        "lore": lore_candidates,
+        "foreshadows": [
+            {
+                "name": item,
+                "status": "未埋",
+                "setup_chapter": "",
+                "payoff_chapter": "",
+                "description": "文档导入候选",
+            }
+            for item in _unique_keep_order(foreshadows, 40)
+        ],
+        "project_materials": {"bible": "", "world_rules": "", "timeline": "", "summary": ""},
+    }
+
+
+def _candidate_detail_text(kind, item):
+    if not isinstance(item, dict):
+        return ""
+    if kind == "characters":
+        lines = [
+            f"姓名：{item.get('name', '')}",
+            f"身份：{item.get('role', '')}",
+            f"人物目标：{item.get('goal', '')}",
+            f"隐藏秘密：{item.get('secret', '')}",
+            f"语言风格：{item.get('voice', '')}",
+            f"备注：{item.get('notes', '')}",
+        ]
+    elif kind == "lore":
+        lines = [
+            f"名称：{item.get('name', '')}",
+            f"类型：{item.get('type', '')}",
+            f"说明：{item.get('description', '')}",
+        ]
+    else:
+        lines = [
+            f"名称：{item.get('name', '')}",
+            f"状态：{item.get('status', '')}",
+            f"埋设章节：{item.get('setup_chapter', '')}",
+            f"回收章节：{item.get('payoff_chapter', '')}",
+            f"说明：{item.get('description', '')}",
+        ]
+    return "\n".join(str(x) for x in lines if str(x).strip())
+
+
+def _append_candidate_note(description, label, value):
+    description = str(description or "").strip()
+    value = str(value or "").strip()
+    if not value:
+        return description
+    line = f"{label}：{value}"
+    if line in description.splitlines():
+        return description
+    return f"{description}\n{line}".strip() if description else line
+
+
+def _candidate_field(item, *keys, default=""):
+    item = item if isinstance(item, dict) else {}
+    for key in keys:
+        if key in item and str(item.get(key, "") or "").strip():
+            return item.get(key)
+    return default
+
+
+def _candidate_group(data, *keys, default=None):
+    data = data if isinstance(data, dict) else {}
+    for key in keys:
+        value = data.get(key)
+        if value:
+            return value
+    return default
+
+
+def _candidate_name(item):
+    return str(_candidate_field(item, "name", "姓名", "名称", "名字", "伏笔名", "线索名", "标题") or "").strip()
+
+
+_PROJECT_MATERIAL_ALIASES = {
+    "bible": ("bible", "小说圣经", "圣经", "故事圣经", "作品圣经", "核心设定"),
+    "world_rules": ("world_rules", "世界观", "规则", "世界规则", "设定规则", "世界观规则", "世界设定"),
+    "timeline": ("timeline", "时间线", "时间顺序", "事件线", "剧情时间线"),
+    "summary": ("summary", "摘要", "阶段摘要", "全局摘要", "故事摘要", "剧情摘要"),
+}
+_PROJECT_MATERIAL_KEYS = ("bible", "world_rules", "timeline", "summary")
+_MANUAL_PROJECT_MATERIAL_KEYS = {"bible", "world_rules"}
+_AUTO_PROJECT_MATERIAL_KEYS = ()
+
+
+def _project_material_key(value):
+    text = _compact_text(value).lower()
+    if not text:
+        return ""
+    for key, aliases in _PROJECT_MATERIAL_ALIASES.items():
+        for alias in aliases:
+            alias_text = _compact_text(alias).lower()
+            if text == alias_text or alias_text in text:
+                return key
+    return ""
+
+
+_LORE_DESCRIPTION_PLACEHOLDERS = {"AI 分析候选", "文档导入候选"}
+_LOW_VALUE_DOSSIER_TEXTS = {
+    "偏远地点暂不影响主线",
+    "普通背景线索暂不影响主线",
+    "暂不影响主线",
+    "已处理",
+    "已回收",
+    "无需回收",
+    "处理完毕",
+}
+_FORESHADOW_MERGE_TARGET_LABELS = ("合并目标", "合并到", "目标伏笔")
+_FORESHADOW_TARGET_CODE_LABELS = ("命中编号", "伏笔编号", "目标编号", "target_code", "merge_target_code")
+
+
+def _chapter_ref_lookup_key(value):
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    text = text.splitlines()[0].strip()
+    for _i in range(4):
+        cleaned = re.sub(r"^(?:伏笔按章比对|章节|当前章节标题|来源)[：:]\s*", "", text).strip()
+        if cleaned == text:
+            break
+        text = cleaned
+    text = re.sub(r"^第\s*[一二两三四五六七八九十百千万零〇\d]+\s*章\s*[：:、.\-—]?\s*", "", text).strip()
+    return _compact_text(text)
+
+
+def _chapter_source_label_map(project):
+    project = project if isinstance(project, dict) else {}
+    chapters = project.get("chapters", [])
+    chapters = chapters if isinstance(chapters, list) else []
+    labels = {}
+    for index, chapter in enumerate(chapters, 1):
+        if not isinstance(chapter, dict):
+            continue
+        title = str(chapter.get("title", "") or "").strip()
+        if not title:
+            continue
+        label = title if re.search(r"第\s*[一二两三四五六七八九十百千万零〇\d]+\s*章", title) else f"第{index}章：{title}"
+        for key in {title, label, _chapter_ref_lookup_key(title), _chapter_ref_lookup_key(label)}:
+            compact = _compact_text(key)
+            if compact and compact not in labels:
+                labels[compact] = label
+    return labels
+
+
+def _foreshadow_resolved_chapter_label(item, chapter_labels=None, fallback_value=""):
+    item = item if isinstance(item, dict) else {}
+    chapter_labels = chapter_labels if isinstance(chapter_labels, dict) else {}
+    for key in (
+        "_resolved_chapter_label",
+        "payoff_chapter",
+        "回收章节",
+        "兑现章节",
+        "揭晓章节",
+        "setup_chapter",
+        "埋设章节",
+        "铺垫章节",
+        "出现章节",
+        "evidence",
+        "依据章节",
+        "章节依据",
+        "chapter_title",
+        "_source_label",
+        "source_label",
+    ):
+        raw = str(item.get(key, "") or "").strip()
+        if not raw:
+            continue
+        for line in raw.splitlines():
+            label = _foreshadow_resolved_chapter_label_from_text(line, chapter_labels)
+            if label:
+                return label
+    return _foreshadow_resolved_chapter_label_from_text(fallback_value, chapter_labels)
+
+
+def _foreshadow_resolved_chapter_label_from_text(value, chapter_labels=None):
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    text = text.splitlines()[0].strip()
+    for _i in range(4):
+        cleaned = re.sub(r"^(?:伏笔按章比对|章节|当前章节标题|来源)[：:]\s*", "", text).strip()
+        if cleaned == text:
+            break
+        text = cleaned
+    compact = _compact_text(text)
+    lookup_key = _chapter_ref_lookup_key(text)
+    for key in (compact, lookup_key):
+        if key and key in (chapter_labels or {}):
+            return chapter_labels[key]
+    if re.search(r"第\s*[一二两三四五六七八九十百千万零〇\d]+\s*章", text):
+        return text
+    return ""
+
+
+def _foreshadow_source_item(item, chapter_labels=None, fallback_value=""):
+    item = item if isinstance(item, dict) else {}
+    source = _foreshadow_resolved_chapter_label(item, chapter_labels, fallback_value)
+    if not source:
+        return item
+    copy = dict(item)
+    copy["_resolved_chapter_label"] = source
+    return copy
+
+
+def _foreshadow_chapter_field_source_item(item, field, value, chapter_labels=None):
+    item = item if isinstance(item, dict) else {}
+    value = _normalize_foreshadow_chapter_ref(value)
+    source = ""
+    if field in {"setup_chapter", "payoff_chapter"}:
+        source = _foreshadow_resolved_chapter_label_from_text(value, chapter_labels)
+    if not source:
+        return item, str(value or "").strip()
+    copy = dict(item)
+    copy["_resolved_chapter_label"] = source
+    return copy, source
+
+
+def _foreshadow_chapter_update_text(field, value):
+    value = str(value or "").strip()
+    if not value:
+        return ""
+    label = "埋设章节" if field == "setup_chapter" else "回收章节" if field == "payoff_chapter" else ""
+    if not label:
+        return ""
+    return f"{label}更新为：{value}"
+
+
+def _is_low_value_dossier_text(value):
+    compact = re.sub(r"[。！？!?；;，,、\s]+", "", str(value or ""))
+    return bool(compact) and any(marker in compact for marker in _LOW_VALUE_DOSSIER_TEXTS)
+
+
+def _foreshadow_candidate_target_names(item):
+    item = item if isinstance(item, dict) else {}
+    values = []
+    for key in ("_merge_target", "merge_target", "合并目标", "合并到", "目标伏笔"):
+        value = str(item.get(key, "") or "").strip()
+        if value:
+            values.append(value)
+    label_pattern = "|".join(re.escape(label) for label in _FORESHADOW_MERGE_TARGET_LABELS)
+    source = "\n".join(str(item.get(key, "") or "") for key in ("description", "notes"))
+    for match in re.findall(rf"(?:{label_pattern})[：:]\s*([^\n。；;]+)", source):
+        values.append(match)
+    names = []
+    for value in values:
+        names.extend(_normalize_name_list(value))
+    return _unique_keep_order(names, 12)
+
+
+def _foreshadow_candidate_target_keys(item):
+    return {
+        _compact_text(name)
+        for name in _foreshadow_candidate_target_names(item)
+        if _compact_text(name)
+    }
+
+
+def _foreshadow_code_key(value):
+    code = _normalize_foreshadow_code(value)
+    return f"code:{code}" if code else ""
+
+
+def _foreshadow_record_code_key(item):
+    item = item if isinstance(item, dict) else {}
+    return _foreshadow_code_key(item.get("code", "") or item.get("foreshadow_code", ""))
+
+
+def _foreshadow_candidate_target_codes(item):
+    item = item if isinstance(item, dict) else {}
+    values = []
+    for key in (
+        "_target_code",
+        "target_code",
+        "merge_target_code",
+        "foreshadow_code",
+        "命中编号",
+        "伏笔编号",
+        "目标编号",
+    ):
+        value = str(item.get(key, "") or "").strip()
+        if value:
+            values.append(value)
+    label_pattern = "|".join(re.escape(label) for label in _FORESHADOW_TARGET_CODE_LABELS)
+    source = "\n".join(str(item.get(key, "") or "") for key in ("description", "notes"))
+    for match in re.findall(rf"(?:{label_pattern})[：:]\s*([Ff]?\s*\d{{1,7}}|[Ff]\s*0*\d{{1,7}})", source):
+        values.append(match)
+    codes = []
+    seen = set()
+    for value in values:
+        code = _normalize_foreshadow_code(value)
+        if code and code not in seen:
+            seen.add(code)
+            codes.append(code)
+    return codes[:8]
+
+
+def _foreshadow_candidate_target_code_keys(item):
+    return {
+        _foreshadow_code_key(code)
+        for code in _foreshadow_candidate_target_codes(item)
+        if _foreshadow_code_key(code)
+    }
+
+
+def _foreshadow_candidate_identity_keys(item):
+    item = item if isinstance(item, dict) else {}
+    keys = _record_alias_keys(item, name_key="name")
+    record_code_key = _foreshadow_record_code_key(item)
+    if record_code_key:
+        keys.add(record_code_key)
+    target_code_keys = _foreshadow_candidate_target_code_keys(item)
+    if target_code_keys:
+        keys.update(target_code_keys)
+    else:
+        keys.update(_foreshadow_candidate_target_keys(item))
+    return {key for key in keys if key}
+
+
+def _foreshadow_review_action_text(item):
+    item = item if isinstance(item, dict) else {}
+    action = str(_candidate_field(item, "review_action", "体检建议", "处理建议", "建议动作", "action") or "").strip()
+    if action:
+        return action
+    for key in ("description", "notes"):
+        source = str(item.get(key, "") or "")
+        for match in re.findall(r"(?:体检建议|处理建议|建议动作|action)[：:]\s*([^\n]+)", source):
+            text = str(match or "").strip()
+            if text:
+                return text
+    return ""
+
+
+def _foreshadow_status_from_review_action(action):
+    action = re.sub(r"\s+", "", str(action or ""))
+    if not action:
+        return ""
+    if any(term in action for term in ("无需回收", "不必回收", "不用回收", "无须回收", "不需要回收", "无需追踪")):
+        return "无需回收"
+    if any(term in action for term in ("移出伏笔", "移除伏笔", "废弃", "弃用", "作废")):
+        return "废弃"
+    if any(term in action for term in ("已回收", "回收完成", "兑现完成")):
+        return "已回收"
+    return ""
+
+
+def _foreshadow_candidate_is_terminal_review(item):
+    item = item if isinstance(item, dict) else {}
+    is_review_candidate = bool(
+        _foreshadow_review_action_text(item)
+        or _foreshadow_candidate_target_code_keys(item)
+        or _foreshadow_candidate_target_keys(item)
+    )
+    if not is_review_candidate:
+        return False
+    status_text = str(item.get("status", "") or "").strip()
+    status = _foreshadow_status_from_review_action(status_text) or (
+        _infer_foreshadow_status({"status": status_text}, preserve_manual=False) if status_text else ""
+    )
+    if status in {"已回收", "无需回收", "废弃"}:
+        return True
+    return bool(_foreshadow_status_from_review_action(_foreshadow_review_action_text(item)))
+
+
+def _foreshadow_terminal_review_description(value):
+    lines = []
+    for raw in str(value or "").splitlines():
+        line = str(raw or "").strip()
+        if not line:
+            continue
+        if re.match(r"^补充[：:]", line):
+            break
+        lines.append(line)
+    cleaned = _dedupe_text_lines("\n".join(lines))
+    return cleaned or _dedupe_text_lines(value)
+
+
+def _foreshadow_review_order_from_text(value):
+    text = str(value or "")
+    if not text.strip():
+        return 10 ** 9
+    hits = []
+    order = _story_order_from_text(text)
+    if order != 10 ** 9:
+        hits.append(order)
+    label_pattern = r"(?:章节|章|集|回|场)\s*[：:\-]?\s*(?:第\s*)?([一二两三四五六七八九十百千万零〇\d]+)"
+    for match in re.finditer(label_pattern, text, flags=re.IGNORECASE):
+        raw = str(match.group(1) or "").strip()
+        if not raw:
+            continue
+        order = _story_order_from_text(f"第{raw}章")
+        if order != 10 ** 9:
+            hits.append(order)
+    return min(hits) if hits else 10 ** 9
+
+
+def _foreshadow_terminal_review_order(item):
+    item = item if isinstance(item, dict) else {}
+
+    def first_known_order(values):
+        hits = []
+        for value in values:
+            order = _foreshadow_review_order_from_text(value)
+            if order != 10 ** 9:
+                hits.append(order)
+        return min(hits) if hits else 10 ** 9
+
+    high_confidence = []
+    for key in ("payoff_chapter", "回收章节", "兑现章节", "揭晓章节", "payoff", "evidence", "依据章节", "章节依据", "证据"):
+        high_confidence.append(item.get(key, ""))
+    for key in ("description", "notes"):
+        source = str(item.get(key, "") or "")
+        for match in re.findall(r"(?:章节依据|依据章节|证据|evidence)[：:]\s*([^\n]+)", source, flags=re.IGNORECASE):
+            high_confidence.append(match)
+    order = first_known_order(high_confidence)
+    if order != 10 ** 9:
+        return order
+
+    medium_confidence = []
+    for key in ("review_reason", "判断依据", "reason", "_source_label", "source_label"):
+        medium_confidence.append(item.get(key, ""))
+    for key in ("description", "notes"):
+        source = str(item.get(key, "") or "")
+        for match in re.findall(r"(?:判断依据|reason)[：:]\s*([^\n]+)", source, flags=re.IGNORECASE):
+            medium_confidence.append(match)
+    order = first_known_order(medium_confidence)
+    if order != 10 ** 9:
+        return order
+
+    return first_known_order((item.get("description", ""), item.get("notes", "")))
+
+
+def _foreshadow_terminal_review_should_replace(existing, incoming):
+    if not (_foreshadow_candidate_is_terminal_review(existing) and _foreshadow_candidate_is_terminal_review(incoming)):
+        return False
+    return _foreshadow_terminal_review_order(incoming) < _foreshadow_terminal_review_order(existing)
+
+
+def _lore_description_core(value):
+    text = str(value or "").strip()
+    previous = None
+    while previous != text:
+        previous = text
+        text = re.sub(r"^(?:补充|新增|补充说明)[：:]\s*", "", text).strip()
+    return text
+
+
+def _stable_lore_description_delta(value):
+    kept = []
+    placeholder_keys = {_compact_text(item) for item in _LORE_DESCRIPTION_PLACEHOLDERS}
+    for raw in str(value or "").splitlines():
+        core = _lore_description_core(raw)
+        if not core or _compact_text(core) in placeholder_keys:
+            continue
+        kept.append(str(raw or "").strip())
+    return _dedupe_text_lines("\n".join(kept))
+
+
+def _normalize_ai_candidates(data):
+    data = data if isinstance(data, dict) else {}
+    out = {"characters": [], "lore": [], "foreshadows": [], "project_materials": {}}
+
+    def merge_source_labels(existing, incoming):
+        labels = []
+        seen = set()
+        for value in (existing, incoming):
+            for line in str(value or "").splitlines():
+                line = line.strip()
+                if not line or line in seen:
+                    continue
+                seen.add(line)
+                labels.append(line)
+        return "\n".join(labels)
+
+    def source_label_from_item(item):
+        item = item if isinstance(item, dict) else {}
+        return str(item.get("_source_label", "") or item.get("source_label", "") or "").strip()
+
+    def attach_candidate_metadata(target, source):
+        if not isinstance(target, dict):
+            return target
+        source_label = source_label_from_item(source)
+        if source_label:
+            target["_source_label"] = merge_source_labels(target.get("_source_label", ""), source_label)
+        return target
+
+    def merge_candidate_text(existing, incoming, append=False):
+        old = str(existing or "").strip()
+        new = str(incoming or "").strip()
+        if append:
+            cleaned_old = _dedupe_text_lines(old)
+            if not new:
+                return cleaned_old
+            if not cleaned_old or cleaned_old in {"AI 分析候选", "文档导入候选"}:
+                return _dedupe_text_lines(new)
+            merged, _did_change = _merge_text_lines_without_duplicates(cleaned_old, new)
+            return merged
+        if not new:
+            return old
+        if not old or old in {"AI 分析候选", "文档导入候选"}:
+            return new
+        if new == old or new in old:
+            return old
+        if old in new:
+            return new
+        return old
+
+    def merge_into_group(group_key, item):
+        if not isinstance(item, dict):
+            return
+        if group_key == "lore":
+            item = dict(item)
+            item["description"] = _stable_lore_description_delta(item.get("description", ""))
+        name = str(item.get("name", "") or "").strip()
+        if not name:
+            return
+        target = out[group_key]
+        def merge_keys(value):
+            keys = _record_alias_keys(value, name_key="name")
+            if group_key == "characters":
+                keys.add(_character_merge_key(value))
+            elif group_key == "foreshadows":
+                keys = _foreshadow_candidate_identity_keys(value)
+            return {key for key in keys if key}
+
+        if group_key == "foreshadows" and _foreshadow_candidate_is_terminal_review(item):
+            item = dict(item)
+            item["description"] = _foreshadow_terminal_review_description(item.get("description", ""))
+        item_keys = merge_keys(item)
+        existing = None
+        for candidate in target:
+            if merge_keys(candidate) & item_keys:
+                existing = candidate
+                break
+        if existing is None:
+            attach_candidate_metadata(item, item)
+            target.append(item)
+            return
+        if group_key == "foreshadows" and _foreshadow_candidate_is_terminal_review(existing):
+            if _foreshadow_terminal_review_should_replace(existing, item):
+                replacement = deepcopy(item)
+                existing.clear()
+                existing.update(replacement)
+            return
+        incoming_terminal = group_key == "foreshadows" and _foreshadow_candidate_is_terminal_review(item)
+        if group_key == "characters" and name != str(existing.get("name", "") or "").strip():
+            existing_name = str(existing.get("name", "") or "").strip()
+            if existing_name:
+                existing["notes"] = merge_candidate_text(existing.get("notes", ""), f"别称：{existing_name}", append=True)
+            if _character_merge_key(item) == name:
+                existing["name"] = name
+            else:
+                existing["notes"] = merge_candidate_text(existing.get("notes", ""), f"别称：{name}", append=True)
+        elif group_key in {"lore", "foreshadows"} and name != str(existing.get("name", "") or "").strip():
+            if not (
+                group_key == "foreshadows"
+                and (_foreshadow_candidate_target_keys(item) or _foreshadow_candidate_target_code_keys(item))
+            ):
+                existing["description"] = merge_candidate_text(existing.get("description", ""), f"别称：{name}", append=True)
+        for field, value in item.items():
+            if field == "name":
+                continue
+            if group_key == "foreshadows" and field == "status":
+                if item.get("_status_explicit"):
+                    existing["status"] = _merge_foreshadow_status(existing.get("status", ""), value)
+                continue
+            if field in {"_source_label", "source_label"}:
+                existing["_source_label"] = merge_source_labels(existing.get("_source_label", ""), value)
+                continue
+            if field == "_status_explicit":
+                if value:
+                    existing["_status_explicit"] = True
+                continue
+            if group_key == "lore" and field == "description":
+                value = _stable_lore_description_delta(value)
+            if incoming_terminal and field == "description":
+                cleaned = _foreshadow_terminal_review_description(value)
+                if cleaned and cleaned != str(existing.get(field, "") or "").strip():
+                    existing[field] = cleaned
+                continue
+            existing[field] = merge_candidate_text(
+                existing.get(field, ""),
+                value,
+                append=field in {"notes", "description"},
+            )
+
+    def valid_items(key, *aliases):
+        items = _candidate_group(data, key, *aliases, default=[])
+        for item in items if isinstance(items, list) else []:
+            name = _candidate_name(item)
+            if isinstance(item, dict) and name:
+                yield item, name
+
+    for item, name in valid_items("characters", "人物", "人物卡", "角色", "角色列表", "character_candidates"):
+        normalized_item = {
+            "name": name,
+            "role": str(_candidate_field(item, "role", "身份", "角色定位", "人物身份", "定位") or ""),
+            "goal": str(_candidate_field(item, "goal", "目标", "人物目标", "动机", "诉求") or ""),
+            "secret": str(_candidate_field(item, "secret", "秘密", "隐藏秘密", "隐情") or ""),
+            "voice": str(_candidate_field(item, "voice", "语言风格", "说话风格", "口吻") or ""),
+            "notes": str(_candidate_field(item, "notes", "备注", "说明", "关系变化", "人物关系", "description") or "AI 分析候选"),
+        }
+        char_item, lore_item = _prepare_character_candidate(normalized_item, default_notes="AI 分析候选")
+        if char_item:
+            attach_candidate_metadata(char_item, item)
+            merge_into_group("characters", char_item)
+        elif lore_item:
+            attach_candidate_metadata(lore_item, item)
+            merge_into_group("lore", lore_item)
+    for item, name in valid_items("lore", "设定", "设定库", "世界观设定", "资料设定", "settings"):
+        normalized_item = {
+            "name": name,
+            "type": str(_candidate_field(item, "type", "类型", "类别", "设定类型") or "其他"),
+            "description": str(_candidate_field(item, "description", "说明", "描述", "设定说明", "备注", "规则") or "AI 分析候选"),
+        }
+        attach_candidate_metadata(normalized_item, item)
+        merge_into_group("lore", normalized_item)
+    for item, name in valid_items("foreshadows", "伏笔", "伏笔线索", "线索", "悬念", "clues"):
+        raw_status = str(_candidate_field(item, "status", "状态", "伏笔状态", "建议状态", "suggested_status") or "").strip()
+        review_action = str(_candidate_field(item, "review_action", "体检建议", "处理建议", "建议动作", "action") or "").strip()
+        action_status = _foreshadow_status_from_review_action(raw_status) or _foreshadow_status_from_review_action(
+            review_action or _foreshadow_review_action_text(item)
+        )
+        normalized_status = raw_status or action_status
+        review_reason = str(_candidate_field(item, "review_reason", "reason", "理由", "判断依据", "原因") or "").strip()
+        merge_target = str(_candidate_field(item, "merge_target", "合并到", "合并目标", "目标伏笔") or "").strip()
+        merge_target_code = str(_candidate_field(
+            item,
+            "target_code",
+            "_target_code",
+            "merge_target_code",
+            "foreshadow_code",
+            "命中编号",
+            "伏笔编号",
+            "目标编号",
+        ) or "").strip()
+        evidence = str(_candidate_field(item, "evidence", "依据章节", "证据", "章节依据", "证据章节") or "").strip()
+        description = str(_candidate_field(item, "description", "说明", "描述", "伏笔说明", "备注") or "AI 分析候选")
+        for label, value in (
+            ("体检建议", review_action),
+            ("合并目标", merge_target),
+            ("命中编号", _normalize_foreshadow_code(merge_target_code)),
+            ("判断依据", review_reason),
+            ("章节依据", evidence),
+        ):
+            description = _append_candidate_note(description, label, value)
+        normalized = {
+            "name": name,
+            "status": normalized_status,
+            "setup_chapter": _normalize_foreshadow_chapter_ref(
+                _candidate_field(item, "setup_chapter", "埋设章节", "铺垫章节", "出现章节", "setup")
+            ),
+            "payoff_chapter": _normalize_foreshadow_chapter_ref(
+                _candidate_field(item, "payoff_chapter", "回收章节", "兑现章节", "揭晓章节", "payoff")
+            ),
+            "description": description,
+        }
+        if merge_target:
+            normalized["_merge_target"] = merge_target
+        if merge_target_code:
+            normalized["_target_code"] = _normalize_foreshadow_code(merge_target_code)
+        normalized["_status_explicit"] = bool(normalized_status)
+        if normalized_status:
+            normalized["status"] = action_status or _infer_foreshadow_status(normalized, preserve_manual=False)
+        attach_candidate_metadata(normalized, item)
+        merge_into_group("foreshadows", normalized)
+    materials = _candidate_group(data, "project_materials", "项目资料", "资料草案", "项目材料", "全局资料", default={})
+    material_sources = []
+    if isinstance(materials, dict):
+        material_sources.append(materials)
+    elif isinstance(materials, list):
+        for item in materials:
+            if not isinstance(item, dict):
+                continue
+            material_key = _project_material_key(
+                _candidate_field(item, "key", "type", "类型", "字段", "名称", "标题", "category")
+            )
+            if not material_key:
+                material_key = _project_material_key(
+                    " ".join(str(k) for k in item.keys())
+                )
+            if not material_key:
+                continue
+            value = _candidate_field(item, "content", "内容", "text", "正文", "value", "说明", "description")
+            if value:
+                material_sources.append({material_key: value})
+    material_sources.append(data)
+    for source in material_sources:
+        if isinstance(source, dict):
+            for key in _PROJECT_MATERIAL_KEYS:
+                out["project_materials"][key] = merge_candidate_text(
+                    out["project_materials"].get(key, ""),
+                    str(_candidate_field(source, *_PROJECT_MATERIAL_ALIASES[key]) or "").strip(),
+                    append=True,
+                )
+    return out
+
+
+def _apply_import_candidates(project, candidates, checked):
+    project = project if isinstance(project, dict) else {}
+    _ensure_foreshadow_codes(project)
+    candidates = candidates if isinstance(candidates, dict) else {}
+    checked = checked if isinstance(checked, dict) else {}
+    result = {
+        "added": {"characters": 0, "lore": 0, "foreshadows": 0},
+        "merged": {"characters": 0, "lore": 0, "foreshadows": 0},
+        "materials": {"bible": False, "world_rules": False, "timeline": False, "summary": False},
+        "removed_candidates": 0,
+    }
+
+    chars = project.setdefault("characters", [])
+    lore = project.setdefault("lore", [])
+    foreshadows = project.setdefault("foreshadow_items", [])
+    chapter_labels = _chapter_source_label_map(project)
+
+    def useful(value):
+        text = str(value or "").strip()
+        return text and text not in {"AI 分析候选", "文档导入候选"}
+
+    def merge_text(existing, incoming, append=False):
+        old = str(existing or "").strip()
+        new = str(incoming or "").strip()
+        if append:
+            cleaned_old = _dedupe_text_lines(old)
+            if not useful(new):
+                return cleaned_old, cleaned_old != old
+            if not cleaned_old or cleaned_old in {"AI 分析候选", "文档导入候选"}:
+                cleaned_new = _dedupe_text_lines(new)
+                return cleaned_new, cleaned_new != old
+            merged, did_change = _merge_text_lines_without_duplicates(cleaned_old, new)
+            return merged, did_change or merged != old
+        if not useful(new):
+            return old, False
+        if not old or old in {"AI 分析候选", "文档导入候选"}:
+            return new, True
+        if new == old or new in old:
+            return old, False
+        if append and old not in new:
+            return f"{old}\n补充：{new}", True
+        if len(new) > len(old) * 1.4 and old in new:
+            return new, True
+        return old, False
+
+    def merge_item(key, target_item, incoming, fields, append_fields=()):
+        changed = False
+        for field in fields:
+            incoming_value = incoming.get(field, "") if isinstance(incoming, dict) else ""
+            incoming_source = incoming
+            if key == "foreshadows":
+                if field in {"setup_chapter", "payoff_chapter"}:
+                    incoming_source, incoming_value = _foreshadow_chapter_field_source_item(
+                        incoming,
+                        field,
+                        incoming_value,
+                        chapter_labels,
+                    )
+                else:
+                    incoming_source = _foreshadow_source_item(incoming, chapter_labels, incoming_value)
+            if key == "foreshadows" and field == "status":
+                if not incoming.get("_status_explicit"):
+                    continue
+                incoming_value = _merge_foreshadow_status(target_item.get(field, ""), incoming_value)
+                if incoming_value != str(target_item.get(field, "") or "").strip():
+                    target_item[field] = incoming_value
+                    changed = True
+                continue
+            if key == "lore" and field == "description":
+                incoming_value = _stable_lore_description_delta(incoming_value)
+            if key == "foreshadows" and field == "description" and field in append_fields:
+                merged, did_change = _merge_foreshadow_description_without_bloat(
+                    target_item.get(field, ""),
+                    incoming_value,
+                    incoming_source,
+                )
+            else:
+                merged, did_change = merge_text(
+                    target_item.get(field, ""),
+                    incoming_value,
+                    append=field in append_fields,
+                )
+            if did_change:
+                target_item[field] = merged
+                changed = True
+                if key == "foreshadows" and field in {"setup_chapter", "payoff_chapter"}:
+                    update_text = _foreshadow_chapter_update_text(field, merged)
+                    if update_text:
+                        merged_desc, desc_changed = _merge_foreshadow_description_without_bloat(
+                            target_item.get("description", ""),
+                            update_text,
+                            incoming_source,
+                        )
+                        if desc_changed:
+                            target_item["description"] = merged_desc
+                            changed = True
+        return changed
+
+    def replace_linked_character(old_name, new_name):
+        old_name = str(old_name or "").strip()
+        new_name = str(new_name or "").strip()
+        if not old_name or not new_name or old_name == new_name:
+            return
+        for chap in project.get("chapters", []) if isinstance(project.get("chapters", []), list) else []:
+            if not isinstance(chap, dict) or not isinstance(chap.get("linked_characters"), list):
+                continue
+            linked = []
+            seen = set()
+            changed = False
+            for value in chap.get("linked_characters", []):
+                text = str(value or "").strip()
+                if text == old_name:
+                    text = new_name
+                    changed = True
+                if text and text not in seen:
+                    seen.add(text)
+                    linked.append(text)
+            if changed:
+                chap["linked_characters"] = linked
+
+    def merge_key(key, item):
+        if key == "characters":
+            return _character_merge_key(item)
+        return str(item.get("name", "") if isinstance(item, dict) else "").strip()
+
+    def merge_keys(key, item):
+        if not isinstance(item, dict):
+            return set()
+        keys = _record_alias_keys(item, name_key="name")
+        if key == "characters":
+            keys.add(_character_merge_key(item))
+        elif key == "foreshadows":
+            keys = _foreshadow_candidate_identity_keys(item)
+        return {value for value in keys if value}
+
+    def project_record_from_candidate(item):
+        data = deepcopy(item)
+        if isinstance(data, dict):
+            for field in list(data.keys()):
+                if str(field).startswith("_") or field in {"source_label"}:
+                    data.pop(field, None)
+        return data
+
+    def append_foreshadow_review_note(target_item, incoming, target_code, old_name, old_status):
+        target_item = target_item if isinstance(target_item, dict) else {}
+        incoming = incoming if isinstance(incoming, dict) else {}
+        code = _normalize_foreshadow_code(target_code) or _normalize_foreshadow_code(target_item.get("code", ""))
+        title = str(old_name or target_item.get("name", "") or incoming.get("name", "") or "").strip()
+        suggested_status = str(incoming.get("status", "") or target_item.get("status", "") or "").strip()
+        description_source = incoming.get("description", "")
+        if _foreshadow_candidate_is_terminal_review(incoming):
+            description_source = _foreshadow_terminal_review_description(description_source)
+        description = _dedupe_text_lines(description_source)
+        lines = []
+        if code:
+            lines.append(f"命中编号：{code}")
+        if title:
+            lines.append(f"原伏笔标题：{title}")
+        if suggested_status:
+            lines.append(f"建议状态：{suggested_status}")
+        if description:
+            lines.append(f"建议说明：{description}")
+        if old_status:
+            lines.append(f"原状态：{old_status}")
+        note = "\n".join(lines).strip()
+        if not note:
+            return False
+        existing = str(target_item.get("notes", "") or "").strip()
+        if note in existing:
+            return False
+        target_item["notes"] = f"{existing}\n\n{note}".strip() if existing else note
+        return True
+
+    def is_closed_foreshadow_status(value):
+        status = _infer_foreshadow_status({"status": value}, preserve_manual=False) if str(value or "").strip() else ""
+        return status in {"已回收", "无需回收", "废弃"}
+
+    skipped_candidate_indexes = {}
+
+    def apply_group(key, target, fields, append_fields=(), status_infer=None):
+        existing = {}
+        existing_aliases = {}
+        duplicates = []
+        merged_count = 0
+        for x in target:
+            if not isinstance(x, dict) or not str(x.get("name", "") or "").strip():
+                continue
+            if key == "characters":
+                old_name, new_name = _canonicalize_character_record(x)
+                replace_linked_character(old_name, new_name)
+            item_key = merge_key(key, x)
+            if not item_key:
+                continue
+            alias_keys = merge_keys(key, x) or {item_key}
+            existing_item = None
+            for alias_key in alias_keys:
+                existing_item = existing_aliases.get(alias_key)
+                if existing_item is not None:
+                    break
+            if existing_item is not None:
+                alias_changed = False
+                name = str(x.get("name", "") or "").strip()
+                existing_name = str(existing_item.get("name", "") or "").strip()
+                if name and name != existing_name:
+                    if key == "characters":
+                        existing_item["notes"], alias_changed = merge_text(
+                            existing_item.get("notes", ""),
+                            f"别称：{name}",
+                            append=True,
+                        )
+                    elif key in {"lore", "foreshadows"}:
+                        existing_item["description"], alias_changed = merge_text(
+                            existing_item.get("description", ""),
+                            f"别称：{name}",
+                            append=True,
+                        )
+                if merge_item(key, existing_item, x, fields, append_fields):
+                    merged_count += 1
+                elif alias_changed:
+                    merged_count += 1
+                for alias_key in alias_keys:
+                    existing_aliases[alias_key] = existing_item
+                duplicates.append(x)
+            else:
+                existing[item_key] = x
+                for alias_key in alias_keys:
+                    existing_aliases[alias_key] = x
+        for duplicate in duplicates:
+            if duplicate in target:
+                target.remove(duplicate)
+        items = candidates.get(key, [])
+        added_count = 0
+        skipped_indexes = set()
+        for i in checked.get(key, []):
+            if i < 0 or i >= len(items):
+                continue
+            item = items[i]
+            name = str(item.get("name", "") if isinstance(item, dict) else "").strip()
+            if not name:
+                continue
+            item_key = merge_key(key, item)
+            alias_keys = merge_keys(key, item) or {item_key}
+            target_code_keys = _foreshadow_candidate_target_code_keys(item) if key == "foreshadows" else set()
+            target_keys = set() if target_code_keys else (_foreshadow_candidate_target_keys(item) if key == "foreshadows" else set())
+            existing_item = None
+            matched_by_target = False
+            matched_by_code = False
+            search_keys = list(target_code_keys) + list(target_keys) + [
+                value for value in alias_keys if value not in target_keys and value not in target_code_keys
+            ]
+            for alias_key in search_keys:
+                existing_item = existing_aliases.get(alias_key)
+                if existing_item is not None:
+                    matched_by_target = alias_key in target_keys
+                    matched_by_code = alias_key in target_code_keys
+                    break
+            if existing_item is not None:
+                old_name = str(existing_item.get("name", "") or "").strip()
+                old_status = str(existing_item.get("status", "") or "").strip()
+                is_targeted_foreshadow_review = key == "foreshadows" and (matched_by_target or matched_by_code)
+                if is_targeted_foreshadow_review and is_closed_foreshadow_status(old_status):
+                    continue
+                if name != str(existing_item.get("name", "") or "").strip():
+                    if key == "characters":
+                        existing_item["notes"], alias_changed = merge_text(
+                            existing_item.get("notes", ""),
+                            f"别称：{name}",
+                            append=True,
+                        )
+                    elif key in {"lore", "foreshadows"}:
+                        if is_targeted_foreshadow_review:
+                            alias_changed = False
+                        else:
+                            existing_item["description"], alias_changed = merge_text(
+                                existing_item.get("description", ""),
+                                f"别称：{name}",
+                                append=True,
+                            )
+                    else:
+                        alias_changed = False
+                else:
+                    alias_changed = False
+                merge_fields = ("status",) if is_targeted_foreshadow_review else fields
+                merge_append_fields = () if is_targeted_foreshadow_review else append_fields
+                changed = merge_item(key, existing_item, item, merge_fields, merge_append_fields) or alias_changed
+                if (
+                    is_targeted_foreshadow_review
+                    and item.get("_status_explicit")
+                    and old_status != str(existing_item.get("status", "") or "").strip()
+                ):
+                    note_changed = append_foreshadow_review_note(
+                        existing_item,
+                        item,
+                        item.get("_target_code") or next(iter(target_code_keys), ""),
+                        old_name,
+                        old_status,
+                    )
+                    changed = changed or note_changed
+                if changed:
+                    merged_count += 1
+                continue
+            if key == "foreshadows" and (target_keys or target_code_keys):
+                skipped_indexes.add(i)
+                continue
+            data = project_record_from_candidate(item)
+            if key == "lore":
+                data["description"] = _stable_lore_description_delta(data.get("description", ""))
+            data.setdefault("id", uuid.uuid4().hex)
+            if status_infer is not None:
+                data["status"] = status_infer(data)
+            target.append(data)
+            existing[item_key] = data
+            for alias_key in merge_keys(key, data) or {item_key}:
+                existing_aliases[alias_key] = data
+            added_count += 1
+        if skipped_indexes:
+            result.setdefault("skipped", {}).setdefault(key, 0)
+            result["skipped"][key] += len(skipped_indexes)
+            skipped_candidate_indexes.setdefault(key, set()).update(skipped_indexes)
+        return added_count, merged_count
+
+    result["added"]["characters"], result["merged"]["characters"] = apply_group(
+        "characters",
+        chars,
+        ("role", "goal", "secret", "voice", "notes"),
+        append_fields=("notes",),
+    )
+    result["added"]["lore"], result["merged"]["lore"] = apply_group(
+        "lore",
+        lore,
+        ("type", "description"),
+        append_fields=("description",),
+    )
+    result["added"]["foreshadows"], result["merged"]["foreshadows"] = apply_group(
+        "foreshadows",
+        foreshadows,
+        ("status", "setup_chapter", "payoff_chapter", "description"),
+        append_fields=("description",),
+        status_infer=lambda item: _infer_foreshadow_status(item, preserve_manual=False),
+    )
+
+    materials = candidates.get("project_materials", {})
+    if isinstance(materials, dict):
+        material_keys = _PROJECT_MATERIAL_KEYS
+        selected = checked.get("project_materials", None)
+        if isinstance(selected, list):
+            selected_keys = set()
+            for item in selected:
+                if isinstance(item, int) and 0 <= item < len(material_keys):
+                    selected_keys.add(material_keys[item])
+                elif str(item) in material_keys:
+                    selected_keys.add(str(item))
+        else:
+            selected_keys = set(_AUTO_PROJECT_MATERIAL_KEYS)
+        for key in material_keys:
+            if key not in selected_keys:
+                continue
+            merged, did_change = merge_text(project.get(key, ""), materials.get(key, ""), append=True)
+            if did_change:
+                project[key] = merged
+                result["materials"][key] = True
+                materials[key] = ""
+
+    for key, indexes in checked.items():
+        if key == "project_materials":
+            continue
+        skipped_indexes = skipped_candidate_indexes.get(key, set())
+        items = candidates.get(key, [])
+        for i in sorted(indexes, reverse=True):
+            if i in skipped_indexes:
+                continue
+            if 0 <= i < len(items):
+                del items[i]
+                result["removed_candidates"] += 1
+    return result
+
+
+def _candidate_dossier_detail_score(item, fields):
+    item = item if isinstance(item, dict) else {}
+    score = 0
+    for field, weight in fields:
+        value = str(item.get(field, "") or "").strip()
+        if not value:
+            continue
+        compact = _compact_text(value)
+        if compact in {"AI分析候选", "文档导入候选", "后续处理", "待后续处理", "待补充", "待定"}:
+            continue
+        score += weight + min(60, len(compact) // 4)
+    return score
+
+
+def _rank_candidate_dossier_characters(project, limit=40):
+    project = project if isinstance(project, dict) else {}
+    characters = project.get("characters", [])
+    characters = characters if isinstance(characters, list) else []
+    activity = _character_activity_stats(project)
+    ranked = []
+    for index, item in enumerate(characters):
+        if not isinstance(item, dict):
+            continue
+        name = str(item.get("name", "") or "").strip()
+        if not name:
+            continue
+        stat = activity.get(name, {})
+        count = int(stat.get("chapters", 0) or 0)
+        detail_score = _candidate_dossier_detail_score(
+            item,
+            (("role", 160), ("goal", 120), ("secret", 120), ("voice", 80), ("notes", 50)),
+        )
+        if count <= 0 and detail_score <= 0:
+            continue
+        score = count * 1000 + detail_score
+        ranked.append((-score, -count, index, item))
+    ranked.sort()
+    if limit is None or int(limit or 0) <= 0:
+        return [item for _score, _count, _index, item in ranked]
+    return [item for _score, _count, _index, item in ranked[: int(limit or 0)]]
+
+
+def _rank_candidate_dossier_lore(project, limit=40):
+    project = project if isinstance(project, dict) else {}
+    lore_items = project.get("lore", [])
+    lore_items = lore_items if isinstance(lore_items, list) else []
+    activity = _lore_activity_stats(project)
+    ranked = []
+    for index, item in enumerate(lore_items):
+        if not isinstance(item, dict):
+            continue
+        name = str(item.get("name", "") or "").strip()
+        if not name:
+            continue
+        stat = activity.get(name, {})
+        count = int(stat.get("chapters", 0) or 0)
+        stable_desc = _stable_lore_description_delta(item.get("description", ""))
+        detail_score = _candidate_dossier_detail_score(
+            {"type": item.get("type", ""), "description": stable_desc},
+            (("type", 80), ("description", 180)),
+        )
+        if count <= 0 and (not stable_desc or _is_low_value_dossier_text(stable_desc)):
+            continue
+        score = count * 1000 + detail_score
+        ranked.append((-score, -count, index, item))
+    ranked.sort()
+    if limit is None or int(limit or 0) <= 0:
+        return [item for _score, _count, _index, item in ranked]
+    return [item for _score, _count, _index, item in ranked[: int(limit or 0)]]
+
+
+def _rank_candidate_dossier_foreshadows(project, limit=60):
+    project = project if isinstance(project, dict) else {}
+    items = project.get("foreshadow_items", [])
+    items = items if isinstance(items, list) else []
+    ranked = []
+    status_weight = {"已埋": 5000, "未埋": 4500, "其他": 2400, "已回收": 900, "无需回收": 120, "废弃": 0}
+    for index, item in enumerate(items):
+        if not isinstance(item, dict):
+            continue
+        name = str(item.get("name", "") or "").strip()
+        if not name:
+            continue
+        status = _infer_foreshadow_status(item)
+        score = status_weight.get(status, status_weight["其他"])
+        if str(item.get("setup_chapter", "") or "").strip():
+            score += 420
+        if str(item.get("payoff_chapter", "") or "").strip():
+            score += 360 if status in {"未埋", "已埋"} else 180
+        score += _candidate_dossier_detail_score(item, (("description", 220),))
+        desc_text = _compact_text(item.get("description", ""))
+        if desc_text in {"AI分析候选", "文档导入候选", "后续处理", "待后续处理", "待回收"}:
+            score -= 500
+        if status in {"已回收", "无需回收", "废弃"} and _is_low_value_dossier_text(desc_text):
+            continue
+        ranked.append((-score, index if status in {"未埋", "已埋"} else -index, item))
+    ranked.sort()
+    if limit is None or int(limit or 0) <= 0:
+        return [item for _score, _tie_index, item in ranked]
+    return [item for _score, _tie_index, item in ranked[: int(limit or 0)]]
+
+
+def _candidate_analysis_dossier_text(project):
+    project = _project_without_private_notes(project)
+    _ensure_foreshadow_codes(project)
+    context_parts = []
+    meta = project.get("meta", {}) if isinstance(project.get("meta"), dict) else {}
+    meta_lines = []
+    for label, key in (("书名", "title"), ("类型", "genre"), ("风格", "style"), ("故事核心", "premise")):
+        value = str(meta.get(key, "") or "").strip()
+        if value:
+            meta_lines.append(f"{label}：{value}")
+    if meta_lines:
+        context_parts.append("项目基础：\n" + "\n".join(meta_lines))
+    for label, key, limit in (
+        ("小说圣经", "bible", 1200),
+        ("世界观/规则", "world_rules", 1000),
+        ("时间线", "timeline", 1400),
+        ("阶段摘要", "summary", 1400),
+    ):
+        value = _clip_context_text(_dedupe_text_lines(project.get(key, "")), limit, keep_tail=True, preserve_lines=True)
+        if value:
+            context_parts.append(f"{label}：\n{value}")
+    character_lines = []
+    for item in _rank_candidate_dossier_characters(project, limit=0):
+        if not isinstance(item, dict):
+            continue
+        name = str(item.get("name", "") or "").strip()
+        if not name:
+            continue
+        detail = "｜".join(
+            str(item.get(key, "") or "").strip()
+            for key in ("role", "goal", "secret", "voice")
+            if str(item.get(key, "") or "").strip()
+        )
+        notes = _clip_context_text(_stable_character_notes_context(item.get("notes", "")), 180)
+        if notes:
+            detail = f"{detail}｜已有长期备注：{notes}" if detail else f"已有长期备注：{notes}"
+        character_lines.append(f"- {name}｜{detail}" if detail else f"- {name}")
+    if character_lines:
+        context_parts.append(
+            "已有主要人物（同名/别称请合并，不要重复新增）：\n"
+            + "\n".join(_select_lines_by_char_budget(character_lines, 2600, omitted_label="人物"))
+        )
+    lore_lines = []
+    for item in _rank_candidate_dossier_lore(project, limit=0):
+        if not isinstance(item, dict):
+            continue
+        name = str(item.get("name", "") or "").strip()
+        if not name:
+            continue
+        typ = str(item.get("type", "") or "其他").strip()
+        desc = _clip_context_text(_stable_lore_description_delta(item.get("description", "")), 120)
+        lore_lines.append(f"- {name}｜{typ}｜{desc}" if desc else f"- {name}｜{typ}")
+    if lore_lines:
+        context_parts.append(
+            "已有设定库（同名/别称请合并，不要重复新增）：\n"
+            + "\n".join(_select_lines_by_char_budget(lore_lines, 2600, omitted_label="设定"))
+        )
+    foreshadow_lines = []
+    for item in _rank_candidate_dossier_foreshadows(project, limit=0):
+        if not isinstance(item, dict):
+            continue
+        name = str(item.get("name", "") or "").strip()
+        if not name:
+            continue
+        code = _normalize_foreshadow_code(item.get("code", ""))
+        head = f"{code}｜{name}" if code else name
+        status = str(item.get("status", "") or "").strip()
+        route = " -> ".join(
+            str(item.get(key, "") or "").strip()
+            for key in ("setup_chapter", "payoff_chapter")
+            if str(item.get(key, "") or "").strip()
+        )
+        route = f"｜{route}" if route else ""
+        desc = _clip_context_text(_stable_foreshadow_description_context(item.get("description", "")), 120)
+        tail = f"｜{desc}" if desc else ""
+        foreshadow_lines.append(f"- {head}｜{status}{route}{tail}")
+    if foreshadow_lines:
+        context_parts.append(
+            "已有伏笔（继续补充状态/章节，不要重复新增）：\n"
+            + "\n".join(_select_lines_by_char_budget(foreshadow_lines, 3000, omitted_label="伏笔"))
+        )
+    if not context_parts:
+        return ""
+    return "【已有项目档案】\n" + "\n\n".join(context_parts)
+
+
+def _candidate_analysis_text(project, last_import_text="", chapter_ids=None, include_dossier=True):
+    text = str(last_import_text or "").strip()
+    if text and chapter_ids is None:
+        return text
+    project = _project_without_private_notes(project)
+    parts = []
+    if include_dossier:
+        dossier = _candidate_analysis_dossier_text(project)
+        if dossier:
+            parts.append(dossier)
+    chapters = project.get("chapters", [])
+    ids = {str(x) for x in chapter_ids} if chapter_ids is not None else None
+    for chap in chapters if isinstance(chapters, list) else []:
+        if not isinstance(chap, dict):
+            continue
+        if ids is not None and str(chap.get("id", "") or "") not in ids:
+            continue
+        text_body = str(chap.get("text", "") or "").strip()
+        if not text_body:
+            continue
+        parts.append(str(chap.get("title", "") or ""))
+        outline = str(chap.get("outline", "") or "").strip()
+        if outline:
+            parts.append("章节提纲：\n" + outline)
+        linked = chap.get("linked_characters", [])
+        linked_names = _normalize_name_list(linked if isinstance(linked, list) else str(linked or ""))
+        if linked_names:
+            parts.append("关联人物：\n" + "、".join(linked_names))
+        parts.append("正文：\n" + text_body)
+        summary = str(chap.get("summary", "") or "").strip()
+        if summary:
+            parts.append("摘要：\n" + summary)
+        key_facts = str(chap.get("key_facts", "") or "").strip()
+        if key_facts:
+            parts.append("关键事实：\n" + key_facts)
+    return "\n".join(parts).strip()
+
+
+def _foreshadow_review_dossier_text(project):
+    project = _project_without_private_notes(project)
+    _ensure_foreshadow_codes(project)
+    parts = []
+    meta = project.get("meta", {}) if isinstance(project.get("meta"), dict) else {}
+    meta_lines = []
+    for label, key in (("书名", "title"), ("类型", "genre"), ("风格", "style"), ("故事核心", "premise")):
+        value = str(meta.get(key, "") or "").strip()
+        if value:
+            meta_lines.append(f"{label}：{value}")
+    if meta_lines:
+        parts.append("【作品信息】\n" + "\n".join(meta_lines))
+
+    foreshadow_lines = []
+    for index, item in enumerate(project.get("foreshadow_items", []) if isinstance(project.get("foreshadow_items"), list) else [], 1):
+        if not isinstance(item, dict):
+            continue
+        name = str(item.get("name", "") or "").strip()
+        if not name:
+            continue
+        desc = _clip_complete_text(_stable_foreshadow_description_context(item.get("description", "")), 420)
+        code = _normalize_foreshadow_code(item.get("code", "")) or f"F{index:04d}"
+        line_parts = [
+            f"编号：{code}",
+            f"名称：{name}",
+            f"状态：{str(item.get('status', '') or '').strip()}",
+            f"埋设：{str(item.get('setup_chapter', '') or '').strip()}",
+            f"回收：{str(item.get('payoff_chapter', '') or '').strip()}",
+        ]
+        if desc:
+            line_parts.append(f"说明：{desc}")
+        foreshadow_lines.append("｜".join(part for part in line_parts if part and not part.endswith("：")))
+    if foreshadow_lines:
+        parts.append("【现有伏笔列表】\n" + "\n".join(foreshadow_lines))
+    return "\n\n".join(parts).strip()
+
+
+def _foreshadow_review_chapter_chunks(project, chapter_ids=None):
+    project = _project_without_private_notes(project)
+    chapters = project.get("chapters", [])
+    chapters = chapters if isinstance(chapters, list) else []
+    ids = {str(x) for x in chapter_ids} if chapter_ids is not None else None
+    selected = []
+    for index, chap in enumerate(chapters, 1):
+        if not isinstance(chap, dict):
+            continue
+        chapter_id = str(chap.get("id", "") or "")
+        if ids is not None and chapter_id not in ids:
+            continue
+        body = str(chap.get("text", "") or "").strip()
+        if not body:
+            continue
+        title = str(chap.get("title", "") or "").strip() or f"第 {index} 章"
+        text = "\n".join([
+            f"当前章节标题：{title}",
+            f"当前章节ID：{chapter_id}" if chapter_id else "",
+            "正文：",
+            body,
+        ]).strip()
+        selected.append({
+            "text": text,
+            "index": len(selected) + 1,
+            "total": 0,
+            "chapter_id": chapter_id,
+            "chapter_title": title,
+        })
+    total = len(selected)
+    for item in selected:
+        item["total"] = total
+    return selected
+
+
+def _foreshadow_review_context(project):
+    dossier = _foreshadow_review_dossier_text(project)
+    chunks = _foreshadow_review_chapter_chunks(project)
+    chapter_text = "\n\n".join(str(item.get("text", "") or "").strip() for item in chunks)
+    return "\n\n".join(part for part in (dossier, "【章节正文】\n" + chapter_text if chapter_text else "") if part).strip()

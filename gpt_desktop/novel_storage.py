@@ -1,7 +1,14 @@
+import hashlib
+import json
 import os
+import re
+import sys
+import threading
+import time
+import traceback
 from copy import deepcopy
 
-from .core import HISTORY_DIR, load_json_file, now_str, save_json_file
+from .core import HISTORY_DIR, _atomic_write_json, load_json_file, now_str
 from .novel_utils import (
     _body_display_len,
     _default_project,
@@ -14,10 +21,434 @@ from .novel_utils import (
 NOVEL_DIR = os.path.join(HISTORY_DIR, "novel_projects")
 NOVEL_DRAFT_FILE = os.path.join(HISTORY_DIR, "novel_draft.json")
 NOVEL_LAST_FILE = os.path.join(HISTORY_DIR, "novel_last.json")
+NOVEL_STYLE_LIBRARY_FILE = os.path.join(HISTORY_DIR, "novel_style_profiles.json")
+NOVEL_DIAGNOSTIC_DIR = os.path.join(HISTORY_DIR, "novel_diagnostics")
+NOVEL_DIAGNOSTIC_LOG_FILE = os.path.join(NOVEL_DIAGNOSTIC_DIR, "events.jsonl")
+NOVEL_DIAGNOSTIC_BACKUP_FILE = os.path.join(NOVEL_DIAGNOSTIC_DIR, "events.jsonl.1")
+NOVEL_DIAGNOSTIC_LATEST_ERROR_FILE = os.path.join(NOVEL_DIAGNOSTIC_DIR, "latest_error.json")
+NOVEL_DIAGNOSTIC_SNAPSHOT_DIR = os.path.join(NOVEL_DIAGNOSTIC_DIR, "failure_snapshots")
+NOVEL_DIAGNOSTIC_LATEST_SNAPSHOT_FILE = os.path.join(
+    NOVEL_DIAGNOSTIC_DIR, "latest_failure_snapshot.json"
+)
+NOVEL_DIAGNOSTIC_LATEST_EXCHANGE_FILE = os.path.join(
+    NOVEL_DIAGNOSTIC_DIR, "latest_model_exchange.json"
+)
+NOVEL_DIAGNOSTIC_MAX_BYTES = 12 * 1024 * 1024
+NOVEL_DIAGNOSTIC_MAX_SNAPSHOTS = 60
+NOVEL_DIAGNOSTIC_SNAPSHOT_TEXT_LIMIT = 180000
+_NOVEL_DIAGNOSTIC_LOCK = threading.Lock()
+_NOVEL_DIAGNOSTIC_HOOKS_INSTALLED = False
+
+
+def _redact_novel_diagnostic_text(value, limit=4000, strip=True):
+    text = str(value or "")
+    text = re.sub(
+        r"(?i)(api[-_ ]?key|authorization|bearer|access[-_ ]?token|password|secret)(\s*[:=]\s*)(?:bearer\s+)?[^,;\s]+",
+        r"\1\2[REDACTED]",
+        text,
+    )
+    text = re.sub(
+        r"(?i)\b(bearer)\s+[^,;\s]+",
+        r"\1 [REDACTED]",
+        text,
+    )
+    text = re.sub(
+        r"(?i)([?&](?:api[-_ ]?key|access[-_ ]?token|token|password|secret)=)[^&\s]+",
+        r"\1[REDACTED]",
+        text,
+    )
+    text = re.sub(
+        r"(?i)(https?://)[^/\s:@]+:[^/\s@]+@",
+        r"\1[REDACTED]@",
+        text,
+    )
+    text = re.sub(r"\bsk-[A-Za-z0-9_-]{12,}\b", "[REDACTED_KEY]", text)
+    if strip:
+        text = text.strip()
+    if len(text) > limit:
+        return text[:limit] + "..."
+    return text
+
+
+def _sanitize_novel_diagnostic_value(value, depth=0):
+    if depth > 6:
+        return "<max-depth>"
+    if value is None or isinstance(value, (bool, int, float)):
+        return value
+    if isinstance(value, str):
+        return _redact_novel_diagnostic_text(value)
+    if isinstance(value, dict):
+        result = {}
+        for raw_key, raw_value in list(value.items())[:120]:
+            key = str(raw_key or "")
+            lowered = key.lower().replace("-", "_")
+            if any(
+                marker in lowered
+                for marker in ("api_key", "authorization", "password", "access_token", "proxy_url")
+            ):
+                continue
+            result[key] = _sanitize_novel_diagnostic_value(raw_value, depth + 1)
+        return result
+    if isinstance(value, (list, tuple, set)):
+        return [_sanitize_novel_diagnostic_value(item, depth + 1) for item in list(value)[:120]]
+    return _redact_novel_diagnostic_text(value)
+
+
+def _write_novel_diagnostic_json(path, data):
+    directory = os.path.dirname(path)
+    os.makedirs(directory, exist_ok=True)
+    temp_path = f"{path}.{os.getpid()}.{threading.get_ident()}.tmp"
+    try:
+        with open(temp_path, "w", encoding="utf-8") as handle:
+            json.dump(data, handle, ensure_ascii=False, indent=2)
+            handle.flush()
+        os.replace(temp_path, path)
+    finally:
+        try:
+            if os.path.exists(temp_path):
+                os.remove(temp_path)
+        except Exception:
+            pass
+
+
+def append_novel_diagnostic_event(event):
+    """Append one bounded, secret-redacted diagnostic event for novel writing."""
+    if not isinstance(event, dict):
+        event = {"event": str(event or "unknown")}
+    record = _sanitize_novel_diagnostic_value(event)
+    if not isinstance(record, dict):
+        record = {"event": "unknown", "detail": record}
+    record.setdefault("schema_version", 1)
+    record.setdefault("recorded_at", now_str())
+    record.setdefault("event", "unknown")
+    record.setdefault(
+        "event_id",
+        hashlib.sha256(
+            f"{time.time_ns()}:{os.getpid()}:{threading.get_ident()}".encode("utf-8")
+        ).hexdigest()[:20],
+    )
+    record.setdefault("process_id", os.getpid())
+    record.setdefault("thread_name", threading.current_thread().name)
+    try:
+        line = json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\n"
+        with _NOVEL_DIAGNOSTIC_LOCK:
+            os.makedirs(NOVEL_DIAGNOSTIC_DIR, exist_ok=True)
+            if (
+                os.path.exists(NOVEL_DIAGNOSTIC_LOG_FILE)
+                and os.path.getsize(NOVEL_DIAGNOSTIC_LOG_FILE) + len(line.encode("utf-8"))
+                > NOVEL_DIAGNOSTIC_MAX_BYTES
+            ):
+                try:
+                    if os.path.exists(NOVEL_DIAGNOSTIC_BACKUP_FILE):
+                        os.remove(NOVEL_DIAGNOSTIC_BACKUP_FILE)
+                    os.replace(NOVEL_DIAGNOSTIC_LOG_FILE, NOVEL_DIAGNOSTIC_BACKUP_FILE)
+                except Exception:
+                    pass
+            with open(NOVEL_DIAGNOSTIC_LOG_FILE, "a", encoding="utf-8") as handle:
+                handle.write(line)
+            if str(record.get("level", "") or "").lower() in {"error", "fatal"}:
+                _write_novel_diagnostic_json(NOVEL_DIAGNOSTIC_LATEST_ERROR_FILE, record)
+        return NOVEL_DIAGNOSTIC_LOG_FILE
+    except Exception:
+        return ""
+
+
+def read_novel_diagnostic_events(limit=200):
+    try:
+        limit = max(1, min(2000, int(limit or 200)))
+    except Exception:
+        limit = 200
+    lines = []
+    for path in (NOVEL_DIAGNOSTIC_BACKUP_FILE, NOVEL_DIAGNOSTIC_LOG_FILE):
+        if not os.path.exists(path):
+            continue
+        try:
+            with open(path, "r", encoding="utf-8") as handle:
+                lines.extend(handle.readlines())
+        except Exception:
+            continue
+    lines = lines[-limit:]
+    events = []
+    for line in lines:
+        try:
+            item = json.loads(line)
+        except Exception:
+            continue
+        if isinstance(item, dict):
+            events.append(item)
+    return events
+
+
+def read_latest_novel_diagnostic_error():
+    value = load_json_file(NOVEL_DIAGNOSTIC_LATEST_ERROR_FILE, {})
+    return value if isinstance(value, dict) else {}
+
+
+def _prepare_novel_diagnostic_snapshot(request_id, payload):
+    safe_request_id = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(request_id or "failure")).strip("._")
+    safe_request_id = safe_request_id[:120] or "failure"
+    raw_payload = payload if isinstance(payload, dict) else {"detail": payload}
+    content_keys = {
+        "system_prompt",
+        "user_context",
+        "sent_user_context",
+        "partial_output",
+        "validation_payload",
+    }
+    compact_payload = {
+        key: value for key, value in raw_payload.items() if str(key) not in content_keys
+    }
+    snapshot = _sanitize_novel_diagnostic_value(compact_payload)
+    snapshot = snapshot if isinstance(snapshot, dict) else {"detail": snapshot}
+    for key in content_keys:
+        if key not in raw_payload:
+            continue
+        snapshot[key] = _redact_novel_diagnostic_text(
+            raw_payload.get(key, ""),
+            limit=NOVEL_DIAGNOSTIC_SNAPSHOT_TEXT_LIMIT,
+            strip=False,
+        )
+    snapshot["schema_version"] = 1
+    snapshot["request_id"] = safe_request_id
+    snapshot.setdefault("saved_at", now_str())
+    snapshot.setdefault("process_id", os.getpid())
+    return safe_request_id, snapshot
+
+
+def save_novel_diagnostic_snapshot(request_id, payload):
+    """Persist one bounded failure snapshot without credentials."""
+    safe_request_id, snapshot = _prepare_novel_diagnostic_snapshot(request_id, payload)
+    path = os.path.join(NOVEL_DIAGNOSTIC_SNAPSHOT_DIR, f"{safe_request_id}.json")
+    try:
+        with _NOVEL_DIAGNOSTIC_LOCK:
+            _write_novel_diagnostic_json(path, snapshot)
+            _write_novel_diagnostic_json(NOVEL_DIAGNOSTIC_LATEST_SNAPSHOT_FILE, snapshot)
+            candidates = []
+            for name in os.listdir(NOVEL_DIAGNOSTIC_SNAPSHOT_DIR):
+                candidate = os.path.join(NOVEL_DIAGNOSTIC_SNAPSHOT_DIR, name)
+                if name.endswith(".json") and os.path.isfile(candidate):
+                    try:
+                        candidates.append((os.path.getmtime(candidate), candidate))
+                    except Exception:
+                        continue
+            candidates.sort()
+            for _mtime, stale_path in candidates[:-NOVEL_DIAGNOSTIC_MAX_SNAPSHOTS]:
+                try:
+                    os.remove(stale_path)
+                except Exception:
+                    pass
+        return path
+    except Exception:
+        return ""
+
+
+def save_novel_diagnostic_latest_exchange(request_id, payload):
+    """Keep only the latest completed model exchange for post-processing crash diagnosis."""
+    _safe_request_id, snapshot = _prepare_novel_diagnostic_snapshot(request_id, payload)
+    try:
+        with _NOVEL_DIAGNOSTIC_LOCK:
+            _write_novel_diagnostic_json(NOVEL_DIAGNOSTIC_LATEST_EXCHANGE_FILE, snapshot)
+        return NOVEL_DIAGNOSTIC_LATEST_EXCHANGE_FILE
+    except Exception:
+        return ""
+
+
+def _record_uncaught_novel_exception(exc_type, exc_value, exc_traceback, origin="main"):
+    try:
+        formatted = "".join(
+            traceback.format_exception(exc_type, exc_value, exc_traceback)
+        )
+    except Exception:
+        formatted = str(exc_value or exc_type or "")
+    return append_novel_diagnostic_event({
+        "event": "uncaught_exception",
+        "level": "fatal",
+        "origin": str(origin or "main"),
+        "error_type": getattr(exc_type, "__name__", str(exc_type or "")),
+        "error": str(exc_value or ""),
+        "traceback": formatted,
+        "latest_model_exchange": (
+            NOVEL_DIAGNOSTIC_LATEST_EXCHANGE_FILE
+            if os.path.exists(NOVEL_DIAGNOSTIC_LATEST_EXCHANGE_FILE) else ""
+        ),
+        "latest_failure_snapshot": (
+            NOVEL_DIAGNOSTIC_LATEST_SNAPSHOT_FILE
+            if os.path.exists(NOVEL_DIAGNOSTIC_LATEST_SNAPSHOT_FILE) else ""
+        ),
+    })
+
+
+def install_novel_diagnostic_exception_hooks():
+    """Capture uncaught Python and background-thread failures without swallowing them."""
+    global _NOVEL_DIAGNOSTIC_HOOKS_INSTALLED
+    if _NOVEL_DIAGNOSTIC_HOOKS_INSTALLED:
+        return
+    _NOVEL_DIAGNOSTIC_HOOKS_INSTALLED = True
+    original_sys_hook = sys.excepthook
+
+    def sys_hook(exc_type, exc_value, exc_traceback):
+        _record_uncaught_novel_exception(exc_type, exc_value, exc_traceback, "main")
+        if original_sys_hook:
+            original_sys_hook(exc_type, exc_value, exc_traceback)
+
+    sys.excepthook = sys_hook
+    original_thread_hook = getattr(threading, "excepthook", None)
+    if original_thread_hook is not None:
+        def thread_hook(args):
+            _record_uncaught_novel_exception(
+                args.exc_type,
+                args.exc_value,
+                args.exc_traceback,
+                f"thread:{getattr(args.thread, 'name', '')}",
+            )
+            original_thread_hook(args)
+
+        threading.excepthook = thread_hook
 
 
 def ensure_novel_storage():
     os.makedirs(NOVEL_DIR, exist_ok=True)
+
+
+def _save_novel_json_strict(path, data):
+    """Keep novel persistence failures observable to the writing pipeline."""
+    _atomic_write_json(path, data)
+
+
+def _normalized_style_profile_record(style_reference, cache_entry, name="", source_project=""):
+    reference = str(style_reference or "").strip()
+    if not reference or not isinstance(cache_entry, dict):
+        return None
+    reference_hash = hashlib.sha256(reference.encode("utf-8")).hexdigest()
+    normalized_project = _normalize_project({
+        "style_reference": reference,
+        "style_profile_cache": {reference_hash: cache_entry},
+    })
+    normalized_entry = normalized_project.get("style_profile_cache", {}).get(reference_hash, {})
+    profile = str(normalized_entry.get("profile", "") or "").strip()
+    status = str(normalized_entry.get("status", "") or "").strip()
+    if not profile or (status and status != "complete"):
+        return None
+    return {
+        "id": reference_hash,
+        "name": str(name or "").strip() or f"永久文风 {reference_hash[:8]}",
+        "reference_hash": reference_hash,
+        "style_reference": reference,
+        "cache_entry": normalized_entry,
+        "source_project": str(source_project or "").strip(),
+        "updated_at": str(normalized_entry.get("cached_at", "") or "").strip() or now_str(),
+    }
+
+
+def load_style_profile_library():
+    raw = load_json_file(NOVEL_STYLE_LIBRARY_FILE, {})
+    items = raw.get("profiles", []) if isinstance(raw, dict) else []
+    profiles = []
+    seen = set()
+    for item in items if isinstance(items, list) else []:
+        if not isinstance(item, dict):
+            continue
+        record = _normalized_style_profile_record(
+            item.get("style_reference", ""),
+            item.get("cache_entry", {}),
+            item.get("name", ""),
+            item.get("source_project", ""),
+        )
+        if not record or record["id"] in seen:
+            continue
+        record["created_at"] = str(item.get("created_at", "") or "").strip() or record["updated_at"]
+        stored_updated_at = str(item.get("updated_at", "") or "").strip()
+        if stored_updated_at:
+            record["updated_at"] = stored_updated_at
+        seen.add(record["id"])
+        profiles.append(record)
+    profiles.sort(key=lambda item: (item.get("name", ""), item.get("id", "")))
+    return profiles
+
+
+def save_style_profile_library(profiles):
+    normalized = []
+    seen = set()
+    for item in profiles if isinstance(profiles, list) else []:
+        if not isinstance(item, dict):
+            continue
+        record = _normalized_style_profile_record(
+            item.get("style_reference", ""),
+            item.get("cache_entry", {}),
+            item.get("name", ""),
+            item.get("source_project", ""),
+        )
+        if not record or record["id"] in seen:
+            continue
+        record["created_at"] = str(item.get("created_at", "") or "").strip() or now_str()
+        record["updated_at"] = str(item.get("updated_at", "") or "").strip() or now_str()
+        seen.add(record["id"])
+        normalized.append(record)
+    normalized.sort(key=lambda item: (item.get("name", ""), item.get("id", "")))
+    _save_novel_json_strict(NOVEL_STYLE_LIBRARY_FILE, {"version": 1, "profiles": normalized})
+    return normalized
+
+
+def get_style_profile(profile_id):
+    profile_id = str(profile_id or "").strip().lower()
+    if not profile_id:
+        return None
+    for item in load_style_profile_library():
+        if item.get("id") == profile_id:
+            return deepcopy(item)
+    return None
+
+
+def upsert_style_profile(style_reference, cache_entry, name="", source_project=""):
+    record = _normalized_style_profile_record(style_reference, cache_entry, name, source_project)
+    if not record:
+        return ""
+    profiles = load_style_profile_library()
+    existing = next((item for item in profiles if item.get("id") == record["id"]), None)
+    if existing:
+        record["created_at"] = existing.get("created_at", "") or now_str()
+        if existing.get("name") and not name:
+            record["name"] = existing["name"]
+        profiles = [record if item.get("id") == record["id"] else item for item in profiles]
+    else:
+        record["created_at"] = now_str()
+        profiles.append(record)
+    record["updated_at"] = now_str()
+    save_style_profile_library(profiles)
+    return record["id"]
+
+
+def sync_style_profile_library_from_projects():
+    before = load_style_profile_library()
+    profiles = {item.get("id"): item for item in before if item.get("id")}
+    paths = [path for _mtime, _name, path in list_project_files(include_empty=True)]
+    if os.path.exists(NOVEL_DRAFT_FILE):
+        paths.append(NOVEL_DRAFT_FILE)
+    for path in paths:
+        data = load_json_file(path, {})
+        if not isinstance(data, dict):
+            continue
+        reference = str(data.get("style_reference", "") or "").strip()
+        if not reference:
+            continue
+        reference_hash = hashlib.sha256(reference.encode("utf-8")).hexdigest()
+        cache = data.get("style_profile_cache", {})
+        entry = cache.get(reference_hash, {}) if isinstance(cache, dict) else {}
+        title = str(data.get("meta", {}).get("title", "") or "").strip() if isinstance(data.get("meta"), dict) else ""
+        record = _normalized_style_profile_record(reference, entry, title, path)
+        if not record:
+            continue
+        old = profiles.get(record["id"])
+        if old:
+            record["created_at"] = old.get("created_at", "") or record["updated_at"]
+            record["name"] = old.get("name", "") or record["name"]
+        else:
+            record["created_at"] = record["updated_at"]
+        profiles[record["id"]] = record
+    merged = list(profiles.values())
+    if merged != before or (merged and not os.path.exists(NOVEL_STYLE_LIBRARY_FILE)):
+        return save_style_profile_library(merged)
+    return before
 
 
 def safe_project_timestamp():
@@ -110,6 +541,14 @@ def _merge_candidate_analysis_state(primary, fallback):
     return primary
 
 
+def _file_mtime_ns(path):
+    try:
+        stat = os.stat(path)
+        return int(getattr(stat, "st_mtime_ns", stat.st_mtime * 1_000_000_000))
+    except Exception:
+        return 0
+
+
 def load_initial_project_data():
     if os.path.exists(NOVEL_DRAFT_FILE):
         last = load_json_file(NOVEL_LAST_FILE, {}) if os.path.exists(NOVEL_LAST_FILE) else {}
@@ -118,6 +557,9 @@ def load_initial_project_data():
         if last_path and os.path.exists(last_path):
             project_data = load_json_file(last_path, {})
             if isinstance(project_data, dict):
+                if _file_mtime_ns(last_path) > _file_mtime_ns(NOVEL_DRAFT_FILE):
+                    project_data = _merge_candidate_analysis_state(project_data, draft_data)
+                    return project_data, last_path
                 draft_data = _merge_candidate_analysis_state(draft_data, project_data)
             return draft_data, last_path
         return draft_data, NOVEL_DRAFT_FILE
@@ -129,7 +571,7 @@ def load_initial_project_data():
 
 
 def save_draft_project(data):
-    save_json_file(NOVEL_DRAFT_FILE, _normalize_project(data))
+    _save_novel_json_strict(NOVEL_DRAFT_FILE, _normalize_project(data))
 
 
 def save_project_file(path, data, preserve_mtime=False):
@@ -142,7 +584,7 @@ def save_project_file(path, data, preserve_mtime=False):
             old_times = None
     data = _normalize_project(data)
     data["updated_at"] = now_str()
-    save_json_file(path, data)
+    _save_novel_json_strict(path, data)
     if old_times is not None:
         try:
             os.utime(path, old_times)
@@ -170,7 +612,7 @@ def auto_preserve_project(data, reason):
 
 def remember_project_path(path):
     if path:
-        save_json_file(NOVEL_LAST_FILE, {"path": path})
+        _save_novel_json_strict(NOVEL_LAST_FILE, {"path": path})
 
 
 def clear_last_project_path():

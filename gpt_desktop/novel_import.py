@@ -4,6 +4,7 @@ from copy import deepcopy
 
 from .novel_utils import (
     _canonicalize_character_record,
+    _chinese_numeral_to_int,
     _character_activity_stats,
     _character_merge_key,
     _clip_complete_text,
@@ -74,6 +75,176 @@ def _read_txt_text(path):
         raise last_error
     with open(path, "r", encoding="utf-8") as f:
         return f.read()
+
+
+_FRAMEWORK_STAGE_HEADING_RE = re.compile(
+    r"^第\s*([一二两三四五六七八九十百千万零〇\d]+)\s*(阶段|卷|篇|部)\s*[：:]\s*(.+)$"
+)
+_FRAMEWORK_CHAPTER_RANGE_RE = re.compile(
+    r"(?:章节|章数|范围)\s*[：:]\s*第?\s*([一二两三四五六七八九十百千万零〇\d]+)\s*"
+    r"[—–~～\-至到]\s*第?\s*([一二两三四五六七八九十百千万零〇\d]+)\s*章"
+)
+_FRAMEWORK_NUMBERED_EVENT_RE = re.compile(r"^(\d{1,5})\s*[.．、)）]\s*(.+)$")
+_FRAMEWORK_MAJOR_HEADING_RE = re.compile(r"^[一二两三四五六七八九十百千万]+、\s*\S+")
+_FRAMEWORK_EXPLICIT_TITLE_RE = re.compile(
+    r"^\d{1,5}\s*[.．、)）]\s*第\s*([一二两三四五六七八九十百千万零〇\d]+)\s*章\s*[：:]\s*(.+)$"
+)
+
+
+def _extract_structured_framework_chapter_plan(text):
+    lines = [str(line or "").strip() for line in str(text or "").splitlines()]
+    explicit_titles = {}
+    for line in lines:
+        match = _FRAMEWORK_EXPLICIT_TITLE_RE.match(line)
+        if not match:
+            continue
+        chapter_index = _chinese_numeral_to_int(match.group(1))
+        title = str(match.group(2) or "").strip()
+        if chapter_index and title:
+            explicit_titles[int(chapter_index)] = title
+
+    stage_positions = [
+        index for index, line in enumerate(lines) if _FRAMEWORK_STAGE_HEADING_RE.match(line)
+    ]
+    stages = []
+    for stage_offset, stage_position in enumerate(stage_positions):
+        stage_match = _FRAMEWORK_STAGE_HEADING_RE.match(lines[stage_position])
+        if not stage_match:
+            continue
+        block_end = stage_positions[stage_offset + 1] if stage_offset + 1 < len(stage_positions) else len(lines)
+        range_position = -1
+        range_match = None
+        for index in range(stage_position + 1, min(block_end, stage_position + 8)):
+            match = _FRAMEWORK_CHAPTER_RANGE_RE.search(lines[index])
+            if match:
+                range_position = index
+                range_match = match
+                break
+        if range_match is None:
+            continue
+        start_chapter = _chinese_numeral_to_int(range_match.group(1))
+        end_chapter = _chinese_numeral_to_int(range_match.group(2))
+        if not start_chapter or not end_chapter or end_chapter < start_chapter:
+            continue
+        numbered_events = {}
+        for index in range(range_position + 1, block_end):
+            line = lines[index]
+            if _FRAMEWORK_MAJOR_HEADING_RE.match(line):
+                break
+            event_match = _FRAMEWORK_NUMBERED_EVENT_RE.match(line)
+            if not event_match:
+                continue
+            relative_index = int(event_match.group(1))
+            event_text = str(event_match.group(2) or "").strip()
+            if relative_index >= 1 and event_text and relative_index not in numbered_events:
+                numbered_events[relative_index] = event_text
+        if not numbered_events:
+            continue
+        event_count = max(numbered_events)
+        if sorted(numbered_events) != list(range(1, event_count + 1)):
+            continue
+        stage_label = f"第{stage_match.group(1)}{stage_match.group(2)}：{stage_match.group(3).strip()}"
+        stage_id = f"S{len(stages) + 1:02d}"
+        stages.append({
+            "id": stage_id,
+            "name": stage_label,
+            "start_chapter": int(start_chapter),
+            "end_chapter": int(end_chapter),
+            "events": [
+                {
+                    "id": f"{stage_id}-E{relative_index:02d}",
+                    "order": relative_index,
+                    "text": numbered_events[relative_index],
+                }
+                for relative_index in range(1, event_count + 1)
+            ],
+        })
+
+    chapters = []
+    for chapter_index in sorted(explicit_titles):
+        stage_label = ""
+        for stage in stages:
+            if int(stage["start_chapter"]) <= chapter_index <= int(stage["end_chapter"]):
+                stage_label = stage["name"]
+                break
+        chapters.append({
+            "index": chapter_index,
+            "title": explicit_titles[chapter_index],
+            "target_words": "",
+            "narrative_stage": stage_label,
+            "chapter_function": "",
+            "conflict_intensity": "",
+            "setup_ratio": "",
+            "character_task": "",
+            "mainline_task": "",
+            "outline": "",
+            "characters": [],
+            "settings": [],
+            "ending_hook": "",
+            "forbidden": "",
+            "source_event_ids": [],
+            "source": "explicit_chapter_constraint",
+        })
+    summary = "\n".join(
+        f"{stage['name']}（第{stage['start_chapter']}-{stage['end_chapter']}章）"
+        for stage in stages
+    )
+    return {"summary": summary, "chapters": chapters, "stages": stages}
+
+
+def _merge_framework_chapter_plans(ai_plan, structured_plan):
+    ai_plan = ai_plan if isinstance(ai_plan, dict) else {}
+    structured_plan = structured_plan if isinstance(structured_plan, dict) else {}
+    structured_chapters = structured_plan.get("chapters", [])
+    structured_chapters = structured_chapters if isinstance(structured_chapters, list) else []
+    ai_by_index = {}
+    for fallback_index, item in enumerate(
+        ai_plan.get("chapters", []) if isinstance(ai_plan.get("chapters"), list) else [], 1
+    ):
+        if not isinstance(item, dict):
+            continue
+        try:
+            index = int(item.get("index", fallback_index) or fallback_index)
+        except Exception:
+            index = fallback_index
+        ai_by_index[index] = item
+
+    explicit_by_index = {}
+    for fallback_index, item in enumerate(structured_chapters, 1):
+        if not isinstance(item, dict):
+            continue
+        try:
+            index = int(item.get("index", fallback_index) or fallback_index)
+        except Exception:
+            index = fallback_index
+        explicit_by_index[index] = item
+
+    merged = []
+    for index in sorted(set(ai_by_index) | set(explicit_by_index)):
+        ai_item = ai_by_index.get(index, {})
+        explicit_item = explicit_by_index.get(index, {})
+        item = deepcopy(ai_item if isinstance(ai_item, dict) else {})
+        if not item:
+            item = deepcopy(explicit_item)
+        item["index"] = index
+        explicit_title = str(explicit_item.get("title", "") or "").strip() if isinstance(explicit_item, dict) else ""
+        if explicit_title:
+            item["title"] = explicit_title
+        explicit_stage = str(explicit_item.get("narrative_stage", "") or "").strip() if isinstance(explicit_item, dict) else ""
+        if explicit_stage and not str(item.get("narrative_stage", "") or "").strip():
+            item["narrative_stage"] = explicit_stage
+        item["source_event_ids"] = []
+        item["source"] = "explicit_chapter_constraint"
+        merged.append(item)
+    structured_summary = str(structured_plan.get("summary", "") or "").strip()
+    ai_summary = str(ai_plan.get("summary", "") or "").strip()
+    summary = structured_summary
+    if ai_summary and ai_summary not in summary:
+        summary = f"{summary}\n\nAI阶段摘要：\n{ai_summary}".strip()
+    result = {"summary": summary, "chapters": merged, "stages": deepcopy(structured_plan.get("stages", []))}
+    if not result["chapters"] and not result["stages"]:
+        return deepcopy(ai_plan)
+    return result
 
 
 def _write_docx_text(path, title, chapters, center_chapter_headings=False):
@@ -242,9 +413,7 @@ _PROJECT_MATERIAL_ALIASES = {
 }
 _PROJECT_MATERIAL_KEYS = ("bible", "world_rules", "timeline", "summary")
 _MANUAL_PROJECT_MATERIAL_KEYS = {"bible", "world_rules"}
-_AUTO_PROJECT_MATERIAL_KEYS = tuple(
-    key for key in _PROJECT_MATERIAL_KEYS if key not in _MANUAL_PROJECT_MATERIAL_KEYS
-)
+_AUTO_PROJECT_MATERIAL_KEYS = ()
 
 
 def _project_material_key(value):

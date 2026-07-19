@@ -1,5 +1,6 @@
 import asyncio
 import gc
+import hashlib
 import json
 import mimetypes
 import os
@@ -10,6 +11,7 @@ import subprocess
 import tempfile
 import threading
 import time
+import traceback
 import uuid
 from datetime import datetime
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
@@ -37,9 +39,11 @@ from .core import (
     save_bytes_to_image,
 )
 from .novel_utils import (
+    NOVEL_AI_CONTEXT_LIMIT,
     _infer_foreshadow_status,
     _merge_foreshadow_description_without_bloat,
     _merge_foreshadow_status,
+    _parse_style_execution_result,
 )
 from .novel_import import (
     _foreshadow_candidate_is_terminal_review,
@@ -1699,6 +1703,8 @@ class NovelAnalysisWorker(QThread):
                         self.progress.emit("当前接口不支持流式候选分析，已自动退回普通分块请求...")
                         return self._post_analysis_chunk(prompt, chunk, label, total, False), False
                     if stream_supported and self._is_stream_transport_error(e2):
+                        if getattr(self, "_retry_stream_transport_before_nonstream", False):
+                            raise
                         self._set_analysis_stream_supported(False)
                         self.progress.emit("流式候选分析连接提前结束，已切换为普通请求重试...")
                         return self._post_analysis_chunk(prompt, chunk, label, total, False), False
@@ -1708,6 +1714,8 @@ class NovelAnalysisWorker(QThread):
                 self.progress.emit("当前接口不支持流式候选分析，已自动退回普通分块请求...")
                 return self._post_analysis_chunk(prompt, chunk, label, total, use_response_format), use_response_format
             if stream_supported and self._is_stream_transport_error(e):
+                if getattr(self, "_retry_stream_transport_before_nonstream", False):
+                    raise
                 self._set_analysis_stream_supported(False)
                 self.progress.emit("流式候选分析连接提前结束，已切换为普通请求重试...")
                 return self._post_analysis_chunk(prompt, chunk, label, total, use_response_format), use_response_format
@@ -2212,6 +2220,7 @@ class NovelFrameworkImportWorker(NovelAnalysisWorker):
             proxy_mode=proxy_mode,
             max_concurrency=1,
         )
+        self._retry_stream_transport_before_nonstream = True
 
     def _analysis_prompt(self):
         return (
@@ -2888,6 +2897,40 @@ class NovelWritingWorker(QThread):
         self._session.trust_env = False
         self._stop_requested = False
         self._response = None
+        self.last_response_text = ""
+        self.diagnostic_request_id = ""
+        self.diagnostic_started_at = 0.0
+        context_bytes = self.context.encode("utf-8", errors="replace")
+        sent_context_bytes = self.context[:NOVEL_AI_CONTEXT_LIMIT].encode(
+            "utf-8", errors="replace"
+        )
+        self.diagnostics = {
+            "action": self.action,
+            "model": self.model,
+            "context_chars": len(self.context),
+            "context_utf8_bytes": len(context_bytes),
+            "context_sha256": hashlib.sha256(context_bytes).hexdigest(),
+            "sent_context_chars": min(len(self.context), NOVEL_AI_CONTEXT_LIMIT),
+            "sent_context_utf8_bytes": len(sent_context_bytes),
+            "sent_context_sha256": hashlib.sha256(sent_context_bytes).hexdigest(),
+            "context_truncated": len(self.context) > NOVEL_AI_CONTEXT_LIMIT,
+            "context_limit": NOVEL_AI_CONTEXT_LIMIT,
+            "max_output_tokens": self._max_tokens_for_request(),
+            "system_prompt_chars": 0,
+            "system_prompt_sha256": "",
+            "http_status": None,
+            "response_headers": {},
+            "sse_lines": 0,
+            "invalid_sse_json_lines": 0,
+            "time_to_headers_ms": 0,
+            "time_to_first_piece_ms": 0,
+            "finish_reason": "",
+            "done_received": False,
+            "response_chars": 0,
+            "response_sha256": "",
+            "outcome": "pending",
+            "cancelled_before_headers": False,
+        }
 
     def stop(self):
         self._stop_requested = True
@@ -2916,8 +2959,68 @@ class NovelWritingWorker(QThread):
             return requests_proxies(self.proxy_url)
         return None
 
+    def _post_stream_request_interruptibly(self, url, headers, payload):
+        """让中止操作可以脱离厂商迟迟不返回响应头的 requests.post。"""
+        result = {}
+        finished = threading.Event()
+        cancelled = threading.Event()
+        session = self._session
+        proxies = self._proxies()
+
+        def request():
+            response = None
+            try:
+                response = session.post(
+                    url,
+                    headers=headers,
+                    json=payload,
+                    stream=True,
+                    timeout=(10, 180),
+                    proxies=proxies,
+                )
+                if cancelled.is_set():
+                    try:
+                        response.close()
+                    except Exception:
+                        pass
+                else:
+                    result["response"] = response
+            except Exception as exc:
+                if not cancelled.is_set():
+                    result["error"] = exc
+            finally:
+                finished.set()
+
+        request_thread = threading.Thread(
+            target=request,
+            name="novel-ai-http-request",
+            daemon=True,
+        )
+        self._request_thread = request_thread
+        request_thread.start()
+        while not finished.wait(0.05):
+            if self._stop_requested or self.isInterruptionRequested():
+                cancelled.set()
+                self.diagnostics["cancelled_before_headers"] = True
+                self._close_network_handles()
+                self._request_thread = None
+                return None
+        self._request_thread = None
+        if self._stop_requested or self.isInterruptionRequested():
+            response = result.pop("response", None)
+            try:
+                if response is not None:
+                    response.close()
+            except Exception:
+                pass
+            return None
+        error = result.get("error")
+        if error is not None:
+            raise error
+        return result.get("response")
+
     def _draft_word_target(self):
-        if self.action != "draft":
+        if self.action not in {"draft", "style_finalize"}:
             return 0
         match = re.search(r"本次新增正文(?:参考)?目标：\s*约?\s*(\d{1,7})\s*字", self.context)
         if not match:
@@ -2931,10 +3034,40 @@ class NovelWritingWorker(QThread):
         return value if value > 0 else 0
 
     def _max_tokens_for_request(self):
+        if self.action == "draft" and "【剧情执行稿任务】" in self.context:
+            target = self._draft_word_target()
+            return min(24000, max(10000, target * 2 + 5000)) if target else 16000
         if self.action == "outline":
             return 1200
         if self.action == "summary":
-            return 1200
+            return 6000
+        if self.action == "style_profile":
+            return 2800
+        if self.action == "style_baseline":
+            return 12000
+        if self.action in {"style_sheet", "style_sheet_merge"}:
+            return 6000
+        if self.action == "style_cards":
+            return 7000
+        if self.action == "style_persona":
+            return 3200
+        if self.action == "style_rules":
+            return 4200
+        if self.action == "style_finalize":
+            target = self._draft_word_target()
+            return min(24000, max(7000, target * 2 + 2500)) if target else 16000
+        if self.action == "style_audit":
+            return 2200
+        if self.action == "style_plot_extract":
+            return 1800
+        if self.action == "memory_finalize":
+            return 9000
+        if self.action == "memory_reconcile":
+            return 4500
+        if self.action == "memory_repair":
+            if "【状态增量修复补丁】" in self.context:
+                return 6000
+            return 8000
         return 0
 
     def _stream_finished_normally(self, done_received, finish_reason):
@@ -2950,6 +3083,19 @@ class NovelWritingWorker(QThread):
         reason = str(finish_reason or "").strip().lower()
         action_label = {
             "draft": "正文",
+            "style_profile": "文风画像",
+            "style_baseline": "普通写法基准稿",
+            "style_sheet": "单元作者写作档案",
+            "style_sheet_merge": "合并作者写作档案",
+            "style_persona": "作者人格",
+            "style_rules": "本章文风执行规则",
+            "style_finalize": "正文终稿",
+            "style_audit": "文风审校",
+            "style_rewrite": "重写正文",
+            "style_plot_extract": "剧情事实提取",
+            "memory_finalize": "章节状态整理",
+            "memory_reconcile": "十章边界语义对账",
+            "memory_repair": "章节状态修复",
             "outline": "提纲",
             "summary": "摘要",
             "script_to_novel": "小说正文",
@@ -2971,11 +3117,27 @@ class NovelWritingWorker(QThread):
         text = text.rstrip(" \t\r\n\"'”’」』》）)]】")
         if not text:
             return False
-        return text[-1] in "。！？!?…."
+        if text[-1] in "。！？!?….":
+            return True
+        return bool(re.search(r"(?:—{2,}|-{2,}|─{2,})$", text))
 
     def _initial_progress_text(self):
         return {
             "draft": "正在扩写正文...",
+            "style_profile": "正在分析正文样本的文风...",
+            "style_baseline": "正在生成普通写法基准稿...",
+            "style_sheet": "正在提取带原文证据的作者写法...",
+            "style_sheet_merge": "正在合并作者写作档案...",
+            "style_persona": "正在生成可长期复用的作者人格...",
+            "style_cards": "正在建立功能型原文片段库...",
+            "style_rules": "正在生成本章专用文风规则...",
+            "style_finalize": "正在审校并整理正文终稿...",
+            "style_audit": "正在独立审校候选正文的文风...",
+            "style_rewrite": "正在按审校结果定向重写正文...",
+            "style_plot_extract": "正在提取候选正文的剧情事实...",
+            "memory_finalize": "正在独立整理本章摘要和长期状态...",
+            "memory_reconcile": "正在执行十章边界语义对账...",
+            "memory_repair": "正在修复本章摘要和长篇状态...",
             "outline": "正在生成章节提纲...",
             "summary": "正在提炼摘要/关键事实...",
             "script_to_novel": "正在改编为小说正文...",
@@ -3038,6 +3200,140 @@ class NovelWritingWorker(QThread):
         )
 
     def _action_prompt(self):
+        if self.action == "style_baseline":
+            return (
+                "你是中文小说基准稿改写器。严格保留作者原文的全部人物、事件、信息、顺序、叙事人称和大致篇幅，"
+                "只把表达改成没有鲜明个人特征的普通中文小说写法。不得总结、续写、删改剧情或模仿原作者。"
+                "只输出完整基准正文，不输出标题、说明、分析或Markdown代码块。"
+            )
+        if self.action == "style_sheet":
+            return (
+                "你是作者文风差异分析师。通过比较内容相同的作者原文与普通基准稿，提取作者独有且可跨剧情复用的写作行为。"
+                "每条结论必须由作者原文中的逐字证据支持，不得把题材、人物、设定或具体情节当成文风，不得自动美化成通用优秀写法。"
+                "必须重点提取作者反复原样使用的词组、句首、句法框架、说话标签、对白停顿和不同功能角色的说话机制，"
+                "并写明使用场景、出现层级和不适用边界。"
+                "严格按用户指定分类直接输出档案，不输出思考过程、评价或Markdown代码块。"
+            )
+        if self.action == "style_sheet_merge":
+            return (
+                "你是作者写作档案合并器。只合并真正等价的结论，保留不同侧重点和最有代表性的逐字证据，"
+                "删除空泛、矛盾、重复或与题材绑定的内容。必须输出完整合并档案，不输出分析过程或Markdown代码块。"
+            )
+        if self.action == "style_persona":
+            return (
+                "你是作者人格与语言声纹建模编辑。把证据化作者写作档案转成模型可以长期扮演的第二人称写作人格，"
+                "必须保留分层习惯词、句式框架、对白停顿、语气词、说话标签和功能角色说话方式，"
+                "忠实保留作者真实习惯，不添加通用商业写作规则，不提分析过程、样本和证据。只输出人格正文。"
+            )
+        if self.action == "style_cards":
+            return (
+                "你是作者原文功能片段建档员。只能从用户提供的作者完整原文中逐字连续截取片段，"
+                "不得改写、拼接、纠错、补字或把档案概括伪装成原文。"
+                "每张片段卡必须完整展示一种可迁移写法，并写清适用场景、不适用边界和可观察声纹。"
+                "严格输出用户指定的合法JSON，不输出Markdown、分析过程或额外说明。"
+            )
+        if self.action == "style_rules":
+            return (
+                "你是小说文风执行策划。根据作者写作档案、作者人格、原文证据和当前章节资料，"
+                "生成只适用于本章的可执行文风规则。规则只能控制同一剧情的表达与组织，不得改变剧情、人物、设定和事件顺序。"
+                "不得把参考原文中的角色、物件、设定或原句带入新正文。只输出规则正文，不输出提纲、分析或Markdown代码块。"
+            )
+        if self.action == "style_profile":
+            return (
+                "你是小说文风分析师。只分析样本怎样写，不评价剧情，不提出通用写作建议。"
+                "必须识别作者真实存在的直白、重复、解释性叙述、短段或长段习惯，不能自动美化成标准商业文风。"
+                "分析重复时必须区分关键词强调、对白回环、情绪递进等修辞性重复，与同一事实、规则、因果或结论的重复说明；"
+                "不能因为少量强调例句，就推断作者希望所有信息跨段或跨章反复解释。"
+                "忽略网页复制、OCR和文档提取造成的异常空格、异形字符、断词、孤立引号及明显标点错误，不得要求仿写这些污染。"
+                "严格按用户要求输出可解析JSON，不输出Markdown代码块或额外说明。"
+            )
+        if self.action == "style_finalize":
+            return (
+                "你是长篇小说终稿编辑。必须同时校验剧情执行、连续性和样本文风，并直接交付可用终稿。"
+                "正文风格样本是唯一写法标准，不得擅自改成模型默认的整齐商业网文、电影分镜、短句强调或动作流。"
+                "必须校准样本的习惯词、句首、句式框架、动作与反应词、说话标签和对白声纹；"
+                "样本稳定重复的词在适用语境中应原样使用，不得为了词汇丰富强行替换。"
+                "结合角色卡语言方式落实不同功能角色的对白长短、停顿、称呼、语气词和接话习惯，不能让所有人物一个腔调。"
+                "文风中的关键词强调、对白回环和情绪递进可以保留，但不得把状态资料、既有规则或已经完成的结论反复改写成正文；"
+                "同一信息只有出现新证据、新决定或新后果时才能再次展开。"
+                "剧情事件、人物、设定、时间线和结尾要求必须完整保留；只修正错误和确有证据的写法偏差。"
+                "必须严格使用用户上下文指定的输出分区，不输出审校报告、评分、修改说明、Markdown代码块或额外内容。"
+            )
+        if self.action == "style_audit":
+            return (
+                "你是独立小说文风审校员。只比较写法，不评价候选剧情是否精彩，不因为题材、人物和事件不同扣分。"
+                "必须以正文样本为唯一标准，严格识别候选是否仍使用模型默认的整齐商业网文、电影分镜、短句强调或视觉动作流。"
+                "必须专项比较习惯用词、句式框架、说话标签、对白停顿、语气词、称呼和不同功能角色的说话方式，"
+                "不能只看段落、句长和对白比例。"
+                "忽略样本中的异常空格、异形字符、断词和明显标点错误。绝不能要求候选删除、提前、延后或更换既定剧情事件，"
+                "只能要求用更接近样本的方式表达同一剧情；章节结尾也只比较表达和段落组织，不比较具体停在哪个事件。"
+                "正常标点、语法规范和剧情题材差异不构成文风问题；最多列5项真正影响整体读感的阻断差异。"
+                "严格按用户要求输出可解析JSON；没有明显差异且评分达到80才允许通过，不输出Markdown代码块或额外说明。"
+            )
+        if self.action == "style_plot_extract":
+            return (
+                "你是小说剧情事实整理员。把候选正文转换成不带任何原文文风的剧情事实清单。"
+                "必须保留事件顺序、人物行为结果、对白传达的关键信息、设定事实、伤势、物品和结尾状态；"
+                "删除原文句式、修辞、氛围、节奏、段落和强调方式。用简短编号条目输出，不写分析、评价或改写后的正文。"
+            )
+        if self.action == "memory_finalize":
+            return (
+                "你是长篇小说连续性总编辑。最终正文是唯一事实来源；独立逐段检查正文并生成实际提纲、摘要、关键事实和版本2长篇记忆增量，"
+                "不得重写正文，不得把原提纲、未来规划、人物秘密或伏笔答案当成已经发生。"
+                "必须识别所有会影响后文的命名人物行动、伤势与能力边界、关系变化、物件去向、未决任务、"
+                "新线索、证据异常、记录缺失或覆盖、未知来源、责任边界、设施规则、伏笔推进和章节结尾状态。"
+                "每项长期事件必须落到真实存储位置；更新旧事实时必须保留仍有效的数量、程度、范围和不确定性。"
+                "必须使用用户资料提供的短引用和当前修订号，所有动态更新都附正文逐字证据。"
+                "严格输出一个合法JSON对象，不输出Markdown、分析、说明或额外文字。"
+            )
+        if self.action == "memory_reconcile":
+            return (
+                "你是十章边界的长篇小说状态语义对账编辑。最终正文是唯一事实来源，"
+                "调用前的状态快照和原状态增量只是待核对资料。只查找会影响后文的语义错误："
+                "把未完成写成完成、把未授权写成已授权、把疑似/未知写成确定、把已发生动作写回尚未发生、"
+                "把同一冲突或任务同时写成停止和成功、把新证据批次覆盖旧批次，或把仍有效的精确限制错误退出。"
+                "只返回最小纠错补丁，不重写完整状态，不新增人物、设定、伏笔，不补正文没有发生的事件。"
+                "事实纠错必须保留原scope和旧事实，状态纠错必须使用目录中的真实ID；没有可靠逐字证据就不要纠正。"
+                "如果原状态没有语义错误，返回空corrections。严格只输出一个合法JSON对象，不输出Markdown、分析或额外文字。"
+            )
+        if self.action == "memory_repair":
+            return (
+                "你是长篇小说章节状态修复器。最终正文是唯一事实来源；只修复实际提纲、摘要、关键事实和版本2长篇记忆增量，"
+                "不得重写正文，不得补写正文没有发生的事件，不得改写用户导入的人物身份、长期目标、秘密、语言方式、设定定义或伏笔计划。"
+                "必须使用用户资料提供的短引用和当前修订号；所有动态更新必须附带正文逐字证据。"
+                "严格输出一个合法JSON对象，不输出Markdown、分析、说明或额外文字。"
+            )
+        if self.action == "draft" and "【剧情执行稿任务】" in self.context:
+            return (
+                "你是长篇小说剧情与声纹执行编辑。严格依据当前章节资料完成三项内容：先合并提纲不同字段中的同义任务，"
+                "生成按发生顺序排列的唯一剧情拍点；再根据作者人格和功能型原文片段库生成本章声纹执行表；"
+                "最后生成一份完整备用正文草稿。"
+                "每个拍点必须带来新动作、新信息、新决定、新后果或必要情绪转折，不得把同一场对话、规则、责任边界或人物反应拆成多项。"
+                "伤势、能力、证据和连续性限制集中放在清单末尾的静默继承边界，只约束写作，不得为了证明遵守而反复写进对白或旁白。"
+                "执行清单必须保留必要的人物行动、因果、物件和证据变化及结尾承接，"
+                "使下一次调用无需阅读备用草稿措辞也能从零写作，但不要写成逐句分镜。"
+                "不得改变提纲，不得提前未来事件，不得把参考样本中的人物、句子或剧情带入当前小说。"
+                "本章声纹执行表必须逐个区分实际说话人物，并明确普通段落合并与短段边界。"
+                "严格使用用户指定的三个分区标题，不输出分析、状态JSON、Markdown代码块或额外内容。"
+            )
+        if self.action in {"draft", "style_rewrite"} and "【正文风格参考】\n" in self.context:
+            return (
+                "你是长篇小说正文起草与仿写助手。用户资料中的【正文风格参考】是本次唯一写法标准，"
+                "其优先级高于你默认的小说写法、商业网文经验和通用编辑偏好。\n"
+                "剧情事件、人物、设定、世界规则、时间线和连续性事实严格按用户资料执行；除剧情内容外，"
+                "叙事口吻、段落密度、长短段分布、句式、对白比例、叙述与对白衔接、背景铺陈、信息揭示和收尾方式都模仿样本。\n"
+                "必须模仿样本的习惯词、句首、动作与反应词、解释框架、说话标签、对白停顿、称呼、语气词和接话方式；"
+                "样本稳定重复的词在适用语境中应原样使用，不要为了词汇丰富换同义词。\n"
+                "结合当前人物卡的身份和语言方式，匹配作者人格中的功能角色声纹；不同人物必须可区分，不能全都说成同一种口气。\n"
+                "不得复制样本人物名、专有设定、具体对白或整句表达，也不得把局部惯用词集中堆进一个场景。\n"
+                "不要自行追求多动作、多对白、高密度推进、短句、少解释、电影感、分镜感、去AI味或所谓更成熟的商业表达；"
+                "样本怎么写就怎么组织，样本有解释性叙述、长段、慢铺陈或不工整表达时必须保留这种倾向。\n"
+                "保留样本的修辞性重复，但删除同一事实、规则、因果、证据边界和人物反应的同义复述；"
+                "状态资料只用于静默继承，不能通过重复说明来证明已经记住。\n"
+                "严格执行【风格锁定规则】中的动态指标。若资料包含【风格验收未通过：本次必须重写】，"
+                "必须保留首次正文的全部剧情事实和顺序，只重写表达与段落结构。\n"
+                "只输出可直接使用的正文，不输出标题、说明、分析、指标、创作建议或修改记录。"
+            )
         prompts = {
             "outline": (
                 "你是长篇小说章节策划助手。请基于资料为当前章节生成可直接使用的章节提纲。\n"
@@ -3103,7 +3399,16 @@ class NovelWritingWorker(QThread):
         return prompt + self._editorial_quality_prompt()
 
     def run(self):
+        started = time.perf_counter()
+        full = ""
+        finish_reason = ""
+        done_received = False
+        first_piece_seen = False
         try:
+            self.diagnostics.update({
+                "started_at": now_str(),
+                "outcome": "running",
+            })
             if not self.base_url:
                 raise Exception("请先选择厂商。")
             if not self.api_key:
@@ -3115,6 +3420,19 @@ class NovelWritingWorker(QThread):
 
             self.progress.emit(self._initial_progress_text())
             url = api_url(self.base_url, "/v1/chat/completions")
+            system_prompt = self._action_prompt()
+            sent_context = self.context[:NOVEL_AI_CONTEXT_LIMIT]
+            self.diagnostics.update({
+                "system_prompt_chars": len(system_prompt),
+                "system_prompt_sha256": hashlib.sha256(
+                    system_prompt.encode("utf-8", errors="replace")
+                ).hexdigest(),
+                "sent_context_chars": len(sent_context),
+                "sent_context_utf8_bytes": len(sent_context.encode("utf-8", errors="replace")),
+                "sent_context_sha256": hashlib.sha256(
+                    sent_context.encode("utf-8", errors="replace")
+                ).hexdigest(),
+            })
             headers = {
                 "Authorization": f"Bearer {self.api_key}",
                 "Content-Type": "application/json",
@@ -3123,32 +3441,56 @@ class NovelWritingWorker(QThread):
             payload = {
                 "model": self.model,
                 "messages": [
-                    {"role": "system", "content": self._action_prompt()},
-                    {"role": "user", "content": self.context[:60000]},
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": sent_context},
                 ],
-                "temperature": 0.65 if self.action in ("draft", "script_to_novel") else 0.35,
+                "temperature": (
+                    0.30 if self.action == "draft" and "【剧情执行稿任务】" in self.context
+                    else 0.20 if self.action in (
+                        "style_profile", "style_baseline", "style_sheet", "style_sheet_merge",
+                        "style_persona", "style_cards", "style_rules", "style_finalize", "style_audit",
+                        "style_plot_extract", "style_rewrite", "memory_finalize", "memory_reconcile", "memory_repair",
+                    )
+                    else 0.55 if self.action in ("draft", "script_to_novel")
+                    else 0.35
+                ),
                 "stream": True,
             }
             max_tokens = self._max_tokens_for_request()
+            self.diagnostics["max_output_tokens"] = max_tokens
             if max_tokens:
                 payload["max_tokens"] = max_tokens
-            r = self._session.post(
-                url,
-                headers=headers,
-                json=payload,
-                stream=True,
-                timeout=(10, 180),
-                proxies=self._proxies(),
-            )
+            r = self._post_stream_request_interruptibly(url, headers, payload)
+            if r is None:
+                self.diagnostics.update({
+                    "outcome": "stopped",
+                    "finished_at": now_str(),
+                })
+                self.result_ready.emit(self.action, "")
+                return
             self._response = r
+            self.diagnostics["http_status"] = int(getattr(r, "status_code", 0) or 0)
+            try:
+                response_headers = getattr(r, "headers", {}) or {}
+                if hasattr(response_headers, "items"):
+                    selected_headers = {}
+                    for raw_key, raw_value in response_headers.items():
+                        key = str(raw_key or "").lower()
+                        if key in {
+                            "request-id", "x-request-id", "trace-id", "x-correlation-id",
+                            "retry-after", "content-type", "server",
+                        }:
+                            selected_headers[key] = str(raw_value or "")[:500]
+                    self.diagnostics["response_headers"] = selected_headers
+            except Exception as header_error:
+                self.diagnostics["response_headers_error"] = type(header_error).__name__
+            self.diagnostics["time_to_headers_ms"] = round((time.perf_counter() - started) * 1000, 1)
             if r.status_code >= 400:
                 raise Exception(f"接口错误 {r.status_code}：{extract_api_error(r)}")
 
-            full = ""
-            finish_reason = ""
-            done_received = False
             r.encoding = "utf-8"
             for raw_line in r.iter_lines(decode_unicode=False):
+                self.diagnostics["sse_lines"] = int(self.diagnostics.get("sse_lines", 0) or 0) + 1
                 if self._stop_requested or self.isInterruptionRequested():
                     break
                 if not raw_line:
@@ -3167,6 +3509,9 @@ class NovelWritingWorker(QThread):
                 try:
                     data = json.loads(data_str)
                 except Exception:
+                    self.diagnostics["invalid_sse_json_lines"] = int(
+                        self.diagnostics.get("invalid_sse_json_lines", 0) or 0
+                    ) + 1
                     continue
                 if isinstance(data.get("error"), dict):
                     raise Exception(data["error"].get("message") or json.dumps(data["error"], ensure_ascii=False))
@@ -3189,28 +3534,85 @@ class NovelWritingWorker(QThread):
                     or choice.get("text")
                 )
                 if piece:
+                    if not first_piece_seen:
+                        first_piece_seen = True
+                        self.diagnostics["time_to_first_piece_ms"] = round(
+                            (time.perf_counter() - started) * 1000, 1
+                        )
                     full += piece
-                    self.chunk.emit(piece)
+                    self.last_response_text = full
+                    if self.action not in {"style_profile", "style_cards", "style_finalize", "style_audit", "style_plot_extract", "style_rewrite", "memory_finalize", "memory_reconcile", "memory_repair"}:
+                        self.chunk.emit(piece)
 
             content = full.strip()
+            self.last_response_text = full
             stopped = bool(self._stop_requested or self.isInterruptionRequested())
             if not content:
                 if stopped:
+                    self.diagnostics.update({
+                        "outcome": "stopped",
+                        "finish_reason": finish_reason,
+                        "done_received": bool(done_received),
+                        "response_chars": 0,
+                        "response_sha256": "",
+                        "finished_at": now_str(),
+                    })
                     self.result_ready.emit(self.action, "")
                     return
                 reason_text = f" finish_reason={finish_reason}" if finish_reason else ""
                 raise Exception(f"AI 没有返回有效内容。{reason_text}".strip())
             if not stopped and not self._stream_finished_normally(done_received, finish_reason):
                 raise Exception(self._incomplete_stream_error(finish_reason))
-            if self.action == "draft" and not stopped and not self._draft_ending_looks_complete(content):
+            validation_text = content
+            if self.action == "draft" and "【剧情执行稿任务】" in self.context:
+                execution_result = _parse_style_execution_result(content)
+                validation_text = str(execution_result.get("draft", "") or "").strip()
+                if not (
+                    execution_result.get("parsed")
+                    and execution_result.get("style_plan_parsed")
+                    and validation_text
+                ):
+                    raise Exception(
+                        "AI 剧情执行稿结构不完整，已丢弃本次半成品，请重新扩写正文。"
+                    )
+            if (
+                self.action in {"draft", "style_rewrite"}
+                and not stopped
+                and not self._draft_ending_looks_complete(validation_text)
+            ):
                 raise Exception("AI 正文似乎还没有写完，已保留当前预览内容，可点续写正文继续。")
+            self.diagnostics.update({
+                "outcome": "stopped" if stopped else "success",
+                "finish_reason": finish_reason,
+                "done_received": bool(done_received),
+                "response_chars": len(content),
+                "response_sha256": hashlib.sha256(content.encode("utf-8")).hexdigest(),
+                "elapsed_ms": round((time.perf_counter() - started) * 1000, 1),
+                "finished_at": now_str(),
+            })
             self.result_ready.emit(self.action, content)
         except Exception as e:
-            if self._stop_requested or self.isInterruptionRequested():
+            stopped = bool(self._stop_requested or self.isInterruptionRequested())
+            self.diagnostics.update({
+                "outcome": "stopped" if stopped else "error",
+                "finish_reason": finish_reason,
+                "done_received": bool(done_received),
+                "response_chars": len(str(full or "").strip()),
+                "response_sha256": hashlib.sha256(
+                    str(full or "").strip().encode("utf-8")
+                ).hexdigest() if str(full or "").strip() else "",
+                "error_type": type(e).__name__,
+                "error": str(e)[:4000],
+                "traceback": traceback.format_exc(limit=30),
+                "elapsed_ms": round((time.perf_counter() - started) * 1000, 1),
+                "finished_at": now_str(),
+            })
+            if stopped:
                 self.result_ready.emit(self.action, "")
             else:
                 self.failed.emit(str(e))
         finally:
+            self.diagnostics["elapsed_ms"] = round((time.perf_counter() - started) * 1000, 1)
             self._close_network_handles()
 
 
@@ -3291,6 +3693,143 @@ class EdgeTTSWorker(QThread):
                 self.failed.emit(str(e))
 
 
+class NovelChapterPlanMasterWorker(NovelAnalysisWorker):
+    result_ready = Signal(dict)
+
+    def __init__(
+        self,
+        base_url,
+        api_key,
+        model,
+        project_context,
+        target_words,
+        average_chapter_words,
+        total_chapter_count,
+        existing_chapter_count=0,
+        proxy_url="",
+        proxy_mode="不使用代理",
+    ):
+        super().__init__(
+            base_url,
+            api_key,
+            model,
+            str(project_context or ""),
+            proxy_url=proxy_url,
+            proxy_mode=proxy_mode,
+            max_concurrency=1,
+        )
+        self._retry_stream_transport_before_nonstream = True
+        self.target_words = max(1, int(target_words or 1))
+        self.average_chapter_words = max(1, int(average_chapter_words or 3000))
+        self.total_chapter_count = max(1, int(total_chapter_count or 1))
+        self.existing_chapter_count = max(0, int(existing_chapter_count or 0))
+        remaining = max(1, self.total_chapter_count - self.existing_chapter_count)
+        self.arc_count = max(1, min(20, (remaining + 24) // 25))
+
+    def _analysis_prompt(self):
+        first_chapter = self.existing_chapter_count + 1
+        sample_end = min(self.total_chapter_count, first_chapter + 24)
+        return (
+            "你是长篇小说全书结构规划编辑。先为后续分批章节规划建立唯一的全书阶段地图。\n"
+            "必须只输出一个合法JSON对象，不要Markdown、解释、注释或尾随逗号。\n"
+            f"目标总字数约{self.target_words}字，单章约{self.average_chapter_words}字，"
+            f"全书预计{self.total_chapter_count}章，已有{self.existing_chapter_count}章。\n"
+            f"请把尚未规划的章节划分为约{self.arc_count}个连续剧情阶段。阶段必须首尾相接、覆盖到第"
+            f"{self.total_chapter_count}章，不得重叠或留空；第一个阶段必须从第{first_chapter}章开始。\n"
+            "summary写全书主线走向和最终收束承诺。每个阶段必须写清阶段目标、核心冲突、关键转折、"
+            "结束状态和禁止提前发生的内容；不要生成逐章提纲，不要固定安排伏笔编号。\n"
+            "如果项目资料包含 imported_chapter_plan_reference，阶段边界和阶段顺序必须以其中的"
+            "stages及绝对章号为准；stages.events是阶段内有序剧情节点，不是一条节点固定对应一章。"
+            "不得合并阶段、调序阶段或用新阶段替换用户原始阶段。\n"
+            f'JSON结构：{{"summary":"","arcs":[{{"name":"","start_chapter":{first_chapter},'
+            f'"end_chapter":{sample_end},"goal":"","main_conflict":"","turning_points":"",'
+            '"end_state":"","forbidden":""}]}。'
+        )
+
+    def _chunk_user_text(self, chunk_text, chunk_index, total_chunks):
+        return str(chunk_text or "")
+
+    def _analysis_progress_label(self):
+        return "全书阶段规划"
+
+    def _allow_retry_chunk_split(self):
+        return False
+
+    def _normalize_master_plan(self, data):
+        data = data if isinstance(data, dict) else {}
+        raw_arcs = data.get("arcs", [])
+        if not isinstance(raw_arcs, list) or not raw_arcs:
+            raise ValueError("AI没有返回全书阶段规划。")
+        arcs = []
+        for item in raw_arcs:
+            if not isinstance(item, dict):
+                continue
+            try:
+                start = int(item.get("start_chapter", 0) or 0)
+                end = int(item.get("end_chapter", 0) or 0)
+            except Exception:
+                continue
+            if start <= 0 or end < start:
+                continue
+            arcs.append({
+                "name": str(item.get("name", "") or f"阶段{len(arcs) + 1}").strip(),
+                "start_chapter": start,
+                "end_chapter": end,
+                "goal": str(item.get("goal", "") or "").strip(),
+                "main_conflict": str(item.get("main_conflict", "") or "").strip(),
+                "turning_points": str(item.get("turning_points", "") or "").strip(),
+                "end_state": str(item.get("end_state", "") or "").strip(),
+                "forbidden": str(item.get("forbidden", "") or "").strip(),
+            })
+        arcs.sort(key=lambda item: item["start_chapter"])
+        expected_start = self.existing_chapter_count + 1
+        for arc in arcs:
+            if arc["start_chapter"] != expected_start:
+                raise ValueError(f"全书阶段范围不连续：应从第{expected_start}章开始。")
+            expected_start = arc["end_chapter"] + 1
+        if expected_start - 1 != self.total_chapter_count:
+            raise ValueError(f"全书阶段规划未覆盖到第{self.total_chapter_count}章。")
+        return {
+            "summary": str(data.get("summary", "") or "").strip(),
+            "target_words": self.target_words,
+            "average_chapter_words": self.average_chapter_words,
+            "total_chapter_count": self.total_chapter_count,
+            "existing_chapter_count": self.existing_chapter_count,
+            "arcs": arcs,
+        }
+
+    def run(self):
+        try:
+            if not self.base_url:
+                raise Exception("请先选择厂商。")
+            if not self.api_key:
+                raise Exception("请先设置 API Key。")
+            if not self.model:
+                raise Exception("请选择模型。")
+            if not self.text.strip():
+                raise Exception("没有可用于生成全书阶段规划的项目资料。")
+            self.progress.emit("正在生成全书阶段规划...")
+            response_format_supported, _stream_supported = self._analysis_request_capabilities()
+            last_error = None
+            for structure_attempt in range(2):
+                parsed, response_format_supported = self._analyze_chunk_with_retries(
+                    self._analysis_prompt(), self.text, 1, 1, response_format_supported
+                )
+                if self._stop_requested or self.isInterruptionRequested():
+                    return
+                try:
+                    self.result_ready.emit(self._normalize_master_plan(parsed))
+                    return
+                except ValueError as e:
+                    last_error = e
+                    if structure_attempt == 0:
+                        self.progress.emit("全书阶段范围不完整，正在自动重做总规划一次...")
+            raise last_error or ValueError("全书阶段规划格式不完整。")
+        except Exception as e:
+            if not self._stop_requested and not self.isInterruptionRequested():
+                self.failed.emit(str(e))
+
+
 class NovelChapterPlanWorker(NovelAnalysisWorker):
     result_ready = Signal(dict)
 
@@ -3307,6 +3846,8 @@ class NovelChapterPlanWorker(NovelAnalysisWorker):
         existing_chapter_count=0,
         proxy_url="",
         proxy_mode="不使用代理",
+        batch_number=1,
+        total_batches=1,
     ):
         super().__init__(
             base_url,
@@ -3317,11 +3858,14 @@ class NovelChapterPlanWorker(NovelAnalysisWorker):
             proxy_mode=proxy_mode,
             max_concurrency=1,
         )
+        self._retry_stream_transport_before_nonstream = True
         self.target_words = max(1, int(target_words or 1))
         self.average_chapter_words = max(1, int(average_chapter_words or 3000))
         self.chapter_count = max(1, int(chapter_count or 1))
         self.total_chapter_count = max(1, int(total_chapter_count or self.chapter_count))
         self.existing_chapter_count = max(0, int(existing_chapter_count or 0))
+        self.batch_number = max(1, int(batch_number or 1))
+        self.total_batches = max(1, int(total_batches or 1))
 
     def _analysis_prompt(self):
         return (
@@ -3330,7 +3874,7 @@ class NovelChapterPlanWorker(NovelAnalysisWorker):
             "规划目标：先保证主线可控、章节功能明确、阶段节奏清楚，再兼顾标题吸引力。\n"
             f"目标总字数约 {self.target_words} 字，单章目标约 {self.average_chapter_words} 字，"
             f"全书预计约 {self.total_chapter_count} 章，已有 {self.existing_chapter_count} 章，"
-            f"本次请输出 {self.chapter_count} 章。若剧情结构需要微调，仍尽量贴近该章节数量。\n"
+            f"本次是第 {self.batch_number}/{self.total_batches} 批，必须输出接下来的 {self.chapter_count} 章。\n"
             "每章都要有明确作用，避免重复水章节；不要提前回收后期伏笔，不要擅自推翻小说圣经和世界规则。\n"
             "不要按伏笔编号、旧伏笔列表或现有早期伏笔为章节固定安排埋设、推进或回收；"
             "伏笔由后续扩写正文和正文分析根据实际内容动态处理。若需要悬念，只写自然剧情信息变化，不写固定伏笔任务。\n"
@@ -3341,9 +3885,13 @@ class NovelChapterPlanWorker(NovelAnalysisWorker):
             "outline 要写成可直接用于扩写正文的章节提纲，包含本章目标、必须发生、冲突转折和结尾钩子，不写固定伏笔编号或伏笔动作。\n"
             "每章必须填写 narrative_stage/chapter_function/conflict_intensity/setup_ratio/character_task/mainline_task/ending_hook。"
             "narrative_stage 只能从“强钩子阶段”“主线扩展阶段”“收束升级阶段”中选择。\n"
+            "如果项目资料包含 imported_chapter_plan_reference：chapters是明确章节级约束，必须按绝对章号执行；"
+            "stages.events是阶段内有序剧情节点，不得把事件序号当作章号。每章用source_event_ids列出承载的节点ID；"
+            "一章可以承载多个连续节点，扩展章可以用空数组，但每个节点只能使用一次、必须在所属阶段内并保持顺序，"
+            "阶段结束前必须全部覆盖。凡引用节点，outline必须逐字包含对应事件text，再补充冲突转折和衔接。\n"
             "characters/settings 只填本章实际相关项，没有则用空数组。\n"
-            'JSON 结构：{"summary":"","chapters":[{"index":1,"title":"","target_words":"3000","narrative_stage":"","chapter_function":"","conflict_intensity":"","setup_ratio":"","character_task":"","mainline_task":"","outline":"","characters":[],"settings":[],"ending_hook":"","forbidden":""}]}\n'
-            "chapters 数量必须尽量等于请求章节数，index 从 1 连续递增。"
+            'JSON 结构：{"summary":"","chapters":[{"index":1,"title":"","target_words":"3000","narrative_stage":"","chapter_function":"","conflict_intensity":"","setup_ratio":"","character_task":"","mainline_task":"","source_event_ids":[],"outline":"","characters":[],"settings":[],"ending_hook":"","forbidden":""}]}\n'
+            "chapters 数量必须严格等于请求章节数，index 从 1 连续递增。"
         )
 
     def _chunk_user_text(self, chunk_text, chunk_index, total_chunks):
@@ -3466,6 +4014,9 @@ class NovelChapterPlanWorker(NovelAnalysisWorker):
                 "setup_ratio": str(item.get("setup_ratio", "") or item.get("铺垫比例", "") or "").strip(),
                 "character_task": str(item.get("character_task", "") or item.get("人物任务", "") or "").strip(),
                 "mainline_task": str(item.get("mainline_task", "") or item.get("主线任务", "") or "").strip(),
+                "source_event_ids": [
+                    value.upper() for value in self._string_list(item.get("source_event_ids", []))
+                ],
                 "foreshadow_task": "",
                 "outline": outline,
                 "characters": self._string_list(item.get("characters", [])),
@@ -3477,6 +4028,8 @@ class NovelChapterPlanWorker(NovelAnalysisWorker):
         normalized.sort(key=lambda item: item.get("index", 0))
         if not normalized:
             raise ValueError("AI 返回的章节规划为空。")
+        if len(normalized) != self.chapter_count:
+            raise ValueError(f"章节规划数量不一致：需要{self.chapter_count}章，实际{len(normalized)}章。")
         for index, item in enumerate(normalized, 1):
             item["index"] = index
         return {
@@ -3501,16 +4054,25 @@ class NovelChapterPlanWorker(NovelAnalysisWorker):
                 raise Exception("没有可用于生成章节规划的项目资料。")
             self.progress.emit("正在生成章节规划...")
             response_format_supported, _stream_supported = self._analysis_request_capabilities()
-            parsed, _response_format = self._analyze_chunk_with_retries(
-                self._analysis_prompt(),
-                self.text,
-                1,
-                1,
-                response_format_supported,
-            )
-            if self._stop_requested or self.isInterruptionRequested():
-                return
-            self.result_ready.emit(self._normalize_plan(parsed))
+            last_error = None
+            for structure_attempt in range(2):
+                parsed, response_format_supported = self._analyze_chunk_with_retries(
+                    self._analysis_prompt(),
+                    self.text,
+                    1,
+                    1,
+                    response_format_supported,
+                )
+                if self._stop_requested or self.isInterruptionRequested():
+                    return
+                try:
+                    self.result_ready.emit(self._normalize_plan(parsed))
+                    return
+                except ValueError as e:
+                    last_error = e
+                    if structure_attempt == 0:
+                        self.progress.emit("当前批次章节数量或结构不完整，正在自动重做本批一次...")
+            raise last_error or ValueError("当前批次章节规划格式不完整。")
         except Exception as e:
             if not self._stop_requested and not self.isInterruptionRequested():
                 self.failed.emit(str(e))

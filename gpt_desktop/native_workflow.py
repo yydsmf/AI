@@ -73,9 +73,22 @@ from .blender_director_project import (
     write_blender_director_action_matches_csv,
     write_blender_director_action_matches_manifest,
     write_blender_director_action_matches_report,
+    write_blender_director_ai_workflow_handoff_package,
+    write_blender_director_ai_workflow_results_csv,
+    write_blender_director_ai_workflow_results_manifest,
+    write_blender_director_ai_workflow_results_report,
+    write_blender_director_ai_workflow_tasks_csv,
+    write_blender_director_ai_workflow_tasks_manifest,
+    write_blender_director_ai_workflow_tasks_report,
     write_blender_director_asset_requirements_csv,
     write_blender_director_asset_requirements_manifest,
     write_blender_director_asset_requirements_report,
+    write_blender_director_asset_ecosystem_csv,
+    write_blender_director_asset_ecosystem_manifest,
+    write_blender_director_asset_ecosystem_report,
+    write_blender_director_asset_preflight_csv,
+    write_blender_director_asset_preflight_manifest,
+    write_blender_director_asset_preflight_report,
     write_blender_director_asset_usage_csv,
     write_blender_director_batch_render_jobs_csv,
     write_blender_director_batch_render_jobs_manifest,
@@ -115,6 +128,9 @@ from .blender_director_project import (
     write_blender_director_render_versions_csv,
     write_blender_director_render_versions_manifest,
     write_blender_director_render_versions_report,
+    write_blender_director_retarget_summary_csv,
+    write_blender_director_retarget_summary_manifest,
+    write_blender_director_retarget_summary_report,
     write_blender_director_scene_breakdown_csv,
     write_blender_director_scene_breakdown_manifest,
     write_blender_director_scene_breakdown_report,
@@ -4269,9 +4285,25 @@ class WorkflowScene(QGraphicsScene):
         asset_requirements_manifest_path = write_blender_director_asset_requirements_manifest(meta)
         asset_requirements_report_path = write_blender_director_asset_requirements_report(meta)
         asset_requirements_csv_path = write_blender_director_asset_requirements_csv(meta)
+        asset_ecosystem_manifest_path = write_blender_director_asset_ecosystem_manifest(meta)
+        asset_ecosystem_report_path = write_blender_director_asset_ecosystem_report(meta)
+        asset_ecosystem_csv_path = write_blender_director_asset_ecosystem_csv(meta)
+        asset_preflight_manifest_path = write_blender_director_asset_preflight_manifest(meta)
+        asset_preflight_report_path = write_blender_director_asset_preflight_report(meta)
+        asset_preflight_csv_path = write_blender_director_asset_preflight_csv(meta)
         action_matches_manifest_path = write_blender_director_action_matches_manifest(meta)
         action_matches_report_path = write_blender_director_action_matches_report(meta)
         action_matches_csv_path = write_blender_director_action_matches_csv(meta)
+        ai_workflow_tasks_manifest_path = write_blender_director_ai_workflow_tasks_manifest(meta)
+        ai_workflow_tasks_report_path = write_blender_director_ai_workflow_tasks_report(meta)
+        ai_workflow_tasks_csv_path = write_blender_director_ai_workflow_tasks_csv(meta)
+        ai_workflow_handoff = write_blender_director_ai_workflow_handoff_package(meta)
+        ai_workflow_results_manifest_path = write_blender_director_ai_workflow_results_manifest(meta)
+        ai_workflow_results_report_path = write_blender_director_ai_workflow_results_report(meta)
+        ai_workflow_results_csv_path = write_blender_director_ai_workflow_results_csv(meta)
+        retarget_summary_manifest_path = write_blender_director_retarget_summary_manifest(meta)
+        retarget_summary_report_path = write_blender_director_retarget_summary_report(meta)
+        retarget_summary_csv_path = write_blender_director_retarget_summary_csv(meta)
         project_dashboard_path = write_blender_director_project_dashboard(meta)
         storyboard_entries = build_blender_director_storyboard(meta)
         action_matches = build_blender_director_action_matches(meta)
@@ -4436,6 +4468,24 @@ class WorkflowScene(QGraphicsScene):
         if asset_requirements_csv_path:
             meta["asset_requirements_csv_path"] = asset_requirements_csv_path
             project["asset_requirements_csv_path"] = asset_requirements_csv_path
+        if asset_ecosystem_manifest_path:
+            meta["asset_ecosystem_manifest_path"] = asset_ecosystem_manifest_path
+            project["asset_ecosystem_manifest_path"] = asset_ecosystem_manifest_path
+        if asset_ecosystem_report_path:
+            meta["asset_ecosystem_report_path"] = asset_ecosystem_report_path
+            project["asset_ecosystem_report_path"] = asset_ecosystem_report_path
+        if asset_ecosystem_csv_path:
+            meta["asset_ecosystem_csv_path"] = asset_ecosystem_csv_path
+            project["asset_ecosystem_csv_path"] = asset_ecosystem_csv_path
+        if asset_preflight_manifest_path:
+            meta["asset_preflight_manifest_path"] = asset_preflight_manifest_path
+            project["asset_preflight_manifest_path"] = asset_preflight_manifest_path
+        if asset_preflight_report_path:
+            meta["asset_preflight_report_path"] = asset_preflight_report_path
+            project["asset_preflight_report_path"] = asset_preflight_report_path
+        if asset_preflight_csv_path:
+            meta["asset_preflight_csv_path"] = asset_preflight_csv_path
+            project["asset_preflight_csv_path"] = asset_preflight_csv_path
         if action_matches_manifest_path:
             meta["action_matches_manifest_path"] = action_matches_manifest_path
             project["action_matches_manifest_path"] = action_matches_manifest_path
@@ -4445,6 +4495,48 @@ class WorkflowScene(QGraphicsScene):
         if action_matches_csv_path:
             meta["action_matches_csv_path"] = action_matches_csv_path
             project["action_matches_csv_path"] = action_matches_csv_path
+        if ai_workflow_tasks_manifest_path:
+            meta["ai_workflow_tasks_manifest_path"] = ai_workflow_tasks_manifest_path
+            project["ai_workflow_tasks_manifest_path"] = ai_workflow_tasks_manifest_path
+        if ai_workflow_tasks_report_path:
+            meta["ai_workflow_tasks_report_path"] = ai_workflow_tasks_report_path
+            project["ai_workflow_tasks_report_path"] = ai_workflow_tasks_report_path
+        if ai_workflow_tasks_csv_path:
+            meta["ai_workflow_tasks_csv_path"] = ai_workflow_tasks_csv_path
+            project["ai_workflow_tasks_csv_path"] = ai_workflow_tasks_csv_path
+        if ai_workflow_handoff.get("handoff_dir"):
+            meta["ai_workflow_handoff_dir"] = ai_workflow_handoff.get("handoff_dir")
+            project["ai_workflow_handoff_dir"] = ai_workflow_handoff.get("handoff_dir")
+        if ai_workflow_handoff.get("manifest_path"):
+            meta["ai_workflow_handoff_manifest_path"] = ai_workflow_handoff.get("manifest_path")
+            project["ai_workflow_handoff_manifest_path"] = ai_workflow_handoff.get("manifest_path")
+        if ai_workflow_handoff.get("report_path"):
+            meta["ai_workflow_handoff_report_path"] = ai_workflow_handoff.get("report_path")
+            project["ai_workflow_handoff_report_path"] = ai_workflow_handoff.get("report_path")
+        if ai_workflow_handoff.get("csv_path"):
+            meta["ai_workflow_handoff_csv_path"] = ai_workflow_handoff.get("csv_path")
+            project["ai_workflow_handoff_csv_path"] = ai_workflow_handoff.get("csv_path")
+        if ai_workflow_handoff.get("readme_path"):
+            meta["ai_workflow_handoff_readme_path"] = ai_workflow_handoff.get("readme_path")
+            project["ai_workflow_handoff_readme_path"] = ai_workflow_handoff.get("readme_path")
+        if ai_workflow_results_manifest_path:
+            meta["ai_workflow_results_manifest_path"] = ai_workflow_results_manifest_path
+            project["ai_workflow_results_manifest_path"] = ai_workflow_results_manifest_path
+        if ai_workflow_results_report_path:
+            meta["ai_workflow_results_report_path"] = ai_workflow_results_report_path
+            project["ai_workflow_results_report_path"] = ai_workflow_results_report_path
+        if ai_workflow_results_csv_path:
+            meta["ai_workflow_results_csv_path"] = ai_workflow_results_csv_path
+            project["ai_workflow_results_csv_path"] = ai_workflow_results_csv_path
+        if retarget_summary_manifest_path:
+            meta["retarget_summary_manifest_path"] = retarget_summary_manifest_path
+            project["retarget_summary_manifest_path"] = retarget_summary_manifest_path
+        if retarget_summary_report_path:
+            meta["retarget_summary_report_path"] = retarget_summary_report_path
+            project["retarget_summary_report_path"] = retarget_summary_report_path
+        if retarget_summary_csv_path:
+            meta["retarget_summary_csv_path"] = retarget_summary_csv_path
+            project["retarget_summary_csv_path"] = retarget_summary_csv_path
         if project_dashboard_path:
             meta["project_dashboard_path"] = project_dashboard_path
             project["project_dashboard_path"] = project_dashboard_path
@@ -4454,7 +4546,7 @@ class WorkflowScene(QGraphicsScene):
                     json.dump(meta, f, ensure_ascii=False, indent=2)
             except Exception:
                 pass
-        if storyboard_manifest_path or storyboard_report_path or storyboard_csv_path or render_queue_manifest_path or render_queue_report_path or render_queue_csv_path or batch_render_jobs_manifest_path or batch_render_jobs_report_path or batch_render_jobs_csv_path or batch_render_command.get("report_path") or render_versions_manifest_path or render_versions_report_path or render_versions_csv_path or scene_breakdown_manifest_path or scene_breakdown_report_path or scene_breakdown_csv_path or episode_delivery_manifest_path or episode_delivery_report_path or episode_delivery_csv_path or episode_delivery_packages.get("report_path") or call_sheet_manifest_path or call_sheet_report_path or call_sheet_csv_path or actor_schedule_manifest_path or actor_schedule_report_path or actor_schedule_csv_path or edit_timeline_manifest_path or edit_timeline_report_path or edit_timeline_csv_path or edit_timeline_edl_path or edit_timeline_fcpxml_path or post_handoff_manifest_path or post_handoff_report_path or post_handoff_csv_path or continuity_check_manifest_path or continuity_check_report_path or continuity_check_csv_path or production_check_manifest_path or production_check_report_path or production_check_csv_path or duration_summary_path or production_manifest_path or production_report_path or asset_usage_csv_path or asset_requirements_manifest_path or asset_requirements_report_path or asset_requirements_csv_path or action_matches_manifest_path or action_matches_report_path or action_matches_csv_path or project_dashboard_path:
+        if storyboard_manifest_path or storyboard_report_path or storyboard_csv_path or render_queue_manifest_path or render_queue_report_path or render_queue_csv_path or batch_render_jobs_manifest_path or batch_render_jobs_report_path or batch_render_jobs_csv_path or batch_render_command.get("report_path") or render_versions_manifest_path or render_versions_report_path or render_versions_csv_path or scene_breakdown_manifest_path or scene_breakdown_report_path or scene_breakdown_csv_path or episode_delivery_manifest_path or episode_delivery_report_path or episode_delivery_csv_path or episode_delivery_packages.get("report_path") or call_sheet_manifest_path or call_sheet_report_path or call_sheet_csv_path or actor_schedule_manifest_path or actor_schedule_report_path or actor_schedule_csv_path or edit_timeline_manifest_path or edit_timeline_report_path or edit_timeline_csv_path or edit_timeline_edl_path or edit_timeline_fcpxml_path or post_handoff_manifest_path or post_handoff_report_path or post_handoff_csv_path or continuity_check_manifest_path or continuity_check_report_path or continuity_check_csv_path or production_check_manifest_path or production_check_report_path or production_check_csv_path or duration_summary_path or production_manifest_path or production_report_path or asset_usage_csv_path or asset_requirements_manifest_path or asset_requirements_report_path or asset_requirements_csv_path or asset_ecosystem_manifest_path or asset_ecosystem_report_path or asset_ecosystem_csv_path or asset_preflight_manifest_path or asset_preflight_report_path or asset_preflight_csv_path or action_matches_manifest_path or action_matches_report_path or action_matches_csv_path or ai_workflow_tasks_manifest_path or ai_workflow_tasks_report_path or ai_workflow_tasks_csv_path or ai_workflow_handoff.get("report_path") or ai_workflow_results_manifest_path or ai_workflow_results_report_path or ai_workflow_results_csv_path or retarget_summary_manifest_path or retarget_summary_report_path or retarget_summary_csv_path or project_dashboard_path:
             node.data["director_project"] = project
         self._refresh_blender_director_project_summary(node, meta)
         renders = meta.get("renders", [])
@@ -4547,9 +4639,29 @@ class WorkflowScene(QGraphicsScene):
             "asset_requirements_manifest_path": asset_requirements_manifest_path,
             "asset_requirements_report_path": asset_requirements_report_path,
             "asset_requirements_csv_path": asset_requirements_csv_path,
+            "asset_ecosystem_manifest_path": asset_ecosystem_manifest_path,
+            "asset_ecosystem_report_path": asset_ecosystem_report_path,
+            "asset_ecosystem_csv_path": asset_ecosystem_csv_path,
+            "asset_preflight_manifest_path": asset_preflight_manifest_path,
+            "asset_preflight_report_path": asset_preflight_report_path,
+            "asset_preflight_csv_path": asset_preflight_csv_path,
             "action_matches_manifest_path": action_matches_manifest_path,
             "action_matches_report_path": action_matches_report_path,
             "action_matches_csv_path": action_matches_csv_path,
+            "ai_workflow_tasks_manifest_path": ai_workflow_tasks_manifest_path,
+            "ai_workflow_tasks_report_path": ai_workflow_tasks_report_path,
+            "ai_workflow_tasks_csv_path": ai_workflow_tasks_csv_path,
+            "ai_workflow_handoff_dir": ai_workflow_handoff.get("handoff_dir", ""),
+            "ai_workflow_handoff_manifest_path": ai_workflow_handoff.get("manifest_path", ""),
+            "ai_workflow_handoff_report_path": ai_workflow_handoff.get("report_path", ""),
+            "ai_workflow_handoff_csv_path": ai_workflow_handoff.get("csv_path", ""),
+            "ai_workflow_handoff_readme_path": ai_workflow_handoff.get("readme_path", ""),
+            "ai_workflow_results_manifest_path": ai_workflow_results_manifest_path,
+            "ai_workflow_results_report_path": ai_workflow_results_report_path,
+            "ai_workflow_results_csv_path": ai_workflow_results_csv_path,
+            "retarget_summary_manifest_path": retarget_summary_manifest_path,
+            "retarget_summary_report_path": retarget_summary_report_path,
+            "retarget_summary_csv_path": retarget_summary_csv_path,
             "action_matches": action_matches.get("requirements", []),
             "action_match_count": int(action_matches.get("matched_count") or 0),
             "action_match_requirement_count": int(action_matches.get("requirement_count") or 0),

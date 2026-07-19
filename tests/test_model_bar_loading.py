@@ -189,7 +189,70 @@ class SimpleModelBarMixinTests(unittest.TestCase):
 
         self.assertEqual(tab.bar.models, ["model-b"])
         self.assertEqual(tab.config["model_cache"]["p2"], ["model-b"])
+        self.assertEqual(tab.config["image"]["model"], "model-b")
+        self.assertEqual(tab.config["image"]["model_by_provider"]["p2"], "model-b")
         self.assertIn("已加载", tab.bar.status)
+
+    def test_loaded_models_do_not_prepend_foreign_provider_model(self):
+        tab = _FakeModelTab()
+        tab.config["image"] = {"provider_id": "p2", "model": "model-from-p1"}
+        tab.config["model_cache"] = {"p2": ["model-b", "model-c"]}
+        tab._model_request_id = "request"
+        tab.bar.provider_id = "p2"
+
+        with mock.patch("gpt_desktop.model_bar_mixin.save_config"):
+            tab.on_models_loaded("p2", "request", ["model-b", "model-c"])
+
+        self.assertEqual(tab.bar.models, ["model-b", "model-c"])
+        self.assertEqual(tab.bar.current, "model-b")
+        self.assertNotIn("model-from-p1", tab.bar.models)
+
+    def test_switching_provider_restores_each_provider_model_independently(self):
+        tab = _FakeModelTab()
+        tab.config["image"] = {"provider_id": "p1", "model": "model-a"}
+        tab.config["model_cache"] = {
+            "p1": ["model-a"],
+            "p2": ["model-b"],
+        }
+        tab.bar.current = "model-a"
+        tab.bar.provider_id = "p2"
+
+        with mock.patch("gpt_desktop.model_bar_mixin.save_config"), mock.patch.object(
+            tab, "load_models"
+        ):
+            tab.on_provider_changed("p2")
+
+        self.assertEqual(tab.config["image"]["model"], "")
+        self.assertEqual(tab.config["image"]["model_by_provider"]["p1"], "model-a")
+
+        tab._model_request_id = "request-p2"
+        with mock.patch("gpt_desktop.model_bar_mixin.save_config"):
+            tab.on_models_loaded("p2", "request-p2", ["model-b"])
+        self.assertEqual(tab.config["image"]["model"], "model-b")
+
+        tab.bar.provider_id = "p1"
+        tab.bar.current = "model-b"
+        with mock.patch("gpt_desktop.model_bar_mixin.save_config"), mock.patch.object(
+            tab, "load_models"
+        ):
+            tab.on_provider_changed("p1")
+
+        self.assertEqual(tab.config["image"]["model"], "model-a")
+
+    def test_model_list_failure_prefers_current_provider_cache(self):
+        tab = _FakeModelTab()
+        tab.config["image"] = {"provider_id": "p2", "model": "model-from-p1"}
+        tab.config["model_cache"] = {"p2": ["model-b", "model-c"]}
+        tab._model_request_id = "request"
+        tab.bar.provider_id = "p2"
+
+        with mock.patch("gpt_desktop.model_bar_mixin.save_config"):
+            tab.on_models_failed("p2", "request", "network failed")
+
+        self.assertEqual(tab.bar.models, ["model-b", "model-c"])
+        self.assertEqual(tab.bar.current, "model-b")
+        self.assertNotIn("model-from-p1", tab.bar.models)
+        self.assertIn("该厂商缓存", tab.bar.status)
 
 
 class ModelListRequestPoolTests(unittest.TestCase):

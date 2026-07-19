@@ -4,6 +4,8 @@ import hashlib
 import re
 import json
 import time
+import random
+import traceback
 from copy import deepcopy
 
 from PySide6.QtCore import QFileSystemWatcher, QSize, QUrl, Qt, QTimer, Signal
@@ -45,6 +47,7 @@ from .novel_import import (
     _candidate_detail_text,
     _chapter_source_label_map,
     _extract_import_candidates,
+    _extract_structured_framework_chapter_plan,
     _foreshadow_candidate_identity_keys,
     _foreshadow_candidate_is_terminal_review,
     _foreshadow_candidate_target_code_keys,
@@ -58,6 +61,7 @@ from .novel_import import (
     _foreshadow_review_chapter_chunks,
     _foreshadow_review_dossier_text,
     _normalize_ai_candidates,
+    _merge_framework_chapter_plans,
     _read_docx_text,
     _read_txt_text,
     _write_docx_text,
@@ -65,22 +69,49 @@ from .novel_import import (
 from .novel_storage import (
     NOVEL_DIR,
     NOVEL_DRAFT_FILE,
+    append_novel_diagnostic_event,
     clear_last_project_path,
     ensure_novel_storage,
+    get_style_profile,
     list_project_summaries,
+    load_style_profile_library,
     load_initial_project_data,
     named_project_path,
     remember_project_path,
     save_draft_project,
     save_named_project,
+    save_novel_diagnostic_latest_exchange,
+    save_novel_diagnostic_snapshot,
     save_project_file,
+    sync_style_profile_library_from_projects,
+    upsert_style_profile,
     unique_project_path,
 )
 from .novel_utils import (
     CHAPTER_ANALYSIS_HASH_VERSION,
     IMPORT_TYPE_OPTIONS,
+    NOVEL_AI_CONTEXT_LIMIT,
+    STYLE_CARD_CACHE_VERSION,
+    STYLE_SHEET_CACHE_VERSION,
     _append_text_without_duplicate_overlap,
+    _append_ai_style_profile_to_context,
+    _apply_long_form_memory_update,
     _build_chapter_ai_context,
+    _build_long_form_memory_finalize_context,
+    _build_long_form_memory_reconcile_context,
+    _build_long_form_memory_repair_context,
+    _build_long_form_selection_index,
+    _build_style_finalize_context,
+    _build_style_baseline_context,
+    _build_style_cards_context,
+    _build_style_execution_context,
+    _build_style_persona_context,
+    _build_style_audit_context,
+    _build_style_profile_request_context,
+    _build_style_profile_units,
+    _build_style_rewrite_context,
+    _build_style_sheet_context,
+    _build_style_sheet_merge_context,
     _build_manuscript_text,
     _build_search_result_text,
     _build_writing_check_text,
@@ -95,6 +126,7 @@ from .novel_utils import (
     _candidate_long_term_review_reasons,
     _compact_chapter_key_facts_text,
     _compact_chapter_summary_text,
+    _compose_style_profile,
     _chapter_needs_analysis,
     _chapter_tooltip,
     _dedupe_chapters,
@@ -128,16 +160,33 @@ from .novel_utils import (
     _project_summary_record_text,
     _project_meta_text,
     _project_summary_text,
+    _parse_style_audit_result,
+    _parse_style_cards_result,
+    _parse_style_execution_result,
+    _parse_style_finalize_result,
+    _parse_long_form_memory_update,
+    _parse_memory_reconciliation_result,
+    _parse_memory_repair_result,
+    _merge_long_form_memory_reconciliation_patch,
+    _merge_long_form_memory_repair_patch,
+    _literalize_long_form_memory_evidence,
+    _normalize_long_form_structural_refs,
+    _validate_long_form_memory_update,
     _record_alias_keys,
     _safe_name,
     _sanitize_import_candidates_for_long_form,
     _split_chapters_from_text,
     _split_manuscript_into_target_chapters,
+    _style_draft_mismatch_reasons,
+    _style_finalize_acceptance_errors,
+    _style_candidate_needs_rescue,
+    _style_candidate_rank,
+    _style_output_target_from_context,
     _target_words,
     FRAMEWORK_IMPORT_TYPE,
 )
 from .widgets import ProviderModelBar, WideComboBox
-from .workers import EdgeTTSWorker, NovelAnalysisWorker, NovelCandidatePostprocessWorker, NovelChapterPlanWorker, NovelChapterTitleWorker, NovelForeshadowReviewPostprocessWorker, NovelForeshadowReviewWorker, NovelFrameworkImportWorker, NovelWritingWorker
+from .workers import EdgeTTSWorker, NovelAnalysisWorker, NovelCandidatePostprocessWorker, NovelChapterPlanMasterWorker, NovelChapterPlanWorker, NovelChapterTitleWorker, NovelForeshadowReviewPostprocessWorker, NovelForeshadowReviewWorker, NovelFrameworkImportWorker, NovelWritingWorker
 
 NOVEL_PERF_LOG_ENABLED = str(os.environ.get("GPT_NOVEL_PERF_LOG", "") or "").strip().lower() in {
     "1",
@@ -147,6 +196,8 @@ NOVEL_PERF_LOG_ENABLED = str(os.environ.get("GPT_NOVEL_PERF_LOG", "") or "").str
 }
 
 _SORT_MISSING_ORDER = 10 ** 9
+_CHAPTER_PLAN_BATCH_SIZE = 30
+_CHAPTER_PLAN_BATCH_STATE_VERSION = 1
 _CHINESE_NUMERAL_DIGITS = {
     "零": 0,
     "〇": 0,
@@ -213,6 +264,44 @@ def _story_order_from_text(value):
     return min(hits) if hits else _SORT_MISSING_ORDER
 
 
+def _chinese_chapter_number(value):
+    try:
+        number = int(value)
+    except (TypeError, ValueError):
+        return str(value or "")
+    if number <= 0 or number > 9999:
+        return str(number)
+    digits = "零一二三四五六七八九"
+    units = ("", "十", "百", "千")
+    values = [int(char) for char in str(number)]
+    result = []
+    zero_pending = False
+    total = len(values)
+    for position, digit in enumerate(values):
+        unit_index = total - position - 1
+        if digit == 0:
+            if result and any(values[position + 1:]):
+                zero_pending = True
+            continue
+        if zero_pending:
+            result.append("零")
+            zero_pending = False
+        if not (digit == 1 and unit_index == 1 and not result):
+            result.append(digits[digit])
+        result.append(units[unit_index])
+    return "".join(result)
+
+
+def _numbered_export_chapter_title(index, title):
+    clean_title = re.sub(
+        r"^第\s*[一二两三四五六七八九十百千万零〇\d]+\s*章\s*[：:、.\-—]?\s*",
+        "",
+        str(title or "").strip(),
+    ).strip()
+    prefix = f"第{_chinese_chapter_number(index)}章"
+    return f"{prefix} {clean_title}" if clean_title else prefix
+
+
 def _record_text_for_sort(item, fields):
     item = item if isinstance(item, dict) else {}
     return "\n".join(str(item.get(field, "") or "") for field in fields)
@@ -243,7 +332,16 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
         self.model_worker = None
         self.analysis_worker = None
         self.writing_worker = None
+        self.writing_retired_workers = []
         self.chapter_plan_worker = None
+        self._chapter_plan_request_kind = ""
+        self._chapter_plan_continue_pending = False
+        self._chapter_plan_auto_active = False
+        self._chapter_plan_sequence_token = 0
+        self._chapter_plan_provider = {}
+        self._chapter_plan_model = ""
+        self._chapter_plan_diagnostic_request_id = ""
+        self._chapter_plan_diagnostic_started_at = 0.0
         self.framework_import_worker = None
         self.chapter_title_worker = None
         self.auto_summary_worker = None
@@ -269,6 +367,7 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
         self._chapter_order_search_cache = None
         self._field_refresh_pending = False
         self._opening_project = False
+        self._loaded_project_file_signature = ()
         self.current_project_path = ""
         self.current_project = _default_project()
         self.import_candidates = {"characters": [], "lore": [], "foreshadows": [], "project_materials": {}}
@@ -283,12 +382,64 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
         self._chapter_ai_preview_is_partial = False
         self._chapter_ai_resume_prefix = ""
         self._chapter_ai_running_action = ""
+        self._chapter_ai_running_context = ""
+        self._chapter_ai_running_status_text = ""
+        self._chapter_ai_running_chapter_id = ""
+        self._chapter_ai_diagnostic_request_id = ""
+        self._chapter_ai_diagnostic_started_at = 0.0
+        self._chapter_ai_transient_retry_counts = {}
+        self._chapter_ai_transient_retry_pending = False
+        self._chapter_ai_transient_retry_token = 0
+        self._chapter_ai_last_context = ""
+        self._chapter_ai_style_retry_attempted = False
+        self._chapter_ai_style_fallback_text = ""
+        self._chapter_ai_style_workflow_active = False
+        self._chapter_ai_style_reference = ""
+        self._chapter_ai_style_original_context = ""
+        self._chapter_ai_style_profile = ""
+        self._chapter_ai_style_profile_cache_hash = ""
+        self._chapter_ai_style_profile_cache_text = ""
+        self._chapter_ai_style_profile_cache_version = 0
+        self._chapter_ai_style_candidate = ""
+        self._chapter_ai_style_finalize_count = 0
+        self._chapter_ai_style_final_bundle = {}
+        self._chapter_ai_style_rewrite_count = 0
+        self._chapter_ai_style_local_reasons = []
+        self._chapter_ai_style_output_target = 0
+        self._chapter_ai_style_plot_ledger = ""
+        self._chapter_ai_style_pending_reasons = []
+        self._chapter_ai_style_cards = []
+        self._chapter_ai_style_plan = ""
         self._chapter_ai_sequence_active = False
         self._chapter_ai_sequence_chapter_id = ""
         self._chapter_ai_sequence_pending_action = ""
         self._chapter_ai_sequence_started_outline = ""
+        self._auto_expand_all_active = False
+        self._auto_expand_all_waiting_next = False
+        self._auto_expand_all_total = 0
+        self._auto_expand_all_completed = 0
+        self._auto_expand_all_current_chapter_id = ""
+        self._auto_expand_restart_rewrite_notice = False
         self._chapter_ai_provider = {}
         self._chapter_ai_model = ""
+        self._status_message = ""
+        self._status_stage_key = ""
+        self._status_stage_label = ""
+        self._status_stage_started_at = 0.0
+        self._status_stage_started_wall = 0.0
+        self._status_stage_scope_label = ""
+        self._status_stage_active = False
+        self._status_history = []
+        self._status_workflow_active = False
+        self._status_workflow_kind = ""
+        self._status_workflow_started_at = 0.0
+        self._status_workflow_started_wall = 0.0
+        self._status_last_run_elapsed = 0.0
+        self._novel_diagnostic_counter = 0
+        self._novel_diagnostic_session_id = hashlib.sha256(
+            f"{time.time_ns()}:{id(self)}".encode("utf-8")
+        ).hexdigest()[:16]
+        self._novel_diagnostics_enabled = True
         self._pending_chapter_plan = {}
         self._pending_split_export = {}
         self.current_character_index = -1
@@ -322,11 +473,17 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
         self._refresh_timer.setInterval(900)
         self._refresh_timer.timeout.connect(self._run_deferred_refresh)
         ensure_novel_storage()
+        sync_style_profile_library_from_projects()
         self._build_ui()
         self._apply_novel_ui_style()
+        self._status_timer = QTimer(self)
+        self._status_timer.setInterval(1000)
+        self._status_timer.timeout.connect(self._refresh_status_display)
+        self._status_timer.start()
         self._init_project_sync_watcher()
         self.refresh_import_candidate_lists()
         self._load_initial_project()
+        self._log_novel_diagnostic("novel_session_started")
         self._autosave_timer = QTimer(self)
         self._autosave_timer.setInterval(3000)
         self._autosave_timer.timeout.connect(self._autosave_draft)
@@ -400,10 +557,9 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
         header_layout_outer.addLayout(header_summary_row)
 
         self.project_info_body = QFrame()
-        header_layout = QGridLayout(self.project_info_body)
+        header_layout = QVBoxLayout(self.project_info_body)
         header_layout.setContentsMargins(0, 0, 0, 0)
-        header_layout.setHorizontalSpacing(10)
-        header_layout.setVerticalSpacing(6)
+        header_layout.setSpacing(6)
 
         self.title_edit = QLineEdit()
         self.genre_edit = QLineEdit()
@@ -413,6 +569,8 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
         self.target_words_edit = QLineEdit()
         self.status_combo = WideComboBox()
         self.status_combo.addItems(["草稿", "连载中", "已完结", "修订中"])
+        self.style_profile_combo = WideComboBox()
+        self.style_profile_combo.setToolTip("选择扩写正文时调用的永久文风档案")
         self.premise_edit = PlainTextEdit()
         self.premise_edit.setFixedHeight(42)
         self.premise_edit.setPlaceholderText("一句话说明主角、目标、冲突和故事承诺。")
@@ -421,24 +579,43 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
             w.textChanged.connect(self._mark_dirty)
         self.pov_combo.currentTextChanged.connect(self._mark_dirty)
         self.status_combo.currentTextChanged.connect(self._mark_dirty)
+        self.style_profile_combo.currentIndexChanged.connect(self._on_style_profile_selected)
         self.premise_edit.textChanged.connect(self._mark_dirty)
 
-        for col in range(6):
-            header_layout.setColumnStretch(col, 1 if col % 2 else 0)
+        def configure_field_grid(column_count):
+            layout = QGridLayout()
+            layout.setContentsMargins(0, 0, 0, 0)
+            layout.setHorizontalSpacing(10)
+            layout.setVerticalSpacing(0)
+            for col in range(column_count):
+                layout.setColumnStretch(col, 1 if col % 2 else 0)
+            return layout
 
-        def add_field(row, col, label, widget):
+        def add_field(layout, col, label, widget):
             lab = QLabel(label)
-            header_layout.addWidget(lab, row, col)
-            header_layout.addWidget(widget, row, col + 1)
+            layout.addWidget(lab, 0, col)
+            layout.addWidget(widget, 0, col + 1)
 
-        add_field(0, 0, "书名", self.title_edit)
-        add_field(0, 2, "类型", self.genre_edit)
-        add_field(0, 4, "风格", self.style_edit)
-        add_field(1, 0, "叙事人称", self.pov_combo)
-        add_field(1, 2, "项目总字数（万字）", self.target_words_edit)
-        add_field(1, 4, "状态", self.status_combo)
-        header_layout.addWidget(QLabel("故事核心"), 2, 0)
-        header_layout.addWidget(self.premise_edit, 2, 1, 1, 5)
+        self.project_info_top_layout = configure_field_grid(6)
+        add_field(self.project_info_top_layout, 0, "书名", self.title_edit)
+        add_field(self.project_info_top_layout, 2, "类型", self.genre_edit)
+        add_field(self.project_info_top_layout, 4, "风格", self.style_edit)
+        header_layout.addLayout(self.project_info_top_layout)
+
+        self.project_info_controls_layout = configure_field_grid(8)
+        add_field(self.project_info_controls_layout, 0, "叙事人称", self.pov_combo)
+        add_field(self.project_info_controls_layout, 2, "项目总字数（万字）", self.target_words_edit)
+        add_field(self.project_info_controls_layout, 4, "状态", self.status_combo)
+        add_field(self.project_info_controls_layout, 6, "写作风格", self.style_profile_combo)
+        header_layout.addLayout(self.project_info_controls_layout)
+
+        premise_layout = QGridLayout()
+        premise_layout.setContentsMargins(0, 0, 0, 0)
+        premise_layout.setHorizontalSpacing(10)
+        premise_layout.addWidget(QLabel("故事核心"), 0, 0)
+        premise_layout.addWidget(self.premise_edit, 0, 1)
+        premise_layout.setColumnStretch(1, 1)
+        header_layout.addLayout(premise_layout)
         header_layout_outer.addWidget(self.project_info_body)
 
         right_layout.addWidget(header)
@@ -506,9 +683,7 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
             ("人物", "人物卡", self._build_characters_tab()),
             ("设定", "设定库", self._build_lore_tab()),
             ("章节", "章节", self._build_chapters_tab()),
-            ("时间线", "时间线", self._build_simple_text_tab("timeline_edit", "时间线")),
             ("伏笔", "伏笔", self._build_foreshadow_tab()),
-            ("摘要", "摘要 / 日志", self._build_simple_text_tab("summary_edit", "摘要 / 日志")),
             ("书稿", "完整书稿", self._build_manuscript_tab()),
             ("检查", "写作检查", self._build_check_tab()),
             ("搜索", "全局搜索", self._build_search_tab()),
@@ -571,9 +746,24 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
         layout.addWidget(self.project_hint)
 
         self.status_label = QLabel("")
-        self.status_label.setObjectName("hint")
+        self.status_label.setObjectName("novel_status_current")
         self.status_label.setWordWrap(True)
+        self.status_label.setMinimumHeight(34)
+        self.status_label.setMaximumHeight(56)
         layout.addWidget(self.status_label)
+
+        self.status_meta_label = QLabel("")
+        self.status_meta_label.setObjectName("novel_status_meta")
+        self.status_meta_label.setWordWrap(True)
+        self.status_meta_label.setFixedHeight(36)
+        layout.addWidget(self.status_meta_label)
+
+        self.status_history_label = QLabel("")
+        self.status_history_label.setObjectName("novel_status_history")
+        self.status_history_label.setWordWrap(True)
+        self.status_history_label.setFixedHeight(52)
+        self.status_history_label.setVisible(False)
+        layout.addWidget(self.status_history_label)
         return box
 
     def set_project_panel_expanded(self, expanded):
@@ -618,6 +808,15 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
         }
         QListWidget#novel_nav::item:hover {
             background-color: #222734;
+        }
+        QLabel#novel_status_current {
+            color: #e7e9ee;
+        }
+        QLabel#novel_status_meta {
+            color: #9ec5ff;
+        }
+        QLabel#novel_status_history {
+            color: #9299a8;
         }
         """)
 
@@ -701,7 +900,7 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
 
     def _current_novel_ai_selection(self):
         provider = get_provider(self.config, self.bar.current_provider_id())
-        model = self.bar.current_model() or self.config.get("novel", {}).get("model", "")
+        model = self.bar.current_model() or self._current_model()
         if not provider:
             return None, "", "请先选择厂商。"
         if not model:
@@ -722,10 +921,14 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
         self.refresh_ai_settings_summary()
 
     def on_models_loaded(self, provider_id, request_id, models):
+        if not self._is_current_model_request(provider_id, request_id):
+            return
         SimpleModelBarMixin.on_models_loaded(self, provider_id, request_id, models)
         self.refresh_ai_settings_summary()
 
     def on_models_failed(self, provider_id, request_id, err):
+        if not self._is_current_model_request(provider_id, request_id):
+            return
         SimpleModelBarMixin.on_models_failed(self, provider_id, request_id, err)
         self.refresh_ai_settings_summary()
 
@@ -756,6 +959,60 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
     def toggle_project_info_panel(self):
         if hasattr(self, "project_info_body"):
             self.set_project_info_expanded(not self.project_info_body.isVisible())
+
+    def _matching_local_style_profile_id(self):
+        reference = str(self.current_project.get("style_reference", "") or "").strip()
+        if not reference:
+            return ""
+        reference_hash = hashlib.sha256(reference.encode("utf-8")).hexdigest()
+        return reference_hash if get_style_profile(reference_hash) else ""
+
+    def _refresh_style_profile_combo(self):
+        if not hasattr(self, "style_profile_combo"):
+            return
+        selected_id = str(self.current_project.get("style_profile_id", "") or "").strip().lower()
+        if not selected_id:
+            matching_id = self._matching_local_style_profile_id()
+            if matching_id:
+                selected_id = matching_id
+                self.current_project["style_profile_id"] = matching_id
+            else:
+                selected_id = "__none__"
+                self.current_project["style_profile_id"] = selected_id
+        profiles = load_style_profile_library()
+        self.style_profile_combo.blockSignals(True)
+        try:
+            self.style_profile_combo.clear()
+            self.style_profile_combo.addItem("不使用文风档案", "__none__")
+            for item in profiles:
+                profile_id = str(item.get("id", "") or "").strip()
+                if not profile_id:
+                    continue
+                name = str(item.get("name", "") or "").strip() or f"永久文风 {profile_id[:8]}"
+                sample_chars = len(str(item.get("style_reference", "") or "").replace("\n", "").strip())
+                label = f"{name}（样本 {sample_chars} 字）" if sample_chars else name
+                self.style_profile_combo.addItem(label, profile_id)
+            index = self.style_profile_combo.findData(selected_id)
+            if index < 0:
+                self.current_project["style_profile_id"] = "__none__"
+                index = self.style_profile_combo.findData("__none__")
+            self.style_profile_combo.setCurrentIndex(max(0, index))
+        finally:
+            self.style_profile_combo.blockSignals(False)
+
+    def _on_style_profile_selected(self, _index=-1):
+        if self._loading or not hasattr(self, "style_profile_combo"):
+            return
+        profile_id = str(self.style_profile_combo.currentData() or "").strip().lower()
+        if profile_id == self.current_project.get("style_profile_id", ""):
+            return
+        self.current_project["style_profile_id"] = profile_id
+        self._note_project_dirty()
+        self._schedule_autosave_only()
+        if profile_id == "__none__":
+            self.set_status_tip("当前项目扩写正文时不使用文风档案。")
+        elif profile_id:
+            self.set_status_tip(f"已选择文风档案：{self.style_profile_combo.currentText()}")
 
     def refresh_project_summary_label(self):
         if not hasattr(self, "project_summary_label"):
@@ -934,6 +1191,323 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
         except Exception:
             return 0
 
+    def _next_novel_diagnostic_request_id(self, prefix="request"):
+        session_id = str(getattr(self, "_novel_diagnostic_session_id", "") or "").strip()
+        if not session_id:
+            session_id = hashlib.sha256(
+                f"{time.time_ns()}:{id(self)}".encode("utf-8")
+            ).hexdigest()[:16]
+            self._novel_diagnostic_session_id = session_id
+        counter = int(getattr(self, "_novel_diagnostic_counter", 0) or 0) + 1
+        self._novel_diagnostic_counter = counter
+        return f"{str(prefix or 'request')}-{session_id}-{counter:05d}"
+
+    @staticmethod
+    def _novel_context_section_metrics(context):
+        text = str(context or "")
+        matches = list(re.finditer(r"(?m)^【([^】\r\n]{1,120})】[ \t]*\r?$", text))
+        sections = []
+        for index, match in enumerate(matches[:120]):
+            next_start = matches[index + 1].start() if index + 1 < len(matches) else len(text)
+            content = text[match.end():next_start].strip()
+            sections.append({
+                "title": str(match.group(1) or "").strip(),
+                "content_chars": len(content),
+                "block_chars": max(0, next_start - match.start()),
+            })
+        return {
+            "section_count": len(matches),
+            "prefix_chars": matches[0].start() if matches else len(text),
+            "sections": sections,
+        }
+
+    @staticmethod
+    def _novel_exception_details(error):
+        formatted = traceback.format_exc(limit=40)
+        if formatted.strip() == "NoneType: None":
+            formatted = ""
+        return {
+            "error": clean_error_text(error),
+            "error_type": type(error).__name__,
+            "traceback": formatted,
+        }
+
+    @staticmethod
+    def _novel_diagnostic_error_category(error):
+        text = clean_error_text(error).lower()
+        if any(marker in text for marker in ("选择厂商", "设置 api key", "设置api key", "选择模型")):
+            return "configuration"
+        if any(marker in text for marker in ("接口错误 401", "接口错误 403", "unauthorized", "forbidden")):
+            return "authentication"
+        if any(marker in text for marker in ("接口错误 429", "rate limit", "too many requests", "concurrency limit")):
+            return "rate_limit"
+        if any(marker in text for marker in ("接口错误 500", "接口错误 502", "接口错误 503", "接口错误 504", "接口错误 524", "upstream")):
+            return "upstream"
+        if any(marker in text for marker in ("timeout", "timed out", "超时")):
+            return "timeout"
+        if any(marker in text for marker in ("ssl", "connection", "remote end closed", "max retries exceeded")):
+            return "network"
+        if any(marker in text for marker in ("length", "max_tokens", "token_limit", "未完整结束", "没有写完")):
+            return "incomplete_output"
+        if any(marker in text for marker in ("json", "无法解析", "格式", "校验")):
+            return "invalid_output"
+        if any(marker in text for marker in ("状态事务", "状态同步", "长期状态", "关键事实", "摘要")):
+            return "memory_state"
+        if any(marker in text for marker in ("保存失败", "持久化失败", "写入失败")):
+            return "storage"
+        if any(marker in text for marker in ("中止", "cancel", "stop requested")):
+            return "cancelled"
+        return "unknown"
+
+    @staticmethod
+    def _auto_expand_stop_reason_code(message):
+        text = str(message or "")
+        checks = (
+            ("自动扩写完成", "completed"),
+            ("已中止", "user_cancelled"),
+            ("没有章节提纲", "missing_outline"),
+            ("无法定位", "chapter_lookup_failed"),
+            ("上下文组装失败", "context_build_failed"),
+            ("状态同步失败", "memory_sync_failed"),
+            ("资料回填不完整", "postwrite_validation_failed"),
+            ("保存失败", "storage_failed"),
+            ("生成失败", "api_generation_failed"),
+            ("完成章节与当前任务不一致", "chapter_mismatch"),
+            ("未能启动", "pipeline_start_failed"),
+        )
+        for marker, code in checks:
+            if marker in text:
+                return code
+        return "unknown"
+
+    def _chapter_ai_signal_diagnostics(self):
+        worker = None
+        try:
+            candidate = self.sender()
+            if candidate is not None and hasattr(candidate, "diagnostics"):
+                worker = candidate
+        except Exception:
+            worker = None
+        if worker is None:
+            worker = getattr(self, "writing_worker", None)
+        diagnostics = getattr(worker, "diagnostics", {}) if worker is not None else {}
+        worker_request_id = str(getattr(worker, "diagnostic_request_id", "") or "") if worker is not None else ""
+        request_id = worker_request_id or str(getattr(self, "_chapter_ai_diagnostic_request_id", "") or "")
+        try:
+            worker_started_at = (
+                float(getattr(worker, "diagnostic_started_at", 0.0) or 0.0)
+                if worker is not None else 0.0
+            )
+            started_at = worker_started_at or float(
+                getattr(self, "_chapter_ai_diagnostic_started_at", 0.0) or 0.0
+            )
+        except Exception:
+            started_at = 0.0
+        return request_id, started_at, deepcopy(diagnostics) if isinstance(diagnostics, dict) else {}
+
+    def _chapter_ai_signal_worker(self):
+        worker = None
+        try:
+            candidate = self.sender()
+            if candidate is not None and hasattr(candidate, "context"):
+                worker = candidate
+        except Exception:
+            worker = None
+        return worker or getattr(self, "writing_worker", None)
+
+    def _save_chapter_ai_failure_snapshot(
+        self, action, request_id, error="", worker_diagnostics=None, validation_payload=""
+    ):
+        if not getattr(self, "_novel_diagnostics_enabled", False):
+            return ""
+        worker = self._chapter_ai_signal_worker()
+        context = str(
+            getattr(worker, "context", "")
+            if worker is not None else getattr(self, "_chapter_ai_running_context", "")
+        )
+        if not context:
+            context = str(getattr(self, "_chapter_ai_running_context", "") or "")
+        system_prompt = ""
+        if worker is not None and hasattr(worker, "_action_prompt"):
+            try:
+                system_prompt = str(worker._action_prompt() or "")
+            except Exception:
+                system_prompt = ""
+        partial_output = str(
+            getattr(worker, "last_response_text", "")
+            if worker is not None else getattr(self, "chapter_ai_stream_text", "")
+        )
+        if not partial_output:
+            partial_output = str(getattr(self, "chapter_ai_stream_text", "") or "")
+        request_id = str(request_id or "").strip() or self._next_novel_diagnostic_request_id(
+            "chapter-ai-failure"
+        )
+        project = self.current_project if isinstance(getattr(self, "current_project", None), dict) else {}
+        chapters = project.get("chapters", []) if isinstance(project.get("chapters"), list) else []
+        chapter = (
+            chapters[self.current_chapter_index]
+            if 0 <= int(getattr(self, "current_chapter_index", -1)) < len(chapters)
+            else {}
+        )
+        provider = getattr(self, "_chapter_ai_provider", {})
+        provider = provider if isinstance(provider, dict) else {}
+        return save_novel_diagnostic_snapshot(request_id, {
+            "request_id": request_id,
+            "action": str(action or ""),
+            "error": clean_error_text(error) if error else "",
+            "project_title": str(project.get("meta", {}).get("title", "") or "")
+            if isinstance(project.get("meta"), dict) else "",
+            "project_path": str(getattr(self, "current_project_path", "") or ""),
+            "chapter_index": int(getattr(self, "current_chapter_index", -1)) + 1,
+            "chapter_id": str(chapter.get("id", "") or "") if isinstance(chapter, dict) else "",
+            "chapter_title": str(chapter.get("title", "") or "") if isinstance(chapter, dict) else "",
+            "provider_id": str(provider.get("id", "") or ""),
+            "provider_name": str(provider.get("name", "") or ""),
+            "model": str(getattr(self, "_chapter_ai_model", "") or ""),
+            "worker_diagnostics": deepcopy(worker_diagnostics)
+            if isinstance(worker_diagnostics, dict) else {},
+            "context_sections": self._novel_context_section_metrics(context),
+            "system_prompt": system_prompt,
+            "user_context": context,
+            "sent_user_context": context[:NOVEL_AI_CONTEXT_LIMIT]
+            if len(context) > NOVEL_AI_CONTEXT_LIMIT else "",
+            "partial_output": partial_output,
+            "validation_payload": str(validation_payload or ""),
+        })
+
+    def _save_chapter_ai_latest_exchange(
+        self, action, request_id, output, worker_diagnostics=None
+    ):
+        if not getattr(self, "_novel_diagnostics_enabled", False):
+            return ""
+        worker = self._chapter_ai_signal_worker()
+        context = str(
+            (getattr(worker, "context", "") if worker is not None else "")
+            or getattr(self, "_chapter_ai_running_context", "")
+            or ""
+        )
+        system_prompt = ""
+        if worker is not None and hasattr(worker, "_action_prompt"):
+            try:
+                system_prompt = str(worker._action_prompt() or "")
+            except Exception:
+                system_prompt = ""
+        project = self.current_project if isinstance(getattr(self, "current_project", None), dict) else {}
+        chapters = project.get("chapters", []) if isinstance(project.get("chapters"), list) else []
+        chapter = (
+            chapters[self.current_chapter_index]
+            if 0 <= int(getattr(self, "current_chapter_index", -1)) < len(chapters)
+            else {}
+        )
+        return save_novel_diagnostic_latest_exchange(request_id, {
+            "request_id": str(request_id or ""),
+            "action": str(action or ""),
+            "project_title": str(project.get("meta", {}).get("title", "") or "")
+            if isinstance(project.get("meta"), dict) else "",
+            "project_path": str(getattr(self, "current_project_path", "") or ""),
+            "chapter_index": int(getattr(self, "current_chapter_index", -1)) + 1,
+            "chapter_id": str(chapter.get("id", "") or "") if isinstance(chapter, dict) else "",
+            "chapter_title": str(chapter.get("title", "") or "") if isinstance(chapter, dict) else "",
+            "model": str(getattr(self, "_chapter_ai_model", "") or ""),
+            "worker_diagnostics": deepcopy(worker_diagnostics)
+            if isinstance(worker_diagnostics, dict) else {},
+            "context_sections": self._novel_context_section_metrics(context),
+            "system_prompt": system_prompt,
+            "user_context": context,
+            "sent_user_context": context[:NOVEL_AI_CONTEXT_LIMIT]
+            if len(context) > NOVEL_AI_CONTEXT_LIMIT else "",
+            "partial_output": str(output or ""),
+        })
+
+    def _log_novel_diagnostic(self, event, level="info", **details):
+        if not getattr(self, "_novel_diagnostics_enabled", False):
+            return ""
+        try:
+            project = self.current_project if isinstance(getattr(self, "current_project", None), dict) else {}
+            chapters = project.get("chapters", []) if isinstance(project.get("chapters"), list) else []
+            requested_chapter_id = str(
+                details.get("chapter_id", "")
+                or getattr(self, "_chapter_ai_running_chapter_id", "")
+                or ""
+            )
+            try:
+                chapter_index = int(getattr(self, "current_chapter_index", -1))
+            except (TypeError, ValueError):
+                chapter_index = -1
+            if requested_chapter_id:
+                for index, item in enumerate(chapters):
+                    if isinstance(item, dict) and str(item.get("id", "") or "") == requested_chapter_id:
+                        chapter_index = index
+                        break
+            chapter = (
+                chapters[chapter_index]
+                if 0 <= chapter_index < len(chapters) and isinstance(chapters[chapter_index], dict)
+                else {}
+            )
+            memory = project.get("long_form_memory", {}) if isinstance(project.get("long_form_memory"), dict) else {}
+            snapshot = memory.get("state_snapshot", {}) if isinstance(memory.get("state_snapshot"), dict) else {}
+            checkpoint = chapter.get("ai_generation_checkpoint", {}) if isinstance(chapter.get("ai_generation_checkpoint"), dict) else {}
+            provider = details.pop("provider", None)
+            provider = provider if isinstance(provider, dict) else getattr(self, "_chapter_ai_provider", {})
+            provider = provider if isinstance(provider, dict) else {}
+            model = str(details.pop("model", "") or getattr(self, "_chapter_ai_model", "") or "")
+            action = str(details.get("action", "") or getattr(self, "_chapter_ai_running_action", "") or "")
+            request_id = str(
+                details.get("request_id", "")
+                or getattr(self, "_chapter_ai_diagnostic_request_id", "")
+                or ""
+            )
+            record = {
+                "event": str(event or "unknown"),
+                "level": str(level or "info"),
+                "session_id": str(getattr(self, "_novel_diagnostic_session_id", "") or ""),
+                "request_id": request_id,
+                "project": {
+                    "title": str(project.get("meta", {}).get("title", "") or "")
+                    if isinstance(project.get("meta"), dict) else "",
+                    "path": str(getattr(self, "current_project_path", "") or ""),
+                    "chapter_count": len(chapters),
+                },
+                "chapter": {
+                    "index": chapter_index + 1 if chapter else 0,
+                    "id": str(chapter.get("id", "") or requested_chapter_id),
+                    "title": str(chapter.get("title", "") or ""),
+                    "outline_chars": len(str(chapter.get("outline", "") or "")),
+                    "body_chars": len(str(chapter.get("text", "") or "")),
+                    "summary_chars": len(str(chapter.get("summary", "") or "")),
+                    "key_facts_chars": len(str(chapter.get("key_facts", "") or "")),
+                    "memory_sync_status": str(chapter.get("memory_sync_status", "") or ""),
+                    "memory_revision": int(chapter.get("memory_revision", 0) or 0),
+                    "checkpoint_stage": str(checkpoint.get("stage", "") or ""),
+                    "checkpoint_status": str(checkpoint.get("status", "") or ""),
+                    "resume_required": bool(chapter.get("auto_expand_resume_required", False)),
+                },
+                "memory": {
+                    "revision": int(memory.get("revision", 0) or 0),
+                    "snapshot_chapter_index": int(snapshot.get("as_of_chapter_index", 0) or 0),
+                    "snapshot_chapter_id": str(snapshot.get("as_of_chapter_id", "") or ""),
+                },
+                "pipeline": {
+                    "action": action,
+                    "sequence_active": bool(getattr(self, "_chapter_ai_sequence_active", False)),
+                    "sequence_pending_action": str(getattr(self, "_chapter_ai_sequence_pending_action", "") or ""),
+                    "style_workflow_active": bool(getattr(self, "_chapter_ai_style_workflow_active", False)),
+                    "auto_expand_active": bool(getattr(self, "_auto_expand_all_active", False)),
+                    "auto_expand_completed": int(getattr(self, "_auto_expand_all_completed", 0) or 0),
+                    "auto_expand_total": int(getattr(self, "_auto_expand_all_total", 0) or 0),
+                },
+                "provider": {
+                    "id": str(provider.get("id", "") or ""),
+                    "name": str(provider.get("name", "") or ""),
+                    "model": model,
+                },
+                "details": details,
+            }
+            return append_novel_diagnostic_event(record)
+        except Exception as exc:
+            log_debug("小说诊断日志写入失败", exc)
+            return ""
+
     def _get_export_path(self, dialog_title, suggested_name, default_ext, file_filter):
         safe_title = _safe_name(suggested_name) or "novel"
         default_name = f"{safe_title}.{default_ext.lstrip('.')}"
@@ -1058,8 +1632,6 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
         layout.addLayout(header)
         edit = PlainTextEdit()
         placeholder = {
-            "timeline_edit": "按时间顺序记录关键事件，避免长篇写作前后矛盾。",
-            "summary_edit": "记录阶段总结、已发生事实、后续调整日志。",
             "draft_note_edit": "仅自己可见的长篇提醒，不会自动进入 AI 写作上下文。",
         }.get(attr_name, "")
         edit.setPlaceholderText(placeholder)
@@ -1210,7 +1782,11 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
                 "根据项目信息、圣经、世界观、人物、设定、时间线和伏笔生成章节名与章节提纲；生成后先预览，确认后再写入章节列表。",
             )),
             (1, 0, self._ghost_button("删除", self.delete_chapter)),
-            (1, 1, self._ghost_button("拆分导出", self.split_current_chapter, "按整本小说正文重切为约定字数的章节并导出 Word")),
+            (1, 1, self._ghost_button(
+                "按章节导出/拆分导出",
+                self.choose_chapter_export_mode,
+                "按现有章节和章节名直接导出，或按目标字数重新拆分并由AI生成章节名",
+            )),
         )
         for row, column, btn in chapter_action_buttons:
             chapter_action_grid.addWidget(btn, row, column)
@@ -1335,6 +1911,11 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
             ai_top.addWidget(btn)
             self.chapter_ai_action_buttons.append(btn)
             self._chapter_ai_buttons_by_action[action] = btn
+        self.auto_expand_all_btn = self._ghost_button("自动扩写全部")
+        self.auto_expand_all_btn.setToolTip("跳过已有正文，按章节顺序自动完成所有未写章节；遇到失败会停止")
+        self.auto_expand_all_btn.clicked.connect(self.start_auto_expand_all_chapters)
+        ai_top.addWidget(self.auto_expand_all_btn)
+        self.chapter_ai_action_buttons.append(self.auto_expand_all_btn)
         self.chapter_ai_stop_btn = QPushButton("中止")
         self.chapter_ai_stop_btn.setObjectName("danger")
         self.chapter_ai_stop_btn.setToolTip("中止当前 AI 辅助生成")
@@ -1658,6 +2239,96 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
             or getattr(self, "_project_file_dirty", False)
         )
 
+    def _project_file_signature(self, path):
+        path = str(path or "").strip()
+        if not path or not os.path.exists(path):
+            return ()
+        try:
+            stat = os.stat(path)
+            mtime_ns = int(getattr(stat, "st_mtime_ns", stat.st_mtime * 1_000_000_000))
+            return mtime_ns, int(stat.st_size)
+        except Exception:
+            return ()
+
+    def _record_current_project_file_signature(self, path=None):
+        target = str(path or getattr(self, "current_project_path", "") or "").strip()
+        self._loaded_project_file_signature = self._project_file_signature(target)
+
+    def _project_payload_matches(self, first, second):
+        try:
+            left = _normalize_project(first if isinstance(first, dict) else {})
+            right = _normalize_project(second if isinstance(second, dict) else {})
+            left.pop("updated_at", None)
+            right.pop("updated_at", None)
+            return left == right
+        except Exception:
+            return False
+
+    def _handle_external_project_change_before_save(self, data, reason, refresh_project_list=True):
+        path = str(getattr(self, "current_project_path", "") or "").strip()
+        if not path or path == NOVEL_DRAFT_FILE:
+            return False
+        expected = tuple(getattr(self, "_loaded_project_file_signature", ()) or ())
+        current = self._project_file_signature(path)
+        if not expected or not current or current == expected:
+            return False
+
+        disk_data = load_json_file(path, None)
+        if isinstance(disk_data, dict) and self._project_payload_matches(data, disk_data):
+            self._loaded_project_file_signature = current
+            return False
+
+        title = str((data.get("meta", {}) if isinstance(data, dict) else {}).get("title", "") or "").strip()
+        backup_title = f"{title or '未命名小说'}_外部更新前备份"
+        backup_path = unique_project_path(backup_title)
+        backup_data = deepcopy(data if isinstance(data, dict) else {})
+        backup_meta = backup_data.setdefault("meta", {})
+        if not isinstance(backup_meta, dict):
+            backup_meta = {}
+            backup_data["meta"] = backup_meta
+        backup_meta["title"] = backup_title
+
+        try:
+            save_project_file(backup_path, backup_data)
+        except Exception as e:
+            self._log_novel_diagnostic(
+                "external_project_conflict_backup_failed",
+                level="error",
+                reason=str(reason or ""),
+                project_path=path,
+                backup_path=backup_path,
+                error_category="storage",
+                **self._novel_exception_details(e),
+            )
+            log_debug("小说项目外部更新冲突备份失败", e)
+            self.set_status_tip("检测到项目已被外部更新，已阻止旧内容覆盖；冲突备份失败。")
+            return True
+
+        if isinstance(disk_data, dict):
+            self._load_project_data(disk_data, path, defer_helpers=True)
+            self._remember_project_path(path)
+        else:
+            self.current_project_path = backup_path
+            self.current_project = _normalize_project(backup_data)
+            self._record_current_project_file_signature(backup_path)
+            self._remember_project_path(backup_path)
+        self._save_draft_snapshot()
+        self._dirty = False
+        self._project_file_dirty = False
+        if refresh_project_list:
+            self._notify_project_store_changed()
+        self.set_status_tip(
+            f"检测到项目已被外部更新，已加载磁盘新版本；旧内存已备份为 {os.path.basename(backup_path)}。"
+        )
+        self._log_novel_perf(
+            f"阻止外部更新被覆盖-{reason}",
+            time.perf_counter(),
+            threshold_ms=0,
+            path=os.path.basename(path),
+            backup=os.path.basename(backup_path),
+        )
+        return True
+
     def _mark_dirty(self):
         if self._loading:
             return
@@ -1707,7 +2378,10 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
             data = deepcopy(self.current_project)
             current_path = self.current_project_path
             if current_path and current_path not in ("", NOVEL_DRAFT_FILE):
+                if self._handle_external_project_change_before_save(data, reason, refresh_project_list):
+                    return current_path
                 save_project_file(current_path, data, preserve_mtime=preserve_project_mtime)
+                self._record_current_project_file_signature(current_path)
                 self._remember_project_path(current_path)
                 self._save_draft_snapshot()
                 if refresh_project_list:
@@ -1745,6 +2419,17 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
                 chapters=summary.get("chapters"),
                 body=summary.get("body_chars"),
             )
+            self._log_novel_diagnostic(
+                "project_save_failed",
+                level="error",
+                save_reason=str(reason or ""),
+                project_path=str(getattr(self, "current_project_path", "") or NOVEL_DRAFT_FILE),
+                preserve_project_mtime=bool(preserve_project_mtime),
+                refresh_project_list=bool(refresh_project_list),
+                project_summary=summary,
+                error_category="storage",
+                **self._novel_exception_details(e),
+            )
             log_debug(f"小说项目{reason}失败", e)
             return ""
 
@@ -1758,7 +2443,12 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
             self._sync_candidate_analysis_state()
             self._sync_import_candidates_to_project()
             if self._has_saved_project_path():
+                if self._handle_external_project_change_before_save(
+                    deepcopy(self.current_project), "导入后保存", True
+                ):
+                    return "检测到外部更新，已保留磁盘新版本并备份当前内容。"
                 save_project_file(self.current_project_path, self.current_project)
+                self._record_current_project_file_signature(self.current_project_path)
                 self._remember_project_path(self.current_project_path)
                 self._save_draft_snapshot()
                 self._notify_project_store_changed()
@@ -1770,6 +2460,13 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
             self._update_stats_label()
             return "已保存到自动草稿。"
         except Exception as e:
+            self._log_novel_diagnostic(
+                "project_import_save_failed",
+                level="error",
+                project_path=str(getattr(self, "current_project_path", "") or NOVEL_DRAFT_FILE),
+                error_category="storage",
+                **self._novel_exception_details(e),
+            )
             log_debug("小说导入后保存失败", e)
             return "导入完成，但自动保存失败。"
 
@@ -1842,7 +2539,23 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
         return data
 
     def _ai_project_snapshot(self):
-        return _project_without_private_notes(self.current_project)
+        project = _project_without_private_notes(self.current_project)
+        project["style_profile_cache"] = deepcopy(self.current_project.get("style_profile_cache", {}))
+        profile_id = str(self.current_project.get("style_profile_id", "") or "").strip().lower()
+        if not profile_id or profile_id == "__none__":
+            project["style_reference"] = ""
+            project["style_profile_cache"] = {}
+            return project
+        if profile_id:
+            profile = get_style_profile(profile_id)
+            if profile:
+                reference = str(profile.get("style_reference", "") or "").strip()
+                reference_hash = str(profile.get("reference_hash", "") or profile_id).strip().lower()
+                cache_entry = profile.get("cache_entry", {})
+                if reference and isinstance(cache_entry, dict):
+                    project["style_reference"] = reference
+                    project["style_profile_cache"] = {reference_hash: deepcopy(cache_entry)}
+        return project
 
     def get_current_project_snapshot(self):
         return self._current_project_to_data(), self.current_project_path or ""
@@ -1868,8 +2581,10 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
         meta["premise"] = self.premise_edit.toPlainText().strip()
         self.current_project["bible"] = self.bible_edit.toPlainText()
         self.current_project["world_rules"] = self.world_rules_edit.toPlainText()
-        self.current_project["timeline"] = self.timeline_edit.toPlainText()
-        self.current_project["summary"] = self.summary_edit.toPlainText()
+        if hasattr(self, "style_profile_combo") and self.style_profile_combo.currentIndex() >= 0:
+            self.current_project["style_profile_id"] = str(
+                self.style_profile_combo.currentData() or ""
+            ).strip().lower()
         self.current_project["draft_note"] = self.draft_note_edit.toPlainText()
         chapters, removed = _dedupe_chapters(self.current_project.get("chapters", []))
         if removed:
@@ -1879,13 +2594,11 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
         _ensure_foreshadow_codes(self.current_project)
 
     def _refresh_project_material_editors(self):
-        pairs = (
+        pairs = [
             ("bible", self.bible_edit),
             ("world_rules", self.world_rules_edit),
-            ("timeline", self.timeline_edit),
-            ("summary", self.summary_edit),
             ("draft_note", self.draft_note_edit),
-        )
+        ]
         for key, widget in pairs:
             self._set_text_without_signals(widget, self.current_project.get(key, ""))
 
@@ -2188,6 +2901,17 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
             group_key="foreshadows",
         )
 
+    def _refresh_long_form_record_views(self):
+        for widget_attr, index_attr, reload_name in (
+            ("character_list", "current_character_index", "_reload_character_list"),
+            ("lore_list", "current_lore_index", "_reload_lore_list"),
+            ("foreshadow_list", "current_foreshadow_index", "_reload_foreshadow_list"),
+        ):
+            if not hasattr(self, widget_attr):
+                continue
+            selected_index = getattr(self, index_attr, -1)
+            getattr(self, reload_name)(selected_index if selected_index >= 0 else None)
+
     def _switch_indexed_editor(self, row, current_attr, save_func, load_func):
         if self._loading:
             return
@@ -2466,6 +3190,56 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
     def delete_chapter(self):
         self._delete_indexed_item("chapters", self.current_chapter_index, "章节", "title", self._reload_chapter_list)
 
+    def choose_chapter_export_mode(self):
+        options = [
+            "按现有章节导出（不调用AI）",
+            "按字数拆分导出（AI生成章节名）",
+        ]
+        selected, ok = QInputDialog.getItem(
+            self,
+            "按章节导出/拆分导出",
+            "请选择导出方式：",
+            options,
+            0,
+            False,
+        )
+        if not ok:
+            return
+        if selected == options[0]:
+            self.export_existing_chapters_docx()
+        elif selected == options[1]:
+            self.split_current_chapter()
+
+    def export_existing_chapters_docx(self):
+        try:
+            self._flush_current_editors()
+            chapters = self.current_project.get("chapters", []) if isinstance(self.current_project, dict) else []
+            export_chapters = []
+            for index, chapter in enumerate(chapters, 1):
+                if not isinstance(chapter, dict) or not str(chapter.get("text", "") or "").strip():
+                    continue
+                export_chapter = deepcopy(chapter)
+                export_chapter["title"] = _numbered_export_chapter_title(index, chapter.get("title", ""))
+                export_chapters.append(export_chapter)
+            if not export_chapters:
+                QMessageBox.information(self, "导出提示", "当前没有可导出的章节正文。")
+                return
+            title = self._project_title()
+            path = self._get_export_path(
+                "按现有章节导出 Word",
+                f"{title}_按章节导出",
+                "docx",
+                "Word 文档 (*.docx)",
+            )
+            if not path:
+                return
+            _write_docx_text(path, title, export_chapters, center_chapter_headings=True)
+            self.set_status_tip(
+                f"已按现有章节和章节名导出 {len(export_chapters)} 章：{os.path.basename(path)}"
+            )
+        except Exception as e:
+            QMessageBox.warning(self, "导出失败", str(e))
+
     def split_current_chapter(self):
         if self.chapter_title_worker is not None and self.chapter_title_worker.isRunning():
             self.set_status_tip("正在生成拆分章节标题，请稍等。")
@@ -2604,6 +3378,7 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
                 path=source_name,
             )
             self.current_project_path = path
+            self._record_current_project_file_signature(path)
             analysis_state = _normalize_candidate_analysis_state(self.current_project.get("analysis_state", {}))
             self.failed_analysis_chunks = analysis_state.get("failed_candidate_chunks", [])
             self.pending_analysis_chapter_ids = analysis_state.get("pending_candidate_chapter_ids", [])
@@ -2629,8 +3404,7 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
             self.premise_edit.setPlainText(meta.get("premise", ""))
             self.bible_edit.setPlainText(self.current_project.get("bible", ""))
             self.world_rules_edit.setPlainText(self.current_project.get("world_rules", ""))
-            self.timeline_edit.setPlainText(self.current_project.get("timeline", ""))
-            self.summary_edit.setPlainText(self.current_project.get("summary", ""))
+            self._refresh_style_profile_combo()
             self.draft_note_edit.setPlainText(self.current_project.get("draft_note", ""))
             step_start = time.perf_counter()
             self._reload_character_list()
@@ -3435,8 +4209,6 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
         labels = (
             ("bible", "圣经"),
             ("world_rules", "世界规则"),
-            ("timeline", "时间线"),
-            ("summary", "摘要"),
         )
         materials = self.import_candidates.get("project_materials", {})
         if not isinstance(materials, dict):
@@ -3491,8 +4263,6 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
         labels = (
             ("bible", "圣经"),
             ("world_rules", "世界规则"),
-            ("timeline", "时间线"),
-            ("summary", "摘要"),
         )
         if material_result is None:
             return [label for _key, label, _value in self._candidate_material_items()]
@@ -4528,18 +5298,26 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
             records.append(record)
         return records
 
-    def _chapter_plan_reference_context(self):
+    def _chapter_plan_reference_context(self, start_index=None, end_index=None):
         reference = self.current_project.get("imported_chapter_plan_reference", {}) if isinstance(self.current_project, dict) else {}
         if not isinstance(reference, dict):
             return {}
         chapters = []
         items = reference.get("chapters", [])
         items = items if isinstance(items, list) else []
-        for fallback_index, item in enumerate(items[:160], 1):
+        for fallback_index, item in enumerate(items[:1000], 1):
             if not isinstance(item, dict):
                 continue
+            try:
+                item_index = int(item.get("index", fallback_index) or fallback_index)
+            except Exception:
+                item_index = fallback_index
+            if start_index is not None and item_index < int(start_index):
+                continue
+            if end_index is not None and item_index > int(end_index):
+                continue
             record = {
-                "index": self._chapter_plan_clip_text(item.get("index", fallback_index), 20),
+                "index": self._chapter_plan_clip_text(item_index, 20),
                 "title": self._chapter_plan_clip_text(item.get("title", ""), 80),
                 "target_words": self._chapter_plan_clip_text(item.get("target_words", ""), 40),
                 "narrative_stage": self._chapter_plan_clip_text(item.get("narrative_stage", ""), 80),
@@ -4553,19 +5331,179 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
                 "settings": _normalize_name_list(item.get("settings", [])),
                 "ending_hook": self._chapter_plan_clip_text(item.get("ending_hook", ""), 240),
                 "forbidden": self._chapter_plan_clip_text(item.get("forbidden", ""), 240),
+                "source_event_ids": _normalize_name_list(item.get("source_event_ids", [])),
             }
             if any(str(value or "").strip() for value in record.values() if not isinstance(value, list)) or record["characters"] or record["settings"]:
                 chapters.append(record)
+        stages = []
+        for item in reference.get("stages", []) if isinstance(reference.get("stages", []), list) else []:
+            if not isinstance(item, dict):
+                continue
+            try:
+                stage_start = int(item.get("start_chapter", 0) or 0)
+                stage_end = int(item.get("end_chapter", 0) or 0)
+            except Exception:
+                continue
+            if stage_start <= 0 or stage_end < stage_start:
+                continue
+            if start_index is not None and stage_end < int(start_index):
+                continue
+            if end_index is not None and stage_start > int(end_index):
+                continue
+            events = []
+            for event in item.get("events", []) if isinstance(item.get("events", []), list) else []:
+                if not isinstance(event, dict):
+                    continue
+                event_id = str(event.get("id", "") or "").strip().upper()
+                event_text = self._chapter_plan_clip_text(event.get("text", ""), 600)
+                if not event_id or not event_text:
+                    continue
+                try:
+                    event_order = int(event.get("order", len(events) + 1) or len(events) + 1)
+                except Exception:
+                    event_order = len(events) + 1
+                events.append({"id": event_id, "order": event_order, "text": event_text})
+            if events:
+                stages.append({
+                    "id": str(item.get("id", "") or "").strip().upper(),
+                    "name": self._chapter_plan_clip_text(item.get("name", ""), 120),
+                    "start_chapter": stage_start,
+                    "end_chapter": stage_end,
+                    "events": events,
+                })
         summary = self._chapter_plan_clip_text(reference.get("summary", ""), 5000)
-        if not summary and not chapters:
+        if not summary and not chapters and not stages:
             return {}
-        return {
-            "usage": "这是导入框架时识别到的原始章节规划参考，只用于本次 AI 章节规划；不要把它当作已经存在的正式章节。",
+        result = {
+            "usage": (
+                "chapters是用户明确给出的章节级约束，必须按绝对章号继承。"
+                "stages.events是阶段内按顺序排列的剧情节点，不是一条节点固定对应一章；"
+                "一章可承载多个节点，扩展章可不消耗节点，但每个节点必须在所属阶段内恰好使用一次。"
+                "规划章节必须用source_event_ids声明承载的节点，并在outline中逐字保留对应事件文本。"
+            ),
             "summary": summary,
-            "chapters": chapters,
         }
+        if chapters:
+            result["chapters"] = chapters
+        if stages:
+            result["stages"] = stages
+        return result
 
-    def _chapter_plan_project_context(self, target_words, average_chapter_words, total_chapter_count, requested_chapter_count):
+    def _chapter_plan_event_reference(self):
+        reference = self.current_project.get("imported_chapter_plan_reference", {}) if isinstance(self.current_project, dict) else {}
+        if not isinstance(reference, dict):
+            return {}, [], {}
+        catalog = {}
+        stages = []
+        for item in reference.get("stages", []) if isinstance(reference.get("stages", []), list) else []:
+            if not isinstance(item, dict):
+                continue
+            try:
+                stage_start = int(item.get("start_chapter", 0) or 0)
+                stage_end = int(item.get("end_chapter", 0) or 0)
+            except Exception:
+                continue
+            stage_id = str(item.get("id", "") or "").strip().upper()
+            events = []
+            for event in item.get("events", []) if isinstance(item.get("events", []), list) else []:
+                if not isinstance(event, dict):
+                    continue
+                event_id = str(event.get("id", "") or "").strip().upper()
+                event_text = str(event.get("text", "") or "").strip()
+                if not event_id or not event_text or event_id in catalog:
+                    continue
+                try:
+                    order = int(event.get("order", len(events) + 1) or len(events) + 1)
+                except Exception:
+                    order = len(events) + 1
+                info = {
+                    "id": event_id,
+                    "text": event_text,
+                    "order": order,
+                    "stage_id": stage_id,
+                    "start_chapter": stage_start,
+                    "end_chapter": stage_end,
+                }
+                catalog[event_id] = info
+                events.append(info)
+            if events:
+                events.sort(key=lambda event: (event["order"], event["id"]))
+                stages.append({
+                    "id": stage_id,
+                    "start_chapter": stage_start,
+                    "end_chapter": stage_end,
+                    "event_ids": [event["id"] for event in events],
+                })
+        explicit = {}
+        for fallback_index, item in enumerate(
+            reference.get("chapters", []) if isinstance(reference.get("chapters", []), list) else [], 1
+        ):
+            if not isinstance(item, dict):
+                continue
+            try:
+                index = int(item.get("index", fallback_index) or fallback_index)
+            except Exception:
+                index = fallback_index
+            explicit[index] = item
+        return catalog, stages, explicit
+
+    def _chapter_plan_event_assignment_error(self, generated, incoming):
+        catalog, stages, _explicit = self._chapter_plan_event_reference()
+        if not catalog:
+            return ""
+        assignments = []
+        seen = set()
+        for item in list(generated or []) + list(incoming or []):
+            if not isinstance(item, dict):
+                continue
+            try:
+                chapter_index = int(item.get("index", 0) or 0)
+            except Exception:
+                chapter_index = 0
+            ids = [value.upper() for value in _normalize_name_list(item.get("source_event_ids", []))]
+            if len(ids) != len(set(ids)):
+                return f"第{chapter_index}章重复填写了同一原始事件ID。"
+            content = f"{item.get('mainline_task', '')}\n{item.get('outline', '')}"
+            for position, event_id in enumerate(ids):
+                info = catalog.get(event_id)
+                if info is None:
+                    return f"第{chapter_index}章引用了未知原始事件ID：{event_id}。"
+                if event_id in seen:
+                    return f"原始事件{event_id}被多个章节重复使用。"
+                if not (info["start_chapter"] <= chapter_index <= info["end_chapter"]):
+                    return f"原始事件{event_id}被安排到所属阶段范围之外的第{chapter_index}章。"
+                if info["text"] not in content:
+                    return f"第{chapter_index}章没有在提纲中逐字保留原始事件{event_id}。"
+                seen.add(event_id)
+                assignments.append((info["stage_id"], chapter_index, position, info["order"], event_id))
+        for stage in stages:
+            ordered = [item for item in assignments if item[0] == stage["id"]]
+            ordered.sort(key=lambda item: (item[1], item[2]))
+            orders = [item[3] for item in ordered]
+            if orders != sorted(orders):
+                return f"阶段{stage['id']}的原始事件顺序被打乱。"
+        batch_end = max(
+            [int(item.get("index", 0) or 0) for item in incoming if isinstance(item, dict)] or [0]
+        )
+        for stage in stages:
+            if stage["end_chapter"] <= batch_end:
+                missing = [event_id for event_id in stage["event_ids"] if event_id not in seen]
+                if missing:
+                    preview = "、".join(missing[:6])
+                    suffix = "等" if len(missing) > 6 else ""
+                    return f"阶段{stage['id']}结束时仍缺少{len(missing)}个原始事件：{preview}{suffix}。"
+        return ""
+
+    def _chapter_plan_project_context(
+        self,
+        target_words,
+        average_chapter_words,
+        total_chapter_count,
+        requested_chapter_count,
+        existing_count_override=None,
+        reference_start_index=None,
+        reference_end_index=None,
+    ):
         project = self._ai_project_snapshot()
         meta = project.get("meta", {}) if isinstance(project.get("meta", {}), dict) else {}
         chapters = project.get("chapters", [])
@@ -4585,6 +5523,10 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
                 "linked_characters": _normalize_name_list(chap.get("linked_characters", [])),
                 "body_tail": self._chapter_plan_clip_text(chap.get("text", ""), 900, keep_tail=True),
             })
+        context_existing_count = (
+            max(0, int(existing_count_override or 0))
+            if existing_count_override is not None else len(chapters)
+        )
         payload = {
             "task": (
                 "生成可以追加到当前项目章节列表的长篇章节规划。"
@@ -4594,7 +5536,7 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
                 "target_words": int(target_words or 0),
                 "average_chapter_words": int(average_chapter_words or 0),
                 "estimated_total_chapters": int(total_chapter_count or 0),
-                "existing_chapter_count": len(chapters),
+                "existing_chapter_count": context_existing_count,
                 "requested_new_chapters": int(requested_chapter_count or 0),
                 "stage_rules": [
                     {
@@ -4645,14 +5587,21 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
             ),
             "existing_chapters": existing_chapters,
         }
-        imported_reference = self._chapter_plan_reference_context()
+        imported_reference = self._chapter_plan_reference_context(
+            reference_start_index,
+            reference_end_index,
+        )
         if imported_reference:
             payload["imported_chapter_plan_reference"] = imported_reference
         return (
             "请根据以下 JSON 项目档案生成章节规划。只规划 requested_new_chapters 指定数量的新章节；"
             "不要重写已有章节，不要输出正文。"
             "必须按 target.stage_rules 和 estimated_total_chapters 判断每章所属阶段，并把阶段任务写入每章规划字段。\n\n"
-            "若存在 imported_chapter_plan_reference，请把它作为用户原始章节方向参考，仍按长篇章节规划标准生成正式规划。\n\n"
+            "若存在 imported_chapter_plan_reference，chapters是按绝对章号执行的明确章节约束；"
+            "stages.events是阶段有序剧情节点，不得把事件序号直接当作章号。"
+            "每章用source_event_ids列出本章承载的节点ID；一章可承载多个连续节点，扩展章可用空数组。"
+            "每个节点只能使用一次、必须位于所属阶段章号范围内并保持原顺序；阶段结束前必须全部覆盖。"
+            "凡引用节点，outline必须逐字包含该节点的原始text，再补充冲突、转折和衔接。\n\n"
             "注意：章节规划只安排主线、人物任务、阶段节奏和结尾钩子，不要按伏笔编号或现有伏笔列表固定安排伏笔埋设、推进、回收；"
             "伏笔由扩写正文时根据当时的开放伏笔动态调度。\n\n"
             + json.dumps(payload, ensure_ascii=False, indent=2)
@@ -4741,6 +5690,232 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
             parts.append(f"禁止/边界：{forbidden}")
         return "\n\n".join(part for part in parts if part).strip()
 
+    def _chapter_plan_batch_ranges(self, chapter_count, batch_size=_CHAPTER_PLAN_BATCH_SIZE):
+        try:
+            chapter_count = max(0, int(chapter_count or 0))
+            batch_size = max(1, int(batch_size or _CHAPTER_PLAN_BATCH_SIZE))
+        except Exception:
+            return []
+        return [
+            (offset, min(batch_size, chapter_count - offset))
+            for offset in range(0, chapter_count, batch_size)
+        ]
+
+    def _persist_chapter_plan_generation_state(self, state):
+        if not isinstance(getattr(self, "current_project", None), dict):
+            return
+        stored = deepcopy(state) if isinstance(state, dict) else {}
+        stored["updated_at"] = now_str()
+        self.current_project["chapter_plan_generation_state"] = stored
+        if hasattr(self, "_note_project_dirty"):
+            self._note_project_dirty()
+        if not hasattr(self, "current_project_path") or not hasattr(self, "_draft_saved_once"):
+            return
+        try:
+            self._save_draft_snapshot()
+            self._save_current_project_snapshot_if_named()
+        except Exception as e:
+            log_debug("章节分批规划进度持久化失败", e)
+
+    def _chapter_plan_state_matches(self, state, target_words, average_words, total_count, existing_count):
+        if not isinstance(state, dict):
+            return False
+        return (
+            int(state.get("version", 0) or 0) == _CHAPTER_PLAN_BATCH_STATE_VERSION
+            and int(state.get("target_words", 0) or 0) == int(target_words or 0)
+            and int(state.get("average_chapter_words", 0) or 0) == int(average_words or 0)
+            and int(state.get("total_chapter_count", 0) or 0) == int(total_count or 0)
+            and int(state.get("existing_chapter_count", -1) or 0) == int(existing_count or 0)
+        )
+
+    def _chapter_plan_master_summary_text(self, master_plan):
+        master_plan = master_plan if isinstance(master_plan, dict) else {}
+        lines = [str(master_plan.get("summary", "") or "").strip()]
+        for arc in master_plan.get("arcs", []) if isinstance(master_plan.get("arcs"), list) else []:
+            if not isinstance(arc, dict):
+                continue
+            start = int(arc.get("start_chapter", 0) or 0)
+            end = int(arc.get("end_chapter", 0) or 0)
+            name = str(arc.get("name", "") or "阶段").strip()
+            lines.append(f"第{start}-{end}章｜{name}")
+            for label, key in (
+                ("目标", "goal"),
+                ("核心冲突", "main_conflict"),
+                ("关键转折", "turning_points"),
+                ("结束状态", "end_state"),
+                ("禁止提前", "forbidden"),
+            ):
+                value = str(arc.get(key, "") or "").strip()
+                if value:
+                    lines.append(f"{label}：{value}")
+        return "\n".join(line for line in lines if line).strip()
+
+    def _chapter_plan_batch_context(self, state, batch_count):
+        generated = state.get("chapters", []) if isinstance(state.get("chapters"), list) else []
+        existing_count = int(state.get("existing_chapter_count", 0) or 0)
+        batch_start = existing_count + len(generated) + 1
+        batch_end = batch_start + int(batch_count or 0) - 1
+        base_context = self._chapter_plan_project_context(
+            state.get("target_words", 0),
+            state.get("average_chapter_words", 0),
+            state.get("total_chapter_count", 0),
+            batch_count,
+            existing_count_override=existing_count + len(generated),
+            reference_start_index=batch_start,
+            reference_end_index=batch_end,
+        )
+        ledger = []
+        for item in generated:
+            if not isinstance(item, dict):
+                continue
+            ledger.append({
+                "index": item.get("index", ""),
+                "title": item.get("title", ""),
+                "narrative_stage": item.get("narrative_stage", ""),
+                "chapter_function": item.get("chapter_function", ""),
+                "mainline_task": item.get("mainline_task", ""),
+                "ending_hook": item.get("ending_hook", ""),
+                "source_event_ids": _normalize_name_list(item.get("source_event_ids", [])),
+            })
+        previous_tail = []
+        for item in generated[-5:]:
+            if not isinstance(item, dict):
+                continue
+            previous_tail.append({
+                key: deepcopy(item.get(key, ""))
+                for key in (
+                    "index", "title", "narrative_stage", "chapter_function", "character_task",
+                    "mainline_task", "outline", "characters", "settings", "ending_hook", "forbidden",
+                    "source_event_ids",
+                )
+            })
+        continuity = {
+            "required_absolute_range": [batch_start, batch_end],
+            "master_plan": state.get("master_plan", {}),
+            "planned_chapter_ledger": ledger,
+            "previous_batch_tail": previous_tail,
+            "rules": [
+                "本批必须服从全书阶段总规划，不得把批次结尾写成全书结局。",
+                "第1章的相对index对应required_absolute_range起点，章节数量必须精确。",
+                "承接上一批末章状态，避免重复开局、重复冲突或提前进入后续阶段。",
+            ],
+        }
+        return base_context + "\n\n【自动分批规划连续性资料】\n" + json.dumps(
+            continuity, ensure_ascii=False, indent=2
+        )
+
+    def _chapter_plan_from_generation_state(self, state):
+        return {
+            "summary": self._chapter_plan_master_summary_text(state.get("master_plan", {})),
+            "target_words": int(state.get("target_words", 0) or 0),
+            "average_chapter_words": int(state.get("average_chapter_words", 0) or 0),
+            "chapter_count": int(state.get("requested_chapter_count", 0) or 0),
+            "total_chapter_count": int(state.get("total_chapter_count", 0) or 0),
+            "existing_chapter_count": int(state.get("existing_chapter_count", 0) or 0),
+            "chapters": deepcopy(state.get("chapters", [])),
+        }
+
+    def _show_chapter_plan_generation_progress(self, state, message=""):
+        generated = len(state.get("chapters", [])) if isinstance(state.get("chapters"), list) else 0
+        requested = int(state.get("requested_chapter_count", 0) or 0)
+        total = int(state.get("total_chapter_count", 0) or 0)
+        lines = [
+            "正在自动分批生成章节规划",
+            f"全书预计：{total}章",
+            f"本次需规划：{requested}章",
+            f"已完成：{generated}/{requested}章",
+        ]
+        if state.get("master_plan"):
+            lines.append("全书阶段规划：已完成")
+        else:
+            lines.append("全书阶段规划：待生成")
+        if message:
+            lines.extend(["", str(message)])
+        self.chapter_ai_preview.setPlainText("\n".join(lines))
+
+    def _start_chapter_plan_worker_for_state(self, state):
+        if not getattr(self, "_chapter_plan_auto_active", False):
+            return
+        generated = state.get("chapters", []) if isinstance(state.get("chapters"), list) else []
+        requested = int(state.get("requested_chapter_count", 0) or 0)
+        remaining = max(0, requested - len(generated))
+        if remaining <= 0:
+            state["status"] = "complete"
+            state.pop("error", None)
+            self._persist_chapter_plan_generation_state(state)
+            plan = self._chapter_plan_from_generation_state(state)
+            self._pending_chapter_plan = plan
+            self.chapter_ai_preview.setPlainText(self._format_chapter_plan_preview(plan))
+            if hasattr(self, "chapter_plan_apply_btn"):
+                self.chapter_plan_apply_btn.setVisible(True)
+                self.chapter_plan_apply_btn.setEnabled(True)
+            self._set_chapter_ai_actions_enabled(True)
+            self._chapter_plan_auto_active = False
+            self.set_status_tip(f"章节规划已全部生成：{len(generated)}章。预览确认后可一次应用。")
+            return
+
+        provider = self._chapter_plan_provider
+        model = self._chapter_plan_model
+        if requested > _CHAPTER_PLAN_BATCH_SIZE and not state.get("master_plan"):
+            self._chapter_plan_request_kind = "master"
+            context = self._chapter_plan_project_context(
+                state.get("target_words", 0),
+                state.get("average_chapter_words", 0),
+                state.get("total_chapter_count", 0),
+                requested,
+            )
+            worker = NovelChapterPlanMasterWorker(
+                provider.get("base_url", ""),
+                provider.get("api_key", ""),
+                model,
+                context,
+                state.get("target_words", 0),
+                state.get("average_chapter_words", 0),
+                state.get("total_chapter_count", 0),
+                state.get("existing_chapter_count", 0),
+                provider.get("proxy_url", ""),
+                self._provider_proxy_mode(provider),
+            )
+            status = "正在生成全书阶段总规划..."
+        else:
+            batch_count = min(_CHAPTER_PLAN_BATCH_SIZE, remaining)
+            ranges = self._chapter_plan_batch_ranges(requested)
+            batch_number = len(generated) // _CHAPTER_PLAN_BATCH_SIZE + 1
+            self._chapter_plan_request_kind = "batch"
+            context = self._chapter_plan_batch_context(state, batch_count)
+            worker = NovelChapterPlanWorker(
+                provider.get("base_url", ""),
+                provider.get("api_key", ""),
+                model,
+                context,
+                state.get("target_words", 0),
+                state.get("average_chapter_words", 0),
+                batch_count,
+                state.get("total_chapter_count", 0),
+                int(state.get("existing_chapter_count", 0) or 0) + len(generated),
+                provider.get("proxy_url", ""),
+                self._provider_proxy_mode(provider),
+                batch_number=batch_number,
+                total_batches=len(ranges),
+            )
+            absolute_start = int(state.get("existing_chapter_count", 0) or 0) + len(generated) + 1
+            absolute_end = absolute_start + batch_count - 1
+            status = f"正在规划第{absolute_start}-{absolute_end}章，共{state.get('total_chapter_count', 0)}章..."
+
+        state["status"] = "generating"
+        state.pop("error", None)
+        self._persist_chapter_plan_generation_state(state)
+        self._show_chapter_plan_generation_progress(state, status)
+        self.chapter_plan_worker = worker
+        worker.progress.connect(self.set_status_tip)
+        worker.result_ready.connect(self.on_chapter_plan_ready)
+        worker.failed.connect(self.on_chapter_plan_failed)
+        worker.finished.connect(self._cleanup_chapter_plan_worker)
+        self._chapter_ai_stop_requested_by_user = False
+        self._set_chapter_ai_actions_enabled(False)
+        self.set_status_tip(status)
+        worker.start()
+
     def generate_chapter_plan(self):
         if self.writing_worker is not None and self.writing_worker.isRunning():
             self.set_status_tip("AI 写作助手正在生成，请稍等。")
@@ -4793,72 +5968,138 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
             average_chapter_words,
             existing_count,
         )
-        if requested_chapter_count > 120:
-            QMessageBox.information(
-                self,
-                "AI 生成章节规划",
-                "一次最多生成 120 章规划。当前目标拆得太细，请提高单章目标字数，或按分季/分卷分批规划。",
-            )
-            return
-        context = self._chapter_plan_project_context(
-            target_words,
-            average_chapter_words,
-            total_chapter_count,
-            requested_chapter_count,
-        )
         self.set_chapter_ai_panel_expanded(True)
         if hasattr(self, "chapter_plan_apply_btn"):
             self.chapter_plan_apply_btn.setVisible(False)
             self.chapter_plan_apply_btn.setEnabled(False)
+        saved_state = self.current_project.get("chapter_plan_generation_state", {})
+        if self._chapter_plan_state_matches(
+            saved_state, target_words, average_chapter_words, total_chapter_count, existing_count
+        ) and len(saved_state.get("chapters", [])) <= requested_chapter_count:
+            state = deepcopy(saved_state)
+        else:
+            state = {
+                "version": _CHAPTER_PLAN_BATCH_STATE_VERSION,
+                "status": "pending",
+                "target_words": target_words,
+                "average_chapter_words": average_chapter_words,
+                "total_chapter_count": total_chapter_count,
+                "existing_chapter_count": existing_count,
+                "requested_chapter_count": requested_chapter_count,
+                "batch_size": _CHAPTER_PLAN_BATCH_SIZE,
+                "master_plan": {},
+                "chapters": [],
+                "started_at": now_str(),
+            }
+        if str(state.get("status", "") or "") == "complete":
+            self._chapter_plan_auto_active = False
+            self._pending_chapter_plan = self._chapter_plan_from_generation_state(state)
+            self.chapter_ai_preview.setPlainText(self._format_chapter_plan_preview(self._pending_chapter_plan))
+            if hasattr(self, "chapter_plan_apply_btn"):
+                self.chapter_plan_apply_btn.setVisible(True)
+                self.chapter_plan_apply_btn.setEnabled(True)
+            self.set_status_tip("已恢复完成的章节规划，可直接预览并应用。")
+            return
         self._pending_chapter_plan = {}
+        self._chapter_plan_provider = provider
+        self._chapter_plan_model = model
+        self._chapter_plan_continue_pending = False
+        self._chapter_plan_auto_active = True
+        self._chapter_plan_sequence_token = int(getattr(self, "_chapter_plan_sequence_token", 0) or 0) + 1
         self.chapter_ai_stream_text = ""
-        self.chapter_ai_preview.setPlainText(
-            f"正在生成章节规划：预计整本约 {total_chapter_count} 章，当前已有 {existing_count} 章，本次规划 {requested_chapter_count} 章..."
-        )
-        self.chapter_plan_worker = NovelChapterPlanWorker(
-            provider.get("base_url", ""),
-            provider.get("api_key", ""),
-            model,
-            context,
-            target_words,
-            average_chapter_words,
-            requested_chapter_count,
-            total_chapter_count,
-            existing_count,
-            provider.get("proxy_url", ""),
-            self._provider_proxy_mode(provider),
-        )
-        self.chapter_plan_worker.progress.connect(self.set_status_tip)
-        self.chapter_plan_worker.result_ready.connect(self.on_chapter_plan_ready)
-        self.chapter_plan_worker.failed.connect(self.on_chapter_plan_failed)
-        self.chapter_plan_worker.finished.connect(self._cleanup_chapter_plan_worker)
-        self._chapter_ai_stop_requested_by_user = False
-        self._set_chapter_ai_actions_enabled(False)
-        self.set_status_tip(f"正在生成章节规划：本次 {requested_chapter_count} 章...")
-        self.chapter_plan_worker.start()
+        self._persist_chapter_plan_generation_state(state)
+        self._start_chapter_plan_worker_for_state(state)
 
     def on_chapter_plan_ready(self, plan):
+        state = deepcopy(self.current_project.get("chapter_plan_generation_state", {}))
+        if not isinstance(state, dict) or not state:
+            self.on_chapter_plan_failed("章节规划进度状态丢失。")
+            return
+        kind = str(getattr(self, "_chapter_plan_request_kind", "") or "")
+        if kind == "master":
+            if not isinstance(plan, dict) or not plan.get("arcs"):
+                self.on_chapter_plan_failed("AI 没有返回可用全书阶段规划。")
+                return
+            state["master_plan"] = deepcopy(plan)
+            state["status"] = "generating"
+            self._persist_chapter_plan_generation_state(state)
+            self._show_chapter_plan_generation_progress(state, "全书阶段规划已完成，正在准备第一批详细章节。")
+            self._chapter_plan_continue_pending = True
+            return
         chapters = (plan or {}).get("chapters", []) if isinstance(plan, dict) else []
         if not chapters:
             self.on_chapter_plan_failed("AI 没有返回可用章节规划。")
             return
-        self._pending_chapter_plan = deepcopy(plan)
-        self.chapter_ai_preview.setPlainText(self._format_chapter_plan_preview(plan))
-        if hasattr(self, "chapter_plan_apply_btn"):
-            self.chapter_plan_apply_btn.setVisible(True)
-            self.chapter_plan_apply_btn.setEnabled(True)
-        self.set_status_tip(f"章节规划已生成：{len(chapters)} 章。预览确认后可应用到章节列表。")
+        generated = state.get("chapters", []) if isinstance(state.get("chapters"), list) else []
+        expected = min(
+            _CHAPTER_PLAN_BATCH_SIZE,
+            int(state.get("requested_chapter_count", 0) or 0) - len(generated),
+        )
+        if len(chapters) != expected:
+            self.on_chapter_plan_failed(f"章节规划数量不一致：需要{expected}章，实际{len(chapters)}章。")
+            return
+        absolute_start = int(state.get("existing_chapter_count", 0) or 0) + len(generated) + 1
+        _catalog, _stages, explicit = self._chapter_plan_event_reference()
+        incoming = []
+        for offset, item in enumerate(chapters):
+            chapter = deepcopy(item)
+            chapter["index"] = absolute_start + offset
+            chapter["source_event_ids"] = [
+                value.upper() for value in _normalize_name_list(chapter.get("source_event_ids", []))
+            ]
+            explicit_item = explicit.get(chapter["index"], {})
+            explicit_title = str(explicit_item.get("title", "") or "").strip() if isinstance(explicit_item, dict) else ""
+            if explicit_title:
+                chapter["title"] = explicit_title
+            incoming.append(chapter)
+        assignment_error = self._chapter_plan_event_assignment_error(generated, incoming)
+        if assignment_error:
+            self.on_chapter_plan_failed(f"原始框架事件覆盖校验失败：{assignment_error}")
+            return
+        generated.extend(incoming)
+        batch_summary = str((plan or {}).get("summary", "") or "").strip()
+        master_plan = state.get("master_plan", {}) if isinstance(state.get("master_plan"), dict) else {}
+        if batch_summary and not str(master_plan.get("summary", "") or "").strip():
+            master_plan["summary"] = batch_summary
+            state["master_plan"] = master_plan
+        state["chapters"] = generated
+        state["status"] = "complete" if len(generated) >= int(state.get("requested_chapter_count", 0) or 0) else "generating"
+        state.pop("error", None)
+        self._persist_chapter_plan_generation_state(state)
+        if state["status"] == "complete":
+            self._chapter_plan_auto_active = False
+            self._pending_chapter_plan = self._chapter_plan_from_generation_state(state)
+            self.chapter_ai_preview.setPlainText(self._format_chapter_plan_preview(self._pending_chapter_plan))
+            if hasattr(self, "chapter_plan_apply_btn"):
+                self.chapter_plan_apply_btn.setVisible(True)
+                self.chapter_plan_apply_btn.setEnabled(True)
+            self.set_status_tip(f"章节规划已全部生成：{len(generated)}章。预览确认后可一次应用。")
+        else:
+            self._show_chapter_plan_generation_progress(state, "当前批次已保存，正在准备下一批。")
+            self._chapter_plan_continue_pending = True
 
     def on_chapter_plan_failed(self, err):
         if getattr(self, "_chapter_ai_stop_requested_by_user", False):
             self.set_status_tip("章节规划生成已中止。")
             return
         err_text = clean_error_text(err)
-        self._pending_chapter_plan = {}
+        self._chapter_plan_auto_active = False
+        self._chapter_plan_sequence_token = int(getattr(self, "_chapter_plan_sequence_token", 0) or 0) + 1
+        state = deepcopy(self.current_project.get("chapter_plan_generation_state", {}))
+        if isinstance(state, dict) and state:
+            state["status"] = "failed"
+            state["error"] = err_text[:500]
+            self._persist_chapter_plan_generation_state(state)
+            generated = len(state.get("chapters", [])) if isinstance(state.get("chapters"), list) else 0
+            requested = int(state.get("requested_chapter_count", 0) or 0)
+            self._show_chapter_plan_generation_progress(
+                state,
+                f"当前批次失败，已保存{generated}/{requested}章；再次点击AI生成章节规划将从这里继续。",
+            )
         if hasattr(self, "chapter_plan_apply_btn"):
             self.chapter_plan_apply_btn.setVisible(False)
             self.chapter_plan_apply_btn.setEnabled(False)
-        self.set_status_tip(f"章节规划生成失败：{err_text[:100]}")
+        self.set_status_tip(f"章节规划当前批次失败，进度已保存：{err_text[:100]}")
         QMessageBox.warning(self, "章节规划生成失败", err_text)
 
     def _cleanup_chapter_plan_worker(self):
@@ -4872,10 +6113,28 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
                 if worker is not None:
                     worker.deleteLater()
                 if was_current:
-                    self._set_chapter_ai_actions_enabled(True)
+                    continue_pending = bool(getattr(self, "_chapter_plan_continue_pending", False))
+                    self._set_chapter_ai_actions_enabled(not continue_pending)
                     if getattr(self, "_chapter_ai_stop_requested_by_user", False):
+                        state = deepcopy(self.current_project.get("chapter_plan_generation_state", {}))
+                        if isinstance(state, dict) and state and state.get("status") != "complete":
+                            state["status"] = "interrupted"
+                            self._persist_chapter_plan_generation_state(state)
                         self.set_status_tip("章节规划生成已中止。")
                     self._chapter_ai_stop_requested_by_user = False
+                    if continue_pending:
+                        self._chapter_plan_continue_pending = False
+                        state = deepcopy(self.current_project.get("chapter_plan_generation_state", {}))
+                        token = int(getattr(self, "_chapter_plan_sequence_token", 0) or 0)
+                        QTimer.singleShot(
+                            100,
+                            lambda s=state, t=token: (
+                                self._start_chapter_plan_worker_for_state(s)
+                                if getattr(self, "_chapter_plan_auto_active", False)
+                                and int(getattr(self, "_chapter_plan_sequence_token", 0) or 0) == t
+                                else None
+                            ),
+                        )
             except Exception as e:
                 log_debug("小说章节规划线程清理失败", e)
 
@@ -4916,6 +6175,9 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
                 chapter["draft_words"] = target_words
             chapter["outline"] = self._chapter_plan_outline_for_item(item)
             chapter["linked_characters"] = _normalize_name_list(item.get("characters", []))
+            chapter["source_event_ids"] = [
+                value.upper() for value in _normalize_name_list(item.get("source_event_ids", []))
+            ]
             chapter["status"] = "大纲"
             chapters.append(chapter)
         plan_summary = str(plan.get("summary", "") or "").strip()
@@ -4927,6 +6189,7 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
                 if hasattr(self, "draft_note_edit"):
                     self.draft_note_edit.setPlainText(self.current_project["draft_note"])
         self.current_project.pop("imported_chapter_plan_reference", None)
+        self.current_project.pop("chapter_plan_generation_state", None)
         self._pending_chapter_plan = {}
         if hasattr(self, "chapter_plan_apply_btn"):
             self.chapter_plan_apply_btn.setVisible(False)
@@ -4968,6 +6231,38 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
 
     def _has_partial_draft_preview(self):
         return self._has_partial_chapter_ai_preview("draft")
+
+    def _discard_partial_preview_for_auto_rewrite(self):
+        if not self._has_partial_chapter_ai_preview():
+            return False
+        action = str(getattr(self, "_chapter_ai_preview_action", "") or "draft")
+        preview_text = str(self.chapter_ai_preview.toPlainText() or "").strip()
+        request_id = str(getattr(self, "_chapter_ai_diagnostic_request_id", "") or "")
+        snapshot_path = ""
+        try:
+            snapshot_path = self._save_chapter_ai_failure_snapshot(
+                action,
+                request_id,
+                error="自动扩写重新启动：半成品不参与续写，改为从干净上下文重写",
+                validation_payload="半成品仅保存到诊断快照，不写入章节正文。",
+            )
+        except Exception as exc:
+            log_debug("自动扩写半成品诊断快照保存失败", exc)
+        self._log_novel_diagnostic(
+            "auto_expand_partial_preview_discarded",
+            level="warning",
+            action=action,
+            chapter_id=self._current_chapter_id(),
+            partial_preview_chars=len(preview_text),
+            diagnostic_snapshot_path=snapshot_path,
+            restart_mode="rewrite",
+        )
+        self.chapter_ai_preview.clear()
+        self.chapter_ai_stream_text = ""
+        self._chapter_ai_resume_prefix = ""
+        self._set_partial_chapter_ai_preview_state(False)
+        self._reset_chapter_ai_sequence()
+        return True
 
     def _on_chapter_ai_preview_text_changed(self):
         self._refresh_chapter_ai_action_labels()
@@ -5068,57 +6363,1512 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
         self._chapter_ai_sequence_started_outline = ""
         self._chapter_ai_sequence_skipped_outline = False
 
-    def _start_chapter_ai_worker(self, action, context, status_text="", resume_prefix=""):
+    def _auto_expand_chapter_has_committed_memory(self, chapter):
+        if not isinstance(chapter, dict):
+            return False
+        if not all(
+            str(chapter.get(key, "") or "").strip()
+            for key in ("text", "summary", "key_facts")
+        ):
+            return False
+        if str(chapter.get("memory_sync_status", "") or "") != "complete":
+            return False
+        if str(chapter.get("memory_sync_error", "") or "").strip():
+            return False
+        try:
+            chapter_revision = int(chapter.get("memory_revision", 0) or 0)
+        except Exception:
+            chapter_revision = 0
+        memory = self.current_project.get("long_form_memory", {}) if isinstance(self.current_project, dict) else {}
+        try:
+            memory_revision = int(memory.get("revision", 0) or 0) if isinstance(memory, dict) else 0
+        except Exception:
+            memory_revision = 0
+        return bool(
+            chapter_revision > 0
+            and chapter_revision <= memory_revision
+            and str(chapter.get("memory_update_hash", "") or "").strip()
+        )
+
+    def _auto_expand_chapter_needs_work(self, chapter):
+        if not isinstance(chapter, dict):
+            return False
+        if not str(chapter.get("text", "") or "").strip():
+            return True
+        if self._auto_expand_chapter_has_committed_memory(chapter):
+            return False
+        if self._memory_finalize_checkpoint_text(chapter):
+            return True
+        if bool(chapter.get("auto_expand_resume_required", False)):
+            return True
+        if (
+            str(chapter.get("memory_sync_status", "") or "") == "failed"
+            or str(chapter.get("memory_sync_error", "") or "").strip()
+        ):
+            return True
+        return not (
+            str(chapter.get("summary", "") or "").strip()
+            and str(chapter.get("key_facts", "") or "").strip()
+        )
+
+    def _auto_expand_pending_indexes(self):
+        chapters = self.current_project.get("chapters", []) if isinstance(self.current_project, dict) else []
+        return [
+            index
+            for index, chapter in enumerate(chapters if isinstance(chapters, list) else [])
+            if self._auto_expand_chapter_needs_work(chapter)
+        ]
+
+    def _persist_completed_auto_expand_resume_flags(self):
+        chapters = self.current_project.get("chapters", []) if isinstance(self.current_project, dict) else []
+        chapters = chapters if isinstance(chapters, list) else []
+        completed = [
+            chapter
+            for chapter in chapters
+            if (
+                isinstance(chapter, dict)
+                and bool(chapter.get("auto_expand_resume_required", False))
+                and self._auto_expand_chapter_has_committed_memory(chapter)
+            )
+        ]
+        if not completed:
+            return True
+        for chapter in completed:
+            chapter["auto_expand_resume_required"] = False
+        if hasattr(self, "_note_project_dirty"):
+            self._note_project_dirty()
+        saved_path = self._save_current_work(
+            "恢复自动扩写完成状态",
+            refresh_project_list=False,
+        )
+        if saved_path:
+            return True
+        for chapter in completed:
+            chapter["auto_expand_resume_required"] = True
+        if hasattr(self, "_note_project_dirty"):
+            self._note_project_dirty()
+        self._persist_ai_generation_state()
+        self._log_novel_diagnostic(
+            "auto_expand_resume_state_save_failed",
+            level="error",
+            affected_chapter_ids=[
+                str(chapter.get("id", "") or "") for chapter in completed
+                if isinstance(chapter, dict)
+            ],
+            error="已完成章节的续跑状态保存失败",
+            error_category="storage",
+        )
+        self.set_status_tip("自动扩写未启动：已完成章节的续跑状态保存失败。")
+        return False
+
+    def _auto_expand_all_chapter_progress(self):
+        project = self.current_project if isinstance(getattr(self, "current_project", None), dict) else {}
+        chapters = project.get("chapters", []) if isinstance(project.get("chapters"), list) else []
+        total = len(chapters)
+        if not total:
+            return 0, 0
+
+        current_id = str(getattr(self, "_auto_expand_all_current_chapter_id", "") or "")
+        if current_id:
+            for index, chapter in enumerate(chapters):
+                if isinstance(chapter, dict) and str(chapter.get("id", "") or "") == current_id:
+                    return index + 1, total
+
+        if bool(getattr(self, "_auto_expand_all_active", False)):
+            pending = self._auto_expand_pending_indexes()
+            if pending:
+                return pending[0] + 1, total
+
+        try:
+            current_index = int(getattr(self, "current_chapter_index", -1))
+        except (TypeError, ValueError):
+            current_index = -1
+        if 0 <= current_index < total:
+            return current_index + 1, total
+        return 0, total
+
+    def _set_auto_expand_all_button_text(self):
+        if not hasattr(self, "auto_expand_all_btn"):
+            return
+        if getattr(self, "_auto_expand_all_active", False):
+            current, total = self._auto_expand_all_chapter_progress()
+            progress = f" {current}/{total}" if current and total else ""
+            self.auto_expand_all_btn.setText(f"自动扩写全部{progress}")
+        else:
+            self.auto_expand_all_btn.setText("自动扩写全部")
+
+    def _stop_auto_expand_all(self, message=""):
+        message_text = str(message or "").strip()
+        if message_text:
+            if "完成" in message_text and not any(
+                marker in message_text for marker in ("失败", "不完整", "无法", "停止")
+            ):
+                level = "info"
+            elif "中止" in message_text:
+                level = "warning"
+            else:
+                level = "error"
+            self._log_novel_diagnostic(
+                "auto_expand_stopped",
+                level=level,
+                reason=message_text,
+                reason_code=self._auto_expand_stop_reason_code(message_text),
+            )
+        self._auto_expand_all_active = False
+        self._auto_expand_all_waiting_next = False
+        self._auto_expand_all_current_chapter_id = ""
+        self._set_auto_expand_all_button_text()
+        if message:
+            self.set_status_tip(message)
+
+    def start_auto_expand_all_chapters(self):
+        if getattr(self, "_auto_expand_all_active", False):
+            self.set_status_tip("正在自动扩写所有未写章节。")
+            return
+        worker = getattr(self, "writing_worker", None)
+        if worker is not None and worker.isRunning():
+            self.set_status_tip("当前章节仍在生成，请完成后再启动自动扩写。")
+            return
+        plan_worker = getattr(self, "chapter_plan_worker", None)
+        if plan_worker is not None and plan_worker.isRunning():
+            self.set_status_tip("章节规划仍在生成，请完成后再启动自动扩写。")
+            return
+        provider, model, error = self._current_novel_ai_selection()
+        if error:
+            self._log_novel_diagnostic(
+                "auto_expand_start_failed",
+                level="error",
+                error=clean_error_text(error),
+                error_category=self._novel_diagnostic_error_category(error),
+            )
+            self.set_ai_settings_expanded(True)
+            QMessageBox.warning(self, "自动扩写失败", error)
+            return
+        self._flush_current_editors()
+        self._auto_expand_restart_rewrite_notice = self._discard_partial_preview_for_auto_rewrite()
+        if not self._persist_completed_auto_expand_resume_flags():
+            return
+        pending = self._auto_expand_pending_indexes()
+        if not pending:
+            self._log_novel_diagnostic("auto_expand_no_pending")
+            self.set_status_tip("所有章节均已完成，无需自动扩写或恢复。")
+            return
+        self._chapter_ai_provider = provider
+        self._chapter_ai_model = model
+        self._auto_expand_all_active = True
+        self._auto_expand_all_waiting_next = False
+        self._auto_expand_all_total = len(pending)
+        self._auto_expand_all_completed = 0
+        self._auto_expand_all_current_chapter_id = ""
+        self._status_begin_workflow("auto_expand")
+        self._log_novel_diagnostic(
+            "auto_expand_started",
+            provider=provider,
+            model=model,
+            pending_count=len(pending),
+            pending_chapter_indexes=[index + 1 for index in pending],
+        )
+        self._set_auto_expand_all_button_text()
+        self._start_next_auto_expand_chapter()
+
+    def _start_next_auto_expand_chapter(self):
+        if not getattr(self, "_auto_expand_all_active", False):
+            return
+        self._auto_expand_all_waiting_next = False
+        pending = self._auto_expand_pending_indexes()
+        if not pending:
+            batch_total = int(getattr(self, "_auto_expand_all_total", 0) or 0)
+            project_total = len(self.current_project.get("chapters", []))
+            self._stop_auto_expand_all(
+                f"自动扩写完成：全书 {project_total}/{project_total} 章均已完成，本轮完成 {batch_total} 章。"
+            )
+            return
+        index = pending[0]
+        chapters = self.current_project.get("chapters", [])
+        chapter = chapters[index]
+        title = str(chapter.get("title", "") or f"第{index + 1}章").strip()
+        has_body = bool(str(chapter.get("text", "") or "").strip())
+        has_checkpoint = bool(self._memory_finalize_checkpoint_text(chapter))
+        if not str(chapter.get("outline", "") or "").strip() and not has_body and not has_checkpoint:
+            self._stop_auto_expand_all(f"自动扩写已停止：第{index + 1}章《{title}》没有章节提纲。")
+            self._set_chapter_ai_actions_enabled(True)
+            return
+        row = self._row_for_source_index(self.chapter_list, index)
+        if row < 0:
+            self._stop_auto_expand_all(f"自动扩写已停止：无法定位第{index + 1}章《{title}》。")
+            self._set_chapter_ai_actions_enabled(True)
+            return
+        self.chapter_list.setCurrentRow(row)
+        if self._discard_partial_preview_for_auto_rewrite():
+            self._auto_expand_restart_rewrite_notice = True
+        self._auto_expand_all_current_chapter_id = str(chapter.get("id", "") or "")
+        self._set_auto_expand_all_button_text()
+        completed = int(getattr(self, "_auto_expand_all_completed", 0) or 0)
+        total = int(getattr(self, "_auto_expand_all_total", 0) or 0)
+        self._log_novel_diagnostic(
+            "auto_expand_chapter_started",
+            chapter_id=str(chapter.get("id", "") or ""),
+            queue_position=completed + 1,
+            queue_total=total,
+            recovery_mode=("checkpoint" if has_checkpoint else "existing_body" if has_body else "new_draft"),
+        )
+        rewrite_notice = "（已丢弃半成品，重新生成）" if getattr(
+            self, "_auto_expand_restart_rewrite_notice", False
+        ) else ""
+        self._auto_expand_restart_rewrite_notice = False
+        chapter_number, project_total = self._auto_expand_all_chapter_progress()
+        self.set_status_tip(
+            f"自动扩写 {chapter_number}/{project_total}：第{index + 1}章《{title}》...{rewrite_notice}"
+        )
+        self._start_chapter_ai_sequence()
+        if (
+            getattr(self, "_auto_expand_all_active", False)
+            and not getattr(self, "_chapter_ai_sequence_active", False)
+            and getattr(self, "writing_worker", None) is None
+        ):
+            self._stop_auto_expand_all(f"自动扩写已停止：第{index + 1}章《{title}》未能启动。")
+            self._set_chapter_ai_actions_enabled(True)
+
+    def _on_auto_expand_chapter_completed(self, memory_changed):
+        if not getattr(self, "_auto_expand_all_active", False):
+            return
+        chapter_id = self._current_chapter_id()
+        if chapter_id != getattr(self, "_auto_expand_all_current_chapter_id", ""):
+            self._stop_auto_expand_all("自动扩写已停止：完成章节与当前任务不一致。")
+            return
+        chapter = self.current_project.get("chapters", [])[self.current_chapter_index]
+        memory = self.current_project.get("long_form_memory", {}) if isinstance(self.current_project, dict) else {}
+        snapshot = memory.get("state_snapshot", {}) if isinstance(memory, dict) else {}
+        memory_revision = int(memory.get("revision", 0) or 0) if isinstance(memory, dict) else 0
+        complete = bool(
+            str(chapter.get("text", "") or "").strip()
+            and str(chapter.get("summary", "") or "").strip()
+            and str(chapter.get("key_facts", "") or "").strip()
+            and memory_changed
+            and str(chapter.get("memory_sync_status", "") or "") == "complete"
+            and int(chapter.get("memory_revision", 0) or 0) == memory_revision
+            and str(chapter.get("memory_update_hash", "") or "").strip()
+            and str(snapshot.get("as_of_chapter_id", "") or "") == str(chapter.get("id", "") or "")
+        )
+        if not complete:
+            self._log_novel_diagnostic(
+                "auto_expand_postwrite_validation_failed",
+                level="error",
+                chapter_id=str(chapter.get("id", "") or ""),
+                memory_changed=bool(memory_changed),
+                has_body=bool(str(chapter.get("text", "") or "").strip()),
+                has_summary=bool(str(chapter.get("summary", "") or "").strip()),
+                has_key_facts=bool(str(chapter.get("key_facts", "") or "").strip()),
+                memory_status=str(chapter.get("memory_sync_status", "") or ""),
+                chapter_memory_revision=int(chapter.get("memory_revision", 0) or 0),
+                global_memory_revision=memory_revision,
+                has_memory_update_hash=bool(str(chapter.get("memory_update_hash", "") or "").strip()),
+                snapshot_matches=(
+                    str(snapshot.get("as_of_chapter_id", "") or "")
+                    == str(chapter.get("id", "") or "")
+                ),
+            )
+            self._stop_auto_expand_all(
+                f"自动扩写已停止：第{self.current_chapter_index + 1}章资料回填不完整，请检查后继续。"
+            )
+            return
+        chapter["auto_expand_resume_required"] = False
+        if hasattr(self, "_note_project_dirty"):
+            self._note_project_dirty()
+        saved_path = self._save_current_work(
+            f"自动扩写第{self.current_chapter_index + 1}章完成",
+            refresh_project_list=False,
+        )
+        if not saved_path:
+            chapter["auto_expand_resume_required"] = True
+            if hasattr(self, "_note_project_dirty"):
+                self._note_project_dirty()
+            self._persist_ai_generation_state()
+            self._log_novel_diagnostic(
+                "auto_expand_chapter_save_failed",
+                level="error",
+                chapter_id=str(chapter.get("id", "") or ""),
+                error="章节内容和长期状态已完成，但项目文件保存失败",
+                error_category="storage",
+            )
+            self._stop_auto_expand_all(
+                f"自动扩写已停止：第{self.current_chapter_index + 1}章保存失败。"
+            )
+            return
+        self._auto_expand_all_completed = int(getattr(self, "_auto_expand_all_completed", 0) or 0) + 1
+        self._auto_expand_all_waiting_next = True
+        self._log_novel_diagnostic(
+            "auto_expand_chapter_completed",
+            chapter_id=str(chapter.get("id", "") or ""),
+            completed_count=self._auto_expand_all_completed,
+            queue_total=int(getattr(self, "_auto_expand_all_total", 0) or 0),
+        )
+        self._set_auto_expand_all_button_text()
+        chapter_number, project_total = self._auto_expand_all_chapter_progress()
+        self.set_status_tip(
+            f"自动扩写进度：第{chapter_number}章已完成（{chapter_number}/{project_total}），正在准备下一章。"
+        )
+
+    def _reset_chapter_ai_style_retry(self):
+        self._chapter_ai_transient_retry_pending = False
+        self._chapter_ai_transient_retry_token = int(
+            getattr(self, "_chapter_ai_transient_retry_token", 0) or 0
+        ) + 1
+        self._chapter_ai_transient_retry_counts = {}
+        self._chapter_ai_style_retry_attempted = False
+        self._chapter_ai_style_fallback_text = ""
+        self._chapter_ai_last_context = ""
+        self._chapter_ai_style_workflow_active = False
+        self._chapter_ai_style_reference = ""
+        self._chapter_ai_style_original_context = ""
+        self._chapter_ai_style_profile = ""
+        self._chapter_ai_style_candidate = ""
+        self._chapter_ai_style_finalize_count = 0
+        self._chapter_ai_style_final_bundle = {}
+        self._chapter_ai_style_rewrite_count = 0
+        self._chapter_ai_style_local_reasons = []
+        self._chapter_ai_style_output_target = 0
+        self._chapter_ai_style_plot_ledger = ""
+        self._chapter_ai_style_pending_reasons = []
+        self._chapter_ai_style_cards = []
+        self._chapter_ai_style_plan = ""
+        self._chapter_ai_style_reference_hash = ""
+        self._chapter_ai_style_cache_entry = {}
+        self._chapter_ai_style_build_unit_index = -1
+        self._chapter_ai_style_combined_sheet = ""
+        self._chapter_ai_style_persona = ""
+        self._chapter_ai_style_rules = ""
+        self._chapter_ai_style_execution = ""
+        self._chapter_ai_memory_finalize_attempted = False
+        self._chapter_ai_memory_repair_attempts = 0
+        self._chapter_ai_memory_pending = {}
+
+    def _start_style_locked_draft(self, context):
+        project = self._ai_project_snapshot()
+        style_reference = str(project.get("style_reference", "") or "").strip()
+        if not style_reference:
+            self._start_chapter_ai_worker("draft", context, "正在扩写正文...")
+            return
+        self._chapter_ai_style_workflow_active = True
+        self._chapter_ai_style_reference = style_reference
+        self._chapter_ai_style_original_context = str(context or "")
+        self._chapter_ai_style_output_target = _style_output_target_from_context(context)
+        reference_hash = hashlib.sha256(style_reference.encode("utf-8")).hexdigest()
+        self._chapter_ai_style_reference_hash = reference_hash
+        project_cache = project.get("style_profile_cache", {})
+        cached_item = project_cache.get(reference_hash, {}) if isinstance(project_cache, dict) else {}
+        try:
+            cached_version = int(cached_item.get("version", 0) or 0) if isinstance(cached_item, dict) else 0
+        except Exception:
+            cached_version = 0
+        persisted_text = (
+            str(cached_item.get("profile", "") or "").strip()
+            if isinstance(cached_item, dict) else str(cached_item or "").strip()
+        )
+        if persisted_text and cached_version >= STYLE_SHEET_CACHE_VERSION:
+            if isinstance(cached_item, dict):
+                self._chapter_ai_style_cache_entry = deepcopy(cached_item)
+                self._chapter_ai_style_combined_sheet = str(
+                    cached_item.get("combined_sheet", "") or persisted_text
+                ).strip()
+                self._chapter_ai_style_persona = str(cached_item.get("persona", "") or "").strip()
+                self._chapter_ai_style_cards = deepcopy(
+                    cached_item.get("style_cards", [])
+                    if isinstance(cached_item.get("style_cards"), list) else []
+                )
+            self._chapter_ai_style_profile = persisted_text
+            self._chapter_ai_style_profile_cache_hash = reference_hash
+            self._chapter_ai_style_profile_cache_text = persisted_text
+            self._chapter_ai_style_profile_cache_version = cached_version
+            self._start_style_profiled_draft()
+            return
+        cached_hash = str(getattr(self, "_chapter_ai_style_profile_cache_hash", "") or "")
+        cached_text = str(getattr(self, "_chapter_ai_style_profile_cache_text", "") or "").strip()
+        cached_runtime_version = int(
+            getattr(self, "_chapter_ai_style_profile_cache_version", 0) or 0
+        )
+        if (
+            reference_hash == cached_hash
+            and cached_text
+            and cached_runtime_version >= STYLE_SHEET_CACHE_VERSION
+        ):
+            self._chapter_ai_style_profile = cached_text
+            self._start_style_profiled_draft()
+            return
+        if isinstance(cached_item, dict) and int(cached_item.get("version", 0) or 0) >= STYLE_SHEET_CACHE_VERSION:
+            entry = deepcopy(cached_item)
+        else:
+            entry = {
+                "version": STYLE_SHEET_CACHE_VERSION,
+                "status": "building",
+                "profile": "",
+                "combined_sheet": "",
+                "persona": "",
+                "style_cards_version": 0,
+                "style_cards": [],
+                "units": _build_style_profile_units(style_reference, max_units=10, target_chars=2400),
+                "merge_results": [],
+            }
+        if not entry.get("units"):
+            profile_context = _build_style_profile_request_context(style_reference)
+            self._start_chapter_ai_worker(
+                "style_profile",
+                profile_context,
+                "样本无法分段，正在使用兼容模式建立文风画像...",
+            )
+            return
+        self._chapter_ai_style_cache_entry = entry
+        self._persist_style_cache_entry(reference_hash, entry)
+        self._continue_style_profile_build()
+
+    def _start_style_profiled_draft(self):
+        self._chapter_ai_style_rules = ""
+        self._start_style_draft_with_rules()
+
+    def _start_style_draft_with_rules(self):
+        if str(self._chapter_ai_style_persona or "").strip():
+            profile = _compose_style_profile(
+                "",
+                self._chapter_ai_style_persona,
+                self._chapter_ai_style_rules,
+            )
+        else:
+            profile = _compose_style_profile(
+                self._chapter_ai_style_combined_sheet or self._chapter_ai_style_profile,
+                "",
+                self._chapter_ai_style_rules,
+            )
+        profile = profile or self._chapter_ai_style_profile
+        self._chapter_ai_style_profile = profile
+        context = _build_style_execution_context(
+            self._chapter_ai_style_original_context,
+            profile,
+            style_cards=self._chapter_ai_style_cards,
+            style_reference=self._chapter_ai_style_reference,
+        )
+        self.chapter_ai_preview.clear()
+        self.chapter_ai_stream_text = ""
+        self._start_chapter_ai_worker("draft", context, "文风档案已载入，正在生成剧情执行稿和备用正文...")
+
+    def _persist_style_cache_entry(self, reference_hash, entry):
+        cache_key = str(reference_hash or "").strip().lower()
+        if not cache_key or not isinstance(entry, dict):
+            return
+        stored = deepcopy(entry)
+        stored["cached_at"] = now_str()
+        stored["model"] = str(getattr(self, "_chapter_ai_model", "") or "")
+        cache = self.current_project.setdefault("style_profile_cache", {})
+        if not isinstance(cache, dict):
+            cache = {}
+            self.current_project["style_profile_cache"] = cache
+        cache[cache_key] = stored
+        self._chapter_ai_style_cache_entry = deepcopy(stored)
+        if hasattr(self, "_note_project_dirty"):
+            self._note_project_dirty()
+        if not hasattr(self, "current_project_path") or not hasattr(self, "_draft_saved_once"):
+            return
+        self._archive_completed_style_profile(cache_key, stored)
+        try:
+            self._save_draft_snapshot()
+            self._save_current_project_snapshot_if_named()
+        except Exception as e:
+            log_debug("小说完整文风档案持久化失败", e)
+
+    def _archive_completed_style_profile(self, reference_hash, cache_entry):
+        if not isinstance(cache_entry, dict) or not str(cache_entry.get("profile", "") or "").strip():
+            return ""
+        status = str(cache_entry.get("status", "") or "").strip()
+        if status and status != "complete":
+            return ""
+        reference = str(getattr(self, "_chapter_ai_style_reference", "") or "").strip()
+        if not reference:
+            reference = str(self.current_project.get("style_reference", "") or "").strip()
+        if not reference or hashlib.sha256(reference.encode("utf-8")).hexdigest() != reference_hash:
+            return ""
+        title = str(self.current_project.get("meta", {}).get("title", "") or "").strip()
+        profile_id = upsert_style_profile(
+            reference,
+            cache_entry,
+            name=title,
+            source_project=str(getattr(self, "current_project_path", "") or ""),
+        )
+        local_reference = str(self.current_project.get("style_reference", "") or "").strip()
+        selected_id = str(self.current_project.get("style_profile_id", "") or "").strip().lower()
+        if profile_id and local_reference == reference and selected_id != "__none__":
+            self.current_project["style_profile_id"] = profile_id
+            self._refresh_style_profile_combo()
+        return profile_id
+
+    def _continue_style_profile_build(self):
+        entry = self._chapter_ai_style_cache_entry if isinstance(self._chapter_ai_style_cache_entry, dict) else {}
+        units = entry.get("units", []) if isinstance(entry.get("units"), list) else []
+        total = len(units)
+        for index, unit in enumerate(units):
+            if not isinstance(unit, dict):
+                continue
+            self._chapter_ai_style_build_unit_index = index
+            if not str(unit.get("baseline", "") or "").strip():
+                self._start_chapter_ai_worker(
+                    "style_baseline",
+                    _build_style_baseline_context(unit, index + 1, total),
+                    f"首次文风建档：正在生成普通基准稿 {index + 1}/{total}...",
+                )
+                return
+            if not str(unit.get("sheet", "") or "").strip():
+                self._start_chapter_ai_worker(
+                    "style_sheet",
+                    _build_style_sheet_context(unit, index + 1, total),
+                    f"首次文风建档：正在提取证据化写法 {index + 1}/{total}...",
+                )
+                return
+
+        merge_results = entry.get("merge_results", []) if isinstance(entry.get("merge_results"), list) else []
+        if total == 1:
+            entry["combined_sheet"] = str(units[0].get("sheet", "") or "").strip()
+        elif len(merge_results) < total - 1:
+            next_unit_index = len(merge_results) + 1
+            previous = (
+                str(merge_results[-1] or "").strip()
+                if merge_results else str(units[0].get("sheet", "") or "").strip()
+            )
+            current = str(units[next_unit_index].get("sheet", "") or "").strip()
+            self._chapter_ai_style_build_unit_index = next_unit_index
+            self._start_chapter_ai_worker(
+                "style_sheet_merge",
+                _build_style_sheet_merge_context(previous, current, next_unit_index + 1, total),
+                f"首次文风建档：正在合并作者写作档案 {next_unit_index}/{total - 1}...",
+            )
+            return
+        else:
+            entry["combined_sheet"] = str(merge_results[-1] or "").strip()
+
+        if not str(entry.get("persona", "") or "").strip():
+            self._chapter_ai_style_cache_entry = entry
+            self._persist_style_cache_entry(self._chapter_ai_style_reference_hash, entry)
+            self._start_chapter_ai_worker(
+                "style_persona",
+                _build_style_persona_context(entry.get("combined_sheet", "")),
+                "首次文风建档：正在生成作者人格（最后一步）...",
+            )
+            return
+
+        if int(entry.get("style_cards_version", 0) or 0) < STYLE_CARD_CACHE_VERSION:
+            self._chapter_ai_style_cache_entry = entry
+            self._persist_style_cache_entry(self._chapter_ai_style_reference_hash, entry)
+            self._start_chapter_ai_worker(
+                "style_cards",
+                _build_style_cards_context(
+                    self._chapter_ai_style_reference,
+                    entry.get("combined_sheet", ""),
+                    entry.get("persona", ""),
+                ),
+                "首次文风建档：正在建立功能型原文片段库（最后一步）...",
+            )
+            return
+
+        entry["profile"] = _compose_style_profile(entry.get("combined_sheet", ""), entry.get("persona", ""))
+        entry["status"] = "complete"
+        entry.pop("error", None)
+        self._persist_style_cache_entry(self._chapter_ai_style_reference_hash, entry)
+        self._chapter_ai_style_combined_sheet = str(entry.get("combined_sheet", "") or "").strip()
+        self._chapter_ai_style_persona = str(entry.get("persona", "") or "").strip()
+        self._chapter_ai_style_cards = deepcopy(
+            entry.get("style_cards", []) if isinstance(entry.get("style_cards"), list) else []
+        )
+        self._chapter_ai_style_profile = str(entry.get("profile", "") or "").strip()
+        self._chapter_ai_style_profile_cache_hash = self._chapter_ai_style_reference_hash
+        self._chapter_ai_style_profile_cache_text = self._chapter_ai_style_profile
+        self._chapter_ai_style_profile_cache_version = STYLE_SHEET_CACHE_VERSION
+        self._start_style_profiled_draft()
+
+    def _persist_style_profile(self, reference_hash, profile_text):
+        profile = str(profile_text or "").strip()
+        if not profile:
+            return
+        cache = self.current_project.setdefault("style_profile_cache", {})
+        if not isinstance(cache, dict):
+            cache = {}
+            self.current_project["style_profile_cache"] = cache
+        cache[reference_hash] = {
+            "version": 1,
+            "status": "complete",
+            "profile": profile,
+            "cached_at": now_str(),
+            "model": str(getattr(self, "_chapter_ai_model", "") or ""),
+        }
+        if hasattr(self, "_note_project_dirty"):
+            self._note_project_dirty()
+        if not hasattr(self, "current_project_path") or not hasattr(self, "_draft_saved_once"):
+            return
+        self._archive_completed_style_profile(reference_hash, cache[reference_hash])
+        try:
+            self._save_draft_snapshot()
+            self._save_current_project_snapshot_if_named()
+        except Exception as e:
+            log_debug("小说文风画像持久化失败", e)
+
+    def _start_style_candidate_finalize(self, candidate, rescue=False, gate_errors=None):
+        self._chapter_ai_style_candidate = str(candidate or "").strip()
+        self._chapter_ai_style_finalize_count = int(
+            getattr(self, "_chapter_ai_style_finalize_count", 0) or 0
+        ) + 1
+        execution_text = str(getattr(self, "_chapter_ai_style_execution", "") or "").strip()
+        self._chapter_ai_style_local_reasons = _style_draft_mismatch_reasons(
+            self._chapter_ai_style_reference,
+            self._chapter_ai_style_candidate,
+            self._chapter_ai_style_output_target,
+        )
+        for reason in gate_errors or []:
+            reason = str(reason or "").strip()
+            if reason and reason not in self._chapter_ai_style_local_reasons:
+                self._chapter_ai_style_local_reasons.append(reason)
+        finalize_context = _build_style_finalize_context(
+            self._chapter_ai_style_original_context,
+            self._chapter_ai_style_candidate,
+            self._chapter_ai_style_profile,
+            self._chapter_ai_style_reference,
+            local_reasons=self._chapter_ai_style_local_reasons,
+            output_target=self._chapter_ai_style_output_target,
+            project=self._ai_project_snapshot(),
+            chapter_index=int(getattr(self, "current_chapter_index", 0) or 0),
+            include_memory=False,
+            execution_text=execution_text,
+            style_plan=str(getattr(self, "_chapter_ai_style_plan", "") or ""),
+            style_cards=getattr(self, "_chapter_ai_style_cards", []),
+            rescue_from_candidate=bool(rescue),
+        )
+        self.chapter_ai_preview.clear()
+        self.chapter_ai_stream_text = ""
+        self._start_chapter_ai_worker(
+            "style_finalize",
+            finalize_context,
+            "正文存在严重偏差，正在执行一次终稿补救..." if rescue else
+            "正文已生成，正在专门审校并修订正文终稿...",
+        )
+
+    @staticmethod
+    def _chapter_ai_checkpoint_hash(value):
+        return hashlib.sha256(str(value or "").encode("utf-8")).hexdigest()
+
+    def _persist_ai_generation_state(self):
+        if not hasattr(self, "current_project_path") or not hasattr(self, "_draft_saved_once"):
+            return
+        try:
+            self.current_project["updated_at"] = now_str()
+            self._save_draft_snapshot()
+            self._save_current_project_snapshot_if_named()
+        except Exception as e:
+            self._log_novel_diagnostic(
+                "ai_generation_checkpoint_save_failed",
+                level="error",
+                project_path=str(getattr(self, "current_project_path", "") or NOVEL_DRAFT_FILE),
+                error_category="storage",
+                **self._novel_exception_details(e),
+            )
+            log_debug("小说AI生成检查点保存失败", e)
+
+    def _store_memory_finalize_checkpoint(self, final_text, status="pending", error=""):
+        chapters = self.current_project.get("chapters", []) if isinstance(self.current_project, dict) else []
+        if not (0 <= self.current_chapter_index < len(chapters)):
+            return False
+        chapter = chapters[self.current_chapter_index]
+        if not isinstance(chapter, dict):
+            return False
+        text = str(final_text or "").strip()
+        if not text:
+            return False
+        memory = self.current_project.get("long_form_memory", {})
+        memory = memory if isinstance(memory, dict) else {}
+        previous = chapter.get("ai_generation_checkpoint", {})
+        previous = previous if isinstance(previous, dict) else {}
+        checkpoint = {
+            "version": 1,
+            "stage": "memory_finalize",
+            "status": str(status or "pending"),
+            "chapter_id": str(chapter.get("id", "") or ""),
+            "final_text": text,
+            "final_text_sha256": self._chapter_ai_checkpoint_hash(text),
+            "source_text_sha256": self._chapter_ai_checkpoint_hash(chapter.get("text", "")),
+            "outline_sha256": self._chapter_ai_checkpoint_hash(chapter.get("outline", "")),
+            "base_memory_revision": int(memory.get("revision", 0) or 0),
+            "provider": str(
+                (getattr(self, "_chapter_ai_provider", {}) or {}).get("name", "")
+                if isinstance(getattr(self, "_chapter_ai_provider", {}), dict) else ""
+            ),
+            "model": str(getattr(self, "_chapter_ai_model", "") or ""),
+            "created_at": str(previous.get("created_at", "") or now_str()),
+            "updated_at": now_str(),
+        }
+        if error:
+            checkpoint["error"] = str(error)[:1000]
+        chapter["ai_generation_checkpoint"] = checkpoint
+        if hasattr(self, "_note_project_dirty"):
+            self._note_project_dirty()
+        self._persist_ai_generation_state()
+        return True
+
+    def _memory_finalize_checkpoint_text(self, chapter):
+        if not isinstance(chapter, dict):
+            return ""
+        checkpoint = chapter.get("ai_generation_checkpoint", {})
+        if not isinstance(checkpoint, dict) or not checkpoint:
+            return ""
+        text = str(checkpoint.get("final_text", "") or "").strip()
+        memory = self.current_project.get("long_form_memory", {})
+        memory = memory if isinstance(memory, dict) else {}
+        current_text_hash = self._chapter_ai_checkpoint_hash(chapter.get("text", ""))
+        final_text_hash = self._chapter_ai_checkpoint_hash(text)
+        checkpoint_source_hash = str(checkpoint.get("source_text_sha256", "") or "")
+        try:
+            checkpoint_version = int(checkpoint.get("version", 0) or 0)
+        except Exception:
+            checkpoint_version = 0
+        try:
+            checkpoint_revision = int(checkpoint.get("base_memory_revision", -1) or 0)
+        except Exception:
+            checkpoint_revision = -1
+        try:
+            memory_revision = int(memory.get("revision", 0) or 0)
+        except Exception:
+            memory_revision = 0
+        source_matches = checkpoint_source_hash == current_text_hash or current_text_hash == final_text_hash
+        valid = (
+            checkpoint_version == 1
+            and str(checkpoint.get("stage", "") or "") == "memory_finalize"
+            and str(checkpoint.get("chapter_id", "") or "") == str(chapter.get("id", "") or "")
+            and bool(text)
+            and str(checkpoint.get("final_text_sha256", "") or "") == final_text_hash
+            and source_matches
+            and str(checkpoint.get("outline_sha256", "") or "")
+            == self._chapter_ai_checkpoint_hash(chapter.get("outline", ""))
+            and checkpoint_revision == memory_revision
+            and str(chapter.get("memory_sync_status", "") or "") in {"pending", "failed"}
+        )
+        if not valid:
+            return ""
+        return text
+
+    def _validated_memory_finalize_checkpoint(self):
+        chapters = self.current_project.get("chapters", []) if isinstance(self.current_project, dict) else []
+        if not (0 <= self.current_chapter_index < len(chapters)):
+            return ""
+        text = self._memory_finalize_checkpoint_text(chapters[self.current_chapter_index])
+        if not text:
+            return ""
+        preview = str(self.chapter_ai_preview.toPlainText() or "").strip()
+        return preview or text
+
+    def _clear_memory_finalize_checkpoint(self, persist=False):
+        chapters = self.current_project.get("chapters", []) if isinstance(self.current_project, dict) else []
+        if not (0 <= self.current_chapter_index < len(chapters)):
+            return False
+        chapter = chapters[self.current_chapter_index]
+        if not isinstance(chapter, dict) or not chapter.get("ai_generation_checkpoint"):
+            return False
+        chapter["ai_generation_checkpoint"] = {}
+        if hasattr(self, "_note_project_dirty"):
+            self._note_project_dirty()
+        if persist:
+            self._persist_ai_generation_state()
+        return True
+
+    def _start_memory_finalize(self, final_text, resumed=False):
+        text = str(final_text or "").strip()
+        if not text:
+            self._fail_memory_sync("正文终稿为空，无法整理章节状态")
+            return
+        self._chapter_ai_memory_finalize_attempted = True
+        self._chapter_ai_memory_pending = {
+            "chapter_id": self._current_chapter_id(),
+            "final_text": text,
+            "bundle": {},
+            "errors": [],
+            "mode": "style",
+            "reconciliation_started": False,
+        }
+        chapters = self.current_project.get("chapters", []) if isinstance(self.current_project, dict) else []
+        if 0 <= self.current_chapter_index < len(chapters) and isinstance(chapters[self.current_chapter_index], dict):
+            chapter = chapters[self.current_chapter_index]
+            if (self.current_chapter_index + 1) % 10 == 0:
+                chapter["memory_reconciliation_status"] = "pending"
+                chapter["memory_reconciliation_error"] = ""
+            else:
+                chapter["memory_reconciliation_status"] = "skipped"
+                chapter["memory_reconciliation_error"] = ""
+        self._store_memory_finalize_checkpoint(text)
+        context = _build_long_form_memory_finalize_context(
+            self._ai_project_snapshot(),
+            self.current_chapter_index,
+            text,
+        )
+        self.chapter_ai_preview.clear()
+        self.chapter_ai_stream_text = ""
+        status_text = (
+            f"已识别后台保存的完整正文（{len(text)}字），不重写正文，正在补摘要和长期状态..."
+            if resumed else
+            "正文终稿已确定，正在独立整理摘要、关键事实和长期状态..."
+        )
+        self._start_chapter_ai_worker(
+            "memory_finalize",
+            context,
+            status_text,
+        )
+
+    def _start_memory_reconciliation(self, final_text, bundle):
+        pending = getattr(self, "_chapter_ai_memory_pending", {})
+        if not isinstance(pending, dict) or pending.get("chapter_id") != self._current_chapter_id():
+            self._fail_memory_sync("章节已切换，无法启动边界状态对账")
+            return
+        pending["bundle"] = deepcopy(bundle) if isinstance(bundle, dict) else {}
+        pending["reconciliation_started"] = True
+        self._chapter_ai_memory_pending = pending
+        chapters = self.current_project.get("chapters", []) if isinstance(self.current_project, dict) else []
+        if 0 <= self.current_chapter_index < len(chapters) and isinstance(chapters[self.current_chapter_index], dict):
+            chapters[self.current_chapter_index]["memory_reconciliation_status"] = "pending"
+            chapters[self.current_chapter_index]["memory_reconciliation_error"] = ""
+        context = _build_long_form_memory_reconcile_context(
+            self._ai_project_snapshot(),
+            self.current_chapter_index,
+            final_text,
+            (bundle or {}).get("memory_update", {}) if isinstance(bundle, dict) else {},
+            summary=(bundle or {}).get("summary", "") if isinstance(bundle, dict) else "",
+            key_facts=(bundle or {}).get("key_facts", "") if isinstance(bundle, dict) else "",
+        )
+        self.chapter_ai_preview.clear()
+        self.chapter_ai_stream_text = ""
+        self._start_chapter_ai_worker(
+            "memory_reconcile",
+            context,
+            "十章边界状态已通过结构校验，正在执行一次语义对账（只修正状态，不阻断正文）...",
+        )
+
+    def _apply_memory_reconciliation_fallback(self, message, status="failed"):
+        pending = getattr(self, "_chapter_ai_memory_pending", {})
+        if not isinstance(pending, dict):
+            self._fail_memory_sync(message)
+            return
+        final_text = str(pending.get("final_text", "") or "").strip()
+        bundle = deepcopy(pending.get("bundle", {})) if isinstance(pending.get("bundle"), dict) else {}
+        chapters = self.current_project.get("chapters", []) if isinstance(self.current_project, dict) else []
+        if 0 <= self.current_chapter_index < len(chapters) and isinstance(chapters[self.current_chapter_index], dict):
+            chapter = chapters[self.current_chapter_index]
+            chapter["memory_reconciliation_status"] = str(status or "failed")
+            chapter["memory_reconciliation_error"] = str(message or "")[:1000]
+        mode = str(pending.get("mode", "style") or "style")
+        self._chapter_ai_memory_pending = {}
+        if final_text and bundle:
+            if mode == "summary":
+                self._apply_repaired_summary_result(bundle)
+            else:
+                self._apply_style_final_result(final_text, bundle, memory_validated=True)
+        else:
+            self._fail_memory_sync(message)
+
+    def _handle_memory_reconciliation_ready(self, content):
+        pending = getattr(self, "_chapter_ai_memory_pending", {})
+        if not isinstance(pending, dict) or pending.get("chapter_id") != self._current_chapter_id():
+            self._fail_memory_sync("章节已切换，对账结果未应用")
+            return
+        parsed = _parse_memory_reconciliation_result(content)
+        if not parsed.get("parsed"):
+            self._apply_memory_reconciliation_fallback("边界语义对账结果无法解析")
+            return
+        original_bundle = deepcopy(pending.get("bundle", {})) if isinstance(pending.get("bundle"), dict) else {}
+        final_text = str(pending.get("final_text", "") or "").strip()
+        merged_update = _merge_long_form_memory_reconciliation_patch(
+            original_bundle.get("memory_update", {}) if isinstance(original_bundle, dict) else {},
+            parsed.get("corrections", {}),
+        )
+        merged_update = _literalize_long_form_memory_evidence(merged_update, final_text)
+        if isinstance(getattr(self, "current_project", None), dict):
+            merged_update = _normalize_long_form_structural_refs(
+                self.current_project,
+                self.current_chapter_index,
+                merged_update,
+            )
+        bundle = deepcopy(original_bundle)
+        bundle["memory_update"] = merged_update
+        errors = self._memory_bundle_validation_errors(final_text, bundle)
+        if errors:
+            self._apply_memory_reconciliation_fallback(
+                "对账纠错补丁未通过完整校验，已采用原状态增量：" + "；".join(errors)
+            )
+            return
+        chapters = self.current_project.get("chapters", []) if isinstance(self.current_project, dict) else []
+        if 0 <= self.current_chapter_index < len(chapters) and isinstance(chapters[self.current_chapter_index], dict):
+            chapter = chapters[self.current_chapter_index]
+            chapter["memory_reconciliation_status"] = "complete"
+            chapter["memory_reconciliation_error"] = ""
+        mode = str(pending.get("mode", "style") or "style")
+        self._chapter_ai_memory_pending = {}
+        if mode == "summary":
+            self._apply_repaired_summary_result(bundle)
+        else:
+            self._apply_style_final_result(final_text, bundle, memory_validated=True)
+
+    def _handle_memory_finalize_ready(self, content):
+        pending = getattr(self, "_chapter_ai_memory_pending", {})
+        if not isinstance(pending, dict) or pending.get("chapter_id") != self._current_chapter_id():
+            self._fail_memory_sync("章节已切换，状态整理结果未应用")
+            return
+        parsed = _parse_memory_repair_result(content)
+        bundle = {
+            "outline": str(parsed.get("outline", "") or "").strip(),
+            "summary": str(parsed.get("summary", "") or "").strip(),
+            "key_facts": str(parsed.get("key_facts", "") or "").strip(),
+            "memory_update": deepcopy(parsed.get("memory_update", {}))
+            if isinstance(parsed.get("memory_update"), dict) else {},
+        }
+        final_text = str(pending.get("final_text", "") or "").strip()
+        errors = self._memory_bundle_validation_errors(final_text, bundle)
+        if not parsed.get("parsed"):
+            errors.insert(0, "独立状态整理结果无法解析")
+        if errors:
+            self._start_memory_repair(final_text, bundle, errors, "style")
+            return
+        if (self.current_chapter_index + 1) % 10 == 0 and not pending.get("reconciliation_started"):
+            self._start_memory_reconciliation(final_text, bundle)
+            return
+        self._chapter_ai_memory_pending = {}
+        self.chapter_ai_preview.setPlainText(final_text)
+        self._apply_style_final_result(final_text, bundle, memory_validated=True)
+
+    def _memory_bundle_validation_errors(self, final_text, bundle):
+        errors = []
+        if not isinstance(bundle, dict):
+            return ["终稿附带资料无法解析"]
+        for key, label in (("outline", "实际提纲"), ("summary", "本章摘要"), ("key_facts", "关键事实")):
+            if not str(bundle.get(key, "") or "").strip():
+                errors.append(f"{label}为空")
+        if not isinstance(getattr(self, "current_project", None), dict):
+            return errors
+        normalized_update = _literalize_long_form_memory_evidence(
+            bundle.get("memory_update", {}), final_text
+        )
+        normalized_update = _normalize_long_form_structural_refs(
+            self.current_project,
+            self.current_chapter_index,
+            normalized_update,
+        )
+        update_errors = _validate_long_form_memory_update(
+            self.current_project,
+            self.current_chapter_index,
+            normalized_update,
+            final_text=final_text,
+            require_revision=True,
+            require_evidence=True,
+        )
+        if not update_errors:
+            bundle["memory_update"] = normalized_update
+        errors.extend(update_errors)
+        return errors
+
+    def _start_memory_repair(self, final_text, bundle, validation_errors=None, mode="style"):
+        attempts = int(getattr(self, "_chapter_ai_memory_repair_attempts", 0) or 0) + 1
+        self._chapter_ai_memory_repair_attempts = attempts
+        self._log_novel_diagnostic(
+            "memory_validation_failed",
+            level="warning",
+            action="memory_repair",
+            validation_attempt=attempts,
+            validation_errors=[str(item) for item in validation_errors or []],
+            final_text_chars=len(str(final_text or "").strip()),
+            final_text_sha256=self._chapter_ai_checkpoint_hash(final_text),
+            repair_mode=str(mode or "style"),
+        )
+        self._chapter_ai_memory_pending = {
+            "chapter_id": self._current_chapter_id(),
+            "final_text": str(final_text or "").strip(),
+            "bundle": deepcopy(bundle) if isinstance(bundle, dict) else {},
+            "errors": [str(item) for item in validation_errors or []],
+            "mode": str(mode or "style"),
+        }
+        context = _build_long_form_memory_repair_context(
+            self._ai_project_snapshot(),
+            self.current_chapter_index,
+            final_text,
+            outline=(bundle or {}).get("outline", "") if isinstance(bundle, dict) else "",
+            summary=(bundle or {}).get("summary", "") if isinstance(bundle, dict) else "",
+            key_facts=(bundle or {}).get("key_facts", "") if isinstance(bundle, dict) else "",
+            memory_update=(bundle or {}).get("memory_update", {}) if isinstance(bundle, dict) else {},
+            validation_errors=validation_errors,
+        )
+        self.chapter_ai_preview.clear()
+        self.chapter_ai_stream_text = ""
+        self._start_chapter_ai_worker(
+            "memory_repair",
+            context,
+            f"正文终稿已保留，正在自动修复章节状态（{attempts}/2）...",
+        )
+
+    def _fail_memory_sync(self, message):
+        chapters = self.current_project.get("chapters", []) if isinstance(self.current_project, dict) else []
+        if 0 <= self.current_chapter_index < len(chapters) and isinstance(chapters[self.current_chapter_index], dict):
+            chapters[self.current_chapter_index]["memory_sync_status"] = "failed"
+            chapters[self.current_chapter_index]["memory_sync_error"] = str(message or "")[:1000]
+        pending = getattr(self, "_chapter_ai_memory_pending", {})
+        final_text = str(pending.get("final_text", "") or "").strip() if isinstance(pending, dict) else ""
+        if final_text:
+            self.chapter_ai_preview.setPlainText(final_text)
+            self._store_memory_finalize_checkpoint(
+                final_text,
+                status="failed",
+                error=str(message or ""),
+            )
+        request_id = str(getattr(self, "_chapter_ai_diagnostic_request_id", "") or "")
+        validation_payload = ""
+        try:
+            validation_payload = json.dumps({
+                "message": str(message or ""),
+                "pending_errors": pending.get("errors", []) if isinstance(pending, dict) else [],
+                "bundle": pending.get("bundle", {}) if isinstance(pending, dict) else {},
+            }, ensure_ascii=False, default=str)
+        except Exception:
+            validation_payload = str(message or "")
+        snapshot_path = self._save_chapter_ai_failure_snapshot(
+            "memory_sync",
+            request_id,
+            error=str(message or ""),
+            validation_payload=validation_payload,
+        )
+        self._log_novel_diagnostic(
+            "memory_sync_failed",
+            level="error",
+            action="memory_sync",
+            request_id=request_id,
+            error=clean_error_text(message),
+            error_category="memory_state",
+            repair_attempts=int(getattr(self, "_chapter_ai_memory_repair_attempts", 0) or 0),
+            final_text_chars=len(final_text),
+            final_text_sha256=self._chapter_ai_checkpoint_hash(final_text) if final_text else "",
+            diagnostic_snapshot_path=snapshot_path,
+        )
+        self._chapter_ai_style_workflow_active = False
+        self._set_partial_chapter_ai_preview_state(False)
+        self._reset_chapter_ai_sequence()
+        if getattr(self, "_auto_expand_all_active", False):
+            self._stop_auto_expand_all(
+                f"自动扩写已停止：第{self.current_chapter_index + 1}章正文完成，但状态同步失败。"
+            )
+        self.set_status_tip(
+            "正文终稿未写入章节：状态同步失败，已保留后台恢复检查点；"
+            "重新启动自动扩写时会继续整理状态。"
+            f"{str(message or '')[:120]}"
+        )
+
+    def _handle_memory_repair_ready(self, content):
+        pending = getattr(self, "_chapter_ai_memory_pending", {})
+        if not isinstance(pending, dict) or pending.get("chapter_id") != self._current_chapter_id():
+            self._fail_memory_sync("章节已切换，修复结果未应用")
+            return
+        parsed = _parse_memory_repair_result(content)
+        bundle = deepcopy(pending.get("bundle", {})) if isinstance(pending.get("bundle"), dict) else {}
+        for key in ("outline", "summary", "key_facts"):
+            value = str(parsed.get(key, "") or "").strip()
+            if value:
+                bundle[key] = value
+        if parsed.get("repair_mode") == "patch":
+            bundle["memory_update"] = _merge_long_form_memory_repair_patch(
+                bundle.get("memory_update", {}),
+                parsed.get("memory_patch", {}),
+            )
+        elif parsed.get("parsed") and isinstance(parsed.get("memory_update"), dict):
+            bundle["memory_update"] = deepcopy(parsed.get("memory_update", {}))
+        final_text = str(pending.get("final_text", "") or "").strip()
+        errors = self._memory_bundle_validation_errors(final_text, bundle)
+        if errors:
+            if int(getattr(self, "_chapter_ai_memory_repair_attempts", 0) or 0) < 2:
+                self._start_memory_repair(final_text, bundle, errors, pending.get("mode", "style"))
+                return
+            self._fail_memory_sync("；".join(errors))
+            return
+        self._chapter_ai_memory_pending = {}
+        self.chapter_ai_preview.setPlainText(final_text)
+        if pending.get("mode") == "summary":
+            self._apply_repaired_summary_result(bundle)
+        else:
+            self._apply_style_final_result(final_text, bundle, memory_validated=True)
+
+    def _apply_repaired_summary_result(self, bundle):
+        if isinstance(getattr(self, "current_project", None), dict):
+            memory_changed = _apply_long_form_memory_update(
+                self.current_project,
+                self.current_chapter_index,
+                bundle.get("memory_update", {}) if isinstance(bundle, dict) else {},
+            )
+        else:
+            memory_changed = True
+        if not memory_changed:
+            self._fail_memory_sync("修复后的状态事务未能提交")
+            return
+        summary = str(bundle.get("summary", "") or "").strip()
+        key_facts = str(bundle.get("key_facts", "") or "").strip()
+        if summary:
+            self._set_text_without_signals(self.chapter_summary, summary)
+        if key_facts:
+            self._set_text_without_signals(self.chapter_key_facts, key_facts)
+        chapters = self.current_project.get("chapters", [])
+        chapter = chapters[self.current_chapter_index] if 0 <= self.current_chapter_index < len(chapters) else {}
+        self._set_line_text_without_signals(
+            self.chapter_linked,
+            ", ".join(_normalize_name_list(chapter.get("linked_characters", []))),
+        )
+        self._refresh_long_form_record_views()
+        self._mark_chapter_dirty()
+        self._mark_current_chapter_ai_result_analyzed()
+        self._note_project_dirty()
+        self.chapter_ai_preview.clear()
+        self._set_partial_chapter_ai_preview_state(False)
+        self._reset_chapter_ai_sequence()
+        self.set_chapter_ai_panel_expanded(False)
+        self.set_status_tip("章节 AI 已完成：摘要、关键事实和长篇状态已自动修复并提交。")
+        self._on_auto_expand_chapter_completed(True)
+
+    def _start_chapter_ai_worker(
+        self, action, context, status_text="", resume_prefix="", transient_retry=False
+    ):
         self.set_chapter_ai_panel_expanded(True)
+        self._status_begin_workflow("chapter_ai")
+        chapter_id = self._current_chapter_id()
+        request_id = self._next_novel_diagnostic_request_id("chapter-ai")
+        diagnostic_started_at = time.perf_counter()
+        self._chapter_ai_diagnostic_request_id = request_id
+        self._chapter_ai_diagnostic_started_at = diagnostic_started_at
+        if not transient_retry:
+            retry_counts = getattr(self, "_chapter_ai_transient_retry_counts", None)
+            if isinstance(retry_counts, dict):
+                retry_counts.pop(f"{chapter_id}:{action}", None)
+            self._chapter_ai_transient_retry_pending = False
+            self._chapter_ai_transient_retry_token = int(
+                getattr(self, "_chapter_ai_transient_retry_token", 0) or 0
+            ) + 1
         self.chapter_ai_stream_text = str(resume_prefix or "").strip()
         self._chapter_ai_resume_prefix = str(resume_prefix or "").strip() if action == "draft" else ""
         if status_text:
             self.set_status_tip(status_text)
-        self.writing_worker = NovelWritingWorker(
-            self._chapter_ai_provider.get("base_url", ""),
-            self._chapter_ai_provider.get("api_key", ""),
-            self._chapter_ai_model,
-            action,
-            context,
-            self._chapter_ai_provider.get("proxy_url", ""),
-            self._provider_proxy_mode(self._chapter_ai_provider),
-        )
+        if action == "draft":
+            self._chapter_ai_last_context = str(context or "")
+        self._chapter_ai_running_action = action
+        self._chapter_ai_running_context = str(context or "")
+        self._chapter_ai_running_chapter_id = chapter_id
+        self._retain_previous_writing_worker()
+        try:
+            self.writing_worker = NovelWritingWorker(
+                self._chapter_ai_provider.get("base_url", ""),
+                self._chapter_ai_provider.get("api_key", ""),
+                self._chapter_ai_model,
+                action,
+                context,
+                self._chapter_ai_provider.get("proxy_url", ""),
+                self._provider_proxy_mode(self._chapter_ai_provider),
+            )
+        except Exception as exc:
+            error_details = self._novel_exception_details(exc)
+            snapshot_path = self._save_chapter_ai_failure_snapshot(
+                action,
+                request_id,
+                error=error_details["error"],
+                validation_payload=error_details["traceback"],
+            )
+            self._log_novel_diagnostic(
+                "chapter_ai_worker_create_failed",
+                level="error",
+                action=action,
+                chapter_id=chapter_id,
+                request_id=request_id,
+                diagnostic_snapshot_path=snapshot_path,
+                error_category=self._novel_diagnostic_error_category(exc),
+                **error_details,
+            )
+            raise
+        self.writing_worker.diagnostic_request_id = request_id
+        self.writing_worker.diagnostic_started_at = diagnostic_started_at
         self.writing_worker.progress.connect(self.set_status_tip)
         self.writing_worker.chunk.connect(self.on_chapter_ai_chunk)
         self.writing_worker.result_ready.connect(self.on_chapter_ai_ready)
         self.writing_worker.failed.connect(self.on_chapter_ai_failed)
         self.writing_worker.finished.connect(self._cleanup_writing_worker)
         self._chapter_ai_stop_requested_by_user = False
-        self._chapter_ai_running_action = action
+        if not transient_retry or not str(getattr(self, "_chapter_ai_running_status_text", "") or ""):
+            self._chapter_ai_running_status_text = str(status_text or "")
+        context_text = str(context or "")
+        sent_context = context_text[:NOVEL_AI_CONTEXT_LIMIT]
+        retry_counts = getattr(self, "_chapter_ai_transient_retry_counts", {})
+        retry_attempt = int(retry_counts.get(f"{chapter_id}:{action}", 0) or 0) if isinstance(retry_counts, dict) else 0
+        self._log_novel_diagnostic(
+            "chapter_ai_request_started",
+            action=action,
+            chapter_id=chapter_id,
+            request_id=request_id,
+            transient_retry=bool(transient_retry),
+            retry_attempt=retry_attempt,
+            context_chars=len(context_text),
+            context_utf8_bytes=len(context_text.encode("utf-8", errors="replace")),
+            sent_context_chars=len(sent_context),
+            sent_context_utf8_bytes=len(sent_context.encode("utf-8", errors="replace")),
+            context_limit=NOVEL_AI_CONTEXT_LIMIT,
+            context_truncated=len(context_text) > NOVEL_AI_CONTEXT_LIMIT,
+            context_fill_percent=round(
+                min(100.0, len(sent_context) * 100.0 / max(1, NOVEL_AI_CONTEXT_LIMIT)), 2
+            ),
+            context_sha256=hashlib.sha256(
+                context_text.encode("utf-8", errors="replace")
+            ).hexdigest(),
+            sent_context_sha256=hashlib.sha256(
+                sent_context.encode("utf-8", errors="replace")
+            ).hexdigest(),
+            context_sections=self._novel_context_section_metrics(context_text),
+            resume_prefix_chars=len(str(resume_prefix or "")),
+            max_output_tokens=int(
+                getattr(self.writing_worker, "diagnostics", {}).get("max_output_tokens", 0) or 0
+            ),
+        )
         self._set_chapter_ai_actions_enabled(False)
-        self.writing_worker.start()
+        try:
+            self.writing_worker.start()
+        except Exception as exc:
+            error_details = self._novel_exception_details(exc)
+            snapshot_path = self._save_chapter_ai_failure_snapshot(
+                action,
+                request_id,
+                error=error_details["error"],
+                worker_diagnostics=getattr(self.writing_worker, "diagnostics", {}),
+                validation_payload=error_details["traceback"],
+            )
+            self._log_novel_diagnostic(
+                "chapter_ai_worker_start_failed",
+                level="error",
+                action=action,
+                chapter_id=chapter_id,
+                request_id=request_id,
+                diagnostic_snapshot_path=snapshot_path,
+                error_category=self._novel_diagnostic_error_category(exc),
+                **error_details,
+            )
+            raise
+
+    @staticmethod
+    def _is_transient_chapter_ai_error(err):
+        text = clean_error_text(err).lower()
+        transient_markers = (
+            "upstream request failed",
+            "upstream service temporarily unavailable",
+            "service temporarily unavailable",
+            "concurrency limit exceeded",
+            "rate limit",
+            "too many requests",
+            "timeout",
+            "timed out",
+            "connection reset",
+            "connection aborted",
+            "connection broken",
+            "remote end closed",
+            "ssl eof",
+            "ssleoferror",
+            "eof occurred in violation of protocol",
+            "max retries exceeded",
+            "response ended prematurely",
+            "未完整结束",
+            "接口错误 429",
+            "接口错误 500",
+            "接口错误 502",
+            "接口错误 503",
+            "接口错误 504",
+            "接口错误 524",
+        )
+        return any(marker in text for marker in transient_markers)
+
+    @staticmethod
+    def _transient_chapter_ai_retry_delay(attempt, err=""):
+        attempt = max(1, int(attempt or 1))
+        base_seconds = min(120, 15 * (2 ** (attempt - 1)))
+        retry_after_seconds = 0
+        retry_after_match = re.search(
+            r"retry[-_ ]?after[^\d]*(\d{1,4})",
+            clean_error_text(err).lower(),
+        )
+        if retry_after_match:
+            retry_after_seconds = min(300, int(retry_after_match.group(1)))
+            base_seconds = max(base_seconds, retry_after_seconds)
+        jittered = round(base_seconds * random.uniform(0.85, 1.15))
+        return max(5, retry_after_seconds, min(300, int(jittered)))
+
+    def _schedule_transient_chapter_ai_retry(self, action, err):
+        if not self._is_transient_chapter_ai_error(err):
+            return False
+        if getattr(self, "_chapter_ai_stop_requested_by_user", False):
+            return False
+        context = str(getattr(self, "_chapter_ai_running_context", "") or "")
+        chapter_id = str(getattr(self, "_chapter_ai_running_chapter_id", "") or "")
+        if not action or not context or not chapter_id:
+            return False
+        retry_counts = getattr(self, "_chapter_ai_transient_retry_counts", None)
+        if not isinstance(retry_counts, dict):
+            retry_counts = {}
+            self._chapter_ai_transient_retry_counts = retry_counts
+        retry_key = f"{chapter_id}:{action}"
+        attempt = int(retry_counts.get(retry_key, 0) or 0) + 1
+        max_retries = 1 if action == "memory_repair" else 4
+        if attempt > max_retries:
+            return False
+        retry_counts[retry_key] = attempt
+        delay_seconds = self._transient_chapter_ai_retry_delay(attempt, err)
+        status_text = str(getattr(self, "_chapter_ai_running_status_text", "") or "")
+        self._chapter_ai_transient_retry_pending = True
+        token = int(getattr(self, "_chapter_ai_transient_retry_token", 0) or 0) + 1
+        self._chapter_ai_transient_retry_token = token
+        self.set_status_tip(
+            f"AI 上游暂时异常，{delay_seconds} 秒后自动重试当前步骤（{attempt}/{max_retries}）..."
+        )
+
+        def retry():
+            if token != int(getattr(self, "_chapter_ai_transient_retry_token", 0) or 0):
+                return
+            if not getattr(self, "_chapter_ai_transient_retry_pending", False):
+                return
+            if getattr(self, "_chapter_ai_stop_requested_by_user", False):
+                self._chapter_ai_transient_retry_pending = False
+                return
+            if self._current_chapter_id() != chapter_id:
+                self._chapter_ai_transient_retry_pending = False
+                self._chapter_ai_transient_retry_counts.pop(retry_key, None)
+                self._reset_chapter_ai_sequence()
+                self.set_status_tip("章节已切换，已取消上一个章节的自动重试。")
+                self._set_chapter_ai_actions_enabled(True)
+                return
+            if action.startswith("style_") and not getattr(self, "_chapter_ai_style_workflow_active", False):
+                self._chapter_ai_transient_retry_pending = False
+                return
+            worker = getattr(self, "writing_worker", None)
+            if worker is not None and worker.isRunning():
+                QTimer.singleShot(500, retry)
+                return
+            self._chapter_ai_transient_retry_pending = False
+            self._start_chapter_ai_worker(
+                action,
+                context,
+                f"正在自动重试当前步骤（{attempt}/{max_retries}）..." if not status_text else
+                f"{status_text.rstrip('。.')}，自动重试 {attempt}/{max_retries}...",
+                transient_retry=True,
+            )
+
+        QTimer.singleShot(delay_seconds * 1000, retry)
+        self._log_novel_diagnostic(
+            "chapter_ai_retry_scheduled",
+            level="warning",
+            action=action,
+            chapter_id=chapter_id,
+            request_id=str(getattr(self, "_chapter_ai_diagnostic_request_id", "") or ""),
+            retry_attempt=attempt,
+            max_retries=max_retries,
+            delay_seconds=delay_seconds,
+            error=clean_error_text(err),
+            error_category=self._novel_diagnostic_error_category(err),
+        )
+        return True
+
+    def _clear_transient_chapter_ai_retry(self, action):
+        chapter_id = str(getattr(self, "_chapter_ai_running_chapter_id", "") or "")
+        retry_counts = getattr(self, "_chapter_ai_transient_retry_counts", None)
+        if isinstance(retry_counts, dict) and chapter_id and action:
+            retry_counts.pop(f"{chapter_id}:{action}", None)
+        self._chapter_ai_transient_retry_pending = False
+        self._chapter_ai_transient_retry_token = int(
+            getattr(self, "_chapter_ai_transient_retry_token", 0) or 0
+        ) + 1
+
+    def _retain_previous_writing_worker(self):
+        worker = getattr(self, "writing_worker", None)
+        if worker is None:
+            return
+        retired = getattr(self, "writing_retired_workers", None)
+        if not isinstance(retired, list):
+            retired = []
+            self.writing_retired_workers = retired
+        if worker not in retired:
+            retired.append(worker)
+        self.writing_worker = None
 
     def _start_chapter_ai_sequence(self):
         if self.current_chapter_index < 0:
             QMessageBox.warning(self, "AI 写作失败", "请先选择一个章节。")
             return
-        provider, model, error = self._current_novel_ai_selection()
+        if (
+            getattr(self, "_auto_expand_all_active", False)
+            and isinstance(getattr(self, "_chapter_ai_provider", None), dict)
+            and getattr(self, "_chapter_ai_provider", None)
+            and str(getattr(self, "_chapter_ai_model", "") or "").strip()
+        ):
+            provider = self._chapter_ai_provider
+            model = self._chapter_ai_model
+            error = ""
+        else:
+            provider, model, error = self._current_novel_ai_selection()
         if error:
             self.set_ai_settings_expanded(True)
             self.set_status_tip(f"AI 写作失败：{error}")
             QMessageBox.warning(self, "AI 写作失败", error)
             return
+        if hasattr(self, "_loading"):
+            self._flush_current_editors()
+        chapters = self.current_project.get("chapters", []) if isinstance(self.current_project, dict) else []
+        chapter = (
+            chapters[self.current_chapter_index]
+            if 0 <= self.current_chapter_index < len(chapters)
+            and isinstance(chapters[self.current_chapter_index], dict)
+            else {}
+        )
+        had_memory_checkpoint = bool(chapter.get("ai_generation_checkpoint"))
+        checkpoint_text = self._validated_memory_finalize_checkpoint()
+        if had_memory_checkpoint and not checkpoint_text:
+            self._clear_memory_finalize_checkpoint(persist=True)
         self._chapter_ai_provider = provider
         self._chapter_ai_model = model
         self._reset_chapter_ai_sequence()
+        self._reset_chapter_ai_style_retry()
         self._chapter_ai_sequence_active = True
         self._chapter_ai_sequence_chapter_id = self._current_chapter_id()
+        if 0 <= self.current_chapter_index < len(chapters) and isinstance(chapters[self.current_chapter_index], dict):
+            if getattr(self, "_auto_expand_all_active", False):
+                chapters[self.current_chapter_index]["auto_expand_resume_required"] = True
+            chapters[self.current_chapter_index]["memory_sync_status"] = "pending"
+            chapters[self.current_chapter_index]["memory_sync_error"] = ""
+            if getattr(self, "_auto_expand_all_active", False):
+                if hasattr(self, "_note_project_dirty"):
+                    self._note_project_dirty()
+                self._persist_ai_generation_state()
         self._chapter_ai_sequence_started_outline = self.chapter_outline.toPlainText().strip()
         self._set_partial_chapter_ai_preview_state(False)
         self._chapter_ai_resume_prefix = ""
         self.chapter_ai_preview.setPlainText("")
+        if checkpoint_text:
+            self._chapter_ai_style_workflow_active = True
+            self._start_memory_finalize(checkpoint_text, resumed=True)
+            return
+        existing_body = str(chapter.get("text", "") or "").strip()
+        if getattr(self, "_auto_expand_all_active", False) and existing_body:
+            self._chapter_ai_style_workflow_active = True
+            self._start_memory_finalize(existing_body, resumed=True)
+            return
         try:
             context = self._chapter_ai_context_with_preview("draft")
         except Exception as e:
+            self._log_novel_diagnostic(
+                "chapter_ai_context_build_failed",
+                level="error",
+                action="draft",
+                chapter_id=self._current_chapter_id(),
+                error_category="context_build",
+                **self._novel_exception_details(e),
+            )
+            if getattr(self, "_auto_expand_all_active", False):
+                self._stop_auto_expand_all(
+                    f"自动扩写已停止：第{self.current_chapter_index + 1}章上下文组装失败。"
+                )
             self._reset_chapter_ai_sequence()
             QMessageBox.warning(self, "AI 写作失败", str(e))
             return
-        self._start_chapter_ai_worker("draft", context, "正在扩写正文...")
+        self._start_style_locked_draft(context)
 
     def _continue_chapter_ai_sequence(self, next_action):
         if not getattr(self, "_chapter_ai_sequence_active", False):
@@ -5129,6 +7879,18 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
         try:
             context = self._chapter_ai_context_with_preview(next_action)
         except Exception as e:
+            self._log_novel_diagnostic(
+                "chapter_ai_context_build_failed",
+                level="error",
+                action=next_action,
+                chapter_id=self._current_chapter_id(),
+                error_category="context_build",
+                **self._novel_exception_details(e),
+            )
+            if getattr(self, "_auto_expand_all_active", False):
+                self._stop_auto_expand_all(
+                    f"自动扩写已停止：第{self.current_chapter_index + 1}章上下文组装失败。"
+                )
             self._reset_chapter_ai_sequence()
             QMessageBox.warning(self, "AI 写作失败", str(e))
             return False
@@ -5187,6 +7949,7 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
             return
         if resume_partial:
             self._reset_chapter_ai_sequence()
+            self._reset_chapter_ai_style_retry()
             self._chapter_ai_sequence_active = True
             self._chapter_ai_sequence_chapter_id = self._current_chapter_id()
             self._chapter_ai_sequence_pending_action = "draft"
@@ -5194,6 +7957,14 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
         try:
             context = self._chapter_ai_context_with_preview(action)
         except Exception as e:
+            self._log_novel_diagnostic(
+                "chapter_ai_context_build_failed",
+                level="error",
+                action=action,
+                chapter_id=self._current_chapter_id(),
+                error_category="context_build",
+                **self._novel_exception_details(e),
+            )
             if resume_partial:
                 self._reset_chapter_ai_sequence()
             QMessageBox.warning(self, "AI 写作失败", str(e))
@@ -5212,8 +7983,39 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
         self._start_chapter_ai_worker(action, context, resume_prefix=self._chapter_ai_resume_prefix)
 
     def stop_chapter_ai_action(self):
+        if getattr(self, "_auto_expand_all_active", False):
+            completed = int(getattr(self, "_auto_expand_all_completed", 0) or 0)
+            current, total = self._auto_expand_all_chapter_progress()
+            position = f"停在第{current}章（{current}/{total}）" if current and total else "当前章节已停止"
+            self._stop_auto_expand_all(f"自动扩写已中止：{position}，本轮已完成 {completed} 章。")
         worker = self.writing_worker
         plan_worker = getattr(self, "chapter_plan_worker", None)
+        if getattr(self, "_chapter_plan_auto_active", False):
+            self._chapter_ai_stop_requested_by_user = True
+            self._chapter_plan_auto_active = False
+            self._chapter_plan_continue_pending = False
+            self._chapter_plan_sequence_token = int(
+                getattr(self, "_chapter_plan_sequence_token", 0) or 0
+            ) + 1
+            state = deepcopy(self.current_project.get("chapter_plan_generation_state", {}))
+            if isinstance(state, dict) and state and state.get("status") != "complete":
+                state["status"] = "interrupted"
+                self._persist_chapter_plan_generation_state(state)
+            if plan_worker is None or not plan_worker.isRunning():
+                self._chapter_ai_stop_requested_by_user = False
+                self._set_chapter_ai_actions_enabled(True)
+                self.set_status_tip("章节规划生成已中止，已保存当前批次进度。")
+                return
+        if getattr(self, "_chapter_ai_transient_retry_pending", False):
+            self._chapter_ai_stop_requested_by_user = True
+            self._chapter_ai_transient_retry_pending = False
+            self._chapter_ai_transient_retry_token = int(
+                getattr(self, "_chapter_ai_transient_retry_token", 0) or 0
+            ) + 1
+            self._reset_chapter_ai_sequence()
+            self._set_chapter_ai_actions_enabled(True)
+            self.set_status_tip("AI 辅助生成已中止。")
+            return
         if (worker is None or not worker.isRunning()) and (plan_worker is None or not plan_worker.isRunning()):
             return
         self._chapter_ai_stop_requested_by_user = True
@@ -5242,7 +8044,160 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
         bar = self.chapter_ai_preview.verticalScrollBar()
         bar.setValue(bar.maximum())
 
+    def _maybe_retry_draft_for_style(self, action, final_text):
+        if action != "draft" or getattr(self, "_chapter_ai_style_retry_attempted", False):
+            return False
+        project = self._ai_project_snapshot()
+        style_reference = str(project.get("style_reference", "") or "").strip()
+        if not style_reference:
+            return False
+        original_context = str(getattr(self, "_chapter_ai_last_context", "") or "")
+        output_target = _style_output_target_from_context(original_context)
+        reasons = _style_draft_mismatch_reasons(style_reference, final_text, output_target)
+        if not reasons:
+            return False
+        if not original_context:
+            return False
+        repair_context = _build_style_rewrite_context(
+            original_context,
+            final_text,
+            reasons,
+            style_reference=style_reference,
+            output_target=output_target,
+        )
+        self._chapter_ai_style_retry_attempted = True
+        self._chapter_ai_style_fallback_text = str(final_text or "").strip()
+        self._chapter_ai_resume_prefix = ""
+        self.chapter_ai_stream_text = ""
+        self.chapter_ai_preview.clear()
+        self._start_chapter_ai_worker(
+            "draft",
+            repair_context,
+            "首次正文与风格样本偏差较大，正在自动重写一次...",
+        )
+        return True
+
+    def _select_style_final_text(self, initial, revised, bundle, validate_memory=True):
+        initial = str(initial or "").strip()
+        revised = str(revised or "").strip()
+        selected = initial
+        if revised and _style_candidate_rank(
+            self._chapter_ai_style_reference, revised, self._chapter_ai_style_output_target
+        ) <= _style_candidate_rank(
+            self._chapter_ai_style_reference, initial, self._chapter_ai_style_output_target
+        ):
+            selected = revised
+        if (
+            validate_memory
+            and selected == initial
+            and revised
+            and isinstance(getattr(self, "current_project", None), dict)
+        ):
+            initial_errors = self._memory_bundle_validation_errors(initial, bundle)
+            if initial_errors and not self._memory_bundle_validation_errors(revised, bundle):
+                selected = revised
+        return selected
+
+    def _apply_style_final_result(self, final_text, bundle, memory_validated=False):
+        text = str(final_text or "").strip()
+        if not text:
+            self._reset_chapter_ai_sequence()
+            self.set_status_tip("终稿编辑没有返回可用正文，已保留首次正文预览。")
+            return
+        if not memory_validated:
+            errors = self._memory_bundle_validation_errors(text, bundle)
+            if errors:
+                self._start_memory_repair(text, bundle, errors)
+                return
+        if isinstance(getattr(self, "current_project", None), dict):
+            memory_changed = _apply_long_form_memory_update(
+                self.current_project,
+                self.current_chapter_index,
+                bundle.get("memory_update", {}) if isinstance(bundle, dict) else {},
+            )
+        else:
+            memory_changed = True
+        if not memory_changed:
+            self._fail_memory_sync("状态事务未能提交")
+            return
+        old_text = self.chapter_text.toPlainText().strip()
+        self.chapter_text.setPlainText(_append_text_without_duplicate_overlap(old_text, text))
+        outline = str(bundle.get("outline", "") or "").strip() if isinstance(bundle, dict) else ""
+        summary = str(bundle.get("summary", "") or "").strip() if isinstance(bundle, dict) else ""
+        key_facts = str(bundle.get("key_facts", "") or "").strip() if isinstance(bundle, dict) else ""
+        if outline and not str(getattr(self, "_chapter_ai_sequence_started_outline", "") or "").strip():
+            self.chapter_outline.setPlainText(outline)
+        if summary:
+            self.chapter_summary.setPlainText(summary)
+        if key_facts:
+            self.chapter_key_facts.setPlainText(key_facts)
+        if memory_changed and isinstance(getattr(self, "current_project", None), dict):
+            self._refresh_long_form_record_views()
+            chapters = self.current_project.get("chapters", [])
+            chapter = chapters[self.current_chapter_index] if 0 <= self.current_chapter_index < len(chapters) else {}
+            self._set_line_text_without_signals(
+                self.chapter_linked,
+                ", ".join(_normalize_name_list(chapter.get("linked_characters", []))),
+            )
+        else:
+            inferred_names = self._infer_current_chapter_linked_names(
+                extra_text="\n".join([text, outline, summary, key_facts])
+            )
+            self._merge_chapter_linked_names(inferred_names)
+        if memory_changed and hasattr(self, "chapter_status"):
+            completed_index = self.chapter_status.findText("已完成")
+            if completed_index >= 0:
+                self.chapter_status.blockSignals(True)
+                try:
+                    self.chapter_status.setCurrentIndex(completed_index)
+                finally:
+                    self.chapter_status.blockSignals(False)
+        self._mark_chapter_dirty()
+        if memory_changed and isinstance(getattr(self, "current_project", None), dict):
+            self._mark_current_chapter_ai_result_analyzed()
+        checkpoint_cleared = self._clear_memory_finalize_checkpoint()
+        if memory_changed and hasattr(self, "_note_project_dirty"):
+            self._note_project_dirty()
+        if checkpoint_cleared:
+            self._persist_ai_generation_state()
+        self.chapter_ai_preview.clear()
+        self._set_partial_chapter_ai_preview_state(False)
+        self._chapter_ai_resume_prefix = ""
+        self._chapter_ai_style_workflow_active = False
+        self._reset_chapter_ai_sequence()
+        self.set_chapter_ai_panel_expanded(False)
+        if outline and summary and key_facts:
+            self.set_status_tip("章节 AI 已完成：正文终稿、提纲、摘要和关键事实已自动更新。")
+        else:
+            self.set_status_tip("正文终稿已写入；终稿附带资料不完整，可单独补提纲或摘要。")
+        self._on_auto_expand_chapter_completed(memory_changed)
+
+    def _mark_current_chapter_ai_result_analyzed(self):
+        chapters = self.current_project.get("chapters", []) if isinstance(self.current_project, dict) else []
+        if not (0 <= self.current_chapter_index < len(chapters)):
+            return False
+        chapter = chapters[self.current_chapter_index]
+        if not isinstance(chapter, dict):
+            return False
+        for field, attr_name in (
+            ("outline", "chapter_outline"),
+            ("text", "chapter_text"),
+            ("summary", "chapter_summary"),
+            ("key_facts", "chapter_key_facts"),
+        ):
+            editor = getattr(self, attr_name, None)
+            if editor is not None:
+                chapter[field] = editor.toPlainText().strip()
+        linked_editor = getattr(self, "chapter_linked", None)
+        if linked_editor is not None:
+            chapter["linked_characters"] = _normalize_name_list(linked_editor.text())
+        marked = bool(_mark_chapters_analyzed(chapters, [str(chapter.get("id", "") or "")]))
+        if marked and hasattr(self, "chapter_list"):
+            self._refresh_chapter_item(self.current_chapter_index)
+        return marked
+
     def on_chapter_ai_ready(self, action, content):
+        self._clear_transient_chapter_ai_retry(action)
         self.set_chapter_ai_panel_expanded(True)
         raw_final_text = str(content or "").strip() or self.chapter_ai_stream_text.strip()
         resume_prefix = getattr(self, "_chapter_ai_resume_prefix", "") if action == "draft" else ""
@@ -5250,9 +8205,44 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
             final_text = _append_text_without_duplicate_overlap(resume_prefix, raw_final_text)
         else:
             final_text = raw_final_text
+        request_id, started_at, worker_diagnostics = self._chapter_ai_signal_diagnostics()
+        elapsed_ms = worker_diagnostics.get("elapsed_ms", 0) if isinstance(worker_diagnostics, dict) else 0
+        if not elapsed_ms and started_at:
+            elapsed_ms = round((time.perf_counter() - started_at) * 1000, 1)
+        exchange_path = self._save_chapter_ai_latest_exchange(
+            action,
+            request_id,
+            final_text,
+            worker_diagnostics=worker_diagnostics,
+        )
+        self._log_novel_diagnostic(
+            "chapter_ai_request_result",
+            level="info",
+            action=action,
+            request_id=request_id,
+            content_chars=len(str(content or "")),
+            output_chars=len(final_text),
+            output_sha256=hashlib.sha256(
+                final_text.encode("utf-8", errors="replace")
+            ).hexdigest() if final_text else "",
+            elapsed_ms=elapsed_ms,
+            diagnostic_exchange_path=exchange_path,
+            worker_diagnostics=worker_diagnostics,
+        )
         if final_text:
             self.chapter_ai_preview.setPlainText(final_text)
         if getattr(self, "_chapter_ai_stop_requested_by_user", False):
+            if action == "memory_finalize":
+                pending = getattr(self, "_chapter_ai_memory_pending", {})
+                kept_final = str(pending.get("final_text", "") or "").strip() if isinstance(pending, dict) else ""
+                if kept_final:
+                    self.chapter_ai_preview.setPlainText(kept_final)
+                self._reset_chapter_ai_sequence()
+                self.set_status_tip(
+                    "状态整理已中止，正文终稿已保留在预览和恢复检查点中；"
+                    "重新启动自动扩写时会继续整理状态。"
+                )
+                return
             if final_text:
                 if action in {"draft", "outline", "summary"}:
                     self._set_partial_chapter_ai_preview_state(True, action)
@@ -5261,6 +8251,167 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
                 self.set_status_tip("AI 辅助生成已中止。")
             self._reset_chapter_ai_sequence()
             return
+        if action == "memory_repair":
+            self._handle_memory_repair_ready(final_text)
+            return
+        if action == "memory_reconcile":
+            self._handle_memory_reconciliation_ready(final_text)
+            return
+        if action == "memory_finalize":
+            self._handle_memory_finalize_ready(final_text)
+            return
+        if action in {"style_baseline", "style_sheet", "style_sheet_merge", "style_persona", "style_cards"} and getattr(
+            self, "_chapter_ai_style_workflow_active", False
+        ):
+            entry = self._chapter_ai_style_cache_entry if isinstance(self._chapter_ai_style_cache_entry, dict) else {}
+            units = entry.get("units", []) if isinstance(entry.get("units"), list) else []
+            index = int(getattr(self, "_chapter_ai_style_build_unit_index", -1) or 0)
+            if action in {"style_baseline", "style_sheet"} and 0 <= index < len(units):
+                units[index]["baseline" if action == "style_baseline" else "sheet"] = final_text
+                entry["units"] = units
+            elif action == "style_sheet_merge":
+                merge_results = entry.get("merge_results", []) if isinstance(entry.get("merge_results"), list) else []
+                merge_results.append(final_text)
+                entry["merge_results"] = merge_results
+                entry["combined_sheet"] = final_text
+            elif action == "style_persona":
+                entry["persona"] = final_text
+            elif action == "style_cards":
+                entry["style_cards"] = _parse_style_cards_result(
+                    final_text,
+                    self._chapter_ai_style_reference,
+                )
+                entry["style_cards_version"] = STYLE_CARD_CACHE_VERSION
+            entry["status"] = "building"
+            entry.pop("error", None)
+            self._persist_style_cache_entry(self._chapter_ai_style_reference_hash, entry)
+            self.chapter_ai_preview.clear()
+            self.chapter_ai_stream_text = ""
+            self._continue_style_profile_build()
+            return
+        if action == "style_profile" and getattr(self, "_chapter_ai_style_workflow_active", False):
+            self._chapter_ai_style_profile = final_text
+            self._chapter_ai_style_combined_sheet = final_text
+            reference_hash = hashlib.sha256(self._chapter_ai_style_reference.encode("utf-8")).hexdigest()
+            self._chapter_ai_style_profile_cache_hash = reference_hash
+            self._chapter_ai_style_profile_cache_text = final_text
+            self._persist_style_profile(reference_hash, final_text)
+            self._start_style_profiled_draft()
+            return
+        if action == "style_rules" and getattr(self, "_chapter_ai_style_workflow_active", False):
+            self._chapter_ai_style_rules = final_text
+            self._start_style_draft_with_rules()
+            return
+        if action == "draft" and getattr(self, "_chapter_ai_style_workflow_active", False):
+            execution_result = _parse_style_execution_result(final_text)
+            complete_set_count = int(execution_result.get("complete_set_count", 0) or 0)
+            if complete_set_count > 1:
+                self._log_novel_diagnostic(
+                    "style_execution_restarted_output_recovered",
+                    level="warning",
+                    action=action,
+                    request_id=request_id,
+                    complete_set_count=complete_set_count,
+                    selected_set_index=complete_set_count,
+                )
+            self._chapter_ai_style_execution = str(
+                execution_result.get("execution", "") or ""
+            ).strip()
+            self._chapter_ai_style_plan = str(
+                execution_result.get("style_plan", "") or ""
+            ).strip()
+            candidate = str(execution_result.get("draft", "") or "").strip() or final_text
+            self._start_style_candidate_finalize(candidate)
+            return
+        if action == "style_finalize" and getattr(self, "_chapter_ai_style_workflow_active", False):
+            bundle = _parse_style_finalize_result(final_text)
+            initial = str(getattr(self, "_chapter_ai_style_candidate", "") or "").strip()
+            revised = str(bundle.get("text", "") or "").strip()
+            execution = str(getattr(self, "_chapter_ai_style_execution", "") or "").strip()
+            selected = (
+                revised or initial
+                if execution else
+                self._select_style_final_text(initial, revised, bundle, validate_memory=False)
+            )
+            selected_errors = _style_finalize_acceptance_errors(
+                execution,
+                selected,
+                bundle.get("acceptance", {}),
+                self._chapter_ai_style_reference,
+                self._chapter_ai_style_output_target,
+            )
+            if selected_errors and revised and selected != revised:
+                revised_errors = _style_finalize_acceptance_errors(
+                    execution,
+                    revised,
+                    bundle.get("acceptance", {}),
+                    self._chapter_ai_style_reference,
+                    self._chapter_ai_style_output_target,
+                )
+                if not revised_errors:
+                    selected = revised
+                    selected_errors = []
+            hard_error = lambda value: (
+                str(value or "").startswith("剧情拍点")
+                or "前两章剧情复演" in str(value or "")
+            )
+            if (
+                selected_errors
+                and int(getattr(self, "_chapter_ai_style_finalize_count", 0) or 0) >= 2
+                and initial
+            ):
+                previous_errors = [
+                    str(value or "").strip()
+                    for value in getattr(self, "_chapter_ai_style_pending_reasons", [])
+                    if str(value or "").strip()
+                ]
+                previous_hard_errors = [
+                    value for value in previous_errors if hard_error(value)
+                ]
+                current_hard_errors = [
+                    value for value in selected_errors if hard_error(value)
+                ]
+                if not previous_hard_errors and (
+                    current_hard_errors
+                    or _style_candidate_rank(
+                        self._chapter_ai_style_reference,
+                        initial,
+                        self._chapter_ai_style_output_target,
+                    ) <= _style_candidate_rank(
+                        self._chapter_ai_style_reference,
+                        selected,
+                        self._chapter_ai_style_output_target,
+                    )
+                ):
+                    selected = initial
+                    selected_errors = previous_errors
+            if selected_errors:
+                if int(getattr(self, "_chapter_ai_style_finalize_count", 0) or 0) < 2:
+                    self._chapter_ai_style_pending_reasons = list(selected_errors)
+                    self._start_style_candidate_finalize(
+                        revised or initial,
+                        rescue=True,
+                        gate_errors=selected_errors,
+                    )
+                    return
+                self._chapter_ai_style_pending_reasons = list(selected_errors)
+                hard_errors = [value for value in selected_errors if hard_error(value)]
+                if hard_errors:
+                    self.on_chapter_ai_failed(
+                        "终稿剧情拍点验收连续两次未通过："
+                        + "；".join(hard_errors[:6])
+                    )
+                    return
+            self._chapter_ai_style_final_bundle = bundle
+            self._chapter_ai_style_retry_attempted = True
+            self._chapter_ai_style_fallback_text = ""
+            self.chapter_ai_preview.setPlainText(selected)
+            self._start_memory_finalize(selected)
+            return
+        if self._maybe_retry_draft_for_style(action, final_text):
+            return
+        if action == "draft":
+            self._chapter_ai_style_fallback_text = ""
         labels = {
             "outline": "提纲",
             "draft": "正文",
@@ -5299,7 +8450,10 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
                         self._continue_chapter_ai_sequence("outline")
                     return
                 if action == "summary":
-                    self.on_auto_chapter_summary_ready("summary", final_text)
+                    memory_changed = self.on_auto_chapter_summary_ready("summary", final_text)
+                    if memory_changed is None:
+                        self.chapter_ai_preview.clear()
+                        return
                     self.chapter_ai_preview.clear()
                     skipped_outline = bool(getattr(self, "_chapter_ai_sequence_skipped_outline", False))
                     self._reset_chapter_ai_sequence()
@@ -5308,6 +8462,7 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
                         self.set_status_tip("章节 AI 已完成：正文已写入，已保留原章节提纲，并补摘要/关键事实。")
                     else:
                         self.set_status_tip("章节 AI 已完成：正文、提纲、摘要/关键事实已按顺序更新。")
+                    self._on_auto_expand_chapter_completed(bool(memory_changed))
                     return
             self.apply_chapter_ai_preview(target)
         else:
@@ -5316,6 +8471,121 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
     def on_chapter_ai_failed(self, err):
         action = getattr(self, "_chapter_ai_running_action", "")
         sequence_active = bool(getattr(self, "_chapter_ai_sequence_active", False))
+        err_text = clean_error_text(err)
+        request_id, started_at, worker_diagnostics = self._chapter_ai_signal_diagnostics()
+        snapshot_path = self._save_chapter_ai_failure_snapshot(
+            action,
+            request_id,
+            error=err_text,
+            worker_diagnostics=worker_diagnostics,
+        )
+        retry_scheduled = False
+        try:
+            retry_scheduled = self._schedule_transient_chapter_ai_retry(action, err)
+        except Exception as exc:
+            self._log_novel_diagnostic(
+                "chapter_ai_retry_scheduler_failed",
+                level="error",
+                action=action,
+                request_id=request_id,
+                error=clean_error_text(exc),
+                error_category=self._novel_diagnostic_error_category(exc),
+            )
+        self._log_novel_diagnostic(
+            "chapter_ai_request_failed",
+            level="error",
+            action=action,
+            request_id=request_id,
+            error=err_text,
+            error_category=self._novel_diagnostic_error_category(err_text),
+            retryable=self._is_transient_chapter_ai_error(err_text),
+            retry_scheduled=bool(retry_scheduled),
+            sequence_active=sequence_active,
+            diagnostic_snapshot_path=snapshot_path,
+            partial_output_chars=int(
+                worker_diagnostics.get("response_chars", 0) or 0
+            ) if isinstance(worker_diagnostics, dict) else len(self.chapter_ai_stream_text),
+            worker_diagnostics=worker_diagnostics,
+            elapsed_ms=(
+                worker_diagnostics.get("elapsed_ms", 0)
+                if isinstance(worker_diagnostics, dict) else
+                round((time.perf_counter() - started_at) * 1000, 1) if started_at else 0
+            ),
+        )
+        if retry_scheduled:
+            return
+        if getattr(self, "_auto_expand_all_active", False) and action not in {
+            "style_profile", "style_rules", "memory_reconcile"
+        }:
+            self._stop_auto_expand_all(
+                f"自动扩写已停止：第{self.current_chapter_index + 1}章生成失败，请检查后继续。"
+            )
+        if action == "draft" and "剧情执行稿结构不完整" in err_text:
+            self._log_novel_diagnostic(
+                "style_execution_partial_discarded",
+                level="warning",
+                action=action,
+                request_id=request_id,
+                discarded_chars=len(str(self.chapter_ai_stream_text or "")),
+            )
+            self.chapter_ai_preview.clear()
+            self.chapter_ai_stream_text = ""
+            self._chapter_ai_resume_prefix = ""
+            self._chapter_ai_style_workflow_active = False
+            self._chapter_ai_style_fallback_text = ""
+            self._chapter_ai_style_execution = ""
+            self._chapter_ai_style_plan = ""
+            self._set_partial_chapter_ai_preview_state(False)
+            self._reset_chapter_ai_sequence()
+            self.set_status_tip("剧情执行稿结构不完整，半成品已丢弃；请重新扩写本章。")
+            QMessageBox.warning(self, "AI 写作失败", err_text)
+            return
+        if action in {"style_baseline", "style_sheet", "style_sheet_merge", "style_persona", "style_cards"} and getattr(
+            self, "_chapter_ai_style_workflow_active", False
+        ):
+            entry = self._chapter_ai_style_cache_entry if isinstance(self._chapter_ai_style_cache_entry, dict) else {}
+            entry["status"] = "failed"
+            entry["error"] = clean_error_text(err)[:500]
+            self._persist_style_cache_entry(self._chapter_ai_style_reference_hash, entry)
+            self._reset_chapter_ai_sequence()
+            self.set_status_tip(
+                f"首次文风建档已暂停，已保存完成进度；重新扩写时会从当前步骤继续：{clean_error_text(err)[:90]}"
+            )
+            return
+        if action == "style_profile" and getattr(self, "_chapter_ai_style_workflow_active", False):
+            self._chapter_ai_style_profile = ""
+            self._start_style_profiled_draft()
+            return
+        if action == "style_rules" and getattr(self, "_chapter_ai_style_workflow_active", False):
+            self._chapter_ai_style_rules = ""
+            self._start_style_draft_with_rules()
+            return
+        if action == "memory_reconcile":
+            self._apply_memory_reconciliation_fallback(
+                "边界语义对账调用失败，已采用原本通过校验的状态增量：" + clean_error_text(err)
+            )
+            return
+        if action in {"memory_finalize", "memory_repair"}:
+            self._fail_memory_sync(clean_error_text(err))
+            return
+        if action in {"style_finalize", "style_audit", "style_rewrite", "style_plot_extract"} and getattr(self, "_chapter_ai_style_workflow_active", False):
+            candidate = str(getattr(self, "_chapter_ai_style_candidate", "") or "").strip()
+            self.chapter_ai_preview.setPlainText(candidate)
+            self._chapter_ai_style_workflow_active = False
+            self._set_partial_chapter_ai_preview_state(False)
+            self._reset_chapter_ai_sequence()
+            self.set_status_tip(
+                f"文风流程失败，候选正文仅保留在预览，未写入章节：{clean_error_text(err)[:100]}"
+            )
+            return
+        style_fallback = str(getattr(self, "_chapter_ai_style_fallback_text", "") or "").strip()
+        if action == "draft" and style_fallback:
+            self.chapter_ai_preview.setPlainText(style_fallback)
+            self._chapter_ai_style_fallback_text = ""
+            self._set_partial_chapter_ai_preview_state(True, action)
+            self._reset_chapter_ai_sequence()
+            self.set_status_tip("风格自动重写失败，已保留首次正文预览，可检查后决定是否应用。")
+            return
         kept_preview = self.chapter_ai_stream_text.strip()
         if kept_preview:
             self.chapter_ai_preview.setPlainText(kept_preview)
@@ -5327,7 +8597,6 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
             self._refresh_chapter_ai_action_labels()
         self._reset_chapter_ai_sequence()
         action_label = {"draft": "正文", "outline": "提纲", "summary": "摘要"}.get(action, "正文")
-        err_text = clean_error_text(err)
         if sequence_active and action == "outline":
             status = f"正文已写入，补提纲失败，可继续补提纲：{err_text[:80]}"
         elif sequence_active and action == "summary":
@@ -5349,12 +8618,22 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
                 was_current = self.writing_worker is worker
                 if was_current:
                     self.writing_worker = None
+                retired = getattr(self, "writing_retired_workers", None)
+                if isinstance(retired, list) and worker in retired:
+                    retired.remove(worker)
                 if worker is not None:
                     worker.deleteLater()
                 if was_current:
-                    self._set_chapter_ai_actions_enabled(True)
-                    self._chapter_ai_stop_requested_by_user = False
+                    retry_pending = bool(getattr(self, "_chapter_ai_transient_retry_pending", False))
+                    self._set_chapter_ai_actions_enabled(not retry_pending)
+                    if not retry_pending:
+                        self._chapter_ai_stop_requested_by_user = False
                     self._chapter_ai_running_action = ""
+                    if (
+                        getattr(self, "_auto_expand_all_active", False)
+                        and getattr(self, "_auto_expand_all_waiting_next", False)
+                    ):
+                        QTimer.singleShot(100, self._start_next_auto_expand_chapter)
             except Exception as e:
                 log_debug("小说章节 AI 线程清理失败", e)
         QTimer.singleShot(0, cleanup)
@@ -5483,26 +8762,101 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
 
     def on_auto_chapter_summary_ready(self, action, content):
         if action != "summary":
-            return
+            return False
         if self._current_chapter_id() != getattr(self, "_auto_summary_chapter_id", ""):
-            return
+            return False
         current_summary = self.chapter_summary.toPlainText().strip()
         current_key_facts = self.chapter_key_facts.toPlainText().strip()
         current_linked = self.chapter_linked.text().strip()
         summary_text, key_facts_text, linked_names = self._split_chapter_summary_bundle(content)
-        if not summary_text and not key_facts_text and not linked_names:
-            return
+        memory_update = _parse_long_form_memory_update(content)
+        if not summary_text and not key_facts_text and not linked_names and not memory_update:
+            return False
+        body_editor = getattr(self, "chapter_text", None)
+        if body_editor is not None:
+            body_text = body_editor.toPlainText().strip()
+        else:
+            chapters = self.current_project.get("chapters", []) if isinstance(self.current_project, dict) else []
+            chapter = chapters[self.current_chapter_index] if 0 <= self.current_chapter_index < len(chapters) else {}
+            body_text = str(chapter.get("text", "") or "").strip() if isinstance(chapter, dict) else ""
+        strict_sync = bool(getattr(self, "_chapter_ai_sequence_active", False))
+        validation_errors = (
+            _validate_long_form_memory_update(
+                self.current_project,
+                self.current_chapter_index,
+                memory_update,
+                final_text=body_text,
+                require_revision=True,
+                require_evidence=True,
+            )
+            if strict_sync else []
+        )
+        if validation_errors:
+            chapters = self.current_project.get("chapters", []) if isinstance(self.current_project, dict) else []
+            if 0 <= self.current_chapter_index < len(chapters) and isinstance(chapters[self.current_chapter_index], dict):
+                chapters[self.current_chapter_index]["memory_sync_status"] = "failed"
+                chapters[self.current_chapter_index]["memory_sync_error"] = "；".join(validation_errors)[:1000]
+            if getattr(self, "_chapter_ai_sequence_active", False):
+                self._start_memory_repair(
+                    body_text,
+                    {
+                        "outline": self.chapter_outline.toPlainText().strip(),
+                        "summary": summary_text,
+                        "key_facts": key_facts_text,
+                        "memory_update": memory_update,
+                    },
+                    validation_errors,
+                    mode="summary",
+                )
+                return None
+            return False
+        if strict_sync and (self.current_chapter_index + 1) % 10 == 0:
+            bundle = {
+                "outline": self.chapter_outline.toPlainText().strip(),
+                "summary": summary_text,
+                "key_facts": key_facts_text,
+                "memory_update": memory_update,
+            }
+            self._chapter_ai_memory_pending = {
+                "chapter_id": self._current_chapter_id(),
+                "final_text": body_text,
+                "bundle": bundle,
+                "errors": [],
+                "mode": "summary",
+                "reconciliation_started": False,
+            }
+            self._start_memory_reconciliation(body_text, bundle)
+            return None
         summary_unchanged = current_summary == getattr(self, "_auto_summary_started_summary", "")
         key_facts_unchanged = current_key_facts == getattr(self, "_auto_summary_started_key_facts", "")
         linked_unchanged = current_linked == getattr(self, "_auto_summary_started_linked", "")
-        changed = False
+        memory_changed = _apply_long_form_memory_update(
+            self.current_project,
+            self.current_chapter_index,
+            memory_update,
+        )
+        if memory_changed:
+            self._refresh_long_form_record_views()
+        changed = memory_changed
         if summary_text and summary_unchanged:
             self._set_text_without_signals(self.chapter_summary, summary_text)
             changed = True
         if key_facts_text and key_facts_unchanged:
             self._set_text_without_signals(self.chapter_key_facts, key_facts_text)
             changed = True
-        if linked_unchanged:
+        actual_ids_provided = isinstance(memory_update.get("current_chapter_character_ids"), list)
+        if memory_changed and actual_ids_provided:
+            chapters = self.current_project.get("chapters", [])
+            chapter = chapters[self.current_chapter_index] if 0 <= self.current_chapter_index < len(chapters) else {}
+            self._set_line_text_without_signals(
+                self.chapter_linked,
+                ", ".join(_normalize_name_list(chapter.get("linked_characters", []))),
+            )
+            changed = True
+        elif memory_changed and linked_names:
+            self._set_line_text_without_signals(self.chapter_linked, ", ".join(linked_names))
+            changed = True
+        elif linked_unchanged:
             inferred_names = self._infer_current_chapter_linked_names(
                 extra_text="\n".join([summary_text, key_facts_text, "、".join(linked_names)])
             )
@@ -5517,8 +8871,18 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
                 self._set_line_text_without_signals(self.chapter_linked, ", ".join(merged_names))
                 changed = True
         if not changed:
-            return
+            return False
+        if memory_changed and hasattr(self, "chapter_status"):
+            completed_index = self.chapter_status.findText("已完成")
+            if completed_index >= 0:
+                self.chapter_status.blockSignals(True)
+                try:
+                    self.chapter_status.setCurrentIndex(completed_index)
+                finally:
+                    self.chapter_status.blockSignals(False)
         self._mark_chapter_dirty()
+        if memory_changed and isinstance(getattr(self, "current_project", None), dict):
+            self._mark_current_chapter_ai_result_analyzed()
         skipped = []
         if summary_text and not summary_unchanged:
             skipped.append("摘要")
@@ -5530,6 +8894,7 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
             self.set_status_tip(f"已自动补齐未手动修改的摘要资料；已保留你手动修改的{'、'.join(skipped)}。")
         else:
             self.set_status_tip("已自动提炼本章摘要/关键事实，并更新本章关联人物。")
+        return memory_changed
 
     def on_auto_chapter_summary_failed(self, err):
         log_debug("小说章节自动摘要失败", clean_error_text(err))
@@ -6220,6 +9585,15 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
                 chapters=summary.get("chapters"),
                 body=summary.get("body_chars"),
             )
+            self._log_novel_diagnostic(
+                "project_autosave_failed",
+                level="error",
+                autosave_generation=int(current_generation or 0),
+                project_path=str(getattr(self, "current_project_path", "") or NOVEL_DRAFT_FILE),
+                project_summary=summary,
+                error_category="storage",
+                **self._novel_exception_details(e),
+            )
             log_debug("小说草稿自动保存失败", e)
         finally:
             self._autosave_in_progress = False
@@ -6232,7 +9606,12 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
         path = str(self.current_project_path or "").strip()
         if not path or path == NOVEL_DRAFT_FILE:
             return
+        if self._handle_external_project_change_before_save(
+            deepcopy(self.current_project), "项目快照保存", False
+        ):
+            return
         save_project_file(path, self.current_project)
+        self._record_current_project_file_signature(path)
         self._remember_project_path(path)
         self._project_file_dirty = False
 
@@ -6245,6 +9624,13 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
             self._save_draft_snapshot()
             self._dirty = False
         except Exception as e:
+            self._log_novel_diagnostic(
+                "candidate_state_save_failed",
+                level="error",
+                project_path=str(getattr(self, "current_project_path", "") or NOVEL_DRAFT_FILE),
+                error_category="storage",
+                **self._novel_exception_details(e),
+            )
             log_debug("小说候选分析草稿保存失败", e)
 
     def _remember_project_path(self, path):
@@ -6257,7 +9643,12 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
         if not self.current_project_path or self.current_project_path == NOVEL_DRAFT_FILE:
             return self.save_project_as_named()
         try:
+            if self._handle_external_project_change_before_save(
+                deepcopy(self.current_project), "手动保存", True
+            ):
+                return True
             save_project_file(self.current_project_path, self.current_project)
+            self._record_current_project_file_signature(self.current_project_path)
             self._remember_project_path(self.current_project_path)
             self._save_draft_snapshot()
             self._notify_project_store_changed()
@@ -6266,6 +9657,13 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
             self._update_stats_label()
             return True
         except Exception as e:
+            self._log_novel_diagnostic(
+                "manual_project_save_failed",
+                level="error",
+                project_path=str(getattr(self, "current_project_path", "") or ""),
+                error_category="storage",
+                **self._novel_exception_details(e),
+            )
             QMessageBox.warning(self, "保存失败", str(e))
             return False
 
@@ -6292,6 +9690,7 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
             self._remember_project_path(path)
             self._save_draft_snapshot()
             self.current_project_path = path
+            self._record_current_project_file_signature(path)
             self._update_stats_label()
             self._dirty = False
             self._project_file_dirty = False
@@ -6299,6 +9698,13 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
             self.set_status_tip(f"已保存：{name}")
             return True
         except Exception as e:
+            self._log_novel_diagnostic(
+                "named_project_save_failed",
+                level="error",
+                project_path=str(path or ""),
+                error_category="storage",
+                **self._novel_exception_details(e),
+            )
             QMessageBox.warning(self, "保存失败", str(e))
             return False
 
@@ -6585,7 +9991,9 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
             save_project_file(project_path, data)
             self._load_project_data(data, project_path)
             self._remember_project_path(project_path)
+            self._store_imported_framework_source(text, title, source_label, path)
             self._save_draft_snapshot()
+            self._save_current_project_snapshot_if_named()
             self._notify_project_store_changed()
             self._dirty = False
             self._project_file_dirty = False
@@ -6593,7 +10001,29 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
             if not self._has_saved_project_path():
                 self._save_current_work(f"{source_label}框架导入前保存")
             self._flush_current_editors()
+            if self._store_imported_framework_source(text, title, source_label, path):
+                self._note_project_dirty()
+                self._save_draft_snapshot()
+                self._save_current_project_snapshot_if_named()
         return title
+
+    def _store_imported_framework_source(self, text, title="", source_label="", source_path=""):
+        text = str(text or "").strip()
+        if not text or not isinstance(getattr(self, "current_project", None), dict):
+            return False
+        source_hash = hashlib.sha256(text.encode("utf-8")).hexdigest()
+        existing = self.current_project.get("imported_framework_source", {})
+        if isinstance(existing, dict) and str(existing.get("sha256", "") or "") == source_hash:
+            return False
+        self.current_project["imported_framework_source"] = {
+            "source_title": str(title or "").strip(),
+            "source_label": str(source_label or "").strip(),
+            "source_path": str(source_path or "").strip(),
+            "text": text,
+            "sha256": source_hash,
+            "imported_at": now_str(),
+        }
+        return True
 
     def _framework_bible_reference_block(self, text, title="", source_label=""):
         text = str(text or "").strip()
@@ -6668,6 +10098,7 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
             "source_title": str(source_title or "").strip(),
             "source_label": str(source_label or "").strip(),
             "import_mode": str(import_mode or "").strip(),
+            "source_text": str(text or ""),
         }
         self.framework_import_worker = NovelFrameworkImportWorker(
             provider.get("base_url", ""),
@@ -6758,7 +10189,9 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
         for fallback_index, item in enumerate(items, 1):
             if not isinstance(item, dict):
                 continue
-            outline = self._chapter_plan_outline_for_item(item)
+            outline = str(item.get("outline", "") or "").strip()
+            if not outline:
+                outline = self._chapter_plan_outline_for_item(item)
             title = str(item.get("title", "") or "").strip()
             if not title and not outline:
                 continue
@@ -6777,17 +10210,59 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
                 "settings": _normalize_name_list(item.get("settings", [])),
                 "ending_hook": str(item.get("ending_hook", "") or "").strip(),
                 "forbidden": str(item.get("forbidden", "") or "").strip(),
+                "source_event_ids": _normalize_name_list(item.get("source_event_ids", [])),
             })
+        stages = []
+        for stage_index, item in enumerate(
+            plan.get("stages", []) if isinstance(plan.get("stages", []), list) else [], 1
+        ):
+            if not isinstance(item, dict):
+                continue
+            try:
+                start_chapter = int(item.get("start_chapter", 0) or 0)
+                end_chapter = int(item.get("end_chapter", 0) or 0)
+            except Exception:
+                continue
+            if start_chapter <= 0 or end_chapter < start_chapter:
+                continue
+            stage_id = str(item.get("id", "") or f"S{stage_index:02d}").strip().upper()
+            events = []
+            for event_index, event in enumerate(
+                item.get("events", []) if isinstance(item.get("events", []), list) else [], 1
+            ):
+                if not isinstance(event, dict):
+                    continue
+                event_id = str(event.get("id", "") or f"{stage_id}-E{event_index:02d}").strip().upper()
+                event_text = str(event.get("text", "") or "").strip()
+                if not event_id or not event_text:
+                    continue
+                try:
+                    order = int(event.get("order", event_index) or event_index)
+                except Exception:
+                    order = event_index
+                events.append({"id": event_id, "order": order, "text": event_text})
+            if events:
+                stages.append({
+                    "id": stage_id,
+                    "name": str(item.get("name", "") or f"阶段{stage_index}").strip(),
+                    "start_chapter": start_chapter,
+                    "end_chapter": end_chapter,
+                    "events": events,
+                })
         summary = str(plan.get("summary", "") or "").strip()
-        if not summary and not chapters:
+        if not summary and not chapters and not stages:
             return {}
-        return {
+        reference = {
             "summary": summary,
-            "chapters": chapters,
             "source_title": str(source_title or "").strip(),
             "source_label": str(source_label or "").strip(),
             "imported_at": now_str(),
         }
+        if chapters:
+            reference["chapters"] = chapters
+        if stages:
+            reference["stages"] = stages
+        return reference
 
     def _store_imported_chapter_plan_reference(self, plan, source_title="", source_label=""):
         reference = self._normalize_imported_chapter_plan_reference(plan, source_title, source_label)
@@ -6819,8 +10294,16 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
             "project_materials": ["bible", "world_rules", "timeline", "summary"],
         }
         apply_result = _apply_import_candidates(self.current_project, candidates, checked)
+        source_text = str(context.get("source_text", "") or "").strip()
+        if not source_text:
+            source_text = str(
+                self.current_project.get("imported_framework_source", {}).get("text", "")
+                if isinstance(self.current_project.get("imported_framework_source"), dict) else ""
+            ).strip()
+        structured_plan = _extract_structured_framework_chapter_plan(source_text)
+        merged_plan = _merge_framework_chapter_plans(data.get("chapter_plan", {}), structured_plan)
         plan_added = self._store_imported_chapter_plan_reference(
-            data.get("chapter_plan", {}),
+            merged_plan,
             context.get("source_title", ""),
             context.get("source_label", ""),
         )
@@ -6838,12 +10321,18 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
             if hasattr(self, "nav_list") and hasattr(self, "page_indexes"):
                 self.nav_list.setCurrentRow(self.page_indexes.get("圣经", 0))
             material_count = sum(1 for value in materials.values() if value) if isinstance(materials, dict) else 0
+            reference = self.current_project.get("imported_chapter_plan_reference", {})
+            stage_event_count = sum(
+                len(item.get("events", []))
+                for item in reference.get("stages", [])
+                if isinstance(item, dict) and isinstance(item.get("events", []), list)
+            ) if isinstance(reference, dict) else 0
             self.set_status_tip(
                 "框架 AI 分类完成："
                 f"项目信息 {meta_changed} 项，"
                 f"新增 人物 {added.get('characters', 0)} / 设定 {added.get('lore', 0)} / 伏笔 {added.get('foreshadows', 0)}，"
                 f"补充 人物 {merged.get('characters', 0)} / 设定 {merged.get('lore', 0)} / 伏笔 {merged.get('foreshadows', 0)}，"
-                f"资料分类 {material_count} 项，章节规划参考 {plan_added} 章。{save_message}"
+                f"资料分类 {material_count} 项，明确章节约束 {plan_added} 章，阶段剧情节点 {stage_event_count} 个。{save_message}"
             )
         except Exception as e:
             self.on_framework_import_failed(str(e))
@@ -6952,11 +10441,331 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
             f"候选人物 {candidate_counts['characters']}，候选设定 {candidate_counts['lore']}，候选伏笔 {candidate_counts['foreshadows']}。{save_message}"
         )
 
+    @staticmethod
+    def _format_status_elapsed(seconds):
+        try:
+            total = max(0, int(float(seconds or 0)))
+        except (TypeError, ValueError):
+            total = 0
+        hours, remainder = divmod(total, 3600)
+        minutes, secs = divmod(remainder, 60)
+        if hours:
+            return f"{hours}时{minutes:02d}分{secs:02d}秒"
+        if minutes:
+            return f"{minutes}分{secs:02d}秒"
+        return f"{secs}秒"
+
+    @staticmethod
+    def _status_action_label(action):
+        return {
+            "draft": "剧情执行稿",
+            "style_profile": "文风画像",
+            "style_baseline": "文风基准稿",
+            "style_sheet": "作者写法提取",
+            "style_sheet_merge": "文风档案合并",
+            "style_persona": "作者人格",
+            "style_cards": "原文片段库",
+            "style_rules": "本章文风规则",
+            "style_finalize": "仿写终稿",
+            "style_audit": "文风审校",
+            "style_rewrite": "定向重写",
+            "style_plot_extract": "剧情事实整理",
+            "memory_finalize": "状态整理",
+            "memory_reconcile": "十章边界对账",
+            "memory_repair": "状态修复",
+            "outline": "章节提纲",
+            "summary": "摘要/关键事实",
+            "script_to_novel": "剧本转小说",
+            "novel_to_script": "小说转剧本",
+            "novel_to_storyboard": "小说转分镜",
+            "script_to_storyboard": "剧本转分镜",
+        }.get(str(action or "").strip(), "")
+
+    @staticmethod
+    def _status_message_is_terminal(text):
+        value = str(text or "")
+        return any(marker in value for marker in (
+            "自动扩写完成",
+            "自动扩写已中止",
+            "自动扩写已停止",
+            "章节 AI 已完成",
+            "AI 写作失败",
+            "正文终稿未写入章节",
+            "状态整理已中止",
+            "AI 辅助生成已中止",
+            "章节规划生成已中止",
+            "章节规划已全部生成",
+        ))
+
+    def _status_stage_for_message(self, text):
+        value = str(text or "").strip()
+        terminal_patterns = (
+            ("自动扩写完成", "批次完成", "auto_complete"),
+            ("自动扩写已中止", "批次已中止", "auto_aborted"),
+            ("自动扩写已停止", "批次已停止", "auto_stopped"),
+            ("章节 AI 已完成", "本章完成", "chapter_complete"),
+            ("正文终稿未写入章节", "状态同步失败", "memory_failed"),
+            ("AI 写作失败", "生成失败", "generation_failed"),
+            ("状态整理已中止", "状态整理已中止", "memory_aborted"),
+            ("AI 辅助生成已中止", "生成已中止", "generation_aborted"),
+            ("章节规划生成已中止", "规划已中止", "plan_aborted"),
+            ("章节规划已全部生成", "规划完成", "plan_complete"),
+        )
+        for marker, label, key in terminal_patterns:
+            if marker in value:
+                return label, key
+        text_patterns = (
+            (("秒后自动重试", "正在自动重试", "自动重试当前步骤"), "等待自动重试", "retry"),
+            (("正在中止",), "正在中止", "stopping"),
+            (("普通基准稿",), "文风基准稿", "style_baseline"),
+            (("提取证据化写法", "作者写法"), "作者写法提取", "style_sheet"),
+            (("合并作者写作档案",), "文风档案合并", "style_sheet_merge"),
+            (("作者人格",), "作者人格", "style_persona"),
+            (("功能型原文片段库", "原文片段库"), "原文片段库", "style_cards"),
+            (("本章专用文风规则", "本章文风规则"), "本章文风规则", "style_rules"),
+            (("剧情执行稿", "文风档案已载入"), "剧情执行稿", "draft"),
+            (("终稿补救",), "终稿补救", "style_finalize_rescue"),
+            (("审校并修订正文终稿", "专门审校并修订正文终稿", "仿写终稿"), "仿写终稿", "style_finalize"),
+            (("独立审校", "文风审校"), "文风审校", "style_audit"),
+            (("定向重写", "自动重写一次"), "定向重写", "style_rewrite"),
+            (("剧情事实",), "剧情事实整理", "style_plot_extract"),
+            (("边界语义对账", "十章对账"), "十章边界对账", "memory_reconcile"),
+            (("状态修复", "修复本章摘要", "正在修复"), "状态修复", "memory_repair"),
+            (("状态整理", "长期状态"), "状态整理", "memory_finalize"),
+            (("章节提纲", "补提纲"), "章节提纲", "outline"),
+            (("摘要/关键事实", "补摘要", "提炼摘要"), "摘要/关键事实", "summary"),
+            (("准备下一章",), "准备下一章", "next_chapter"),
+            (("已丢弃半成品", "半成品不参与续写"), "半成品重写", "partial_rewrite"),
+            (("自动扩写",), "自动扩写队列", "auto_queue"),
+            (("章节规划",), "章节规划", "chapter_plan"),
+        )
+        for markers, label, key in text_patterns:
+            if any(marker in value for marker in markers):
+                return label, key
+        action = str(getattr(self, "_chapter_ai_running_action", "") or "")
+        action_label = self._status_action_label(action)
+        if action_label:
+            return action_label, action or "chapter_ai"
+        if "正在" in value:
+            return "处理中", "working"
+        return "状态更新", "status"
+
+    def _status_current_chapter_scope(self):
+        project = self.current_project if isinstance(getattr(self, "current_project", None), dict) else {}
+        chapters = project.get("chapters", []) if isinstance(project.get("chapters"), list) else []
+        try:
+            index = int(getattr(self, "current_chapter_index", -1))
+        except (TypeError, ValueError):
+            index = -1
+        if not (0 <= index < len(chapters)) or not isinstance(chapters[index], dict):
+            return "", ""
+        chapter = chapters[index]
+        chapter_id = str(chapter.get("id", "") or f"index:{index}")
+        title = str(chapter.get("title", "") or "").strip()
+        if len(title) > 18:
+            title = title[:18] + "..."
+        label = f"第{index + 1}章"
+        if title:
+            label += f"《{title}》"
+        return chapter_id, label
+
+    def _status_close_current_stage(self, now_mono=None, now_wall=None):
+        if not bool(getattr(self, "_status_stage_active", False)):
+            return
+        now_mono = float(now_mono if now_mono is not None else time.monotonic())
+        now_wall = float(now_wall if now_wall is not None else time.time())
+        started_at = float(getattr(self, "_status_stage_started_at", 0.0) or now_mono)
+        started_wall = float(getattr(self, "_status_stage_started_wall", 0.0) or now_wall)
+        history = getattr(self, "_status_history", None)
+        if not isinstance(history, list):
+            history = []
+            self._status_history = history
+        history.append({
+            "label": str(getattr(self, "_status_stage_label", "") or "处理中"),
+            "scope": str(getattr(self, "_status_stage_scope_label", "") or ""),
+            "started_wall": started_wall,
+            "ended_wall": now_wall,
+            "elapsed": max(0.0, now_mono - started_at),
+        })
+        del history[:-6]
+        self._status_stage_active = False
+
+    def _status_begin_workflow(self, kind=""):
+        if bool(getattr(self, "_status_workflow_active", False)):
+            return
+        now_mono = time.monotonic()
+        now_wall = time.time()
+        self._status_close_current_stage(now_mono, now_wall)
+        self._status_workflow_active = True
+        self._status_workflow_kind = str(kind or "")
+        self._status_workflow_started_at = now_mono
+        self._status_workflow_started_wall = now_wall
+        self._status_last_run_elapsed = 0.0
+        self._status_history = []
+        self._status_stage_key = ""
+        self._status_stage_label = ""
+        self._status_stage_active = False
+
+    def _status_end_workflow(self, now_mono=None, now_wall=None):
+        now_mono = float(now_mono if now_mono is not None else time.monotonic())
+        now_wall = float(now_wall if now_wall is not None else time.time())
+        self._status_close_current_stage(now_mono, now_wall)
+        started_at = float(getattr(self, "_status_workflow_started_at", 0.0) or 0.0)
+        if started_at:
+            self._status_last_run_elapsed = max(0.0, now_mono - started_at)
+        self._status_workflow_active = False
+
+    def _status_has_active_work(self):
+        if any(bool(getattr(self, name, False)) for name in (
+            "_auto_expand_all_active",
+            "_auto_expand_all_waiting_next",
+            "_chapter_ai_sequence_active",
+            "_chapter_ai_transient_retry_pending",
+            "_chapter_plan_auto_active",
+        )):
+            return True
+        for name in ("writing_worker", "chapter_plan_worker"):
+            worker = getattr(self, name, None)
+            if worker is None:
+                continue
+            try:
+                if worker.isRunning():
+                    return True
+            except Exception:
+                continue
+        return False
+
+    def _track_status_message(self, text):
+        value = str(text or "")
+        now_mono = time.monotonic()
+        now_wall = time.time()
+        terminal_message = self._status_message_is_terminal(value)
+        has_active_work = self._status_has_active_work()
+        if (
+            has_active_work
+            and not bool(getattr(self, "_status_workflow_active", False))
+            and not terminal_message
+            and "中止" not in value
+            and not bool(getattr(self, "_chapter_ai_stop_requested_by_user", False))
+        ):
+            self._status_begin_workflow("detected")
+            now_mono = time.monotonic()
+            now_wall = time.time()
+        label, stage_code = self._status_stage_for_message(value)
+        scope_id, scope_label = self._status_current_chapter_scope()
+        if (
+            not has_active_work
+            and not bool(getattr(self, "_status_workflow_active", False))
+            and not terminal_message
+        ):
+            self._status_close_current_stage(now_mono, now_wall)
+            self._status_stage_key = "global:status"
+            self._status_stage_label = "状态更新"
+            self._status_stage_scope_label = ""
+            self._status_stage_started_at = now_mono
+            self._status_stage_started_wall = now_wall
+            self._status_stage_active = False
+            return
+        stage_key = f"{scope_id or 'global'}:{stage_code}"
+        if stage_key != str(getattr(self, "_status_stage_key", "") or ""):
+            self._status_close_current_stage(now_mono, now_wall)
+            self._status_stage_key = stage_key
+            self._status_stage_label = label
+            self._status_stage_scope_label = scope_label
+            self._status_stage_started_at = now_mono
+            self._status_stage_started_wall = now_wall
+            self._status_stage_active = True
+        else:
+            self._status_stage_label = label
+            self._status_stage_scope_label = scope_label
+        terminal = terminal_message
+        if bool(getattr(self, "_auto_expand_all_active", False)) and not any(
+            marker in value for marker in ("自动扩写完成", "自动扩写已中止", "自动扩写已停止")
+        ):
+            terminal = False
+        if terminal:
+            self._status_end_workflow(now_mono, now_wall)
+
+    def _status_history_text(self):
+        history = getattr(self, "_status_history", [])
+        if not isinstance(history, list) or not history:
+            return ""
+        lines = []
+        for entry in history[-2:]:
+            if not isinstance(entry, dict):
+                continue
+            started = time.strftime("%H:%M:%S", time.localtime(float(entry.get("started_wall", 0) or 0)))
+            ended = time.strftime("%H:%M:%S", time.localtime(float(entry.get("ended_wall", 0) or 0)))
+            scope = str(entry.get("scope", "") or "")
+            label = str(entry.get("label", "") or "处理中")
+            elapsed = self._format_status_elapsed(entry.get("elapsed", 0))
+            stage = f"{scope} · {label}" if scope else label
+            lines.append(f"{started}-{ended}  {stage}（{elapsed}）")
+        return "最近阶段\n" + "\n".join(lines) if lines else ""
+
+    def _refresh_status_display(self):
+        has_active_work = self._status_has_active_work()
+        if bool(getattr(self, "_status_workflow_active", False)) and not has_active_work:
+            self._status_end_workflow()
+        elif (
+            bool(getattr(self, "_status_stage_active", False))
+            and str(getattr(self, "_status_stage_key", "") or "").endswith(":stopping")
+            and not has_active_work
+        ):
+            self._status_close_current_stage()
+        message = str(getattr(self, "_status_message", "") or "")
+        display_message = message if len(message) <= 180 else message[:177] + "..."
+        if hasattr(self, "status_label"):
+            self.status_label.setText(display_message)
+            self.status_label.setToolTip(message)
+
+        progress_parts = []
+        auto_active = bool(getattr(self, "_auto_expand_all_active", False))
+        if auto_active or message.startswith("自动扩写"):
+            current, total = self._auto_expand_all_chapter_progress()
+            if message.startswith("自动扩写完成") and total:
+                current = total
+            if current and total:
+                progress_parts.append(f"自动扩写 {current}/{total}")
+        _, chapter_scope = self._status_current_chapter_scope()
+        stage_label = str(getattr(self, "_status_stage_label", "") or "")
+        if chapter_scope and stage_label not in {"状态更新", "批次完成", "批次已中止", "批次已停止"}:
+            progress_parts.append(chapter_scope)
+        if stage_label:
+            progress_parts.append(stage_label)
+
+        timing_parts = []
+        stage_started_wall = float(getattr(self, "_status_stage_started_wall", 0.0) or 0.0)
+        stage_started_at = float(getattr(self, "_status_stage_started_at", 0.0) or 0.0)
+        now_mono = time.monotonic()
+        if stage_started_wall:
+            timing_parts.append(time.strftime("%H:%M:%S 开始", time.localtime(stage_started_wall)))
+        if bool(getattr(self, "_status_stage_active", False)) and stage_started_at:
+            timing_parts.append("本阶段 " + self._format_status_elapsed(now_mono - stage_started_at))
+        workflow_started_at = float(getattr(self, "_status_workflow_started_at", 0.0) or 0.0)
+        if bool(getattr(self, "_status_workflow_active", False)) and workflow_started_at:
+            timing_parts.append("本轮 " + self._format_status_elapsed(now_mono - workflow_started_at))
+        elif float(getattr(self, "_status_last_run_elapsed", 0.0) or 0.0) > 0:
+            timing_parts.append("本轮共 " + self._format_status_elapsed(self._status_last_run_elapsed))
+        meta_text = " · ".join(progress_parts)
+        if timing_parts:
+            meta_text += ("\n" if meta_text else "") + " · ".join(timing_parts)
+        if hasattr(self, "status_meta_label"):
+            self.status_meta_label.setText(meta_text)
+            self.status_meta_label.setToolTip(meta_text)
+
+        history_text = self._status_history_text()
+        if hasattr(self, "status_history_label"):
+            self.status_history_label.setText(history_text)
+            self.status_history_label.setToolTip(history_text)
+            self.status_history_label.setVisible(bool(history_text))
+
     def set_status_tip(self, text):
         text = str(text or "")
         self.setToolTip("")
-        if hasattr(self, "status_label"):
-            self.status_label.setText(text)
+        self._status_message = text
+        self._track_status_message(text)
+        self._refresh_status_display()
         try:
             candidate_page_visible = (
                 hasattr(self, "tabs")

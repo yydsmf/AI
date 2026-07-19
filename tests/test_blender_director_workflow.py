@@ -154,6 +154,10 @@ class BlenderDirectorWorkflowTests(unittest.TestCase):
                 self.assertTrue(os.path.exists(project[key]), key)
             for key in ("characters", "props", "scenes", "actions", "models", "materials", "textures", "hdris"):
                 self.assertTrue(os.path.isdir(project["asset_dirs"][key]), key)
+            self.assertTrue(Path(project["mannequin_asset_path"]).exists())
+            self.assertTrue(Path(project["mannequin_attribution_path"]).exists())
+            self.assertTrue(Path(project["furniture_asset_path"]).exists())
+            self.assertTrue(Path(project["furniture_attribution_path"]).exists())
             self.assertTrue(os.path.isdir(project["shots_dir"]))
             self.assertTrue(os.path.isdir(project["presets_dir"]))
             self.assertTrue(os.path.isdir(project["set_packages_dir"]))
@@ -190,23 +194,49 @@ class BlenderDirectorWorkflowTests(unittest.TestCase):
             self.assertEqual(meta_data["asset_libraries"], [])
             self.assertEqual(meta_data["asset_library_items"], [])
             self.assertEqual(meta_data["asset_sources"], [])
+            self.assertEqual(meta_data["shot_asset_preparations"], [])
+            self.assertEqual(meta_data["ai_workflow_results"], [])
             self.assertEqual(len(meta_data["builtin_asset_pack"]), 4)
-            self.assertEqual(len(meta_data["open_asset_source_profiles"]), 5)
+            self.assertEqual(len(meta_data["open_asset_source_profiles"]), 6)
             self.assertEqual(
                 meta_data["director_capabilities"]["built_in_scene_operator"],
                 "gpt_director.add_dialogue_lounge_scene",
             )
             self.assertIn("root_empty", meta_data["director_capabilities"]["control_model"])
+            self.assertIn("object_mode_pose_proxies", meta_data["director_capabilities"]["control_model"])
+            self.assertIn("color_coded_controls", meta_data["director_capabilities"]["control_model"])
             self.assertIn("GPT_PT_director_panel", addon)
             self.assertIn("BUILTIN_DIRECTOR_ASSET_PACK", addon)
             self.assertIn("OPEN_ASSET_SOURCE_PROFILES", addon)
+            self.assertIn("blender_asset_browser", addon)
             self.assertIn("gpt_director.add_dialogue_lounge_scene", addon)
             self.assertIn("_build_dialogue_lounge_scene", addon)
             self.assertIn("_seed_director_metadata_for_lounge", addon)
             self.assertIn("_add_empty_control", addon)
             self.assertIn("_add_control_ring", addon)
+            self.assertIn("_add_mannequin_pose_controls", addon)
+            self.assertIn("_add_pose_proxy_control", addon)
+            self.assertIn("gpt_director_control_bone", addon)
+            self.assertIn("GPT 导演台可视控制器", addon)
+            self.assertIn("对象模式直接拖动", addon)
+            self.assertIn("gpt_director.toggle_control_labels", addon)
+            self.assertIn("默认隐藏文字标签，视图更干净", addon)
+            self.assertIn("_set_all_director_label_visibility", addon)
+            self.assertIn("gpt_director.toggle_clean_view", addon)
+            self.assertIn("清爽视图", addon)
+            self.assertIn("_set_director_clean_view", addon)
+            self.assertIn("gpt_director.simple_drag_mode", addon)
+            self.assertIn("极简拖动模式：点住模型直接拖", addon)
+            self.assertIn("_raycast_visible_director_object", addon)
+            self.assertIn("gpt_director.select_mannequin_controls", addon)
+            self.assertIn("彩色控制器：橙色手｜绿色脚｜粉色肘｜蓝色膝", addon)
             self.assertIn("builtin_blue_mannequin", addon)
             self.assertIn("builtin_sofa_table_props", addon)
+            self.assertIn("FURNITURE_TEMPLATE_PATH", addon)
+            self.assertIn("Director Modern Sofa", addon)
+            self.assertIn("Director Modern Coffee Table", addon)
+            self.assertIn("_add_bundled_furniture_asset", addon)
+            self.assertIn("专业家具资产", addon)
             self.assertIn("PRESETS_DIR", addon)
             self.assertIn("SET_PACKAGES_DIR", addon)
             self.assertIn("import hashlib", addon)
@@ -214,9 +244,14 @@ class BlenderDirectorWorkflowTests(unittest.TestCase):
             self.assertIn("gpt_director.import_model", addon)
             self.assertIn("gpt_director.import_asset_directory", addon)
             self.assertIn("*.blend;*.glb;*.gltf;*.fbx;*.obj;*.bvh", addon)
+            self.assertIn("*.stl;*.ply;*.abc;*.usd;*.usdz", addon)
             self.assertIn("SUPPORTED_ASSET_EXTENSIONS", addon)
             self.assertIn("SUPPORTED_TEXTURE_EXTENSIONS", addon)
             self.assertIn("SUPPORTED_LIBRARY_EXTENSIONS", addon)
+            self.assertIn("bpy.ops.import_mesh.stl", addon)
+            self.assertIn("bpy.ops.import_mesh.ply", addon)
+            self.assertIn("bpy.ops.wm.alembic_import", addon)
+            self.assertIn("bpy.ops.wm.usd_import", addon)
             self.assertIn("_asset_paths_from_directory", addon)
             self.assertIn("_texture_role_from_path", addon)
             self.assertIn("_apply_library_texture_material", addon)
@@ -226,9 +261,19 @@ class BlenderDirectorWorkflowTests(unittest.TestCase):
             self.assertIn("_asset_source_profile_enum_items", addon)
             self.assertIn("_upsert_asset_source", addon)
             self.assertIn("_library_asset_enum_items", addon)
+            self.assertIn("_read_blender_asset_catalogs", addon)
+            self.assertIn("_catalog_for_library_item", addon)
+            self.assertIn("asset_browser_catalog_path", addon)
             self.assertIn("_set_library_asset_favorite", addon)
             self.assertIn("_set_library_asset_metadata", addon)
             self.assertIn("_mark_library_asset_used", addon)
+            self.assertIn("_asset_preflight_for_library_item", addon)
+            self.assertIn("_draw_library_asset_preflight", addon)
+            self.assertIn("_set_library_asset_preflight", addon)
+            self.assertIn("preflight_status_label", addon)
+            self.assertIn("资产预检：", addon)
+            self.assertIn("资产预检阻断", addon)
+            self.assertIn("unsupported_format", addon)
             self.assertIn("gpt_director.scan_asset_library", addon)
             self.assertIn("gpt_director.import_library_asset", addon)
             self.assertIn("gpt_director.apply_library_texture_material", addon)
@@ -246,6 +291,35 @@ class BlenderDirectorWorkflowTests(unittest.TestCase):
             self.assertIn("gpt_director_library_asset_tags", addon)
             self.assertIn("gpt_director_library_asset_note", addon)
             self.assertIn("gpt_director.import_plan_assets", addon)
+            self.assertIn("_shot_asset_plan", addon)
+            self.assertIn("_draw_shot_asset_plan", addon)
+            self.assertIn("_append_shot_asset_preparation", addon)
+            self.assertIn("gpt_director.prepare_shot_assets", addon)
+            self.assertIn("镜头资产准备：", addon)
+            self.assertIn("准备镜头资产", addon)
+            self.assertIn('"prepared_for_shot_id"', addon)
+            self.assertIn("_build_ai_workflow_tasks", addon)
+            self.assertIn("_write_ai_workflow_tasks", addon)
+            self.assertIn("_write_ai_workflow_handoff", addon)
+            self.assertIn("gpt_director.export_ai_workflow_tasks", addon)
+            self.assertIn("gpt_director.export_ai_workflow_handoff", addon)
+            self.assertIn("导出AI任务包", addon)
+            self.assertIn("导出AI工作包", addon)
+            self.assertIn("ai_workflow_tasks_report_path", addon)
+            self.assertIn("ai_workflow_handoff_report_path", addon)
+            self.assertIn("_register_ai_workflow_result", addon)
+            self.assertIn("_append_ai_workflow_result", addon)
+            self.assertIn("_ai_result_task_id_from_path", addon)
+            self.assertIn("gpt_director.register_ai_workflow_result", addon)
+            self.assertIn("gpt_director.register_ai_workflow_result_directory", addon)
+            self.assertIn("gpt_director_ai_task_id", addon)
+            self.assertIn("gpt_director_ai_result_type", addon)
+            self.assertIn("gpt_director_ai_result_note", addon)
+            self.assertIn("gpt_director_ai_result_directory", addon)
+            self.assertIn("gpt_director_ai_result_recursive", addon)
+            self.assertIn("登记AI结果", addon)
+            self.assertIn("批量登记AI结果目录", addon)
+            self.assertIn('"ai_workflow_results"', addon)
             self.assertIn("gpt_director_asset_kind", addon)
             self.assertIn("gpt_director_asset_name", addon)
             self.assertIn("gpt_director_asset_choice", addon)
@@ -254,6 +328,12 @@ class BlenderDirectorWorkflowTests(unittest.TestCase):
             self.assertIn("_register_selected_asset", addon)
             self.assertIn('"registered_from"', addon)
             self.assertIn('"selected_objects"', addon)
+            self.assertIn("_attach_imported_asset_controls", addon)
+            self.assertIn("_parent_preserve_world", addon)
+            self.assertIn('"control_root"', addon)
+            self.assertIn('"control_objects"', addon)
+            self.assertIn('"imported_asset_control"', addon)
+            self.assertIn('"可控"', addon)
             self.assertIn("_actor_enum_items", addon)
             self.assertIn("_actor_from_selected_objects", addon)
             self.assertIn("_select_actor_objects", addon)
@@ -273,11 +353,34 @@ class BlenderDirectorWorkflowTests(unittest.TestCase):
             self.assertIn('"matched_action_clip"', addon)
             self.assertIn("_retarget_action_to_armature", addon)
             self.assertIn("_retarget_profile_enum_items", addon)
+            self.assertIn("_retarget_bone_mapping_enum_items", addon)
+            self.assertIn("_refresh_retarget_profile_stats", addon)
+            self.assertIn("_retarget_motion_scale", addon)
+            self.assertIn("_retarget_rest_correction", addon)
+            self.assertIn("_write_retarget_rotation_curves", addon)
+            self.assertIn("_write_retarget_root_location_curves", addon)
+            self.assertIn("_upsert_retarget_action_clip", addon)
+            self.assertIn("_find_action_clip_by_action", addon)
             self.assertIn("gpt_director.build_retarget_profile", addon)
             self.assertIn("gpt_director.apply_retarget_profile", addon)
             self.assertIn("GPT_OT_director_apply_retarget_profile", addon)
+            self.assertIn("gpt_director.load_retarget_bone_mapping", addon)
+            self.assertIn("gpt_director.set_retarget_bone_mapping", addon)
+            self.assertIn("gpt_director.remove_retarget_bone_mapping", addon)
             self.assertIn("gpt_director_retarget_source_armature", addon)
             self.assertIn("gpt_director_retarget_target_armature", addon)
+            self.assertIn("gpt_director_retarget_bone_mapping_choice", addon)
+            self.assertIn("gpt_director_retarget_root_motion_enabled", addon)
+            self.assertIn("gpt_director_retarget_root_motion_scale", addon)
+            self.assertIn("gpt_director_retarget_rest_pose_enabled", addon)
+            self.assertIn("gpt_director_retarget_bake_step", addon)
+            self.assertIn('"unmapped_source_bones"', addon)
+            self.assertIn('"root_motion"', addon)
+            self.assertIn('"rest_pose_alignment"', addon)
+            self.assertIn('"generated_by"] = "retarget"', addon)
+            self.assertIn('"retarget_quality"', addon)
+            self.assertIn('"retarget_source_clip_name"', addon)
+            self.assertIn('"action_matches"', addon)
             self.assertIn("_upsert_action_clip_from_asset_record", addon)
             self.assertIn("_select_objects_by_names", addon)
             self.assertIn("gpt_director.save_actor", addon)
@@ -443,7 +546,7 @@ class BlenderDirectorWorkflowTests(unittest.TestCase):
             meta_data["render_templates"].append({"id": "render_001", "name": "分镜预览规格"})
             meta_data["light_templates"].append({"id": "light_001", "name": "夜景冷光"})
             meta_data["camera_templates"].append({"id": "camera_001", "name": "正反打机位"})
-            meta_data["action_clips"].append({"id": "action_clip_001", "name": "走入停顿"})
+            meta_data["action_clips"].append({"id": "action_clip_001", "name": "走入停顿", "generated_by": "retarget"})
             meta_data["retarget_profiles"].append({"id": "retarget_001", "name": "Mixamo到主角骨骼"})
             meta_data["retarget_applications"].append({"id": "retarget_apply_001", "name": "走入动作重定向"})
             meta_data["pose_templates"].append({"id": "pose_001", "name": "举手质问"})
@@ -455,10 +558,12 @@ class BlenderDirectorWorkflowTests(unittest.TestCase):
             meta_data["asset_sources"].append({"id": "source_001", "name": "Mixamo动作库"})
             meta_data["asset_libraries"].append({"id": "library_001", "name": "影视资产库"})
             meta_data["asset_library_items"].append({"id": "asset_001", "name": "蓝色人偶"})
+            meta_data["ai_workflow_results"].append({"id": "ai_result_001", "payload_name": "AI首帧"})
             meta_data["renders"].append({"output_type": "layered", "output_label": "分层素材包"})
             summary = blender_director_project.summarize_blender_director_metadata(meta_data)
             self.assertIn("输出 1 个", summary)
             self.assertIn("分层素材包 1 个", summary)
+            self.assertIn("AI结果回填 1 个", summary)
             self.assertIn("演员位 1 个", summary)
             self.assertIn("场景预设 1 个", summary)
             self.assertIn("镜头包 1 个", summary)
@@ -467,6 +572,7 @@ class BlenderDirectorWorkflowTests(unittest.TestCase):
             self.assertIn("灯光模板 1 个", summary)
             self.assertIn("机位模板 1 个", summary)
             self.assertIn("动作片段 1 个", summary)
+            self.assertIn("重定向动作片段 1 个", summary)
             self.assertIn("重定向档案 1 个", summary)
             self.assertIn("重定向记录 1 条", summary)
             self.assertIn("姿势模板 1 个", summary)
@@ -715,10 +821,30 @@ class BlenderDirectorWorkflowTests(unittest.TestCase):
             self.assertTrue(asset_requirements_path.exists())
             asset_requirements_csv_path = Path(captured["result"]["blender_project"]["asset_requirements_csv_path"])
             self.assertTrue(asset_requirements_csv_path.exists())
+            asset_ecosystem_path = Path(captured["result"]["blender_project"]["asset_ecosystem_report_path"])
+            self.assertTrue(asset_ecosystem_path.exists())
+            asset_ecosystem_csv_path = Path(captured["result"]["blender_project"]["asset_ecosystem_csv_path"])
+            self.assertTrue(asset_ecosystem_csv_path.exists())
+            asset_preflight_path = Path(captured["result"]["blender_project"]["asset_preflight_report_path"])
+            self.assertTrue(asset_preflight_path.exists())
+            asset_preflight_csv_path = Path(captured["result"]["blender_project"]["asset_preflight_csv_path"])
+            self.assertTrue(asset_preflight_csv_path.exists())
             action_matches_path = Path(captured["result"]["blender_project"]["action_matches_report_path"])
             self.assertTrue(action_matches_path.exists())
             action_matches_csv_path = Path(captured["result"]["blender_project"]["action_matches_csv_path"])
             self.assertTrue(action_matches_csv_path.exists())
+            ai_workflow_tasks_path = Path(captured["result"]["blender_project"]["ai_workflow_tasks_report_path"])
+            self.assertTrue(ai_workflow_tasks_path.exists())
+            ai_workflow_tasks_csv_path = Path(captured["result"]["blender_project"]["ai_workflow_tasks_csv_path"])
+            self.assertTrue(ai_workflow_tasks_csv_path.exists())
+            ai_workflow_handoff_path = Path(captured["result"]["blender_project"]["ai_workflow_handoff_report_path"])
+            self.assertTrue(ai_workflow_handoff_path.exists())
+            ai_workflow_handoff_csv_path = Path(captured["result"]["blender_project"]["ai_workflow_handoff_csv_path"])
+            self.assertTrue(ai_workflow_handoff_csv_path.exists())
+            ai_workflow_results_path = Path(captured["result"]["blender_project"]["ai_workflow_results_report_path"])
+            self.assertTrue(ai_workflow_results_path.exists())
+            ai_workflow_results_csv_path = Path(captured["result"]["blender_project"]["ai_workflow_results_csv_path"])
+            self.assertTrue(ai_workflow_results_csv_path.exists())
             dashboard_path = Path(captured["result"]["blender_project"]["project_dashboard_path"])
             self.assertTrue(dashboard_path.exists())
             report_html = report_path.read_text(encoding="utf-8")
@@ -768,8 +894,18 @@ class BlenderDirectorWorkflowTests(unittest.TestCase):
             self.assertEqual(node.data["director_project"]["asset_usage_csv_path"], str(asset_usage_csv_path))
             self.assertEqual(node.data["director_project"]["asset_requirements_report_path"], str(asset_requirements_path))
             self.assertEqual(node.data["director_project"]["asset_requirements_csv_path"], str(asset_requirements_csv_path))
+            self.assertEqual(node.data["director_project"]["asset_ecosystem_report_path"], str(asset_ecosystem_path))
+            self.assertEqual(node.data["director_project"]["asset_ecosystem_csv_path"], str(asset_ecosystem_csv_path))
+            self.assertEqual(node.data["director_project"]["asset_preflight_report_path"], str(asset_preflight_path))
+            self.assertEqual(node.data["director_project"]["asset_preflight_csv_path"], str(asset_preflight_csv_path))
             self.assertEqual(node.data["director_project"]["action_matches_report_path"], str(action_matches_path))
             self.assertEqual(node.data["director_project"]["action_matches_csv_path"], str(action_matches_csv_path))
+            self.assertEqual(node.data["director_project"]["ai_workflow_tasks_report_path"], str(ai_workflow_tasks_path))
+            self.assertEqual(node.data["director_project"]["ai_workflow_tasks_csv_path"], str(ai_workflow_tasks_csv_path))
+            self.assertEqual(node.data["director_project"]["ai_workflow_handoff_report_path"], str(ai_workflow_handoff_path))
+            self.assertEqual(node.data["director_project"]["ai_workflow_handoff_csv_path"], str(ai_workflow_handoff_csv_path))
+            self.assertEqual(node.data["director_project"]["ai_workflow_results_report_path"], str(ai_workflow_results_path))
+            self.assertEqual(node.data["director_project"]["ai_workflow_results_csv_path"], str(ai_workflow_results_csv_path))
             self.assertEqual(node.data["director_project"]["project_dashboard_path"], str(dashboard_path))
             self.assertIn(str(render_a), node.data["director_synced_renders"])
             self.assertIn(str(render_b), node.data["director_synced_renders"])
@@ -1796,6 +1932,59 @@ class BlenderDirectorWorkflowTests(unittest.TestCase):
                         "render_version": 3,
                     }
                 ],
+                "retarget_profiles": [
+                    {
+                        "id": "retarget_mixamo_hero",
+                        "name": "Mixamo到主角骨骼",
+                        "source_armature": "MixamoRig",
+                        "target_armature": "HeroRig",
+                        "mapped_bone_count": 55,
+                        "unmapped_source_count": 2,
+                        "unmapped_target_count": 1,
+                        "rest_pose_alignment": {
+                            "enabled": True,
+                            "mismatch_bone_count": 4,
+                            "max_angle_degrees": 18.5,
+                            "bake_step": 1,
+                        },
+                        "root_motion": {"enabled": True, "effective_scale": 1.2},
+                    }
+                ],
+                "action_clips": [
+                    {
+                        "id": "retarget_walk",
+                        "name": "走入停顿（重定向）",
+                        "action": "HeroRig_Walk_retarget",
+                        "target_armature": "HeroRig",
+                        "generated_by": "retarget",
+                        "retarget_profile_name": "Mixamo到主角骨骼",
+                        "retarget_quality": {
+                            "copied_fcurve_count": 96,
+                            "skipped_fcurve_count": 3,
+                            "mapped_bone_count": 55,
+                            "unmapped_source_count": 2,
+                            "unmapped_target_count": 1,
+                            "rest_pose_mismatch_bone_count": 4,
+                            "rest_pose_max_angle_degrees": 18.5,
+                            "root_motion_scale": 1.2,
+                        },
+                    }
+                ],
+                "retarget_applications": [
+                    {
+                        "profile_name": "Mixamo到主角骨骼",
+                        "source_action": "Walk",
+                        "target_action": "HeroRig_Walk_retarget",
+                        "target_armature": "HeroRig",
+                        "status": "applied",
+                        "copied_fcurve_count": 96,
+                        "skipped_fcurve_count": 3,
+                        "root_motion_scale": 1.2,
+                        "action_clip": {"id": "retarget_walk", "name": "走入停顿（重定向）"},
+                        "action_matches": {"matched_count": 1, "requirement_count": 1, "unmatched_count": 0},
+                        "applied_at": "2026-07-10 17:00:00",
+                    }
+                ],
             }
 
             manifest = blender_director_project.build_blender_director_production_manifest(metadata)
@@ -1810,11 +1999,15 @@ class BlenderDirectorWorkflowTests(unittest.TestCase):
             self.assertEqual(manifest["assets"][0]["used_by_shots"][0]["shot_name"], "镜头A")
             self.assertEqual(manifest["asset_usage"][0]["name"], "蓝色主角模型")
             self.assertEqual(manifest["asset_usage"][0]["shots"][0]["shot_id"], "shot_a")
+            self.assertEqual(manifest["retarget_summary"]["ready_clip_count"], 1)
+            self.assertEqual(manifest["retarget_summary"]["mapped_bone_count"], 55)
+            self.assertEqual(manifest["retarget_summary"]["rest_pose_max_angle_degrees"], 18.5)
 
             manifest_path = Path(blender_director_project.write_blender_director_production_manifest(metadata))
             manifest_data = json.loads(manifest_path.read_text(encoding="utf-8"))
             self.assertEqual(manifest_data["shots"][0]["render_version"], 3)
             self.assertEqual(manifest_data["assets"][0]["used_by_shots"][0]["shot_id"], "shot_a")
+            self.assertEqual(manifest_data["retarget_summary"]["success_count"], 1)
             report_path = Path(blender_director_project.write_blender_director_production_report(metadata))
             report_html = report_path.read_text(encoding="utf-8")
             self.assertIn("制作清单测试 - 制作清单", report_html)
@@ -1823,6 +2016,21 @@ class BlenderDirectorWorkflowTests(unittest.TestCase):
             self.assertIn("蓝色主角模型", report_html)
             self.assertIn("会议桌", report_html)
             self.assertIn("引用镜头", report_html)
+            self.assertIn("重定向动作质量", report_html)
+            self.assertIn("Mixamo到主角骨骼", report_html)
+            self.assertIn("根运动比例", report_html)
+            retarget_manifest_path = Path(blender_director_project.write_blender_director_retarget_summary_manifest(metadata))
+            retarget_manifest = json.loads(retarget_manifest_path.read_text(encoding="utf-8"))
+            self.assertEqual(retarget_manifest["ready_clip_count"], 1)
+            retarget_report_path = Path(blender_director_project.write_blender_director_retarget_summary_report(metadata))
+            retarget_report_html = retarget_report_path.read_text(encoding="utf-8")
+            self.assertIn("重定向质量报告", retarget_report_html)
+            self.assertIn("走入停顿（重定向）", retarget_report_html)
+            self.assertIn("最大轴向差", retarget_report_html)
+            retarget_csv_path = Path(blender_director_project.write_blender_director_retarget_summary_csv(metadata))
+            retarget_csv = retarget_csv_path.read_text(encoding="utf-8-sig")
+            self.assertIn("Rest Pose差异骨骼", retarget_csv)
+            self.assertIn("走入停顿（重定向）", retarget_csv)
             usage_csv_path = Path(blender_director_project.write_blender_director_asset_usage_csv(metadata))
             usage_csv = usage_csv_path.read_text(encoding="utf-8-sig")
             self.assertIn("资产ID", usage_csv)
@@ -1831,6 +2039,15 @@ class BlenderDirectorWorkflowTests(unittest.TestCase):
 
     def test_asset_requirements_report_marks_missing_actor_models_and_assets(self):
         with tempfile.TemporaryDirectory(dir="/private/tmp") as tmp:
+            library_dir = Path(tmp) / "library"
+            character_dir = library_dir / "characters"
+            prop_dir = library_dir / "props"
+            character_dir.mkdir(parents=True)
+            prop_dir.mkdir(parents=True)
+            missing_actor_candidate = character_dir / "black_agent.glb"
+            missing_actor_candidate.write_bytes(b"glb")
+            missing_car_candidate = prop_dir / "black_car.glb"
+            missing_car_candidate.write_bytes(b"glb")
             metadata = {
                 "project_id": "asset_requirements_test",
                 "project_name": "资产需求测试",
@@ -1855,6 +2072,25 @@ class BlenderDirectorWorkflowTests(unittest.TestCase):
                         ],
                     }
                 ],
+                "asset_library_items": [
+                    {
+                        "id": "candidate_black_agent",
+                        "name": "黑衣人",
+                        "path": str(missing_actor_candidate),
+                        "relative_path": "characters/black_agent.glb",
+                        "kind_hint": "character",
+                        "format": "glb",
+                        "favorite": True,
+                    },
+                    {
+                        "id": "candidate_black_car",
+                        "name": "黑色轿车",
+                        "path": str(missing_car_candidate),
+                        "relative_path": "props/black_car.glb",
+                        "kind_hint": "prop",
+                        "format": "glb",
+                    },
+                ],
             }
 
             requirements = blender_director_project.build_blender_director_asset_requirements(metadata)
@@ -1862,8 +2098,11 @@ class BlenderDirectorWorkflowTests(unittest.TestCase):
             self.assertEqual(requirements["requirement_count"], 4)
             self.assertEqual(requirements["available_count"], 2)
             self.assertEqual(requirements["missing_count"], 2)
+            self.assertEqual(requirements["missing_with_candidate_count"], 2)
             missing_names = {item["name"] for item in requirements["requirements"] if not item["available"]}
             self.assertEqual(missing_names, {"黑衣人", "黑色轿车"})
+            missing_actor = next(item for item in requirements["requirements"] if item["name"] == "黑衣人")
+            self.assertEqual(missing_actor["best_library_candidate"]["id"], "candidate_black_agent")
 
             manifest_path = Path(blender_director_project.write_blender_director_asset_requirements_manifest(metadata))
             report_path = Path(blender_director_project.write_blender_director_asset_requirements_report(metadata))
@@ -1874,9 +2113,184 @@ class BlenderDirectorWorkflowTests(unittest.TestCase):
             self.assertIn("资产需求测试 - 资产需求清单", report_html)
             self.assertIn("缺素材", report_html)
             self.assertIn("黑衣人", report_html)
+            self.assertIn("缺项有本地候选", report_html)
+            self.assertIn("candidate_black_agent", json.dumps(manifest, ensure_ascii=False))
             csv_text = csv_path.read_text(encoding="utf-8-sig")
             self.assertIn("资产类型", csv_text)
             self.assertIn("黑色轿车", csv_text)
+            self.assertIn("本地库候选", csv_text)
+
+    def test_asset_ecosystem_report_tracks_sources_files_licenses_and_imports(self):
+        with tempfile.TemporaryDirectory(dir="/private/tmp") as tmp:
+            project_dir = Path(tmp)
+            library_dir = project_dir / "open_assets"
+            project_assets = project_dir / "assets"
+            library_dir.mkdir()
+            project_assets.mkdir()
+            hero_source = library_dir / "characters" / "hero.glb"
+            hero_source.parent.mkdir()
+            hero_source.write_bytes(b"glb")
+            walk_source = library_dir / "actions" / "walk.bvh"
+            walk_source.parent.mkdir()
+            walk_source.write_bytes(b"bvh")
+            imported_hero = project_assets / "hero.glb"
+            imported_hero.write_bytes(b"glb")
+            missing_prop = library_dir / "props" / "missing_chair.glb"
+            metadata = {
+                "project_id": "asset_ecosystem_test",
+                "project_name": "资产生态测试",
+                "project_dir": tmp,
+                "asset_sources": [
+                    {
+                        "id": "source_open",
+                        "name": "本地开源库",
+                        "path": str(library_dir),
+                        "profile_id": "sketchfab_opengameart",
+                        "profile_name": "Sketchfab / OpenGameArt 本地下载库",
+                        "item_count": 3,
+                        "asset_browser_catalog_count": 1,
+                    }
+                ],
+                "asset_libraries": [
+                    {
+                        "id": "library_open",
+                        "name": "open_assets",
+                        "path": str(library_dir),
+                        "source_profile_id": "sketchfab_opengameart",
+                        "source_profile_name": "Sketchfab / OpenGameArt 本地下载库",
+                        "item_count": 3,
+                        "asset_browser_catalog_count": 1,
+                        "asset_browser_catalog_path": str(library_dir / "blender_assets.cats.txt"),
+                    }
+                ],
+                "asset_library_items": [
+                    {
+                        "id": "hero_item",
+                        "name": "蓝色主角",
+                        "path": str(hero_source),
+                        "relative_path": "characters/hero.glb",
+                        "library_id": "library_open",
+                        "library_path": str(library_dir),
+                        "kind_hint": "character",
+                        "format": "glb",
+                        "source_profile_id": "sketchfab_opengameart",
+                        "source_profile_name": "Sketchfab / OpenGameArt 本地下载库",
+                        "license": "CC-BY",
+                        "favorite": True,
+                        "tags": "主角 hero",
+                        "usage_count": 1,
+                        "asset_browser_catalog_id": "catalog-hero",
+                        "asset_browser_catalog_path": "Characters/Heroes",
+                        "asset_browser_catalog_name": "Heroes",
+                    },
+                    {
+                        "id": "walk_item",
+                        "name": "走路动作",
+                        "path": str(walk_source),
+                        "relative_path": "actions/walk.bvh",
+                        "library_id": "library_open",
+                        "library_path": str(library_dir),
+                        "kind_hint": "action",
+                        "format": "bvh",
+                        "source_profile_id": "mixamo",
+                        "source_profile_name": "Mixamo / 角色动作",
+                        "usage_note": "走入镜头可用",
+                        "usage_count": 1,
+                    },
+                    {
+                        "id": "missing_prop",
+                        "name": "缺失椅子",
+                        "path": str(missing_prop),
+                        "relative_path": "props/missing_chair.glb",
+                        "library_id": "library_open",
+                        "library_path": str(library_dir),
+                        "kind_hint": "prop",
+                        "format": "glb",
+                    },
+                ],
+                "assets": [
+                    {
+                        "id": "asset_hero",
+                        "name": "蓝色主角",
+                        "type": "character",
+                        "format": "glb",
+                        "path": str(imported_hero),
+                        "source_path": str(hero_source),
+                        "library_item_id": "hero_item",
+                        "library_relative_path": "characters/hero.glb",
+                        "source_profile_id": "sketchfab_opengameart",
+                        "source_profile_name": "Sketchfab / OpenGameArt 本地下载库",
+                        "license": "CC-BY",
+                        "objects": ["Hero"],
+                        "control_root": "蓝色主角 导演控制器",
+                        "control_objects": ["蓝色主角 导演控制器", "蓝色主角 导演控制圈"],
+                        "controls": ["root_empty", "viewport_control_ring", "drag_transform", "object_motion", "select_asset"],
+                    }
+                ],
+            }
+
+            ecosystem = blender_director_project.build_blender_director_asset_ecosystem(metadata)
+
+            self.assertEqual(ecosystem["source_count"], 1)
+            self.assertEqual(ecosystem["library_count"], 1)
+            self.assertEqual(ecosystem["library_item_count"], 3)
+            self.assertEqual(ecosystem["available_item_count"], 2)
+            self.assertEqual(ecosystem["missing_file_count"], 1)
+            self.assertEqual(ecosystem["missing_license_count"], 1)
+            self.assertEqual(ecosystem["favorite_count"], 1)
+            self.assertEqual(ecosystem["tagged_count"], 2)
+            self.assertEqual(ecosystem["imported_item_count"], 1)
+            self.assertEqual(ecosystem["controllable_asset_count"], 1)
+            self.assertEqual(ecosystem["asset_browser_catalog_count"], 1)
+            self.assertEqual(ecosystem["action_item_count"], 1)
+            self.assertEqual(ecosystem["ready_action_count"], 1)
+            self.assertIn("库资产缺文件 1 个", ecosystem["health_warnings"])
+            missing_row = next(item for item in ecosystem["items"] if item["id"] == "missing_prop")
+            self.assertIn("缺文件", missing_row["status_label"])
+            self.assertIn("缺授权来源", missing_row["status_label"])
+
+            manifest_path = Path(blender_director_project.write_blender_director_asset_ecosystem_manifest(metadata))
+            report_path = Path(blender_director_project.write_blender_director_asset_ecosystem_report(metadata))
+            csv_path = Path(blender_director_project.write_blender_director_asset_ecosystem_csv(metadata))
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            self.assertEqual(manifest["imported_item_count"], 1)
+            report_html = report_path.read_text(encoding="utf-8")
+            self.assertIn("资产生态测试 - 资产生态报告", report_html)
+            self.assertIn("开源生态来源", report_html)
+            self.assertIn("缺授权来源", report_html)
+            self.assertIn("蓝色主角", report_html)
+            self.assertIn("Blender Catalog", report_html)
+            self.assertIn("Characters/Heroes", report_html)
+            self.assertIn("可控工程资产", report_html)
+            self.assertIn("蓝色主角 导演控制器", report_html)
+            csv_text = csv_path.read_text(encoding="utf-8-sig")
+            self.assertIn("授权", csv_text)
+            self.assertIn("Blender Catalog", csv_text)
+            self.assertIn("Characters/Heroes", csv_text)
+            self.assertIn("缺失椅子", csv_text)
+            self.assertIn("可控", csv_text)
+
+            preflight = blender_director_project.build_blender_director_asset_preflight(metadata)
+            self.assertEqual(preflight["library_item_count"], 3)
+            self.assertEqual(preflight["blocked_count"], 1)
+            self.assertGreaterEqual(preflight["review_count"], 1)
+            self.assertGreaterEqual(preflight["warning_count"], 2)
+            missing_preflight = next(item for item in preflight["items"] if item["id"] == "missing_prop")
+            self.assertEqual(missing_preflight["preflight_status_label"], "阻断")
+            self.assertIn("库资产文件不存在", [issue["title"] for issue in missing_preflight["issues"]])
+            walk_preflight = next(item for item in preflight["items"] if item["id"] == "walk_item")
+            self.assertIn(walk_preflight["preflight_status_label"], {"需复核", "可导入（有建议）"})
+            preflight_manifest_path = Path(blender_director_project.write_blender_director_asset_preflight_manifest(metadata))
+            preflight_report_path = Path(blender_director_project.write_blender_director_asset_preflight_report(metadata))
+            preflight_csv_path = Path(blender_director_project.write_blender_director_asset_preflight_csv(metadata))
+            preflight_manifest = json.loads(preflight_manifest_path.read_text(encoding="utf-8"))
+            self.assertEqual(preflight_manifest["blocked_count"], 1)
+            preflight_report_html = preflight_report_path.read_text(encoding="utf-8")
+            self.assertIn("资产导入预检", preflight_report_html)
+            self.assertIn("修复建议", preflight_report_html)
+            preflight_csv = preflight_csv_path.read_text(encoding="utf-8-sig")
+            self.assertIn("预检状态", preflight_csv)
+            self.assertIn("缺失椅子", preflight_csv)
 
     def test_action_matches_rank_reusable_clips_and_flag_missing_actions(self):
         with tempfile.TemporaryDirectory(dir="/private/tmp") as tmp:
@@ -1953,6 +2367,184 @@ class BlenderDirectorWorkflowTests(unittest.TestCase):
             self.assertIn("WalkStop", csv_text)
             self.assertIn("待补动作", csv_text)
 
+    def test_ai_workflow_tasks_package_shots_assets_and_motion_needs(self):
+        with tempfile.TemporaryDirectory(dir="/private/tmp") as tmp:
+            preview_path = Path(tmp) / "shot_ai.png"
+            preview_path.write_bytes(b"png")
+            library_dir = Path(tmp) / "open_library"
+            library_dir.mkdir()
+            umbrella_path = library_dir / "umbrella.glb"
+            umbrella_path.write_bytes(b"glb")
+            metadata = {
+                "project_id": "ai_workflow_test",
+                "project_name": "AI工作流测试",
+                "project_dir": tmp,
+                "shots": [
+                    {
+                        "id": "shot_ai",
+                        "name": "雨夜挥手",
+                        "note": "女主撑伞在雨夜街口向远处挥手告别",
+                        "scene_number": "场次03",
+                        "scene_location": "街口",
+                        "output_type": "video",
+                        "output_label": "视频",
+                        "frame_start": 1,
+                        "frame_end": 72,
+                        "actors": [{"id": "actor_heroine", "name": "女主", "role": "主角"}],
+                        "assets": [{"id": "asset_umbrella", "name": "雨伞", "type": "prop"}],
+                    }
+                ],
+                "renders": [
+                    {
+                        "shot_id": "shot_ai",
+                        "path": str(preview_path),
+                        "preview_path": str(preview_path),
+                        "output_path": str(preview_path),
+                    }
+                ],
+                "asset_library_items": [
+                    {
+                        "id": "candidate_umbrella",
+                        "name": "雨伞",
+                        "path": str(umbrella_path),
+                        "relative_path": "props/umbrella.glb",
+                        "kind_hint": "prop",
+                        "format": "glb",
+                    }
+                ],
+            }
+
+            tasks = blender_director_project.build_blender_director_ai_workflow_tasks(metadata)
+
+            self.assertEqual(tasks["shot_count"], 1)
+            self.assertEqual(tasks["task_count"], 3)
+            task_types = {item["type"] for item in tasks["tasks"]}
+            self.assertEqual(task_types, {"image_to_video", "asset_generation", "motion_generation"})
+            visual = next(item for item in tasks["tasks"] if item["type"] == "image_to_video")
+            self.assertEqual(visual["status"], "ready_with_reference")
+            self.assertEqual(visual["inputs"]["reference_image"]["path"], str(preview_path))
+            asset_task = next(item for item in tasks["tasks"] if item["type"] == "asset_generation")
+            self.assertEqual(asset_task["status"], "ready_with_candidates")
+            umbrella_requirement = next(
+                item
+                for item in asset_task["inputs"]["missing_requirements"]
+                if item["name"] == "雨伞"
+            )
+            self.assertEqual(
+                umbrella_requirement["best_library_candidate"]["id"],
+                "candidate_umbrella",
+            )
+            motion_task = next(item for item in tasks["tasks"] if item["type"] == "motion_generation")
+            self.assertEqual(motion_task["status"], "needs_motion")
+
+            manifest_path = Path(blender_director_project.write_blender_director_ai_workflow_tasks_manifest(metadata))
+            report_path = Path(blender_director_project.write_blender_director_ai_workflow_tasks_report(metadata))
+            csv_path = Path(blender_director_project.write_blender_director_ai_workflow_tasks_csv(metadata))
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            self.assertEqual(manifest["task_count"], 3)
+            report_html = report_path.read_text(encoding="utf-8")
+            self.assertIn("AI工作流测试 - AI 工作流任务包", report_html)
+            self.assertIn("图生视频", report_html)
+            self.assertIn("资产生成/替换", report_html)
+            csv_text = csv_path.read_text(encoding="utf-8-sig")
+            self.assertIn("任务类型", csv_text)
+            self.assertIn("雨夜挥手", csv_text)
+
+            handoff = blender_director_project.write_blender_director_ai_workflow_handoff_package(metadata)
+            self.assertEqual(handoff["task_count"], 3)
+            self.assertEqual(handoff["result_inbox_count"], 3)
+            handoff_dir = Path(handoff["handoff_dir"])
+            self.assertTrue(handoff_dir.exists())
+            self.assertTrue(Path(handoff["manifest_path"]).exists())
+            self.assertTrue(Path(handoff["report_path"]).exists())
+            self.assertTrue(Path(handoff["csv_path"]).exists())
+            self.assertTrue(Path(handoff["readme_path"]).exists())
+            visual_job = next(item for item in handoff["jobs"] if item["task_type"] == "image_to_video")
+            self.assertTrue(Path(visual_job["prompt_path"]).exists())
+            self.assertTrue(Path(visual_job["task_manifest_path"]).exists())
+            self.assertTrue(Path(visual_job["result_dir"]).is_dir())
+            self.assertTrue(Path(visual_job["result_readme_path"]).exists())
+            self.assertEqual(visual_job["expected_output"]["label"], "视频镜头")
+            self.assertIn("AI 工作包与结果收件箱", Path(handoff["report_path"]).read_text(encoding="utf-8"))
+
+    def test_ai_workflow_results_report_tracks_registered_outputs(self):
+        with tempfile.TemporaryDirectory(dir="/private/tmp") as tmp:
+            image_path = Path(tmp) / "ai_frame.png"
+            asset_path = Path(tmp) / "ai_prop.glb"
+            missing_path = Path(tmp) / "missing_ai_video.mp4"
+            image_path.write_bytes(b"png")
+            asset_path.write_bytes(b"glb")
+            metadata = {
+                "project_id": "ai_result_test",
+                "project_name": "AI结果测试",
+                "project_dir": tmp,
+                "ai_workflow_tasks": {
+                    "tasks": [
+                        {
+                            "id": "ai_visual_shot_ai",
+                            "type": "image_to_video",
+                            "type_label": "图生视频/镜头延展",
+                            "shot_id": "shot_ai",
+                            "shot_name": "雨夜挥手",
+                        }
+                    ]
+                },
+                "ai_workflow_results": [
+                    {
+                        "id": "ai_result_frame",
+                        "task_id": "ai_visual_shot_ai",
+                        "result_type": "image",
+                        "target_type": "render",
+                        "path": str(image_path),
+                        "payload_name": "AI首帧",
+                        "note": "外部工具生成首帧",
+                        "registered_at": "2026-07-10 18:00:00",
+                    },
+                    {
+                        "id": "ai_result_missing_video",
+                        "task_id": "ai_visual_shot_ai",
+                        "result_type": "video",
+                        "target_type": "attachment",
+                        "path": str(missing_path),
+                        "payload_name": "缺失视频",
+                    },
+                ],
+                "assets": [
+                    {
+                        "id": "asset_ai_prop",
+                        "name": "AI道具",
+                        "path": str(asset_path),
+                        "generated_by": "ai_workflow",
+                        "ai_task_id": "ai_assets_shot_ai",
+                        "ai_result_type": "asset",
+                    }
+                ],
+            }
+
+            results = blender_director_project.build_blender_director_ai_workflow_results(metadata)
+
+            self.assertEqual(results["result_count"], 3)
+            self.assertEqual(results["file_exists_count"], 2)
+            self.assertEqual(results["missing_file_count"], 1)
+            self.assertEqual(results["render_count"], 1)
+            self.assertEqual(results["asset_count"], 1)
+            frame = next(item for item in results["results"] if item["id"] == "ai_result_frame")
+            self.assertEqual(frame["task_type_label"], "图生视频/镜头延展")
+            self.assertEqual(frame["shot_name"], "雨夜挥手")
+
+            manifest_path = Path(blender_director_project.write_blender_director_ai_workflow_results_manifest(metadata))
+            report_path = Path(blender_director_project.write_blender_director_ai_workflow_results_report(metadata))
+            csv_path = Path(blender_director_project.write_blender_director_ai_workflow_results_csv(metadata))
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            self.assertEqual(manifest["result_count"], 3)
+            report_html = report_path.read_text(encoding="utf-8")
+            self.assertIn("AI结果测试 - AI 结果回填台账", report_html)
+            self.assertIn("AI首帧", report_html)
+            self.assertIn("文件缺失", report_html)
+            csv_text = csv_path.read_text(encoding="utf-8-sig")
+            self.assertIn("结果ID", csv_text)
+            self.assertIn("AI道具", csv_text)
+
     def test_project_dashboard_links_core_reports(self):
         with tempfile.TemporaryDirectory(dir="/private/tmp") as tmp:
             render_path = Path(tmp) / "shot_a.png"
@@ -1972,6 +2564,35 @@ class BlenderDirectorWorkflowTests(unittest.TestCase):
                 ],
                 "assets": [{"id": "asset_a", "name": "主角模型", "type": "character"}],
                 "renders": [{"shot_id": "shot_a", "path": str(render_path), "preview_path": str(render_path)}],
+                "ai_workflow_results": [
+                    {
+                        "id": "ai_result_dashboard",
+                        "task_id": "ai_visual_shot_a",
+                        "result_type": "image",
+                        "target_type": "render",
+                        "path": str(render_path),
+                        "payload_name": "AI首帧",
+                    }
+                ],
+                "retarget_profiles": [
+                    {
+                        "id": "retarget_hero",
+                        "name": "动作库到主角",
+                        "mapped_bone_count": 40,
+                        "rest_pose_alignment": {"mismatch_bone_count": 3, "max_angle_degrees": 12},
+                    }
+                ],
+                "action_clips": [
+                    {
+                        "id": "retarget_idle",
+                        "name": "站定（重定向）",
+                        "generated_by": "retarget",
+                        "retarget_quality": {"mapped_bone_count": 40, "rest_pose_mismatch_bone_count": 3},
+                    }
+                ],
+                "retarget_applications": [
+                    {"status": "failed", "profile_name": "动作库到主角", "message": "测试失败记录"}
+                ],
             }
             metadata["storyboard_report_path"] = blender_director_project.write_blender_director_storyboard_report(metadata)
             metadata["storyboard_csv_path"] = blender_director_project.write_blender_director_storyboard_csv(metadata)
@@ -2013,8 +2634,21 @@ class BlenderDirectorWorkflowTests(unittest.TestCase):
             metadata["asset_usage_csv_path"] = blender_director_project.write_blender_director_asset_usage_csv(metadata)
             metadata["asset_requirements_report_path"] = blender_director_project.write_blender_director_asset_requirements_report(metadata)
             metadata["asset_requirements_csv_path"] = blender_director_project.write_blender_director_asset_requirements_csv(metadata)
+            metadata["asset_ecosystem_report_path"] = blender_director_project.write_blender_director_asset_ecosystem_report(metadata)
+            metadata["asset_ecosystem_csv_path"] = blender_director_project.write_blender_director_asset_ecosystem_csv(metadata)
+            metadata["asset_preflight_report_path"] = blender_director_project.write_blender_director_asset_preflight_report(metadata)
+            metadata["asset_preflight_csv_path"] = blender_director_project.write_blender_director_asset_preflight_csv(metadata)
             metadata["action_matches_report_path"] = blender_director_project.write_blender_director_action_matches_report(metadata)
             metadata["action_matches_csv_path"] = blender_director_project.write_blender_director_action_matches_csv(metadata)
+            metadata["ai_workflow_tasks_report_path"] = blender_director_project.write_blender_director_ai_workflow_tasks_report(metadata)
+            metadata["ai_workflow_tasks_csv_path"] = blender_director_project.write_blender_director_ai_workflow_tasks_csv(metadata)
+            ai_handoff = blender_director_project.write_blender_director_ai_workflow_handoff_package(metadata)
+            metadata["ai_workflow_handoff_report_path"] = ai_handoff["report_path"]
+            metadata["ai_workflow_handoff_csv_path"] = ai_handoff["csv_path"]
+            metadata["ai_workflow_results_report_path"] = blender_director_project.write_blender_director_ai_workflow_results_report(metadata)
+            metadata["ai_workflow_results_csv_path"] = blender_director_project.write_blender_director_ai_workflow_results_csv(metadata)
+            metadata["retarget_summary_report_path"] = blender_director_project.write_blender_director_retarget_summary_report(metadata)
+            metadata["retarget_summary_csv_path"] = blender_director_project.write_blender_director_retarget_summary_csv(metadata)
             metadata["delivery_audit_report_path"] = blender_director_project.write_blender_director_delivery_audit_report(metadata)
 
             dashboard_path = Path(blender_director_project.write_blender_director_project_dashboard(metadata))
@@ -2043,8 +2677,30 @@ class BlenderDirectorWorkflowTests(unittest.TestCase):
             self.assertIn("估算秒数", dashboard_html)
             self.assertIn("制作清单", dashboard_html)
             self.assertIn("资产需求清单", dashboard_html)
+            self.assertIn("缺项有候选", dashboard_html)
+            self.assertIn("资产生态报告", dashboard_html)
+            self.assertIn("资产生态 CSV", dashboard_html)
+            self.assertIn("资产库缺文件", dashboard_html)
+            self.assertIn("缺授权来源", dashboard_html)
+            self.assertIn("可控工程资产", dashboard_html)
+            self.assertIn("资产导入预检", dashboard_html)
+            self.assertIn("资产导入预检 CSV", dashboard_html)
+            self.assertIn("导入阻断", dashboard_html)
+            self.assertIn("导入需复核", dashboard_html)
             self.assertIn("动作匹配清单", dashboard_html)
             self.assertIn("待补动作", dashboard_html)
+            self.assertIn("AI 工作流任务包", dashboard_html)
+            self.assertIn("AI任务可执行", dashboard_html)
+            self.assertIn("AI 工作包与结果收件箱", dashboard_html)
+            self.assertIn("AI结果收件箱", dashboard_html)
+            self.assertIn("AI 结果回填台账", dashboard_html)
+            self.assertIn("AI结果回填", dashboard_html)
+            self.assertIn("AI结果缺文件", dashboard_html)
+            self.assertIn("重定向动作片段", dashboard_html)
+            self.assertIn("Rest Pose 差异骨骼", dashboard_html)
+            self.assertIn("重定向失败", dashboard_html)
+            self.assertIn("重定向质量报告", dashboard_html)
+            self.assertIn("重定向质量 CSV", dashboard_html)
             self.assertIn("交付检查", dashboard_html)
 
     def test_delivery_audit_detects_missing_files_and_pending_shots(self):
@@ -2095,20 +2751,23 @@ class BlenderDirectorWorkflowTests(unittest.TestCase):
             project_dir = Path(tmp)
             assets_dir = project_dir / "assets"
             characters_dir = assets_dir / "characters"
+            library_dir = project_dir / "open_library"
             shots_dir = project_dir / "shots"
             renders_dir = project_dir / "renders"
             layer_dir = renders_dir / "shot_01_layers"
-            for path in (characters_dir, shots_dir, layer_dir):
+            for path in (characters_dir, library_dir, shots_dir, layer_dir):
                 path.mkdir(parents=True, exist_ok=True)
             meta_path = project_dir / "director_project.json"
             blend_path = project_dir / "director.blend"
             asset_path = characters_dir / "hero.glb"
+            library_asset_path = library_dir / "hero_source.glb"
             shot_path = shots_dir / "shot_01.json"
             preview_path = renders_dir / "shot_01.png"
             transparent_path = layer_dir / "transparent.png"
             layer_manifest_path = layer_dir / "manifest.json"
             blend_path.write_bytes(b"blend")
             asset_path.write_bytes(b"glb")
+            library_asset_path.write_bytes(b"source glb")
             shot_path.write_text('{"id":"shot_01"}', encoding="utf-8")
             preview_path.write_bytes(b"png")
             transparent_path.write_bytes(b"transparent")
@@ -2125,7 +2784,52 @@ class BlenderDirectorWorkflowTests(unittest.TestCase):
                 "shots_dir": str(shots_dir),
                 "renders_dir": str(renders_dir),
                 "assets": [
-                    {"id": "hero", "name": "主角", "path": str(asset_path), "type": "character"}
+                    {
+                        "id": "hero",
+                        "name": "主角",
+                        "path": str(asset_path),
+                        "source_path": str(library_asset_path),
+                        "type": "character",
+                        "library_item_id": "library_hero",
+                        "library_relative_path": "hero_source.glb",
+                        "source_profile_id": "poly_haven",
+                        "source_profile_name": "Poly Haven / HDRI 与 CC0 资产",
+                    }
+                ],
+                "asset_sources": [
+                    {
+                        "id": "source_poly_haven",
+                        "name": "open_library",
+                        "path": str(library_dir),
+                        "profile_id": "poly_haven",
+                        "profile_name": "Poly Haven / HDRI 与 CC0 资产",
+                        "item_count": 1,
+                    }
+                ],
+                "asset_libraries": [
+                    {
+                        "id": "library_open",
+                        "name": "open_library",
+                        "path": str(library_dir),
+                        "source_profile_id": "poly_haven",
+                        "source_profile_name": "Poly Haven / HDRI 与 CC0 资产",
+                        "item_count": 1,
+                    }
+                ],
+                "asset_library_items": [
+                    {
+                        "id": "library_hero",
+                        "name": "主角源文件",
+                        "path": str(library_asset_path),
+                        "relative_path": "hero_source.glb",
+                        "library_id": "library_open",
+                        "library_path": str(library_dir),
+                        "kind_hint": "character",
+                        "format": "glb",
+                        "source_profile_id": "poly_haven",
+                        "source_profile_name": "Poly Haven / HDRI 与 CC0 资产",
+                        "tags": "主角 可商用",
+                    }
                 ],
                 "shots": [
                     {"id": "shot_01", "name": "开场", "assets": [{"id": "hero", "name": "主角"}]}
@@ -2138,6 +2842,55 @@ class BlenderDirectorWorkflowTests(unittest.TestCase):
                         "output_path": str(layer_dir),
                         "manifest_path": str(layer_manifest_path),
                         "layer_paths": {"transparent": str(transparent_path)},
+                    }
+                ],
+                "ai_workflow_results": [
+                    {
+                        "id": "ai_result_delivery",
+                        "task_id": "ai_visual_shot_01",
+                        "result_type": "image",
+                        "target_type": "render",
+                        "path": str(preview_path),
+                        "payload_name": "AI交付首帧",
+                        "registered_at": "2026-07-10 18:30:00",
+                    }
+                ],
+                "retarget_profiles": [
+                    {
+                        "id": "retarget_delivery",
+                        "name": "交付骨骼重定向",
+                        "source_armature": "SourceRig",
+                        "target_armature": "HeroRig",
+                        "mapped_bone_count": 30,
+                        "unmapped_source_count": 0,
+                        "unmapped_target_count": 1,
+                        "rest_pose_alignment": {"mismatch_bone_count": 2, "max_angle_degrees": 8.5},
+                        "root_motion": {"effective_scale": 1.1},
+                    }
+                ],
+                "action_clips": [
+                    {
+                        "id": "retarget_delivery_clip",
+                        "name": "走入（重定向）",
+                        "generated_by": "retarget",
+                        "retarget_profile_name": "交付骨骼重定向",
+                        "retarget_quality": {
+                            "copied_fcurve_count": 48,
+                            "mapped_bone_count": 30,
+                            "unmapped_target_count": 1,
+                            "rest_pose_mismatch_bone_count": 2,
+                            "rest_pose_max_angle_degrees": 8.5,
+                            "root_motion_scale": 1.1,
+                        },
+                    }
+                ],
+                "retarget_applications": [
+                    {
+                        "status": "applied",
+                        "profile_name": "交付骨骼重定向",
+                        "target_action": "HeroRig_Walk_retarget",
+                        "copied_fcurve_count": 48,
+                        "action_clip": {"id": "retarget_delivery_clip", "name": "走入（重定向）"},
                     }
                 ],
             }
@@ -2201,13 +2954,36 @@ class BlenderDirectorWorkflowTests(unittest.TestCase):
                 self.assertIn("asset_requirements.json", names)
                 self.assertIn("asset_requirements.html", names)
                 self.assertIn("asset_requirements.csv", names)
+                self.assertIn("asset_ecosystem.json", names)
+                self.assertIn("asset_ecosystem.html", names)
+                self.assertIn("asset_ecosystem.csv", names)
+                self.assertIn("asset_preflight.json", names)
+                self.assertIn("asset_preflight.html", names)
+                self.assertIn("asset_preflight.csv", names)
                 self.assertIn("action_matches.json", names)
                 self.assertIn("action_matches.html", names)
                 self.assertIn("action_matches.csv", names)
+                self.assertIn("ai_workflow_tasks.json", names)
+                self.assertIn("ai_workflow_tasks.html", names)
+                self.assertIn("ai_workflow_tasks.csv", names)
+                self.assertIn("ai_workflow_handoff/handoff_manifest.json", names)
+                self.assertIn("ai_workflow_handoff/handoff.html", names)
+                self.assertIn("ai_workflow_handoff/handoff.csv", names)
+                self.assertIn("ai_workflow_handoff/README.txt", names)
+                self.assertIn("ai_workflow_handoff/ai_visual_shot_01/task.json", names)
+                self.assertIn("ai_workflow_handoff/ai_visual_shot_01/prompt.txt", names)
+                self.assertIn("ai_workflow_handoff/ai_visual_shot_01/results/README.txt", names)
+                self.assertIn("ai_workflow_results.json", names)
+                self.assertIn("ai_workflow_results.html", names)
+                self.assertIn("ai_workflow_results.csv", names)
+                self.assertIn("retarget_summary.json", names)
+                self.assertIn("retarget_summary.html", names)
+                self.assertIn("retarget_summary.csv", names)
                 self.assertIn("delivery_audit.json", names)
                 self.assertIn("delivery_audit.html", names)
                 self.assertIn("project_dashboard.html", names)
                 self.assertIn("assets/characters/hero.glb", names)
+                self.assertIn("open_library/hero_source.glb", names)
                 self.assertIn("shots/shot_01.json", names)
                 self.assertIn("renders/shot_01.png", names)
                 self.assertIn("renders/shot_01_layers/transparent.png", names)
@@ -2257,8 +3033,40 @@ class BlenderDirectorWorkflowTests(unittest.TestCase):
             self.assertEqual(manifest["asset_usage_csv"], "asset_usage.csv")
             self.assertEqual(manifest["asset_requirements_report"], "asset_requirements.html")
             self.assertEqual(manifest["asset_requirements_csv"], "asset_requirements.csv")
+            self.assertEqual(manifest["asset_ecosystem_manifest"], "asset_ecosystem.json")
+            self.assertEqual(manifest["asset_ecosystem_report"], "asset_ecosystem.html")
+            self.assertEqual(manifest["asset_ecosystem_csv"], "asset_ecosystem.csv")
+            self.assertEqual(manifest["asset_ecosystem"]["library_item_count"], 1)
+            self.assertEqual(manifest["asset_ecosystem"]["imported_item_count"], 1)
+            self.assertEqual(manifest["asset_ecosystem"]["controllable_asset_count"], 0)
+            self.assertEqual(manifest["asset_ecosystem"]["missing_file_count"], 0)
+            self.assertEqual(manifest["asset_preflight_manifest"], "asset_preflight.json")
+            self.assertEqual(manifest["asset_preflight_report"], "asset_preflight.html")
+            self.assertEqual(manifest["asset_preflight_csv"], "asset_preflight.csv")
+            self.assertEqual(manifest["asset_preflight"]["library_item_count"], 1)
+            self.assertEqual(manifest["asset_preflight"]["blocked_count"], 0)
             self.assertEqual(manifest["action_matches_report"], "action_matches.html")
             self.assertEqual(manifest["action_matches_csv"], "action_matches.csv")
+            self.assertEqual(manifest["ai_workflow_tasks_manifest"], "ai_workflow_tasks.json")
+            self.assertEqual(manifest["ai_workflow_tasks_report"], "ai_workflow_tasks.html")
+            self.assertEqual(manifest["ai_workflow_tasks_csv"], "ai_workflow_tasks.csv")
+            self.assertGreaterEqual(manifest["ai_workflow_tasks"]["task_count"], 1)
+            self.assertEqual(manifest["ai_workflow_handoff_manifest"], "ai_workflow_handoff/handoff_manifest.json")
+            self.assertEqual(manifest["ai_workflow_handoff_report"], "ai_workflow_handoff/handoff.html")
+            self.assertEqual(manifest["ai_workflow_handoff_csv"], "ai_workflow_handoff/handoff.csv")
+            self.assertEqual(manifest["ai_workflow_handoff_readme"], "ai_workflow_handoff/README.txt")
+            self.assertGreaterEqual(manifest["ai_workflow_handoff"]["result_inbox_count"], 1)
+            self.assertEqual(manifest["ai_workflow_results_manifest"], "ai_workflow_results.json")
+            self.assertEqual(manifest["ai_workflow_results_report"], "ai_workflow_results.html")
+            self.assertEqual(manifest["ai_workflow_results_csv"], "ai_workflow_results.csv")
+            self.assertEqual(manifest["ai_workflow_results"]["result_count"], 1)
+            self.assertEqual(manifest["ai_workflow_results"]["missing_file_count"], 0)
+            self.assertEqual(manifest["retarget_summary_manifest"], "retarget_summary.json")
+            self.assertEqual(manifest["retarget_summary_report"], "retarget_summary.html")
+            self.assertEqual(manifest["retarget_summary_csv"], "retarget_summary.csv")
+            self.assertEqual(manifest["retarget_summary"]["ready_clip_count"], 1)
+            self.assertEqual(manifest["retarget_summary"]["mapped_bone_count"], 30)
+            self.assertEqual(manifest["retarget_summary"]["rest_pose_max_angle_degrees"], 8.5)
             self.assertEqual(manifest["project_dashboard"], "project_dashboard.html")
             self.assertGreater(manifest["file_count"], 0)
             saved_meta = json.loads(meta_path.read_text(encoding="utf-8"))

@@ -1,4 +1,6 @@
 import json
+import hashlib
+import threading
 import unittest
 from unittest.mock import patch
 
@@ -7,6 +9,7 @@ import gpt_desktop.workers as workers_module
 from gpt_desktop.workers import (
     NovelAnalysisWorker,
     NovelCandidatePostprocessWorker,
+    NovelChapterPlanMasterWorker,
     NovelChapterPlanWorker,
     NovelChapterTitleWorker,
     NovelFrameworkImportWorker,
@@ -33,6 +36,7 @@ class NovelAnalysisWorkerTests(unittest.TestCase):
                     "foreshadows": "F0001 风雨信号",
                     "ending_hook": "旧案卷宗出现。",
                     "forbidden": "不要提前揭晓幕后人。",
+                    "source_event_ids": ["s01-e03", "S01-E04"],
                 },
                 {
                     "index": 1,
@@ -53,6 +57,7 @@ class NovelAnalysisWorkerTests(unittest.TestCase):
         self.assertEqual(plan["chapters"][1]["title"], "风雨入城")
         self.assertEqual(plan["chapters"][1]["target_words"], "3200")
         self.assertEqual(plan["chapters"][1]["characters"], ["陈景川", "林晚"])
+        self.assertEqual(plan["chapters"][1]["source_event_ids"], ["S01-E03", "S01-E04"])
         self.assertEqual(plan["chapters"][1]["foreshadow_task"], "")
         self.assertEqual(plan["chapters"][1]["foreshadows"], [])
 
@@ -62,7 +67,7 @@ class NovelAnalysisWorkerTests(unittest.TestCase):
         prompt = worker._analysis_prompt()
 
         self.assertIn("必须只输出一个合法 JSON 对象", prompt)
-        self.assertIn("请输出 67 章", prompt)
+        self.assertIn("必须输出接下来的 67 章", prompt)
         self.assertIn("不要擅自推翻小说圣经和世界规则", prompt)
         self.assertIn("outline 要写成可直接用于扩写正文的章节提纲", prompt)
         self.assertIn("不写固定伏笔编号或伏笔动作", prompt)
@@ -72,8 +77,62 @@ class NovelAnalysisWorkerTests(unittest.TestCase):
         self.assertIn("后 20%", prompt)
         self.assertIn("narrative_stage", prompt)
         self.assertIn("chapter_function", prompt)
+        self.assertIn("source_event_ids", prompt)
+        self.assertIn("不得把事件序号当作章号", prompt)
+        self.assertIn("每个节点只能使用一次", prompt)
         self.assertNotIn('"foreshadow_task"', prompt)
         self.assertNotIn('"foreshadows"', prompt)
+
+    def test_chapter_plan_master_requires_contiguous_full_book_coverage(self):
+        worker = NovelChapterPlanMasterWorker(
+            "http://example.test", "key", "model", "context", 500000, 2000, 250
+        )
+        self.assertTrue(worker._retry_stream_transport_before_nonstream)
+
+        plan = worker._normalize_master_plan({
+            "summary": "全书主线持续推进到终局。",
+            "arcs": [
+                {
+                    "name": f"阶段{index + 1}",
+                    "start_chapter": index * 25 + 1,
+                    "end_chapter": (index + 1) * 25,
+                    "goal": "推进主线",
+                    "end_state": "进入下一阶段",
+                }
+                for index in range(10)
+            ],
+        })
+
+        self.assertEqual(len(plan["arcs"]), 10)
+        self.assertEqual(plan["arcs"][0]["start_chapter"], 1)
+        self.assertEqual(plan["arcs"][-1]["end_chapter"], 250)
+
+        with self.assertRaisesRegex(ValueError, "不连续"):
+            worker._normalize_master_plan({
+                "arcs": [
+                    {"name": "阶段1", "start_chapter": 1, "end_chapter": 25},
+                    {"name": "阶段2", "start_chapter": 27, "end_chapter": 250},
+                ]
+            })
+
+    def test_chapter_plan_master_prompt_starts_after_existing_chapters(self):
+        worker = NovelChapterPlanMasterWorker(
+            "http://example.test",
+            "key",
+            "model",
+            "context",
+            500000,
+            2000,
+            250,
+            existing_chapter_count=34,
+        )
+
+        prompt = worker._analysis_prompt()
+
+        self.assertIn("第一个阶段必须从第35章开始", prompt)
+        self.assertIn('"start_chapter":35', prompt)
+        self.assertIn("阶段边界和阶段顺序", prompt)
+        self.assertIn("stages.events", prompt)
 
     def test_chapter_plan_stage_uses_existing_chapters_when_appending(self):
         worker = NovelChapterPlanWorker(
@@ -87,6 +146,7 @@ class NovelAnalysisWorkerTests(unittest.TestCase):
             total_chapter_count=100,
             existing_chapter_count=85,
         )
+        self.assertTrue(worker._retry_stream_transport_before_nonstream)
 
         plan = worker._normalize_plan({
             "chapters": [
@@ -200,7 +260,7 @@ class NovelAnalysisWorkerTests(unittest.TestCase):
         self.assertIn("重要连续性事实必须保留", prompt)
         self.assertIn("章节结尾的时间、天气、地点、人物位置", prompt)
         self.assertIn("雨停/雨后", prompt)
-        self.assertEqual(worker._max_tokens_for_request(), 1200)
+        self.assertEqual(worker._max_tokens_for_request(), 6000)
 
     def test_writing_prompts_include_editorial_quality_standard(self):
         for action in (
@@ -219,6 +279,21 @@ class NovelAnalysisWorkerTests(unittest.TestCase):
 
                 self.assertIn("成熟的商业小说作者兼责任编辑", prompt)
                 self.assertIn("人物、设定、时间线、伏笔、空间关系和因果链", prompt)
+
+    def test_memory_repair_patch_uses_smaller_output_budget(self):
+        full_worker = NovelWritingWorker(
+            "http://example.test", "key", "model", "memory_repair", "完整修复上下文"
+        )
+        patch_worker = NovelWritingWorker(
+            "http://example.test",
+            "key",
+            "model",
+            "memory_repair",
+            "【状态增量修复补丁】\n只替换错误字段。",
+        )
+
+        self.assertEqual(full_worker._max_tokens_for_request(), 8000)
+        self.assertEqual(patch_worker._max_tokens_for_request(), 6000)
 
     def test_fiction_prompts_include_body_specific_quality_requirements(self):
         for action in ("draft", "script_to_novel"):
@@ -245,6 +320,111 @@ class NovelAnalysisWorkerTests(unittest.TestCase):
         self.assertIn("必须继承承接点里的时间、天气、地点", prompt)
         self.assertIn("雨已停", prompt)
         self.assertIn("不要在下一章开头改成仍在下雨", prompt)
+
+    def test_draft_prompt_with_style_reference_disables_generic_writing_preferences(self):
+        worker = NovelWritingWorker(
+            "http://example.test",
+            "key",
+            "model",
+            "draft",
+            "【当前章节】\n剧情资料。\n\n【正文风格参考】\n样本正文。",
+        )
+
+        prompt = worker._action_prompt()
+
+        self.assertIn("唯一写法标准", prompt)
+        self.assertIn("严格执行【风格锁定规则】中的动态指标", prompt)
+        self.assertIn("不要自行追求多动作、多对白", prompt)
+        self.assertNotIn("中段必须出现一次意料之外", prompt)
+        self.assertNotIn("至少写出 3 处具体可见细节", prompt)
+        self.assertNotIn("多用动作和对话推进", prompt)
+
+    def test_style_execution_draft_uses_specialized_three_part_contract(self):
+        worker = NovelWritingWorker(
+            "http://example.test",
+            "key",
+            "model",
+            "draft",
+            "本章扩写字数：3000字\n【剧情执行稿任务】\n输出清单和备用正文。",
+        )
+
+        prompt = worker._action_prompt()
+
+        self.assertIn("剧情与声纹执行编辑", prompt)
+        self.assertIn("无需阅读备用草稿措辞也能从零写作", prompt)
+        self.assertIn("唯一剧情拍点", prompt)
+        self.assertIn("静默继承边界", prompt)
+        self.assertIn("不得把同一场对话", prompt)
+        self.assertIn("本章声纹执行表", prompt)
+        self.assertIn("三个分区标题", prompt)
+        self.assertEqual(worker._max_tokens_for_request(), 11000)
+
+    def test_style_profile_audit_and_rewrite_prompts_are_specialized(self):
+        profile_worker = NovelWritingWorker("http://example.test", "key", "model", "style_profile", "样本")
+        finalize_worker = NovelWritingWorker(
+            "http://example.test", "key", "model", "style_finalize", "本章扩写字数：3000字"
+        )
+        audit_worker = NovelWritingWorker("http://example.test", "key", "model", "style_audit", "样本和候选")
+        rewrite_worker = NovelWritingWorker(
+            "http://example.test",
+            "key",
+            "model",
+            "style_rewrite",
+            "【正文风格参考】\n样本\n\n【风格验收未通过：本次必须重写】\n要求",
+        )
+        plot_worker = NovelWritingWorker("http://example.test", "key", "model", "style_plot_extract", "候选")
+        baseline_worker = NovelWritingWorker("http://example.test", "key", "model", "style_baseline", "作者原文")
+        sheet_worker = NovelWritingWorker("http://example.test", "key", "model", "style_sheet", "作者原文和基准稿")
+        merge_worker = NovelWritingWorker("http://example.test", "key", "model", "style_sheet_merge", "两个档案")
+        persona_worker = NovelWritingWorker("http://example.test", "key", "model", "style_persona", "最终档案")
+        cards_worker = NovelWritingWorker("http://example.test", "key", "model", "style_cards", "作者完整原文")
+        rules_worker = NovelWritingWorker("http://example.test", "key", "model", "style_rules", "本章资料")
+        memory_finalize_worker = NovelWritingWorker(
+            "http://example.test", "key", "model", "memory_finalize", "最终正文和长期资料"
+        )
+
+        profile_prompt = profile_worker._action_prompt()
+        finalize_prompt = finalize_worker._action_prompt()
+        audit_prompt = audit_worker._action_prompt()
+        rewrite_prompt = rewrite_worker._action_prompt()
+        plot_prompt = plot_worker._action_prompt()
+
+        self.assertIn("不能自动美化成标准商业文风", profile_prompt)
+        self.assertIn("修辞性重复", profile_prompt)
+        self.assertIn("跨段或跨章反复解释", profile_prompt)
+        self.assertIn("同一信息只有出现新证据", finalize_prompt)
+        self.assertIn("同时校验剧情执行、连续性和样本文风", finalize_prompt)
+        self.assertIn("用户上下文指定的输出分区", finalize_prompt)
+        self.assertIn("独立小说文风审校员", audit_prompt)
+        self.assertIn("最多列5项真正影响整体读感的阻断差异", audit_prompt)
+        self.assertIn("评分达到80才允许通过", audit_prompt)
+        self.assertIn("唯一写法标准", rewrite_prompt)
+        self.assertIn("不带任何原文文风的剧情事实清单", plot_prompt)
+        self.assertIn("普通中文小说写法", baseline_worker._action_prompt())
+        self.assertIn("逐字证据", sheet_worker._action_prompt())
+        self.assertIn("只合并真正等价", merge_worker._action_prompt())
+        self.assertIn("第二人称", persona_worker._action_prompt())
+        self.assertIn("逐字连续截取片段", cards_worker._action_prompt())
+        self.assertEqual(cards_worker._max_tokens_for_request(), 7000)
+        self.assertIn("当前章节资料", rules_worker._action_prompt())
+        self.assertIn("连续性总编辑", memory_finalize_worker._action_prompt())
+        self.assertIn("记录缺失或覆盖", memory_finalize_worker._action_prompt())
+        self.assertEqual(profile_worker._max_tokens_for_request(), 2800)
+        self.assertEqual(finalize_worker._max_tokens_for_request(), 8500)
+        self.assertEqual(memory_finalize_worker._max_tokens_for_request(), 9000)
+        reconcile_worker = NovelWritingWorker(
+            "http://example.test", "key", "model", "memory_reconcile", "十章边界资料"
+        )
+        self.assertEqual(reconcile_worker._max_tokens_for_request(), 4500)
+        self.assertIn("最小纠错补丁", reconcile_worker._action_prompt())
+        self.assertIn("未授权写成已授权", reconcile_worker._action_prompt())
+        self.assertEqual(audit_worker._max_tokens_for_request(), 2200)
+        self.assertEqual(plot_worker._max_tokens_for_request(), 1800)
+        self.assertEqual(baseline_worker._max_tokens_for_request(), 12000)
+        self.assertEqual(sheet_worker._max_tokens_for_request(), 6000)
+        self.assertEqual(merge_worker._max_tokens_for_request(), 6000)
+        self.assertEqual(persona_worker._max_tokens_for_request(), 3200)
+        self.assertEqual(rules_worker._max_tokens_for_request(), 4200)
 
     def test_outline_prompt_is_kept_compact(self):
         worker = NovelWritingWorker("http://example.test", "key", "model", "outline", "context")
@@ -315,6 +495,84 @@ class NovelAnalysisWorkerTests(unittest.TestCase):
         self.assertTrue(errors)
         self.assertIn("未完整结束", errors[0])
 
+    def test_writing_worker_diagnostics_capture_failed_request_and_partial_output(self):
+        context = "【当前章节】\n" + ("连续性资料。" * 80)
+        worker = NovelWritingWorker("http://example.test", "key", "model", "draft", context)
+        worker._session = _FakeStreamSession([
+            'data: {"choices":[{"delta":{"content":"半截正文"}}]}',
+        ])
+
+        worker.run()
+
+        diagnostics = worker.diagnostics
+        self.assertEqual(diagnostics["outcome"], "error")
+        self.assertEqual(diagnostics["error_type"], "Exception")
+        self.assertEqual(diagnostics["response_chars"], len("半截正文"))
+        self.assertEqual(worker.last_response_text, "半截正文")
+        self.assertEqual(
+            diagnostics["sent_context_sha256"],
+            hashlib.sha256(context.encode("utf-8")).hexdigest(),
+        )
+        self.assertTrue(diagnostics["traceback"])
+        self.assertGreater(diagnostics["sse_lines"], 0)
+
+    def test_writing_worker_diagnostics_mark_empty_user_stop(self):
+        worker = NovelWritingWorker("http://example.test", "key", "model", "outline", "context")
+        worker._session = _FakeStreamSession([])
+        worker._stop_requested = True
+        results = []
+        worker.result_ready.connect(lambda action, content: results.append((action, content)))
+
+        worker.run()
+
+        self.assertEqual(results, [("outline", "")])
+        self.assertEqual(worker.diagnostics["outcome"], "stopped")
+        self.assertIn("finished_at", worker.diagnostics)
+
+    def test_writing_worker_stop_does_not_wait_for_response_headers(self):
+        class BlockingSession:
+            trust_env = False
+
+            def __init__(self):
+                self.started = threading.Event()
+                self.release = threading.Event()
+                self.completed = threading.Event()
+                self.closed = False
+
+            def post(self, *_args, **_kwargs):
+                self.started.set()
+                try:
+                    self.release.wait(5)
+                    raise RuntimeError("request released after cancellation")
+                finally:
+                    self.completed.set()
+
+            def close(self):
+                self.closed = True
+
+        session = BlockingSession()
+        worker = NovelWritingWorker("http://example.test", "key", "model", "draft", "context")
+        worker._session = session
+        results = []
+        errors = []
+        worker.result_ready.connect(lambda action, content: results.append((action, content)))
+        worker.failed.connect(errors.append)
+        runner = threading.Thread(target=worker.run, daemon=True)
+        runner.start()
+        self.assertTrue(session.started.wait(1))
+
+        worker.stop()
+        runner.join(1)
+
+        try:
+            self.assertFalse(runner.is_alive())
+            self.assertEqual(errors, [])
+            self.assertTrue(worker.diagnostics["cancelled_before_headers"])
+            self.assertEqual(worker.diagnostics["outcome"], "stopped")
+        finally:
+            session.release.set()
+            session.completed.wait(1)
+
     def test_writing_worker_rejects_length_finish_reason_even_with_done_marker(self):
         worker = NovelWritingWorker("http://example.test", "key", "model", "draft", "context")
         worker._session = _FakeStreamSession([
@@ -348,6 +606,20 @@ class NovelAnalysisWorkerTests(unittest.TestCase):
         self.assertEqual(errors, [])
         self.assertEqual(results, [("draft", "完整正文。")])
 
+    def test_writing_worker_sends_up_to_shared_novel_context_limit(self):
+        context = "长篇上下文" * 30000
+        worker = NovelWritingWorker("http://example.test", "key", "model", "outline", context)
+        session = _FakeStreamSession([
+            'data: {"choices":[{"delta":{"content":"1. 提纲"},"finish_reason":"stop"}]}',
+        ])
+        worker._session = session
+
+        worker.run()
+
+        sent = session.last_payload["messages"][1]["content"]
+        self.assertEqual(len(sent), workers_module.NOVEL_AI_CONTEXT_LIMIT)
+        self.assertEqual(sent, context[:workers_module.NOVEL_AI_CONTEXT_LIMIT])
+
     def test_draft_worker_rejects_body_that_ends_mid_sentence(self):
         worker = NovelWritingWorker("http://example.test", "key", "model", "draft", "context")
         worker._session = _FakeStreamSession([
@@ -363,6 +635,79 @@ class NovelAnalysisWorkerTests(unittest.TestCase):
         self.assertEqual(results, [])
         self.assertTrue(errors)
         self.assertIn("还没有写完", errors[0])
+
+    def test_draft_worker_accepts_em_dash_cliffhanger(self):
+        worker = NovelWritingWorker("http://example.test", "key", "model", "draft", "context")
+        content = "黑暗中传来规律的声音。\n\n滴——\n\n滴——"
+        worker._session = _FakeStreamSession([
+            "data: " + json.dumps({
+                "choices": [{
+                    "delta": {"content": content},
+                    "finish_reason": "stop",
+                }]
+            }, ensure_ascii=False),
+            "data: [DONE]",
+        ])
+        errors = []
+        results = []
+        worker.failed.connect(errors.append)
+        worker.result_ready.connect(lambda action, value: results.append((action, value)))
+
+        worker.run()
+
+        self.assertEqual(errors, [])
+        self.assertEqual(results, [("draft", content)])
+
+    def test_structured_draft_worker_validates_extracted_backup_draft(self):
+        context = "【剧情执行稿任务】\n严格输出三个分区。"
+        worker = NovelWritingWorker("http://example.test", "key", "model", "draft", context)
+        content = (
+            "【剧情执行清单】\n1. 主角渡劫。\n\n"
+            "【本章声纹执行表】\n结尾停在监护声。\n\n"
+            "【备用正文草稿】\n黑暗中响起声音。\n\n滴——"
+        )
+        worker._session = _FakeStreamSession([
+            "data: " + json.dumps({
+                "choices": [{
+                    "delta": {"content": content},
+                    "finish_reason": "stop",
+                }]
+            }, ensure_ascii=False),
+            "data: [DONE]",
+        ])
+        errors = []
+        results = []
+        worker.failed.connect(errors.append)
+        worker.result_ready.connect(lambda action, value: results.append((action, value)))
+
+        worker.run()
+
+        self.assertEqual(errors, [])
+        self.assertEqual(results, [("draft", content)])
+
+    def test_structured_draft_worker_rejects_incomplete_sections(self):
+        context = "【剧情执行稿任务】\n严格输出三个分区。"
+        worker = NovelWritingWorker("http://example.test", "key", "model", "draft", context)
+        content = "【剧情执行清单】\n1. 主角渡劫。\n\n【备用正文草稿】\n正文完成。"
+        worker._session = _FakeStreamSession([
+            "data: " + json.dumps({
+                "choices": [{
+                    "delta": {"content": content},
+                    "finish_reason": "stop",
+                }]
+            }, ensure_ascii=False),
+            "data: [DONE]",
+        ])
+        errors = []
+        results = []
+        worker.failed.connect(errors.append)
+        worker.result_ready.connect(lambda action, value: results.append((action, value)))
+
+        worker.run()
+
+        self.assertEqual(results, [])
+        self.assertTrue(errors)
+        self.assertIn("剧情执行稿结构不完整", errors[0])
 
     def test_outline_worker_allows_compact_unpunctuated_result(self):
         worker = NovelWritingWorker("http://example.test", "key", "model", "outline", "context")
@@ -1143,6 +1488,42 @@ class NovelAnalysisWorkerTests(unittest.TestCase):
         self.assertEqual(normalized["chapter_plan"]["chapters"][0]["title"], "旧案重启")
         self.assertIn("赵明收到缺页卷宗", normalized["chapter_plan"]["chapters"][0]["outline"])
 
+    def test_framework_import_retries_premature_transport_with_stream(self):
+        worker = NovelFrameworkImportWorker(
+            "http://example.test",
+            "key",
+            "model",
+            "主角：赵明",
+        )
+        worker.retry_attempts = 2
+        stream_calls = []
+        normal_calls = []
+
+        def fake_stream(*_args, **_kwargs):
+            stream_calls.append(1)
+            if len(stream_calls) == 1:
+                raise RuntimeError("Response ended prematurely")
+            return {"meta": {"title": "旧案录"}, "characters": [], "lore": [], "foreshadows": []}
+
+        def fake_normal(*_args, **_kwargs):
+            normal_calls.append(1)
+            raise AssertionError("框架长请求不应在流式传输中断后降级为普通请求")
+
+        worker._post_analysis_chunk_stream = fake_stream
+        worker._post_analysis_chunk = fake_normal
+
+        parsed, _response_format = worker._analyze_chunk_with_retries(
+            worker._analysis_prompt(),
+            worker._framework_user_text(),
+            1,
+            1,
+            True,
+        )
+
+        self.assertEqual(parsed["meta"]["title"], "旧案录")
+        self.assertEqual(len(stream_calls), 2)
+        self.assertEqual(normal_calls, [])
+
     def test_framework_import_normalizes_project_target_words_to_wan_unit(self):
         worker = NovelFrameworkImportWorker(
             "http://example.test",
@@ -1524,8 +1905,10 @@ class _FakeStreamSession:
     def __init__(self, lines):
         self._response = _FakeStreamResponse(lines)
         self.closed = False
+        self.last_payload = None
 
     def post(self, *_args, **_kwargs):
+        self.last_payload = _kwargs.get("json")
         return self._response
 
     def close(self):

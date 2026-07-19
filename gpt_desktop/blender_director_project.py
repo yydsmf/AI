@@ -1,9 +1,12 @@
 import csv
 import hashlib
+import csv
 import json
 import os
 import re
+import shutil
 import subprocess
+import sys
 import uuid
 import zipfile
 import xml.etree.ElementTree as ET
@@ -15,45 +18,128 @@ from .core import APP_DIR
 
 
 DIRECTOR_PROJECT_ROOT = os.path.join(APP_DIR, "blender_director_projects")
+BUNDLED_MANNEQUIN_FILENAME = "wooden_mannequin_rigged_293.blend"
+BUNDLED_MANNEQUIN_ATTRIBUTION_FILENAME = "WOODEN_MANNEQUIN_ATTRIBUTION.md"
+BUNDLED_FURNITURE_FILENAME = "modern_furniture_pack_293.blend"
+BUNDLED_FURNITURE_ATTRIBUTION_FILENAME = "MODERN_FURNITURE_ATTRIBUTION.md"
+BUNDLED_FURNITURE_SOFA_COLLECTION = "Director Modern Sofa"
+BUNDLED_FURNITURE_TABLE_COLLECTION = "Director Modern Coffee Table"
+
+
+def _bundled_blender_resource_path(filename):
+    filename = str(filename or "").strip()
+    package_path = Path(__file__).resolve().parent / "resources" / "blender" / filename
+    candidates = [package_path]
+    bundle_root = str(getattr(sys, "_MEIPASS", "") or "").strip()
+    if bundle_root:
+        candidates.insert(0, Path(bundle_root) / "gpt_desktop" / "resources" / "blender" / filename)
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+    return package_path
+
+
+def _file_sha256(path):
+    digest = hashlib.sha256()
+    with open(path, "rb") as source:
+        for chunk in iter(lambda: source.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _copy_bundled_mannequin_assets(character_assets_dir):
+    character_assets_dir = str(character_assets_dir or "").strip()
+    if not character_assets_dir:
+        raise RuntimeError("导演台人物资产目录不可用。")
+    os.makedirs(character_assets_dir, exist_ok=True)
+    source_blend = _bundled_blender_resource_path(BUNDLED_MANNEQUIN_FILENAME)
+    source_attribution = _bundled_blender_resource_path(BUNDLED_MANNEQUIN_ATTRIBUTION_FILENAME)
+    if not source_blend.exists():
+        raise RuntimeError("缺少内置骨骼人偶资源：" + str(source_blend))
+    target_blend = Path(character_assets_dir) / BUNDLED_MANNEQUIN_FILENAME
+    target_attribution = Path(character_assets_dir) / BUNDLED_MANNEQUIN_ATTRIBUTION_FILENAME
+    if not target_blend.exists() or _file_sha256(source_blend) != _file_sha256(target_blend):
+        shutil.copy2(source_blend, target_blend)
+    if source_attribution.exists():
+        if not target_attribution.exists() or source_attribution.read_bytes() != target_attribution.read_bytes():
+            shutil.copy2(source_attribution, target_attribution)
+    return {
+        "path": str(target_blend),
+        "attribution_path": str(target_attribution),
+        "source_path": str(source_blend),
+        "sha256": _file_sha256(target_blend),
+    }
+
+
+def _copy_bundled_furniture_assets(prop_assets_dir):
+    prop_assets_dir = str(prop_assets_dir or "").strip()
+    if not prop_assets_dir:
+        raise RuntimeError("导演台道具资产目录不可用。")
+    os.makedirs(prop_assets_dir, exist_ok=True)
+    source_blend = _bundled_blender_resource_path(BUNDLED_FURNITURE_FILENAME)
+    source_attribution = _bundled_blender_resource_path(BUNDLED_FURNITURE_ATTRIBUTION_FILENAME)
+    if not source_blend.exists():
+        raise RuntimeError("缺少内置现代家具资源：" + str(source_blend))
+    target_blend = Path(prop_assets_dir) / BUNDLED_FURNITURE_FILENAME
+    target_attribution = Path(prop_assets_dir) / BUNDLED_FURNITURE_ATTRIBUTION_FILENAME
+    if not target_blend.exists() or _file_sha256(source_blend) != _file_sha256(target_blend):
+        shutil.copy2(source_blend, target_blend)
+    if source_attribution.exists():
+        if not target_attribution.exists() or source_attribution.read_bytes() != target_attribution.read_bytes():
+            shutil.copy2(source_attribution, target_attribution)
+    return {
+        "path": str(target_blend),
+        "attribution_path": str(target_attribution),
+        "source_path": str(source_blend),
+        "sha256": _file_sha256(target_blend),
+    }
 
 
 def _default_director_asset_pack():
     return [
         {
             "id": "builtin_blue_mannequin",
-            "name": "蓝色可控人偶",
+            "name": "蓝色 IK/FK 骨骼人偶",
             "type": "character",
-            "format": "procedural",
-            "license": "procedural_local",
-            "controls": ["root_empty", "viewport_control_ring", "object_motion", "pose_snapshot"],
-            "description": "内置影视人偶，可拖动根控制器、保存演员位、记录走位和镜头引用。",
+            "format": "blend",
+            "license": "CC-BY",
+            "author": "jgilhutton / Juan Ignacio",
+            "source_url": "https://blendswap.com/blend/13034",
+            "controls": ["root_empty", "viewport_control_ring", "armature", "ik_fk", "hand_foot_controls", "object_mode_pose_proxies", "color_coded_controls", "object_motion", "pose_snapshot"],
+            "description": "Blender 2.93 骨骼人偶，保留手脚 IK、肘膝 Pole、IK/FK、骨盆、胸腔和头部控制器，并提供对象模式可直接拖动的彩色控制器。",
         },
         {
             "id": "builtin_red_mannequin",
-            "name": "红色可控人偶",
+            "name": "红色 IK/FK 骨骼人偶",
             "type": "character",
-            "format": "procedural",
-            "license": "procedural_local",
-            "controls": ["root_empty", "viewport_control_ring", "object_motion", "pose_snapshot"],
-            "description": "用于正反打、对话、对峙等短剧分镜的第二演员位。",
+            "format": "blend",
+            "license": "CC-BY",
+            "author": "jgilhutton / Juan Ignacio",
+            "source_url": "https://blendswap.com/blend/13034",
+            "controls": ["root_empty", "viewport_control_ring", "armature", "ik_fk", "hand_foot_controls", "object_mode_pose_proxies", "color_coded_controls", "object_motion", "pose_snapshot"],
+            "description": "用于正反打、对话和对峙分镜的第二演员位，可在对象模式直接拖动彩色手脚与肘膝控制器摆姿势。",
         },
         {
             "id": "builtin_lounge_set",
-            "name": "双人沙发圆桌布景",
+            "name": "专业双人沙发茶几布景",
             "type": "scene",
-            "format": "procedural",
-            "license": "procedural_local",
+            "format": "blend",
+            "license": "CC0",
+            "author": "LauroVictorDesign / Neobox",
+            "source_url": "https://blendswap.com/blend/26538 | https://blendswap.com/blend/27096",
             "controls": ["set_package", "scene_preset", "object_template"],
-            "description": "一键搭出双人对话场景：两张沙发、圆桌、深色网格导演台、三点布光和可调机位。",
+            "description": "一键搭出双人对话场景：真实软包双人沙发、几何茶几、深色网格导演台、三点布光和可调机位。",
         },
         {
             "id": "builtin_sofa_table_props",
-            "name": "沙发茶几与圆桌道具",
+            "name": "现代软包沙发与几何茶几",
             "type": "prop",
-            "format": "procedural",
-            "license": "procedural_local",
+            "format": "blend",
+            "license": "CC0",
+            "author": "LauroVictorDesign / Neobox",
+            "source_url": "https://blendswap.com/blend/26538 | https://blendswap.com/blend/27096",
             "controls": ["select_asset", "register_selected_asset", "object_template"],
-            "description": "可直接拖动摆位，也可登记为工程道具资产并参与资产需求清单。",
+            "description": "Blender 2.93 原生材质家具，可通过根控制器直接拖动、旋转、缩放，也可登记为工程道具资产。",
         },
     ]
 
@@ -63,13 +149,19 @@ def _default_open_asset_source_profiles():
         {
             "id": "blenderkit",
             "name": "BlenderKit / 本地 BlenderKit 缓存",
-            "formats": ["blend", "fbx", "obj", "glb", "gltf"],
+            "formats": ["blend", "fbx", "obj", "glb", "gltf", "stl", "ply", "abc", "usd", "usdz"],
             "route": "把下载后的本地目录作为资产库扫描；保留原始授权信息。",
+        },
+        {
+            "id": "blender_asset_browser",
+            "name": "Blender Asset Browser / 本地资产库",
+            "formats": ["blend"],
+            "route": "扫描 Blender 原生资产库目录，读取 blender_assets.cats.txt 目录编目并保留 Catalog 信息。",
         },
         {
             "id": "poly_haven",
             "name": "Poly Haven / HDRI 与 CC0 资产",
-            "formats": ["blend", "fbx", "obj", "glb", "gltf", "hdr", "exr"],
+            "formats": ["blend", "fbx", "obj", "glb", "gltf", "stl", "ply", "abc", "usd", "usdz", "hdr", "exr"],
             "route": "用于场景、灯光、HDRI、材质目录的本地导入和归档。",
         },
         {
@@ -87,7 +179,7 @@ def _default_open_asset_source_profiles():
         {
             "id": "sketchfab_opengameart",
             "name": "Sketchfab / OpenGameArt 本地下载库",
-            "formats": ["blend", "fbx", "obj", "glb", "gltf"],
+            "formats": ["blend", "fbx", "obj", "glb", "gltf", "stl", "ply", "abc", "usd", "usdz"],
             "route": "作为人物、道具、场景资产库扫描；按目录关键词自动推断资产类型。",
         },
     ]
@@ -145,6 +237,8 @@ def prepare_blender_director_project(project_id="", project_name="", plan=None):
     }
     for path in (project_dir, scripts_dir, renders_dir, assets_dir, shots_dir, presets_dir, set_packages_dir, *asset_dirs.values()):
         os.makedirs(path, exist_ok=True)
+    bundled_mannequin = _copy_bundled_mannequin_assets(asset_dirs["characters"])
+    bundled_furniture = _copy_bundled_furniture_assets(asset_dirs["props"])
 
     blend_path = os.path.join(project_dir, f"{_safe_name(project_name)}.blend")
     meta_path = os.path.join(project_dir, "director_project.json")
@@ -180,6 +274,8 @@ def prepare_blender_director_project(project_id="", project_name="", plan=None):
             "batch_render_script_path": batch_render_script_path,
             "batch_render_command_path": batch_render_command_path,
             "batch_render_command_report_path": batch_render_command_report_path,
+            "bundled_mannequin": bundled_mannequin,
+            "bundled_furniture": bundled_furniture,
             "plan": plan,
             "updated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         }
@@ -200,6 +296,10 @@ def prepare_blender_director_project(project_id="", project_name="", plan=None):
         metadata["asset_library_items"] = []
     if not isinstance(metadata.get("asset_sources"), list):
         metadata["asset_sources"] = []
+    if not isinstance(metadata.get("shot_asset_preparations"), list):
+        metadata["shot_asset_preparations"] = []
+    if not isinstance(metadata.get("ai_workflow_results"), list):
+        metadata["ai_workflow_results"] = []
     if not isinstance(metadata.get("renders"), list):
         metadata["renders"] = []
     if not isinstance(metadata.get("render_templates"), list):
@@ -243,9 +343,9 @@ def prepare_blender_director_project(project_id="", project_name="", plan=None):
     metadata["director_capabilities"] = {
         "version": 2,
         "mode": "real_blender_director_stage",
-        "asset_formats": ["blend", "glb", "gltf", "fbx", "obj", "bvh", "png", "jpg", "jpeg", "tif", "tiff", "exr", "hdr"],
+        "asset_formats": ["blend", "glb", "gltf", "fbx", "obj", "bvh", "stl", "ply", "abc", "usd", "usdz", "png", "jpg", "jpeg", "tif", "tiff", "exr", "hdr"],
         "asset_kinds": ["character", "prop", "scene", "action", "model", "material", "texture", "hdri"],
-        "control_model": ["root_empty", "viewport_control_ring", "actor_slots", "object_templates", "camera_templates", "texture_materials", "action_clips", "retarget_profiles"],
+        "control_model": ["root_empty", "viewport_control_ring", "armature", "ik_fk", "hand_foot_controls", "object_mode_pose_proxies", "color_coded_controls", "actor_slots", "object_templates", "camera_templates", "texture_materials", "action_clips", "retarget_profiles"],
         "built_in_scene_operator": "gpt_director.add_dialogue_lounge_scene",
         "open_ecosystem": [item["id"] for item in _default_open_asset_source_profiles()],
     }
@@ -277,6 +377,10 @@ def prepare_blender_director_project(project_id="", project_name="", plan=None):
         "presets_dir": presets_dir,
         "set_packages_dir": set_packages_dir,
         "asset_dirs": asset_dirs,
+        "mannequin_asset_path": bundled_mannequin.get("path", ""),
+        "mannequin_attribution_path": bundled_mannequin.get("attribution_path", ""),
+        "furniture_asset_path": bundled_furniture.get("path", ""),
+        "furniture_attribution_path": bundled_furniture.get("attribution_path", ""),
     }
 
 
@@ -3267,6 +3371,7 @@ def build_blender_director_production_manifest(metadata):
             unused_assets.append(row)
     shot_count = len(storyboard)
     render_count = len(renders)
+    retarget_summary = build_blender_director_retarget_summary(metadata)
     return {
         "project_id": str(metadata.get("project_id") or ""),
         "project_name": str(metadata.get("project_name") or "Blender 导演台工程"),
@@ -3287,6 +3392,7 @@ def build_blender_director_production_manifest(metadata):
             key=lambda item: str(item.get("name") or item.get("id") or ""),
         ),
         "unused_assets": unused_assets,
+        "retarget_summary": retarget_summary,
     }
 
 
@@ -3351,6 +3457,24 @@ def write_blender_director_production_report(metadata):
         )
     if not asset_rows:
         asset_rows.append('<tr><td colspan="6" class="empty">暂无工程资产</td></tr>')
+    retarget_summary = manifest.get("retarget_summary") if isinstance(manifest.get("retarget_summary"), dict) else {}
+    retarget_clip_rows = []
+    for clip in retarget_summary.get("action_clips", []):
+        if not isinstance(clip, dict):
+            continue
+        retarget_clip_rows.append(
+            "<tr>"
+            f"<td>{escape(str(clip.get('name') or clip.get('id') or '重定向动作片段'))}<div class=\"id\">{escape(str(clip.get('id') or ''))}</div></td>"
+            f"<td>{escape(str(clip.get('retarget_profile_name') or ''))}</td>"
+            f"<td>{escape(str(clip.get('target_armature') or ''))}</td>"
+            f"<td>{int(clip.get('mapped_bone_count') or 0)} / 源缺 {int(clip.get('unmapped_source_count') or 0)} / 目标缺 {int(clip.get('unmapped_target_count') or 0)}</td>"
+            f"<td>{float(clip.get('rest_pose_max_angle_degrees') or 0):.1f}° / {int(clip.get('rest_pose_mismatch_bone_count') or 0)} 根</td>"
+            f"<td>{float(clip.get('root_motion_scale') or 1.0):.3f}</td>"
+            f"<td>{int(clip.get('copied_fcurve_count') or 0)} / 跳过 {int(clip.get('skipped_fcurve_count') or 0)}</td>"
+            "</tr>"
+        )
+    if not retarget_clip_rows:
+        retarget_clip_rows.append('<tr><td colspan="7" class="empty">暂无已生成的重定向动作片段</td></tr>')
     updated_at = str(manifest.get("updated_at") or "")
     html = f"""<!doctype html>
 <html lang="zh-CN">
@@ -3383,6 +3507,8 @@ def write_blender_director_production_report(metadata):
       <div class="stat"><strong>{int(manifest.get('approved_shot_count') or 0)}</strong>已定稿镜头</div>
       <div class="stat"><strong>{int(manifest.get('asset_count') or 0)}</strong>工程资产</div>
       <div class="stat"><strong>{int(manifest.get('unused_asset_count') or 0)}</strong>未使用资产</div>
+      <div class="stat"><strong>{int(retarget_summary.get('ready_clip_count') or 0)}</strong>重定向动作片段</div>
+      <div class="stat"><strong>{int(retarget_summary.get('failure_count') or 0)}</strong>重定向失败</div>
     </div>
     <h2>镜头进度</h2>
     <table>
@@ -3393,6 +3519,11 @@ def write_blender_director_production_report(metadata):
     <table>
       <thead><tr><th>资产</th><th>类型</th><th>格式</th><th>使用状态</th><th>引用镜头</th><th>来源</th></tr></thead>
       <tbody>{''.join(asset_rows)}</tbody>
+    </table>
+    <h2>重定向动作质量</h2>
+    <table>
+      <thead><tr><th>动作片段</th><th>档案</th><th>目标骨骼</th><th>骨骼映射</th><th>Rest Pose 差异</th><th>根运动比例</th><th>曲线</th></tr></thead>
+      <tbody>{''.join(retarget_clip_rows)}</tbody>
     </table>
   </main>
 </body>
@@ -3437,6 +3568,1177 @@ def write_blender_director_asset_usage_csv(metadata):
     return path
 
 
+def _asset_ecosystem_license_hint(profile_id="", profile_name="", record=None):
+    record = record if isinstance(record, dict) else {}
+    explicit = str(
+        record.get("license")
+        or record.get("license_label")
+        or record.get("usage_rights")
+        or record.get("authorization")
+        or record.get("rights")
+        or ""
+    ).strip()
+    if explicit:
+        return explicit, "ok"
+    profile_text = (str(profile_id or "") + " " + str(profile_name or "")).lower()
+    if "poly_haven" in profile_text or "poly haven" in profile_text or "ambientcg" in profile_text:
+        return "CC0 / 可商用（按来源说明归档）", "ok"
+    if "mixamo" in profile_text:
+        return "Mixamo / Adobe 使用条款，需保留来源", "review"
+    if "blender_asset_browser" in profile_text or "asset browser" in profile_text:
+        return "Blender Asset Browser 本地库，需逐项保留原始授权", "review"
+    if "blenderkit" in profile_text:
+        return "BlenderKit 原资产授权，需逐项保留", "review"
+    if "sketchfab" in profile_text or "opengameart" in profile_text or "open game art" in profile_text:
+        return "按原始下载页授权，需逐项核对", "review"
+    return "未标注授权来源", "missing"
+
+
+def _asset_ecosystem_kind_label(kind):
+    labels = {
+        "character": "人物/角色",
+        "prop": "物品/道具",
+        "scene": "场景/布景",
+        "action": "动作/动画",
+        "model": "通用模型",
+        "material": "材质",
+        "texture": "贴图",
+        "hdri": "HDRI",
+    }
+    return labels.get(str(kind or ""), str(kind or "未分类"))
+
+
+def build_blender_director_asset_ecosystem(metadata):
+    if not isinstance(metadata, dict):
+        metadata = {}
+    profiles = metadata.get("open_asset_source_profiles") if isinstance(metadata.get("open_asset_source_profiles"), list) else []
+    profile_by_id = {}
+    for profile in _default_open_asset_source_profiles() + [item for item in profiles if isinstance(item, dict)]:
+        profile_id = str(profile.get("id") or "").strip()
+        if profile_id:
+            profile_by_id[profile_id] = profile
+    sources = metadata.get("asset_sources") if isinstance(metadata.get("asset_sources"), list) else []
+    libraries = metadata.get("asset_libraries") if isinstance(metadata.get("asset_libraries"), list) else []
+    items = metadata.get("asset_library_items") if isinstance(metadata.get("asset_library_items"), list) else []
+    assets = metadata.get("assets") if isinstance(metadata.get("assets"), list) else []
+    imported_library_ids = set()
+    imported_source_paths = set()
+    imported_asset_paths = set()
+    for asset in assets:
+        if not isinstance(asset, dict):
+            continue
+        for key in ("library_item_id",):
+            value = str(asset.get(key) or "").strip()
+            if value:
+                imported_library_ids.add(value)
+        for key in ("source_path", "path"):
+            value = str(asset.get(key) or "").strip()
+            if value:
+                imported_source_paths.add(os.path.abspath(value))
+                imported_asset_paths.add(os.path.abspath(value))
+        for path in asset.get("source_texture_paths") if isinstance(asset.get("source_texture_paths"), list) else []:
+            value = str(path or "").strip()
+            if value:
+                imported_source_paths.add(os.path.abspath(value))
+    source_rows = []
+    for source in sources:
+        if not isinstance(source, dict):
+            continue
+        source_path = str(source.get("path") or "").strip()
+        profile_id = str(source.get("profile_id") or source.get("source_profile_id") or "").strip()
+        profile_name = str(source.get("profile_name") or source.get("source_profile_name") or profile_by_id.get(profile_id, {}).get("name") or "").strip()
+        license_label, license_status = _asset_ecosystem_license_hint(profile_id, profile_name, source)
+        source_rows.append(
+            {
+                "id": str(source.get("id") or ""),
+                "name": str(source.get("name") or os.path.basename(source_path) or "资产源"),
+                "path": source_path,
+                "exists": bool(source_path and os.path.isdir(source_path)),
+                "profile_id": profile_id,
+                "profile_name": profile_name or "通用本地资产库",
+                "license_label": license_label,
+                "license_status": license_status,
+                "item_count": int(source.get("item_count") or 0),
+                "scanned_at": str(source.get("scanned_at") or ""),
+                "route": str(source.get("route") or profile_by_id.get(profile_id, {}).get("route") or ""),
+            }
+        )
+    library_rows = []
+    for library in libraries:
+        if not isinstance(library, dict):
+            continue
+        library_path = str(library.get("path") or "").strip()
+        profile_id = str(library.get("source_profile_id") or "").strip()
+        profile_name = str(library.get("source_profile_name") or profile_by_id.get(profile_id, {}).get("name") or "").strip()
+        license_label, license_status = _asset_ecosystem_license_hint(profile_id, profile_name, library)
+        library_rows.append(
+            {
+                "id": str(library.get("id") or ""),
+                "name": str(library.get("name") or os.path.basename(library_path) or "资产库"),
+                "path": library_path,
+                "exists": bool(library_path and os.path.isdir(library_path)),
+                "source_profile_id": profile_id,
+                "source_profile_name": profile_name,
+                "license_label": license_label,
+                "license_status": license_status,
+                "item_count": int(library.get("item_count") or 0),
+                "asset_browser_catalog_count": int(library.get("asset_browser_catalog_count") or 0),
+                "asset_browser_catalog_path": str(library.get("asset_browser_catalog_path") or ""),
+                "scanned_at": str(library.get("scanned_at") or ""),
+            }
+        )
+    item_rows = []
+    kind_counts = {}
+    format_counts = {}
+    source_counts = {}
+    missing_file_count = 0
+    missing_license_count = 0
+    favorite_count = 0
+    tagged_count = 0
+    imported_count = 0
+    controllable_asset_count = 0
+    action_item_count = 0
+    ready_action_count = 0
+    unclassified_count = 0
+    asset_browser_catalog_paths = set()
+    total_size = 0
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        item_path = str(item.get("path") or "").strip()
+        abs_path = os.path.abspath(item_path) if item_path else ""
+        exists = bool(item_path and os.path.isfile(item_path))
+        if not exists:
+            missing_file_count += 1
+        kind = str(item.get("kind_hint") or item.get("type") or "model").strip() or "model"
+        if not kind:
+            unclassified_count += 1
+        file_format = str(item.get("format") or os.path.splitext(item_path)[1].lstrip(".").lower()).strip().lower()
+        profile_id = str(item.get("source_profile_id") or "").strip()
+        profile_name = str(item.get("source_profile_name") or profile_by_id.get(profile_id, {}).get("name") or "").strip()
+        license_label, license_status = _asset_ecosystem_license_hint(profile_id, profile_name, item)
+        if license_status == "missing":
+            missing_license_count += 1
+        imported = bool(
+            str(item.get("id") or "") in imported_library_ids
+            or (abs_path and abs_path in imported_source_paths)
+        )
+        if imported:
+            imported_count += 1
+        favorite = bool(item.get("favorite"))
+        if favorite:
+            favorite_count += 1
+        tagged = bool(str(item.get("tags") or "").strip() or str(item.get("usage_note") or "").strip())
+        if tagged:
+            tagged_count += 1
+        try:
+            usage_count = int(item.get("usage_count") or 0)
+        except Exception:
+            usage_count = 0
+        if kind == "action":
+            action_item_count += 1
+            if imported or usage_count > 0:
+                ready_action_count += 1
+        try:
+            size = int(item.get("size") or 0)
+        except Exception:
+            size = 0
+        total_size += max(0, size)
+        kind_counts[kind] = kind_counts.get(kind, 0) + 1
+        if file_format:
+            format_counts[file_format] = format_counts.get(file_format, 0) + 1
+        source_key = profile_name or profile_id or "未标注来源"
+        source_counts[source_key] = source_counts.get(source_key, 0) + 1
+        catalog_path = str(item.get("asset_browser_catalog_path") or "").strip()
+        if catalog_path:
+            asset_browser_catalog_paths.add(catalog_path)
+        status_parts = []
+        if not exists:
+            status_parts.append("缺文件")
+        if license_status == "missing":
+            status_parts.append("缺授权来源")
+        elif license_status == "review":
+            status_parts.append("需核对授权")
+        if not tagged:
+            status_parts.append("未打标")
+        if imported:
+            status_parts.append("已导入")
+        item_rows.append(
+            {
+                "id": str(item.get("id") or ""),
+                "name": str(item.get("name") or item.get("file_name") or item.get("id") or "资产"),
+                "file_name": str(item.get("file_name") or os.path.basename(item_path)),
+                "path": item_path,
+                "relative_path": str(item.get("relative_path") or ""),
+                "library_id": str(item.get("library_id") or ""),
+                "library_path": str(item.get("library_path") or ""),
+                "exists": exists,
+                "kind": kind,
+                "kind_label": _asset_ecosystem_kind_label(kind),
+                "format": file_format,
+                "size": size,
+                "source_profile_id": profile_id,
+                "source_profile_name": profile_name,
+                "asset_browser_catalog_id": str(item.get("asset_browser_catalog_id") or ""),
+                "asset_browser_catalog_path": str(item.get("asset_browser_catalog_path") or ""),
+                "asset_browser_catalog_name": str(item.get("asset_browser_catalog_name") or ""),
+                "license_label": license_label,
+                "license_status": license_status,
+                "favorite": favorite,
+                "tags": str(item.get("tags") or ""),
+                "usage_note": str(item.get("usage_note") or ""),
+                "usage_count": usage_count,
+                "imported": imported,
+                "status_label": " / ".join(status_parts) if status_parts else "可用",
+                "modified_at": str(item.get("modified_at") or ""),
+                "scanned_at": str(item.get("scanned_at") or ""),
+            }
+        )
+    imported_rows = []
+    for asset in assets:
+        if not isinstance(asset, dict):
+            continue
+        path = str(asset.get("path") or "").strip()
+        source_path = str(asset.get("source_path") or "").strip()
+        library_item_id = str(asset.get("library_item_id") or "").strip()
+        profile_id = str(asset.get("source_profile_id") or "").strip()
+        profile_name = str(asset.get("source_profile_name") or profile_by_id.get(profile_id, {}).get("name") or "").strip()
+        license_label, license_status = _asset_ecosystem_license_hint(profile_id, profile_name, asset)
+        controls = asset.get("controls") if isinstance(asset.get("controls"), list) else []
+        control_objects = asset.get("control_objects") if isinstance(asset.get("control_objects"), list) else []
+        control_root = str(asset.get("control_root") or "").strip()
+        controllable = bool(control_root or control_objects or controls)
+        if controllable:
+            controllable_asset_count += 1
+        imported_rows.append(
+            {
+                "id": str(asset.get("id") or ""),
+                "name": str(asset.get("name") or asset.get("file_name") or asset.get("id") or "工程资产"),
+                "type": str(asset.get("type") or ""),
+                "kind_label": _asset_ecosystem_kind_label(asset.get("type") or ""),
+                "format": str(asset.get("format") or ""),
+                "path": path,
+                "exists": bool(path and os.path.exists(path)),
+                "source_path": source_path,
+                "source_exists": bool(source_path and os.path.exists(source_path)),
+                "library_item_id": library_item_id,
+                "library_relative_path": str(asset.get("library_relative_path") or ""),
+                "source_profile_id": profile_id,
+                "source_profile_name": profile_name,
+                "license_label": license_label,
+                "license_status": license_status,
+                "imported_at": str(asset.get("imported_at") or ""),
+                "object_count": len(asset.get("objects")) if isinstance(asset.get("objects"), list) else 0,
+                "action_count": len(asset.get("actions")) if isinstance(asset.get("actions"), list) else 0,
+                "controllable": controllable,
+                "control_root": control_root,
+                "control_count": len(control_objects),
+                "controls": controls,
+            }
+        )
+    health_warnings = []
+    if missing_file_count:
+        health_warnings.append(f"库资产缺文件 {missing_file_count} 个")
+    if missing_license_count:
+        health_warnings.append(f"缺授权来源 {missing_license_count} 个")
+    if unclassified_count:
+        health_warnings.append(f"未分类资产 {unclassified_count} 个")
+    if action_item_count and ready_action_count < action_item_count:
+        health_warnings.append(f"动作资产待导入 {action_item_count - ready_action_count} 个")
+    return {
+        "profile_catalog_count": len(profile_by_id),
+        "source_count": len(source_rows),
+        "library_count": len(library_rows),
+        "library_item_count": len(item_rows),
+        "available_item_count": len(item_rows) - missing_file_count,
+        "missing_file_count": missing_file_count,
+        "missing_license_count": missing_license_count,
+        "favorite_count": favorite_count,
+        "tagged_count": tagged_count,
+        "imported_item_count": imported_count,
+        "imported_asset_count": len(imported_rows),
+        "controllable_asset_count": controllable_asset_count,
+        "action_item_count": action_item_count,
+        "ready_action_count": ready_action_count,
+        "unclassified_count": unclassified_count,
+        "asset_browser_catalog_count": len(asset_browser_catalog_paths),
+        "total_size": total_size,
+        "kind_counts": [
+            {"kind": key, "kind_label": _asset_ecosystem_kind_label(key), "count": value}
+            for key, value in sorted(kind_counts.items(), key=lambda row: (-row[1], row[0]))
+        ],
+        "format_counts": [
+            {"format": key, "count": value}
+            for key, value in sorted(format_counts.items(), key=lambda row: (-row[1], row[0]))
+        ],
+        "source_counts": [
+            {"source": key, "count": value}
+            for key, value in sorted(source_counts.items(), key=lambda row: (-row[1], row[0]))
+        ],
+        "health_warnings": health_warnings,
+        "sources": source_rows,
+        "libraries": library_rows,
+        "items": item_rows,
+        "imported_assets": imported_rows,
+    }
+
+
+def write_blender_director_asset_ecosystem_manifest(metadata):
+    project_dir = _storyboard_project_dir(metadata)
+    if not project_dir:
+        return ""
+    os.makedirs(project_dir, exist_ok=True)
+    path = os.path.join(project_dir, "asset_ecosystem.json")
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(build_blender_director_asset_ecosystem(metadata), f, ensure_ascii=False, indent=2)
+    return path
+
+
+def write_blender_director_asset_ecosystem_csv(metadata):
+    project_dir = _storyboard_project_dir(metadata)
+    if not project_dir:
+        return ""
+    os.makedirs(project_dir, exist_ok=True)
+    path = os.path.join(project_dir, "asset_ecosystem.csv")
+    data = build_blender_director_asset_ecosystem(metadata)
+    with open(path, "w", encoding="utf-8-sig", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(["类型", "名称", "分类", "格式", "来源", "Blender Catalog", "授权", "状态", "路径", "使用次数", "标签", "备注"])
+        for item in data.get("items", []):
+            if not isinstance(item, dict):
+                continue
+            writer.writerow(
+                [
+                    "库资产",
+                    item.get("name") or "",
+                    item.get("kind_label") or "",
+                    item.get("format") or "",
+                    item.get("source_profile_name") or "",
+                    item.get("asset_browser_catalog_path") or item.get("asset_browser_catalog_name") or "",
+                    item.get("license_label") or "",
+                    item.get("status_label") or "",
+                    item.get("relative_path") or item.get("path") or "",
+                    item.get("usage_count") or 0,
+                    item.get("tags") or "",
+                    item.get("usage_note") or "",
+                ]
+            )
+        for asset in data.get("imported_assets", []):
+            if not isinstance(asset, dict):
+                continue
+            writer.writerow(
+                [
+                    "工程资产",
+                    asset.get("name") or "",
+                    asset.get("kind_label") or asset.get("type") or "",
+                    asset.get("format") or "",
+                    asset.get("source_profile_name") or "",
+                    asset.get("asset_browser_catalog_path") or asset.get("asset_browser_catalog_name") or "",
+                    asset.get("license_label") or "",
+                    ("已导入" if asset.get("exists") else "工程文件缺失") + (" / 可控" if asset.get("controllable") else ""),
+                    asset.get("library_relative_path") or asset.get("path") or "",
+                    "",
+                    "",
+                    "",
+                ]
+            )
+    return path
+
+
+def write_blender_director_asset_ecosystem_report(metadata):
+    project_dir = _storyboard_project_dir(metadata)
+    if not project_dir:
+        return ""
+    os.makedirs(project_dir, exist_ok=True)
+    data = build_blender_director_asset_ecosystem(metadata)
+    project_name = str((metadata or {}).get("project_name") or "Blender 导演台工程")
+
+    def empty_row(columns, text):
+        return f'<tr><td colspan="{columns}" class="empty">{escape(text)}</td></tr>'
+
+    source_rows = []
+    for source in data.get("sources", []):
+        if not isinstance(source, dict):
+            continue
+        source_rows.append(
+            "<tr>"
+            f"<td>{escape(str(source.get('name') or source.get('id') or '资产源'))}<div class=\"id\">{escape(str(source.get('profile_name') or ''))}</div></td>"
+            f"<td>{'可用' if source.get('exists') else '目录缺失'}</td>"
+            f"<td>{escape(str(source.get('license_label') or ''))}</td>"
+            f"<td>{int(source.get('item_count') or 0)}</td>"
+            f"<td>{escape(str(source.get('route') or ''))}</td>"
+            f"<td>{escape(str(source.get('path') or ''))}</td>"
+            "</tr>"
+        )
+    if not source_rows:
+        source_rows.append(empty_row(6, "暂无资产源，请先扫描本地开源资产库"))
+
+    item_rows = []
+    for item in data.get("items", [])[:300]:
+        if not isinstance(item, dict):
+            continue
+        item_rows.append(
+            "<tr>"
+            f"<td>{escape(str(item.get('name') or item.get('id') or '库资产'))}<div class=\"id\">{escape(str(item.get('relative_path') or item.get('file_name') or ''))}</div></td>"
+            f"<td>{escape(str(item.get('kind_label') or ''))}</td>"
+            f"<td>{escape(str(item.get('format') or '').upper())}</td>"
+            f"<td>{escape(str(item.get('source_profile_name') or '未标注来源'))}</td>"
+            f"<td>{escape(str(item.get('asset_browser_catalog_path') or item.get('asset_browser_catalog_name') or '—'))}</td>"
+            f"<td>{escape(str(item.get('license_label') or ''))}</td>"
+            f"<td>{escape(str(item.get('status_label') or ''))}</td>"
+            f"<td>{'★' if item.get('favorite') else ''}</td>"
+            f"<td>{escape(str(item.get('tags') or item.get('usage_note') or ''))}</td>"
+            "</tr>"
+        )
+    if not item_rows:
+        item_rows.append(empty_row(9, "暂无库资产文件"))
+
+    imported_rows = []
+    for asset in data.get("imported_assets", [])[:300]:
+        if not isinstance(asset, dict):
+            continue
+        imported_rows.append(
+            "<tr>"
+            f"<td>{escape(str(asset.get('name') or asset.get('id') or '工程资产'))}<div class=\"id\">{escape(str(asset.get('id') or ''))}</div></td>"
+            f"<td>{escape(str(asset.get('kind_label') or asset.get('type') or ''))}</td>"
+            f"<td>{'可用' if asset.get('exists') else '文件缺失'}</td>"
+            f"<td>{escape(str(asset.get('source_profile_name') or ''))}</td>"
+            f"<td>{escape(str(asset.get('license_label') or ''))}</td>"
+            f"<td>{escape(str(asset.get('library_relative_path') or asset.get('source_path') or ''))}</td>"
+            f"<td>{int(asset.get('object_count') or 0)} / {int(asset.get('action_count') or 0)}</td>"
+            f"<td>{'可控' if asset.get('controllable') else '—'}<div class=\"id\">{escape(str(asset.get('control_root') or ''))}</div></td>"
+            "</tr>"
+        )
+    if not imported_rows:
+        imported_rows.append(empty_row(8, "暂无已导入工程资产"))
+
+    warning_text = "；".join(str(item or "") for item in data.get("health_warnings", []) if str(item or "").strip()) or "暂无关键风险"
+    html = f"""<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <title>{escape(project_name)} - 资产生态报告</title>
+  <style>
+    body {{ margin: 0; background: #0f1218; color: #e8edf5; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }}
+    main {{ padding: 24px; }}
+    h1 {{ margin: 0 0 6px; font-size: 24px; }}
+    h2 {{ margin: 22px 0 10px; font-size: 18px; }}
+    .meta, .id {{ color: #96a3b7; }}
+    .stats {{ display: flex; flex-wrap: wrap; gap: 10px; margin: 18px 0; }}
+    .stat {{ background: #151a22; border: 1px solid #2d3440; border-radius: 8px; padding: 10px 12px; min-width: 130px; }}
+    .stat strong {{ display: block; font-size: 20px; color: #ffffff; }}
+    .warning {{ background: #2a1d16; border: 1px solid #6b3f25; color: #ffd2ad; padding: 10px 12px; border-radius: 8px; margin: 14px 0; }}
+    table {{ width: 100%; border-collapse: collapse; background: #151a22; border: 1px solid #2d3440; margin-bottom: 18px; }}
+    th, td {{ border-bottom: 1px solid #2d3440; padding: 10px; vertical-align: top; text-align: left; }}
+    th {{ color: #b9c6d8; background: #1d2430; font-weight: 700; }}
+    .empty {{ color: #96a3b7; text-align: center; padding: 24px; }}
+  </style>
+</head>
+<body>
+  <main>
+    <h1>{escape(project_name)} - 资产生态报告</h1>
+    <div class="meta">追踪开源生态来源、授权提示、库文件可用性、收藏标签、导入记录和动作资产准备度。</div>
+    <div class="stats">
+      <div class="stat"><strong>{int(data.get('source_count') or 0)}</strong>资产源</div>
+      <div class="stat"><strong>{int(data.get('library_count') or 0)}</strong>资产库</div>
+      <div class="stat"><strong>{int(data.get('library_item_count') or 0)}</strong>库资产</div>
+      <div class="stat"><strong>{int(data.get('available_item_count') or 0)}</strong>文件可用</div>
+      <div class="stat"><strong>{int(data.get('missing_file_count') or 0)}</strong>缺文件</div>
+      <div class="stat"><strong>{int(data.get('missing_license_count') or 0)}</strong>缺授权来源</div>
+      <div class="stat"><strong>{int(data.get('favorite_count') or 0)}</strong>收藏</div>
+      <div class="stat"><strong>{int(data.get('tagged_count') or 0)}</strong>已打标</div>
+      <div class="stat"><strong>{int(data.get('imported_item_count') or 0)}</strong>已从库导入</div>
+      <div class="stat"><strong>{int(data.get('controllable_asset_count') or 0)}</strong>可控工程资产</div>
+      <div class="stat"><strong>{int(data.get('ready_action_count') or 0)}/{int(data.get('action_item_count') or 0)}</strong>动作准备</div>
+    </div>
+    <div class="warning">{escape(warning_text)}</div>
+    <h2>资产源</h2>
+    <table><thead><tr><th>来源</th><th>目录</th><th>授权提示</th><th>文件数</th><th>接入方式</th><th>路径</th></tr></thead><tbody>{''.join(source_rows)}</tbody></table>
+    <h2>库资产</h2>
+    <table><thead><tr><th>资产</th><th>分类</th><th>格式</th><th>来源</th><th>Blender Catalog</th><th>授权</th><th>状态</th><th>收藏</th><th>标签/备注</th></tr></thead><tbody>{''.join(item_rows)}</tbody></table>
+    <h2>已导入工程资产</h2>
+    <table><thead><tr><th>资产</th><th>类型</th><th>文件</th><th>来源</th><th>授权</th><th>库路径</th><th>对象/动作</th><th>控制</th></tr></thead><tbody>{''.join(imported_rows)}</tbody></table>
+  </main>
+</body>
+</html>
+"""
+    path = os.path.join(project_dir, "asset_ecosystem.html")
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(html)
+    return path
+
+
+def _asset_preflight_issue(severity, code, title, suggestion):
+    return {
+        "severity": str(severity or "info"),
+        "code": str(code or ""),
+        "title": str(title or ""),
+        "suggestion": str(suggestion or ""),
+    }
+
+
+def _asset_preflight_texture_roles(items):
+    roles_by_dir = {}
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        path = str(item.get("path") or "").strip()
+        if not path:
+            continue
+        kind = str(item.get("kind") or item.get("kind_hint") or "").strip()
+        if kind not in {"material", "texture"}:
+            continue
+        role = str(item.get("texture_role") or "").strip()
+        if not role:
+            lower = os.path.basename(path).lower()
+            if "normal" in lower:
+                role = "normal"
+            elif "rough" in lower:
+                role = "roughness"
+            elif "metal" in lower:
+                role = "metallic"
+            elif "height" in lower or "disp" in lower:
+                role = "height"
+            else:
+                role = "base_color"
+        roles_by_dir.setdefault(os.path.dirname(path), set()).add(role)
+    return roles_by_dir
+
+
+def build_blender_director_asset_preflight(metadata):
+    ecosystem = build_blender_director_asset_ecosystem(metadata)
+    items = ecosystem.get("items") if isinstance(ecosystem.get("items"), list) else []
+    imported_assets = ecosystem.get("imported_assets") if isinstance(ecosystem.get("imported_assets"), list) else []
+    texture_roles = _asset_preflight_texture_roles(items)
+    rows = []
+    issue_rows = []
+    error_count = 0
+    warning_count = 0
+    info_count = 0
+    ready_count = 0
+    review_count = 0
+    blocked_count = 0
+    supported_formats = {
+        "blend", "glb", "gltf", "fbx", "obj", "bvh", "stl", "ply", "abc", "usd", "usdz",
+        "png", "jpg", "jpeg", "tif", "tiff", "exr", "hdr",
+    }
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        issues = []
+        kind = str(item.get("kind") or "").strip() or "model"
+        file_format = str(item.get("format") or "").strip().lower()
+        path = str(item.get("path") or "").strip()
+        if not item.get("exists"):
+            issues.append(_asset_preflight_issue("error", "missing_file", "库资产文件不存在", "重新扫描资产库，或把源文件恢复到原路径后再导入。"))
+        if file_format and file_format not in supported_formats:
+            issues.append(_asset_preflight_issue("error", "unsupported_format", "暂不支持该文件格式", "转换为 blend/glb/gltf/fbx/obj/bvh/stl/ply/abc/usd/usdz 或常见贴图/HDRI 格式。"))
+        try:
+            size = int(item.get("size") or 0)
+        except Exception:
+            size = 0
+        if item.get("exists") and size <= 0:
+            issues.append(_asset_preflight_issue("warning", "empty_file", "文件大小为 0", "确认文件是否下载完整，必要时重新下载。"))
+        license_status = str(item.get("license_status") or "")
+        if license_status == "missing":
+            issues.append(_asset_preflight_issue("warning", "missing_license", "缺授权来源", "补充 license/usage_rights 字段，或在备注里写明下载页授权。"))
+        elif license_status == "review":
+            issues.append(_asset_preflight_issue("warning", "license_review", "授权需人工复核", "导入商用工程前核对原始下载页授权和署名要求。"))
+        if kind == "model":
+            issues.append(_asset_preflight_issue("info", "confirm_asset_kind", "资产分类需要确认", "导入前选择人物、道具或场景分类，方便进入对应集合和报告。"))
+        if kind in {"character", "prop", "scene", "model"} and not str(item.get("preview_path") or item.get("thumbnail_path") or "").strip():
+            issues.append(_asset_preflight_issue("info", "no_preview", "没有预览图", "可稍后生成缩略图或登记预览，方便导演台选资产。"))
+        if kind == "action":
+            if not item.get("imported") and int(item.get("usage_count") or 0) <= 0:
+                issues.append(_asset_preflight_issue("warning", "action_not_prepared", "动作尚未导入/验证", "导入到目标骨骼或建立重定向档案后再用于分镜匹配。"))
+            if file_format not in {"fbx", "bvh"}:
+                issues.append(_asset_preflight_issue("warning", "action_format_review", "动作格式需确认", "优先使用 FBX/BVH 动作文件；其他格式请先在 Blender 内确认包含 Action。"))
+        if kind in {"material", "texture"}:
+            roles = texture_roles.get(os.path.dirname(path), set())
+            if "base_color" in roles and not ({"normal", "roughness"} & roles):
+                issues.append(_asset_preflight_issue("info", "incomplete_texture_set", "贴图组不完整", "如需 PBR 材质，补齐 normal/roughness/metallic 等贴图。"))
+        if kind == "hdri" and file_format not in {"hdr", "exr"}:
+            issues.append(_asset_preflight_issue("warning", "hdri_format_review", "HDRI 格式需确认", "建议使用 HDR/EXR 环境光贴图，避免普通图片误作 HDRI。"))
+        severity_rank = {"error": 3, "warning": 2, "info": 1}
+        max_severity = "ready"
+        if issues:
+            max_issue = max(issues, key=lambda issue: severity_rank.get(issue.get("severity"), 0))
+            max_severity = str(max_issue.get("severity") or "info")
+        if max_severity == "error":
+            blocked_count += 1
+        elif max_severity == "warning":
+            review_count += 1
+        else:
+            ready_count += 1
+        for issue in issues:
+            severity = str(issue.get("severity") or "info")
+            if severity == "error":
+                error_count += 1
+            elif severity == "warning":
+                warning_count += 1
+            else:
+                info_count += 1
+            issue_rows.append(
+                {
+                    "asset_id": str(item.get("id") or ""),
+                    "asset_name": str(item.get("name") or ""),
+                    "kind": kind,
+                    "kind_label": str(item.get("kind_label") or _asset_ecosystem_kind_label(kind)),
+                    "severity": severity,
+                    "code": str(issue.get("code") or ""),
+                    "title": str(issue.get("title") or ""),
+                    "suggestion": str(issue.get("suggestion") or ""),
+                    "path": path,
+                }
+            )
+        rows.append(
+            {
+                "id": str(item.get("id") or ""),
+                "name": str(item.get("name") or item.get("file_name") or "库资产"),
+                "kind": kind,
+                "kind_label": str(item.get("kind_label") or _asset_ecosystem_kind_label(kind)),
+                "format": file_format,
+                "source_profile_name": str(item.get("source_profile_name") or ""),
+                "license_label": str(item.get("license_label") or ""),
+                "path": path,
+                "relative_path": str(item.get("relative_path") or ""),
+                "imported": bool(item.get("imported")),
+                "preflight_status": max_severity,
+                "preflight_status_label": {
+                    "error": "阻断",
+                    "warning": "需复核",
+                    "info": "可导入（有建议）",
+                    "ready": "可导入",
+                }.get(max_severity, max_severity),
+                "issue_count": len(issues),
+                "issues": issues,
+            }
+        )
+    imported_issue_rows = []
+    for asset in imported_assets:
+        if not isinstance(asset, dict):
+            continue
+        if not asset.get("exists"):
+            imported_issue_rows.append(
+                {
+                    "asset_id": str(asset.get("id") or ""),
+                    "asset_name": str(asset.get("name") or ""),
+                    "severity": "error",
+                    "code": "imported_file_missing",
+                    "title": "工程资产文件缺失",
+                    "suggestion": "重新导入资产或恢复工程资产文件。",
+                    "path": str(asset.get("path") or ""),
+                }
+            )
+            error_count += 1
+        if asset.get("source_path") and not asset.get("source_exists"):
+            imported_issue_rows.append(
+                {
+                    "asset_id": str(asset.get("id") or ""),
+                    "asset_name": str(asset.get("name") or ""),
+                    "severity": "warning",
+                    "code": "source_file_missing",
+                    "title": "原始源文件缺失",
+                    "suggestion": "如需重新导入或溯源，请恢复原始下载文件或更新来源路径。",
+                    "path": str(asset.get("source_path") or ""),
+                }
+            )
+            warning_count += 1
+    issue_rows.extend(imported_issue_rows)
+    return {
+        "library_item_count": len(rows),
+        "ready_count": ready_count,
+        "review_count": review_count,
+        "blocked_count": blocked_count,
+        "issue_count": len(issue_rows),
+        "error_count": error_count,
+        "warning_count": warning_count,
+        "info_count": info_count,
+        "imported_asset_issue_count": len(imported_issue_rows),
+        "items": rows,
+        "issues": issue_rows,
+    }
+
+
+def write_blender_director_asset_preflight_manifest(metadata):
+    project_dir = _storyboard_project_dir(metadata)
+    if not project_dir:
+        return ""
+    os.makedirs(project_dir, exist_ok=True)
+    path = os.path.join(project_dir, "asset_preflight.json")
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(build_blender_director_asset_preflight(metadata), f, ensure_ascii=False, indent=2)
+    return path
+
+
+def write_blender_director_asset_preflight_csv(metadata):
+    project_dir = _storyboard_project_dir(metadata)
+    if not project_dir:
+        return ""
+    os.makedirs(project_dir, exist_ok=True)
+    path = os.path.join(project_dir, "asset_preflight.csv")
+    data = build_blender_director_asset_preflight(metadata)
+    with open(path, "w", encoding="utf-8-sig", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(["资产ID", "资产名", "分类", "格式", "预检状态", "问题数", "问题级别", "问题", "修复建议", "路径"])
+        for item in data.get("items", []):
+            if not isinstance(item, dict):
+                continue
+            issues = item.get("issues") if isinstance(item.get("issues"), list) else []
+            if not issues:
+                writer.writerow([
+                    item.get("id") or "",
+                    item.get("name") or "",
+                    item.get("kind_label") or "",
+                    item.get("format") or "",
+                    item.get("preflight_status_label") or "",
+                    0,
+                    "",
+                    "",
+                    "",
+                    item.get("relative_path") or item.get("path") or "",
+                ])
+                continue
+            for issue in issues:
+                if not isinstance(issue, dict):
+                    continue
+                writer.writerow([
+                    item.get("id") or "",
+                    item.get("name") or "",
+                    item.get("kind_label") or "",
+                    item.get("format") or "",
+                    item.get("preflight_status_label") or "",
+                    item.get("issue_count") or 0,
+                    issue.get("severity") or "",
+                    issue.get("title") or "",
+                    issue.get("suggestion") or "",
+                    item.get("relative_path") or item.get("path") or "",
+                ])
+    return path
+
+
+def write_blender_director_asset_preflight_report(metadata):
+    project_dir = _storyboard_project_dir(metadata)
+    if not project_dir:
+        return ""
+    os.makedirs(project_dir, exist_ok=True)
+    data = build_blender_director_asset_preflight(metadata)
+    project_name = str((metadata or {}).get("project_name") or "Blender 导演台工程")
+    item_rows = []
+    for item in data.get("items", []):
+        if not isinstance(item, dict):
+            continue
+        issues = item.get("issues") if isinstance(item.get("issues"), list) else []
+        issue_text = "；".join(
+            str(issue.get("title") or "")
+            for issue in issues
+            if isinstance(issue, dict) and str(issue.get("title") or "").strip()
+        )
+        suggestion_text = "；".join(
+            str(issue.get("suggestion") or "")
+            for issue in issues
+            if isinstance(issue, dict) and str(issue.get("suggestion") or "").strip()
+        )
+        item_rows.append(
+            "<tr>"
+            f"<td>{escape(str(item.get('name') or item.get('id') or '库资产'))}<div class=\"id\">{escape(str(item.get('relative_path') or item.get('id') or ''))}</div></td>"
+            f"<td>{escape(str(item.get('kind_label') or ''))}</td>"
+            f"<td>{escape(str(item.get('format') or '').upper())}</td>"
+            f"<td>{escape(str(item.get('preflight_status_label') or ''))}</td>"
+            f"<td>{escape(issue_text or '无阻断问题')}</td>"
+            f"<td>{escape(suggestion_text or '可直接导入')}</td>"
+            "</tr>"
+        )
+    if not item_rows:
+        item_rows.append('<tr><td colspan="6" class="empty">暂无可预检的库资产</td></tr>')
+    html = f"""<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <title>{escape(project_name)} - 资产导入预检</title>
+  <style>
+    body {{ margin: 0; background: #0f1218; color: #e8edf5; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }}
+    main {{ padding: 24px; }}
+    h1 {{ margin: 0 0 6px; font-size: 24px; }}
+    .meta, .id {{ color: #96a3b7; }}
+    .stats {{ display: flex; flex-wrap: wrap; gap: 10px; margin: 18px 0; }}
+    .stat {{ background: #151a22; border: 1px solid #2d3440; border-radius: 8px; padding: 10px 12px; min-width: 130px; }}
+    .stat strong {{ display: block; font-size: 20px; color: #ffffff; }}
+    table {{ width: 100%; border-collapse: collapse; background: #151a22; border: 1px solid #2d3440; }}
+    th, td {{ border-bottom: 1px solid #2d3440; padding: 10px; vertical-align: top; text-align: left; }}
+    th {{ color: #b9c6d8; background: #1d2430; font-weight: 700; }}
+    .empty {{ color: #96a3b7; text-align: center; padding: 24px; }}
+  </style>
+</head>
+<body>
+  <main>
+    <h1>{escape(project_name)} - 资产导入预检</h1>
+    <div class="meta">导入前检查文件、授权、分类、动作准备度、预览和贴图组完整性，并给出修复建议。</div>
+    <div class="stats">
+      <div class="stat"><strong>{int(data.get('library_item_count') or 0)}</strong>库资产</div>
+      <div class="stat"><strong>{int(data.get('ready_count') or 0)}</strong>可导入</div>
+      <div class="stat"><strong>{int(data.get('review_count') or 0)}</strong>需复核</div>
+      <div class="stat"><strong>{int(data.get('blocked_count') or 0)}</strong>阻断</div>
+      <div class="stat"><strong>{int(data.get('error_count') or 0)}</strong>错误</div>
+      <div class="stat"><strong>{int(data.get('warning_count') or 0)}</strong>提醒</div>
+      <div class="stat"><strong>{int(data.get('info_count') or 0)}</strong>建议</div>
+    </div>
+    <table>
+      <thead><tr><th>资产</th><th>分类</th><th>格式</th><th>预检状态</th><th>问题</th><th>修复建议</th></tr></thead>
+      <tbody>{''.join(item_rows)}</tbody>
+    </table>
+  </main>
+</body>
+</html>
+"""
+    path = os.path.join(project_dir, "asset_preflight.html")
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(html)
+    return path
+
+
+def build_blender_director_retarget_summary(metadata):
+    if not isinstance(metadata, dict):
+        metadata = {}
+    profiles = metadata.get("retarget_profiles") if isinstance(metadata.get("retarget_profiles"), list) else []
+    applications = metadata.get("retarget_applications") if isinstance(metadata.get("retarget_applications"), list) else []
+    action_clips = metadata.get("action_clips") if isinstance(metadata.get("action_clips"), list) else []
+    retarget_clips = [
+        clip
+        for clip in action_clips
+        if isinstance(clip, dict) and str(clip.get("generated_by") or "") == "retarget"
+    ]
+    profile_rows = []
+    mapped_bones = 0
+    unmapped_source = 0
+    unmapped_target = 0
+    max_rest_angle = 0.0
+    mismatch_bones = 0
+    for profile in profiles:
+        if not isinstance(profile, dict):
+            continue
+        rest_pose = profile.get("rest_pose_alignment") if isinstance(profile.get("rest_pose_alignment"), dict) else {}
+        root_motion = profile.get("root_motion") if isinstance(profile.get("root_motion"), dict) else {}
+        try:
+            mapped = int(profile.get("mapped_bone_count") or 0)
+        except Exception:
+            mapped = 0
+        try:
+            source_missing = int(profile.get("unmapped_source_count") or 0)
+        except Exception:
+            source_missing = 0
+        try:
+            target_missing = int(profile.get("unmapped_target_count") or 0)
+        except Exception:
+            target_missing = 0
+        try:
+            angle = float(rest_pose.get("max_angle_degrees") or 0.0)
+        except Exception:
+            angle = 0.0
+        try:
+            profile_mismatch = int(rest_pose.get("mismatch_bone_count") or 0)
+        except Exception:
+            profile_mismatch = 0
+        mapped_bones += mapped
+        unmapped_source += source_missing
+        unmapped_target += target_missing
+        max_rest_angle = max(max_rest_angle, angle)
+        mismatch_bones += profile_mismatch
+        profile_rows.append(
+            {
+                "id": str(profile.get("id") or ""),
+                "name": str(profile.get("name") or profile.get("id") or ""),
+                "source_armature": str(profile.get("source_armature") or ""),
+                "target_armature": str(profile.get("target_armature") or ""),
+                "mapped_bone_count": mapped,
+                "unmapped_source_count": source_missing,
+                "unmapped_target_count": target_missing,
+                "rest_pose_enabled": bool(rest_pose.get("enabled", True)),
+                "rest_pose_mismatch_bone_count": profile_mismatch,
+                "rest_pose_max_angle_degrees": round(angle, 3),
+                "root_motion_enabled": bool(root_motion.get("enabled", True)),
+                "root_motion_scale": float(root_motion.get("effective_scale") or root_motion.get("automatic_scale") or 1.0),
+                "saved_at": str(profile.get("saved_at") or ""),
+            }
+        )
+    application_rows = []
+    success_count = 0
+    failure_count = 0
+    copied_fcurves = 0
+    skipped_fcurves = 0
+    latest_at = ""
+    matched_requirements = 0
+    match_requirements = 0
+    for record in applications:
+        if not isinstance(record, dict):
+            continue
+        status = str(record.get("status") or "")
+        if status == "applied":
+            success_count += 1
+        elif status == "failed":
+            failure_count += 1
+        try:
+            copied = int(record.get("copied_fcurve_count") or 0)
+        except Exception:
+            copied = 0
+        try:
+            skipped = int(record.get("skipped_fcurve_count") or 0)
+        except Exception:
+            skipped = 0
+        copied_fcurves += copied
+        skipped_fcurves += skipped
+        applied_at = str(record.get("applied_at") or "")
+        if applied_at > latest_at:
+            latest_at = applied_at
+        match_data = record.get("action_matches") if isinstance(record.get("action_matches"), dict) else {}
+        matched_requirements = max(matched_requirements, int(match_data.get("matched_count") or 0))
+        match_requirements = max(match_requirements, int(match_data.get("requirement_count") or 0))
+        action_clip = record.get("action_clip") if isinstance(record.get("action_clip"), dict) else {}
+        application_rows.append(
+            {
+                "profile_name": str(record.get("profile_name") or ""),
+                "source_action": str(record.get("source_action") or ""),
+                "target_action": str(record.get("target_action") or ""),
+                "target_armature": str(record.get("target_armature") or ""),
+                "status": status,
+                "message": str(record.get("message") or ""),
+                "copied_fcurve_count": copied,
+                "skipped_fcurve_count": skipped,
+                "root_motion_scale": float(record.get("root_motion_scale") or 1.0),
+                "action_clip_id": str(action_clip.get("id") or ""),
+                "action_clip_name": str(action_clip.get("name") or ""),
+                "applied_at": applied_at,
+            }
+        )
+    clip_rows = []
+    for clip in retarget_clips:
+        quality = clip.get("retarget_quality") if isinstance(clip.get("retarget_quality"), dict) else {}
+        clip_rows.append(
+            {
+                "id": str(clip.get("id") or ""),
+                "name": str(clip.get("name") or ""),
+                "action": str(clip.get("action") or ""),
+                "target_armature": str(clip.get("target_armature") or ""),
+                "source_action_clip_id": str(clip.get("source_action_clip_id") or ""),
+                "retarget_profile_name": str(clip.get("retarget_profile_name") or ""),
+                "copied_fcurve_count": int(quality.get("copied_fcurve_count") or 0),
+                "skipped_fcurve_count": int(quality.get("skipped_fcurve_count") or 0),
+                "mapped_bone_count": int(quality.get("mapped_bone_count") or 0),
+                "unmapped_source_count": int(quality.get("unmapped_source_count") or 0),
+                "unmapped_target_count": int(quality.get("unmapped_target_count") or 0),
+                "rest_pose_mismatch_bone_count": int(quality.get("rest_pose_mismatch_bone_count") or 0),
+                "rest_pose_max_angle_degrees": float(quality.get("rest_pose_max_angle_degrees") or 0.0),
+                "root_motion_scale": float(quality.get("root_motion_scale") or 1.0),
+                "status": str(clip.get("status") or ""),
+            }
+        )
+    return {
+        "profile_count": len(profile_rows),
+        "application_count": len(application_rows),
+        "success_count": success_count,
+        "failure_count": failure_count,
+        "ready_clip_count": len(clip_rows),
+        "mapped_bone_count": mapped_bones,
+        "unmapped_source_count": unmapped_source,
+        "unmapped_target_count": unmapped_target,
+        "rest_pose_mismatch_bone_count": mismatch_bones,
+        "rest_pose_max_angle_degrees": round(max_rest_angle, 3),
+        "copied_fcurve_count": copied_fcurves,
+        "skipped_fcurve_count": skipped_fcurves,
+        "matched_requirement_count": matched_requirements,
+        "match_requirement_count": match_requirements,
+        "latest_application_at": latest_at,
+        "profiles": profile_rows,
+        "applications": application_rows,
+        "action_clips": clip_rows,
+    }
+
+
+def write_blender_director_retarget_summary_manifest(metadata):
+    project_dir = _storyboard_project_dir(metadata)
+    if not project_dir:
+        return ""
+    os.makedirs(project_dir, exist_ok=True)
+    path = os.path.join(project_dir, "retarget_summary.json")
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(build_blender_director_retarget_summary(metadata), f, ensure_ascii=False, indent=2)
+    return path
+
+
+def write_blender_director_retarget_summary_csv(metadata):
+    project_dir = _storyboard_project_dir(metadata)
+    if not project_dir:
+        return ""
+    os.makedirs(project_dir, exist_ok=True)
+    path = os.path.join(project_dir, "retarget_summary.csv")
+    data = build_blender_director_retarget_summary(metadata)
+    with open(path, "w", encoding="utf-8-sig", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(["类型", "名称", "档案", "目标骨骼", "状态", "映射骨骼", "源未映射", "目标未映射", "Rest Pose差异骨骼", "最大轴向差", "根运动比例", "复制曲线", "跳过曲线", "时间"])
+        for clip in data.get("action_clips", []):
+            if not isinstance(clip, dict):
+                continue
+            writer.writerow(
+                [
+                    "动作片段",
+                    clip.get("name") or clip.get("id") or "",
+                    clip.get("retarget_profile_name") or "",
+                    clip.get("target_armature") or "",
+                    clip.get("status") or "",
+                    clip.get("mapped_bone_count") or 0,
+                    clip.get("unmapped_source_count") or 0,
+                    clip.get("unmapped_target_count") or 0,
+                    clip.get("rest_pose_mismatch_bone_count") or 0,
+                    clip.get("rest_pose_max_angle_degrees") or 0,
+                    clip.get("root_motion_scale") or 1.0,
+                    clip.get("copied_fcurve_count") or 0,
+                    clip.get("skipped_fcurve_count") or 0,
+                    "",
+                ]
+            )
+        for record in data.get("applications", []):
+            if not isinstance(record, dict):
+                continue
+            writer.writerow(
+                [
+                    "应用记录",
+                    record.get("target_action") or "",
+                    record.get("profile_name") or "",
+                    record.get("target_armature") or "",
+                    record.get("status") or "",
+                    "",
+                    "",
+                    "",
+                    "",
+                    "",
+                    record.get("root_motion_scale") or 1.0,
+                    record.get("copied_fcurve_count") or 0,
+                    record.get("skipped_fcurve_count") or 0,
+                    record.get("applied_at") or "",
+                ]
+            )
+    return path
+
+
+def write_blender_director_retarget_summary_report(metadata):
+    project_dir = _storyboard_project_dir(metadata)
+    if not project_dir:
+        return ""
+    os.makedirs(project_dir, exist_ok=True)
+    data = build_blender_director_retarget_summary(metadata)
+    project_name = str((metadata or {}).get("project_name") or "Blender 导演台工程")
+
+    def empty_row(columns, text):
+        return f'<tr><td colspan="{columns}" class="empty">{escape(text)}</td></tr>'
+
+    profile_rows = []
+    for profile in data.get("profiles", []):
+        if not isinstance(profile, dict):
+            continue
+        profile_rows.append(
+            "<tr>"
+            f"<td>{escape(str(profile.get('name') or profile.get('id') or '重定向档案'))}<div class=\"id\">{escape(str(profile.get('id') or ''))}</div></td>"
+            f"<td>{escape(str(profile.get('source_armature') or ''))} → {escape(str(profile.get('target_armature') or ''))}</td>"
+            f"<td>{int(profile.get('mapped_bone_count') or 0)}</td>"
+            f"<td>{int(profile.get('unmapped_source_count') or 0)} / {int(profile.get('unmapped_target_count') or 0)}</td>"
+            f"<td>{int(profile.get('rest_pose_mismatch_bone_count') or 0)} 根 / {float(profile.get('rest_pose_max_angle_degrees') or 0):.1f}°</td>"
+            f"<td>{float(profile.get('root_motion_scale') or 1.0):.3f}</td>"
+            f"<td>{escape(str(profile.get('saved_at') or ''))}</td>"
+            "</tr>"
+        )
+    if not profile_rows:
+        profile_rows.append(empty_row(7, "暂无重定向档案"))
+
+    clip_rows = []
+    for clip in data.get("action_clips", []):
+        if not isinstance(clip, dict):
+            continue
+        clip_rows.append(
+            "<tr>"
+            f"<td>{escape(str(clip.get('name') or clip.get('id') or '重定向动作片段'))}<div class=\"id\">{escape(str(clip.get('id') or ''))}</div></td>"
+            f"<td>{escape(str(clip.get('retarget_profile_name') or ''))}</td>"
+            f"<td>{escape(str(clip.get('target_armature') or ''))}</td>"
+            f"<td>{int(clip.get('mapped_bone_count') or 0)}</td>"
+            f"<td>{int(clip.get('unmapped_source_count') or 0)} / {int(clip.get('unmapped_target_count') or 0)}</td>"
+            f"<td>{float(clip.get('rest_pose_max_angle_degrees') or 0):.1f}° / {int(clip.get('rest_pose_mismatch_bone_count') or 0)} 根</td>"
+            f"<td>{float(clip.get('root_motion_scale') or 1.0):.3f}</td>"
+            f"<td>{int(clip.get('copied_fcurve_count') or 0)} / {int(clip.get('skipped_fcurve_count') or 0)}</td>"
+            "</tr>"
+        )
+    if not clip_rows:
+        clip_rows.append(empty_row(8, "暂无已生成的重定向动作片段"))
+
+    application_rows = []
+    for record in data.get("applications", []):
+        if not isinstance(record, dict):
+            continue
+        application_rows.append(
+            "<tr>"
+            f"<td>{escape(str(record.get('profile_name') or ''))}</td>"
+            f"<td>{escape(str(record.get('source_action') or ''))} → {escape(str(record.get('target_action') or ''))}</td>"
+            f"<td>{escape(str(record.get('target_armature') or ''))}</td>"
+            f"<td>{escape(str(record.get('status') or ''))}</td>"
+            f"<td>{int(record.get('copied_fcurve_count') or 0)} / {int(record.get('skipped_fcurve_count') or 0)}</td>"
+            f"<td>{float(record.get('root_motion_scale') or 1.0):.3f}</td>"
+            f"<td>{escape(str(record.get('action_clip_name') or record.get('action_clip_id') or ''))}</td>"
+            f"<td>{escape(str(record.get('applied_at') or ''))}</td>"
+            "</tr>"
+        )
+    if not application_rows:
+        application_rows.append(empty_row(8, "暂无重定向应用记录"))
+
+    html = f"""<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <title>{escape(project_name)} - 重定向质量报告</title>
+  <style>
+    body {{ margin: 0; background: #0f1218; color: #e8edf5; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }}
+    main {{ padding: 24px; }}
+    h1 {{ margin: 0 0 6px; font-size: 24px; }}
+    h2 {{ margin: 22px 0 10px; font-size: 18px; }}
+    .meta, .id {{ color: #96a3b7; }}
+    .stats {{ display: flex; flex-wrap: wrap; gap: 10px; margin: 18px 0; }}
+    .stat {{ background: #151a22; border: 1px solid #2d3440; border-radius: 8px; padding: 10px 12px; min-width: 130px; }}
+    .stat strong {{ display: block; font-size: 20px; color: #ffffff; }}
+    table {{ width: 100%; border-collapse: collapse; background: #151a22; border: 1px solid #2d3440; margin-bottom: 18px; }}
+    th, td {{ border-bottom: 1px solid #2d3440; padding: 10px; vertical-align: top; text-align: left; }}
+    th {{ color: #b9c6d8; background: #1d2430; font-weight: 700; }}
+    .empty {{ color: #96a3b7; text-align: center; padding: 24px; }}
+  </style>
+</head>
+<body>
+  <main>
+    <h1>{escape(project_name)} - 重定向质量报告</h1>
+    <div class="meta">用于复核跨骨骼动作适配、Rest Pose 校正、根运动比例和分镜动作片段可用性。</div>
+    <div class="stats">
+      <div class="stat"><strong>{int(data.get('profile_count') or 0)}</strong>重定向档案</div>
+      <div class="stat"><strong>{int(data.get('success_count') or 0)}</strong>成功应用</div>
+      <div class="stat"><strong>{int(data.get('failure_count') or 0)}</strong>失败记录</div>
+      <div class="stat"><strong>{int(data.get('ready_clip_count') or 0)}</strong>可用动作片段</div>
+      <div class="stat"><strong>{int(data.get('mapped_bone_count') or 0)}</strong>映射骨骼</div>
+      <div class="stat"><strong>{int(data.get('unmapped_source_count') or 0)}</strong>源未映射</div>
+      <div class="stat"><strong>{int(data.get('unmapped_target_count') or 0)}</strong>目标未映射</div>
+      <div class="stat"><strong>{float(data.get('rest_pose_max_angle_degrees') or 0):.1f}°</strong>最大轴向差</div>
+      <div class="stat"><strong>{int(data.get('copied_fcurve_count') or 0)}</strong>复制曲线</div>
+      <div class="stat"><strong>{int(data.get('matched_requirement_count') or 0)}/{int(data.get('match_requirement_count') or 0)}</strong>动作匹配</div>
+    </div>
+    <h2>重定向档案</h2>
+    <table><thead><tr><th>档案</th><th>骨骼</th><th>映射</th><th>未映射</th><th>Rest Pose</th><th>根运动</th><th>保存时间</th></tr></thead><tbody>{''.join(profile_rows)}</tbody></table>
+    <h2>可用动作片段</h2>
+    <table><thead><tr><th>片段</th><th>档案</th><th>目标骨骼</th><th>映射</th><th>未映射</th><th>Rest Pose</th><th>根运动</th><th>曲线</th></tr></thead><tbody>{''.join(clip_rows)}</tbody></table>
+    <h2>应用记录</h2>
+    <table><thead><tr><th>档案</th><th>动作</th><th>目标骨骼</th><th>状态</th><th>曲线</th><th>根运动</th><th>动作片段</th><th>时间</th></tr></thead><tbody>{''.join(application_rows)}</tbody></table>
+  </main>
+</body>
+</html>
+"""
+    path = os.path.join(project_dir, "retarget_summary.html")
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(html)
+    return path
+
+
 def _requirement_key(kind, item):
     if not isinstance(item, dict):
         return ""
@@ -3447,6 +4749,157 @@ def _requirement_key(kind, item):
     if item_name:
         return f"{kind}:name:{item_name}"
     return ""
+
+
+def _asset_requirement_normalized_text(value):
+    if isinstance(value, (list, tuple, set)):
+        value = " ".join(str(item or "") for item in value)
+    elif isinstance(value, dict):
+        value = " ".join(str(item or "") for item in value.values())
+    return re.sub(r"\s+", " ", str(value or "").strip().lower())
+
+
+def _asset_requirement_tokens(value):
+    text = _asset_requirement_normalized_text(value)
+    parts = re.split(r"[^0-9a-zA-Z\u4e00-\u9fff]+", text)
+    return [part for part in parts if len(part) >= 2]
+
+
+def _asset_requirement_target_type(requirement):
+    if not isinstance(requirement, dict):
+        return ""
+    if requirement.get("kind") == "actor":
+        return "character"
+    kind = str(requirement.get("type") or "").strip().lower()
+    aliases = {
+        "actor": "character",
+        "person": "character",
+        "human": "character",
+        "role": "character",
+        "object": "prop",
+        "set": "scene",
+        "environment": "scene",
+    }
+    return aliases.get(kind, kind)
+
+
+def _asset_library_candidate_text(item):
+    if not isinstance(item, dict):
+        return ""
+    return _asset_requirement_normalized_text(
+        [
+            item.get("id"),
+            item.get("name"),
+            item.get("file_name"),
+            item.get("relative_path"),
+            item.get("path"),
+            item.get("kind_hint"),
+            item.get("tags"),
+            item.get("usage_note"),
+            item.get("source_profile_name"),
+        ]
+    )
+
+
+def _asset_library_candidate_supported(path):
+    supported = (
+        ".blend",
+        ".glb",
+        ".gltf",
+        ".fbx",
+        ".obj",
+        ".bvh",
+        ".png",
+        ".jpg",
+        ".jpeg",
+        ".tif",
+        ".tiff",
+        ".exr",
+        ".hdr",
+    )
+    return str(path or "").lower().endswith(supported)
+
+
+def _score_asset_library_candidate(requirement, item):
+    if not isinstance(requirement, dict) or not isinstance(item, dict):
+        return None
+    path = str(item.get("path") or "").strip()
+    if not path or not os.path.exists(path) or not _asset_library_candidate_supported(path):
+        return None
+    target_type = _asset_requirement_target_type(requirement)
+    item_kind = str(item.get("kind_hint") or item.get("type") or "model").strip().lower()
+    req_name = str(requirement.get("name") or requirement.get("id") or "").strip()
+    req_text = _asset_requirement_normalized_text(
+        [requirement.get("id"), requirement.get("name"), requirement.get("type"), requirement.get("kind_label")]
+    )
+    candidate_text = _asset_library_candidate_text(item)
+    score = 0.0
+    reasons = []
+    if target_type and item_kind == target_type:
+        score += 0.36
+        reasons.append("类型匹配：" + _asset_ecosystem_kind_label(target_type))
+    elif target_type == "character" and item_kind == "model":
+        score += 0.18
+        reasons.append("通用模型可作为人物候选")
+    elif target_type in ("prop", "scene") and item_kind == "model":
+        score += 0.16
+        reasons.append("通用模型可作为" + _asset_ecosystem_kind_label(target_type) + "候选")
+    elif not target_type and item_kind in {"character", "prop", "scene", "model"}:
+        score += 0.12
+        reasons.append("可作为镜头资产候选")
+    normalized_name = _asset_requirement_normalized_text(req_name)
+    if normalized_name and (normalized_name in candidate_text or candidate_text in normalized_name):
+        score += 0.42
+        reasons.append("名称匹配")
+    shared_tokens = []
+    for token in _asset_requirement_tokens(req_text):
+        if token in candidate_text and token not in shared_tokens:
+            shared_tokens.append(token)
+    if shared_tokens:
+        score += min(0.24, 0.08 * len(shared_tokens))
+        reasons.append("关键词：" + "、".join(shared_tokens[:4]))
+    if bool(item.get("favorite")):
+        score += 0.04
+        reasons.append("已收藏")
+    try:
+        usage_count = int(item.get("usage_count") or 0)
+    except Exception:
+        usage_count = 0
+    if usage_count > 0:
+        score += min(0.05, usage_count * 0.01)
+        reasons.append("历史使用 " + str(usage_count) + " 次")
+    if score <= 0:
+        return None
+    return {
+        "id": str(item.get("id") or ""),
+        "name": str(item.get("name") or item.get("file_name") or item.get("id") or "库资产"),
+        "kind": item_kind,
+        "kind_label": _asset_ecosystem_kind_label(item_kind),
+        "format": str(item.get("format") or os.path.splitext(path)[1].lstrip(".").lower()),
+        "path": path,
+        "relative_path": str(item.get("relative_path") or ""),
+        "library_id": str(item.get("library_id") or ""),
+        "library_path": str(item.get("library_path") or ""),
+        "source_profile_id": str(item.get("source_profile_id") or ""),
+        "source_profile_name": str(item.get("source_profile_name") or ""),
+        "favorite": bool(item.get("favorite")),
+        "usage_count": usage_count,
+        "score": round(min(score, 1.0), 4),
+        "reasons": reasons,
+    }
+
+
+def _asset_requirement_library_candidates(metadata, requirement, limit=5):
+    if not isinstance(metadata, dict) or not isinstance(requirement, dict):
+        return []
+    rows = []
+    items = metadata.get("asset_library_items") if isinstance(metadata.get("asset_library_items"), list) else []
+    for item in items:
+        candidate = _score_asset_library_candidate(requirement, item)
+        if candidate:
+            rows.append(candidate)
+    rows.sort(key=lambda item: (-float(item.get("score") or 0), str(item.get("name") or ""), str(item.get("id") or "")))
+    return rows[: max(1, int(limit or 1))]
 
 
 def build_blender_director_asset_requirements(metadata):
@@ -3552,6 +5005,16 @@ def build_blender_director_asset_requirements(metadata):
         requirements.values(),
         key=lambda item: (0 if not item.get("available") else 1, str(item.get("kind_label") or ""), str(item.get("name") or item.get("id") or "")),
     )
+    missing_with_candidate_count = 0
+    candidate_total = 0
+    for row in rows:
+        candidates = _asset_requirement_library_candidates(metadata, row, limit=5)
+        row["library_candidates"] = candidates
+        row["library_candidate_count"] = len(candidates)
+        row["best_library_candidate"] = candidates[0] if candidates else {}
+        candidate_total += len(candidates)
+        if not row.get("available") and candidates:
+            missing_with_candidate_count += 1
     missing_count = sum(1 for item in rows if not item.get("available"))
     return {
         "project_id": str(metadata.get("project_id") or ""),
@@ -3560,6 +5023,8 @@ def build_blender_director_asset_requirements(metadata):
         "requirement_count": len(rows),
         "available_count": len(rows) - missing_count,
         "missing_count": missing_count,
+        "missing_with_candidate_count": missing_with_candidate_count,
+        "library_candidate_count": candidate_total,
         "requirements": rows,
     }
 
@@ -3585,7 +5050,7 @@ def write_blender_director_asset_requirements_csv(metadata):
     data = build_blender_director_asset_requirements(metadata)
     with open(path, "w", encoding="utf-8-sig", newline="") as f:
         writer = csv.writer(f)
-        writer.writerow(["类型", "名称", "ID", "资产类型", "状态", "引用镜头数", "引用镜头", "说明"])
+        writer.writerow(["类型", "名称", "ID", "资产类型", "状态", "引用镜头数", "引用镜头", "本地库候选", "最佳候选", "匹配分", "说明"])
         for item in data.get("requirements", []):
             if not isinstance(item, dict):
                 continue
@@ -3595,6 +5060,7 @@ def write_blender_director_asset_requirements_csv(metadata):
                 for shot in shots
                 if isinstance(shot, dict) and str(shot.get("shot_name") or shot.get("shot_id") or "").strip()
             )
+            best_candidate = item.get("best_library_candidate") if isinstance(item.get("best_library_candidate"), dict) else {}
             writer.writerow(
                 [
                     item.get("kind_label") or "",
@@ -3604,6 +5070,9 @@ def write_blender_director_asset_requirements_csv(metadata):
                     item.get("status_label") or "",
                     item.get("shot_count") or 0,
                     shot_text,
+                    item.get("library_candidate_count") or 0,
+                    best_candidate.get("name") or "",
+                    best_candidate.get("score") or "",
                     item.get("status_note") or "",
                 ]
             )
@@ -3628,6 +5097,19 @@ def write_blender_director_asset_requirements_report(metadata):
             if isinstance(shot, dict) and str(shot.get("shot_name") or shot.get("shot_id") or "").strip()
         )
         status_class = "ok" if item.get("available") else "bad"
+        best_candidate = item.get("best_library_candidate") if isinstance(item.get("best_library_candidate"), dict) else {}
+        candidate_text = ""
+        if best_candidate:
+            reasons = best_candidate.get("reasons") if isinstance(best_candidate.get("reasons"), list) else []
+            candidate_text = (
+                str(best_candidate.get("name") or "")
+                + " · "
+                + str(best_candidate.get("kind_label") or best_candidate.get("kind") or "")
+                + " · "
+                + str(best_candidate.get("score") or "")
+            )
+            if reasons:
+                candidate_text += "｜" + "；".join(str(reason or "") for reason in reasons[:3])
         rows.append(
             "<tr>"
             f"<td>{escape(str(item.get('kind_label') or ''))}</td>"
@@ -3636,11 +5118,12 @@ def write_blender_director_asset_requirements_report(metadata):
             f"<td class=\"{status_class}\">{escape(str(item.get('status_label') or ''))}</td>"
             f"<td>{int(item.get('shot_count') or 0)}</td>"
             f"<td>{escape(shot_text)}</td>"
+            f"<td>{escape(candidate_text or '—')}</td>"
             f"<td>{escape(str(item.get('status_note') or ''))}</td>"
             "</tr>"
         )
     if not rows:
-        rows.append('<tr><td colspan="7" class="empty">暂无资产需求，请先在 Blender 导演台保存带演员或资产的镜头。</td></tr>')
+        rows.append('<tr><td colspan="8" class="empty">暂无资产需求，请先在 Blender 导演台保存带演员或资产的镜头。</td></tr>')
     html = f"""<!doctype html>
 <html lang="zh-CN">
 <head>
@@ -3670,9 +5153,10 @@ def write_blender_director_asset_requirements_report(metadata):
       <div class="stat"><strong>{int(data.get('requirement_count') or 0)}</strong>需求</div>
       <div class="stat"><strong>{int(data.get('available_count') or 0)}</strong>已具备</div>
       <div class="stat"><strong>{int(data.get('missing_count') or 0)}</strong>缺素材</div>
+      <div class="stat"><strong>{int(data.get('missing_with_candidate_count') or 0)}</strong>缺项有本地候选</div>
     </div>
     <table>
-      <thead><tr><th>类型</th><th>名称</th><th>资产类型</th><th>状态</th><th>镜头数</th><th>引用镜头</th><th>说明</th></tr></thead>
+      <thead><tr><th>类型</th><th>名称</th><th>资产类型</th><th>状态</th><th>镜头数</th><th>引用镜头</th><th>本地库最佳候选</th><th>说明</th></tr></thead>
       <tbody>{''.join(rows)}</tbody>
     </table>
   </main>
@@ -3754,6 +5238,9 @@ def _action_match_candidate(item, origin, index):
         item.get("library_relative_path"),
         item.get("path"),
         item.get("source_profile_name"),
+        item.get("retarget_profile_name"),
+        item.get("retarget_source_action"),
+        item.get("retarget_source_clip_name"),
     ]
     search_text = _action_match_text(text_parts)
     keywords, matched_terms = _action_match_keywords(search_text)
@@ -3786,6 +5273,12 @@ def _action_match_candidate(item, origin, index):
         "format": str(item.get("format") or "").strip(),
         "favorite": bool(item.get("favorite")),
         "usage_count": usage_count,
+        "generated_by": str(item.get("generated_by") or "").strip(),
+        "retarget_profile_id": str(item.get("retarget_profile_id") or "").strip(),
+        "retarget_profile_name": str(item.get("retarget_profile_name") or "").strip(),
+        "retarget_source_action": str(item.get("retarget_source_action") or "").strip(),
+        "retarget_source_clip_name": str(item.get("retarget_source_clip_name") or "").strip(),
+        "retarget_quality": item.get("retarget_quality") if isinstance(item.get("retarget_quality"), dict) else {},
         "keywords": keywords,
         "matched_terms": matched_terms,
         "_search_text": search_text,
@@ -3841,8 +5334,9 @@ def _score_action_match(requirement, candidate):
     query_text = _action_match_text(requirement.get("query"))
     candidate_name = _action_match_text(candidate.get("name"))
     candidate_action = _action_match_text(candidate.get("action"))
+    candidate_source_clip_name = _action_match_text(candidate.get("retarget_source_clip_name"))
     phrase_hit = False
-    for phrase in (candidate_name, candidate_action):
+    for phrase in (candidate_name, candidate_action, candidate_source_clip_name):
         if len(phrase) >= 2 and (phrase in query_text or query_text in phrase):
             phrase_hit = True
             break
@@ -3878,6 +5372,9 @@ def _score_action_match(requirement, candidate):
     if "mixamo" in source_name.lower():
         score += 0.03
         reasons.append("来源：Mixamo 动作生态")
+    if str(candidate.get("generated_by") or "") == "retarget":
+        score += 0.05
+        reasons.append("已完成目标骨骼重定向")
     if candidate.get("favorite"):
         score += 0.03
         reasons.append("已收藏")
@@ -3915,6 +5412,12 @@ def _public_action_match_candidate(candidate, score=0.0, reasons=None, shared_ke
             "format": candidate.get("format") or "",
             "favorite": bool(candidate.get("favorite")),
             "usage_count": int(candidate.get("usage_count") or 0),
+            "generated_by": candidate.get("generated_by") or "",
+            "retarget_profile_id": candidate.get("retarget_profile_id") or "",
+            "retarget_profile_name": candidate.get("retarget_profile_name") or "",
+            "retarget_source_action": candidate.get("retarget_source_action") or "",
+            "retarget_source_clip_name": candidate.get("retarget_source_clip_name") or "",
+            "retarget_quality": candidate.get("retarget_quality") if isinstance(candidate.get("retarget_quality"), dict) else {},
             "keywords": candidate.get("keywords") if isinstance(candidate.get("keywords"), list) else [],
             "score": score,
             "reasons": reasons or [],
@@ -3999,7 +5502,11 @@ def build_blender_director_action_matches(metadata):
                     "best_match": best_match,
                     "alternatives": alternatives,
                     "candidate_count": len(candidates),
-                    "match_note": "动作片段可直接复用；跨骨架资产仍需后续人工确认或骨骼重定向。"
+                    "match_note": (
+                        "动作片段已完成目标骨骼重定向，可直接进入镜头验证。"
+                        if best_match and str(best_match.get("generated_by") or "") == "retarget"
+                        else "动作片段可直接复用；跨骨架资产仍需后续人工确认或骨骼重定向。"
+                    )
                     if best_match
                     else "现有动作片段和动作资产库没有达到匹配阈值，请补充动作或人工指定。",
                 }
@@ -4163,6 +5670,953 @@ def write_blender_director_action_matches_report(metadata):
 </html>
 """
     path = os.path.join(project_dir, "action_matches.html")
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(html)
+    return path
+
+
+AI_WORKFLOW_TASK_LABELS = {
+    "text_to_image_reference": "文生图/首帧参考",
+    "image_to_video": "图生视频/镜头延展",
+    "asset_generation": "资产生成/替换",
+    "motion_generation": "动作生成/重定向",
+}
+
+AI_WORKFLOW_RESULT_LABELS = {
+    "image": "图片/首帧",
+    "video": "视频",
+    "asset": "模型资产",
+    "motion": "动作",
+    "attachment": "附件",
+}
+
+AI_WORKFLOW_TARGET_LABELS = {
+    "render": "镜头输出",
+    "asset": "工程资产",
+    "attachment": "附件",
+}
+
+
+def _ai_workflow_status_label(status):
+    labels = {
+        "ready": "可执行",
+        "ready_with_reference": "参考图就绪",
+        "ready_with_candidates": "有本地候选",
+        "needs_generation": "需生成",
+        "needs_motion": "需补动作",
+        "review": "需复核",
+        "blocked": "阻断",
+    }
+    return labels.get(str(status or ""), str(status or "未定"))
+
+
+def _ai_workflow_existing_file(path):
+    path = str(path or "").strip()
+    return bool(path and os.path.exists(path))
+
+
+def _ai_workflow_file_ref(path):
+    path = str(path or "").strip()
+    return {
+        "path": path,
+        "exists": _ai_workflow_existing_file(path),
+        "name": os.path.basename(path) if path else "",
+    }
+
+
+def _ai_workflow_names(items):
+    names = []
+    for item in items if isinstance(items, list) else []:
+        if not isinstance(item, dict):
+            continue
+        name = str(item.get("name") or item.get("role") or item.get("id") or "").strip()
+        if name:
+            names.append(name)
+    return names
+
+
+def _ai_workflow_shot_prompt(project_name, shot):
+    if not isinstance(shot, dict):
+        return ""
+    actors = "、".join(_ai_workflow_names(shot.get("actors")))
+    assets = "、".join(_ai_workflow_names(shot.get("assets")))
+    camera = shot.get("camera") if isinstance(shot.get("camera"), dict) else {}
+    camera_parts = []
+    if camera.get("lens") not in (None, ""):
+        camera_parts.append(str(camera.get("lens")) + "mm")
+    if camera.get("location"):
+        camera_parts.append("机位 " + str(camera.get("location")))
+    parts = [
+        "项目：" + str(project_name or "AI短剧"),
+        "镜头：" + str(shot.get("shot_name") or shot.get("shot_id") or ""),
+        "场次：" + str(shot.get("scene_number") or ""),
+        "地点：" + str(shot.get("scene_location") or ""),
+        "环境：" + str(shot.get("scene_environment_label") or shot.get("scene_environment") or ""),
+        "时间：" + str(shot.get("scene_time_label") or shot.get("scene_time") or ""),
+        "内容：" + str(shot.get("note") or ""),
+        "演员：" + actors,
+        "资产：" + assets,
+        "机位：" + "，".join(camera_parts),
+        "输出：" + str(shot.get("output_label") or shot.get("output_type") or ""),
+    ]
+    return "；".join(part for part in parts if part and not part.endswith("："))
+
+
+def _ai_workflow_requirements_by_shot(asset_requirements):
+    by_shot = {}
+    for item in asset_requirements.get("requirements", []) if isinstance(asset_requirements, dict) else []:
+        if not isinstance(item, dict):
+            continue
+        shots = item.get("shots") if isinstance(item.get("shots"), list) else []
+        for shot in shots:
+            if not isinstance(shot, dict):
+                continue
+            shot_id = str(shot.get("shot_id") or "").strip()
+            if not shot_id:
+                continue
+            by_shot.setdefault(shot_id, []).append(item)
+    return by_shot
+
+
+def _ai_workflow_actions_by_shot(action_matches):
+    by_shot = {}
+    for item in action_matches.get("requirements", []) if isinstance(action_matches, dict) else []:
+        if not isinstance(item, dict):
+            continue
+        shot_id = str(item.get("shot_id") or "").strip()
+        if not shot_id:
+            continue
+        by_shot.setdefault(shot_id, []).append(item)
+    return by_shot
+
+
+def _ai_workflow_task(task_id, task_type, status, shot, prompt, inputs=None, notes=None):
+    inputs = inputs if isinstance(inputs, dict) else {}
+    notes = notes if isinstance(notes, list) else ([] if notes in (None, "") else [str(notes)])
+    return {
+        "id": _safe_name(task_id, "ai_task"),
+        "type": task_type,
+        "type_label": AI_WORKFLOW_TASK_LABELS.get(task_type, task_type),
+        "status": status,
+        "status_label": _ai_workflow_status_label(status),
+        "shot_id": str(shot.get("shot_id") or ""),
+        "shot_name": str(shot.get("shot_name") or ""),
+        "scene_number": str(shot.get("scene_number") or ""),
+        "scene_location": str(shot.get("scene_location") or ""),
+        "frame_start": shot.get("frame_start"),
+        "frame_end": shot.get("frame_end"),
+        "output_type": str(shot.get("output_type") or ""),
+        "output_label": str(shot.get("output_label") or shot.get("output_type") or ""),
+        "prompt": prompt,
+        "inputs": inputs,
+        "notes": notes,
+    }
+
+
+def build_blender_director_ai_workflow_tasks(metadata):
+    if not isinstance(metadata, dict):
+        metadata = {}
+    project_name = str(metadata.get("project_name") or "Blender 导演台工程")
+    storyboard = build_blender_director_storyboard(metadata)
+    asset_requirements = build_blender_director_asset_requirements(metadata)
+    action_matches = build_blender_director_action_matches(metadata)
+    requirements_by_shot = _ai_workflow_requirements_by_shot(asset_requirements)
+    actions_by_shot = _ai_workflow_actions_by_shot(action_matches)
+    tasks = []
+    ready_count = 0
+    review_count = 0
+    blocked_count = 0
+    task_type_counts = {}
+    for shot in storyboard:
+        if not isinstance(shot, dict):
+            continue
+        shot_id = str(shot.get("shot_id") or f"shot_{len(tasks) + 1:03d}").strip()
+        prompt = _ai_workflow_shot_prompt(project_name, shot)
+        preview_path = str(shot.get("preview_path") or "").strip()
+        output_path = str(shot.get("output_path") or "").strip()
+        reference_exists = _ai_workflow_existing_file(preview_path)
+        visual_type = "image_to_video" if reference_exists else "text_to_image_reference"
+        visual_status = "ready_with_reference" if reference_exists else "ready"
+        visual_notes = []
+        if not reference_exists:
+            visual_notes.append("没有可用预览图，建议先由文本生成首帧参考，或先执行 Blender 渲染。")
+        if str(shot.get("output_type") or "") == "video":
+            visual_notes.append("目标输出为视频，可用于图生视频或镜头延展。")
+        tasks.append(
+            _ai_workflow_task(
+                "ai_visual_" + shot_id,
+                visual_type,
+                visual_status if prompt else "blocked",
+                shot,
+                prompt,
+                {
+                    "reference_image": _ai_workflow_file_ref(preview_path),
+                    "render_output": _ai_workflow_file_ref(output_path),
+                    "layer_paths": shot.get("layer_paths") if isinstance(shot.get("layer_paths"), dict) else {},
+                    "actors": shot.get("actors") if isinstance(shot.get("actors"), list) else [],
+                    "assets": shot.get("assets") if isinstance(shot.get("assets"), list) else [],
+                },
+                visual_notes,
+            )
+        )
+        shot_requirements = requirements_by_shot.get(shot_id, [])
+        missing_requirements = [item for item in shot_requirements if isinstance(item, dict) and not item.get("available")]
+        if missing_requirements:
+            with_candidates = [
+                item
+                for item in missing_requirements
+                if isinstance(item.get("best_library_candidate"), dict) and item.get("best_library_candidate")
+            ]
+            tasks.append(
+                _ai_workflow_task(
+                    "ai_assets_" + shot_id,
+                    "asset_generation",
+                    "ready_with_candidates" if with_candidates else "needs_generation",
+                    shot,
+                    prompt,
+                    {
+                        "missing_requirements": missing_requirements,
+                        "candidate_count": sum(int(item.get("library_candidate_count") or 0) for item in missing_requirements if isinstance(item, dict)),
+                    },
+                    [
+                        "优先复用本地库候选；没有候选的条目可进入资产生成、模型修复或人工建模流程。"
+                    ],
+                )
+            )
+        shot_actions = actions_by_shot.get(shot_id, [])
+        if shot_actions:
+            unmatched = [item for item in shot_actions if isinstance(item, dict) and item.get("status") != "matched"]
+            matched = [item for item in shot_actions if isinstance(item, dict) and item.get("status") == "matched"]
+            tasks.append(
+                _ai_workflow_task(
+                    "ai_motion_" + shot_id,
+                    "motion_generation",
+                    "needs_motion" if unmatched else "review",
+                    shot,
+                    prompt,
+                    {
+                        "action_requirements": shot_actions,
+                        "matched_count": len(matched),
+                        "unmatched_count": len(unmatched),
+                    },
+                    [
+                        "已匹配动作可进入重定向/验证；待补动作可进入动作生成或动作库补充流程。"
+                    ],
+                )
+            )
+    for task in tasks:
+        status = str(task.get("status") or "")
+        task_type = str(task.get("type") or "")
+        task_type_counts[task_type] = task_type_counts.get(task_type, 0) + 1
+        if status == "blocked":
+            blocked_count += 1
+        elif status in {"review", "needs_generation", "needs_motion"}:
+            review_count += 1
+        else:
+            ready_count += 1
+    return {
+        "project_id": str(metadata.get("project_id") or ""),
+        "project_name": project_name,
+        "updated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "shot_count": len(storyboard),
+        "task_count": len(tasks),
+        "ready_count": ready_count,
+        "review_count": review_count,
+        "blocked_count": blocked_count,
+        "task_type_counts": [
+            {"type": key, "type_label": AI_WORKFLOW_TASK_LABELS.get(key, key), "count": value}
+            for key, value in sorted(task_type_counts.items(), key=lambda row: (-row[1], row[0]))
+        ],
+        "asset_requirement_summary": {
+            "missing_count": int(asset_requirements.get("missing_count") or 0),
+            "missing_with_candidate_count": int(asset_requirements.get("missing_with_candidate_count") or 0),
+        },
+        "action_match_summary": {
+            "requirement_count": int(action_matches.get("requirement_count") or 0),
+            "matched_count": int(action_matches.get("matched_count") or 0),
+            "unmatched_count": int(action_matches.get("unmatched_count") or 0),
+        },
+        "tasks": tasks,
+    }
+
+
+def write_blender_director_ai_workflow_tasks_manifest(metadata):
+    project_dir = _storyboard_project_dir(metadata)
+    if not project_dir:
+        return ""
+    os.makedirs(project_dir, exist_ok=True)
+    path = os.path.join(project_dir, "ai_workflow_tasks.json")
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(build_blender_director_ai_workflow_tasks(metadata), f, ensure_ascii=False, indent=2)
+    return path
+
+
+def write_blender_director_ai_workflow_tasks_csv(metadata):
+    project_dir = _storyboard_project_dir(metadata)
+    if not project_dir:
+        return ""
+    os.makedirs(project_dir, exist_ok=True)
+    path = os.path.join(project_dir, "ai_workflow_tasks.csv")
+    data = build_blender_director_ai_workflow_tasks(metadata)
+    with open(path, "w", encoding="utf-8-sig", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(["任务ID", "任务类型", "状态", "镜头ID", "镜头名", "场次", "地点", "帧段", "输出", "参考图", "渲染输出", "提示词", "备注"])
+        for item in data.get("tasks", []):
+            if not isinstance(item, dict):
+                continue
+            inputs = item.get("inputs") if isinstance(item.get("inputs"), dict) else {}
+            reference = inputs.get("reference_image") if isinstance(inputs.get("reference_image"), dict) else {}
+            render_output = inputs.get("render_output") if isinstance(inputs.get("render_output"), dict) else {}
+            frame_text = ""
+            if item.get("frame_start") is not None and item.get("frame_end") is not None:
+                frame_text = str(item.get("frame_start")) + "-" + str(item.get("frame_end"))
+            writer.writerow(
+                [
+                    item.get("id") or "",
+                    item.get("type_label") or item.get("type") or "",
+                    item.get("status_label") or item.get("status") or "",
+                    item.get("shot_id") or "",
+                    item.get("shot_name") or "",
+                    item.get("scene_number") or "",
+                    item.get("scene_location") or "",
+                    frame_text,
+                    item.get("output_label") or item.get("output_type") or "",
+                    reference.get("path") or "",
+                    render_output.get("path") or "",
+                    item.get("prompt") or "",
+                    "；".join(str(note or "") for note in item.get("notes", []) if str(note or "").strip()),
+                ]
+            )
+    return path
+
+
+def write_blender_director_ai_workflow_tasks_report(metadata):
+    project_dir = _storyboard_project_dir(metadata)
+    if not project_dir:
+        return ""
+    os.makedirs(project_dir, exist_ok=True)
+    data = build_blender_director_ai_workflow_tasks(metadata)
+    rows = []
+    for item in data.get("tasks", []):
+        if not isinstance(item, dict):
+            continue
+        inputs = item.get("inputs") if isinstance(item.get("inputs"), dict) else {}
+        reference = inputs.get("reference_image") if isinstance(inputs.get("reference_image"), dict) else {}
+        render_output = inputs.get("render_output") if isinstance(inputs.get("render_output"), dict) else {}
+        ref_text = str(reference.get("path") or "")
+        if ref_text:
+            ref_text += "（可用）" if reference.get("exists") else "（缺失）"
+        output_text = str(render_output.get("path") or "")
+        if output_text:
+            output_text += "（可用）" if render_output.get("exists") else "（缺失）"
+        notes = "；".join(str(note or "") for note in item.get("notes", []) if str(note or "").strip())
+        status_class = "bad" if item.get("status") == "blocked" else ("warn" if item.get("status") in {"review", "needs_generation", "needs_motion"} else "ok")
+        rows.append(
+            "<tr>"
+            f"<td><strong>{escape(str(item.get('type_label') or item.get('type') or ''))}</strong><div class=\"id\">{escape(str(item.get('id') or ''))}</div></td>"
+            f"<td>{escape(str(item.get('shot_name') or item.get('shot_id') or ''))}<div class=\"id\">{escape(str(item.get('shot_id') or ''))}</div></td>"
+            f"<td class=\"{status_class}\">{escape(str(item.get('status_label') or item.get('status') or ''))}</td>"
+            f"<td>{escape(ref_text or '—')}</td>"
+            f"<td>{escape(output_text or '—')}</td>"
+            f"<td>{escape(str(item.get('prompt') or ''))}</td>"
+            f"<td>{escape(notes or '—')}</td>"
+            "</tr>"
+        )
+    if not rows:
+        rows.append('<tr><td colspan="7" class="empty">暂无 AI 工作流任务，请先保存镜头和资产需求。</td></tr>')
+    project_name = str(data.get("project_name") or "Blender 导演台工程")
+    html = f"""<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <title>{escape(project_name)} - AI 工作流任务包</title>
+  <style>
+    body {{ margin: 0; background: #0f1218; color: #e8edf5; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }}
+    main {{ padding: 24px; }}
+    h1 {{ margin: 0 0 6px; font-size: 24px; }}
+    .meta, .id {{ color: #96a3b7; }}
+    .stats {{ display: flex; flex-wrap: wrap; gap: 10px; margin: 18px 0; }}
+    .stat {{ background: #151a22; border: 1px solid #2d3440; border-radius: 8px; padding: 10px 12px; min-width: 130px; }}
+    .stat strong {{ display: block; font-size: 20px; color: #ffffff; }}
+    table {{ width: 100%; border-collapse: collapse; background: #151a22; border: 1px solid #2d3440; }}
+    th, td {{ border-bottom: 1px solid #2d3440; padding: 10px; vertical-align: top; text-align: left; }}
+    th {{ color: #b9c6d8; background: #1d2430; font-weight: 700; }}
+    .ok {{ color: #86efac; }}
+    .warn {{ color: #f6d78b; }}
+    .bad {{ color: #ff9f9f; }}
+    .empty {{ color: #96a3b7; text-align: center; padding: 26px; }}
+  </style>
+</head>
+<body>
+  <main>
+    <h1>{escape(project_name)} - AI 工作流任务包</h1>
+    <div class="meta">更新于 {escape(str(data.get('updated_at') or ''))}。本文件只整理本地任务，不调用外部 AI 服务。</div>
+    <div class="stats">
+      <div class="stat"><strong>{int(data.get('shot_count') or 0)}</strong>镜头</div>
+      <div class="stat"><strong>{int(data.get('task_count') or 0)}</strong>AI任务</div>
+      <div class="stat"><strong>{int(data.get('ready_count') or 0)}</strong>可执行</div>
+      <div class="stat"><strong>{int(data.get('review_count') or 0)}</strong>需生成/复核</div>
+      <div class="stat"><strong>{int(data.get('blocked_count') or 0)}</strong>阻断</div>
+      <div class="stat"><strong>{int(data.get('asset_requirement_summary', {}).get('missing_with_candidate_count') or 0)}</strong>缺素材有候选</div>
+      <div class="stat"><strong>{int(data.get('action_match_summary', {}).get('unmatched_count') or 0)}</strong>待补动作</div>
+    </div>
+    <table>
+      <thead><tr><th>任务</th><th>镜头</th><th>状态</th><th>参考图</th><th>渲染输出</th><th>提示词</th><th>备注</th></tr></thead>
+      <tbody>{''.join(rows)}</tbody>
+    </table>
+  </main>
+</body>
+</html>
+"""
+    path = os.path.join(project_dir, "ai_workflow_tasks.html")
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(html)
+    return path
+
+
+AI_WORKFLOW_EXPECTED_OUTPUTS = {
+    "text_to_image_reference": {
+        "label": "首帧/参考图",
+        "extensions": ["png", "jpg", "jpeg", "webp", "exr"],
+        "drop_hint": "把文生图或首帧参考图放入 results 目录，回 Blender 后登记为图片/首帧。",
+    },
+    "image_to_video": {
+        "label": "视频镜头",
+        "extensions": ["mp4", "mov", "avi", "mkv"],
+        "drop_hint": "把图生视频或镜头延展结果放入 results 目录，回 Blender 后登记为视频。",
+    },
+    "asset_generation": {
+        "label": "模型/资产",
+        "extensions": ["blend", "glb", "gltf", "fbx", "obj", "stl", "ply", "abc", "usd", "usdz"],
+        "drop_hint": "把生成或修复后的模型资产放入 results 目录，回 Blender 后登记为模型资产。",
+    },
+    "motion_generation": {
+        "label": "动作文件",
+        "extensions": ["bvh", "fbx"],
+        "drop_hint": "把动作生成结果放入 results 目录，回 Blender 后登记为动作。",
+    },
+}
+
+
+def _ai_workflow_task_input_files(task):
+    files = []
+    inputs = task.get("inputs") if isinstance(task.get("inputs"), dict) else {}
+
+    def add_file(label, value):
+        path = str(value or "").strip()
+        if not path:
+            return
+        files.append(
+            {
+                "label": label,
+                "path": path,
+                "exists": bool(os.path.exists(path)),
+            }
+        )
+
+    reference = inputs.get("reference_image") if isinstance(inputs.get("reference_image"), dict) else {}
+    render_output = inputs.get("render_output") if isinstance(inputs.get("render_output"), dict) else {}
+    add_file("参考图", reference.get("path"))
+    add_file("渲染输出", render_output.get("path"))
+    layer_paths = inputs.get("layer_paths") if isinstance(inputs.get("layer_paths"), dict) else {}
+    for label, path in sorted(layer_paths.items()):
+        add_file("分层素材：" + str(label), path)
+    for actor in inputs.get("actors", []) if isinstance(inputs.get("actors"), list) else []:
+        if isinstance(actor, dict):
+            add_file("演员资产：" + str(actor.get("name") or actor.get("id") or ""), actor.get("path"))
+    for asset in inputs.get("assets", []) if isinstance(inputs.get("assets"), list) else []:
+        if isinstance(asset, dict):
+            add_file("镜头资产：" + str(asset.get("name") or asset.get("id") or ""), asset.get("path"))
+    return files
+
+
+def build_blender_director_ai_workflow_handoff(metadata):
+    if not isinstance(metadata, dict):
+        metadata = {}
+    project_dir = _storyboard_project_dir(metadata)
+    task_data = build_blender_director_ai_workflow_tasks(metadata)
+    handoff_dir = os.path.join(project_dir, "ai_workflow_handoff") if project_dir else ""
+    jobs = []
+    ready_count = 0
+    review_count = 0
+    blocked_count = 0
+    for index, task in enumerate(task_data.get("tasks", []) if isinstance(task_data, dict) else [], start=1):
+        if not isinstance(task, dict):
+            continue
+        task_id = str(task.get("id") or f"ai_task_{index:03d}").strip()
+        task_dir_name = _safe_name(task_id, f"ai_task_{index:03d}")
+        job_dir = os.path.join(handoff_dir, task_dir_name) if handoff_dir else ""
+        result_dir = os.path.join(job_dir, "results") if job_dir else ""
+        task_type = str(task.get("type") or "")
+        expected = AI_WORKFLOW_EXPECTED_OUTPUTS.get(
+            task_type,
+            {
+                "label": "AI 结果文件",
+                "extensions": [],
+                "drop_hint": "把外部 AI 输出文件放入 results 目录，回 Blender 后批量登记。",
+            },
+        )
+        status = str(task.get("status") or "")
+        if status == "blocked":
+            blocked_count += 1
+        elif status in {"review", "needs_generation", "needs_motion"}:
+            review_count += 1
+        else:
+            ready_count += 1
+        jobs.append(
+            {
+                "id": task_id,
+                "task_id": task_id,
+                "task_type": task_type,
+                "task_type_label": str(task.get("type_label") or AI_WORKFLOW_TASK_LABELS.get(task_type, task_type)),
+                "status": status,
+                "status_label": str(task.get("status_label") or _ai_workflow_status_label(status)),
+                "shot_id": str(task.get("shot_id") or ""),
+                "shot_name": str(task.get("shot_name") or ""),
+                "scene_number": str(task.get("scene_number") or ""),
+                "scene_location": str(task.get("scene_location") or ""),
+                "frame_start": task.get("frame_start"),
+                "frame_end": task.get("frame_end"),
+                "prompt": str(task.get("prompt") or ""),
+                "notes": task.get("notes") if isinstance(task.get("notes"), list) else [],
+                "input_files": _ai_workflow_task_input_files(task),
+                "expected_output": expected,
+                "job_dir": job_dir,
+                "result_dir": result_dir,
+                "task_manifest_path": os.path.join(job_dir, "task.json") if job_dir else "",
+                "prompt_path": os.path.join(job_dir, "prompt.txt") if job_dir else "",
+                "notes_path": os.path.join(job_dir, "notes.txt") if job_dir else "",
+                "result_readme_path": os.path.join(result_dir, "README.txt") if result_dir else "",
+                "suggested_result_name": task_dir_name + "_result",
+            }
+        )
+    return {
+        "project_id": str(metadata.get("project_id") or ""),
+        "project_name": str(metadata.get("project_name") or "Blender 导演台工程"),
+        "updated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "handoff_dir": handoff_dir,
+        "manifest_path": os.path.join(handoff_dir, "handoff_manifest.json") if handoff_dir else "",
+        "report_path": os.path.join(handoff_dir, "handoff.html") if handoff_dir else "",
+        "csv_path": os.path.join(handoff_dir, "handoff.csv") if handoff_dir else "",
+        "readme_path": os.path.join(handoff_dir, "README.txt") if handoff_dir else "",
+        "task_count": len(jobs),
+        "ready_count": ready_count,
+        "review_count": review_count,
+        "blocked_count": blocked_count,
+        "result_inbox_count": len(jobs),
+        "jobs": jobs,
+    }
+
+
+def write_blender_director_ai_workflow_handoff_package(metadata):
+    project_dir = _storyboard_project_dir(metadata)
+    if not project_dir:
+        return {}
+    data = build_blender_director_ai_workflow_handoff(metadata)
+    handoff_dir = data.get("handoff_dir")
+    if not handoff_dir:
+        return data
+    os.makedirs(handoff_dir, exist_ok=True)
+    for job in data.get("jobs", []):
+        if not isinstance(job, dict):
+            continue
+        job_dir = str(job.get("job_dir") or "").strip()
+        result_dir = str(job.get("result_dir") or "").strip()
+        if not job_dir or not result_dir:
+            continue
+        os.makedirs(result_dir, exist_ok=True)
+        task_manifest = {
+            "project_id": data.get("project_id") or "",
+            "project_name": data.get("project_name") or "",
+            "task_id": job.get("task_id") or "",
+            "task_type": job.get("task_type") or "",
+            "task_type_label": job.get("task_type_label") or "",
+            "status": job.get("status") or "",
+            "status_label": job.get("status_label") or "",
+            "shot_id": job.get("shot_id") or "",
+            "shot_name": job.get("shot_name") or "",
+            "scene_number": job.get("scene_number") or "",
+            "scene_location": job.get("scene_location") or "",
+            "frame_start": job.get("frame_start"),
+            "frame_end": job.get("frame_end"),
+            "prompt": job.get("prompt") or "",
+            "notes": job.get("notes") if isinstance(job.get("notes"), list) else [],
+            "input_files": job.get("input_files") if isinstance(job.get("input_files"), list) else [],
+            "expected_output": job.get("expected_output") if isinstance(job.get("expected_output"), dict) else {},
+            "result_dir": result_dir,
+            "suggested_result_name": job.get("suggested_result_name") or "",
+        }
+        with open(job.get("task_manifest_path"), "w", encoding="utf-8") as f:
+            json.dump(task_manifest, f, ensure_ascii=False, indent=2)
+        with open(job.get("prompt_path"), "w", encoding="utf-8") as f:
+            f.write(str(job.get("prompt") or "").strip() + "\n")
+        notes = [str(note or "") for note in job.get("notes", []) if str(note or "").strip()]
+        with open(job.get("notes_path"), "w", encoding="utf-8") as f:
+            f.write("\n".join(notes) + ("\n" if notes else ""))
+        expected = job.get("expected_output") if isinstance(job.get("expected_output"), dict) else {}
+        with open(job.get("result_readme_path"), "w", encoding="utf-8") as f:
+            f.write(
+                "AI 结果收件箱\n"
+                "任务ID：" + str(job.get("task_id") or "") + "\n"
+                "任务类型：" + str(job.get("task_type_label") or job.get("task_type") or "") + "\n"
+                "建议输出：" + str(expected.get("label") or "AI 结果文件") + "\n"
+                "建议扩展名：" + "、".join(str(ext) for ext in expected.get("extensions", []) if str(ext).strip()) + "\n"
+                + str(expected.get("drop_hint") or "把外部 AI 输出文件放在这里，然后回 Blender 批量登记。")
+                + "\n"
+            )
+    with open(data.get("manifest_path"), "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+    with open(data.get("csv_path"), "w", encoding="utf-8-sig", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(["任务ID", "任务类型", "状态", "镜头ID", "镜头名", "结果目录", "提示词文件", "建议输出", "建议扩展名"])
+        for job in data.get("jobs", []):
+            if not isinstance(job, dict):
+                continue
+            expected = job.get("expected_output") if isinstance(job.get("expected_output"), dict) else {}
+            writer.writerow(
+                [
+                    job.get("task_id") or "",
+                    job.get("task_type_label") or job.get("task_type") or "",
+                    job.get("status_label") or job.get("status") or "",
+                    job.get("shot_id") or "",
+                    job.get("shot_name") or "",
+                    job.get("result_dir") or "",
+                    job.get("prompt_path") or "",
+                    expected.get("label") or "",
+                    "、".join(str(ext) for ext in expected.get("extensions", []) if str(ext).strip()),
+                ]
+            )
+    rows = []
+    for job in data.get("jobs", []):
+        if not isinstance(job, dict):
+            continue
+        expected = job.get("expected_output") if isinstance(job.get("expected_output"), dict) else {}
+        status_class = "bad" if job.get("status") == "blocked" else ("warn" if job.get("status") in {"review", "needs_generation", "needs_motion"} else "ok")
+        rows.append(
+            "<tr>"
+            f"<td><strong>{escape(str(job.get('task_type_label') or job.get('task_type') or ''))}</strong><div class=\"id\">{escape(str(job.get('task_id') or ''))}</div></td>"
+            f"<td>{escape(str(job.get('shot_name') or job.get('shot_id') or ''))}</td>"
+            f"<td class=\"{status_class}\">{escape(str(job.get('status_label') or job.get('status') or ''))}</td>"
+            f"<td>{escape(str(expected.get('label') or 'AI 结果文件'))}<div class=\"id\">{escape('、'.join(str(ext) for ext in expected.get('extensions', []) if str(ext).strip()))}</div></td>"
+            f"<td>{escape(str(job.get('result_dir') or ''))}</td>"
+            f"<td>{escape(str(job.get('prompt') or ''))}</td>"
+            "</tr>"
+        )
+    if not rows:
+        rows.append('<tr><td colspan="6" class="empty">暂无 AI 工作包任务。</td></tr>')
+    project_name = str(data.get("project_name") or "Blender 导演台工程")
+    html = f"""<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <title>{escape(project_name)} - AI 工作包与结果收件箱</title>
+  <style>
+    body {{ margin: 0; background: #0f1218; color: #e8edf5; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }}
+    main {{ padding: 24px; }}
+    h1 {{ margin: 0 0 6px; font-size: 24px; }}
+    .meta, .id {{ color: #96a3b7; }}
+    .stats {{ display: flex; flex-wrap: wrap; gap: 10px; margin: 18px 0; }}
+    .stat {{ background: #151a22; border: 1px solid #2d3440; border-radius: 8px; padding: 10px 12px; min-width: 130px; }}
+    .stat strong {{ display: block; font-size: 20px; color: #ffffff; }}
+    table {{ width: 100%; border-collapse: collapse; background: #151a22; border: 1px solid #2d3440; }}
+    th, td {{ border-bottom: 1px solid #2d3440; padding: 10px; vertical-align: top; text-align: left; }}
+    th {{ color: #b9c6d8; background: #1d2430; font-weight: 700; }}
+    .ok {{ color: #86efac; }}
+    .warn {{ color: #f6d78b; }}
+    .bad {{ color: #ff9f9f; }}
+    .empty {{ color: #96a3b7; text-align: center; padding: 26px; }}
+  </style>
+</head>
+<body>
+  <main>
+    <h1>{escape(project_name)} - AI 工作包与结果收件箱</h1>
+    <div class="meta">更新于 {escape(str(data.get('updated_at') or ''))}。每个任务都有独立 prompt、task.json 和 results 目录；外部 AI 工具输出后可回 Blender 批量登记。</div>
+    <div class="stats">
+      <div class="stat"><strong>{int(data.get('task_count') or 0)}</strong>工作包任务</div>
+      <div class="stat"><strong>{int(data.get('ready_count') or 0)}</strong>可执行</div>
+      <div class="stat"><strong>{int(data.get('review_count') or 0)}</strong>需生成/复核</div>
+      <div class="stat"><strong>{int(data.get('blocked_count') or 0)}</strong>阻断</div>
+      <div class="stat"><strong>{int(data.get('result_inbox_count') or 0)}</strong>结果收件箱</div>
+    </div>
+    <table>
+      <thead><tr><th>任务</th><th>镜头</th><th>状态</th><th>建议输出</th><th>结果目录</th><th>提示词</th></tr></thead>
+      <tbody>{''.join(rows)}</tbody>
+    </table>
+  </main>
+</body>
+</html>
+"""
+    with open(data.get("report_path"), "w", encoding="utf-8") as f:
+        f.write(html)
+    with open(data.get("readme_path"), "w", encoding="utf-8") as f:
+        f.write(
+            "AI 工作包与结果收件箱\n"
+            "1. 打开每个任务目录里的 prompt.txt 或 task.json。\n"
+            "2. 用任意外部 AI 工具生成图片、视频、模型或动作。\n"
+            "3. 把结果文件放进对应任务的 results 目录。\n"
+            "4. 回到 Blender 导演台，使用“批量登记AI结果目录”登记 results 或整个 ai_workflow_handoff 目录。\n"
+        )
+    if isinstance(metadata, dict):
+        metadata["ai_workflow_handoff_dir"] = data.get("handoff_dir") or ""
+        metadata["ai_workflow_handoff_manifest_path"] = data.get("manifest_path") or ""
+        metadata["ai_workflow_handoff_report_path"] = data.get("report_path") or ""
+        metadata["ai_workflow_handoff_csv_path"] = data.get("csv_path") or ""
+        metadata["ai_workflow_handoff_readme_path"] = data.get("readme_path") or ""
+    return data
+
+
+def _ai_workflow_result_type_from_path(path, fallback="attachment"):
+    lower = str(path or "").lower()
+    if lower.endswith((".mp4", ".mov", ".avi", ".mkv")):
+        return "video"
+    if lower.endswith((".png", ".jpg", ".jpeg", ".webp", ".bmp", ".exr", ".hdr")):
+        return "image"
+    if lower.endswith(".bvh"):
+        return "motion"
+    if lower.endswith((".blend", ".glb", ".gltf", ".fbx", ".obj", ".stl", ".ply", ".abc", ".usd", ".usdz")):
+        return "asset"
+    return str(fallback or "attachment")
+
+
+def _ai_workflow_result_task_lookup(metadata):
+    task_data = metadata.get("ai_workflow_tasks") if isinstance(metadata.get("ai_workflow_tasks"), dict) else {}
+    tasks = task_data.get("tasks") if isinstance(task_data.get("tasks"), list) else []
+    if not tasks:
+        try:
+            task_data = build_blender_director_ai_workflow_tasks(metadata)
+            tasks = task_data.get("tasks") if isinstance(task_data.get("tasks"), list) else []
+        except Exception:
+            tasks = []
+    return {
+        str(task.get("id") or ""): task
+        for task in tasks
+        if isinstance(task, dict) and str(task.get("id") or "").strip()
+    }
+
+
+def _ai_workflow_normalize_result(item, task_lookup, source="registered"):
+    if not isinstance(item, dict):
+        item = {}
+    task_id = str(item.get("task_id") or item.get("ai_task_id") or "").strip()
+    task = task_lookup.get(task_id, {}) if task_id else {}
+    path = str(item.get("path") or item.get("output_path") or item.get("preview_path") or "").strip()
+    result_type = str(item.get("result_type") or item.get("ai_result_type") or "").strip()
+    if not result_type:
+        result_type = _ai_workflow_result_type_from_path(path)
+    target_type = str(item.get("target_type") or "").strip()
+    if not target_type:
+        target_type = "render" if source == "render" else ("asset" if source == "asset" else "attachment")
+    payload_id = str(item.get("payload_id") or item.get("shot_id") or item.get("id") or "").strip()
+    payload_name = str(item.get("payload_name") or item.get("shot_name") or item.get("name") or os.path.basename(path) or "").strip()
+    shot_id = str(item.get("shot_id") or task.get("shot_id") or "").strip()
+    shot_name = str(item.get("shot_name") or task.get("shot_name") or "").strip()
+    result_id = str(item.get("id") or "").strip()
+    if not result_id:
+        result_id = _safe_name("ai_result_" + (task_id or payload_id or os.path.basename(path) or source), "ai_result")
+    return {
+        "id": result_id,
+        "task_id": task_id,
+        "task_type": str(task.get("type") or ""),
+        "task_type_label": str(task.get("type_label") or AI_WORKFLOW_TASK_LABELS.get(str(task.get("type") or ""), "")),
+        "shot_id": shot_id,
+        "shot_name": shot_name,
+        "result_type": result_type,
+        "result_type_label": AI_WORKFLOW_RESULT_LABELS.get(result_type, result_type),
+        "target_type": target_type,
+        "target_type_label": AI_WORKFLOW_TARGET_LABELS.get(target_type, target_type),
+        "path": path,
+        "path_exists": bool(path and os.path.exists(path)),
+        "payload_id": payload_id,
+        "payload_name": payload_name,
+        "note": str(item.get("note") or item.get("ai_result_note") or ""),
+        "registered_at": str(item.get("registered_at") or item.get("created_at") or ""),
+        "source": source,
+    }
+
+
+def build_blender_director_ai_workflow_results(metadata):
+    if not isinstance(metadata, dict):
+        metadata = {}
+    task_lookup = _ai_workflow_result_task_lookup(metadata)
+    entries = []
+    seen = set()
+
+    def add(item, source):
+        entry = _ai_workflow_normalize_result(item, task_lookup, source)
+        if entry.get("path"):
+            key = (
+                "path",
+                entry.get("task_id") or "",
+                entry.get("target_type") or "",
+                entry.get("result_type") or "",
+                entry.get("path") or "",
+            )
+        else:
+            key = ("id", entry.get("id") or "", entry.get("task_id") or "", entry.get("target_type") or "")
+        if key in seen:
+            return
+        seen.add(key)
+        entries.append(entry)
+
+    for item in metadata.get("ai_workflow_results", []) if isinstance(metadata.get("ai_workflow_results"), list) else []:
+        if isinstance(item, dict):
+            add(item, "registered")
+    for item in metadata.get("renders", []) if isinstance(metadata.get("renders"), list) else []:
+        if not isinstance(item, dict):
+            continue
+        if item.get("mode") == "ai_workflow_result" or item.get("ai_task_id") or item.get("ai_result_type"):
+            add(item, "render")
+    for item in metadata.get("assets", []) if isinstance(metadata.get("assets"), list) else []:
+        if not isinstance(item, dict):
+            continue
+        if item.get("generated_by") == "ai_workflow" or item.get("ai_task_id") or item.get("ai_result_type"):
+            add(item, "asset")
+
+    result_type_counts = {}
+    target_type_counts = {}
+    file_exists_count = 0
+    for entry in entries:
+        result_type = str(entry.get("result_type") or "attachment")
+        target_type = str(entry.get("target_type") or "attachment")
+        result_type_counts[result_type] = result_type_counts.get(result_type, 0) + 1
+        target_type_counts[target_type] = target_type_counts.get(target_type, 0) + 1
+        if entry.get("path_exists"):
+            file_exists_count += 1
+
+    return {
+        "project_id": str(metadata.get("project_id") or ""),
+        "project_name": str(metadata.get("project_name") or "Blender 导演台工程"),
+        "updated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "result_count": len(entries),
+        "file_exists_count": file_exists_count,
+        "missing_file_count": max(0, len(entries) - file_exists_count),
+        "render_count": int(target_type_counts.get("render") or 0),
+        "asset_count": int(target_type_counts.get("asset") or 0),
+        "attachment_count": int(target_type_counts.get("attachment") or 0),
+        "result_type_counts": [
+            {"type": key, "type_label": AI_WORKFLOW_RESULT_LABELS.get(key, key), "count": value}
+            for key, value in sorted(result_type_counts.items(), key=lambda row: (-row[1], row[0]))
+        ],
+        "target_type_counts": [
+            {"type": key, "type_label": AI_WORKFLOW_TARGET_LABELS.get(key, key), "count": value}
+            for key, value in sorted(target_type_counts.items(), key=lambda row: (-row[1], row[0]))
+        ],
+        "results": entries,
+    }
+
+
+def write_blender_director_ai_workflow_results_manifest(metadata):
+    project_dir = _storyboard_project_dir(metadata)
+    if not project_dir:
+        return ""
+    os.makedirs(project_dir, exist_ok=True)
+    path = os.path.join(project_dir, "ai_workflow_results.json")
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(build_blender_director_ai_workflow_results(metadata), f, ensure_ascii=False, indent=2)
+    return path
+
+
+def write_blender_director_ai_workflow_results_csv(metadata):
+    project_dir = _storyboard_project_dir(metadata)
+    if not project_dir:
+        return ""
+    os.makedirs(project_dir, exist_ok=True)
+    path = os.path.join(project_dir, "ai_workflow_results.csv")
+    data = build_blender_director_ai_workflow_results(metadata)
+    with open(path, "w", encoding="utf-8-sig", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(["结果ID", "任务ID", "任务类型", "镜头ID", "镜头名", "结果类型", "去向", "文件状态", "路径", "名称", "备注", "登记时间"])
+        for item in data.get("results", []):
+            if not isinstance(item, dict):
+                continue
+            writer.writerow(
+                [
+                    item.get("id") or "",
+                    item.get("task_id") or "",
+                    item.get("task_type_label") or item.get("task_type") or "",
+                    item.get("shot_id") or "",
+                    item.get("shot_name") or "",
+                    item.get("result_type_label") or item.get("result_type") or "",
+                    item.get("target_type_label") or item.get("target_type") or "",
+                    "可用" if item.get("path_exists") else "缺失",
+                    item.get("path") or "",
+                    item.get("payload_name") or "",
+                    item.get("note") or "",
+                    item.get("registered_at") or "",
+                ]
+            )
+    return path
+
+
+def write_blender_director_ai_workflow_results_report(metadata):
+    project_dir = _storyboard_project_dir(metadata)
+    if not project_dir:
+        return ""
+    os.makedirs(project_dir, exist_ok=True)
+    data = build_blender_director_ai_workflow_results(metadata)
+    rows = []
+    for item in data.get("results", []):
+        if not isinstance(item, dict):
+            continue
+        status_class = "ok" if item.get("path_exists") else "bad"
+        rows.append(
+            "<tr>"
+            f"<td><strong>{escape(str(item.get('result_type_label') or item.get('result_type') or ''))}</strong><div class=\"id\">{escape(str(item.get('id') or ''))}</div></td>"
+            f"<td>{escape(str(item.get('target_type_label') or item.get('target_type') or ''))}</td>"
+            f"<td>{escape(str(item.get('task_type_label') or item.get('task_id') or '—'))}<div class=\"id\">{escape(str(item.get('task_id') or ''))}</div></td>"
+            f"<td>{escape(str(item.get('shot_name') or item.get('shot_id') or '—'))}<div class=\"id\">{escape(str(item.get('shot_id') or ''))}</div></td>"
+            f"<td class=\"{status_class}\">{'可用' if item.get('path_exists') else '缺失'}</td>"
+            f"<td>{escape(str(item.get('path') or '—'))}</td>"
+            f"<td>{escape(str(item.get('payload_name') or '—'))}</td>"
+            f"<td>{escape(str(item.get('note') or '—'))}</td>"
+            f"<td>{escape(str(item.get('registered_at') or ''))}</td>"
+            "</tr>"
+        )
+    if not rows:
+        rows.append('<tr><td colspan="9" class="empty">暂无已登记的 AI 工作流结果。</td></tr>')
+    project_name = str(data.get("project_name") or "Blender 导演台工程")
+    html = f"""<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <title>{escape(project_name)} - AI 结果回填台账</title>
+  <style>
+    body {{ margin: 0; background: #0f1218; color: #e8edf5; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }}
+    main {{ padding: 24px; }}
+    h1 {{ margin: 0 0 6px; font-size: 24px; }}
+    .meta, .id {{ color: #96a3b7; }}
+    .stats {{ display: flex; flex-wrap: wrap; gap: 10px; margin: 18px 0; }}
+    .stat {{ background: #151a22; border: 1px solid #2d3440; border-radius: 8px; padding: 10px 12px; min-width: 130px; }}
+    .stat strong {{ display: block; font-size: 20px; color: #ffffff; }}
+    table {{ width: 100%; border-collapse: collapse; background: #151a22; border: 1px solid #2d3440; }}
+    th, td {{ border-bottom: 1px solid #2d3440; padding: 10px; vertical-align: top; text-align: left; }}
+    th {{ color: #b9c6d8; background: #1d2430; font-weight: 700; }}
+    .ok {{ color: #86efac; }}
+    .bad {{ color: #ff9f9f; }}
+    .empty {{ color: #96a3b7; text-align: center; padding: 26px; }}
+  </style>
+</head>
+<body>
+  <main>
+    <h1>{escape(project_name)} - AI 结果回填台账</h1>
+    <div class="meta">更新于 {escape(str(data.get('updated_at') or ''))}。记录外部 AI 输出回填到 Blender 镜头、资产、动作或附件的情况。</div>
+    <div class="stats">
+      <div class="stat"><strong>{int(data.get('result_count') or 0)}</strong>已登记结果</div>
+      <div class="stat"><strong>{int(data.get('render_count') or 0)}</strong>镜头输出</div>
+      <div class="stat"><strong>{int(data.get('asset_count') or 0)}</strong>工程资产/动作</div>
+      <div class="stat"><strong>{int(data.get('attachment_count') or 0)}</strong>附件</div>
+      <div class="stat"><strong>{int(data.get('file_exists_count') or 0)}</strong>文件可用</div>
+      <div class="stat"><strong>{int(data.get('missing_file_count') or 0)}</strong>文件缺失</div>
+    </div>
+    <table>
+      <thead><tr><th>结果</th><th>去向</th><th>任务</th><th>镜头</th><th>文件</th><th>路径</th><th>名称</th><th>备注</th><th>登记时间</th></tr></thead>
+      <tbody>{''.join(rows)}</tbody>
+    </table>
+  </main>
+</body>
+</html>
+"""
+    path = os.path.join(project_dir, "ai_workflow_results.html")
     with open(path, "w", encoding="utf-8") as f:
         f.write(html)
     return path
@@ -4606,7 +7060,13 @@ def write_blender_director_project_dashboard(metadata):
     duration = build_blender_director_duration_summary(metadata)
     edit_timeline = build_blender_director_edit_timeline(metadata)
     asset_requirements = build_blender_director_asset_requirements(metadata)
+    asset_ecosystem = build_blender_director_asset_ecosystem(metadata)
+    asset_preflight = build_blender_director_asset_preflight(metadata)
     action_matches = build_blender_director_action_matches(metadata)
+    ai_workflow_tasks = build_blender_director_ai_workflow_tasks(metadata)
+    ai_workflow_handoff = build_blender_director_ai_workflow_handoff(metadata)
+    ai_workflow_results = build_blender_director_ai_workflow_results(metadata)
+    retarget_summary = build_blender_director_retarget_summary(metadata)
     production_check = build_blender_director_production_check(metadata)
     post_handoff = build_blender_director_post_handoff(metadata)
     continuity_check = build_blender_director_continuity_check(metadata)
@@ -4660,12 +7120,24 @@ def write_blender_director_project_dashboard(metadata):
         link_row("制作问题检查", metadata.get("production_check_report_path") or os.path.join(project_dir, "production_check.html"), "重复镜头、缺字段、帧段问题、缺文件"),
         link_row("制作问题 CSV", metadata.get("production_check_csv_path") or os.path.join(project_dir, "production_check.csv"), "用于批量核对制作问题"),
         link_row("时长统计", metadata.get("duration_summary_path") or os.path.join(project_dir, "duration_summary.json"), "总帧数、估算秒数、平均镜头时长"),
-        link_row("制作清单", metadata.get("production_report_path") or os.path.join(project_dir, "production_report.html"), "镜头进度与资产使用"),
+        link_row("制作清单", metadata.get("production_report_path") or os.path.join(project_dir, "production_report.html"), "镜头进度、资产使用与重定向动作质量"),
         link_row("资产使用 CSV", metadata.get("asset_usage_csv_path") or os.path.join(project_dir, "asset_usage.csv"), "资产反查引用镜头"),
         link_row("资产需求清单", metadata.get("asset_requirements_report_path") or os.path.join(project_dir, "asset_requirements.html"), "演员模型、镜头资产、缺素材核对"),
         link_row("资产需求 CSV", metadata.get("asset_requirements_csv_path") or os.path.join(project_dir, "asset_requirements.csv"), "用于采购、建模或资产整理"),
+        link_row("资产生态报告", metadata.get("asset_ecosystem_report_path") or os.path.join(project_dir, "asset_ecosystem.html"), "开源来源、授权提示、库文件可用性和导入记录"),
+        link_row("资产生态 CSV", metadata.get("asset_ecosystem_csv_path") or os.path.join(project_dir, "asset_ecosystem.csv"), "用于资产库整理、授权复核和缺文件排查"),
+        link_row("资产导入预检", metadata.get("asset_preflight_report_path") or os.path.join(project_dir, "asset_preflight.html"), "导入前风险、动作准备度、贴图完整性与修复建议"),
+        link_row("资产导入预检 CSV", metadata.get("asset_preflight_csv_path") or os.path.join(project_dir, "asset_preflight.csv"), "用于批量修复资产库问题"),
         link_row("动作匹配清单", metadata.get("action_matches_report_path") or os.path.join(project_dir, "action_matches.html"), "按镜头和演员匹配工程动作片段与动作库资产"),
         link_row("动作匹配 CSV", metadata.get("action_matches_csv_path") or os.path.join(project_dir, "action_matches.csv"), "用于动作采购、动画调度和人工复核"),
+        link_row("AI 工作流任务包", metadata.get("ai_workflow_tasks_report_path") or os.path.join(project_dir, "ai_workflow_tasks.html"), "图生视频、资产生成/修复、动作生成/重定向的本地任务清单"),
+        link_row("AI 工作流 CSV", metadata.get("ai_workflow_tasks_csv_path") or os.path.join(project_dir, "ai_workflow_tasks.csv"), "用于桥接外部 AI 工具或批处理脚本"),
+        link_row("AI 工作包与结果收件箱", metadata.get("ai_workflow_handoff_report_path") or os.path.join(project_dir, "ai_workflow_handoff", "handoff.html"), "每个 AI 任务的 prompt、task.json 与 results 投递目录"),
+        link_row("AI 工作包 CSV", metadata.get("ai_workflow_handoff_csv_path") or os.path.join(project_dir, "ai_workflow_handoff", "handoff.csv"), "用于外部 AI 工具批处理和结果投递核对"),
+        link_row("AI 结果回填台账", metadata.get("ai_workflow_results_report_path") or os.path.join(project_dir, "ai_workflow_results.html"), "外部 AI 生成结果回填到镜头、资产、动作或附件的登记记录"),
+        link_row("AI 结果回填 CSV", metadata.get("ai_workflow_results_csv_path") or os.path.join(project_dir, "ai_workflow_results.csv"), "用于核对 AI 输出文件、任务归属和回填去向"),
+        link_row("重定向质量报告", metadata.get("retarget_summary_report_path") or os.path.join(project_dir, "retarget_summary.html"), "跨骨骼动作适配、Rest Pose、根运动和动作片段质量"),
+        link_row("重定向质量 CSV", metadata.get("retarget_summary_csv_path") or os.path.join(project_dir, "retarget_summary.csv"), "用于动画质检和动作资产复核"),
         link_row("交付检查", metadata.get("delivery_audit_report_path") or os.path.join(project_dir, "delivery_audit.html"), "缺失文件与未渲染镜头检查"),
         link_row("最近交付包", metadata.get("delivery_package_path"), str(metadata.get("delivery_package_created_at") or "")),
     ]
@@ -4715,8 +7187,24 @@ def write_blender_director_project_dashboard(metadata):
       <div class="stat"><strong>{int(production_check.get('error_count') or 0)}</strong>制作错误</div>
       <div class="stat"><strong>{int(production_check.get('warning_count') or 0)}</strong>制作提醒</div>
       <div class="stat"><strong>{int(asset_requirements.get('missing_count') or 0)}</strong>缺素材</div>
+      <div class="stat"><strong>{int(asset_requirements.get('missing_with_candidate_count') or 0)}</strong>缺项有候选</div>
+      <div class="stat"><strong>{int(asset_ecosystem.get('library_item_count') or 0)}</strong>库资产</div>
+      <div class="stat"><strong>{int(asset_ecosystem.get('asset_browser_catalog_count') or 0)}</strong>Blender Catalog</div>
+      <div class="stat"><strong>{int(asset_ecosystem.get('controllable_asset_count') or 0)}</strong>可控工程资产</div>
+      <div class="stat"><strong>{int(asset_ecosystem.get('missing_file_count') or 0)}</strong>资产库缺文件</div>
+      <div class="stat"><strong>{int(asset_ecosystem.get('missing_license_count') or 0)}</strong>缺授权来源</div>
+      <div class="stat"><strong>{int(asset_preflight.get('blocked_count') or 0)}</strong>导入阻断</div>
+      <div class="stat"><strong>{int(asset_preflight.get('review_count') or 0)}</strong>导入需复核</div>
       <div class="stat"><strong>{int(action_matches.get('matched_count') or 0)}</strong>动作已匹配</div>
       <div class="stat"><strong>{int(action_matches.get('unmatched_count') or 0)}</strong>待补动作</div>
+      <div class="stat"><strong>{int(ai_workflow_tasks.get('task_count') or 0)}</strong>AI工作流任务</div>
+      <div class="stat"><strong>{int(ai_workflow_tasks.get('ready_count') or 0)}</strong>AI任务可执行</div>
+      <div class="stat"><strong>{int(ai_workflow_handoff.get('result_inbox_count') or 0)}</strong>AI结果收件箱</div>
+      <div class="stat"><strong>{int(ai_workflow_results.get('result_count') or 0)}</strong>AI结果回填</div>
+      <div class="stat"><strong>{int(ai_workflow_results.get('missing_file_count') or 0)}</strong>AI结果缺文件</div>
+      <div class="stat"><strong>{int(retarget_summary.get('ready_clip_count') or 0)}</strong>重定向动作片段</div>
+      <div class="stat"><strong>{int(retarget_summary.get('rest_pose_mismatch_bone_count') or 0)}</strong>Rest Pose 差异骨骼</div>
+      <div class="stat"><strong>{int(retarget_summary.get('failure_count') or 0)}</strong>重定向失败</div>
       <div class="stat"><strong>{int(duration.get('total_frames') or 0)}</strong>总帧数</div>
       <div class="stat"><strong>{int(production.get('asset_count') or 0)}</strong>工程资产</div>
       <div class="stat"><strong>{int(production.get('unused_asset_count') or 0)}</strong>未使用资产</div>
@@ -5241,9 +7729,25 @@ def write_blender_director_delivery_package(metadata):
     asset_requirements_manifest_path = write_blender_director_asset_requirements_manifest(metadata)
     asset_requirements_report_path = write_blender_director_asset_requirements_report(metadata)
     asset_requirements_csv_path = write_blender_director_asset_requirements_csv(metadata)
+    asset_ecosystem_manifest_path = write_blender_director_asset_ecosystem_manifest(metadata)
+    asset_ecosystem_report_path = write_blender_director_asset_ecosystem_report(metadata)
+    asset_ecosystem_csv_path = write_blender_director_asset_ecosystem_csv(metadata)
+    asset_preflight_manifest_path = write_blender_director_asset_preflight_manifest(metadata)
+    asset_preflight_report_path = write_blender_director_asset_preflight_report(metadata)
+    asset_preflight_csv_path = write_blender_director_asset_preflight_csv(metadata)
     action_matches_manifest_path = write_blender_director_action_matches_manifest(metadata)
     action_matches_report_path = write_blender_director_action_matches_report(metadata)
     action_matches_csv_path = write_blender_director_action_matches_csv(metadata)
+    ai_workflow_tasks_manifest_path = write_blender_director_ai_workflow_tasks_manifest(metadata)
+    ai_workflow_tasks_report_path = write_blender_director_ai_workflow_tasks_report(metadata)
+    ai_workflow_tasks_csv_path = write_blender_director_ai_workflow_tasks_csv(metadata)
+    ai_workflow_handoff = write_blender_director_ai_workflow_handoff_package(metadata)
+    ai_workflow_results_manifest_path = write_blender_director_ai_workflow_results_manifest(metadata)
+    ai_workflow_results_report_path = write_blender_director_ai_workflow_results_report(metadata)
+    ai_workflow_results_csv_path = write_blender_director_ai_workflow_results_csv(metadata)
+    retarget_summary_manifest_path = write_blender_director_retarget_summary_manifest(metadata)
+    retarget_summary_report_path = write_blender_director_retarget_summary_report(metadata)
+    retarget_summary_csv_path = write_blender_director_retarget_summary_csv(metadata)
     delivery_audit_path = write_blender_director_delivery_audit(metadata)
     delivery_audit_report_path = write_blender_director_delivery_audit_report(metadata)
 
@@ -5299,9 +7803,29 @@ def write_blender_director_delivery_package(metadata):
     metadata["asset_requirements_manifest_path"] = asset_requirements_manifest_path
     metadata["asset_requirements_report_path"] = asset_requirements_report_path
     metadata["asset_requirements_csv_path"] = asset_requirements_csv_path
+    metadata["asset_ecosystem_manifest_path"] = asset_ecosystem_manifest_path
+    metadata["asset_ecosystem_report_path"] = asset_ecosystem_report_path
+    metadata["asset_ecosystem_csv_path"] = asset_ecosystem_csv_path
+    metadata["asset_preflight_manifest_path"] = asset_preflight_manifest_path
+    metadata["asset_preflight_report_path"] = asset_preflight_report_path
+    metadata["asset_preflight_csv_path"] = asset_preflight_csv_path
     metadata["action_matches_manifest_path"] = action_matches_manifest_path
     metadata["action_matches_report_path"] = action_matches_report_path
     metadata["action_matches_csv_path"] = action_matches_csv_path
+    metadata["ai_workflow_tasks_manifest_path"] = ai_workflow_tasks_manifest_path
+    metadata["ai_workflow_tasks_report_path"] = ai_workflow_tasks_report_path
+    metadata["ai_workflow_tasks_csv_path"] = ai_workflow_tasks_csv_path
+    metadata["ai_workflow_handoff_dir"] = ai_workflow_handoff.get("handoff_dir") or ""
+    metadata["ai_workflow_handoff_manifest_path"] = ai_workflow_handoff.get("manifest_path") or ""
+    metadata["ai_workflow_handoff_report_path"] = ai_workflow_handoff.get("report_path") or ""
+    metadata["ai_workflow_handoff_csv_path"] = ai_workflow_handoff.get("csv_path") or ""
+    metadata["ai_workflow_handoff_readme_path"] = ai_workflow_handoff.get("readme_path") or ""
+    metadata["ai_workflow_results_manifest_path"] = ai_workflow_results_manifest_path
+    metadata["ai_workflow_results_report_path"] = ai_workflow_results_report_path
+    metadata["ai_workflow_results_csv_path"] = ai_workflow_results_csv_path
+    metadata["retarget_summary_manifest_path"] = retarget_summary_manifest_path
+    metadata["retarget_summary_report_path"] = retarget_summary_report_path
+    metadata["retarget_summary_csv_path"] = retarget_summary_csv_path
     metadata["delivery_audit_path"] = delivery_audit_path
     metadata["delivery_audit_report_path"] = delivery_audit_report_path
 
@@ -5315,6 +7839,21 @@ def write_blender_director_delivery_package(metadata):
     metadata["delivery_package_created_at"] = created_at
     project_dashboard_path = write_blender_director_project_dashboard(metadata)
     metadata["project_dashboard_path"] = project_dashboard_path
+    asset_ecosystem = build_blender_director_asset_ecosystem(metadata)
+    asset_preflight = build_blender_director_asset_preflight(metadata)
+    ai_workflow_tasks = build_blender_director_ai_workflow_tasks(metadata)
+    ai_workflow_results = build_blender_director_ai_workflow_results(metadata)
+    retarget_summary = build_blender_director_retarget_summary(metadata)
+    metadata["ai_workflow_tasks"] = ai_workflow_tasks
+    metadata["ai_workflow_results_summary"] = {
+        "result_count": int(ai_workflow_results.get("result_count") or 0),
+        "file_exists_count": int(ai_workflow_results.get("file_exists_count") or 0),
+        "missing_file_count": int(ai_workflow_results.get("missing_file_count") or 0),
+        "render_count": int(ai_workflow_results.get("render_count") or 0),
+        "asset_count": int(ai_workflow_results.get("asset_count") or 0),
+        "attachment_count": int(ai_workflow_results.get("attachment_count") or 0),
+    }
+    metadata["retarget_summary"] = retarget_summary
 
     meta_path = str(metadata.get("meta_path") or "").strip()
     if not meta_path:
@@ -5432,9 +7971,29 @@ def write_blender_director_delivery_package(metadata):
         asset_requirements_manifest_path,
         asset_requirements_report_path,
         asset_requirements_csv_path,
+        asset_ecosystem_manifest_path,
+        asset_ecosystem_report_path,
+        asset_ecosystem_csv_path,
+        asset_preflight_manifest_path,
+        asset_preflight_report_path,
+        asset_preflight_csv_path,
         action_matches_manifest_path,
         action_matches_report_path,
         action_matches_csv_path,
+        ai_workflow_tasks_manifest_path,
+        ai_workflow_tasks_report_path,
+        ai_workflow_tasks_csv_path,
+        ai_workflow_handoff.get("handoff_dir"),
+        ai_workflow_handoff.get("manifest_path"),
+        ai_workflow_handoff.get("report_path"),
+        ai_workflow_handoff.get("csv_path"),
+        ai_workflow_handoff.get("readme_path"),
+        ai_workflow_results_manifest_path,
+        ai_workflow_results_report_path,
+        ai_workflow_results_csv_path,
+        retarget_summary_manifest_path,
+        retarget_summary_report_path,
+        retarget_summary_csv_path,
         delivery_audit_path,
         delivery_audit_report_path,
         project_dashboard_path,
@@ -5444,7 +8003,7 @@ def write_blender_director_delivery_package(metadata):
     for item in episode_delivery_packages.get("packages", []):
         if isinstance(item, dict):
             base_paths.append(item.get("package_path"))
-    for collection_name in ("assets", "asset_library_items", "renders"):
+    for collection_name in ("assets", "asset_library_items", "renders", "ai_workflow_results"):
         collection = metadata.get(collection_name)
         if not isinstance(collection, list):
             continue
@@ -5501,8 +8060,73 @@ def write_blender_director_delivery_package(metadata):
             "asset_usage_csv": _delivery_archive_name(asset_usage_csv_path, project_dir),
             "asset_requirements_report": _delivery_archive_name(asset_requirements_report_path, project_dir),
             "asset_requirements_csv": _delivery_archive_name(asset_requirements_csv_path, project_dir),
+            "asset_ecosystem_manifest": _delivery_archive_name(asset_ecosystem_manifest_path, project_dir),
+            "asset_ecosystem_report": _delivery_archive_name(asset_ecosystem_report_path, project_dir),
+            "asset_ecosystem_csv": _delivery_archive_name(asset_ecosystem_csv_path, project_dir),
+            "asset_preflight_manifest": _delivery_archive_name(asset_preflight_manifest_path, project_dir),
+            "asset_preflight_report": _delivery_archive_name(asset_preflight_report_path, project_dir),
+            "asset_preflight_csv": _delivery_archive_name(asset_preflight_csv_path, project_dir),
+            "asset_ecosystem": {
+                "source_count": int(asset_ecosystem.get("source_count") or 0),
+                "library_count": int(asset_ecosystem.get("library_count") or 0),
+                "library_item_count": int(asset_ecosystem.get("library_item_count") or 0),
+                "available_item_count": int(asset_ecosystem.get("available_item_count") or 0),
+                "missing_file_count": int(asset_ecosystem.get("missing_file_count") or 0),
+                "missing_license_count": int(asset_ecosystem.get("missing_license_count") or 0),
+                "imported_item_count": int(asset_ecosystem.get("imported_item_count") or 0),
+                "controllable_asset_count": int(asset_ecosystem.get("controllable_asset_count") or 0),
+                "asset_browser_catalog_count": int(asset_ecosystem.get("asset_browser_catalog_count") or 0),
+                "ready_action_count": int(asset_ecosystem.get("ready_action_count") or 0),
+                "action_item_count": int(asset_ecosystem.get("action_item_count") or 0),
+                "health_warnings": asset_ecosystem.get("health_warnings") if isinstance(asset_ecosystem.get("health_warnings"), list) else [],
+                "kind_counts": asset_ecosystem.get("kind_counts") if isinstance(asset_ecosystem.get("kind_counts"), list) else [],
+            },
+            "asset_preflight": {
+                "library_item_count": int(asset_preflight.get("library_item_count") or 0),
+                "ready_count": int(asset_preflight.get("ready_count") or 0),
+                "review_count": int(asset_preflight.get("review_count") or 0),
+                "blocked_count": int(asset_preflight.get("blocked_count") or 0),
+                "error_count": int(asset_preflight.get("error_count") or 0),
+                "warning_count": int(asset_preflight.get("warning_count") or 0),
+                "issue_count": int(asset_preflight.get("issue_count") or 0),
+            },
             "action_matches_report": _delivery_archive_name(action_matches_report_path, project_dir),
             "action_matches_csv": _delivery_archive_name(action_matches_csv_path, project_dir),
+            "ai_workflow_tasks_manifest": _delivery_archive_name(ai_workflow_tasks_manifest_path, project_dir),
+            "ai_workflow_tasks_report": _delivery_archive_name(ai_workflow_tasks_report_path, project_dir),
+            "ai_workflow_tasks_csv": _delivery_archive_name(ai_workflow_tasks_csv_path, project_dir),
+            "ai_workflow_tasks": {
+                "task_count": int(ai_workflow_tasks.get("task_count") or 0),
+                "ready_count": int(ai_workflow_tasks.get("ready_count") or 0),
+                "review_count": int(ai_workflow_tasks.get("review_count") or 0),
+                "blocked_count": int(ai_workflow_tasks.get("blocked_count") or 0),
+            },
+            "ai_workflow_handoff_manifest": _delivery_archive_name(ai_workflow_handoff.get("manifest_path"), project_dir),
+            "ai_workflow_handoff_report": _delivery_archive_name(ai_workflow_handoff.get("report_path"), project_dir),
+            "ai_workflow_handoff_csv": _delivery_archive_name(ai_workflow_handoff.get("csv_path"), project_dir),
+            "ai_workflow_handoff_readme": _delivery_archive_name(ai_workflow_handoff.get("readme_path"), project_dir),
+            "ai_workflow_handoff": {
+                "task_count": int(ai_workflow_handoff.get("task_count") or 0),
+                "ready_count": int(ai_workflow_handoff.get("ready_count") or 0),
+                "review_count": int(ai_workflow_handoff.get("review_count") or 0),
+                "blocked_count": int(ai_workflow_handoff.get("blocked_count") or 0),
+                "result_inbox_count": int(ai_workflow_handoff.get("result_inbox_count") or 0),
+            },
+            "ai_workflow_results_manifest": _delivery_archive_name(ai_workflow_results_manifest_path, project_dir),
+            "ai_workflow_results_report": _delivery_archive_name(ai_workflow_results_report_path, project_dir),
+            "ai_workflow_results_csv": _delivery_archive_name(ai_workflow_results_csv_path, project_dir),
+            "ai_workflow_results": {
+                "result_count": int(ai_workflow_results.get("result_count") or 0),
+                "file_exists_count": int(ai_workflow_results.get("file_exists_count") or 0),
+                "missing_file_count": int(ai_workflow_results.get("missing_file_count") or 0),
+                "render_count": int(ai_workflow_results.get("render_count") or 0),
+                "asset_count": int(ai_workflow_results.get("asset_count") or 0),
+                "attachment_count": int(ai_workflow_results.get("attachment_count") or 0),
+            },
+            "retarget_summary_manifest": _delivery_archive_name(retarget_summary_manifest_path, project_dir),
+            "retarget_summary_report": _delivery_archive_name(retarget_summary_report_path, project_dir),
+            "retarget_summary_csv": _delivery_archive_name(retarget_summary_csv_path, project_dir),
+            "retarget_summary": retarget_summary,
             "delivery_audit_report": _delivery_archive_name(delivery_audit_report_path, project_dir),
             "project_dashboard": _delivery_archive_name(project_dashboard_path, project_dir),
             "episode_delivery_packages": [
@@ -5531,6 +8155,12 @@ def summarize_blender_director_metadata(metadata):
     shot_packages = metadata.get("shot_packages") if isinstance(metadata.get("shot_packages"), list) else []
     set_packages = metadata.get("set_packages") if isinstance(metadata.get("set_packages"), list) else []
     renders = metadata.get("renders") if isinstance(metadata.get("renders"), list) else []
+    ai_workflow_results = metadata.get("ai_workflow_results") if isinstance(metadata.get("ai_workflow_results"), list) else []
+    ai_workflow_results_summary = (
+        metadata.get("ai_workflow_results_summary")
+        if isinstance(metadata.get("ai_workflow_results_summary"), dict)
+        else {}
+    )
     render_templates = metadata.get("render_templates") if isinstance(metadata.get("render_templates"), list) else []
     scene_presets = metadata.get("scene_presets") if isinstance(metadata.get("scene_presets"), list) else []
     action_applications = metadata.get("action_applications") if isinstance(metadata.get("action_applications"), list) else []
@@ -5555,6 +8185,9 @@ def summarize_blender_director_metadata(metadata):
     summary = f"资产 {len(assets)} 个 · 镜头 {len(shots)} 个 · 输出 {len(renders)} 个"
     if layered_renders:
         summary += f" · 分层素材包 {len(layered_renders)} 个"
+    ai_workflow_result_count = int(ai_workflow_results_summary.get("result_count") or len(ai_workflow_results))
+    if ai_workflow_result_count:
+        summary += f" · AI结果回填 {ai_workflow_result_count} 个"
     if actors:
         summary += f" · 演员位 {len(actors)} 个"
     if shot_packages:
@@ -5575,6 +8208,13 @@ def summarize_blender_director_metadata(metadata):
         summary += f" · 动作记录 {len(action_applications)} 条"
     if action_clips:
         summary += f" · 动作片段 {len(action_clips)} 个"
+    retarget_action_clips = [
+        clip
+        for clip in action_clips
+        if isinstance(clip, dict) and str(clip.get("generated_by") or "") == "retarget"
+    ]
+    if retarget_action_clips:
+        summary += f" · 重定向动作片段 {len(retarget_action_clips)} 个"
     if retarget_profiles:
         summary += f" · 重定向档案 {len(retarget_profiles)} 个"
     if retarget_applications:
@@ -5727,6 +8367,7 @@ bl_info = {{
     "category": "3D View",
 }}
 
+import csv
 import json
 import hashlib
 import math
@@ -5736,9 +8377,10 @@ import shutil
 from datetime import datetime
 
 import bpy
-from bpy.props import BoolProperty, EnumProperty, IntProperty, StringProperty
+from bpy.props import BoolProperty, EnumProperty, FloatProperty, IntProperty, StringProperty
+from bpy_extras import view3d_utils
 from bpy_extras.io_utils import ImportHelper
-from mathutils import Vector
+from mathutils import Euler, Quaternion, Vector
 
 META_PATH = {_json_literal(meta_path)}
 BLEND_PATH = {_json_literal(blend_path)}
@@ -5748,6 +8390,12 @@ SHOTS_DIR = {_json_literal(shots_dir)}
 PRESETS_DIR = {_json_literal(presets_dir)}
 SET_PACKAGES_DIR = {_json_literal(set_packages_dir)}
 ASSET_DIRS = json.loads({json.dumps(json.dumps(asset_dirs or {}, ensure_ascii=False), ensure_ascii=False)})
+MANNEQUIN_TEMPLATE_PATH = {_json_literal(os.path.join((asset_dirs or {}).get("characters", ""), BUNDLED_MANNEQUIN_FILENAME))}
+MANNEQUIN_ATTRIBUTION_PATH = {_json_literal(os.path.join((asset_dirs or {}).get("characters", ""), BUNDLED_MANNEQUIN_ATTRIBUTION_FILENAME))}
+FURNITURE_TEMPLATE_PATH = {_json_literal(os.path.join((asset_dirs or {}).get("props", ""), BUNDLED_FURNITURE_FILENAME))}
+FURNITURE_ATTRIBUTION_PATH = {_json_literal(os.path.join((asset_dirs or {}).get("props", ""), BUNDLED_FURNITURE_ATTRIBUTION_FILENAME))}
+FURNITURE_SOFA_COLLECTION_NAME = {_json_literal(BUNDLED_FURNITURE_SOFA_COLLECTION)}
+FURNITURE_TABLE_COLLECTION_NAME = {_json_literal(BUNDLED_FURNITURE_TABLE_COLLECTION)}
 BUILTIN_DIRECTOR_ASSET_PACK = json.loads({json.dumps(json.dumps(_default_director_asset_pack(), ensure_ascii=False), ensure_ascii=False)})
 OPEN_ASSET_SOURCE_PROFILES = json.loads({json.dumps(json.dumps(_default_open_asset_source_profiles(), ensure_ascii=False), ensure_ascii=False)})
 ASSET_KIND_DIR_KEYS = {{
@@ -5811,7 +8459,7 @@ OBJECT_MOTION_LABELS = {{
     "rise": "升起",
     "descend": "下降",
 }}
-SUPPORTED_ASSET_EXTENSIONS = (".blend", ".glb", ".gltf", ".fbx", ".obj", ".bvh")
+SUPPORTED_ASSET_EXTENSIONS = (".blend", ".glb", ".gltf", ".fbx", ".obj", ".bvh", ".stl", ".ply", ".abc", ".usd", ".usdz")
 SUPPORTED_TEXTURE_EXTENSIONS = (".png", ".jpg", ".jpeg", ".tif", ".tiff", ".exr", ".hdr")
 SUPPORTED_HDRI_EXTENSIONS = (".hdr",)
 SUPPORTED_LIBRARY_EXTENSIONS = SUPPORTED_ASSET_EXTENSIONS + SUPPORTED_TEXTURE_EXTENSIONS
@@ -5985,7 +8633,59 @@ def _asset_source_profile_enum_items(self, context):
     return items
 
 
-def _library_item_from_path(path, library_path="", source_profile=None):
+def _read_blender_asset_catalogs(library_path):
+    library_path = os.path.abspath(str(library_path or ""))
+    catalog_path = os.path.join(library_path, "blender_assets.cats.txt")
+    catalogs = []
+    if not os.path.isfile(catalog_path):
+        return catalogs, ""
+    try:
+        with open(catalog_path, "r", encoding="utf-8") as f:
+            lines = f.readlines()
+    except Exception:
+        return catalogs, catalog_path
+    for line in lines:
+        text = str(line or "").strip()
+        if not text or text.startswith("#") or text.upper().startswith("VERSION"):
+            continue
+        parts = text.split(":")
+        if len(parts) < 3:
+            continue
+        catalog_id = parts[0].strip()
+        catalog_path_value = parts[1].strip().strip("/")
+        catalog_name = ":".join(parts[2:]).strip() or os.path.basename(catalog_path_value)
+        if not catalog_id or not catalog_path_value:
+            continue
+        catalogs.append({{
+            "id": catalog_id,
+            "path": catalog_path_value,
+            "name": catalog_name,
+        }})
+    return catalogs, catalog_path
+
+
+def _catalog_for_library_item(relative_path, catalogs):
+    relative_dir = os.path.dirname(str(relative_path or "")).replace(os.sep, "/").strip("/")
+    if not relative_dir:
+        return {{}}
+    best = {{}}
+    best_len = -1
+    rel_lower = relative_dir.lower()
+    for catalog in catalogs if isinstance(catalogs, list) else []:
+        if not isinstance(catalog, dict):
+            continue
+        catalog_path = str(catalog.get("path") or "").replace("\\\\", "/").strip("/")
+        if not catalog_path:
+            continue
+        catalog_lower = catalog_path.lower()
+        matched = rel_lower == catalog_lower or rel_lower.startswith(catalog_lower + "/") or catalog_lower.endswith("/" + rel_lower)
+        if matched and len(catalog_path) > best_len:
+            best = catalog
+            best_len = len(catalog_path)
+    return dict(best) if best else {{}}
+
+
+def _library_item_from_path(path, library_path="", source_profile=None, catalogs=None):
     path = str(path or "").strip()
     if not path:
         return {{}}
@@ -6006,6 +8706,7 @@ def _library_item_from_path(path, library_path="", source_profile=None):
             relative_path = os.path.relpath(path, library_path)
         except Exception:
             relative_path = file_name
+    catalog = _catalog_for_library_item(relative_path, catalogs)
     kind_hint = _asset_kind_from_path(path, source_profile)
     item = {{
         "id": _path_based_id(path, "library_asset"),
@@ -6021,13 +8722,16 @@ def _library_item_from_path(path, library_path="", source_profile=None):
         "scanned_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "source_profile_id": str(source_profile.get("id") or ""),
         "source_profile_name": str(source_profile.get("name") or ""),
+        "asset_browser_catalog_id": str(catalog.get("id") or ""),
+        "asset_browser_catalog_path": str(catalog.get("path") or ""),
+        "asset_browser_catalog_name": str(catalog.get("name") or ""),
     }}
     if kind_hint in ("material", "texture", "hdri"):
         item["texture_role"] = _texture_role_from_path(path)
     return item
 
 
-def _upsert_asset_source(data, directory, profile_id="", item_count=0):
+def _upsert_asset_source(data, directory, profile_id="", item_count=0, catalog_count=0):
     sources = data.get("asset_sources")
     if not isinstance(sources, list):
         sources = []
@@ -6044,6 +8748,7 @@ def _upsert_asset_source(data, directory, profile_id="", item_count=0):
         "formats": profile.get("formats") if isinstance(profile.get("formats"), list) else [],
         "route": str(profile.get("route") or ""),
         "item_count": int(item_count or 0),
+        "asset_browser_catalog_count": int(catalog_count or 0),
         "scanned_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
     }}
     replaced = False
@@ -6058,7 +8763,7 @@ def _upsert_asset_source(data, directory, profile_id="", item_count=0):
     return record
 
 
-def _upsert_asset_library(data, directory, item_count=0, profile_id=""):
+def _upsert_asset_library(data, directory, item_count=0, profile_id="", catalog_count=0, catalog_path=""):
     libraries = data.get("asset_libraries")
     if not isinstance(libraries, list):
         libraries = []
@@ -6070,6 +8775,8 @@ def _upsert_asset_library(data, directory, item_count=0, profile_id=""):
         "path": directory,
         "name": os.path.basename(directory) or directory,
         "item_count": int(item_count or 0),
+        "asset_browser_catalog_count": int(catalog_count or 0),
+        "asset_browser_catalog_path": str(catalog_path or ""),
         "scanned_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "source_profile_id": str(profile.get("id") or profile_id or ""),
         "source_profile_name": str(profile.get("name") or ""),
@@ -6090,8 +8797,9 @@ def _scan_asset_library(data, directory, profile_id=""):
     directory = os.path.abspath(str(directory or ""))
     paths = _asset_paths_from_directory(directory, recursive=True)
     profile = _source_profile_by_id(profile_id)
-    _upsert_asset_source(data, directory, profile_id, len(paths))
-    library = _upsert_asset_library(data, directory, len(paths), profile_id)
+    catalogs, catalog_path = _read_blender_asset_catalogs(directory)
+    _upsert_asset_source(data, directory, profile_id, len(paths), len(catalogs))
+    library = _upsert_asset_library(data, directory, len(paths), profile_id, len(catalogs), catalog_path)
     library_id = str(library.get("id") or _library_key_for_path(directory))
     old_items = data.get("asset_library_items") if isinstance(data.get("asset_library_items"), list) else []
     old_by_key = {{}}
@@ -6108,7 +8816,7 @@ def _scan_asset_library(data, directory, profile_id=""):
     ]
     new_items = []
     for path in paths:
-        item = _library_item_from_path(path, directory, profile)
+        item = _library_item_from_path(path, directory, profile, catalogs)
         if not item:
             continue
         item["library_id"] = library_id
@@ -6127,6 +8835,7 @@ def _scan_asset_library(data, directory, profile_id=""):
                     item["usage_count"] = usage_count
             except Exception:
                 pass
+        _copy_asset_preflight_fields(item, _asset_preflight_for_library_item(data, item))
         new_items.append(item)
     data["asset_library_items"] = (kept + new_items)[-3000:]
     return library, new_items
@@ -6159,6 +8868,8 @@ def _library_item_matches_filters(item):
         item.get("kind_hint"),
         item.get("tags"),
         item.get("usage_note"),
+        item.get("asset_browser_catalog_path"),
+        item.get("asset_browser_catalog_name"),
     ]
     haystack = " ".join(str(part or "") for part in fields).lower()
     return query in haystack
@@ -6186,7 +8897,13 @@ def _library_asset_enum_items(self, context):
         usage_count = item.get("usage_count")
         last_used_at = str(item.get("last_used_at") or "").strip()
         favorite = bool(item.get("favorite"))
+        preflight_label = str(item.get("preflight_status_label") or "").strip()
+        catalog_label = str(item.get("asset_browser_catalog_path") or item.get("asset_browser_catalog_name") or "").strip()
         detail_parts = [file_format, relative]
+        if catalog_label:
+            detail_parts.append("Catalog：" + catalog_label)
+        if preflight_label:
+            detail_parts.append("预检：" + preflight_label)
         if usage_count not in (None, ""):
             detail_parts.append("使用 " + str(usage_count) + " 次" + (("：" + last_used_at) if last_used_at else ""))
         if tags:
@@ -6227,6 +8944,248 @@ def _find_library_asset(data, key):
         if _library_asset_matches_key(item, key):
             return dict(item)
     return {{}}
+
+
+def _asset_preflight_issue(severity, code, title, suggestion):
+    return {{
+        "severity": str(severity or "info"),
+        "code": str(code or ""),
+        "title": str(title or ""),
+        "suggestion": str(suggestion or ""),
+    }}
+
+
+def _asset_preflight_license_hint(profile_id="", profile_name="", record=None):
+    record = record if isinstance(record, dict) else {{}}
+    explicit = str(
+        record.get("license")
+        or record.get("license_label")
+        or record.get("usage_rights")
+        or record.get("authorization")
+        or record.get("rights")
+        or ""
+    ).strip()
+    if explicit:
+        return explicit, "ok"
+    profile_text = (str(profile_id or "") + " " + str(profile_name or "")).lower()
+    if "poly_haven" in profile_text or "poly haven" in profile_text or "ambientcg" in profile_text:
+        return "CC0 / 可商用（按来源说明归档）", "ok"
+    if "mixamo" in profile_text:
+        return "Mixamo / Adobe 使用条款，需保留来源", "review"
+    if "blender_asset_browser" in profile_text or "asset browser" in profile_text:
+        return "Blender Asset Browser 本地库，需逐项保留原始授权", "review"
+    if "blenderkit" in profile_text:
+        return "BlenderKit 原资产授权，需逐项保留", "review"
+    if "sketchfab" in profile_text or "opengameart" in profile_text or "open game art" in profile_text:
+        return "按原始下载页授权，需逐项核对", "review"
+    return "未标注授权来源", "missing"
+
+
+def _library_item_import_record(data, item):
+    if not isinstance(data, dict) or not isinstance(item, dict):
+        return {{}}
+    item_id = str(item.get("id") or "").strip()
+    source_path = os.path.abspath(str(item.get("path") or "")) if item.get("path") else ""
+    relative_path = str(item.get("relative_path") or "").strip()
+    assets = data.get("assets") if isinstance(data.get("assets"), list) else []
+    for asset in assets:
+        if not isinstance(asset, dict):
+            continue
+        if item_id and str(asset.get("library_item_id") or "") == item_id:
+            return dict(asset)
+        asset_source = os.path.abspath(str(asset.get("source_path") or "")) if asset.get("source_path") else ""
+        if source_path and asset_source and asset_source == source_path:
+            return dict(asset)
+        if relative_path and str(asset.get("library_relative_path") or "") == relative_path:
+            return dict(asset)
+    return {{}}
+
+
+def _asset_preflight_texture_roles(data, item):
+    roles = set()
+    if not isinstance(item, dict):
+        return roles
+    path = str(item.get("path") or "").strip()
+    base_dir = os.path.dirname(os.path.abspath(path)) if path else ""
+    library_id = str(item.get("library_id") or "")
+    items = data.get("asset_library_items") if isinstance(data, dict) and isinstance(data.get("asset_library_items"), list) else []
+    for candidate in items:
+        if not isinstance(candidate, dict):
+            continue
+        candidate_path = str(candidate.get("path") or "").strip()
+        if not candidate_path or not _is_texture_asset_path(candidate_path):
+            continue
+        same_library = library_id and str(candidate.get("library_id") or "") == library_id
+        same_dir = base_dir and os.path.dirname(os.path.abspath(candidate_path)) == base_dir
+        if not same_library and not same_dir:
+            continue
+        role = str(candidate.get("texture_role") or _texture_role_from_path(candidate_path) or "").strip()
+        if role:
+            roles.add(role)
+    if not roles and _is_texture_asset_path(path):
+        roles.add(str(item.get("texture_role") or _texture_role_from_path(path) or "base_color"))
+    return roles
+
+
+def _asset_preflight_status(issues):
+    issues = issues if isinstance(issues, list) else []
+    error_count = sum(1 for issue in issues if isinstance(issue, dict) and issue.get("severity") == "error")
+    warning_count = sum(1 for issue in issues if isinstance(issue, dict) and issue.get("severity") == "warning")
+    info_count = sum(1 for issue in issues if isinstance(issue, dict) and issue.get("severity") == "info")
+    if error_count:
+        return "error", "阻断", error_count, warning_count, info_count
+    if warning_count:
+        return "warning", "需复核", error_count, warning_count, info_count
+    if info_count:
+        return "info", "可导入（有建议）", error_count, warning_count, info_count
+    return "ready", "可导入", error_count, warning_count, info_count
+
+
+def _asset_preflight_for_library_item(data, item):
+    item = item if isinstance(item, dict) else {{}}
+    path = str(item.get("path") or "").strip()
+    file_format = str(item.get("format") or os.path.splitext(path)[1].lstrip(".").lower()).strip().lower()
+    lower_path = path.lower()
+    kind = str(item.get("kind_hint") or _asset_kind_from_path(path, item) or "model").strip()
+    issues = []
+    exists = bool(path and os.path.exists(path))
+    supported = bool(lower_path and lower_path.endswith(SUPPORTED_LIBRARY_EXTENSIONS))
+    if not path or not exists:
+        issues.append(_asset_preflight_issue("error", "missing_file", "库资产文件不存在", "重新扫描资产库，或把源文件恢复到原路径后再导入。"))
+    if path and not supported:
+        issues.append(_asset_preflight_issue("error", "unsupported_format", "暂不支持该文件格式", "转换为 blend/glb/gltf/fbx/obj/bvh/stl/ply/abc/usd/usdz 或常见贴图/HDRI 格式。"))
+    if exists:
+        try:
+            if os.path.getsize(path) <= 0:
+                issues.append(_asset_preflight_issue("warning", "empty_file", "文件大小为 0", "确认文件是否下载完整，必要时重新下载。"))
+        except Exception:
+            pass
+    profile_id = str(item.get("source_profile_id") or "").strip()
+    profile_name = str(item.get("source_profile_name") or "").strip()
+    license_label, license_status = _asset_preflight_license_hint(profile_id, profile_name, item)
+    if license_status == "missing":
+        issues.append(_asset_preflight_issue("warning", "missing_license", "缺授权来源", "补充 license/usage_rights 字段，或在备注里写明下载页授权。"))
+    elif license_status == "review":
+        issues.append(_asset_preflight_issue("warning", "license_review", "授权需人工复核", "导入商用工程前核对原始下载页授权和署名要求。"))
+    if kind == "model":
+        issues.append(_asset_preflight_issue("info", "confirm_asset_kind", "资产分类需要确认", "导入前选择人物、道具或场景分类，方便进入对应集合和报告。"))
+    preview = str(item.get("preview") or item.get("preview_path") or item.get("thumbnail") or item.get("thumbnail_path") or "").strip()
+    if not preview:
+        issues.append(_asset_preflight_issue("info", "no_preview", "没有预览图", "可稍后生成缩略图或登记预览，方便导演台选资产。"))
+    imported = _library_item_import_record(data, item)
+    if kind == "action":
+        if not imported:
+            issues.append(_asset_preflight_issue("warning", "action_not_prepared", "动作尚未导入/验证", "导入到目标骨骼或建立重定向档案后再用于分镜匹配。"))
+        if file_format not in ("fbx", "bvh"):
+            issues.append(_asset_preflight_issue("warning", "action_format_review", "动作格式需确认", "优先使用 FBX/BVH 动作文件；其他格式请先在 Blender 内确认包含 Action。"))
+    if kind in ("material", "texture"):
+        roles = _asset_preflight_texture_roles(data, item)
+        has_base = "base_color" in roles or "diffuse" in roles or "albedo" in roles
+        has_pbr = bool(roles.intersection(set(["normal", "roughness", "metallic"])))
+        if has_base and not has_pbr:
+            issues.append(_asset_preflight_issue("info", "incomplete_texture_set", "贴图组不完整", "如需 PBR 材质，补齐 normal/roughness/metallic 等贴图。"))
+    if kind == "hdri" and file_format not in ("hdr", "exr"):
+        issues.append(_asset_preflight_issue("warning", "hdri_format_review", "HDRI 格式需确认", "建议使用 HDR/EXR 环境光贴图，避免普通图片误作 HDRI。"))
+    status, status_label, error_count, warning_count, info_count = _asset_preflight_status(issues)
+    return {{
+        "status": status,
+        "status_label": status_label,
+        "blocked": status == "error",
+        "issues": issues,
+        "issue_count": len(issues),
+        "error_count": error_count,
+        "warning_count": warning_count,
+        "info_count": info_count,
+        "kind": kind,
+        "format": file_format,
+        "license_label": license_label,
+        "license_status": license_status,
+        "updated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+    }}
+
+
+def _copy_asset_preflight_fields(item, preflight):
+    if not isinstance(item, dict) or not isinstance(preflight, dict):
+        return item
+    item["preflight_status"] = str(preflight.get("status") or "")
+    item["preflight_status_label"] = str(preflight.get("status_label") or "")
+    item["preflight_issue_count"] = int(preflight.get("issue_count") or 0)
+    item["preflight_error_count"] = int(preflight.get("error_count") or 0)
+    item["preflight_warning_count"] = int(preflight.get("warning_count") or 0)
+    item["preflight_issues"] = preflight.get("issues") if isinstance(preflight.get("issues"), list) else []
+    item["preflight_updated_at"] = str(preflight.get("updated_at") or datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+    item["license_label"] = str(preflight.get("license_label") or item.get("license_label") or "")
+    item["license_status"] = str(preflight.get("license_status") or item.get("license_status") or "")
+    return item
+
+
+def _set_library_asset_preflight(data, key, preflight):
+    key = str(key or "").strip()
+    if not key or key == "__manual__":
+        return {{}}
+    library_items = data.get("asset_library_items") if isinstance(data.get("asset_library_items"), list) else []
+    for item in library_items:
+        if not isinstance(item, dict):
+            continue
+        if not _library_asset_matches_key(item, key):
+            continue
+        _copy_asset_preflight_fields(item, preflight)
+        return dict(item)
+    return {{}}
+
+
+def _asset_preflight_error_message(preflight):
+    issues = preflight.get("issues") if isinstance(preflight, dict) and isinstance(preflight.get("issues"), list) else []
+    titles = [
+        str(issue.get("title") or issue.get("code") or "").strip()
+        for issue in issues
+        if isinstance(issue, dict) and issue.get("severity") == "error"
+    ]
+    titles = [title for title in titles if title]
+    if titles:
+        return "资产预检阻断：" + "；".join(titles[:3])
+    return "资产预检阻断：请先修复资产文件或格式"
+
+
+def _draw_library_asset_preflight(layout, context):
+    key = str(getattr(context.scene, "gpt_director_library_asset_choice", "") or "").strip()
+    if not key or key == "__manual__":
+        return
+    data = _load_meta()
+    item = _find_library_asset(data, key)
+    if not item:
+        return
+    preflight = _asset_preflight_for_library_item(data, item)
+    status = str(preflight.get("status") or "ready")
+    icon = "CHECKMARK"
+    if status == "error":
+        icon = "ERROR"
+    elif status == "warning":
+        icon = "INFO"
+    elif status == "info":
+        icon = "QUESTION"
+    box = layout.box()
+    box.label(text="资产预检：" + str(preflight.get("status_label") or "可导入"), icon=icon)
+    detail = "类型 " + str(preflight.get("kind") or "model")
+    if preflight.get("format"):
+        detail += " · 格式 " + str(preflight.get("format")).upper()
+    if preflight.get("license_label"):
+        detail += " · 授权 " + str(preflight.get("license_label"))
+    box.label(text=detail[:120])
+    issues = preflight.get("issues") if isinstance(preflight.get("issues"), list) else []
+    if not issues:
+        box.label(text="未发现阻断项，可以导入。")
+        return
+    for issue in issues[:3]:
+        if not isinstance(issue, dict):
+            continue
+        severity = str(issue.get("severity") or "info")
+        issue_icon = "ERROR" if severity == "error" else "INFO"
+        title = str(issue.get("title") or issue.get("code") or "预检建议").strip()
+        suggestion = str(issue.get("suggestion") or "").strip()
+        box.label(text=title[:90], icon=issue_icon)
+        if suggestion:
+            box.label(text=suggestion[:110])
 
 
 def _set_library_asset_favorite(data, key, favorite):
@@ -7521,6 +10480,880 @@ def _shot_enum_items(self, context):
     return items
 
 
+def _director_asset_kind_label(kind):
+    labels = {{
+        "character": "人物/角色",
+        "prop": "物品/道具",
+        "scene": "场景/布景",
+        "action": "动作/动画",
+        "model": "通用模型",
+        "material": "材质",
+        "texture": "贴图",
+        "hdri": "HDRI",
+    }}
+    return labels.get(str(kind or ""), str(kind or "未分类"))
+
+
+def _shot_asset_normalized_text(value):
+    if isinstance(value, (list, tuple, set)):
+        value = " ".join(str(item or "") for item in value)
+    elif isinstance(value, dict):
+        value = " ".join(str(item or "") for item in value.values())
+    return re.sub(r"\s+", " ", str(value or "").strip().lower())
+
+
+def _shot_asset_tokens(value):
+    text = _shot_asset_normalized_text(value)
+    parts = re.split(r"[^0-9a-zA-Z\u4e00-\u9fff]+", text)
+    return [part for part in parts if len(part) >= 2]
+
+
+def _shot_asset_target_type(requirement):
+    if not isinstance(requirement, dict):
+        return ""
+    if str(requirement.get("kind") or "") == "actor":
+        return "character"
+    asset_type = str(requirement.get("type") or "").strip().lower()
+    aliases = {{
+        "actor": "character",
+        "person": "character",
+        "human": "character",
+        "role": "character",
+        "object": "prop",
+        "set": "scene",
+        "environment": "scene",
+    }}
+    return aliases.get(asset_type, asset_type)
+
+
+def _shot_asset_requirement_records(shot):
+    requirements = []
+    seen = set()
+    if not isinstance(shot, dict):
+        return requirements
+    for actor in shot.get("actors") if isinstance(shot.get("actors"), list) else []:
+        if not isinstance(actor, dict):
+            continue
+        key = "actor:" + str(actor.get("id") or actor.get("name") or actor.get("role") or "").strip()
+        if key in seen or key == "actor:":
+            continue
+        seen.add(key)
+        requirements.append({{
+            "kind": "actor",
+            "kind_label": "演员模型",
+            "id": str(actor.get("id") or "").strip(),
+            "name": str(actor.get("name") or actor.get("role") or actor.get("id") or "").strip(),
+            "type": "character",
+        }})
+    for asset in shot.get("assets") if isinstance(shot.get("assets"), list) else []:
+        if not isinstance(asset, dict):
+            continue
+        key = "asset:" + str(asset.get("id") or asset.get("name") or "").strip()
+        if key in seen or key == "asset:":
+            continue
+        seen.add(key)
+        asset_type = str(asset.get("type") or "").strip()
+        requirements.append({{
+            "kind": "asset",
+            "kind_label": "镜头资产",
+            "id": str(asset.get("id") or "").strip(),
+            "name": str(asset.get("name") or asset.get("id") or "").strip(),
+            "type": asset_type,
+        }})
+    return requirements
+
+
+def _shot_asset_available(data, requirement):
+    if not isinstance(data, dict) or not isinstance(requirement, dict):
+        return False
+    req_id = str(requirement.get("id") or "").strip()
+    req_name = str(requirement.get("name") or "").strip()
+    target_type = _shot_asset_target_type(requirement)
+    if requirement.get("kind") == "actor":
+        for actor in data.get("actors") if isinstance(data.get("actors"), list) else []:
+            if not isinstance(actor, dict):
+                continue
+            has_objects = bool(actor.get("objects") if isinstance(actor.get("objects"), list) else [])
+            if not has_objects:
+                continue
+            if req_id and req_id == str(actor.get("id") or ""):
+                return True
+            if req_name and req_name == str(actor.get("name") or ""):
+                return True
+    for asset in data.get("assets") if isinstance(data.get("assets"), list) else []:
+        if not isinstance(asset, dict):
+            continue
+        asset_type = str(asset.get("type") or "").strip().lower()
+        if target_type and asset_type and target_type != asset_type:
+            if not (target_type == "character" and asset_type in ("actor", "person", "human")):
+                continue
+        if req_id and req_id == str(asset.get("id") or ""):
+            return True
+        if req_name and req_name == str(asset.get("name") or asset.get("file_name") or ""):
+            return True
+    return False
+
+
+def _shot_asset_candidate_text(item):
+    if not isinstance(item, dict):
+        return ""
+    return _shot_asset_normalized_text([
+        item.get("id"),
+        item.get("name"),
+        item.get("file_name"),
+        item.get("relative_path"),
+        item.get("path"),
+        item.get("kind_hint"),
+        item.get("tags"),
+        item.get("usage_note"),
+        item.get("source_profile_name"),
+        item.get("asset_browser_catalog_path"),
+        item.get("asset_browser_catalog_name"),
+    ])
+
+
+def _score_shot_asset_candidate(data, requirement, item):
+    if not isinstance(requirement, dict) or not isinstance(item, dict):
+        return {{}}
+    path = str(item.get("path") or "").strip()
+    if not path or not os.path.exists(path) or not path.lower().endswith(SUPPORTED_LIBRARY_EXTENSIONS):
+        return {{}}
+    preflight = _asset_preflight_for_library_item(data, item)
+    if preflight.get("blocked"):
+        return {{}}
+    target_type = _shot_asset_target_type(requirement)
+    item_kind = str(item.get("kind_hint") or _asset_kind_from_path(path, item) or "model").strip().lower()
+    req_name = str(requirement.get("name") or requirement.get("id") or "").strip()
+    req_text = _shot_asset_normalized_text([requirement.get("id"), requirement.get("name"), requirement.get("type"), requirement.get("kind_label")])
+    candidate_text = _shot_asset_candidate_text(item)
+    score = 0.0
+    reasons = []
+    if target_type and item_kind == target_type:
+        score += 0.36
+        reasons.append("类型匹配：" + _director_asset_kind_label(target_type))
+    elif target_type == "character" and item_kind == "model":
+        score += 0.18
+        reasons.append("通用模型可作人物候选")
+    elif target_type in ("prop", "scene") and item_kind == "model":
+        score += 0.16
+        reasons.append("通用模型可作" + _director_asset_kind_label(target_type) + "候选")
+    elif not target_type and item_kind in ("character", "prop", "scene", "model"):
+        score += 0.12
+        reasons.append("可作为镜头资产候选")
+    normalized_name = _shot_asset_normalized_text(req_name)
+    if normalized_name and (normalized_name in candidate_text or candidate_text in normalized_name):
+        score += 0.42
+        reasons.append("名称匹配")
+    shared_tokens = []
+    for token in _shot_asset_tokens(req_text):
+        if token in candidate_text and token not in shared_tokens:
+            shared_tokens.append(token)
+    if shared_tokens:
+        score += min(0.24, 0.08 * len(shared_tokens))
+        reasons.append("关键词：" + "、".join(shared_tokens[:4]))
+    if bool(item.get("favorite")):
+        score += 0.04
+        reasons.append("已收藏")
+    try:
+        usage_count = int(item.get("usage_count") or 0)
+    except Exception:
+        usage_count = 0
+    if usage_count > 0:
+        score += min(0.05, usage_count * 0.01)
+        reasons.append("历史使用 " + str(usage_count) + " 次")
+    if score <= 0:
+        return {{}}
+    return {{
+        "id": str(item.get("id") or ""),
+        "name": str(item.get("name") or item.get("file_name") or item.get("id") or "库资产"),
+        "kind": item_kind,
+        "kind_label": _director_asset_kind_label(item_kind),
+        "format": str(item.get("format") or os.path.splitext(path)[1].lstrip(".").lower()),
+        "path": path,
+        "relative_path": str(item.get("relative_path") or ""),
+        "library_id": str(item.get("library_id") or ""),
+        "library_path": str(item.get("library_path") or ""),
+        "source_profile_id": str(item.get("source_profile_id") or ""),
+        "source_profile_name": str(item.get("source_profile_name") or ""),
+        "score": round(min(score, 1.0), 4),
+        "reasons": reasons,
+        "preflight_status": str(preflight.get("status") or ""),
+        "preflight_status_label": str(preflight.get("status_label") or ""),
+    }}
+
+
+def _shot_asset_candidates(data, requirement, limit=5):
+    rows = []
+    for item in data.get("asset_library_items") if isinstance(data.get("asset_library_items"), list) else []:
+        candidate = _score_shot_asset_candidate(data, requirement, item)
+        if candidate:
+            rows.append(candidate)
+    rows.sort(key=lambda item: (-float(item.get("score") or 0), str(item.get("name") or ""), str(item.get("id") or "")))
+    return rows[:max(1, int(limit or 1))]
+
+
+def _shot_asset_plan(data, shot):
+    requirements = []
+    ready_count = 0
+    missing_count = 0
+    candidate_count = 0
+    for requirement in _shot_asset_requirement_records(shot):
+        available = _shot_asset_available(data, requirement)
+        candidates = _shot_asset_candidates(data, requirement, limit=5)
+        row = dict(requirement)
+        row["available"] = bool(available)
+        row["status_label"] = "已具备" if available else "缺素材"
+        row["library_candidates"] = candidates
+        row["library_candidate_count"] = len(candidates)
+        row["best_library_candidate"] = candidates[0] if candidates else {{}}
+        candidate_count += len(candidates)
+        if available:
+            ready_count += 1
+        else:
+            missing_count += 1
+        requirements.append(row)
+    return {{
+        "shot_id": str(shot.get("id") or ""),
+        "shot_name": str(shot.get("name") or shot.get("id") or ""),
+        "requirement_count": len(requirements),
+        "ready_count": ready_count,
+        "missing_count": missing_count,
+        "library_candidate_count": candidate_count,
+        "requirements": requirements,
+    }}
+
+
+def _active_shot_asset_plan(context):
+    data = _load_meta()
+    shot = _find_shot(data, _active_shot_key(context.scene))
+    if not shot:
+        return data, {{}}, {{}}
+    return data, shot, _shot_asset_plan(data, shot)
+
+
+def _draw_shot_asset_plan(layout, context):
+    data, shot, plan = _active_shot_asset_plan(context)
+    if not shot or not plan:
+        return
+    box = layout.box()
+    box.label(text="镜头资产准备：" + str(plan.get("shot_name") or plan.get("shot_id") or "当前镜头"), icon="ASSET_MANAGER")
+    box.label(text="已具备 " + str(plan.get("ready_count") or 0) + " / 缺 " + str(plan.get("missing_count") or 0) + " / 本地候选 " + str(plan.get("library_candidate_count") or 0))
+    rows = plan.get("requirements") if isinstance(plan.get("requirements"), list) else []
+    if not rows:
+        box.label(text="当前镜头没有记录演员或资产依赖。")
+        return
+    for row_data in rows[:5]:
+        if not isinstance(row_data, dict):
+            continue
+        icon = "CHECKMARK" if row_data.get("available") else "ERROR"
+        label = str(row_data.get("name") or row_data.get("id") or "资产需求")
+        box.label(text=str(row_data.get("kind_label") or "") + "：" + label + " · " + str(row_data.get("status_label") or ""), icon=icon)
+        best = row_data.get("best_library_candidate") if isinstance(row_data.get("best_library_candidate"), dict) else {{}}
+        if best and not row_data.get("available"):
+            box.label(text="候选：" + str(best.get("name") or "") + " · " + str(best.get("kind_label") or best.get("kind") or "") + " · 匹配 " + str(best.get("score") or ""))
+
+
+def _append_shot_asset_preparation(data, record):
+    records = data.get("shot_asset_preparations")
+    if not isinstance(records, list):
+        records = []
+    records.append(record)
+    data["shot_asset_preparations"] = records[-500:]
+    return record
+
+
+AI_WORKFLOW_TASK_LABELS = {{
+    "text_to_image_reference": "文生图/首帧参考",
+    "image_to_video": "图生视频/镜头延展",
+    "asset_generation": "资产生成/替换",
+    "motion_generation": "动作生成/重定向",
+}}
+
+
+def _ai_status_label(status):
+    labels = {{
+        "ready": "可执行",
+        "ready_with_reference": "参考图就绪",
+        "ready_with_candidates": "有本地候选",
+        "needs_generation": "需生成",
+        "needs_motion": "需补动作",
+        "review": "需复核",
+        "blocked": "阻断",
+    }}
+    return labels.get(str(status or ""), str(status or "未定"))
+
+
+def _ai_file_ref(path):
+    path = str(path or "").strip()
+    return {{
+        "path": path,
+        "exists": bool(path and os.path.exists(path)),
+        "name": os.path.basename(path) if path else "",
+    }}
+
+
+def _ai_html_escape(text):
+    return (
+        str(text or "")
+        .replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+        .replace('"', "&quot;")
+    )
+
+
+def _ai_item_names(items):
+    names = []
+    for item in items if isinstance(items, list) else []:
+        if not isinstance(item, dict):
+            continue
+        name = str(item.get("name") or item.get("role") or item.get("id") or "").strip()
+        if name:
+            names.append(name)
+    return names
+
+
+def _ai_prompt_for_shot(data, shot):
+    project_name = str(data.get("project_name") or "AI短剧")
+    actors = "、".join(_ai_item_names(shot.get("actors") if isinstance(shot, dict) else []))
+    assets = "、".join(_ai_item_names(shot.get("assets") if isinstance(shot, dict) else []))
+    parts = [
+        "项目：" + project_name,
+        "镜头：" + str(shot.get("name") or shot.get("id") or ""),
+        "场次：" + str(shot.get("scene_number") or ""),
+        "地点：" + str(shot.get("scene_location") or ""),
+        "环境：" + str(shot.get("scene_environment_label") or shot.get("scene_environment") or ""),
+        "时间：" + str(shot.get("scene_time_label") or shot.get("scene_time") or ""),
+        "内容：" + str(shot.get("note") or ""),
+        "演员：" + actors,
+        "资产：" + assets,
+        "输出：" + str(shot.get("output_label") or shot.get("output_type") or ""),
+    ]
+    return "；".join(part for part in parts if part and not part.endswith("："))
+
+
+def _ai_renders_by_shot(data):
+    renders_by_shot = {{}}
+    for render in data.get("renders") if isinstance(data.get("renders"), list) else []:
+        if not isinstance(render, dict):
+            continue
+        shot_id = str(render.get("shot_id") or "").strip()
+        if shot_id:
+            renders_by_shot[shot_id] = render
+    return renders_by_shot
+
+
+def _ai_actions_by_shot(data):
+    match_data = _refresh_action_matches(data if isinstance(data, dict) else {{}})
+    rows = {{}}
+    for item in match_data.get("requirements", []) if isinstance(match_data, dict) else []:
+        if not isinstance(item, dict):
+            continue
+        shot_id = str(item.get("shot_id") or "").strip()
+        if shot_id:
+            rows.setdefault(shot_id, []).append(item)
+    return rows, match_data
+
+
+def _ai_task(task_id, task_type, status, shot, prompt, inputs=None, notes=None):
+    inputs = inputs if isinstance(inputs, dict) else {{}}
+    notes = notes if isinstance(notes, list) else ([] if notes in (None, "") else [str(notes)])
+    return {{
+        "id": _safe_id(task_id, "ai_task"),
+        "type": task_type,
+        "type_label": AI_WORKFLOW_TASK_LABELS.get(task_type, task_type),
+        "status": status,
+        "status_label": _ai_status_label(status),
+        "shot_id": str(shot.get("id") or ""),
+        "shot_name": str(shot.get("name") or shot.get("id") or ""),
+        "scene_number": str(shot.get("scene_number") or ""),
+        "scene_location": str(shot.get("scene_location") or ""),
+        "frame_start": shot.get("frame_start"),
+        "frame_end": shot.get("frame_end"),
+        "output_type": str(shot.get("output_type") or ""),
+        "output_label": str(shot.get("output_label") or shot.get("output_type") or ""),
+        "prompt": prompt,
+        "inputs": inputs,
+        "notes": notes,
+    }}
+
+
+def _build_ai_workflow_tasks(data):
+    data = data if isinstance(data, dict) else {{}}
+    renders_by_shot = _ai_renders_by_shot(data)
+    actions_by_shot, match_data = _ai_actions_by_shot(data)
+    tasks = []
+    type_counts = {{}}
+    ready_count = 0
+    review_count = 0
+    blocked_count = 0
+    for shot in data.get("shots") if isinstance(data.get("shots"), list) else []:
+        if not isinstance(shot, dict):
+            continue
+        shot_id = str(shot.get("id") or "").strip()
+        render = renders_by_shot.get(shot_id, {{}})
+        preview_path = ""
+        output_path = ""
+        layer_paths = {{}}
+        if isinstance(render, dict):
+            preview_path = str(render.get("preview_path") or "").strip()
+            path = str(render.get("path") or "").strip()
+            output_path = str(render.get("output_path") or path).strip()
+            if not preview_path and path.lower().endswith((".png", ".jpg", ".jpeg", ".webp", ".bmp")):
+                preview_path = path
+            layer_paths = render.get("layer_paths") if isinstance(render.get("layer_paths"), dict) else {{}}
+        prompt = _ai_prompt_for_shot(data, shot)
+        has_reference = bool(preview_path and os.path.exists(preview_path))
+        visual_type = "image_to_video" if has_reference else "text_to_image_reference"
+        visual_status = "ready_with_reference" if has_reference else "ready"
+        visual_notes = []
+        if not has_reference:
+            visual_notes.append("没有可用预览图，可先生成首帧参考或执行 Blender 渲染。")
+        if str(shot.get("output_type") or "") == "video":
+            visual_notes.append("目标输出为视频，可用于图生视频或镜头延展。")
+        tasks.append(_ai_task(
+            "ai_visual_" + (shot_id or str(len(tasks) + 1)),
+            visual_type,
+            visual_status if prompt else "blocked",
+            shot,
+            prompt,
+            {{
+                "reference_image": _ai_file_ref(preview_path),
+                "render_output": _ai_file_ref(output_path),
+                "layer_paths": layer_paths,
+                "actors": shot.get("actors") if isinstance(shot.get("actors"), list) else [],
+                "assets": shot.get("assets") if isinstance(shot.get("assets"), list) else [],
+            }},
+            visual_notes,
+        ))
+        plan = _shot_asset_plan(data, shot)
+        requirements = plan.get("requirements") if isinstance(plan.get("requirements"), list) else []
+        missing = [item for item in requirements if isinstance(item, dict) and not item.get("available")]
+        if missing:
+            with_candidates = [
+                item
+                for item in missing
+                if isinstance(item.get("best_library_candidate"), dict) and item.get("best_library_candidate")
+            ]
+            tasks.append(_ai_task(
+                "ai_assets_" + (shot_id or str(len(tasks) + 1)),
+                "asset_generation",
+                "ready_with_candidates" if with_candidates else "needs_generation",
+                shot,
+                prompt,
+                {{
+                    "missing_requirements": missing,
+                    "candidate_count": sum(int(item.get("library_candidate_count") or 0) for item in missing if isinstance(item, dict)),
+                }},
+                ["优先复用本地库候选；无候选条目可进入资产生成、模型修复或人工建模流程。"],
+            ))
+        shot_actions = actions_by_shot.get(shot_id, [])
+        if shot_actions:
+            unmatched = [item for item in shot_actions if isinstance(item, dict) and item.get("status") != "matched"]
+            matched = [item for item in shot_actions if isinstance(item, dict) and item.get("status") == "matched"]
+            tasks.append(_ai_task(
+                "ai_motion_" + (shot_id or str(len(tasks) + 1)),
+                "motion_generation",
+                "needs_motion" if unmatched else "review",
+                shot,
+                prompt,
+                {{
+                    "action_requirements": shot_actions,
+                    "matched_count": len(matched),
+                    "unmatched_count": len(unmatched),
+                }},
+                ["已匹配动作可进入重定向/验证；待补动作可进入动作生成或动作库补充流程。"],
+            ))
+    for task in tasks:
+        task_type = str(task.get("type") or "")
+        status = str(task.get("status") or "")
+        type_counts[task_type] = type_counts.get(task_type, 0) + 1
+        if status == "blocked":
+            blocked_count += 1
+        elif status in ("review", "needs_generation", "needs_motion"):
+            review_count += 1
+        else:
+            ready_count += 1
+    return {{
+        "project_id": str(data.get("project_id") or ""),
+        "project_name": str(data.get("project_name") or "Blender 导演台工程"),
+        "updated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "shot_count": len(data.get("shots") if isinstance(data.get("shots"), list) else []),
+        "task_count": len(tasks),
+        "ready_count": ready_count,
+        "review_count": review_count,
+        "blocked_count": blocked_count,
+        "task_type_counts": [
+            {{"type": key, "type_label": AI_WORKFLOW_TASK_LABELS.get(key, key), "count": value}}
+            for key, value in sorted(type_counts.items(), key=lambda row: (-row[1], row[0]))
+        ],
+        "action_match_summary": {{
+            "requirement_count": int(match_data.get("requirement_count") or 0),
+            "matched_count": int(match_data.get("matched_count") or 0),
+            "unmatched_count": int(match_data.get("unmatched_count") or 0),
+        }},
+        "tasks": tasks,
+    }}
+
+
+def _write_ai_workflow_tasks(data):
+    project_dir = os.path.dirname(META_PATH)
+    _ensure_dir(project_dir)
+    task_data = _build_ai_workflow_tasks(data)
+    manifest_path = os.path.join(project_dir, "ai_workflow_tasks.json")
+    report_path = os.path.join(project_dir, "ai_workflow_tasks.html")
+    csv_path = os.path.join(project_dir, "ai_workflow_tasks.csv")
+    with open(manifest_path, "w", encoding="utf-8") as f:
+        json.dump(task_data, f, ensure_ascii=False, indent=2)
+    with open(csv_path, "w", encoding="utf-8-sig", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(["任务ID", "任务类型", "状态", "镜头ID", "镜头名", "场次", "地点", "帧段", "输出", "参考图", "渲染输出", "提示词", "备注"])
+        for task in task_data.get("tasks", []):
+            if not isinstance(task, dict):
+                continue
+            inputs = task.get("inputs") if isinstance(task.get("inputs"), dict) else {{}}
+            reference = inputs.get("reference_image") if isinstance(inputs.get("reference_image"), dict) else {{}}
+            render_output = inputs.get("render_output") if isinstance(inputs.get("render_output"), dict) else {{}}
+            frame_text = ""
+            if task.get("frame_start") is not None and task.get("frame_end") is not None:
+                frame_text = str(task.get("frame_start")) + "-" + str(task.get("frame_end"))
+            writer.writerow([
+                task.get("id") or "",
+                task.get("type_label") or task.get("type") or "",
+                task.get("status_label") or task.get("status") or "",
+                task.get("shot_id") or "",
+                task.get("shot_name") or "",
+                task.get("scene_number") or "",
+                task.get("scene_location") or "",
+                frame_text,
+                task.get("output_label") or task.get("output_type") or "",
+                reference.get("path") or "",
+                render_output.get("path") or "",
+                task.get("prompt") or "",
+                "；".join(str(note or "") for note in task.get("notes", []) if str(note or "").strip()),
+            ])
+    rows = []
+    for task in task_data.get("tasks", []):
+        if not isinstance(task, dict):
+            continue
+        inputs = task.get("inputs") if isinstance(task.get("inputs"), dict) else {{}}
+        reference = inputs.get("reference_image") if isinstance(inputs.get("reference_image"), dict) else {{}}
+        render_output = inputs.get("render_output") if isinstance(inputs.get("render_output"), dict) else {{}}
+        notes = "；".join(str(note or "") for note in task.get("notes", []) if str(note or "").strip())
+        rows.append(
+            "<tr>"
+            "<td><strong>" + _ai_html_escape(task.get("type_label") or task.get("type") or "") + "</strong><div>" + _ai_html_escape(task.get("id") or "") + "</div></td>"
+            "<td>" + _ai_html_escape(task.get("shot_name") or task.get("shot_id") or "") + "</td>"
+            "<td>" + _ai_html_escape(task.get("status_label") or task.get("status") or "") + "</td>"
+            "<td>" + _ai_html_escape(reference.get("path") or "—") + "</td>"
+            "<td>" + _ai_html_escape(render_output.get("path") or "—") + "</td>"
+            "<td>" + _ai_html_escape(task.get("prompt") or "") + "</td>"
+            "<td>" + _ai_html_escape(notes or "—") + "</td>"
+            "</tr>"
+        )
+    if not rows:
+        rows.append('<tr><td colspan="7">暂无 AI 工作流任务。</td></tr>')
+    html = """<!doctype html>
+<html lang="zh-CN">
+<head><meta charset="utf-8"><title>AI 工作流任务包</title></head>
+<body>
+<h1>AI 工作流任务包</h1>
+<p>本文件只整理本地任务，不调用外部 AI 服务。更新于 """ + _ai_html_escape(task_data.get("updated_at") or "") + """。</p>
+<p>镜头 """ + str(task_data.get("shot_count") or 0) + """ 个，任务 """ + str(task_data.get("task_count") or 0) + """ 个，可执行 """ + str(task_data.get("ready_count") or 0) + """ 个，需生成/复核 """ + str(task_data.get("review_count") or 0) + """ 个。</p>
+<table border="1" cellspacing="0" cellpadding="6">
+<thead><tr><th>任务</th><th>镜头</th><th>状态</th><th>参考图</th><th>渲染输出</th><th>提示词</th><th>备注</th></tr></thead>
+<tbody>""" + "".join(rows) + """</tbody>
+</table>
+</body>
+</html>
+"""
+    with open(report_path, "w", encoding="utf-8") as f:
+        f.write(html)
+    data["ai_workflow_tasks"] = task_data
+    data["ai_workflow_tasks_manifest_path"] = manifest_path
+    data["ai_workflow_tasks_report_path"] = report_path
+    data["ai_workflow_tasks_csv_path"] = csv_path
+    data["ai_workflow_tasks_updated_at"] = str(task_data.get("updated_at") or "")
+    return task_data, manifest_path, report_path, csv_path
+
+
+AI_WORKFLOW_EXPECTED_OUTPUTS = {{
+    "text_to_image_reference": {{"label": "首帧/参考图", "extensions": ["png", "jpg", "jpeg", "webp", "exr"], "drop_hint": "把文生图或首帧参考图放入 results 目录，回 Blender 后登记为图片/首帧。"}},
+    "image_to_video": {{"label": "视频镜头", "extensions": ["mp4", "mov", "avi", "mkv"], "drop_hint": "把图生视频或镜头延展结果放入 results 目录，回 Blender 后登记为视频。"}},
+    "asset_generation": {{"label": "模型/资产", "extensions": ["blend", "glb", "gltf", "fbx", "obj", "stl", "ply", "abc", "usd", "usdz"], "drop_hint": "把生成或修复后的模型资产放入 results 目录，回 Blender 后登记为模型资产。"}},
+    "motion_generation": {{"label": "动作文件", "extensions": ["bvh", "fbx"], "drop_hint": "把动作生成结果放入 results 目录，回 Blender 后登记为动作。"}},
+}}
+
+
+def _write_ai_workflow_handoff(data):
+    project_dir = os.path.dirname(META_PATH)
+    handoff_dir = os.path.join(project_dir, "ai_workflow_handoff")
+    _ensure_dir(handoff_dir)
+    task_data = data.get("ai_workflow_tasks") if isinstance(data.get("ai_workflow_tasks"), dict) else {{}}
+    if not task_data.get("tasks"):
+        task_data, _, _, _ = _write_ai_workflow_tasks(data)
+    jobs = []
+    for index, task in enumerate(task_data.get("tasks", []), start=1):
+        if not isinstance(task, dict):
+            continue
+        task_id = str(task.get("id") or ("ai_task_" + str(index))).strip()
+        task_dir_name = _safe_id(task_id, "ai_task_" + str(index))
+        job_dir = os.path.join(handoff_dir, task_dir_name)
+        result_dir = os.path.join(job_dir, "results")
+        _ensure_dir(result_dir)
+        expected = AI_WORKFLOW_EXPECTED_OUTPUTS.get(str(task.get("type") or ""), {{"label": "AI 结果文件", "extensions": [], "drop_hint": "把外部 AI 输出文件放入 results 目录，回 Blender 后批量登记。"}})
+        job = {{
+            "task_id": task_id,
+            "task_type": str(task.get("type") or ""),
+            "task_type_label": str(task.get("type_label") or task.get("type") or ""),
+            "status": str(task.get("status") or ""),
+            "status_label": str(task.get("status_label") or task.get("status") or ""),
+            "shot_id": str(task.get("shot_id") or ""),
+            "shot_name": str(task.get("shot_name") or ""),
+            "prompt": str(task.get("prompt") or ""),
+            "notes": task.get("notes") if isinstance(task.get("notes"), list) else [],
+            "expected_output": expected,
+            "job_dir": job_dir,
+            "result_dir": result_dir,
+            "task_manifest_path": os.path.join(job_dir, "task.json"),
+            "prompt_path": os.path.join(job_dir, "prompt.txt"),
+            "notes_path": os.path.join(job_dir, "notes.txt"),
+            "result_readme_path": os.path.join(result_dir, "README.txt"),
+        }}
+        with open(job["task_manifest_path"], "w", encoding="utf-8") as f:
+            json.dump({{"task": task, "expected_output": expected, "result_dir": result_dir}}, f, ensure_ascii=False, indent=2)
+        with open(job["prompt_path"], "w", encoding="utf-8") as f:
+            f.write(str(task.get("prompt") or "").strip() + "\\n")
+        with open(job["notes_path"], "w", encoding="utf-8") as f:
+            f.write("\\n".join(str(note or "") for note in job["notes"] if str(note or "").strip()))
+        with open(job["result_readme_path"], "w", encoding="utf-8") as f:
+            f.write("AI 结果收件箱\\n任务ID：" + task_id + "\\n建议输出：" + str(expected.get("label") or "") + "\\n建议扩展名：" + "、".join(str(ext) for ext in expected.get("extensions", [])) + "\\n" + str(expected.get("drop_hint") or "") + "\\n")
+        jobs.append(job)
+    manifest = {{
+        "project_id": str(data.get("project_id") or ""),
+        "project_name": str(data.get("project_name") or "Blender 导演台工程"),
+        "updated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "handoff_dir": handoff_dir,
+        "task_count": len(jobs),
+        "result_inbox_count": len(jobs),
+        "jobs": jobs,
+    }}
+    manifest_path = os.path.join(handoff_dir, "handoff_manifest.json")
+    report_path = os.path.join(handoff_dir, "handoff.html")
+    csv_path = os.path.join(handoff_dir, "handoff.csv")
+    readme_path = os.path.join(handoff_dir, "README.txt")
+    with open(manifest_path, "w", encoding="utf-8") as f:
+        json.dump(manifest, f, ensure_ascii=False, indent=2)
+    with open(csv_path, "w", encoding="utf-8-sig", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(["任务ID", "任务类型", "状态", "镜头", "结果目录", "提示词文件", "建议输出"])
+        for job in jobs:
+            writer.writerow([job.get("task_id") or "", job.get("task_type_label") or "", job.get("status_label") or "", job.get("shot_name") or job.get("shot_id") or "", job.get("result_dir") or "", job.get("prompt_path") or "", (job.get("expected_output") or {{}}).get("label") or ""])
+    rows = []
+    for job in jobs:
+        rows.append("<tr><td>" + _ai_html_escape(job.get("task_type_label") or job.get("task_id") or "") + "<div>" + _ai_html_escape(job.get("task_id") or "") + "</div></td><td>" + _ai_html_escape(job.get("shot_name") or job.get("shot_id") or "") + "</td><td>" + _ai_html_escape(job.get("status_label") or "") + "</td><td>" + _ai_html_escape((job.get("expected_output") or {{}}).get("label") or "") + "</td><td>" + _ai_html_escape(job.get("result_dir") or "") + "</td></tr>")
+    if not rows:
+        rows.append('<tr><td colspan="5">暂无 AI 工作包任务。</td></tr>')
+    with open(report_path, "w", encoding="utf-8") as f:
+        f.write("<!doctype html><html lang=\\"zh-CN\\"><head><meta charset=\\"utf-8\\"><title>AI 工作包与结果收件箱</title></head><body><h1>AI 工作包与结果收件箱</h1><p>每个任务目录包含 prompt.txt、task.json 和 results 收件箱。</p><table border=\\"1\\" cellspacing=\\"0\\" cellpadding=\\"6\\"><thead><tr><th>任务</th><th>镜头</th><th>状态</th><th>建议输出</th><th>结果目录</th></tr></thead><tbody>" + "".join(rows) + "</tbody></table></body></html>")
+    with open(readme_path, "w", encoding="utf-8") as f:
+        f.write("AI 工作包与结果收件箱\\n把外部 AI 输出文件放入各任务 results 目录，然后使用“批量登记AI结果目录”。\\n")
+    data["ai_workflow_handoff_dir"] = handoff_dir
+    data["ai_workflow_handoff_manifest_path"] = manifest_path
+    data["ai_workflow_handoff_report_path"] = report_path
+    data["ai_workflow_handoff_csv_path"] = csv_path
+    data["ai_workflow_handoff_readme_path"] = readme_path
+    return manifest, manifest_path, report_path, csv_path, readme_path
+
+
+AI_RESULT_EXTENSIONS = (".blend", ".glb", ".gltf", ".fbx", ".obj", ".bvh", ".stl", ".ply", ".abc", ".usd", ".usdz", ".png", ".jpg", ".jpeg", ".webp", ".bmp", ".mp4", ".mov", ".avi", ".mkv", ".exr", ".hdr")
+AI_RESULT_IMAGE_EXTENSIONS = (".png", ".jpg", ".jpeg", ".webp", ".bmp", ".exr", ".hdr")
+AI_RESULT_VIDEO_EXTENSIONS = (".mp4", ".mov", ".avi", ".mkv")
+
+
+def _ai_result_type_from_path(path, selected_type="auto"):
+    selected_type = str(selected_type or "auto")
+    if selected_type and selected_type != "auto":
+        return selected_type
+    lower = str(path or "").lower()
+    if lower.endswith((".blend", ".glb", ".gltf", ".fbx", ".obj", ".stl", ".ply", ".abc", ".usd", ".usdz")):
+        return "asset"
+    if lower.endswith(".bvh"):
+        return "motion"
+    if lower.endswith(AI_RESULT_VIDEO_EXTENSIONS):
+        return "video"
+    if lower.endswith(AI_RESULT_IMAGE_EXTENSIONS):
+        return "image"
+    return "attachment"
+
+
+def _active_ai_task_id(scene):
+    return str(getattr(scene, "gpt_director_ai_task_id", "") or "").strip()
+
+
+def _active_ai_result_note(scene):
+    return str(getattr(scene, "gpt_director_ai_result_note", "") or "").strip()
+
+
+def _append_ai_workflow_result(data, record):
+    results = data.get("ai_workflow_results")
+    if not isinstance(results, list):
+        results = []
+    results.append(record)
+    data["ai_workflow_results"] = results[-500:]
+    return record
+
+
+def _find_ai_task(data, task_id):
+    task_id = str(task_id or "").strip()
+    task_data = data.get("ai_workflow_tasks") if isinstance(data.get("ai_workflow_tasks"), dict) else {{}}
+    tasks = task_data.get("tasks") if isinstance(task_data.get("tasks"), list) else []
+    for task in tasks:
+        if isinstance(task, dict) and task_id and str(task.get("id") or "") == task_id:
+            return dict(task)
+    # If the in-memory task package is stale or absent, rebuild from the current project state.
+    try:
+        rebuilt = _build_ai_workflow_tasks(data)
+        for task in rebuilt.get("tasks", []):
+            if isinstance(task, dict) and task_id and str(task.get("id") or "") == task_id:
+                data["ai_workflow_tasks"] = rebuilt
+                return dict(task)
+    except Exception:
+        pass
+    return {{}}
+
+
+def _ai_result_task_id_from_path(data, filepath, fallback=""):
+    fallback = str(fallback or "").strip()
+    if fallback:
+        return fallback
+    filename = os.path.basename(str(filepath or "")).lower()
+    if not filename:
+        return ""
+    task_data = data.get("ai_workflow_tasks") if isinstance(data.get("ai_workflow_tasks"), dict) else {{}}
+    tasks = task_data.get("tasks") if isinstance(task_data.get("tasks"), list) else []
+    if not tasks:
+        try:
+            task_data = _build_ai_workflow_tasks(data)
+            data["ai_workflow_tasks"] = task_data
+            tasks = task_data.get("tasks") if isinstance(task_data.get("tasks"), list) else []
+        except Exception:
+            tasks = []
+    for task in tasks:
+        if not isinstance(task, dict):
+            continue
+        task_id = str(task.get("id") or "").strip()
+        if task_id and task_id.lower() in filename:
+            return task_id
+    return ""
+
+
+def _ai_result_target_shot(data, task_id):
+    task = _find_ai_task(data, task_id)
+    shot_id = str(task.get("shot_id") or "").strip()
+    shot_name = str(task.get("shot_name") or "").strip()
+    if shot_id or shot_name:
+        shot = _find_shot(data, shot_id or shot_name)
+        if shot:
+            return shot, task
+    return {{}}, task
+
+
+def _register_ai_render_result(data, filepath, result_type, task_id="", note=""):
+    shot, task = _ai_result_target_shot(data, task_id)
+    shot_id = str(shot.get("id") or task.get("shot_id") or "").strip()
+    shot_name = str(shot.get("name") or task.get("shot_name") or "").strip()
+    output_type = "video" if result_type == "video" else "still"
+    output_label = RENDER_OUTPUT_LABELS.get(output_type, output_type)
+    render_version = _next_render_version(data, shot_id) if shot_id else 1
+    record = {{
+        "path": filepath,
+        "output_path": filepath,
+        "preview_path": filepath if result_type == "image" else "",
+        "output_type": output_type,
+        "output_label": output_label,
+        "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "mode": "ai_workflow_result",
+        "shot_id": shot_id,
+        "shot_name": shot_name,
+        "render_version": render_version,
+        "ai_task_id": str(task_id or ""),
+        "ai_result_type": result_type,
+        "note": str(note or ""),
+    }}
+    if result_type == "video":
+        task_inputs = task.get("inputs") if isinstance(task.get("inputs"), dict) else {{}}
+        reference = task_inputs.get("reference_image") if isinstance(task_inputs.get("reference_image"), dict) else {{}}
+        record["preview_path"] = str(reference.get("path") or "")
+    _record_render(data, record)
+    if shot:
+        updated = dict(shot)
+        updated["last_rendered_at"] = record["created_at"]
+        updated["render_version"] = render_version
+        if result_type == "image":
+            updated["preview_path"] = filepath
+        updated["output_type"] = output_type
+        updated["output_label"] = output_label
+        _upsert_shot(data, updated)
+        _save_shot_file(updated)
+    return record
+
+
+def _register_ai_asset_result(data, filepath, result_type, task_id="", note=""):
+    shot, task = _ai_result_target_shot(data, task_id)
+    actor, target_armature = _active_action_target(data)
+    asset_kind = "action" if result_type == "motion" or str(filepath).lower().endswith(".bvh") else _asset_kind_from_path(filepath)
+    label = str(task.get("shot_name") or os.path.basename(filepath))
+    record = _import_director_asset(filepath, asset_kind, label, target_armature if asset_kind == "action" else None)
+    record["generated_by"] = "ai_workflow"
+    record["ai_task_id"] = str(task_id or "")
+    record["ai_result_type"] = result_type
+    record["ai_result_note"] = str(note or "")
+    record["prepared_for_shot_id"] = str(shot.get("id") or task.get("shot_id") or "")
+    record["prepared_for_shot_name"] = str(shot.get("name") or task.get("shot_name") or "")
+    if asset_kind == "action":
+        _record_action_application(
+            data,
+            record.get("target_armature", target_armature.name if target_armature else ""),
+            (record.get("actions") or [""])[-1] if isinstance(record.get("actions"), list) else "",
+            record.get("auto_apply_status", "not_applied"),
+            record.get("auto_apply_message", ""),
+            actor,
+        )
+        _upsert_action_clip_from_asset_record(data, record, actor, target_armature, {{}}, str(note or "AI 工作流生成动作"))
+    _append_asset_record(data, record)
+    return record
+
+
+def _register_ai_workflow_result(data, filepath, result_type="auto", task_id="", note=""):
+    filepath = str(filepath or "").strip()
+    if not filepath or not os.path.exists(filepath):
+        raise RuntimeError("AI 结果文件不存在")
+    result_type = _ai_result_type_from_path(filepath, result_type)
+    if result_type in ("image", "video"):
+        payload = _register_ai_render_result(data, filepath, result_type, task_id, note)
+        target_type = "render"
+    elif result_type in ("asset", "motion"):
+        payload = _register_ai_asset_result(data, filepath, result_type, task_id, note)
+        target_type = "asset"
+    else:
+        payload = {{"path": filepath, "name": os.path.basename(filepath)}}
+        target_type = "attachment"
+    record = {{
+        "id": _safe_id("ai_result_" + os.path.splitext(os.path.basename(filepath))[0] + "_" + datetime.now().strftime("%H%M%S"), "ai_result"),
+        "task_id": str(task_id or ""),
+        "result_type": result_type,
+        "target_type": target_type,
+        "path": filepath,
+        "payload_id": str(payload.get("id") or payload.get("shot_id") or ""),
+        "payload_name": str(payload.get("name") or payload.get("shot_name") or os.path.basename(filepath)),
+        "note": str(note or ""),
+        "registered_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+    }}
+    _append_ai_workflow_result(data, record)
+    return record, payload
+
+
 ACTION_MATCH_GROUPS = (
     ("走路", ("走路", "行走", "走入", "走进", "进入", "进门", "走到", "步行", "walk", "walking")),
     ("跑步", ("跑步", "奔跑", "冲向", "跑向", "逃跑", "run", "running", "sprint")),
@@ -7588,6 +11421,9 @@ def _action_match_candidate(item, origin, index):
         item.get("library_relative_path"),
         item.get("path"),
         item.get("source_profile_name"),
+        item.get("retarget_profile_name"),
+        item.get("retarget_source_action"),
+        item.get("retarget_source_clip_name"),
     ])
     keywords, matched_terms = _action_match_keywords(search_text)
     try:
@@ -7618,6 +11454,12 @@ def _action_match_candidate(item, origin, index):
         "format": str(item.get("format") or "").strip(),
         "favorite": bool(item.get("favorite")),
         "usage_count": usage_count,
+        "generated_by": str(item.get("generated_by") or "").strip(),
+        "retarget_profile_id": str(item.get("retarget_profile_id") or "").strip(),
+        "retarget_profile_name": str(item.get("retarget_profile_name") or "").strip(),
+        "retarget_source_action": str(item.get("retarget_source_action") or "").strip(),
+        "retarget_source_clip_name": str(item.get("retarget_source_clip_name") or "").strip(),
+        "retarget_quality": item.get("retarget_quality") if isinstance(item.get("retarget_quality"), dict) else {{}},
         "keywords": keywords,
         "matched_terms": matched_terms,
         "_search_text": search_text,
@@ -7666,7 +11508,11 @@ def _score_action_match(requirement, candidate):
         reasons.append("动作词：" + "、".join(shared_keywords))
     query_text = _action_match_text(requirement.get("query"))
     phrase_hit = False
-    for phrase in (_action_match_text(candidate.get("name")), _action_match_text(candidate.get("action"))):
+    for phrase in (
+        _action_match_text(candidate.get("name")),
+        _action_match_text(candidate.get("action")),
+        _action_match_text(candidate.get("retarget_source_clip_name")),
+    ):
         if len(phrase) >= 2 and (phrase in query_text or query_text in phrase):
             phrase_hit = True
             break
@@ -7701,6 +11547,9 @@ def _score_action_match(requirement, candidate):
     if "mixamo" in source_name.lower():
         score += 0.03
         reasons.append("来源：Mixamo 动作生态")
+    if str(candidate.get("generated_by") or "") == "retarget":
+        score += 0.05
+        reasons.append("已完成目标骨骼重定向")
     if candidate.get("favorite"):
         score += 0.03
         reasons.append("已收藏")
@@ -7734,6 +11583,12 @@ def _public_action_match_candidate(candidate, score=0.0, reasons=None, shared_ke
         "format": candidate.get("format") or "",
         "favorite": bool(candidate.get("favorite")),
         "usage_count": int(candidate.get("usage_count") or 0),
+        "generated_by": candidate.get("generated_by") or "",
+        "retarget_profile_id": candidate.get("retarget_profile_id") or "",
+        "retarget_profile_name": candidate.get("retarget_profile_name") or "",
+        "retarget_source_action": candidate.get("retarget_source_action") or "",
+        "retarget_source_clip_name": candidate.get("retarget_source_clip_name") or "",
+        "retarget_quality": candidate.get("retarget_quality") if isinstance(candidate.get("retarget_quality"), dict) else {{}},
         "keywords": candidate.get("keywords") if isinstance(candidate.get("keywords"), list) else [],
         "score": score,
         "reasons": reasons or [],
@@ -7788,7 +11643,11 @@ def _build_action_matches(data):
                 requirement["status"] = "matched"
                 requirement["status_label"] = "已匹配"
                 requirement["best_match"] = _public_action_match_candidate(best[1], best[0], best[2], best[3])
-                requirement["match_note"] = "动作片段可直接复用；跨骨架资产仍需后续人工确认或骨骼重定向。"
+                requirement["match_note"] = (
+                    "动作片段已完成目标骨骼重定向，可直接进入镜头验证。"
+                    if str(best[1].get("generated_by") or "") == "retarget"
+                    else "动作片段可直接复用；跨骨架资产仍需后续人工确认或骨骼重定向。"
+                )
             else:
                 requirement["status"] = "unmatched"
                 requirement["status_label"] = "待补动作"
@@ -8607,6 +12466,277 @@ def _retarget_profile_note():
     return str(getattr(bpy.context.scene, "gpt_director_retarget_profile_note", "") or "").strip()
 
 
+def _armature_height(armature):
+    if not armature or armature.type != "ARMATURE":
+        return 0.0
+    z_values = []
+    for bone in armature.data.bones:
+        try:
+            z_values.extend((float(bone.head_local.z), float(bone.tail_local.z)))
+        except Exception:
+            continue
+    if not z_values:
+        return 0.0
+    return max(z_values) - min(z_values)
+
+
+def _retarget_root_bone_name(armature, preferred=""):
+    if not armature or armature.type != "ARMATURE":
+        return ""
+    preferred = str(preferred or "").strip()
+    if preferred and armature.data.bones.get(preferred):
+        return preferred
+    for bone in armature.data.bones:
+        if _bone_role(bone.name) == "hips":
+            return bone.name
+    for bone in armature.data.bones:
+        if bone.parent is None:
+            return bone.name
+    return ""
+
+
+def _retarget_automatic_scale(source_armature, target_armature):
+    source_height = _armature_height(source_armature)
+    target_height = _armature_height(target_armature)
+    if source_height <= 0.000001 or target_height <= 0.000001:
+        return 1.0
+    return target_height / source_height
+
+
+def _retarget_motion_scale(source_armature, target_armature, profile):
+    root_motion = profile.get("root_motion") if isinstance(profile.get("root_motion"), dict) else {{}}
+    try:
+        manual_scale = max(0.01, float(root_motion.get("manual_scale") or 1.0))
+    except Exception:
+        manual_scale = 1.0
+    return _retarget_automatic_scale(source_armature, target_armature) * manual_scale
+
+
+def _bone_rest_local_quaternion(armature, bone_name):
+    if not armature or armature.type != "ARMATURE":
+        return Quaternion((1.0, 0.0, 0.0, 0.0))
+    bone = armature.data.bones.get(str(bone_name or ""))
+    if not bone:
+        return Quaternion((1.0, 0.0, 0.0, 0.0))
+    try:
+        rest_matrix = bone.matrix_local.copy()
+        if bone.parent:
+            rest_matrix = bone.parent.matrix_local.inverted() @ rest_matrix
+        result = rest_matrix.to_quaternion()
+        result.normalize()
+        return result
+    except Exception:
+        return Quaternion((1.0, 0.0, 0.0, 0.0))
+
+
+def _retarget_rest_correction(source_armature, target_armature, source_bone, target_bone):
+    source_rest = _bone_rest_local_quaternion(source_armature, source_bone)
+    target_rest = _bone_rest_local_quaternion(target_armature, target_bone)
+    try:
+        correction = target_rest.inverted() @ source_rest
+        correction.normalize()
+        return correction
+    except Exception:
+        return Quaternion((1.0, 0.0, 0.0, 0.0))
+
+
+def _retarget_rest_angle_degrees(source_armature, target_armature, source_bone, target_bone):
+    try:
+        return round(float(_retarget_rest_correction(source_armature, target_armature, source_bone, target_bone).angle) * 57.295779513, 3)
+    except Exception:
+        return 0.0
+
+
+def _retarget_rotation_property(data_path):
+    data_path = str(data_path or "")
+    for property_name in ("rotation_quaternion", "rotation_euler", "rotation_axis_angle"):
+        if data_path.endswith("." + property_name):
+            return property_name
+    return ""
+
+
+def _retarget_bake_frames(action, step):
+    try:
+        start, end = action.frame_range
+        start = int(round(float(start)))
+        end = int(round(float(end)))
+    except Exception:
+        start, end = 1, 1
+    if end < start:
+        start, end = end, start
+    step = max(1, min(12, int(step or 1)))
+    frames = list(range(start, end + 1, step))
+    if not frames or frames[-1] != end:
+        frames.append(end)
+    return frames
+
+
+def _retarget_source_rotation_quaternion(source_armature, source_bone, property_name, curve_map, frame):
+    if property_name == "rotation_quaternion":
+        values = [1.0, 0.0, 0.0, 0.0]
+        for index in range(4):
+            curve = curve_map.get(index)
+            if curve:
+                values[index] = float(curve.evaluate(frame))
+        result = Quaternion(tuple(values))
+    elif property_name == "rotation_axis_angle":
+        values = [0.0, 0.0, 1.0, 0.0]
+        for index in range(4):
+            curve = curve_map.get(index)
+            if curve:
+                values[index] = float(curve.evaluate(frame))
+        axis = Vector((values[1], values[2], values[3]))
+        if axis.length <= 0.000001:
+            axis = Vector((0.0, 1.0, 0.0))
+        else:
+            axis.normalize()
+        result = Quaternion(axis, values[0])
+    else:
+        values = [0.0, 0.0, 0.0]
+        for index in range(3):
+            curve = curve_map.get(index)
+            if curve:
+                values[index] = float(curve.evaluate(frame))
+        order = "XYZ"
+        try:
+            pose_bone = source_armature.pose.bones.get(source_bone)
+            if pose_bone and pose_bone.rotation_mode in ("XYZ", "XZY", "YXZ", "YZX", "ZXY", "ZYX"):
+                order = pose_bone.rotation_mode
+        except Exception:
+            pass
+        result = Euler(tuple(values), order).to_quaternion()
+    try:
+        result.normalize()
+    except Exception:
+        pass
+    return result
+
+
+def _write_retarget_rotation_curves(target_action, source_action, source_armature, target_armature, source_bone, target_bone, property_name, curve_map, bake_step):
+    correction = _retarget_rest_correction(source_armature, target_armature, source_bone, target_bone)
+    inverse_correction = correction.inverted()
+    frames = _retarget_bake_frames(source_action, bake_step)
+    samples = []
+    previous = None
+    for frame in frames:
+        source_rotation = _retarget_source_rotation_quaternion(source_armature, source_bone, property_name, curve_map, frame)
+        target_rotation = correction @ source_rotation @ inverse_correction
+        target_rotation.normalize()
+        if previous is not None:
+            target_rotation.make_compatible(previous)
+        samples.append((frame, (target_rotation.w, target_rotation.x, target_rotation.y, target_rotation.z)))
+        previous = target_rotation.copy()
+    target_pose_bone = target_armature.pose.bones.get(target_bone) if target_armature.pose else None
+    if target_pose_bone:
+        target_pose_bone.rotation_mode = "QUATERNION"
+    data_path = 'pose.bones["' + target_bone + '"].rotation_quaternion'
+    written = 0
+    for index in range(4):
+        curve = target_action.fcurves.new(data_path=data_path, index=index, action_group=target_bone)
+        for frame, values in samples:
+            point = curve.keyframe_points.insert(frame, values[index], options={{"FAST"}})
+            point.interpolation = "BEZIER"
+        curve.update()
+        written += 1
+    return written
+
+
+def _write_retarget_root_location_curves(target_action, source_action, source_armature, target_armature, source_root, target_root, curve_map, bake_step, root_scale):
+    correction = _retarget_rest_correction(source_armature, target_armature, source_root, target_root)
+    frames = _retarget_bake_frames(source_action, bake_step)
+    samples = []
+    for frame in frames:
+        source_location = Vector((
+            float(curve_map.get(0).evaluate(frame)) if curve_map.get(0) else 0.0,
+            float(curve_map.get(1).evaluate(frame)) if curve_map.get(1) else 0.0,
+            float(curve_map.get(2).evaluate(frame)) if curve_map.get(2) else 0.0,
+        ))
+        target_location = (correction @ source_location) * root_scale
+        samples.append((frame, tuple(target_location)))
+    data_path = 'pose.bones["' + target_root + '"].location'
+    written = 0
+    for index in range(3):
+        curve = target_action.fcurves.new(data_path=data_path, index=index, action_group=target_root)
+        for frame, values in samples:
+            point = curve.keyframe_points.insert(frame, values[index], options={{"FAST"}})
+            point.interpolation = "BEZIER"
+        curve.update()
+        written += 1
+    return written
+
+
+def _refresh_retarget_profile_stats(profile, source_armature=None, target_armature=None):
+    profile = dict(profile or {{}})
+    source_armature = source_armature or _armature_by_name(profile.get("source_armature"))
+    target_armature = target_armature or _armature_by_name(profile.get("target_armature"))
+    bone_map = profile.get("bone_map") if isinstance(profile.get("bone_map"), list) else []
+    normalized_rows = []
+    seen_sources = set()
+    seen_targets = set()
+    for row in bone_map:
+        if not isinstance(row, dict):
+            continue
+        source_name = str(row.get("source") or "").strip()
+        target_name = str(row.get("target") or "").strip()
+        if not source_name or not target_name or source_name in seen_sources or target_name in seen_targets:
+            continue
+        normalized = dict(row)
+        normalized["source"] = source_name
+        normalized["target"] = target_name
+        normalized["role"] = str(normalized.get("role") or _bone_role(source_name))
+        normalized["rest_pose_angle_degrees"] = _retarget_rest_angle_degrees(
+            source_armature,
+            target_armature,
+            source_name,
+            target_name,
+        )
+        normalized_rows.append(normalized)
+        seen_sources.add(source_name)
+        seen_targets.add(target_name)
+    source_names = [bone.name for bone in source_armature.data.bones] if source_armature else []
+    target_names = [bone.name for bone in target_armature.data.bones] if target_armature else []
+    source_root = _retarget_root_bone_name(source_armature)
+    target_root = ""
+    for row in normalized_rows:
+        if row.get("source") == source_root or row.get("role") == "hips":
+            source_root = str(row.get("source") or source_root)
+            target_root = str(row.get("target") or "")
+            break
+    target_root = _retarget_root_bone_name(target_armature, target_root)
+    root_motion = profile.get("root_motion") if isinstance(profile.get("root_motion"), dict) else {{}}
+    root_motion = dict(root_motion)
+    root_motion["enabled"] = bool(root_motion.get("enabled", True))
+    try:
+        root_motion["manual_scale"] = max(0.01, float(root_motion.get("manual_scale") or 1.0))
+    except Exception:
+        root_motion["manual_scale"] = 1.0
+    root_motion["automatic_scale"] = _retarget_automatic_scale(source_armature, target_armature)
+    root_motion["effective_scale"] = root_motion["automatic_scale"] * root_motion["manual_scale"]
+    root_motion["source_bone"] = source_root
+    root_motion["target_bone"] = target_root
+    root_motion["source_height"] = _armature_height(source_armature)
+    root_motion["target_height"] = _armature_height(target_armature)
+    rest_pose = profile.get("rest_pose_alignment") if isinstance(profile.get("rest_pose_alignment"), dict) else {{}}
+    rest_pose = dict(rest_pose)
+    rest_pose["enabled"] = bool(rest_pose.get("enabled", True))
+    try:
+        rest_pose["bake_step"] = max(1, min(12, int(rest_pose.get("bake_step") or 1)))
+    except Exception:
+        rest_pose["bake_step"] = 1
+    rest_angles = [float(row.get("rest_pose_angle_degrees") or 0.0) for row in normalized_rows]
+    rest_pose["mismatch_bone_count"] = len([angle for angle in rest_angles if angle >= 5.0])
+    rest_pose["max_angle_degrees"] = max(rest_angles) if rest_angles else 0.0
+    profile["bone_map"] = normalized_rows
+    profile["mapped_bone_count"] = len(normalized_rows)
+    profile["unmapped_source_bones"] = [name for name in source_names if name not in seen_sources]
+    profile["unmapped_target_bones"] = [name for name in target_names if name not in seen_targets]
+    profile["unmapped_source_count"] = len(profile["unmapped_source_bones"])
+    profile["unmapped_target_count"] = len(profile["unmapped_target_bones"])
+    profile["root_motion"] = root_motion
+    profile["rest_pose_alignment"] = rest_pose
+    return profile
+
+
 def _auto_bone_map(source_armature, target_armature):
     if not source_armature or not target_armature:
         return []
@@ -8647,7 +12777,7 @@ def _retarget_profile_from_armatures(source_armature, target_armature, profile_i
     if not source_armature or not target_armature:
         raise RuntimeError("请指定源骨骼和目标骨骼")
     bone_map = _auto_bone_map(source_armature, target_armature)
-    return {{
+    profile = {{
         "id": profile_id,
         "name": name,
         "note": note,
@@ -8657,8 +12787,17 @@ def _retarget_profile_from_armatures(source_armature, target_armature, profile_i
         "target_bone_count": len(target_armature.data.bones),
         "mapped_bone_count": len(bone_map),
         "bone_map": bone_map,
+        "root_motion": {{
+            "enabled": bool(getattr(bpy.context.scene, "gpt_director_retarget_root_motion_enabled", True)),
+            "manual_scale": float(getattr(bpy.context.scene, "gpt_director_retarget_root_motion_scale", 1.0) or 1.0),
+        }},
+        "rest_pose_alignment": {{
+            "enabled": bool(getattr(bpy.context.scene, "gpt_director_retarget_rest_pose_enabled", True)),
+            "bake_step": int(getattr(bpy.context.scene, "gpt_director_retarget_bake_step", 1) or 1),
+        }},
         "saved_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
     }}
+    return _refresh_retarget_profile_stats(profile, source_armature, target_armature)
 
 
 def _upsert_retarget_profile(data, profile):
@@ -8739,6 +12878,44 @@ def _retarget_profile_enum_items(self, context):
     return items
 
 
+def _retarget_bone_mapping_enum_items(self, context):
+    items = [("__none__", "选择骨骼映射", "选择后可读取、修改或删除这一条映射")]
+    data = _load_meta()
+    profile = _find_retarget_profile(data, _active_retarget_profile_key(context.scene))
+    bone_map = profile.get("bone_map") if isinstance(profile.get("bone_map"), list) else []
+    for index, row in enumerate(bone_map):
+        if not isinstance(row, dict):
+            continue
+        source_name = str(row.get("source") or "").strip()
+        target_name = str(row.get("target") or "").strip()
+        if not source_name or not target_name:
+            continue
+        method = str(row.get("method") or "骨骼映射")
+        confidence = row.get("confidence")
+        description = method
+        if confidence not in (None, ""):
+            try:
+                description += "｜置信度 " + str(int(float(confidence) * 100)) + "%"
+            except Exception:
+                pass
+        items.append(("map_" + str(index), source_name + " → " + target_name, description))
+    return items
+
+
+def _retarget_mapping_row(profile, choice):
+    choice = str(choice or "").strip()
+    if not choice.startswith("map_"):
+        return {{}}
+    try:
+        index = int(choice.split("_", 1)[1])
+    except Exception:
+        return {{}}
+    bone_map = profile.get("bone_map") if isinstance(profile.get("bone_map"), list) else []
+    if index < 0 or index >= len(bone_map) or not isinstance(bone_map[index], dict):
+        return {{}}
+    return dict(bone_map[index])
+
+
 def _retarget_action_to_armature(source_action, source_armature, target_armature, profile):
     if not source_action:
         raise RuntimeError("没有找到源动作")
@@ -8755,31 +12932,120 @@ def _retarget_action_to_armature(source_action, source_armature, target_armature
     if not mapping:
         raise RuntimeError("骨骼映射为空，请先建立重定向档案")
     target_bones = set(bone.name for bone in target_armature.data.bones)
+    root_motion = profile.get("root_motion") if isinstance(profile.get("root_motion"), dict) else {{}}
+    root_motion_enabled = bool(root_motion.get("enabled", True))
+    source_root = _retarget_root_bone_name(source_armature, root_motion.get("source_bone"))
+    target_root = _retarget_root_bone_name(target_armature, root_motion.get("target_bone") or mapping.get(source_root))
+    root_scale = _retarget_motion_scale(source_armature, target_armature, profile)
+    rest_pose = profile.get("rest_pose_alignment") if isinstance(profile.get("rest_pose_alignment"), dict) else {{}}
+    rest_pose_enabled = bool(rest_pose.get("enabled", True))
+    bake_step = max(1, min(12, int(rest_pose.get("bake_step") or 1)))
     target_action = bpy.data.actions.new(_safe_id(target_armature.name + "_" + source_action.name + "_retarget", "retarget_action"))
+    try:
+        target_action["gpt_director_root_motion_enabled"] = root_motion_enabled
+        target_action["gpt_director_root_motion_scale"] = root_scale
+        target_action["gpt_director_retarget_profile_id"] = str(profile.get("id") or "")
+        target_action["gpt_director_rest_pose_alignment"] = rest_pose_enabled
+        target_action["gpt_director_retarget_bake_step"] = bake_step
+    except Exception:
+        pass
     copied = 0
     skipped = 0
+    rotation_groups = {{}}
+    root_location_curves = {{}}
+    if rest_pose_enabled:
+        for fcurve in source_action.fcurves:
+            data_path = str(fcurve.data_path or "")
+            match = re.search(r'pose\.bones\["([^"]+)"\]', data_path)
+            if not match:
+                continue
+            source_bone = match.group(1)
+            rotation_property = _retarget_rotation_property(data_path)
+            if rotation_property:
+                bone_groups = rotation_groups.setdefault(source_bone, {{}})
+                bone_groups.setdefault(rotation_property, {{}})[int(fcurve.array_index)] = fcurve
+            elif source_bone == source_root and data_path.endswith(".location"):
+                root_location_curves[int(fcurve.array_index)] = fcurve
     for fcurve in source_action.fcurves:
         data_path = str(fcurve.data_path or "")
         match = re.search(r'pose\.bones\["([^"]+)"\]', data_path)
-        if not match:
+        source_bone = ""
+        target_bone = ""
+        action_group = "Root Motion"
+        root_location_curve = False
+        if match:
+            source_bone = match.group(1)
+            if rest_pose_enabled and (_retarget_rotation_property(data_path) or (source_bone == source_root and data_path.endswith(".location"))):
+                continue
+            target_bone = mapping.get(source_bone, "")
+            if not target_bone or target_bone not in target_bones:
+                skipped += 1
+                continue
+            new_path = data_path.replace('pose.bones["' + source_bone + '"]', 'pose.bones["' + target_bone + '"]', 1)
+            action_group = target_bone
+            root_location_curve = source_bone == source_root and target_bone == target_root and data_path.endswith(".location")
+        elif data_path in ("location", "rotation_euler", "rotation_quaternion", "scale"):
+            new_path = data_path
+            root_location_curve = data_path == "location"
+        else:
             skipped += 1
             continue
-        source_bone = match.group(1)
-        target_bone = mapping.get(source_bone, "")
-        if not target_bone or target_bone not in target_bones:
+        if root_location_curve and not root_motion_enabled:
             skipped += 1
             continue
-        new_path = data_path.replace('pose.bones["' + source_bone + '"]', 'pose.bones["' + target_bone + '"]', 1)
         try:
-            new_curve = target_action.fcurves.new(data_path=new_path, index=fcurve.array_index, action_group=target_bone)
+            new_curve = target_action.fcurves.new(data_path=new_path, index=fcurve.array_index, action_group=action_group)
             for keyframe in fcurve.keyframe_points:
-                point = new_curve.keyframe_points.insert(keyframe.co.x, keyframe.co.y, options={{"FAST"}})
+                value = keyframe.co.y * root_scale if root_location_curve else keyframe.co.y
+                point = new_curve.keyframe_points.insert(keyframe.co.x, value, options={{"FAST"}})
                 point.interpolation = keyframe.interpolation
                 point.easing = keyframe.easing
             new_curve.update()
             copied += 1
         except Exception:
             skipped += 1
+    if rest_pose_enabled:
+        property_priority = ("rotation_quaternion", "rotation_euler", "rotation_axis_angle")
+        for source_bone, property_groups in rotation_groups.items():
+            target_bone = mapping.get(source_bone, "")
+            if not target_bone or target_bone not in target_bones:
+                skipped += sum(len(curves) for curves in property_groups.values())
+                continue
+            selected_property = next((name for name in property_priority if property_groups.get(name)), "")
+            selected_curves = property_groups.get(selected_property) if selected_property else {{}}
+            skipped += sum(len(curves) for name, curves in property_groups.items() if name != selected_property)
+            try:
+                copied += _write_retarget_rotation_curves(
+                    target_action,
+                    source_action,
+                    source_armature,
+                    target_armature,
+                    source_bone,
+                    target_bone,
+                    selected_property,
+                    selected_curves,
+                    bake_step,
+                )
+            except Exception:
+                skipped += len(selected_curves)
+        if root_location_curves:
+            if root_motion_enabled and target_root and target_root in target_bones:
+                try:
+                    copied += _write_retarget_root_location_curves(
+                        target_action,
+                        source_action,
+                        source_armature,
+                        target_armature,
+                        source_root,
+                        target_root,
+                        root_location_curves,
+                        bake_step,
+                        root_scale,
+                    )
+                except Exception:
+                    skipped += len(root_location_curves)
+            else:
+                skipped += len(root_location_curves)
     if copied <= 0:
         try:
             bpy.data.actions.remove(target_action)
@@ -8797,7 +13063,7 @@ def _retarget_action_to_armature(source_action, source_armature, target_armature
     return target_action, copied, skipped
 
 
-def _record_retarget_application(data, profile, source_action, target_action, source_armature, target_armature, status, message, copied=0, skipped=0):
+def _record_retarget_application(data, profile, source_action, target_action, source_armature, target_armature, status, message, copied=0, skipped=0, action_clip=None, match_data=None):
     records = data.get("retarget_applications")
     if not isinstance(records, list):
         records = []
@@ -8812,8 +13078,24 @@ def _record_retarget_application(data, profile, source_action, target_action, so
         "message": message,
         "copied_fcurve_count": copied,
         "skipped_fcurve_count": skipped,
+        "root_motion_enabled": bool((profile.get("root_motion") or {{}}).get("enabled", True)) if isinstance(profile.get("root_motion"), dict) else True,
+        "root_motion_scale": _retarget_motion_scale(source_armature, target_armature, profile) if source_armature and target_armature else 1.0,
         "applied_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
     }}
+    if isinstance(action_clip, dict) and action_clip:
+        record["action_clip"] = {{
+            "id": str(action_clip.get("id") or ""),
+            "name": str(action_clip.get("name") or ""),
+            "action": str(action_clip.get("action") or ""),
+            "target_armature": str(action_clip.get("target_armature") or ""),
+        }}
+    if isinstance(match_data, dict):
+        record["action_matches"] = {{
+            "matched_count": int(match_data.get("matched_count") or 0),
+            "requirement_count": int(match_data.get("requirement_count") or 0),
+            "unmatched_count": int(match_data.get("unmatched_count") or 0),
+            "updated_at": str(match_data.get("updated_at") or ""),
+        }}
     records.append(record)
     data["retarget_applications"] = records[-500:]
     return data
@@ -8907,6 +13189,90 @@ def _upsert_action_clip(data, clip):
         clips.append(clip)
     data["action_clips"] = clips[-500:]
     return data
+
+
+def _find_action_clip_by_action(data, action_name):
+    action_name = str(action_name or "").strip()
+    if not action_name:
+        return {{}}
+    clips = data.get("action_clips") if isinstance(data.get("action_clips"), list) else []
+    for clip in reversed(clips):
+        if isinstance(clip, dict) and str(clip.get("action") or "").strip() == action_name:
+            return dict(clip)
+    return {{}}
+
+
+def _upsert_retarget_action_clip(data, profile, source_action, target_action, target_armature, actor=None, copied=0, skipped=0):
+    source_clip = _find_action_clip_by_action(data, source_action.name if source_action else "")
+    base_name = str(source_clip.get("name") or (source_action.name if source_action else "") or target_action.name or "重定向动作").strip()
+    clip_name = base_name if "重定向" in base_name else base_name + "（重定向）"
+    profile_name = str(profile.get("name") or profile.get("id") or "重定向档案")
+    note_parts = [
+        str(source_clip.get("note") or "").strip(),
+        "已通过“" + profile_name + "”适配目标骨骼 " + (target_armature.name if target_armature else ""),
+    ]
+    clip_note = "；".join(part for part in note_parts if part)
+    clip_id = _safe_id(
+        "retarget_"
+        + str(profile.get("id") or profile_name)
+        + "_"
+        + (source_action.name if source_action else target_action.name)
+        + "_"
+        + (target_armature.name if target_armature else ""),
+        "retarget_action_clip",
+    )
+    clip = _action_clip_from_action(
+        target_action,
+        target_armature,
+        clip_id,
+        clip_name,
+        clip_note,
+        actor,
+    )
+    inherited_fields = (
+        "tags",
+        "usage_note",
+        "source_path",
+        "path",
+        "asset_id",
+        "asset_name",
+        "library_item_id",
+        "library_path",
+        "library_relative_path",
+        "source_profile_id",
+        "source_profile_name",
+        "format",
+        "favorite",
+        "usage_count",
+    )
+    for field in inherited_fields:
+        if field in source_clip and source_clip.get(field) not in (None, "", []):
+            clip[field] = source_clip.get(field)
+    rest_pose = profile.get("rest_pose_alignment") if isinstance(profile.get("rest_pose_alignment"), dict) else {{}}
+    root_motion = profile.get("root_motion") if isinstance(profile.get("root_motion"), dict) else {{}}
+    clip["generated_by"] = "retarget"
+    clip["retarget_profile_id"] = str(profile.get("id") or "")
+    clip["retarget_profile_name"] = profile_name
+    clip["retarget_source_action"] = source_action.name if source_action else ""
+    clip["retarget_source_clip_name"] = base_name
+    clip["source_action_clip_id"] = str(source_clip.get("id") or "")
+    clip["retarget_quality"] = {{
+        "copied_fcurve_count": int(copied or 0),
+        "skipped_fcurve_count": int(skipped or 0),
+        "mapped_bone_count": int(profile.get("mapped_bone_count") or 0),
+        "unmapped_source_count": int(profile.get("unmapped_source_count") or 0),
+        "unmapped_target_count": int(profile.get("unmapped_target_count") or 0),
+        "rest_pose_enabled": bool(rest_pose.get("enabled", True)),
+        "rest_pose_mismatch_bone_count": int(rest_pose.get("mismatch_bone_count") or 0),
+        "rest_pose_max_angle_degrees": float(rest_pose.get("max_angle_degrees") or 0.0),
+        "bake_step": int(rest_pose.get("bake_step") or 1),
+        "root_motion_enabled": bool(root_motion.get("enabled", True)),
+        "root_motion_scale": float(root_motion.get("effective_scale") or 1.0),
+    }}
+    clip["status"] = "ready"
+    clip["message"] = "已完成骨骼重定向，可用于分镜动作匹配"
+    _upsert_action_clip(data, clip)
+    return clip
 
 
 def _upsert_action_clip_from_asset_record(data, asset_record, actor=None, target_armature=None, library_item=None, note=""):
@@ -10304,8 +14670,18 @@ def _import_director_asset(filepath, asset_kind="model", asset_label="", target_
         bpy.ops.import_scene.obj(filepath=import_path)
     elif lower.endswith(".bvh"):
         bpy.ops.import_anim.bvh(filepath=import_path)
+    elif lower.endswith(".stl"):
+        bpy.ops.import_mesh.stl(filepath=import_path)
+    elif lower.endswith(".ply"):
+        bpy.ops.import_mesh.ply(filepath=import_path)
+    elif lower.endswith(".abc"):
+        bpy.ops.wm.alembic_import(filepath=import_path)
+    elif lower.endswith((".usd", ".usdz")):
+        if not hasattr(bpy.ops.wm, "usd_import"):
+            raise RuntimeError("当前 Blender 版本没有 USD 导入器，请升级 Blender 或先转换为 GLB/FBX。")
+        bpy.ops.wm.usd_import(filepath=import_path)
     else:
-        raise RuntimeError("只支持 blend/glb/gltf/fbx/obj/bvh/png/jpg/tif/exr/hdr")
+        raise RuntimeError("只支持 blend/glb/gltf/fbx/obj/bvh/stl/ply/abc/usd/usdz/png/jpg/tif/exr/hdr")
     if not lower.endswith(".blend"):
         imported = [obj for obj in bpy.data.objects if obj.name not in before_object_names]
         imported_actions = [action.name for action in bpy.data.actions if action.name not in before_action_names]
@@ -10326,6 +14702,9 @@ def _import_director_asset(filepath, asset_kind="model", asset_label="", target_
         "actions": imported_actions,
         "imported_at": imported_at,
     }}
+    control_record = _attach_imported_asset_controls(asset_record.get("id", ""), asset_name, asset_kind, imported)
+    if control_record:
+        asset_record.update(control_record)
     if asset_kind == "action":
         action = _latest_action(imported_actions[-1] if imported_actions else "")
         if action:
@@ -10438,6 +14817,8 @@ def _asset_enum_items(self, context):
         detail_parts = []
         if object_count:
             detail_parts.append("对象 " + str(object_count))
+        if asset.get("control_root"):
+            detail_parts.append("可控")
         if collection_count:
             detail_parts.append("集合 " + str(collection_count))
         if action_count:
@@ -10500,11 +14881,17 @@ def _select_asset_objects(asset):
     if not isinstance(asset, dict):
         return 0
     names = []
+    control_root = str(asset.get("control_root") or "").strip()
+    if control_root:
+        names.append(control_root)
+    raw_control_objects = asset.get("control_objects")
+    if isinstance(raw_control_objects, list):
+        names.extend(str(name or "").strip() for name in raw_control_objects)
     raw_objects = asset.get("objects")
-    if isinstance(raw_objects, list):
+    if not names and isinstance(raw_objects, list):
         names.extend(str(name or "").strip() for name in raw_objects)
     raw_collections = asset.get("collections")
-    if isinstance(raw_collections, list):
+    if not names and isinstance(raw_collections, list):
         for collection_name in raw_collections:
             collection = bpy.data.collections.get(str(collection_name or ""))
             if collection:
@@ -10553,12 +14940,299 @@ def _set_director_tags(obj, asset_id="", asset_kind="", role=""):
     return obj
 
 
+def _set_director_label_visibility(obj, visible=False):
+    if obj is None:
+        return obj
+    try:
+        obj.show_name = bool(visible)
+    except Exception:
+        pass
+    try:
+        if obj.type == "ARMATURE" and obj.data is not None:
+            obj.data.show_names = bool(visible)
+    except Exception:
+        pass
+    return obj
+
+
+def _is_director_control_object(obj):
+    if obj is None:
+        return False
+    try:
+        return (
+            obj.name.startswith("蓝色人偶")
+            or obj.name.startswith("红色人偶")
+            or obj.name.startswith("Director ")
+            or bool(obj.get("gpt_director_asset_id", ""))
+            or bool(obj.get("gpt_director_control_hint", ""))
+            or bool(obj.get("gpt_director_control_bone", ""))
+        )
+    except Exception:
+        return False
+
+
+def _set_all_director_label_visibility(visible=False):
+    changed = 0
+    for obj in bpy.data.objects:
+        if not _is_director_control_object(obj):
+            continue
+        _set_director_label_visibility(obj, visible)
+        changed += 1
+    return changed
+
+
+def _set_view3d_relationship_lines(context=None, visible=False):
+    try:
+        screen = context.screen if context is not None else bpy.context.screen
+    except Exception:
+        screen = None
+    if screen is None:
+        return
+    try:
+        areas = screen.areas
+    except Exception:
+        return
+    for area in areas:
+        if getattr(area, "type", "") != "VIEW_3D":
+            continue
+        for space in getattr(area, "spaces", []):
+            if getattr(space, "type", "") != "VIEW_3D":
+                continue
+            try:
+                space.overlay.show_relationship_lines = bool(visible)
+            except Exception:
+                pass
+
+
+def _set_view3d_simple_overlays(context=None, simple=True):
+    try:
+        screen = context.screen if context is not None else bpy.context.screen
+    except Exception:
+        screen = None
+    if screen is None:
+        return
+    try:
+        areas = screen.areas
+    except Exception:
+        return
+    for area in areas:
+        if getattr(area, "type", "") != "VIEW_3D":
+            continue
+        for space in getattr(area, "spaces", []):
+            if getattr(space, "type", "") != "VIEW_3D":
+                continue
+            try:
+                space.overlay.show_relationship_lines = not bool(simple)
+            except Exception:
+                pass
+            try:
+                space.overlay.show_extras = not bool(simple)
+            except Exception:
+                pass
+
+
+def _set_director_clean_view(context=None, enabled=True):
+    clean = bool(enabled)
+    changed = _set_all_director_label_visibility(False)
+    for obj in bpy.data.objects:
+        if not _is_director_control_object(obj):
+            continue
+        role = str(obj.get("gpt_director_role", ""))
+        asset_kind = str(obj.get("gpt_director_asset_kind", ""))
+        try:
+            if role == "viewport_control":
+                obj.hide_set(clean)
+                changed += 1
+        except Exception:
+            pass
+        try:
+            if obj.type == "ARMATURE" and asset_kind == "character":
+                obj.hide_set(clean)
+                obj.show_in_front = not clean
+                if obj.data is not None:
+                    obj.data.show_names = False
+                    obj.data.display_type = "STICK" if clean else "BBONE"
+                    try:
+                        obj.data.show_bone_custom_shapes = not clean
+                    except Exception:
+                        pass
+                changed += 1
+        except Exception:
+            pass
+        try:
+            if role == "pose_proxy":
+                original_size = float(obj.get("gpt_director_original_display_size", obj.empty_display_size) or obj.empty_display_size or 0.1)
+                obj["gpt_director_original_display_size"] = original_size
+                obj.empty_display_size = min(original_size, 0.08) if clean else original_size
+                obj.show_in_front = True
+                obj.hide_set(False)
+                changed += 1
+        except Exception:
+            pass
+    _set_view3d_relationship_lines(context, not clean)
+    return changed
+
+
+def _set_director_simple_view(context=None, enabled=True):
+    simple = bool(enabled)
+    changed = _set_all_director_label_visibility(False)
+    for obj in bpy.data.objects:
+        if not _is_director_control_object(obj):
+            continue
+        role = str(obj.get("gpt_director_role", ""))
+        asset_kind = str(obj.get("gpt_director_asset_kind", ""))
+        try:
+            if obj.type == "ARMATURE" and asset_kind == "character":
+                obj.hide_set(simple)
+                obj.show_in_front = not simple
+                if obj.data is not None:
+                    obj.data.show_names = False
+                    obj.data.display_type = "STICK" if simple else "BBONE"
+                    try:
+                        obj.data.show_bone_custom_shapes = not simple
+                    except Exception:
+                        pass
+                changed += 1
+                continue
+        except Exception:
+            pass
+        try:
+            if obj.type == "EMPTY" or role in {"pose_proxy", "viewport_control", "import_control"} or asset_kind == "control":
+                obj.hide_set(simple)
+                changed += 1
+        except Exception:
+            pass
+    _set_view3d_simple_overlays(context, simple)
+    return changed
+
+
+def _director_drag_root_for_object(obj):
+    if obj is None:
+        return None
+    asset_id = str(obj.get("gpt_director_asset_id", "")).strip()
+    if not asset_id and not _is_director_control_object(obj):
+        return None
+    current = obj
+    while current is not None:
+        try:
+            if current.type == "EMPTY" and (not asset_id or str(current.get("gpt_director_asset_id", "")).strip() == asset_id):
+                return current
+        except Exception:
+            pass
+        current = getattr(current, "parent", None)
+    if asset_id:
+        candidates = []
+        for candidate in bpy.data.objects:
+            try:
+                if str(candidate.get("gpt_director_asset_id", "")).strip() != asset_id:
+                    continue
+                if candidate.type != "EMPTY":
+                    continue
+                role = str(candidate.get("gpt_director_role", ""))
+                score = 0
+                if "根控制器" in candidate.name or "root" in candidate.name.lower():
+                    score += 100
+                if "整体移动" in str(candidate.get("gpt_director_control_hint", "")):
+                    score += 80
+                if role in {"pose_proxy", "viewport_control"}:
+                    score -= 80
+                if candidate.parent is None:
+                    score += 20
+                candidates.append((score, candidate.name, candidate))
+            except Exception:
+                pass
+        if candidates:
+            candidates.sort(reverse=True)
+            return candidates[0][2]
+    return obj
+
+
+def _view3d_window_region_and_space(context):
+    area = getattr(context, "area", None)
+    if area is None or getattr(area, "type", "") != "VIEW_3D":
+        return None, None
+    region = None
+    for item in getattr(area, "regions", []):
+        if getattr(item, "type", "") == "WINDOW":
+            region = item
+            break
+    space = getattr(context, "space_data", None)
+    if space is None or getattr(space, "type", "") != "VIEW_3D":
+        for item in getattr(area, "spaces", []):
+            if getattr(item, "type", "") == "VIEW_3D":
+                space = item
+                break
+    if region is None or space is None or getattr(space, "region_3d", None) is None:
+        return None, None
+    return region, space
+
+
+def _view3d_mouse_ray(context, event):
+    region, space = _view3d_window_region_and_space(context)
+    if region is None or space is None:
+        return None, None
+    coord = (event.mouse_x - region.x, event.mouse_y - region.y)
+    try:
+        origin = view3d_utils.region_2d_to_origin_3d(region, space.region_3d, coord)
+        direction = view3d_utils.region_2d_to_vector_3d(region, space.region_3d, coord)
+        return origin, direction
+    except Exception:
+        return None, None
+
+
+def _view3d_plane_intersection(context, event, z_value=0.0):
+    origin, direction = _view3d_mouse_ray(context, event)
+    if origin is None or direction is None:
+        return None
+    try:
+        denom = float(direction.z)
+        if abs(denom) < 1e-6:
+            return None
+        distance = (float(z_value) - float(origin.z)) / denom
+        if distance < 0:
+            return None
+        return origin + direction * distance
+    except Exception:
+        return None
+
+
+def _raycast_visible_director_object(context, event):
+    origin, direction = _view3d_mouse_ray(context, event)
+    if origin is None or direction is None:
+        return None, None
+    try:
+        depsgraph = context.evaluated_depsgraph_get()
+        result = context.scene.ray_cast(depsgraph, origin, direction, distance=1000.0)
+    except TypeError:
+        try:
+            result = context.scene.ray_cast(origin, direction, distance=1000.0)
+        except Exception:
+            return None, None
+    except Exception:
+        return None, None
+    try:
+        hit = bool(result[0])
+        location = result[1]
+        obj = result[4]
+    except Exception:
+        return None, None
+    if not hit or obj is None:
+        return None, None
+    return obj, location
+
+
 def _add_empty_control(name, location=(0, 0, 0), asset_id="", asset_kind="model", role=""):
     bpy.ops.object.empty_add(type="ARROWS", location=location)
     root = bpy.context.object
     root.name = name
-    root.empty_display_size = 0.45
-    root.show_name = True
+    root.empty_display_size = 0.58 if asset_kind == "character" else 0.45
+    _set_director_label_visibility(root, False)
+    try:
+        root.show_in_front = True
+        root.color = (1.0, 0.72, 0.12, 1.0)
+        root["gpt_director_control_hint"] = "拖动此根控制器可整体移动、旋转或缩放资产"
+    except Exception:
+        pass
     _set_director_tags(root, asset_id, asset_kind, role)
     _link_to_collection(root, "Director Controls")
     return root
@@ -10590,10 +15264,99 @@ def _add_control_ring(root, name, radius=0.46, color=(0.92, 0.78, 0.18, 0.55)):
         _link_to_collection(ring, "Director Controls")
         _parent_to_root(ring, root, (0, 0, 0.02), (0, 0, 0))
         ring.hide_render = True
+        ring.hide_select = True
+        ring.show_in_front = True
+        ring.display_type = "WIRE"
+        try:
+            ring.hide_set(True)
+        except Exception:
+            pass
         _set_director_tags(ring, str(root.get("gpt_director_asset_id", "")), "control", "viewport_control")
         return ring
     except Exception:
         return None
+
+
+def _imported_asset_control_location(objects):
+    points = []
+    for obj in objects or []:
+        if obj is None:
+            continue
+        try:
+            points.append(obj.matrix_world.translation.copy())
+        except Exception:
+            try:
+                points.append(obj.location.copy())
+            except Exception:
+                pass
+    if not points:
+        return Vector((0, 0, 0)), 0.72
+    min_x = min(point.x for point in points)
+    max_x = max(point.x for point in points)
+    min_y = min(point.y for point in points)
+    max_y = max(point.y for point in points)
+    min_z = min(point.z for point in points)
+    max_z = max(point.z for point in points)
+    center = Vector(((min_x + max_x) * 0.5, (min_y + max_y) * 0.5, (min_z + max_z) * 0.5))
+    span = max(max_x - min_x, max_y - min_y, max_z - min_z)
+    radius = max(0.48, min(4.0, span * 0.65 if span > 0 else 0.72))
+    return center, radius
+
+
+def _parent_preserve_world(obj, root):
+    if obj is None or root is None:
+        return obj
+    try:
+        matrix = obj.matrix_world.copy()
+        obj.parent = root
+        obj.matrix_parent_inverse = root.matrix_world.inverted()
+        obj.matrix_world = matrix
+    except Exception:
+        try:
+            obj.parent = root
+        except Exception:
+            pass
+    return obj
+
+
+def _attach_imported_asset_controls(asset_id, asset_name, asset_kind, imported_objects):
+    if asset_kind not in ("character", "prop", "scene", "model"):
+        return {{}}
+    imported_objects = [obj for obj in (imported_objects or []) if obj is not None]
+    if not imported_objects:
+        return {{}}
+    label = str(asset_name or asset_id or "导入资产")
+    location, radius = _imported_asset_control_location(imported_objects)
+    root = _add_empty_control(label + " 导演控制器", location, asset_id, asset_kind, "import_control")
+    ring = _add_control_ring(root, label + " 导演控制圈", radius=radius)
+    imported_names = set(obj.name for obj in imported_objects if obj is not None and obj.name)
+    top_level = []
+    for obj in imported_objects:
+        parent = getattr(obj, "parent", None)
+        if parent is None or str(getattr(parent, "name", "") or "") not in imported_names:
+            top_level.append(obj)
+    if not top_level:
+        top_level = list(imported_objects)
+    for obj in imported_objects:
+        _set_director_tags(obj, asset_id, asset_kind, "imported_asset")
+    for obj in top_level:
+        _parent_preserve_world(obj, root)
+    control_objects = [root.name]
+    if ring is not None:
+        control_objects.append(ring.name)
+    try:
+        bpy.ops.object.select_all(action="DESELECT")
+        root.select_set(True)
+        bpy.context.view_layer.objects.active = root
+    except Exception:
+        pass
+    return {{
+        "control_root": root.name,
+        "control_objects": control_objects,
+        "controlled_objects": sorted(set(obj.name for obj in imported_objects if obj is not None and obj.name)),
+        "controls": ["root_empty", "viewport_control_ring", "drag_transform", "object_motion", "select_asset"],
+        "control_role": "imported_asset_control",
+    }}
 
 
 def _upsert_asset_record(data, asset_record):
@@ -11148,114 +15911,373 @@ def _apply_object_motion(motion, objects=None):
     return objects, frame_start, frame_end
 
 
-def _add_basic_mannequin(label, color, location=(0, 0, 0), collection="Director Characters", pose="standing", asset_id="", role="actor"):
-    asset_id = asset_id or _safe_id(label, "builtin_actor")
-    root = _add_empty_control(label + " 根控制器", location, asset_id, "character", role)
-    body_mat = _mat(label + " 材质", color)
-    dark = _mat(label + " 关节深色", (0.04, 0.05, 0.06, 1))
-    head_mat = _mat(label + " 头部肤色", (0.78, 0.72, 0.66, 1))
-    joint_mat = _mat(label + " 球形关节", (0.07, 0.08, 0.10, 1))
-    objects = [root]
-    controls = [root]
-
-    def add_part(obj):
-        _set_director_tags(obj, asset_id, "character", role)
-        objects.append(obj)
-        return obj
-
-    if pose == "seated":
-        body = add_part(_cylinder(label + " 身体", (0, 0, 0), 0.20, 0.85, body_mat, collection=collection))
-        _parent_to_root(body, root, (0, -0.03, 1.03), (math.radians(10), 0, 0))
-        head = add_part(_sphere(label + " 头部", (0, 0, 0), 0.23, head_mat, collection=collection))
-        _parent_to_root(head, root, (0, -0.11, 1.57), (0, 0, 0))
-        for side, sx in (("左", -1), ("右", 1)):
-            upper_arm = add_part(_cylinder(label + " " + side + "上臂", (0, 0, 0), 0.045, 0.48, body_mat, collection=collection))
-            _parent_to_root(upper_arm, root, (sx * 0.27, -0.02, 1.16), (0, math.radians(76 * sx), 0))
-            forearm = add_part(_cylinder(label + " " + side + "前臂", (0, 0, 0), 0.04, 0.42, body_mat, collection=collection))
-            _parent_to_root(forearm, root, (sx * 0.39, -0.16, 0.94), (math.radians(18), math.radians(40 * sx), 0))
-            thigh = add_part(_cylinder(label + " " + side + "大腿", (0, 0, 0), 0.065, 0.55, body_mat, collection=collection))
-            _parent_to_root(thigh, root, (sx * 0.13, -0.24, 0.56), (math.radians(88), 0, 0))
-            shin = add_part(_cylinder(label + " " + side + "小腿", (0, 0, 0), 0.055, 0.48, dark, collection=collection))
-            _parent_to_root(shin, root, (sx * 0.13, -0.58, 0.30), (0, 0, 0))
-            knee = add_part(_sphere(label + " " + side + "膝关节", (0, 0, 0), 0.075, joint_mat, collection=collection))
-            _parent_to_root(knee, root, (sx * 0.13, -0.48, 0.50), (0, 0, 0))
-    elif pose == "reclining":
-        body = add_part(_cylinder(label + " 身体", (0, 0, 0), 0.20, 0.95, body_mat, collection=collection))
-        _parent_to_root(body, root, (0, 0.03, 0.98), (math.radians(58), 0, 0))
-        head = add_part(_sphere(label + " 头部", (0, 0, 0), 0.23, head_mat, collection=collection))
-        _parent_to_root(head, root, (0, 0.38, 1.35), (0, 0, 0))
-        for side, sx in (("左", -1), ("右", 1)):
-            arm = add_part(_cylinder(label + " " + side + "手臂", (0, 0, 0), 0.048, 0.70, body_mat, collection=collection))
-            _parent_to_root(arm, root, (sx * 0.30, 0.03, 1.02), (math.radians(35), math.radians(58 * sx), 0))
-            thigh = add_part(_cylinder(label + " " + side + "大腿", (0, 0, 0), 0.065, 0.56, body_mat, collection=collection))
-            _parent_to_root(thigh, root, (sx * 0.13, -0.34, 0.62), (math.radians(72), 0, 0))
-            shin = add_part(_cylinder(label + " " + side + "小腿", (0, 0, 0), 0.055, 0.52, dark, collection=collection))
-            _parent_to_root(shin, root, (sx * 0.13, -0.70, 0.42), (math.radians(82), 0, 0))
-            knee = add_part(_sphere(label + " " + side + "膝关节", (0, 0, 0), 0.075, joint_mat, collection=collection))
-            _parent_to_root(knee, root, (sx * 0.13, -0.53, 0.52), (0, 0, 0))
+def _set_mannequin_material_color(body, label, color):
+    if body is None or body.type != "MESH":
+        return None
+    if not body.data.materials:
+        material = bpy.data.materials.new(label + " 身体材质")
+        material.use_nodes = True
+        body.data.materials.append(material)
     else:
-        body = add_part(_cylinder(label + " 身体", (0, 0, 0), 0.22, 1.05, body_mat, collection=collection))
-        _parent_to_root(body, root, (0, 0, 1.1), (0, 0, 0))
-        head = add_part(_sphere(label + " 头部", (0, 0, 0), 0.24, head_mat, collection=collection))
-        _parent_to_root(head, root, (0, 0, 1.82), (0, 0, 0))
-        for side, sx in (("左", -1), ("右", 1)):
-            arm = add_part(_cylinder(label + " " + side + "臂", (0, 0, 0), 0.055, 0.74, body_mat, collection=collection))
-            _parent_to_root(arm, root, (sx * 0.36, 0, 1.28), (0, math.radians(70 * sx), 0))
-            leg = add_part(_cylinder(label + " " + side + "腿", (0, 0, 0), 0.07, 0.84, dark, collection=collection))
-            _parent_to_root(leg, root, (sx * 0.12, 0, 0.42), (0, 0, 0))
-            shoulder = add_part(_sphere(label + " " + side + "肩关节", (0, 0, 0), 0.075, joint_mat, collection=collection))
-            _parent_to_root(shoulder, root, (sx * 0.25, 0, 1.5), (0, 0, 0))
+        material = body.data.materials[0].copy()
+        material.name = label + " 身体材质"
+        body.data.materials[0] = material
+    try:
+        material.diffuse_color = color
+    except Exception:
+        pass
+    try:
+        material.use_nodes = True
+        shader = next((node for node in material.node_tree.nodes if node.type == "BSDF_PRINCIPLED"), None)
+        if shader is not None:
+            shader.inputs["Base Color"].default_value = color
+    except Exception:
+        pass
+    return material
 
-    ring = _add_control_ring(root, label + " 视口控制圈")
+
+def _move_pose_control(armature, bone_name, offset):
+    if armature is None or armature.type != "ARMATURE":
+        return
+    pose_bone = armature.pose.bones.get(bone_name)
+    if pose_bone is None:
+        return
+    matrix = pose_bone.matrix.copy()
+    matrix.translation = matrix.translation + Vector(offset)
+    pose_bone.matrix = matrix
+
+
+def _rotate_pose_control(armature, bone_name, rotation):
+    if armature is None or armature.type != "ARMATURE":
+        return
+    pose_bone = armature.pose.bones.get(bone_name)
+    if pose_bone is None:
+        return
+    pose_bone.rotation_mode = "XYZ"
+    pose_bone.rotation_euler = Euler(rotation, "XYZ")
+
+
+def _configure_mannequin_pose_display(armature):
+    if armature is None or armature.type != "ARMATURE":
+        return
+    try:
+        armature.show_in_front = True
+        armature.data.display_type = "BBONE"
+        _set_director_label_visibility(armature, False)
+    except Exception:
+        pass
+    group_specs = (
+        ("GPT 手脚 IK", "THEME03", ("hand.IK.L", "hand.IK.R", "foot.IK.L", "foot.IK.R")),
+        ("GPT 肘膝 Pole", "THEME04", ("Polo.Codo.L", "Polo.Codo.R", "Polo.Rodilla.L", "Polo.Rodilla.R")),
+        ("GPT 躯干", "THEME06", ("hips", "chest", "head")),
+    )
+    for group_name, color_set, bone_names in group_specs:
+        try:
+            group = armature.pose.bone_groups.get(group_name) or armature.pose.bone_groups.new(name=group_name)
+            group.color_set = color_set
+        except Exception:
+            continue
+        for bone_name in bone_names:
+            pose_bone = armature.pose.bones.get(bone_name)
+            if pose_bone is not None:
+                try:
+                    pose_bone.bone_group = group
+                except Exception:
+                    pass
+
+
+def _add_pose_proxy_control(root, armature, bone_name, label, display_type, size, color):
+    if root is None or armature is None or armature.type != "ARMATURE":
+        return None
+    pose_bone = armature.pose.bones.get(bone_name)
+    if pose_bone is None:
+        return None
+    try:
+        matrix_world = armature.matrix_world @ pose_bone.matrix
+        bpy.ops.object.empty_add(type=display_type, location=matrix_world.translation)
+        control = bpy.context.object
+        control.name = label
+        control.matrix_world = matrix_world
+        control.empty_display_size = size
+        control["gpt_director_original_display_size"] = float(size or 0.1)
+        _set_director_label_visibility(control, False)
+        control.show_in_front = True
+        control.color = color
+        control.hide_render = True
+        _link_to_collection(control, "Director Controls")
+        _parent_preserve_world(control, root)
+        _set_director_tags(
+            control,
+            str(root.get("gpt_director_asset_id", "")),
+            "control",
+            "pose_proxy",
+        )
+        control["gpt_director_control_bone"] = bone_name
+        control["gpt_director_control_hint"] = "对象模式直接拖动，驱动骨骼 " + bone_name
+        constraint = pose_bone.constraints.get("GPT 导演台可视控制器")
+        if constraint is None:
+            constraint = pose_bone.constraints.new(type="COPY_TRANSFORMS")
+            constraint.name = "GPT 导演台可视控制器"
+        constraint.target = control
+        constraint.owner_space = "WORLD"
+        constraint.target_space = "WORLD"
+        return control
+    except Exception:
+        return None
+
+
+def _add_mannequin_pose_controls(root, armature, label):
+    specs = (
+        ("hand.IK.L", label + " 左手 IK 控制器", "CUBE", 0.105, (1.0, 0.50, 0.06, 1.0)),
+        ("hand.IK.R", label + " 右手 IK 控制器", "CUBE", 0.105, (1.0, 0.50, 0.06, 1.0)),
+        ("foot.IK.L", label + " 左脚 IK 控制器", "CIRCLE", 0.15, (0.18, 0.88, 0.34, 1.0)),
+        ("foot.IK.R", label + " 右脚 IK 控制器", "CIRCLE", 0.15, (0.18, 0.88, 0.34, 1.0)),
+        ("Polo.Codo.L", label + " 左肘 Pole 控制器", "SPHERE", 0.085, (0.92, 0.20, 0.72, 1.0)),
+        ("Polo.Codo.R", label + " 右肘 Pole 控制器", "SPHERE", 0.085, (0.92, 0.20, 0.72, 1.0)),
+        ("Polo.Rodilla.L", label + " 左膝 Pole 控制器", "SPHERE", 0.09, (0.30, 0.66, 1.0, 1.0)),
+        ("Polo.Rodilla.R", label + " 右膝 Pole 控制器", "SPHERE", 0.09, (0.30, 0.66, 1.0, 1.0)),
+    )
+    controls = []
+    for bone_name, control_label, display_type, size, color in specs:
+        control = _add_pose_proxy_control(
+            root,
+            armature,
+            bone_name,
+            control_label,
+            display_type,
+            size,
+            color,
+        )
+        if control is not None:
+            controls.append(control)
+    return controls
+
+
+def _apply_rigged_mannequin_pose(armature, pose="standing", look_yaw=0.0):
+    if armature is None or armature.type != "ARMATURE":
+        return
+    for pose_bone in armature.pose.bones:
+        try:
+            pose_bone.matrix_basis.identity()
+        except Exception:
+            pass
+    bpy.context.view_layer.update()
+    if pose not in ("seated", "reclining"):
+        if look_yaw:
+            _rotate_pose_control(armature, "head", (0.0, 0.0, math.radians(look_yaw)))
+            bpy.context.view_layer.update()
+        return
+    _move_pose_control(armature, "hips", (0.0, 0.03, -0.21))
+    _move_pose_control(armature, "foot.IK.L", (0.04, -0.40, 0.00))
+    _move_pose_control(armature, "foot.IK.R", (-0.04, -0.40, 0.00))
+    _move_pose_control(armature, "Polo.Rodilla.L", (0.02, -0.02, 0.04))
+    _move_pose_control(armature, "Polo.Rodilla.R", (-0.02, -0.02, 0.04))
+    _move_pose_control(armature, "hand.IK.L", (-0.10, -0.16, -0.11))
+    _move_pose_control(armature, "hand.IK.R", (0.10, -0.16, -0.11))
+    _move_pose_control(armature, "Polo.Codo.L", (-0.24, -0.06, -0.17))
+    _move_pose_control(armature, "Polo.Codo.R", (0.24, -0.06, -0.17))
+    _rotate_pose_control(armature, "hips", (math.radians(4), 0.0, 0.0))
+    _rotate_pose_control(armature, "chest", (math.radians(-3), 0.0, 0.0))
+    head_pitch = 2
+    if pose == "reclining":
+        _move_pose_control(armature, "hips", (0.0, 0.22, 0.01))
+        _move_pose_control(armature, "foot.IK.L", (0.02, -0.12, 0.00))
+        _move_pose_control(armature, "foot.IK.R", (-0.01, -0.03, 0.00))
+        _move_pose_control(armature, "hand.IK.L", (0.34, 0.40, 0.22))
+        _move_pose_control(armature, "hand.IK.R", (0.00, 0.03, 0.00))
+        _move_pose_control(armature, "Polo.Codo.L", (0.20, 0.25, 0.07))
+        _move_pose_control(armature, "Polo.Codo.R", (0.02, 0.02, 0.00))
+        _rotate_pose_control(armature, "hips", (math.radians(-9), 0.0, 0.0))
+        _rotate_pose_control(armature, "chest", (math.radians(-18), 0.0, 0.0))
+        head_pitch = 9
+    _rotate_pose_control(
+        armature,
+        "head",
+        (math.radians(head_pitch), 0.0, math.radians(look_yaw)),
+    )
+    bpy.context.view_layer.update()
+
+
+def _add_rigged_mannequin(label, color, location=(0, 0, 0), collection="Director Characters", pose="standing", asset_id="", role="actor", look_yaw=0.0):
+    asset_id = asset_id or _safe_id(label, "builtin_actor")
+    if not MANNEQUIN_TEMPLATE_PATH or not os.path.exists(MANNEQUIN_TEMPLATE_PATH):
+        raise RuntimeError("内置骨骼人偶资源不存在，请重新打开导演台工程以修复资产：" + str(MANNEQUIN_TEMPLATE_PATH))
+    try:
+        with bpy.data.libraries.load(MANNEQUIN_TEMPLATE_PATH, link=False) as (data_from, data_to):
+            data_to.objects = list(data_from.objects)
+    except Exception as exc:
+        raise RuntimeError("载入内置骨骼人偶失败：" + str(exc))
+    imported = [obj for obj in data_to.objects if obj is not None]
+    armature = next((obj for obj in imported if obj.type == "ARMATURE"), None)
+    body = next(
+        (
+            obj
+            for obj in imported
+            if obj.type == "MESH"
+            and (
+                bool(obj.get("gpt_director_recolor_material", ""))
+                or str(obj.name).startswith("Director Mannequin Body")
+            )
+        ),
+        None,
+    )
+    if armature is None or body is None:
+        for obj in imported:
+            try:
+                bpy.data.objects.remove(obj, do_unlink=True)
+            except Exception:
+                pass
+        raise RuntimeError("内置骨骼人偶模板缺少骨骼或主体网格")
+
+    custom_shapes = set(
+        pose_bone.custom_shape
+        for pose_bone in armature.pose.bones
+        if pose_bone.custom_shape is not None
+    )
+    widgets_collection = _ensure_collection("Director Mannequin Widgets")
+    widgets_collection.hide_render = True
+    widgets_collection.hide_viewport = True
+    for obj in imported:
+        _set_director_tags(obj, asset_id, "character", role)
+        original_name = str(obj.name)
+        obj.name = label + " " + original_name
+        if obj in custom_shapes:
+            _link_to_collection(obj, "Director Mannequin Widgets")
+            obj.hide_render = True
+        elif obj is armature or obj is body:
+            _link_to_collection(obj, collection)
+        else:
+            _link_to_collection(obj, "Director Controls")
+            obj.hide_render = True
+
+    armature.name = label + " 骨骼控制器"
+    body.name = label + " 人偶主体"
+    armature.show_in_front = True
+    armature["gpt_director_asset_source"] = "BlendSwap"
+    armature["gpt_director_asset_source_url"] = "https://blendswap.com/blend/13034"
+    armature["gpt_director_asset_author"] = "jgilhutton / Juan Ignacio"
+    armature["gpt_director_asset_license"] = "CC-BY"
+    armature["gpt_director_attribution_path"] = MANNEQUIN_ATTRIBUTION_PATH
+    armature["gpt_director_ik_controls"] = "hand.IK.L,hand.IK.R,foot.IK.L,foot.IK.R"
+    armature["gpt_director_pole_controls"] = "Polo.Codo.L,Polo.Codo.R,Polo.Rodilla.L,Polo.Rodilla.R"
+    armature["gpt_director_control_mode"] = "对象模式拖动彩色代理控制器；Pose 模式可使用原始自定义骨骼控件"
+    _configure_mannequin_pose_display(armature)
+    _set_mannequin_material_color(body, label, color)
+    _apply_rigged_mannequin_pose(armature, pose, look_yaw)
+
+    root = _add_empty_control(label + " 根控制器", (0, 0, 0), asset_id, "character", role)
+    _parent_preserve_world(armature, root)
+    root.location = Vector(location)
+    pose_controls = _add_mannequin_pose_controls(root, armature, label)
+    ring = _add_control_ring(root, label + " 视口控制圈", radius=0.55)
+    controls = [root, armature] + pose_controls
     if ring is not None:
         controls.append(ring)
+    _set_director_clean_view(None, True)
     _select_roots([root])
-    return dict(root=root, objects=objects, controls=controls)
+    objects = [root] + imported + pose_controls
+    if ring is not None:
+        objects.append(ring)
+    return dict(root=root, armature=armature, body=body, objects=objects, controls=controls)
+
+
+def _add_bundled_furniture_asset(kind, label, location, asset_id, collection="Director Props"):
+    collection_name = (
+        FURNITURE_SOFA_COLLECTION_NAME
+        if kind == "sofa"
+        else FURNITURE_TABLE_COLLECTION_NAME
+    )
+    if not FURNITURE_TEMPLATE_PATH or not os.path.exists(FURNITURE_TEMPLATE_PATH):
+        raise RuntimeError(
+            "内置现代家具资源不存在，请重新打开导演台工程以修复资产："
+            + str(FURNITURE_TEMPLATE_PATH)
+        )
+    try:
+        with bpy.data.libraries.load(FURNITURE_TEMPLATE_PATH, link=False) as (data_from, data_to):
+            if collection_name not in data_from.collections:
+                raise RuntimeError("家具包缺少集合：" + collection_name)
+            data_to.collections = [collection_name]
+    except Exception as exc:
+        raise RuntimeError("载入内置现代家具失败：" + str(exc))
+
+    imported_collection = data_to.collections[0]
+    if imported_collection is None:
+        raise RuntimeError("载入家具集合失败：" + collection_name)
+    imported = [obj for obj in imported_collection.all_objects if obj is not None]
+    root = next(
+        (
+            obj
+            for obj in imported
+            if bool(obj.get("gpt_director_asset_template_root", False))
+            and str(obj.get("gpt_director_furniture_kind", "")) == kind
+        ),
+        None,
+    )
+    if root is None:
+        for obj in imported:
+            try:
+                bpy.data.objects.remove(obj, do_unlink=True)
+            except Exception:
+                pass
+        try:
+            bpy.data.collections.remove(imported_collection)
+        except Exception:
+            pass
+        raise RuntimeError("家具模板缺少根控制器：" + kind)
+
+    role = "sofa" if kind == "sofa" else "table"
+    for obj in imported:
+        original_name = str(obj.name)
+        obj.name = label + " " + original_name
+        _set_director_tags(obj, asset_id, "prop", role)
+        if obj is root:
+            _link_to_collection(obj, "Director Controls")
+        else:
+            _link_to_collection(obj, collection)
+    try:
+        bpy.data.collections.remove(imported_collection)
+    except Exception:
+        pass
+
+    root.name = label + " 根控制器"
+    root.location = Vector(location)
+    root.empty_display_type = "ARROWS"
+    root.empty_display_size = 0.45
+    _set_director_label_visibility(root, False)
+    root.hide_render = True
+    root.show_in_front = True
+    root.color = (1.0, 0.72, 0.12, 1.0)
+    root["gpt_director_attribution_path"] = FURNITURE_ATTRIBUTION_PATH
+    root["gpt_director_control_hint"] = "拖动此根控制器可整体移动、旋转或缩放专业家具资产"
+
+    ring_radius = 1.08 if kind == "sofa" else 0.68
+    ring = _add_control_ring(root, label + " 控制圈", radius=ring_radius)
+    objects = list(imported)
+    if ring is not None:
+        objects.append(ring)
+    _select_roots([root])
+    return dict(root=root, objects=objects)
 
 
 def _add_sofa_unit(label, location=(0, 0, 0), asset_id="", collection="Director Props"):
     asset_id = asset_id or _safe_id(label, "builtin_sofa")
-    root = _add_empty_control(label + " 根控制器", location, asset_id, "prop", "sofa")
-    sofa = _mat(label + " 白色软包", (0.78, 0.78, 0.76, 1))
-    shadow = _mat(label + " 深色缝线", (0.18, 0.18, 0.18, 1))
-    objects = [root]
-
-    def add_part(obj, local_location, local_rotation=(0, 0, 0)):
-        _set_director_tags(obj, asset_id, "prop", "sofa")
-        _parent_to_root(obj, root, local_location, local_rotation)
-        objects.append(obj)
-        return obj
-
-    add_part(_cube(label + " 座垫", (0, 0, 0), (0.78, 0.46, 0.18), sofa, collection), (0, 0, 0.34))
-    add_part(_cube(label + " 靠背", (0, 0, 0), (0.78, 0.10, 0.58), sofa, collection), (0, 0.36, 0.72))
-    add_part(_cube(label + " 左扶手", (0, 0, 0), (0.08, 0.46, 0.36), sofa, collection), (-0.86, 0.00, 0.50))
-    add_part(_cube(label + " 右扶手", (0, 0, 0), (0.08, 0.46, 0.36), sofa, collection), (0.86, 0.00, 0.50))
-    add_part(_cube(label + " 坐垫线", (0, 0, 0), (0.70, 0.012, 0.012), shadow, collection), (0, -0.08, 0.53))
-    ring = _add_control_ring(root, label + " 控制圈", radius=0.72)
-    if ring is not None:
-        objects.append(ring)
-    return dict(root=root, objects=objects)
+    return _add_bundled_furniture_asset(
+        "sofa",
+        label,
+        location,
+        asset_id,
+        collection=collection,
+    )
 
 
 def _add_round_table_asset(label="圆桌", location=(0, 0, 0), asset_id="builtin_round_table", collection="Director Props"):
-    root = _add_empty_control(label + " 根控制器", location, asset_id, "prop", "table")
-    mat = _mat(label + " 浅灰桌面", (0.74, 0.74, 0.70, 1))
-    dark = _mat(label + " 深色桌脚", (0.18, 0.18, 0.18, 1))
-    objects = [root]
-
-    def add_part(obj, local_location, local_rotation=(0, 0, 0)):
-        _set_director_tags(obj, asset_id, "prop", "table")
-        _parent_to_root(obj, root, local_location, local_rotation)
-        objects.append(obj)
-        return obj
-
-    add_part(_cylinder(label + " 桌面", (0, 0, 0), 0.62, 0.08, mat, collection=collection), (0, 0, 0.62))
-    add_part(_cylinder(label + " 桌脚", (0, 0, 0), 0.055, 0.58, dark, collection=collection), (0, 0, 0.32))
-    add_part(_cylinder(label + " 底座", (0, 0, 0), 0.32, 0.035, mat, collection=collection), (0, 0, 0.06))
-    ring = _add_control_ring(root, label + " 控制圈", radius=0.68)
-    if ring is not None:
-        objects.append(ring)
-    return dict(root=root, objects=objects)
+    return _add_bundled_furniture_asset(
+        "table",
+        label,
+        location,
+        asset_id,
+        collection=collection,
+    )
 
 
 def _seed_director_metadata_for_lounge(left_actor, right_actor, left_sofa, right_sofa, table):
@@ -11275,29 +16297,29 @@ def _seed_director_metadata_for_lounge(left_actor, right_actor, left_sofa, right
     data["director_capabilities"] = dict(
         version=2,
         mode="real_blender_director_stage",
-        asset_formats=["blend", "glb", "gltf", "fbx", "obj", "bvh", "png", "jpg", "jpeg", "tif", "tiff", "exr", "hdr"],
+        asset_formats=["blend", "glb", "gltf", "fbx", "obj", "bvh", "stl", "ply", "abc", "usd", "usdz", "png", "jpg", "jpeg", "tif", "tiff", "exr", "hdr"],
         asset_kinds=["character", "prop", "scene", "action", "model", "material", "texture", "hdri"],
-        control_model=["root_empty", "viewport_control_ring", "actor_slots", "object_templates", "camera_templates", "texture_materials", "action_clips", "retarget_profiles"],
+        control_model=["root_empty", "viewport_control_ring", "armature", "ik_fk", "hand_foot_controls", "actor_slots", "object_templates", "camera_templates", "texture_materials", "action_clips", "retarget_profiles"],
         built_in_scene_operator="gpt_director.add_dialogue_lounge_scene",
         open_ecosystem=[item.get("id") for item in OPEN_ASSET_SOURCE_PROFILES if isinstance(item, dict)],
     )
     _record_builtin_asset(
         data,
         "builtin_blue_mannequin",
-        "蓝色可控人偶",
+        "蓝色 IK/FK 骨骼人偶",
         "character",
         right_actor.get("objects") if isinstance(right_actor, dict) else [],
-        ["Director Characters", "Director Controls"],
-        "可拖动根控制器的人偶资产，适合短剧演员位、站位和走位。",
+        ["Director Characters", "Director Controls", "Director Mannequin Widgets"],
+        "CC-BY 骨骼人偶，可拖动根控制器整体走位，也可拖动手脚 IK 控制器摆姿势。",
     )
     _record_builtin_asset(
         data,
         "builtin_red_mannequin",
-        "红色可控人偶",
+        "红色 IK/FK 骨骼人偶",
         "character",
         left_actor.get("objects") if isinstance(left_actor, dict) else [],
-        ["Director Characters", "Director Controls"],
-        "可拖动根控制器的人偶资产，适合对手戏、正反打和动作预演。",
+        ["Director Characters", "Director Controls", "Director Mannequin Widgets"],
+        "CC-BY 骨骼人偶，适合对手戏、正反打、坐姿和动作预演。",
     )
     prop_objects = []
     for bundle in (left_sofa, right_sofa, table):
@@ -11330,7 +16352,7 @@ def _seed_director_metadata_for_lounge(left_actor, right_actor, left_sofa, right
     )
     scene = bpy.context.scene
     scene.gpt_director_preset_name = "双人沙发圆桌导演台"
-    scene.gpt_director_preset_note = "图片参考风格：两名可控人偶、双沙发、圆桌、深色网格地面、可调机位。"
+    scene.gpt_director_preset_note = "图片参考风格：两名可控人偶、专业软包沙发、几何茶几、深色网格地面、可调机位。"
     preset = _scene_preset_from_current_scene(
         scene,
         "builtin_dialogue_lounge_scene",
@@ -11367,22 +16389,24 @@ def _build_dialogue_lounge_scene():
         pass
     left_sofa = _add_sofa_unit("左侧沙发", (-1.15, 0.05, 0), "builtin_left_sofa")
     right_sofa = _add_sofa_unit("右侧沙发", (1.15, 0.05, 0), "builtin_right_sofa")
-    table = _add_round_table_asset("中心圆桌", (0, -0.10, 0), "builtin_round_table")
-    left_actor = _add_basic_mannequin(
+    table = _add_round_table_asset("中心茶几", (0, -0.92, 0), "builtin_round_table")
+    left_actor = _add_rigged_mannequin(
         "红色人偶",
         (0.78, 0.18, 0.12, 1),
         location=(-1.15, -0.28, 0),
         pose="seated",
         asset_id="builtin_red_mannequin",
         role="actor_red",
+        look_yaw=12,
     )
-    right_actor = _add_basic_mannequin(
+    right_actor = _add_rigged_mannequin(
         "蓝色人偶",
         (0.08, 0.38, 0.84, 1),
         location=(1.15, -0.26, 0),
-        pose="reclining",
+        pose="seated",
         asset_id="builtin_blue_mannequin",
         role="actor_blue",
+        look_yaw=-12,
     )
     _add_three_point_lighting()
     camera = bpy.context.scene.camera
@@ -11451,7 +16475,7 @@ class GPT_OT_director_add_dialogue_lounge_scene(bpy.types.Operator):
 
     def execute(self, context):
         _build_dialogue_lounge_scene()
-        self.report({{"INFO"}}, "影视双人对话场已生成：可拖动人偶、沙发、圆桌和机位继续调整")
+        self.report({{"INFO"}}, "影视双人对话场已生成：可拖动人偶、专业沙发、几何茶几和机位继续调整")
         return {{"FINISHED"}}
 
 
@@ -11519,9 +16543,9 @@ class GPT_OT_director_add_blue_mannequin(bpy.types.Operator):
     bl_options = {{"REGISTER", "UNDO"}}
 
     def execute(self, context):
-        bundle = _add_basic_mannequin("蓝色人偶", (0.08, 0.38, 0.84, 1), location=(-0.8, 0, 0), asset_id="builtin_blue_mannequin")
+        bundle = _add_rigged_mannequin("蓝色人偶", (0.08, 0.38, 0.84, 1), location=(-0.8, 0, 0), asset_id="builtin_blue_mannequin")
         data = _load_meta()
-        _record_builtin_asset(data, "builtin_blue_mannequin", "蓝色可控人偶", "character", bundle.get("objects") or [], ["Director Characters", "Director Controls"])
+        _record_builtin_asset(data, "builtin_blue_mannequin", "蓝色 IK/FK 骨骼人偶", "character", bundle.get("objects") or [], ["Director Characters", "Director Controls", "Director Mannequin Widgets"])
         _record_builtin_actor(data, "builtin_actor_blue", "蓝色人偶", "演员位", bundle.get("objects") or [])
         _save_meta(data)
         return {{"FINISHED"}}
@@ -11533,12 +16557,156 @@ class GPT_OT_director_add_red_mannequin(bpy.types.Operator):
     bl_options = {{"REGISTER", "UNDO"}}
 
     def execute(self, context):
-        bundle = _add_basic_mannequin("红色人偶", (0.78, 0.18, 0.12, 1), location=(0.8, 0, 0), asset_id="builtin_red_mannequin")
+        bundle = _add_rigged_mannequin("红色人偶", (0.78, 0.18, 0.12, 1), location=(0.8, 0, 0), asset_id="builtin_red_mannequin")
         data = _load_meta()
-        _record_builtin_asset(data, "builtin_red_mannequin", "红色可控人偶", "character", bundle.get("objects") or [], ["Director Characters", "Director Controls"])
+        _record_builtin_asset(data, "builtin_red_mannequin", "红色 IK/FK 骨骼人偶", "character", bundle.get("objects") or [], ["Director Characters", "Director Controls", "Director Mannequin Widgets"])
         _record_builtin_actor(data, "builtin_actor_red", "红色人偶", "演员位", bundle.get("objects") or [])
         _save_meta(data)
         return {{"FINISHED"}}
+
+
+class GPT_OT_director_select_mannequin_controls(bpy.types.Operator):
+    bl_idname = "gpt_director.select_mannequin_controls"
+    bl_label = "选择人偶可视控制器"
+    bl_options = {{"REGISTER"}}
+
+    asset_id: StringProperty(default="")
+
+    def execute(self, context):
+        controls = [
+            obj
+            for obj in bpy.data.objects
+            if str(obj.get("gpt_director_asset_id", "")) == str(self.asset_id or "")
+            and str(obj.get("gpt_director_role", "")) == "pose_proxy"
+        ]
+        try:
+            bpy.ops.object.mode_set(mode="OBJECT")
+        except Exception:
+            pass
+        try:
+            bpy.ops.object.select_all(action="DESELECT")
+        except Exception:
+            pass
+        for control in controls:
+            try:
+                control.hide_set(False)
+                control.hide_select = False
+                control.select_set(True)
+            except Exception:
+                pass
+        if not controls:
+            self.report({{"WARNING"}}, "未找到该人偶的可视控制器，请先添加人偶或生成双人场")
+            return {{"CANCELLED"}}
+        context.view_layer.objects.active = controls[0]
+        self.report({{"INFO"}}, "已选择 " + str(len(controls)) + " 个彩色控制器，可在对象模式直接拖动")
+        return {{"FINISHED"}}
+
+
+class GPT_OT_director_toggle_control_labels(bpy.types.Operator):
+    bl_idname = "gpt_director.toggle_control_labels"
+    bl_label = "切换导演台文字标签"
+    bl_options = {{"REGISTER", "UNDO"}}
+
+    visible: BoolProperty(default=False)
+
+    def execute(self, context):
+        changed = _set_all_director_label_visibility(bool(self.visible))
+        if self.visible:
+            self.report({{"INFO"}}, "已显示 " + str(changed) + " 个导演台对象/骨骼名称")
+        else:
+            self.report({{"INFO"}}, "已隐藏 " + str(changed) + " 个导演台对象/骨骼名称，控制器仍可选择拖动")
+        return {{"FINISHED"}}
+
+
+class GPT_OT_director_toggle_clean_view(bpy.types.Operator):
+    bl_idname = "gpt_director.toggle_clean_view"
+    bl_label = "切换导演台清爽视图"
+    bl_options = {{"REGISTER", "UNDO"}}
+
+    enabled: BoolProperty(default=True)
+
+    def execute(self, context):
+        changed = _set_director_clean_view(context, bool(self.enabled))
+        if self.enabled:
+            self.report({{"INFO"}}, "已进入清爽视图：隐藏骨架线、大控制圈和关系虚线，保留可拖动控制器")
+        else:
+            self.report({{"INFO"}}, "已显示精调线框：" + str(changed) + " 个导演台辅助对象可见")
+        return {{"FINISHED"}}
+
+
+class GPT_OT_director_simple_drag_mode(bpy.types.Operator):
+    bl_idname = "gpt_director.simple_drag_mode"
+    bl_label = "极简拖动模式"
+    bl_options = {{"REGISTER", "UNDO"}}
+
+    _drag_root = None
+    _drag_plane_z = 0.0
+    _drag_offset = None
+    _dragging = False
+
+    def invoke(self, context, event):
+        region, space = _view3d_window_region_and_space(context)
+        if region is None or space is None:
+            self.report({{"WARNING"}}, "请在 Blender 3D 视图里启动极简拖动模式")
+            return {{"CANCELLED"}}
+        _set_director_simple_view(context, True)
+        self._drag_root = None
+        self._drag_offset = None
+        self._dragging = False
+        context.window_manager.modal_handler_add(self)
+        self.report({{"INFO"}}, "极简拖动模式：左键按住人偶/家具拖动；右键或 Esc 退出")
+        return {{"RUNNING_MODAL"}}
+
+    def modal(self, context, event):
+        if event.type in {"ESC", "RIGHTMOUSE"}:
+            self._drag_root = None
+            self._dragging = False
+            self.report({{"INFO"}}, "已退出极简拖动模式")
+            return {{"CANCELLED"}}
+        if event.type == "LEFTMOUSE" and event.value == "PRESS":
+            obj, hit_location = _raycast_visible_director_object(context, event)
+            root = _director_drag_root_for_object(obj)
+            if root is None:
+                return {{"RUNNING_MODAL"}}
+            try:
+                self._drag_plane_z = float(root.location.z)
+            except Exception:
+                self._drag_plane_z = 0.0
+            plane_point = _view3d_plane_intersection(context, event, self._drag_plane_z) or hit_location
+            if plane_point is None:
+                return {{"RUNNING_MODAL"}}
+            try:
+                self._drag_offset = root.location.copy() - plane_point
+                self._drag_root = root
+                self._dragging = True
+                bpy.ops.object.select_all(action="DESELECT")
+                root.hide_set(False)
+                root.select_set(True)
+                context.view_layer.objects.active = root
+                root.hide_set(True)
+            except Exception:
+                self._drag_root = root
+                self._dragging = True
+            return {{"RUNNING_MODAL"}}
+        if event.type == "MOUSEMOVE" and self._dragging and self._drag_root is not None:
+            plane_point = _view3d_plane_intersection(context, event, self._drag_plane_z)
+            if plane_point is None:
+                return {{"RUNNING_MODAL"}}
+            try:
+                new_location = plane_point + self._drag_offset
+                self._drag_root.location.x = new_location.x
+                self._drag_root.location.y = new_location.y
+                self._drag_root.location.z = self._drag_plane_z
+                context.view_layer.update()
+            except Exception:
+                pass
+            return {{"RUNNING_MODAL"}}
+        if event.type == "LEFTMOUSE" and event.value == "RELEASE":
+            self._drag_root = None
+            self._drag_offset = None
+            self._dragging = False
+            return {{"RUNNING_MODAL"}}
+        return {{"PASS_THROUGH"}}
 
 
 class GPT_OT_director_add_sofa_set(bpy.types.Operator):
@@ -11549,7 +16717,7 @@ class GPT_OT_director_add_sofa_set(bpy.types.Operator):
     def execute(self, context):
         left = _add_sofa_unit("左侧沙发", (-1.0, 0.25, 0), "builtin_left_sofa")
         right = _add_sofa_unit("右侧沙发", (1.0, 0.25, 0), "builtin_right_sofa")
-        table = _add_round_table_asset("中心圆桌", (0, 0.05, 0), "builtin_round_table")
+        table = _add_round_table_asset("中心茶几", (0, -0.85, 0), "builtin_round_table")
         objects = []
         for bundle in (left, right, table):
             objects.extend(bundle.get("objects") or [])
@@ -11561,13 +16729,13 @@ class GPT_OT_director_add_sofa_set(bpy.types.Operator):
 
 class GPT_OT_director_add_round_table(bpy.types.Operator):
     bl_idname = "gpt_director.add_round_table"
-    bl_label = "添加圆桌"
+    bl_label = "添加几何茶几"
     bl_options = {{"REGISTER", "UNDO"}}
 
     def execute(self, context):
-        table = _add_round_table_asset("圆桌", (0, 0, 0), "builtin_round_table")
+        table = _add_round_table_asset("几何茶几", (0, 0, 0), "builtin_round_table")
         data = _load_meta()
-        _record_builtin_asset(data, "builtin_round_table", "圆桌道具", "prop", table.get("objects") or [], ["Director Props", "Director Controls"])
+        _record_builtin_asset(data, "builtin_round_table", "几何茶几道具", "prop", table.get("objects") or [], ["Director Props", "Director Controls"])
         _save_meta(data)
         return {{"FINISHED"}}
 
@@ -12600,7 +17768,7 @@ class GPT_OT_director_import_model(bpy.types.Operator, ImportHelper):
     bl_label = "导入资产"
     bl_options = {{"REGISTER", "UNDO"}}
     filename_ext = ".glb"
-    filter_glob: StringProperty(default="*.blend;*.glb;*.gltf;*.fbx;*.obj;*.bvh;*.png;*.jpg;*.jpeg;*.tif;*.tiff;*.exr;*.hdr", options={{"HIDDEN"}})
+    filter_glob: StringProperty(default="*.blend;*.glb;*.gltf;*.fbx;*.obj;*.bvh;*.stl;*.ply;*.abc;*.usd;*.usdz;*.png;*.jpg;*.jpeg;*.tif;*.tiff;*.exr;*.hdr", options={{"HIDDEN"}})
 
     def execute(self, context):
         filepath = self.filepath
@@ -12701,6 +17869,12 @@ class GPT_OT_director_import_library_asset(bpy.types.Operator):
         if not item:
             self.report({{"ERROR"}}, "没有找到选中的库资产，请先扫描资产库")
             return {{"CANCELLED"}}
+        preflight = _asset_preflight_for_library_item(data, item)
+        _set_library_asset_preflight(data, key, preflight)
+        if preflight.get("blocked"):
+            _save_meta(data)
+            self.report({{"ERROR"}}, _asset_preflight_error_message(preflight))
+            return {{"CANCELLED"}}
         filepath = str(item.get("path") or "").strip()
         if not filepath or not os.path.exists(filepath):
             self.report({{"ERROR"}}, "库资产文件不存在，请重新扫描资产库")
@@ -12755,6 +17929,12 @@ class GPT_OT_director_apply_library_texture_material(bpy.types.Operator):
         item = _find_library_asset(data, key)
         if not item:
             self.report({{"ERROR"}}, "没有找到选中的贴图/材质库资产，请先扫描资产库")
+            return {{"CANCELLED"}}
+        preflight = _asset_preflight_for_library_item(data, item)
+        _set_library_asset_preflight(data, key, preflight)
+        if preflight.get("blocked"):
+            _save_meta(data)
+            self.report({{"ERROR"}}, _asset_preflight_error_message(preflight))
             return {{"CANCELLED"}}
         try:
             asset_record, application = _apply_library_texture_material(context, data, item)
@@ -12910,6 +18090,253 @@ class GPT_OT_director_import_plan_assets(bpy.types.Operator):
         return {{"CANCELLED"}}
 
 
+class GPT_OT_director_prepare_shot_assets(bpy.types.Operator):
+    bl_idname = "gpt_director.prepare_shot_assets"
+    bl_label = "准备当前镜头资产"
+    bl_options = {{"REGISTER", "UNDO"}}
+
+    def execute(self, context):
+        data, shot, plan = _active_shot_asset_plan(context)
+        if not shot:
+            self.report({{"ERROR"}}, "请先选择或保存一个镜头")
+            return {{"CANCELLED"}}
+        requirements = plan.get("requirements") if isinstance(plan.get("requirements"), list) else []
+        if not requirements:
+            self.report({{"ERROR"}}, "当前镜头没有记录演员或资产依赖")
+            return {{"CANCELLED"}}
+        actor, target_armature = _active_action_target(data)
+        imported = 0
+        skipped = 0
+        failed = 0
+        imported_assets = []
+        skipped_requirements = []
+        used_candidates = set()
+        last_asset_id = ""
+        for requirement in requirements:
+            if not isinstance(requirement, dict):
+                continue
+            if requirement.get("available"):
+                skipped += 1
+                skipped_requirements.append({{"name": str(requirement.get("name") or ""), "reason": "已具备"}})
+                continue
+            candidate = requirement.get("best_library_candidate") if isinstance(requirement.get("best_library_candidate"), dict) else {{}}
+            candidate_id = str(candidate.get("id") or "").strip()
+            if not candidate_id:
+                skipped += 1
+                skipped_requirements.append({{"name": str(requirement.get("name") or ""), "reason": "没有本地库候选"}})
+                continue
+            if candidate_id in used_candidates:
+                skipped += 1
+                skipped_requirements.append({{"name": str(requirement.get("name") or ""), "reason": "候选已用于本镜头"}})
+                continue
+            used_candidates.add(candidate_id)
+            item = _find_library_asset(data, candidate_id)
+            if not item:
+                skipped += 1
+                skipped_requirements.append({{"name": str(requirement.get("name") or ""), "reason": "候选记录不存在"}})
+                continue
+            preflight = _asset_preflight_for_library_item(data, item)
+            _set_library_asset_preflight(data, candidate_id, preflight)
+            if preflight.get("blocked"):
+                skipped += 1
+                skipped_requirements.append({{"name": str(requirement.get("name") or ""), "reason": _asset_preflight_error_message(preflight)}})
+                continue
+            filepath = str(item.get("path") or "").strip()
+            if not filepath or not os.path.exists(filepath):
+                skipped += 1
+                skipped_requirements.append({{"name": str(requirement.get("name") or ""), "reason": "候选文件不存在"}})
+                continue
+            item_kind = str(item.get("kind_hint") or _asset_kind_from_path(filepath, item) or "").strip()
+            target_type = _shot_asset_target_type(requirement)
+            asset_kind = item_kind if item_kind in ASSET_KIND_COLLECTIONS else (target_type if target_type in ASSET_KIND_COLLECTIONS else "model")
+            if filepath.lower().endswith(".bvh"):
+                asset_kind = "action"
+            label = str(requirement.get("name") or item.get("name") or item.get("file_name") or os.path.basename(filepath))
+            try:
+                asset_record = _import_director_asset(filepath, asset_kind, label, target_armature if asset_kind == "action" else None)
+            except Exception as exc:
+                failed += 1
+                skipped_requirements.append({{"name": label, "reason": "导入失败：" + str(exc)}})
+                continue
+            asset_record["library_item_id"] = str(item.get("id") or "")
+            asset_record["library_path"] = str(item.get("library_path") or "")
+            asset_record["library_relative_path"] = str(item.get("relative_path") or "")
+            asset_record["source_profile_id"] = str(item.get("source_profile_id") or "")
+            asset_record["source_profile_name"] = str(item.get("source_profile_name") or "")
+            asset_record["prepared_for_shot_id"] = str(shot.get("id") or "")
+            asset_record["prepared_for_shot_name"] = str(shot.get("name") or "")
+            asset_record["shot_asset_requirement"] = {{
+                "kind": str(requirement.get("kind") or ""),
+                "name": str(requirement.get("name") or ""),
+                "type": str(requirement.get("type") or ""),
+                "candidate_score": candidate.get("score"),
+            }}
+            if asset_kind == "action":
+                _record_action_application(
+                    data,
+                    asset_record.get("target_armature", target_armature.name if target_armature else ""),
+                    (asset_record.get("actions") or [""])[-1] if isinstance(asset_record.get("actions"), list) else "",
+                    asset_record.get("auto_apply_status", "not_applied"),
+                    asset_record.get("auto_apply_message", ""),
+                    actor,
+                )
+                _upsert_action_clip_from_asset_record(data, asset_record, actor, target_armature, item)
+            _append_asset_record(data, asset_record)
+            _mark_library_asset_used(data, candidate_id)
+            imported += 1
+            last_asset_id = str(asset_record.get("id") or "")
+            imported_assets.append({{
+                "id": last_asset_id,
+                "name": str(asset_record.get("name") or ""),
+                "type": str(asset_record.get("type") or ""),
+                "library_item_id": str(item.get("id") or ""),
+                "requirement_name": str(requirement.get("name") or ""),
+            }})
+        _append_shot_asset_preparation(data, {{
+            "shot_id": str(shot.get("id") or ""),
+            "shot_name": str(shot.get("name") or ""),
+            "imported_count": imported,
+            "skipped_count": skipped,
+            "failed_count": failed,
+            "imported_assets": imported_assets,
+            "skipped_requirements": skipped_requirements,
+            "prepared_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        }})
+        _save_meta(data)
+        if last_asset_id:
+            try:
+                context.scene.gpt_director_asset_choice = last_asset_id
+            except Exception:
+                pass
+        if imported:
+            self.report({{"INFO"}}, "镜头资产已准备：" + str(imported) + " 个" + (("，跳过 " + str(skipped)) if skipped else "") + (("，失败 " + str(failed)) if failed else ""))
+            return {{"FINISHED"}}
+        self.report({{"ERROR"}}, "没有可导入的镜头资产候选")
+        return {{"CANCELLED"}}
+
+
+class GPT_OT_director_export_ai_workflow_tasks(bpy.types.Operator):
+    bl_idname = "gpt_director.export_ai_workflow_tasks"
+    bl_label = "导出AI工作流任务包"
+    bl_options = {{"REGISTER"}}
+
+    def execute(self, context):
+        data = _load_meta()
+        task_data, manifest_path, report_path, csv_path = _write_ai_workflow_tasks(data)
+        _save_meta(data)
+        self.report({{"INFO"}}, "AI工作流任务包已导出：" + str(task_data.get("task_count") or 0) + " 个任务")
+        return {{"FINISHED"}}
+
+
+class GPT_OT_director_export_ai_workflow_handoff(bpy.types.Operator):
+    bl_idname = "gpt_director.export_ai_workflow_handoff"
+    bl_label = "导出AI工作包与结果收件箱"
+    bl_options = {{"REGISTER"}}
+
+    def execute(self, context):
+        data = _load_meta()
+        manifest, manifest_path, report_path, csv_path, readme_path = _write_ai_workflow_handoff(data)
+        _save_meta(data)
+        self.report({{"INFO"}}, "AI工作包已导出：" + str(manifest.get("task_count") or 0) + " 个任务")
+        return {{"FINISHED"}}
+
+
+class GPT_OT_director_register_ai_workflow_result(bpy.types.Operator, ImportHelper):
+    bl_idname = "gpt_director.register_ai_workflow_result"
+    bl_label = "登记AI生成结果"
+    bl_options = {{"REGISTER", "UNDO"}}
+    filename_ext = ".png"
+    filter_glob: StringProperty(default="*.blend;*.glb;*.gltf;*.fbx;*.obj;*.bvh;*.stl;*.ply;*.abc;*.usd;*.usdz;*.png;*.jpg;*.jpeg;*.webp;*.bmp;*.mp4;*.mov;*.avi;*.mkv;*.exr;*.hdr", options={{"HIDDEN"}})
+
+    def execute(self, context):
+        data = _load_meta()
+        result_type = str(getattr(context.scene, "gpt_director_ai_result_type", "auto") or "auto")
+        task_id = _active_ai_task_id(context.scene)
+        note = _active_ai_result_note(context.scene)
+        try:
+            result, payload = _register_ai_workflow_result(data, self.filepath, result_type, task_id, note)
+        except Exception as exc:
+            self.report({{"ERROR"}}, str(exc))
+            return {{"CANCELLED"}}
+        _save_meta(data)
+        try:
+            if result.get("target_type") == "asset" and payload.get("id"):
+                context.scene.gpt_director_asset_choice = payload.get("id")
+            if result.get("task_id"):
+                context.scene.gpt_director_ai_task_id = result.get("task_id")
+        except Exception:
+            pass
+        self.report({{"INFO"}}, "AI生成结果已登记：" + str(result.get("payload_name") or os.path.basename(self.filepath)))
+        return {{"FINISHED"}}
+
+
+class GPT_OT_director_register_ai_workflow_result_directory(bpy.types.Operator):
+    bl_idname = "gpt_director.register_ai_workflow_result_directory"
+    bl_label = "批量登记AI结果目录"
+    bl_options = {{"REGISTER", "UNDO"}}
+
+    directory: StringProperty(name="AI结果目录", default="", subtype="DIR_PATH")
+    recursive: BoolProperty(name="递归扫描", default=False)
+
+    def invoke(self, context, event):
+        self.directory = str(getattr(context.scene, "gpt_director_ai_result_directory", "") or "")
+        self.recursive = bool(getattr(context.scene, "gpt_director_ai_result_recursive", False))
+        context.window_manager.fileselect_add(self)
+        return {{"RUNNING_MODAL"}}
+
+    def execute(self, context):
+        directory = str(self.directory or getattr(context.scene, "gpt_director_ai_result_directory", "") or "").strip()
+        if not directory or not os.path.isdir(directory):
+            self.report({{"ERROR"}}, "AI结果目录不存在")
+            return {{"CANCELLED"}}
+        data = _load_meta()
+        result_type = str(getattr(context.scene, "gpt_director_ai_result_type", "auto") or "auto")
+        fallback_task_id = _active_ai_task_id(context.scene)
+        note = _active_ai_result_note(context.scene)
+        recursive = bool(getattr(context.scene, "gpt_director_ai_result_recursive", False) or self.recursive)
+        paths = []
+        if recursive:
+            for root, dirs, files in os.walk(directory):
+                dirs[:] = sorted(d for d in dirs if d not in ("__pycache__", ".git"))
+                for name in sorted(files):
+                    path = os.path.join(root, name)
+                    if path.lower().endswith(AI_RESULT_EXTENSIONS):
+                        paths.append(path)
+        else:
+            for name in sorted(os.listdir(directory)):
+                path = os.path.join(directory, name)
+                if os.path.isfile(path) and path.lower().endswith(AI_RESULT_EXTENSIONS):
+                    paths.append(path)
+        if not paths:
+            self.report({{"ERROR"}}, "目录里没有可登记的AI结果文件")
+            return {{"CANCELLED"}}
+        registered = 0
+        failed = 0
+        last_asset_id = ""
+        for path in paths:
+            task_id = _ai_result_task_id_from_path(data, path, fallback_task_id)
+            try:
+                result, payload = _register_ai_workflow_result(data, path, result_type, task_id, note)
+            except Exception:
+                failed += 1
+                continue
+            registered += 1
+            if result.get("target_type") == "asset" and payload.get("id"):
+                last_asset_id = str(payload.get("id") or "")
+        _save_meta(data)
+        try:
+            context.scene.gpt_director_ai_result_directory = directory
+            if last_asset_id:
+                context.scene.gpt_director_asset_choice = last_asset_id
+        except Exception:
+            pass
+        if registered:
+            self.report({{"INFO"}}, "批量登记AI结果：" + str(registered) + " 个" + (("，失败 " + str(failed)) if failed else ""))
+            return {{"FINISHED"}}
+        self.report({{"ERROR"}}, "AI结果登记失败：" + str(failed) + " 个")
+        return {{"CANCELLED"}}
+
+
 class GPT_OT_director_select_asset(bpy.types.Operator):
     bl_idname = "gpt_director.select_asset"
     bl_label = "选中工程资产"
@@ -12995,7 +18422,120 @@ class GPT_OT_director_build_retarget_profile(bpy.types.Operator):
             context.scene.gpt_director_retarget_profile_choice = profile_id
         except Exception:
             pass
-        self.report({{"INFO"}}, "重定向映射已建立：" + str(profile.get("mapped_bone_count") or 0) + " 根骨骼")
+        self.report(
+            {{"INFO"}},
+            "重定向映射已建立："
+            + str(profile.get("mapped_bone_count") or 0)
+            + " 根，源未映射 "
+            + str(profile.get("unmapped_source_count") or 0)
+            + " 根",
+        )
+        return {{"FINISHED"}}
+
+
+class GPT_OT_director_load_retarget_bone_mapping(bpy.types.Operator):
+    bl_idname = "gpt_director.load_retarget_bone_mapping"
+    bl_label = "读取骨骼映射"
+    bl_options = {{"REGISTER"}}
+
+    def execute(self, context):
+        data = _load_meta()
+        profile = _find_retarget_profile(data, _active_retarget_profile_key(context.scene))
+        row = _retarget_mapping_row(profile, getattr(context.scene, "gpt_director_retarget_bone_mapping_choice", ""))
+        if not row:
+            self.report({{"ERROR"}}, "请先选择一条骨骼映射")
+            return {{"CANCELLED"}}
+        context.scene.gpt_director_retarget_source_bone = str(row.get("source") or "")
+        context.scene.gpt_director_retarget_target_bone = str(row.get("target") or "")
+        self.report({{"INFO"}}, "已读取映射：" + context.scene.gpt_director_retarget_source_bone + " → " + context.scene.gpt_director_retarget_target_bone)
+        return {{"FINISHED"}}
+
+
+class GPT_OT_director_set_retarget_bone_mapping(bpy.types.Operator):
+    bl_idname = "gpt_director.set_retarget_bone_mapping"
+    bl_label = "保存骨骼映射"
+    bl_options = {{"REGISTER"}}
+
+    def execute(self, context):
+        data = _load_meta()
+        profile = _find_retarget_profile(data, _active_retarget_profile_key(context.scene))
+        if not profile:
+            self.report({{"ERROR"}}, "请先建立或选择一个重定向档案")
+            return {{"CANCELLED"}}
+        source_armature = _armature_by_name(profile.get("source_armature"))
+        target_armature = _armature_by_name(profile.get("target_armature"))
+        source_name = str(getattr(context.scene, "gpt_director_retarget_source_bone", "") or "").strip()
+        target_name = str(getattr(context.scene, "gpt_director_retarget_target_bone", "") or "").strip()
+        if not source_armature or not source_armature.data.bones.get(source_name):
+            self.report({{"ERROR"}}, "源骨骼不存在：" + (source_name or "未填写"))
+            return {{"CANCELLED"}}
+        if not target_armature or not target_armature.data.bones.get(target_name):
+            self.report({{"ERROR"}}, "目标骨骼不存在：" + (target_name or "未填写"))
+            return {{"CANCELLED"}}
+        bone_map = profile.get("bone_map") if isinstance(profile.get("bone_map"), list) else []
+        kept = []
+        for row in bone_map:
+            if not isinstance(row, dict):
+                continue
+            if str(row.get("source") or "") == source_name or str(row.get("target") or "") == target_name:
+                continue
+            kept.append(row)
+        kept.append({{
+            "source": source_name,
+            "target": target_name,
+            "role": _bone_role(source_name),
+            "confidence": 1.0,
+            "method": "手动覆盖",
+        }})
+        profile["bone_map"] = kept
+        profile["root_motion"] = {{
+            "enabled": bool(getattr(context.scene, "gpt_director_retarget_root_motion_enabled", True)),
+            "manual_scale": float(getattr(context.scene, "gpt_director_retarget_root_motion_scale", 1.0) or 1.0),
+        }}
+        profile["rest_pose_alignment"] = {{
+            "enabled": bool(getattr(context.scene, "gpt_director_retarget_rest_pose_enabled", True)),
+            "bake_step": int(getattr(context.scene, "gpt_director_retarget_bake_step", 1) or 1),
+        }}
+        profile = _refresh_retarget_profile_stats(profile, source_armature, target_armature)
+        profile["saved_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        _upsert_retarget_profile(data, profile)
+        _save_meta(data)
+        context.scene.gpt_director_retarget_bone_mapping_choice = "__none__"
+        self.report({{"INFO"}}, "骨骼映射已保存：" + source_name + " → " + target_name)
+        return {{"FINISHED"}}
+
+
+class GPT_OT_director_remove_retarget_bone_mapping(bpy.types.Operator):
+    bl_idname = "gpt_director.remove_retarget_bone_mapping"
+    bl_label = "删除骨骼映射"
+    bl_options = {{"REGISTER"}}
+
+    def execute(self, context):
+        data = _load_meta()
+        profile = _find_retarget_profile(data, _active_retarget_profile_key(context.scene))
+        row = _retarget_mapping_row(profile, getattr(context.scene, "gpt_director_retarget_bone_mapping_choice", ""))
+        source_name = str(getattr(context.scene, "gpt_director_retarget_source_bone", "") or "").strip()
+        if row:
+            source_name = str(row.get("source") or source_name)
+        if not profile or not source_name:
+            self.report({{"ERROR"}}, "请选择映射或填写要删除的源骨骼")
+            return {{"CANCELLED"}}
+        bone_map = profile.get("bone_map") if isinstance(profile.get("bone_map"), list) else []
+        kept = [item for item in bone_map if not isinstance(item, dict) or str(item.get("source") or "") != source_name]
+        if len(kept) == len(bone_map):
+            self.report({{"ERROR"}}, "没有找到对应骨骼映射")
+            return {{"CANCELLED"}}
+        source_armature = _armature_by_name(profile.get("source_armature"))
+        target_armature = _armature_by_name(profile.get("target_armature"))
+        profile["bone_map"] = kept
+        profile = _refresh_retarget_profile_stats(profile, source_armature, target_armature)
+        profile["saved_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        _upsert_retarget_profile(data, profile)
+        _save_meta(data)
+        context.scene.gpt_director_retarget_bone_mapping_choice = "__none__"
+        context.scene.gpt_director_retarget_source_bone = ""
+        context.scene.gpt_director_retarget_target_bone = ""
+        self.report({{"INFO"}}, "骨骼映射已删除：" + source_name)
         return {{"FINISHED"}}
 
 
@@ -13021,6 +18561,18 @@ class GPT_OT_director_apply_retarget_profile(bpy.types.Operator):
             source_armature = _armature_by_name(profile.get("source_armature"))
         if target_armature is None:
             target_armature = _armature_by_name(profile.get("target_armature"))
+        root_motion = profile.get("root_motion") if isinstance(profile.get("root_motion"), dict) else {{}}
+        root_motion = dict(root_motion)
+        root_motion["enabled"] = bool(getattr(context.scene, "gpt_director_retarget_root_motion_enabled", root_motion.get("enabled", True)))
+        root_motion["manual_scale"] = float(getattr(context.scene, "gpt_director_retarget_root_motion_scale", root_motion.get("manual_scale", 1.0)) or 1.0)
+        profile["root_motion"] = root_motion
+        rest_pose = profile.get("rest_pose_alignment") if isinstance(profile.get("rest_pose_alignment"), dict) else {{}}
+        rest_pose = dict(rest_pose)
+        rest_pose["enabled"] = bool(getattr(context.scene, "gpt_director_retarget_rest_pose_enabled", rest_pose.get("enabled", True)))
+        rest_pose["bake_step"] = int(getattr(context.scene, "gpt_director_retarget_bake_step", rest_pose.get("bake_step", 1)) or 1)
+        profile["rest_pose_alignment"] = rest_pose
+        profile = _refresh_retarget_profile_stats(profile, source_armature, target_armature)
+        _upsert_retarget_profile(data, profile)
         action_name = str(getattr(context.scene, "gpt_director_action_name", "") or "").strip()
         source_action = _latest_action(action_name) or _action_from_armature(source_armature)
         try:
@@ -13030,6 +18582,20 @@ class GPT_OT_director_apply_retarget_profile(bpy.types.Operator):
             _save_meta(data)
             self.report({{"ERROR"}}, str(exc))
             return {{"CANCELLED"}}
+        actor, actor_target = _active_action_target(data)
+        if actor_target is None or target_armature is None or actor_target.name != target_armature.name:
+            actor = {{}}
+        action_clip = _upsert_retarget_action_clip(
+            data,
+            profile,
+            source_action,
+            target_action,
+            target_armature,
+            actor,
+            copied,
+            skipped,
+        )
+        match_data = _refresh_action_matches(data)
         _record_retarget_application(
             data,
             profile,
@@ -13038,18 +18604,44 @@ class GPT_OT_director_apply_retarget_profile(bpy.types.Operator):
             source_armature,
             target_armature,
             "applied",
-            "已复制 " + str(copied) + " 条动作曲线，跳过 " + str(skipped) + " 条",
+            "已复制 "
+            + str(copied)
+            + " 条动作曲线，跳过 "
+            + str(skipped)
+            + " 条，根运动比例 "
+            + ("%.3f" % _retarget_motion_scale(source_armature, target_armature, profile)),
             copied,
             skipped,
+            action_clip,
+            match_data,
         )
         _save_meta(data)
         context.scene.gpt_director_action_name = target_action.name
+        context.scene.gpt_director_action_clip_name = str(action_clip.get("name") or "")
+        context.scene.gpt_director_action_clip_note = str(action_clip.get("note") or "")
+        context.scene.gpt_director_selected_action_clip = str(action_clip.get("id") or "")
         context.scene.gpt_director_selected_retarget_profile = str(profile.get("id") or "")
         try:
             context.scene.gpt_director_retarget_profile_choice = str(profile.get("id") or "__manual__")
         except Exception:
             pass
-        self.report({{"INFO"}}, "重定向动作已应用：" + target_action.name + "，复制 " + str(copied) + " 条曲线")
+        try:
+            context.scene.gpt_director_action_clip_choice = str(action_clip.get("id") or "__manual__")
+        except Exception:
+            pass
+        self.report(
+            {{"INFO"}},
+            "重定向动作已应用："
+            + target_action.name
+            + "，复制 "
+            + str(copied)
+            + " 条曲线，根运动比例 "
+            + ("%.3f" % _retarget_motion_scale(source_armature, target_armature, profile))
+            + "，动作匹配 "
+            + str(match_data.get("matched_count") or 0)
+            + "/"
+            + str(match_data.get("requirement_count") or 0),
+        )
         return {{"FINISHED"}}
 
 
@@ -14005,6 +19597,7 @@ class GPT_PT_director_panel(bpy.types.Panel):
         layout.prop(context.scene, "gpt_director_asset_library_search", text="库资产搜索")
         layout.prop(context.scene, "gpt_director_library_favorites_only", text="只看收藏")
         layout.prop(context.scene, "gpt_director_library_asset_choice", text="库资产")
+        _draw_library_asset_preflight(layout, context)
         layout.prop(context.scene, "gpt_director_library_asset_tags", text="资产标签")
         layout.prop(context.scene, "gpt_director_library_asset_note", text="用途备注")
         row = layout.row(align=True)
@@ -14060,6 +19653,49 @@ class GPT_PT_director_panel(bpy.types.Panel):
         row.operator("gpt_director.apply_retarget_profile", text="重定向动作")
         row = layout.row(align=True)
         row.operator("gpt_director.delete_retarget_profile", text="删除映射")
+        profile = _find_retarget_profile(_load_meta(), _active_retarget_profile_key(context.scene))
+        if profile:
+            profile = _refresh_retarget_profile_stats(profile)
+            mapping_box = layout.box()
+            mapping_box.label(
+                text="映射 "
+                + str(profile.get("mapped_bone_count") or 0)
+                + "｜源未映射 "
+                + str(profile.get("unmapped_source_count") or 0)
+                + "｜目标未映射 "
+                + str(profile.get("unmapped_target_count") or 0)
+            )
+            source_unmapped = profile.get("unmapped_source_bones") if isinstance(profile.get("unmapped_source_bones"), list) else []
+            target_unmapped = profile.get("unmapped_target_bones") if isinstance(profile.get("unmapped_target_bones"), list) else []
+            if source_unmapped:
+                mapping_box.label(text="源待处理：" + "、".join(source_unmapped[:6]), icon="ERROR")
+            if target_unmapped:
+                mapping_box.label(text="目标未使用：" + "、".join(target_unmapped[:6]), icon="INFO")
+            mapping_box.prop(context.scene, "gpt_director_retarget_bone_mapping_choice", text="映射条目")
+            row = mapping_box.row(align=True)
+            row.operator("gpt_director.load_retarget_bone_mapping", text="读取")
+            row.operator("gpt_director.remove_retarget_bone_mapping", text="删除")
+            mapping_box.prop(context.scene, "gpt_director_retarget_source_bone", text="源骨骼")
+            mapping_box.prop(context.scene, "gpt_director_retarget_target_bone", text="目标骨骼")
+            mapping_box.operator("gpt_director.set_retarget_bone_mapping", text="保存手动映射")
+            root_motion = profile.get("root_motion") if isinstance(profile.get("root_motion"), dict) else {{}}
+            rest_pose = profile.get("rest_pose_alignment") if isinstance(profile.get("rest_pose_alignment"), dict) else {{}}
+            mapping_box.prop(context.scene, "gpt_director_retarget_root_motion_enabled", text="保留根运动")
+            mapping_box.prop(context.scene, "gpt_director_retarget_root_motion_scale", text="根运动手动倍率")
+            mapping_box.label(
+                text="自动比例 "
+                + ("%.3f" % float(root_motion.get("automatic_scale") or 1.0))
+                + "｜当前有效 "
+                + ("%.3f" % (float(root_motion.get("automatic_scale") or 1.0) * float(getattr(context.scene, "gpt_director_retarget_root_motion_scale", 1.0) or 1.0)))
+            )
+            mapping_box.prop(context.scene, "gpt_director_retarget_rest_pose_enabled", text="校正 Rest Pose 轴向")
+            mapping_box.prop(context.scene, "gpt_director_retarget_bake_step", text="烘焙帧步长")
+            mapping_box.label(
+                text="姿态差异骨骼 "
+                + str(rest_pose.get("mismatch_bone_count") or 0)
+                + "｜最大轴向差 "
+                + ("%.1f°" % float(rest_pose.get("max_angle_degrees") or 0.0))
+            )
         layout.prop(context.scene, "gpt_director_pose_template_name", text="姿势模板名")
         layout.prop(context.scene, "gpt_director_pose_template_note", text="姿势备注")
         layout.prop(context.scene, "gpt_director_pose_template_choice", text="姿势模板")
@@ -14092,8 +19728,27 @@ class GPT_PT_director_panel(bpy.types.Panel):
         row.operator("gpt_director.delete_material_template", text="删除材质")
         layout.separator()
         row = layout.row(align=True)
-        row.operator("gpt_director.add_blue_mannequin", text="蓝色人偶")
-        row.operator("gpt_director.add_red_mannequin", text="红色人偶")
+        row.operator("gpt_director.add_blue_mannequin", text="蓝色骨骼人偶")
+        row.operator("gpt_director.add_red_mannequin", text="红色骨骼人偶")
+        control_box = layout.box()
+        control_box.label(text="彩色控制器：橙色手｜绿色脚｜粉色肘｜蓝色膝")
+        control_box.label(text="对象模式直接拖动；默认隐藏文字标签，视图更干净")
+        row = control_box.row(align=True)
+        op = row.operator("gpt_director.select_mannequin_controls", text="选择红色控制器")
+        op.asset_id = "builtin_red_mannequin"
+        op = row.operator("gpt_director.select_mannequin_controls", text="选择蓝色控制器")
+        op.asset_id = "builtin_blue_mannequin"
+        row = control_box.row(align=True)
+        op = row.operator("gpt_director.toggle_control_labels", text="隐藏文字")
+        op.visible = False
+        op = row.operator("gpt_director.toggle_control_labels", text="显示文字")
+        op.visible = True
+        row = control_box.row(align=True)
+        op = row.operator("gpt_director.toggle_clean_view", text="清爽视图")
+        op.enabled = True
+        op = row.operator("gpt_director.toggle_clean_view", text="显示精调线框")
+        op.enabled = False
+        control_box.operator("gpt_director.simple_drag_mode", text="极简拖动模式：点住模型直接拖")
         row = layout.row(align=True)
         row.operator("gpt_director.add_sofa_set", text="沙发茶几")
         row.operator("gpt_director.add_round_table", text="圆桌")
@@ -14160,6 +19815,19 @@ class GPT_PT_director_panel(bpy.types.Panel):
         row = layout.row(align=True)
         row.operator("gpt_director.refresh_action_matches", text="刷新动作匹配")
         row.operator("gpt_director.apply_shot_action_match", text="应用匹配动作")
+        _draw_shot_asset_plan(layout, context)
+        layout.operator("gpt_director.prepare_shot_assets", text="准备镜头资产", icon="ASSET_MANAGER")
+        row = layout.row(align=True)
+        row.operator("gpt_director.export_ai_workflow_tasks", text="导出AI任务包", icon="FILE_TICK")
+        row.operator("gpt_director.export_ai_workflow_handoff", text="导出AI工作包", icon="FILE_FOLDER")
+        layout.prop(context.scene, "gpt_director_ai_task_id", text="AI任务ID")
+        layout.prop(context.scene, "gpt_director_ai_result_type", text="AI结果类型")
+        layout.prop(context.scene, "gpt_director_ai_result_note", text="AI结果备注")
+        layout.prop(context.scene, "gpt_director_ai_result_directory", text="AI结果目录")
+        layout.prop(context.scene, "gpt_director_ai_result_recursive", text="递归扫描")
+        row = layout.row(align=True)
+        row.operator("gpt_director.register_ai_workflow_result", text="登记AI结果", icon="IMPORT")
+        row.operator("gpt_director.register_ai_workflow_result_directory", text="批量登记AI结果目录", icon="FILE_FOLDER")
         row = layout.row(align=True)
         row.operator("gpt_director.update_shot", text="更新镜头")
         row.operator("gpt_director.delete_shot", text="删除镜头")
@@ -14201,6 +19869,7 @@ CLASSES = (
     GPT_OT_director_add_stage_set,
     GPT_OT_director_add_blue_mannequin,
     GPT_OT_director_add_red_mannequin,
+    GPT_OT_director_select_mannequin_controls,
     GPT_OT_director_add_sofa_set,
     GPT_OT_director_add_round_table,
     GPT_OT_director_add_camera,
@@ -14251,9 +19920,17 @@ CLASSES = (
     GPT_OT_director_update_library_asset_metadata,
     GPT_OT_director_register_selected_asset,
     GPT_OT_director_import_plan_assets,
+    GPT_OT_director_prepare_shot_assets,
+    GPT_OT_director_export_ai_workflow_tasks,
+    GPT_OT_director_export_ai_workflow_handoff,
+    GPT_OT_director_register_ai_workflow_result,
+    GPT_OT_director_register_ai_workflow_result_directory,
     GPT_OT_director_select_asset,
     GPT_OT_director_apply_action,
     GPT_OT_director_build_retarget_profile,
+    GPT_OT_director_load_retarget_bone_mapping,
+    GPT_OT_director_set_retarget_bone_mapping,
+    GPT_OT_director_remove_retarget_bone_mapping,
     GPT_OT_director_apply_retarget_profile,
     GPT_OT_director_delete_retarget_profile,
     GPT_OT_director_save_action_clip,
@@ -14274,6 +19951,9 @@ CLASSES = (
     GPT_OT_director_update_material_template,
     GPT_OT_director_delete_material_template,
     GPT_OT_director_load_material_template,
+    GPT_OT_director_toggle_control_labels,
+    GPT_OT_director_toggle_clean_view,
+    GPT_OT_director_simple_drag_mode,
     GPT_OT_director_save_render_template,
     GPT_OT_director_update_render_template,
     GPT_OT_director_delete_render_template,
@@ -14369,6 +20049,22 @@ def register():
     bpy.types.Scene.gpt_director_render_template_note = StringProperty(name="渲染备注", default="")
     bpy.types.Scene.gpt_director_render_template_choice = EnumProperty(name="渲染模板", items=_render_template_enum_items)
     bpy.types.Scene.gpt_director_selected_render_template = StringProperty(name="渲染ID/名称", default="")
+    bpy.types.Scene.gpt_director_ai_task_id = StringProperty(name="AI任务ID", default="")
+    bpy.types.Scene.gpt_director_ai_result_type = EnumProperty(
+        name="AI结果类型",
+        default="auto",
+        items=[
+            ("auto", "自动判断", "按文件后缀自动判断 AI 结果用途"),
+            ("image", "图片/首帧", "登记为镜头参考图或首帧图"),
+            ("video", "视频", "登记为镜头视频输出"),
+            ("asset", "模型资产", "导入为人物、道具、场景或通用模型资产"),
+            ("motion", "动作", "导入为动作并尝试进入动作片段/重定向流程"),
+            ("attachment", "附件", "只登记文件，不导入到场景"),
+        ],
+    )
+    bpy.types.Scene.gpt_director_ai_result_note = StringProperty(name="AI结果备注", default="")
+    bpy.types.Scene.gpt_director_ai_result_directory = StringProperty(name="AI结果目录", default="", subtype="DIR_PATH")
+    bpy.types.Scene.gpt_director_ai_result_recursive = BoolProperty(name="递归扫描AI结果目录", default=False)
     bpy.types.Scene.gpt_director_asset_kind = EnumProperty(
         name="资产类型",
         default="model",
@@ -14406,6 +20102,13 @@ def register():
     bpy.types.Scene.gpt_director_retarget_target_armature = StringProperty(name="目标骨骼", default="")
     bpy.types.Scene.gpt_director_retarget_profile_choice = EnumProperty(name="重定向档案", items=_retarget_profile_enum_items)
     bpy.types.Scene.gpt_director_selected_retarget_profile = StringProperty(name="重定向ID/名称", default="")
+    bpy.types.Scene.gpt_director_retarget_bone_mapping_choice = EnumProperty(name="骨骼映射", items=_retarget_bone_mapping_enum_items)
+    bpy.types.Scene.gpt_director_retarget_source_bone = StringProperty(name="源骨骼名称", default="")
+    bpy.types.Scene.gpt_director_retarget_target_bone = StringProperty(name="目标骨骼名称", default="")
+    bpy.types.Scene.gpt_director_retarget_root_motion_enabled = BoolProperty(name="保留根运动", default=True)
+    bpy.types.Scene.gpt_director_retarget_root_motion_scale = FloatProperty(name="根运动倍率", default=1.0, min=0.01, max=100.0, precision=3)
+    bpy.types.Scene.gpt_director_retarget_rest_pose_enabled = BoolProperty(name="校正 Rest Pose 轴向", default=True)
+    bpy.types.Scene.gpt_director_retarget_bake_step = IntProperty(name="重定向烘焙帧步长", default=1, min=1, max=12)
     bpy.types.Scene.gpt_director_pose_template_name = StringProperty(name="姿势模板名", default="姿势模板01")
     bpy.types.Scene.gpt_director_pose_template_note = StringProperty(name="姿势备注", default="")
     bpy.types.Scene.gpt_director_pose_template_choice = EnumProperty(name="姿势模板", items=_pose_template_enum_items)
@@ -14478,6 +20181,11 @@ def unregister():
         del bpy.types.Scene.gpt_director_render_template_note
         del bpy.types.Scene.gpt_director_render_template_choice
         del bpy.types.Scene.gpt_director_selected_render_template
+        del bpy.types.Scene.gpt_director_ai_task_id
+        del bpy.types.Scene.gpt_director_ai_result_type
+        del bpy.types.Scene.gpt_director_ai_result_note
+        del bpy.types.Scene.gpt_director_ai_result_directory
+        del bpy.types.Scene.gpt_director_ai_result_recursive
         del bpy.types.Scene.gpt_director_asset_kind
         del bpy.types.Scene.gpt_director_asset_name
         del bpy.types.Scene.gpt_director_asset_source_profile
@@ -14499,6 +20207,13 @@ def unregister():
         del bpy.types.Scene.gpt_director_retarget_target_armature
         del bpy.types.Scene.gpt_director_retarget_profile_choice
         del bpy.types.Scene.gpt_director_selected_retarget_profile
+        del bpy.types.Scene.gpt_director_retarget_bone_mapping_choice
+        del bpy.types.Scene.gpt_director_retarget_source_bone
+        del bpy.types.Scene.gpt_director_retarget_target_bone
+        del bpy.types.Scene.gpt_director_retarget_root_motion_enabled
+        del bpy.types.Scene.gpt_director_retarget_root_motion_scale
+        del bpy.types.Scene.gpt_director_retarget_rest_pose_enabled
+        del bpy.types.Scene.gpt_director_retarget_bake_step
         del bpy.types.Scene.gpt_director_pose_template_name
         del bpy.types.Scene.gpt_director_pose_template_note
         del bpy.types.Scene.gpt_director_pose_template_choice

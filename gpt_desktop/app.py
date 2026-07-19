@@ -16,10 +16,18 @@ from .core import (
 )
 from .image_tab import ImageGeneratorTab
 from .novel_adaptation_tab import NovelAdaptationTab
+from .novel_storage import install_novel_diagnostic_exception_hooks
 from .novel_writing_tab import NovelWritingTab
 from .settings_dialogs import ProviderManagerDialog
 from .video_tab import VideoGeneratorTab
 from .version import APP_NAME, APP_VERSION
+
+
+PACKAGED_RELEASE = bool(getattr(sys, "frozen", False))
+if PACKAGED_RELEASE:
+    NovelWritingV2Tab = None
+else:
+    from .novel_writing_v2_tab import NovelWritingV2Tab
 
 
 class CompactTabWidget(QTabWidget):
@@ -70,12 +78,15 @@ class MainWindow(QMainWindow):
         self.video_tab = VideoGeneratorTab(self.config)
         self.ai_workflow_tab = AIWorkflowTab(self.config)
         self.novel_writing_tab = NovelWritingTab(self.config)
+        self.novel_writing_v2_tab = NovelWritingV2Tab(self.config) if NovelWritingV2Tab is not None else None
         self.adaptation_tab = NovelAdaptationTab(self.config, self.novel_writing_tab.get_current_project_snapshot)
         self.agent_tab = AgentTab(self.config)
         self.tabs.addTab(self.image_tab, "图片生成")
         self.tabs.addTab(self.video_tab, "视频生成")
         self.tabs.addTab(self.ai_workflow_tab, "AI工作流")
         self.tabs.addTab(self.novel_writing_tab, "小说写作")
+        if self.novel_writing_v2_tab is not None:
+            self.tabs.addTab(self.novel_writing_v2_tab, "小说写作新版")
         self.tabs.addTab(self.adaptation_tab, "改编")
         self.tabs.addTab(self.agent_tab, "智能体")
         layout.addWidget(self.tabs)
@@ -83,6 +94,8 @@ class MainWindow(QMainWindow):
         self.image_tab.request_settings.connect(self.open_provider_manager)
         self.video_tab.request_settings.connect(self.open_provider_manager)
         self.novel_writing_tab.request_settings.connect(self.open_provider_manager)
+        if self.novel_writing_v2_tab is not None:
+            self.novel_writing_v2_tab.request_settings.connect(self.open_provider_manager)
         self.adaptation_tab.request_settings.connect(self.open_provider_manager)
         self.agent_tab.request_settings.connect(self.open_provider_manager)
         self.adaptation_tab.open_project_requested.connect(self.open_adaptation_project)
@@ -125,10 +138,11 @@ class MainWindow(QMainWindow):
                 self.config[key]["provider_id"] = (
                     self.config["providers"][0]["id"] if self.config["providers"] else ""
                 )
-        if self.config.setdefault("novel", {}).get("provider_id") not in valid_ids:
-            self.config["novel"]["provider_id"] = (
-                self.config["providers"][0]["id"] if self.config["providers"] else ""
-            )
+        for section in ("novel", "novel_v2"):
+            if self.config.setdefault(section, {}).get("provider_id") not in valid_ids:
+                self.config[section]["provider_id"] = (
+                    self.config["providers"][0]["id"] if self.config["providers"] else ""
+                )
 
         save_config(self.config)
         self.image_tab.refresh_providers()
@@ -139,6 +153,9 @@ class MainWindow(QMainWindow):
         self.agent_tab.load_models()
         self.novel_writing_tab.refresh_providers()
         self.novel_writing_tab.load_models()
+        if self.novel_writing_v2_tab is not None:
+            self.novel_writing_v2_tab.refresh_providers()
+            self.novel_writing_v2_tab.load_models()
         self.adaptation_tab.refresh_providers()
         self.adaptation_tab.load_models()
 
@@ -233,9 +250,35 @@ class MainWindow(QMainWindow):
             )
             for worker in list(getattr(self.novel_writing_tab, "read_aloud_retired_workers", [])):
                 self._stop_worker(worker)
+            for worker in list(getattr(self.novel_writing_tab, "writing_retired_workers", [])):
+                self._stop_worker(worker)
             self.novel_writing_tab._save_current_work("退出前保存", refresh_project_list=False)
         except Exception as e:
             log_debug("退出前保存小说项目失败", e)
+
+        if self.novel_writing_v2_tab is not None:
+            try:
+                self.novel_writing_v2_tab.stop_read_aloud(silent=True, keep_resume=True)
+                self.novel_writing_v2_tab.stop_import_candidate_analysis()
+                self.novel_writing_v2_tab.stop_chapter_ai_action()
+                self._stop_worker_attrs(
+                    self.novel_writing_v2_tab,
+                    (
+                        "model_worker",
+                        "analysis_worker",
+                        "writing_worker",
+                        "auto_summary_worker",
+                        "auto_outline_worker",
+                        "read_aloud_worker",
+                    ),
+                )
+                for worker in list(getattr(self.novel_writing_v2_tab, "read_aloud_retired_workers", [])):
+                    self._stop_worker(worker)
+                for worker in list(getattr(self.novel_writing_v2_tab, "writing_retired_workers", [])):
+                    self._stop_worker(worker)
+                self.novel_writing_v2_tab._save_current_work("退出前保存", refresh_project_list=False)
+            except Exception as e:
+                log_debug("退出前保存新版小说项目失败", e)
 
         try:
             self.adaptation_tab.stop_adaptation()
@@ -451,6 +494,7 @@ def install_chinese_context_menu(app):
 
 
 def main():
+    install_novel_diagnostic_exception_hooks()
     # macOS 原生文件选择器中文化：
     #
     # 必须在 QApplication 创建之前，通过命令行参数告诉 Cocoa 使用中文。

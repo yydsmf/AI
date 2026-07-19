@@ -4,16 +4,106 @@ from gpt_desktop.novel_import import (
     _apply_import_candidates,
     _candidate_analysis_dossier_text,
     _candidate_analysis_text,
+    _extract_structured_framework_chapter_plan,
     _foreshadow_review_chapter_chunks,
     _foreshadow_review_context,
     _foreshadow_review_dossier_text,
     _normalize_ai_candidates,
+    _merge_framework_chapter_plans,
 )
 from gpt_desktop.novel_utils import _new_chapter, _normalize_project
 from gpt_desktop.novel_utils import _sanitize_import_candidates_for_long_form
 
 
 class NovelImportCandidateTests(unittest.TestCase):
+    def test_structured_framework_keeps_explicit_chapters_and_stage_event_ids_separate(self):
+        text = """四、阶段规划
+第一阶段：开局
+章节：第1—3章
+1. 主角苏醒。
+2. 女主登场。
+3. 首次救人。
+第二阶段：扩展
+章节：第4—6章
+1. 进入富豪圈。
+2. 得到第一株老药。
+3. 查到穿越线索。
+六、开篇建议标题
+1. 第一章：医圣归来
+2. 第二章：肇事千金来了
+"""
+
+        plan = _extract_structured_framework_chapter_plan(text)
+
+        self.assertEqual(len(plan["stages"]), 2)
+        self.assertEqual(len(plan["chapters"]), 2)
+        self.assertEqual([item["index"] for item in plan["chapters"]], [1, 2])
+        self.assertEqual(plan["chapters"][0]["title"], "医圣归来")
+        self.assertEqual(plan["chapters"][1]["title"], "肇事千金来了")
+        self.assertEqual(
+            [event["id"] for event in plan["stages"][0]["events"]],
+            ["S01-E01", "S01-E02", "S01-E03"],
+        )
+        self.assertEqual(plan["stages"][1]["events"][0]["text"], "进入富豪圈。")
+        self.assertEqual(plan["stages"][1]["events"][-1]["text"], "查到穿越线索。")
+
+    def test_structured_framework_does_not_guess_when_numbered_events_are_incomplete(self):
+        text = """第一阶段：开局
+章节：第1—3章
+1. 主角苏醒。
+3. 首次救人。
+"""
+
+        plan = _extract_structured_framework_chapter_plan(text)
+
+        self.assertEqual(plan["chapters"], [])
+        self.assertEqual(plan["stages"], [])
+
+    def test_structured_framework_allows_event_count_to_differ_from_stage_chapter_count(self):
+        plan = _extract_structured_framework_chapter_plan("""第一阶段：开局
+章节：第1—5章
+1. 主角苏醒。
+2. 女主登场。
+3. 首次救人。
+""")
+
+        self.assertEqual(len(plan["stages"]), 1)
+        self.assertEqual(plan["stages"][0]["start_chapter"], 1)
+        self.assertEqual(plan["stages"][0]["end_chapter"], 5)
+        self.assertEqual(len(plan["stages"][0]["events"]), 3)
+
+    def test_structured_framework_plan_keeps_events_out_of_explicit_chapter_merge(self):
+        structured = _extract_structured_framework_chapter_plan("""第一阶段：开局
+章节：第1—2章
+1. 主角苏醒。
+2. 女主登场。
+六、开篇标题
+1. 第一章：医圣归来
+""")
+        ai_plan = {
+            "summary": "AI阶段摘要",
+            "chapters": [
+                {
+                    "index": 1,
+                    "title": "医圣归来",
+                    "outline": "AI补充医院冲突。",
+                    "chapter_function": "建立主角",
+                }
+            ],
+        }
+
+        merged = _merge_framework_chapter_plans(ai_plan, structured)
+
+        self.assertEqual(len(merged["chapters"]), 1)
+        self.assertEqual(merged["chapters"][0]["title"], "医圣归来")
+        self.assertEqual(merged["chapters"][0]["outline"], "AI补充医院冲突。")
+        self.assertEqual(merged["chapters"][0]["source_event_ids"], [])
+        self.assertEqual(len(merged["stages"]), 1)
+        self.assertEqual(
+            [event["text"] for event in merged["stages"][0]["events"]],
+            ["主角苏醒。", "女主登场。"],
+        )
+
     def test_candidate_analysis_text_includes_linked_characters(self):
         chapter = _new_chapter(0)
         chapter["title"] = "第一章 旧案"
@@ -591,7 +681,7 @@ class NovelImportCandidateTests(unittest.TestCase):
         self.assertEqual(candidates["project_materials"]["bible"], "")
         self.assertEqual(candidates["project_materials"]["timeline"], "")
 
-    def test_apply_import_candidates_does_not_auto_merge_core_project_materials(self):
+    def test_apply_import_candidates_does_not_auto_merge_project_materials(self):
         project = {"bible": "已有圣经。", "world_rules": "已有规则。"}
         candidates = {
             "characters": [],
@@ -609,16 +699,16 @@ class NovelImportCandidateTests(unittest.TestCase):
 
         self.assertNotIn("新主线矛盾", project["bible"])
         self.assertNotIn("新世界规则", project["world_rules"])
-        self.assertIn("第1章旧案重启", project["timeline"])
-        self.assertIn("缺页卷宗", project["summary"])
+        self.assertNotIn("timeline", project)
+        self.assertNotIn("summary", project)
         self.assertFalse(result["materials"]["bible"])
         self.assertFalse(result["materials"]["world_rules"])
-        self.assertTrue(result["materials"]["timeline"])
-        self.assertTrue(result["materials"]["summary"])
+        self.assertFalse(result["materials"]["timeline"])
+        self.assertFalse(result["materials"]["summary"])
         self.assertEqual(candidates["project_materials"]["bible"], "新主线矛盾。")
         self.assertEqual(candidates["project_materials"]["world_rules"], "新世界规则。")
-        self.assertEqual(candidates["project_materials"]["timeline"], "")
-        self.assertEqual(candidates["project_materials"]["summary"], "")
+        self.assertEqual(candidates["project_materials"]["timeline"], "第1章旧案重启。")
+        self.assertEqual(candidates["project_materials"]["summary"], "赵明拿到缺页卷宗。")
 
     def test_apply_import_candidates_dedupes_project_material_lines(self):
         repeated = "皇商账册缺页牵出旧案。"

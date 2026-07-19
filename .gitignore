@@ -31,5 +31,10 @@ backups/
 backup_*/
 gpt_desktop_backup*/
 recovered_threads/
+_acceptance/
+_code_backups/
+_data_backups/
+api_test_outputs/
 
 *.spec.bak
+*.blend1

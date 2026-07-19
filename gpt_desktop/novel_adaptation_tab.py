@@ -275,7 +275,7 @@ class NovelAdaptationTab(SimpleModelBarMixin, QWidget):
 
     def _current_novel_ai_selection(self):
         provider = get_provider(self.config, self.bar.current_provider_id())
-        model = self.bar.current_model() or self.config.get("novel", {}).get("model", "")
+        model = self.bar.current_model() or self._current_model()
         if not provider:
             return None, "", "请先选择厂商。"
         if not model:

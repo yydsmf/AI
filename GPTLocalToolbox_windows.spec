@@ -7,6 +7,13 @@ from PyInstaller.utils.hooks import collect_data_files, collect_submodules
 
 project_dir = Path(SPECPATH).resolve()
 icon_file = project_dir / "app_icon.ico"
+blender_resources_dir = project_dir / "gpt_desktop" / "resources" / "blender"
+blender_resource_names = (
+    "modern_furniture_pack_293.blend",
+    "wooden_mannequin_rigged_293.blend",
+    "MODERN_FURNITURE_ATTRIBUTION.md",
+    "WOODEN_MANNEQUIN_ATTRIBUTION.md",
+)
 
 
 def _collect_submodules(package):
@@ -29,6 +36,10 @@ for package_name in ("docx", "pypdf", "edge_tts"):
 
 datas = []
 datas += _collect_data_files("docx")
+for resource_name in blender_resource_names:
+    resource_path = blender_resources_dir / resource_name
+    if resource_path.is_file():
+        datas.append((str(resource_path), "gpt_desktop/resources/blender"))
 
 
 a = Analysis(
@@ -53,6 +64,12 @@ a = Analysis(
         "PySide6.QtWebEngineCore",
         "PySide6.QtWebEngineWidgets",
         "PySide6.QtWebEngineQuick",
+        "gpt_desktop.novel_writing_v2_tab",
+        "gpt_desktop.novel_v2_context",
+        "gpt_desktop.novel_v2_import",
+        "gpt_desktop.novel_v2_storage",
+        "gpt_desktop.novel_v2_utils",
+        "gpt_desktop.novel_v2_workers",
     ],
     noarchive=False,
     optimize=0,

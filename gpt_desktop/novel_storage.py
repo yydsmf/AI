@@ -22,6 +22,12 @@ NOVEL_DIR = os.path.join(HISTORY_DIR, "novel_projects")
 NOVEL_DRAFT_FILE = os.path.join(HISTORY_DIR, "novel_draft.json")
 NOVEL_LAST_FILE = os.path.join(HISTORY_DIR, "novel_last.json")
 NOVEL_STYLE_LIBRARY_FILE = os.path.join(HISTORY_DIR, "novel_style_profiles.json")
+NOVEL_BUILTIN_STYLE_LIBRARY_FILE = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)),
+    "resources",
+    "novel",
+    "default_style_profiles.json",
+)
 NOVEL_DIAGNOSTIC_DIR = os.path.join(HISTORY_DIR, "novel_diagnostics")
 NOVEL_DIAGNOSTIC_LOG_FILE = os.path.join(NOVEL_DIAGNOSTIC_DIR, "events.jsonl")
 NOVEL_DIAGNOSTIC_BACKUP_FILE = os.path.join(NOVEL_DIAGNOSTIC_DIR, "events.jsonl.1")
@@ -340,8 +346,8 @@ def _normalized_style_profile_record(style_reference, cache_entry, name="", sour
     }
 
 
-def load_style_profile_library():
-    raw = load_json_file(NOVEL_STYLE_LIBRARY_FILE, {})
+def _load_style_profile_library_file(path):
+    raw = load_json_file(path, {})
     items = raw.get("profiles", []) if isinstance(raw, dict) else []
     profiles = []
     seen = set()
@@ -364,6 +370,17 @@ def load_style_profile_library():
         profiles.append(record)
     profiles.sort(key=lambda item: (item.get("name", ""), item.get("id", "")))
     return profiles
+
+
+def load_style_profile_library():
+    profiles = {}
+    for path in (NOVEL_BUILTIN_STYLE_LIBRARY_FILE, NOVEL_STYLE_LIBRARY_FILE):
+        for record in _load_style_profile_library_file(path):
+            profiles[record["id"]] = record
+    return sorted(
+        profiles.values(),
+        key=lambda item: (item.get("name", ""), item.get("id", "")),
+    )
 
 
 def save_style_profile_library(profiles):

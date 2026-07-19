@@ -168,8 +168,12 @@ class NovelStorageTests(unittest.TestCase):
     def test_global_style_profile_library_deduplicates_by_reference_hash(self):
         with tempfile.TemporaryDirectory() as tmp:
             old_library = novel_storage.NOVEL_STYLE_LIBRARY_FILE
+            old_builtin_library = novel_storage.NOVEL_BUILTIN_STYLE_LIBRARY_FILE
             try:
                 novel_storage.NOVEL_STYLE_LIBRARY_FILE = os.path.join(tmp, "style_profiles.json")
+                novel_storage.NOVEL_BUILTIN_STYLE_LIBRARY_FILE = os.path.join(
+                    tmp, "missing_builtin_styles.json"
+                )
                 reference = "可跨小说复用的正文样本。" * 20
                 entry = {
                     "version": 2,
@@ -201,16 +205,42 @@ class NovelStorageTests(unittest.TestCase):
                 self.assertEqual(len(profiles[0]["cache_entry"]["style_cards"]), 1)
             finally:
                 novel_storage.NOVEL_STYLE_LIBRARY_FILE = old_library
+                novel_storage.NOVEL_BUILTIN_STYLE_LIBRARY_FILE = old_builtin_library
+
+    def test_builtin_style_profiles_are_available_without_user_history(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            old_library = novel_storage.NOVEL_STYLE_LIBRARY_FILE
+            try:
+                novel_storage.NOVEL_STYLE_LIBRARY_FILE = os.path.join(tmp, "style_profiles.json")
+                profiles = novel_storage.load_style_profile_library()
+                by_name = {item.get("name"): item for item in profiles}
+
+                self.assertIn("男频、穿越、都市高武", by_name)
+                self.assertIn("女频、穿越现代言情、沙雕搞笑", by_name)
+                for item in by_name.values():
+                    if item.get("name") not in {
+                        "男频、穿越、都市高武",
+                        "女频、穿越现代言情、沙雕搞笑",
+                    }:
+                        continue
+                    self.assertGreater(len(item.get("style_reference", "")), 20000)
+                    self.assertEqual(item.get("cache_entry", {}).get("status"), "complete")
+            finally:
+                novel_storage.NOVEL_STYLE_LIBRARY_FILE = old_library
 
     def test_sync_style_profile_library_collects_completed_project_cache(self):
         with tempfile.TemporaryDirectory() as tmp:
             old_dir = novel_storage.NOVEL_DIR
             old_draft = novel_storage.NOVEL_DRAFT_FILE
             old_library = novel_storage.NOVEL_STYLE_LIBRARY_FILE
+            old_builtin_library = novel_storage.NOVEL_BUILTIN_STYLE_LIBRARY_FILE
             try:
                 novel_storage.NOVEL_DIR = os.path.join(tmp, "projects")
                 novel_storage.NOVEL_DRAFT_FILE = os.path.join(tmp, "draft.json")
                 novel_storage.NOVEL_STYLE_LIBRARY_FILE = os.path.join(tmp, "style_profiles.json")
+                novel_storage.NOVEL_BUILTIN_STYLE_LIBRARY_FILE = os.path.join(
+                    tmp, "missing_builtin_styles.json"
+                )
                 os.makedirs(novel_storage.NOVEL_DIR)
                 reference = "现有项目中的永久文风样本。" * 20
                 reference_hash = hashlib.sha256(reference.encode("utf-8")).hexdigest()
@@ -231,6 +261,7 @@ class NovelStorageTests(unittest.TestCase):
                 novel_storage.NOVEL_DIR = old_dir
                 novel_storage.NOVEL_DRAFT_FILE = old_draft
                 novel_storage.NOVEL_STYLE_LIBRARY_FILE = old_library
+                novel_storage.NOVEL_BUILTIN_STYLE_LIBRARY_FILE = old_builtin_library
 
     def test_save_project_preserves_style_profile_cache_by_reference_hash(self):
         with tempfile.TemporaryDirectory() as tmp:

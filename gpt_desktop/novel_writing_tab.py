@@ -758,12 +758,6 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
         self.status_meta_label.setFixedHeight(36)
         layout.addWidget(self.status_meta_label)
 
-        self.status_history_label = QLabel("")
-        self.status_history_label.setObjectName("novel_status_history")
-        self.status_history_label.setWordWrap(True)
-        self.status_history_label.setFixedHeight(52)
-        self.status_history_label.setVisible(False)
-        layout.addWidget(self.status_history_label)
         return box
 
     def set_project_panel_expanded(self, expanded):
@@ -814,9 +808,6 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
         }
         QLabel#novel_status_meta {
             color: #9ec5ff;
-        }
-        QLabel#novel_status_history {
-            color: #9299a8;
         }
         """)
 
@@ -10753,12 +10744,6 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
         if hasattr(self, "status_meta_label"):
             self.status_meta_label.setText(meta_text)
             self.status_meta_label.setToolTip(meta_text)
-
-        history_text = self._status_history_text()
-        if hasattr(self, "status_history_label"):
-            self.status_history_label.setText(history_text)
-            self.status_history_label.setToolTip(history_text)
-            self.status_history_label.setVisible(bool(history_text))
 
     def set_status_tip(self, text):
         text = str(text or "")

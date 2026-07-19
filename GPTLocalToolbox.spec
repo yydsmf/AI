@@ -7,14 +7,16 @@ from PyInstaller.utils.hooks import collect_data_files, collect_submodules
 
 project_dir = Path(SPECPATH).resolve()
 icon_file = project_dir / "app_icon_trimmed.icns"
-app_version = "1.0.20"
+app_version = "1.0.21"
 blender_resources_dir = project_dir / "gpt_desktop" / "resources" / "blender"
+novel_resources_dir = project_dir / "gpt_desktop" / "resources" / "novel"
 blender_resource_names = (
     "modern_furniture_pack_293.blend",
     "wooden_mannequin_rigged_293.blend",
     "MODERN_FURNITURE_ATTRIBUTION.md",
     "WOODEN_MANNEQUIN_ATTRIBUTION.md",
 )
+novel_resource_names = ("default_style_profiles.json",)
 
 
 def _collect_submodules(package):
@@ -41,6 +43,10 @@ for resource_name in blender_resource_names:
     resource_path = blender_resources_dir / resource_name
     if resource_path.is_file():
         datas.append((str(resource_path), "gpt_desktop/resources/blender"))
+for resource_name in novel_resource_names:
+    resource_path = novel_resources_dir / resource_name
+    if resource_path.is_file():
+        datas.append((str(resource_path), "gpt_desktop/resources/novel"))
 
 
 a = Analysis(

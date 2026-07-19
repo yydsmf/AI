@@ -3333,7 +3333,9 @@ class NovelWritingStateTests(unittest.TestCase):
         }
         tab.current_chapter_index = 0
         tab.chapter_outline = _FakePlainTextEdit(chapter["outline"])
-        tab.chapter_ai_preview = _FakePlainTextEdit("")
+        tab.chapter_ai_preview = _FakePlainTextEdit(
+            '```json\n{"summary":"不应被当成正文的内部状态"}\n```'
+        )
         tab._chapter_ai_buttons_by_action = {}
         tab._auto_expand_all_active = False
         tab._flush_current_editors = lambda: None
@@ -3349,6 +3351,44 @@ class NovelWritingStateTests(unittest.TestCase):
         self.assertEqual(resumed_calls, [(final_text, True)])
         self.assertEqual(tab._chapter_ai_model, "gpt-5.5")
         self.assertEqual(tab.current_project["chapters"][0]["memory_sync_status"], "pending")
+
+    def test_internal_memory_stream_stays_out_of_body_preview(self):
+        tab = NovelWritingTab.__new__(NovelWritingTab)
+        tab._chapter_ai_running_action = "memory_finalize"
+        tab._chapter_ai_style_workflow_active = False
+        tab._chapter_ai_sequence_active = True
+        tab.chapter_ai_stream_text = ""
+        tab.chapter_ai_preview = _FakePlainTextEdit("已经确定的正文终稿。")
+
+        tab.on_chapter_ai_chunk('```json\n{"summary":"内部摘要"}')
+
+        self.assertIn("内部摘要", tab.chapter_ai_stream_text)
+        self.assertEqual(tab.chapter_ai_preview.toPlainText(), "已经确定的正文终稿。")
+
+    def test_completed_internal_result_is_parsed_without_flashing_in_preview(self):
+        tab = NovelWritingTab.__new__(NovelWritingTab)
+        tab.chapter_ai_stream_text = ""
+        tab.chapter_ai_preview = _FakePlainTextEdit("已经确定的正文终稿。")
+        tab._chapter_ai_resume_prefix = ""
+        tab._chapter_ai_stop_requested_by_user = False
+        tab._chapter_ai_sequence_active = True
+        tab._chapter_ai_style_workflow_active = True
+        tab._clear_transient_chapter_ai_retry = lambda _action: None
+        tab.set_chapter_ai_panel_expanded = lambda _expanded: None
+        tab._chapter_ai_signal_diagnostics = lambda: ("request-1", 0.0, {})
+        tab._save_chapter_ai_latest_exchange = lambda *_args, **_kwargs: ""
+        tab._log_novel_diagnostic = lambda *_args, **_kwargs: None
+        preview_seen_by_parser = []
+        tab._handle_memory_finalize_ready = lambda _content: preview_seen_by_parser.append(
+            tab.chapter_ai_preview.toPlainText()
+        )
+
+        tab.on_chapter_ai_ready(
+            "memory_finalize",
+            '```json\n{"summary":"内部摘要","key_facts":[]}\n```',
+        )
+
+        self.assertEqual(preview_seen_by_parser, ["已经确定的正文终稿。"])
 
     def test_stale_memory_checkpoint_is_discarded_before_new_draft(self):
         chapter = _new_chapter(0)
@@ -4717,7 +4757,7 @@ class NovelWritingStateTests(unittest.TestCase):
 
         self.assertIn("正文已写入", statuses[-1])
         self.assertIn("补提纲失败", statuses[-1])
-        self.assertIn("可继续补提纲", statuses[-1])
+        self.assertIn("可重新生成提纲", statuses[-1])
         self.assertIn("接口错误 500", statuses[-1])
 
     def test_failed_sequence_summary_status_names_written_body_and_resume_step(self):
@@ -4725,8 +4765,8 @@ class NovelWritingStateTests(unittest.TestCase):
         tab = NovelWritingTab.__new__(NovelWritingTab)
         tab.current_project = {"chapters": [chapter], "characters": []}
         tab.current_chapter_index = 0
-        tab.chapter_ai_preview = _FakePlainTextEdit("")
-        tab.chapter_ai_stream_text = ""
+        tab.chapter_ai_preview = _FakePlainTextEdit("已经确定的正文终稿。")
+        tab.chapter_ai_stream_text = '```json\n{"summary":"未完成的内部摘要"}'
         tab._chapter_ai_running_action = "summary"
         tab._chapter_ai_preview_is_partial = False
         tab._chapter_ai_preview_action = ""
@@ -4747,8 +4787,10 @@ class NovelWritingStateTests(unittest.TestCase):
 
         self.assertIn("正文已写入", statuses[-1])
         self.assertIn("补摘要/关键事实失败", statuses[-1])
-        self.assertIn("可继续补摘要", statuses[-1])
+        self.assertIn("可重新生成摘要", statuses[-1])
         self.assertIn("接口错误 500", statuses[-1])
+        self.assertEqual(tab.chapter_ai_preview.toPlainText(), "已经确定的正文终稿。")
+        self.assertFalse(tab._has_partial_chapter_ai_preview("summary"))
 
     def test_save_chapter_auto_updates_default_status(self):
         chapter = _new_chapter(0)

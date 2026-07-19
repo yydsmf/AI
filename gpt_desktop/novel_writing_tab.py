@@ -7028,7 +7028,7 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
             style_cards=getattr(self, "_chapter_ai_style_cards", []),
             rescue_from_candidate=bool(rescue),
         )
-        self.chapter_ai_preview.clear()
+        self.chapter_ai_preview.setPlainText(self._chapter_ai_style_candidate)
         self.chapter_ai_stream_text = ""
         self._start_chapter_ai_worker(
             "style_finalize",
@@ -7143,11 +7143,7 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
         chapters = self.current_project.get("chapters", []) if isinstance(self.current_project, dict) else []
         if not (0 <= self.current_chapter_index < len(chapters)):
             return ""
-        text = self._memory_finalize_checkpoint_text(chapters[self.current_chapter_index])
-        if not text:
-            return ""
-        preview = str(self.chapter_ai_preview.toPlainText() or "").strip()
-        return preview or text
+        return self._memory_finalize_checkpoint_text(chapters[self.current_chapter_index])
 
     def _clear_memory_finalize_checkpoint(self, persist=False):
         chapters = self.current_project.get("chapters", []) if isinstance(self.current_project, dict) else []
@@ -7192,7 +7188,7 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
             self.current_chapter_index,
             text,
         )
-        self.chapter_ai_preview.clear()
+        self.chapter_ai_preview.setPlainText(text)
         self.chapter_ai_stream_text = ""
         status_text = (
             f"已识别后台保存的完整正文（{len(text)}字），不重写正文，正在补摘要和长期状态..."
@@ -7225,7 +7221,7 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
             summary=(bundle or {}).get("summary", "") if isinstance(bundle, dict) else "",
             key_facts=(bundle or {}).get("key_facts", "") if isinstance(bundle, dict) else "",
         )
-        self.chapter_ai_preview.clear()
+        self.chapter_ai_preview.setPlainText(str(final_text or "").strip())
         self.chapter_ai_stream_text = ""
         self._start_chapter_ai_worker(
             "memory_reconcile",
@@ -7384,7 +7380,7 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
             memory_update=(bundle or {}).get("memory_update", {}) if isinstance(bundle, dict) else {},
             validation_errors=validation_errors,
         )
-        self.chapter_ai_preview.clear()
+        self.chapter_ai_preview.setPlainText(str(final_text or "").strip())
         self.chapter_ai_stream_text = ""
         self._start_chapter_ai_worker(
             "memory_repair",
@@ -8025,11 +8021,40 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
         except Exception as e:
             log_debug("小说章节 AI 中止失败", e)
 
+    def _chapter_ai_output_is_user_facing(self, action=None):
+        action = str(action or getattr(self, "_chapter_ai_running_action", "") or "")
+        if action in {
+            "memory_finalize",
+            "memory_reconcile",
+            "memory_repair",
+            "style_profile",
+            "style_baseline",
+            "style_sheet",
+            "style_sheet_merge",
+            "style_persona",
+            "style_cards",
+            "style_rules",
+            "style_finalize",
+            "style_audit",
+            "style_rewrite",
+            "style_plot_extract",
+        }:
+            return False
+        if action == "draft" and bool(getattr(self, "_chapter_ai_style_workflow_active", False)):
+            return False
+        if action in {"outline", "summary"} and bool(
+            getattr(self, "_chapter_ai_sequence_active", False)
+        ):
+            return False
+        return True
+
     def on_chapter_ai_chunk(self, piece):
         piece = str(piece or "")
         if not piece:
             return
         self.chapter_ai_stream_text += piece
+        if not self._chapter_ai_output_is_user_facing():
+            return
         self.chapter_ai_preview.moveCursor(QTextCursor.End)
         self.chapter_ai_preview.insertPlainText(piece)
         bar = self.chapter_ai_preview.verticalScrollBar()
@@ -8220,7 +8245,7 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
             diagnostic_exchange_path=exchange_path,
             worker_diagnostics=worker_diagnostics,
         )
-        if final_text:
+        if final_text and self._chapter_ai_output_is_user_facing(action):
             self.chapter_ai_preview.setPlainText(final_text)
         if getattr(self, "_chapter_ai_stop_requested_by_user", False):
             if action == "memory_finalize":
@@ -8234,12 +8259,12 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
                     "重新启动自动扩写时会继续整理状态。"
                 )
                 return
-            if final_text:
+            if final_text and self._chapter_ai_output_is_user_facing(action):
                 if action in {"draft", "outline", "summary"}:
                     self._set_partial_chapter_ai_preview_state(True, action)
                 self.set_status_tip("AI 辅助生成已中止，已保留当前预览内容。")
             else:
-                self.set_status_tip("AI 辅助生成已中止。")
+                self.set_status_tip("AI 辅助生成已中止，内部结构化结果未显示。")
             self._reset_chapter_ai_sequence()
             return
         if action == "memory_repair":
@@ -8577,21 +8602,22 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
             self._reset_chapter_ai_sequence()
             self.set_status_tip("风格自动重写失败，已保留首次正文预览，可检查后决定是否应用。")
             return
-        kept_preview = self.chapter_ai_stream_text.strip()
+        output_is_user_facing = self._chapter_ai_output_is_user_facing(action)
+        kept_preview = self.chapter_ai_stream_text.strip() if output_is_user_facing else ""
         if kept_preview:
             self.chapter_ai_preview.setPlainText(kept_preview)
         if action == "draft" and kept_preview:
             self._set_partial_chapter_ai_preview_state(True, action)
-        elif action in {"outline", "summary"}:
+        elif action in {"outline", "summary"} and output_is_user_facing:
             self._set_partial_chapter_ai_preview_state(True, action)
         else:
             self._refresh_chapter_ai_action_labels()
         self._reset_chapter_ai_sequence()
         action_label = {"draft": "正文", "outline": "提纲", "summary": "摘要"}.get(action, "正文")
         if sequence_active and action == "outline":
-            status = f"正文已写入，补提纲失败，可继续补提纲：{err_text[:80]}"
+            status = f"正文已写入，补提纲失败，可重新生成提纲：{err_text[:80]}"
         elif sequence_active and action == "summary":
-            status = f"正文已写入，补摘要/关键事实失败，可继续补摘要：{err_text[:80]}"
+            status = f"正文已写入，补摘要/关键事实失败，可重新生成摘要：{err_text[:80]}"
         else:
             kept_hint = "已保留预览，" if kept_preview else ""
             if kept_preview or action in {"outline", "summary"}:

@@ -10,6 +10,104 @@ from gpt_desktop.core import load_json_file, save_json_file
 
 
 class NovelStorageTests(unittest.TestCase):
+    def test_project_summaries_cache_avoids_rereading_unchanged_large_projects(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            old_dir = novel_storage.NOVEL_DIR
+            try:
+                novel_storage.NOVEL_DIR = os.path.join(tmp, "projects")
+                novel_storage.ensure_novel_storage()
+                project_path = os.path.join(novel_storage.NOVEL_DIR, "缓存测试.json")
+                save_json_file(project_path, {
+                    "meta": {"title": "缓存测试"},
+                    "chapters": [{"title": "第一章", "text": "正文" * 1000}],
+                })
+                original_load = novel_storage.load_json_file
+                project_reads = []
+
+                def tracked_load(path, default=None):
+                    if os.path.abspath(path) == os.path.abspath(project_path):
+                        project_reads.append(path)
+                    return original_load(path, default)
+
+                with patch.object(novel_storage, "load_json_file", side_effect=tracked_load):
+                    first = novel_storage.list_project_summaries()
+                    second = novel_storage.list_project_summaries()
+                    save_json_file(project_path, {
+                        "meta": {"title": "缓存测试"},
+                        "chapters": [{"title": "第一章", "text": "正文追加" * 1200}],
+                    })
+                    third = novel_storage.list_project_summaries()
+
+                self.assertEqual([item["title"] for item in first], ["缓存测试"])
+                self.assertEqual([item["title"] for item in second], ["缓存测试"])
+                self.assertEqual([item["title"] for item in third], ["缓存测试"])
+                self.assertEqual(len(project_reads), 2)
+                self.assertGreater(third[0]["body_words"], first[0]["body_words"])
+            finally:
+                novel_storage.NOVEL_DIR = old_dir
+
+    def test_project_backups_are_saved_outside_project_list(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            old_dir = novel_storage.NOVEL_DIR
+            old_backup_dir = novel_storage.NOVEL_BACKUP_DIR
+            try:
+                novel_storage.NOVEL_DIR = os.path.join(tmp, "projects")
+                novel_storage.NOVEL_BACKUP_DIR = os.path.join(tmp, "backups")
+                novel_storage.ensure_novel_storage()
+                project = {
+                    "meta": {"title": "长篇测试"},
+                    "chapters": [{"title": "第一章", "text": "正文"}],
+                }
+                novel_storage.save_named_project("长篇测试", project)
+
+                backup_path = novel_storage.auto_preserve_project(project, "外部更新前备份")
+
+                self.assertTrue(
+                    os.path.commonpath([backup_path, novel_storage.NOVEL_BACKUP_DIR])
+                    == novel_storage.NOVEL_BACKUP_DIR
+                )
+                self.assertEqual(
+                    [item["title"] for item in novel_storage.list_project_summaries()],
+                    ["长篇测试"],
+                )
+            finally:
+                novel_storage.NOVEL_DIR = old_dir
+                novel_storage.NOVEL_BACKUP_DIR = old_backup_dir
+
+    def test_old_auto_saved_projects_are_filtered_from_records(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            old_dir = novel_storage.NOVEL_DIR
+            try:
+                novel_storage.NOVEL_DIR = os.path.join(tmp, "projects")
+                novel_storage.ensure_novel_storage()
+                save_json_file(os.path.join(novel_storage.NOVEL_DIR, "正式项目.json"), {
+                    "meta": {"title": "正式项目"},
+                    "chapters": [],
+                })
+                save_json_file(os.path.join(novel_storage.NOVEL_DIR, "旧自动备份.json"), {
+                    "meta": {"title": "旧自动备份"},
+                    "chapters": [],
+                    "auto_saved_reason": "旧版本遗留备份",
+                })
+
+                self.assertEqual(
+                    [item["title"] for item in novel_storage.list_project_summaries()],
+                    ["正式项目"],
+                )
+                self.assertEqual(
+                    [item["data"]["meta"]["title"] for item in novel_storage.list_project_records()],
+                    ["正式项目"],
+                )
+                self.assertCountEqual(
+                    [
+                        item["data"]["meta"]["title"]
+                        for item in novel_storage.list_project_records(include_empty=True)
+                    ],
+                    ["正式项目", "旧自动备份"],
+                )
+            finally:
+                novel_storage.NOVEL_DIR = old_dir
+
     def test_novel_diagnostic_event_is_redacted_and_latest_error_is_written(self):
         with tempfile.TemporaryDirectory() as tmp:
             old_values = {
@@ -263,6 +361,67 @@ class NovelStorageTests(unittest.TestCase):
                 novel_storage.NOVEL_STYLE_LIBRARY_FILE = old_library
                 novel_storage.NOVEL_BUILTIN_STYLE_LIBRARY_FILE = old_builtin_library
 
+    def test_style_profile_library_load_uses_fast_cached_records(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            old_library = novel_storage.NOVEL_STYLE_LIBRARY_FILE
+            old_builtin_library = novel_storage.NOVEL_BUILTIN_STYLE_LIBRARY_FILE
+            try:
+                novel_storage.NOVEL_STYLE_LIBRARY_FILE = os.path.join(tmp, "style_profiles.json")
+                novel_storage.NOVEL_BUILTIN_STYLE_LIBRARY_FILE = os.path.join(
+                    tmp, "missing_builtin_styles.json"
+                )
+                novel_storage._invalidate_style_profile_library_cache()
+                reference = "作者文风样本。" * 200
+                reference_hash = hashlib.sha256(reference.encode("utf-8")).hexdigest()
+                save_json_file(novel_storage.NOVEL_STYLE_LIBRARY_FILE, {
+                    "version": 1,
+                    "profiles": [{
+                        "id": reference_hash,
+                        "name": "高速文风",
+                        "reference_hash": reference_hash,
+                        "style_reference": reference,
+                        "cache_entry": {
+                            "status": "complete",
+                            "profile": "文风画像",
+                            "cached_at": "2026-08-02 12:00:00",
+                        },
+                        "updated_at": "2026-08-02 12:00:00",
+                    }],
+                })
+
+                with patch.object(
+                    novel_storage,
+                    "_normalize_project",
+                    side_effect=AssertionError("load should not normalize full project"),
+                ):
+                    first = novel_storage.load_style_profile_library()
+                    first[0]["name"] = "被调用方修改"
+                    second = novel_storage.load_style_profile_library()
+                    save_json_file(novel_storage.NOVEL_STYLE_LIBRARY_FILE, {
+                        "version": 1,
+                        "profiles": [{
+                            "id": reference_hash,
+                            "name": "高速文风-更新",
+                            "reference_hash": reference_hash,
+                            "style_reference": reference + "新增",
+                            "cache_entry": {
+                                "status": "complete",
+                                "profile": "文风画像更新",
+                                "cached_at": "2026-08-02 12:01:00",
+                            },
+                            "updated_at": "2026-08-02 12:01:00",
+                        }],
+                    })
+                    third = novel_storage.load_style_profile_library()
+
+                self.assertEqual(second[0]["name"], "高速文风")
+                self.assertEqual(third[0]["name"], "高速文风-更新")
+                self.assertEqual(third[0]["cache_entry"]["profile"], "文风画像更新")
+            finally:
+                novel_storage.NOVEL_STYLE_LIBRARY_FILE = old_library
+                novel_storage.NOVEL_BUILTIN_STYLE_LIBRARY_FILE = old_builtin_library
+                novel_storage._invalidate_style_profile_library_cache()
+
     def test_save_project_preserves_style_profile_cache_by_reference_hash(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = os.path.join(tmp, "project.json")
@@ -367,7 +526,7 @@ class NovelStorageTests(unittest.TestCase):
                 novel_storage.NOVEL_DRAFT_FILE = old_draft
                 novel_storage.NOVEL_LAST_FILE = old_last
 
-    def test_load_initial_project_prefers_newer_named_project_over_stale_draft(self):
+    def test_load_initial_project_prefers_last_named_project_over_newer_stale_draft(self):
         with tempfile.TemporaryDirectory() as tmp:
             old_draft = novel_storage.NOVEL_DRAFT_FILE
             old_last = novel_storage.NOVEL_LAST_FILE
@@ -390,8 +549,8 @@ class NovelStorageTests(unittest.TestCase):
                     "chapters": [{"title": "第一章", "outline": "完整提纲"}],
                 })
                 save_json_file(last_path, {"path": project_path})
-                os.utime(draft_path, (1000, 1000))
-                os.utime(project_path, (2000, 2000))
+                os.utime(project_path, (1000, 1000))
+                os.utime(draft_path, (2000, 2000))
 
                 data, path = novel_storage.load_initial_project_data()
 

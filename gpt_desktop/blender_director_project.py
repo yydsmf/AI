@@ -26,6 +26,17 @@ BUNDLED_FURNITURE_SOFA_COLLECTION = "Director Modern Sofa"
 BUNDLED_FURNITURE_TABLE_COLLECTION = "Director Modern Coffee Table"
 
 
+def _default_shared_director_asset_library():
+    candidates = [
+        str(os.environ.get("GPT_TOOLBOX_SHARED_ASSET_LIBRARY") or "").strip(),
+        "/srv/gpt-data/assets/three_kingdoms/library",
+    ]
+    for candidate in candidates:
+        if candidate and os.path.isdir(candidate):
+            return os.path.abspath(candidate)
+    return ""
+
+
 def _bundled_blender_resource_path(filename):
     filename = str(filename or "").strip()
     package_path = Path(__file__).resolve().parent / "resources" / "blender" / filename
@@ -239,6 +250,7 @@ def prepare_blender_director_project(project_id="", project_name="", plan=None):
         os.makedirs(path, exist_ok=True)
     bundled_mannequin = _copy_bundled_mannequin_assets(asset_dirs["characters"])
     bundled_furniture = _copy_bundled_furniture_assets(asset_dirs["props"])
+    default_asset_library_path = _default_shared_director_asset_library()
 
     blend_path = os.path.join(project_dir, f"{_safe_name(project_name)}.blend")
     meta_path = os.path.join(project_dir, "director_project.json")
@@ -276,6 +288,7 @@ def prepare_blender_director_project(project_id="", project_name="", plan=None):
             "batch_render_command_report_path": batch_render_command_report_path,
             "bundled_mannequin": bundled_mannequin,
             "bundled_furniture": bundled_furniture,
+            "default_asset_library_path": default_asset_library_path,
             "plan": plan,
             "updated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         }
@@ -332,6 +345,8 @@ def prepare_blender_director_project(project_id="", project_name="", plan=None):
         metadata["object_motions"] = []
     if not isinstance(metadata.get("scene_presets"), list):
         metadata["scene_presets"] = []
+    metadata.pop("depth_estimator_script_path", None)
+    metadata.pop("scene_references", None)
     metadata["builtin_asset_pack"] = _merge_default_records(
         metadata.get("builtin_asset_pack"),
         _default_director_asset_pack(),
@@ -343,7 +358,7 @@ def prepare_blender_director_project(project_id="", project_name="", plan=None):
     metadata["director_capabilities"] = {
         "version": 2,
         "mode": "real_blender_director_stage",
-        "asset_formats": ["blend", "glb", "gltf", "fbx", "obj", "bvh", "stl", "ply", "abc", "usd", "usdz", "png", "jpg", "jpeg", "tif", "tiff", "exr", "hdr"],
+        "asset_formats": ["blend", "glb", "gltf", "fbx", "obj", "bvh", "stl", "ply", "abc", "usd", "usdz", "png", "jpg", "jpeg", "webp", "bmp", "tif", "tiff", "exr", "hdr"],
         "asset_kinds": ["character", "prop", "scene", "action", "model", "material", "texture", "hdri"],
         "control_model": ["root_empty", "viewport_control_ring", "armature", "ik_fk", "hand_foot_controls", "object_mode_pose_proxies", "color_coded_controls", "actor_slots", "object_templates", "camera_templates", "texture_materials", "action_clips", "retarget_profiles"],
         "built_in_scene_operator": "gpt_director.add_dialogue_lounge_scene",
@@ -353,11 +368,29 @@ def prepare_blender_director_project(project_id="", project_name="", plan=None):
         json.dump(metadata, f, ensure_ascii=False, indent=2)
 
     with open(addon_path, "w", encoding="utf-8") as f:
-        f.write(_director_panel_script(meta_path, blend_path, renders_dir, assets_dir, shots_dir, presets_dir, set_packages_dir, asset_dirs))
+        f.write(
+            _director_panel_script(
+                meta_path,
+                blend_path,
+                renders_dir,
+                assets_dir,
+                shots_dir,
+                presets_dir,
+                set_packages_dir,
+                asset_dirs,
+                default_asset_library_path,
+            )
+        )
     with open(bootstrap_path, "w", encoding="utf-8") as f:
         f.write(_director_bootstrap_script(blend_path, addon_path, meta_path))
     with open(batch_render_script_path, "w", encoding="utf-8") as f:
         f.write(_director_batch_render_script(blend_path, addon_path, meta_path))
+    legacy_depth_script = os.path.join(scripts_dir, "generate_scene_depth_map.py")
+    if os.path.exists(legacy_depth_script):
+        try:
+            os.remove(legacy_depth_script)
+        except OSError:
+            pass
     write_blender_director_batch_render_command(metadata)
 
     return {
@@ -8296,14 +8329,25 @@ try:
     if os.path.exists(BLEND_PATH):
         bpy.ops.wm.open_mainfile(filepath=BLEND_PATH)
     else:
-        bpy.ops.wm.read_factory_settings(use_empty=True)
+        # Start from an empty scene without resetting language, theme, or keymap preferences.
+        bpy.ops.wm.read_homefile(use_empty=True)
         created = True
-    _load_director_panel()
+    panel = _load_director_panel()
+    migrated = 0
+    try:
+        migrated = int(panel["_ensure_independent_mannequin_instances"]() or 0)
+    except Exception:
+        traceback.print_exc()
     if created:
         try:
             bpy.ops.gpt_director.add_dialogue_lounge_scene()
         except Exception:
             bpy.ops.gpt_director.init_scene()
+    try:
+        panel["_set_director_simple_view"](bpy.context, True)
+    except Exception:
+        pass
+    if created or migrated:
         bpy.ops.wm.save_as_mainfile(filepath=BLEND_PATH)
     print("GPT_DIRECTOR_PROJECT_READY", BLEND_PATH)
 except Exception:
@@ -8355,7 +8399,17 @@ except Exception:
 """
 
 
-def _director_panel_script(meta_path, blend_path, renders_dir, assets_dir, shots_dir, presets_dir, set_packages_dir, asset_dirs):
+def _director_panel_script(
+    meta_path,
+    blend_path,
+    renders_dir,
+    assets_dir,
+    shots_dir,
+    presets_dir,
+    set_packages_dir,
+    asset_dirs,
+    default_asset_library_path="",
+):
     return f'''# -*- coding: utf-8 -*-
 bl_info = {{
     "name": "GPT Director Panel",
@@ -8377,6 +8431,8 @@ import shutil
 from datetime import datetime
 
 import bpy
+import blf
+from bpy.app.handlers import persistent
 from bpy.props import BoolProperty, EnumProperty, FloatProperty, IntProperty, StringProperty
 from bpy_extras import view3d_utils
 from bpy_extras.io_utils import ImportHelper
@@ -8389,6 +8445,7 @@ ASSETS_DIR = {_json_literal(assets_dir)}
 SHOTS_DIR = {_json_literal(shots_dir)}
 PRESETS_DIR = {_json_literal(presets_dir)}
 SET_PACKAGES_DIR = {_json_literal(set_packages_dir)}
+DEFAULT_ASSET_LIBRARY_PATH = {_json_literal(default_asset_library_path)}
 ASSET_DIRS = json.loads({json.dumps(json.dumps(asset_dirs or {}, ensure_ascii=False), ensure_ascii=False)})
 MANNEQUIN_TEMPLATE_PATH = {_json_literal(os.path.join((asset_dirs or {}).get("characters", ""), BUNDLED_MANNEQUIN_FILENAME))}
 MANNEQUIN_ATTRIBUTION_PATH = {_json_literal(os.path.join((asset_dirs or {}).get("characters", ""), BUNDLED_MANNEQUIN_ATTRIBUTION_FILENAME))}
@@ -8494,6 +8551,40 @@ def _save_meta(data):
     _ensure_dir(os.path.dirname(META_PATH))
     with open(META_PATH, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
+
+
+def _remove_legacy_depth_scene_data():
+    removed = 0
+    for obj in list(bpy.data.objects):
+        try:
+            is_legacy_depth = bool(obj.get("gpt_director_scene_reference"))
+        except Exception:
+            is_legacy_depth = False
+        if not is_legacy_depth:
+            continue
+        try:
+            bpy.data.objects.remove(obj, do_unlink=True)
+            removed += 1
+        except Exception:
+            pass
+    data = _load_meta()
+    changed = "scene_references" in data or "depth_estimator_script_path" in data
+    data.pop("scene_references", None)
+    data.pop("depth_estimator_script_path", None)
+    assets = data.get("assets") if isinstance(data.get("assets"), list) else []
+    filtered_assets = [
+        item for item in assets
+        if not (
+            str((item or {{}}).get("type") or "") == "scene_reference"
+            or str((item or {{}}).get("imported_as") or "").startswith("scene_reference_")
+        )
+    ]
+    if len(filtered_assets) != len(assets):
+        data["assets"] = filtered_assets
+        changed = True
+    if changed:
+        _save_meta(data)
+    return removed
 
 
 def _safe_id(text, fallback="shot"):
@@ -8841,9 +8932,66 @@ def _scan_asset_library(data, directory, profile_id=""):
     return library, new_items
 
 
+def _asset_library_signature(directory):
+    manifest_path = os.path.join(str(directory or ""), "asset_manifest.json")
+    try:
+        stat = os.stat(manifest_path)
+        return str(int(stat.st_mtime)) + ":" + str(int(stat.st_size))
+    except Exception:
+        return ""
+
+
+def _ensure_default_asset_library():
+    directory = os.path.abspath(str(DEFAULT_ASSET_LIBRARY_PATH or "").strip())
+    if not directory or not os.path.isdir(directory):
+        return 0
+    try:
+        bpy.context.scene.gpt_director_asset_library_path = directory
+    except Exception:
+        pass
+    data = _load_meta()
+    signature = _asset_library_signature(directory)
+    previous_signature = str(data.get("default_asset_library_signature") or "")
+    items = data.get("asset_library_items") if isinstance(data.get("asset_library_items"), list) else []
+    existing = [
+        item for item in items
+        if isinstance(item, dict) and os.path.abspath(str(item.get("library_path") or "")) == directory
+    ]
+    if existing and signature and signature == previous_signature:
+        return len(existing)
+    _library, scanned = _scan_asset_library(data, directory, "")
+    data["default_asset_library_path"] = directory
+    data["default_asset_library_signature"] = signature
+    _save_meta(data)
+    return len(scanned)
+
+
 def _asset_library_search_text():
     scene = bpy.context.scene
     return str(getattr(scene, "gpt_director_asset_library_search", "") or "").strip().lower()
+
+
+def _asset_library_catalog_filter():
+    scene = bpy.context.scene
+    return str(getattr(scene, "gpt_director_asset_library_catalog", "__all__") or "__all__").strip()
+
+
+def _asset_library_catalog_enum_items(self, context):
+    items = [("__all__", "全部分类", "显示资产库中的全部分类")]
+    data = _load_meta()
+    library_items = data.get("asset_library_items") if isinstance(data.get("asset_library_items"), list) else []
+    catalogs = {{}}
+    for item in library_items:
+        if not isinstance(item, dict):
+            continue
+        catalog_id = str(item.get("asset_browser_catalog_id") or "").strip()
+        catalog_path = str(item.get("asset_browser_catalog_path") or "").strip()
+        catalog_name = str(item.get("asset_browser_catalog_name") or catalog_path or "").strip()
+        if catalog_id and catalog_id not in catalogs:
+            catalogs[catalog_id] = (catalog_name or catalog_id, catalog_path)
+    for catalog_id, values in sorted(catalogs.items(), key=lambda pair: pair[1][0]):
+        items.append((catalog_id, values[0], values[1] or "资产分类"))
+    return items
 
 
 def _asset_library_favorites_only():
@@ -8855,6 +9003,9 @@ def _library_item_matches_filters(item):
     if not isinstance(item, dict):
         return False
     if _asset_library_favorites_only() and not bool(item.get("favorite")):
+        return False
+    catalog_filter = _asset_library_catalog_filter()
+    if catalog_filter != "__all__" and str(item.get("asset_browser_catalog_id") or "") != catalog_filter:
         return False
     query = _asset_library_search_text()
     if not query:
@@ -8913,7 +9064,8 @@ def _library_asset_enum_items(self, context):
         if modified_at:
             detail_parts.append(modified_at)
         detail = " · ".join(part for part in detail_parts if part)
-        label = ("★ " if favorite else "") + name + (" · " + file_format if file_format else "")
+        catalog_name = str(item.get("asset_browser_catalog_name") or "").strip()
+        label = ("★ " if favorite else "") + ((catalog_name + " / ") if catalog_name else "") + name + (" · " + file_format if file_format else "")
         items.append((key, label, detail or "资产库文件"))
         seen.add(key)
     return items
@@ -14730,6 +14882,7 @@ def _append_asset_record(data, asset_record):
     return data
 
 
+
 def _link_object_to_collection_without_moving(obj, collection_name):
     if obj is None:
         return None
@@ -14971,6 +15124,66 @@ def _is_director_control_object(obj):
         return False
 
 
+def _is_director_mannequin_armature(obj):
+    if obj is None or getattr(obj, "type", "") != "ARMATURE":
+        return False
+    try:
+        if str(obj.get("gpt_director_asset_kind", "")) == "character":
+            return True
+        if "骨骼控制器" in str(obj.name or ""):
+            return True
+        bones = getattr(getattr(obj, "pose", None), "bones", None)
+        if bones is not None:
+            known_controls = ("hand.IK.L", "hand.IK.R", "foot.IK.L", "foot.IK.R")
+            return any(bones.get(name) is not None for name in known_controls)
+    except Exception:
+        pass
+    return False
+
+
+def _remove_mannequin_custom_shapes():
+    removed = 0
+    for obj in bpy.data.objects:
+        if not _is_director_mannequin_armature(obj):
+            continue
+        try:
+            for pose_bone in obj.pose.bones:
+                if pose_bone.custom_shape is not None:
+                    pose_bone.custom_shape = None
+                    removed += 1
+        except Exception:
+            pass
+        try:
+            obj.data.show_names = False
+            obj.data.show_bone_custom_shapes = False
+        except Exception:
+            pass
+    return removed
+
+
+def _remove_mannequin_rig_ui_objects():
+    removable = []
+    for obj in bpy.data.objects:
+        try:
+            parent = obj.parent
+            if (
+                obj.type == "MESH"
+                and parent is not None
+                and _is_director_mannequin_armature(parent)
+                and bool(obj.hide_render)
+                and not bool(obj.get("gpt_director_recolor_material", ""))
+            ):
+                removable.append(obj)
+        except Exception:
+            pass
+    for obj in removable:
+        try:
+            bpy.data.objects.remove(obj, do_unlink=True)
+        except Exception:
+            pass
+    return len(removable)
+
+
 def _set_all_director_label_visibility(visible=False):
     changed = 0
     for obj in bpy.data.objects:
@@ -14981,54 +15194,63 @@ def _set_all_director_label_visibility(visible=False):
     return changed
 
 
-def _set_view3d_relationship_lines(context=None, visible=False):
+def _director_view3d_screens(context=None):
+    screens = []
     try:
         screen = context.screen if context is not None else bpy.context.screen
+        if screen is not None:
+            screens.append(screen)
     except Exception:
-        screen = None
-    if screen is None:
-        return
+        pass
     try:
-        areas = screen.areas
+        for screen in bpy.data.screens:
+            if screen not in screens:
+                screens.append(screen)
     except Exception:
-        return
-    for area in areas:
-        if getattr(area, "type", "") != "VIEW_3D":
-            continue
-        for space in getattr(area, "spaces", []):
-            if getattr(space, "type", "") != "VIEW_3D":
+        pass
+    return screens
+
+
+def _set_view3d_relationship_lines(context=None, visible=False):
+    for screen in _director_view3d_screens(context):
+        for area in getattr(screen, "areas", []):
+            if getattr(area, "type", "") != "VIEW_3D":
                 continue
-            try:
-                space.overlay.show_relationship_lines = bool(visible)
-            except Exception:
-                pass
+            for space in getattr(area, "spaces", []):
+                if getattr(space, "type", "") != "VIEW_3D":
+                    continue
+                try:
+                    space.overlay.show_relationship_lines = bool(visible)
+                except Exception:
+                    pass
 
 
 def _set_view3d_simple_overlays(context=None, simple=True):
-    try:
-        screen = context.screen if context is not None else bpy.context.screen
-    except Exception:
-        screen = None
-    if screen is None:
-        return
-    try:
-        areas = screen.areas
-    except Exception:
-        return
-    for area in areas:
-        if getattr(area, "type", "") != "VIEW_3D":
-            continue
-        for space in getattr(area, "spaces", []):
-            if getattr(space, "type", "") != "VIEW_3D":
+    for screen in _director_view3d_screens(context):
+        for area in getattr(screen, "areas", []):
+            if getattr(area, "type", "") != "VIEW_3D":
                 continue
-            try:
-                space.overlay.show_relationship_lines = not bool(simple)
-            except Exception:
-                pass
-            try:
-                space.overlay.show_extras = not bool(simple)
-            except Exception:
-                pass
+            for space in getattr(area, "spaces", []):
+                if getattr(space, "type", "") != "VIEW_3D":
+                    continue
+                try:
+                    space.overlay.show_relationship_lines = not bool(simple)
+                except Exception:
+                    pass
+                try:
+                    space.overlay.show_extras = not bool(simple)
+                except Exception:
+                    pass
+                try:
+                    space.overlay.show_floor = True
+                    space.overlay.show_ortho_grid = True
+                except Exception:
+                    pass
+                for attr in ("show_axis_x", "show_axis_y", "show_axis_z"):
+                    try:
+                        setattr(space.overlay, attr, not bool(simple))
+                    except Exception:
+                        pass
 
 
 def _set_director_clean_view(context=None, enabled=True):
@@ -15047,6 +15269,7 @@ def _set_director_clean_view(context=None, enabled=True):
             pass
         try:
             if obj.type == "ARMATURE" and asset_kind == "character":
+                obj.hide_viewport = False
                 obj.hide_set(clean)
                 obj.show_in_front = not clean
                 if obj.data is not None:
@@ -15076,13 +15299,39 @@ def _set_director_clean_view(context=None, enabled=True):
 def _set_director_simple_view(context=None, enabled=True):
     simple = bool(enabled)
     changed = _set_all_director_label_visibility(False)
+    if simple:
+        changed += _remove_mannequin_rig_ui_objects()
+        changed += _remove_mannequin_custom_shapes()
+    try:
+        widgets_collection = bpy.data.collections.get("Director Mannequin Widgets")
+        if widgets_collection is not None:
+            widgets_collection.hide_viewport = True
+            widgets_collection.hide_render = True
+    except Exception:
+        pass
     for obj in bpy.data.objects:
-        if not _is_director_control_object(obj):
+        if simple and (str(obj.name or "").startswith("横向网格 ") or str(obj.name or "").startswith("纵向网格 ")):
+            try:
+                obj.hide_set(True)
+                changed += 1
+            except Exception:
+                pass
+            continue
+        if simple and getattr(obj, "type", "") in {{"LIGHT", "CAMERA"}}:
+            try:
+                obj.hide_set(True)
+                changed += 1
+            except Exception:
+                pass
+            continue
+        mannequin_armature = _is_director_mannequin_armature(obj)
+        if not _is_director_control_object(obj) and not mannequin_armature:
             continue
         role = str(obj.get("gpt_director_role", ""))
         asset_kind = str(obj.get("gpt_director_asset_kind", ""))
         try:
-            if obj.type == "ARMATURE" and asset_kind == "character":
+            if mannequin_armature:
+                obj.hide_viewport = simple
                 obj.hide_set(simple)
                 obj.show_in_front = not simple
                 if obj.data is not None:
@@ -15165,6 +15414,30 @@ def _view3d_window_region_and_space(context):
     if region is None or space is None or getattr(space, "region_3d", None) is None:
         return None, None
     return region, space
+
+
+def _event_in_view3d_window(context, event):
+    region, _space = _view3d_window_region_and_space(context)
+    if region is None:
+        return False
+    try:
+        mouse_x = int(event.mouse_x)
+        mouse_y = int(event.mouse_y)
+        area = getattr(context, "area", None)
+        interface_region_types = {{"UI", "HEADER", "TOOL_HEADER", "TOOLS", "HUD", "ASSET_SHELF", "ASSET_SHELF_HEADER"}}
+        for item in getattr(area, "regions", []):
+            if getattr(item, "type", "") not in interface_region_types:
+                continue
+            if int(getattr(item, "width", 0)) <= 0 or int(getattr(item, "height", 0)) <= 0:
+                continue
+            if item.x <= mouse_x < item.x + item.width and item.y <= mouse_y < item.y + item.height:
+                return False
+        return (
+            region.x <= mouse_x < region.x + region.width
+            and region.y <= mouse_y < region.y + region.height
+        )
+    except Exception:
+        return False
 
 
 def _view3d_mouse_ray(context, event):
@@ -16062,10 +16335,48 @@ def _apply_rigged_mannequin_pose(armature, pose="standing", look_yaw=0.0):
         except Exception:
             pass
     bpy.context.view_layer.update()
-    if pose not in ("seated", "reclining"):
+    if pose == "standing":
         if look_yaw:
             _rotate_pose_control(armature, "head", (0.0, 0.0, math.radians(look_yaw)))
             bpy.context.view_layer.update()
+        return
+    if pose == "walking":
+        _move_pose_control(armature, "hips", (0.0, 0.01, -0.02))
+        _move_pose_control(armature, "foot.IK.L", (0.02, -0.30, 0.08))
+        _move_pose_control(armature, "foot.IK.R", (-0.02, 0.24, 0.01))
+        _move_pose_control(armature, "Polo.Rodilla.L", (0.02, -0.12, 0.04))
+        _move_pose_control(armature, "Polo.Rodilla.R", (-0.02, 0.10, 0.02))
+        _move_pose_control(armature, "hand.IK.L", (-0.03, 0.19, 0.02))
+        _move_pose_control(armature, "hand.IK.R", (0.03, -0.19, 0.02))
+        _move_pose_control(armature, "Polo.Codo.L", (-0.08, 0.12, 0.02))
+        _move_pose_control(armature, "Polo.Codo.R", (0.08, -0.12, 0.02))
+        _rotate_pose_control(armature, "hips", (math.radians(3), 0.0, math.radians(-2)))
+        _rotate_pose_control(armature, "chest", (math.radians(-3), 0.0, math.radians(3)))
+        _rotate_pose_control(armature, "head", (0.0, 0.0, math.radians(look_yaw)))
+        bpy.context.view_layer.update()
+        return
+    if pose == "running":
+        _move_pose_control(armature, "hips", (0.0, 0.05, 0.03))
+        _move_pose_control(armature, "foot.IK.L", (0.03, -0.52, 0.22))
+        _move_pose_control(armature, "foot.IK.R", (-0.03, 0.40, 0.08))
+        _move_pose_control(armature, "Polo.Rodilla.L", (0.03, -0.20, 0.13))
+        _move_pose_control(armature, "Polo.Rodilla.R", (-0.03, 0.18, 0.08))
+        _move_pose_control(armature, "hand.IK.L", (-0.08, 0.34, 0.16))
+        _move_pose_control(armature, "hand.IK.R", (0.08, -0.32, 0.18))
+        _move_pose_control(armature, "Polo.Codo.L", (-0.18, 0.20, 0.13))
+        _move_pose_control(armature, "Polo.Codo.R", (0.18, -0.19, 0.14))
+        _rotate_pose_control(armature, "hips", (math.radians(9), 0.0, math.radians(-3)))
+        _rotate_pose_control(armature, "chest", (math.radians(-11), 0.0, math.radians(4)))
+        _rotate_pose_control(armature, "head", (math.radians(4), 0.0, math.radians(look_yaw)))
+        bpy.context.view_layer.update()
+        return
+    if pose == "waving":
+        _move_pose_control(armature, "hand.IK.R", (0.08, 0.02, 0.60))
+        _move_pose_control(armature, "Polo.Codo.R", (0.22, -0.02, 0.34))
+        _move_pose_control(armature, "hand.IK.L", (-0.02, -0.03, 0.02))
+        _rotate_pose_control(armature, "chest", (0.0, 0.0, math.radians(-3)))
+        _rotate_pose_control(armature, "head", (0.0, 0.0, math.radians(look_yaw - 5)))
+        bpy.context.view_layer.update()
         return
     _move_pose_control(armature, "hips", (0.0, 0.03, -0.21))
     _move_pose_control(armature, "foot.IK.L", (0.04, -0.40, 0.00))
@@ -16098,7 +16409,512 @@ def _apply_rigged_mannequin_pose(armature, pose="standing", look_yaw=0.0):
     bpy.context.view_layer.update()
 
 
-def _add_rigged_mannequin(label, color, location=(0, 0, 0), collection="Director Characters", pose="standing", asset_id="", role="actor", look_yaw=0.0):
+def _character_armature_for_asset(asset_id):
+    asset_id = str(asset_id or "").strip()
+    if not asset_id:
+        return None
+    for obj in bpy.data.objects:
+        try:
+            if (
+                obj.type == "ARMATURE"
+                and str(obj.get("gpt_director_asset_id", "")).strip() == asset_id
+                and str(obj.get("gpt_director_asset_kind", "")) == "character"
+            ):
+                return obj
+        except Exception:
+            pass
+    return None
+
+
+def _object_is_descendant_of(obj, root):
+    current = obj
+    while current is not None:
+        if current is root:
+            return True
+        current = getattr(current, "parent", None)
+    return False
+
+
+def _character_armature_for_root(root):
+    if root is None:
+        return None
+    for obj in bpy.data.objects:
+        try:
+            if obj.type == "ARMATURE" and _object_is_descendant_of(obj, root):
+                return obj
+        except Exception:
+            pass
+    return None
+
+
+def _mannequin_color_key(root):
+    if root is None:
+        return ""
+    stored = str(root.get("gpt_director_character_color", "")).strip().lower()
+    if stored in {{"blue", "red"}}:
+        return stored
+    text = " ".join(
+        (
+            str(getattr(root, "name", "") or ""),
+            str(root.get("gpt_director_asset_id", "") or ""),
+            str(root.get("gpt_director_role", "") or ""),
+        )
+    ).lower()
+    if "蓝" in text or "blue" in text or "男角色" in text:
+        return "blue"
+    if "红" in text or "red" in text or "女角色" in text:
+        return "red"
+    return ""
+
+
+def _mannequin_character_roots():
+    roots = []
+    for obj in bpy.data.objects:
+        try:
+            if obj.type != "ARMATURE" or str(obj.get("gpt_director_asset_kind", "")) != "character":
+                continue
+            current = getattr(obj, "parent", None)
+            while current is not None:
+                if current.type == "EMPTY" and str(current.get("gpt_director_asset_kind", "")) == "character":
+                    if _mannequin_color_key(current) and current not in roots:
+                        roots.append(current)
+                    break
+                current = getattr(current, "parent", None)
+        except Exception:
+            pass
+    roots.sort(key=lambda item: str(item.name or ""))
+    return roots
+
+
+def _character_label_for_color(color_key, index):
+    prefix = "男角色" if color_key == "blue" else "女角色"
+    return prefix + str(int(index))
+
+
+def _character_asset_id_for_color(color_key, index):
+    return "builtin_" + color_key + "_mannequin_" + str(int(index))
+
+
+def _set_character_instance_identity(root, color_key, index):
+    if root is None or color_key not in {{"blue", "red"}}:
+        return 0
+    index = max(1, int(index))
+    label = _character_label_for_color(color_key, index)
+    asset_id = _character_asset_id_for_color(color_key, index)
+    changed = 0
+    descendants = [obj for obj in bpy.data.objects if _object_is_descendant_of(obj, root)]
+    for obj in descendants:
+        try:
+            if str(obj.get("gpt_director_asset_id", "")) != asset_id:
+                obj["gpt_director_asset_id"] = asset_id
+                changed += 1
+        except Exception:
+            pass
+    for obj in (root, _character_armature_for_root(root)):
+        if obj is None:
+            continue
+        try:
+            if str(obj.get("gpt_director_character_label", "")) != label:
+                obj["gpt_director_character_label"] = label
+                changed += 1
+            obj["gpt_director_character_color"] = color_key
+            obj["gpt_director_character_index"] = index
+        except Exception:
+            pass
+    try:
+        root["gpt_director_asset_kind"] = "character"
+        root["gpt_director_role"] = "actor_" + color_key
+        root.name = label + " 根控制器"
+    except Exception:
+        pass
+    armature = _character_armature_for_root(root)
+    if armature is not None:
+        try:
+            armature.name = label + " 骨骼控制器"
+        except Exception:
+            pass
+    for obj in descendants:
+        try:
+            if obj.type == "MESH" and bool(obj.get("gpt_director_recolor_material", "")):
+                obj.name = label + " 人偶主体"
+                obj["gpt_director_character_label"] = label
+                obj["gpt_director_character_color"] = color_key
+                obj["gpt_director_character_index"] = index
+                break
+        except Exception:
+            pass
+    return changed
+
+
+def _ensure_independent_mannequin_instances():
+    groups = {{"blue": [], "red": []}}
+    for root in _mannequin_character_roots():
+        color_key = _mannequin_color_key(root)
+        if color_key in groups:
+            groups[color_key].append(root)
+    changed = 0
+    for color_key, roots in groups.items():
+        roots.sort(key=lambda item: str(item.name or ""))
+        for index, root in enumerate(roots, 1):
+            changed += _set_character_instance_identity(root, color_key, index)
+    try:
+        active = getattr(bpy.context, "active_object", None)
+        active_root = next((root for root in _mannequin_character_roots() if _object_is_descendant_of(active, root)), None)
+        if active_root is not None:
+            _remember_active_character(bpy.context, active_root)
+    except Exception:
+        pass
+    return changed
+
+
+def _next_mannequin_index(color_key):
+    _ensure_independent_mannequin_instances()
+    indexes = []
+    for root in _mannequin_character_roots():
+        if _mannequin_color_key(root) != color_key:
+            continue
+        try:
+            indexes.append(int(root.get("gpt_director_character_index", 0) or 0))
+        except Exception:
+            pass
+    return max(indexes or [0]) + 1
+
+
+def _mannequin_spawn_location(color_key, index):
+    offset = max(0, int(index) - 2)
+    direction = -1.0 if color_key == "blue" else 1.0
+    return (direction * (0.8 + 0.7 * (offset % 3)), -0.75 * (offset // 3), 0.0)
+
+
+def _character_label_world_location(root):
+    armature = _character_armature_for_root(root)
+    if armature is not None:
+        try:
+            head = armature.pose.bones.get("head")
+            if head is not None:
+                return armature.matrix_world @ head.head + Vector((0.0, 0.0, 0.28))
+        except Exception:
+            pass
+    try:
+        return root.matrix_world.translation + Vector((0.0, 0.0, 2.1))
+    except Exception:
+        return None
+
+
+def _draw_character_name_labels():
+    context = bpy.context
+    region = getattr(context, "region", None)
+    space = getattr(context, "space_data", None)
+    if region is None or space is None or getattr(space, "type", "") != "VIEW_3D":
+        return
+    region_3d = getattr(space, "region_3d", None)
+    if region_3d is None:
+        return
+    font_id = _character_label_font_id()
+    try:
+        blf.size(font_id, 15, 72)
+        blf.enable(font_id, blf.SHADOW)
+        blf.shadow(font_id, 3, 0.0, 0.0, 0.0, 0.85)
+        blf.shadow_offset(font_id, 1, -1)
+    except Exception:
+        pass
+    for root in _mannequin_character_roots():
+        label = str(root.get("gpt_director_character_label", "") or "").strip()
+        world_location = _character_label_world_location(root)
+        if not label or world_location is None:
+            continue
+        try:
+            point = view3d_utils.location_3d_to_region_2d(region, region_3d, world_location)
+            if point is None:
+                continue
+            width, _height = blf.dimensions(font_id, label)
+            color_key = _mannequin_color_key(root)
+            color = (0.55, 0.80, 1.0, 1.0) if color_key == "blue" else (1.0, 0.68, 0.72, 1.0)
+            blf.color(font_id, *color)
+            blf.position(font_id, point.x - width * 0.5, point.y + 4.0, 0.0)
+            blf.draw(font_id, label)
+        except Exception:
+            pass
+    try:
+        blf.disable(font_id, blf.SHADOW)
+    except Exception:
+        pass
+
+
+_CHARACTER_LABEL_HANDLER_KEY = "gpt_director_character_label_handler"
+_CHARACTER_LABEL_FONT_KEY = "gpt_director_character_label_font"
+_SIMPLE_DRAG_RUNTIME_KEY = "gpt_director_simple_drag_runtime_active"
+_SIMPLE_DRAG_TIMER_KEY = "gpt_director_simple_drag_start_timer"
+_SIMPLE_DRAG_TIMER_ATTEMPTS_KEY = "gpt_director_simple_drag_start_attempts"
+_CHARACTER_LABEL_FONT_PATHS = (
+    "/System/Library/Fonts/PingFang.ttc",
+    "/System/Library/Fonts/Hiragino Sans GB.ttc",
+    "/Library/Fonts/Arial Unicode.ttf",
+)
+
+
+def _character_label_font_id():
+    try:
+        cached = bpy.app.driver_namespace.get(_CHARACTER_LABEL_FONT_KEY)
+        if isinstance(cached, int) and cached >= 0:
+            return cached
+    except Exception:
+        pass
+    font_id = 0
+    for path in _CHARACTER_LABEL_FONT_PATHS:
+        if not os.path.exists(path):
+            continue
+        try:
+            loaded = int(blf.load(path))
+            if loaded >= 0:
+                font_id = loaded
+                break
+        except Exception:
+            pass
+    try:
+        bpy.app.driver_namespace[_CHARACTER_LABEL_FONT_KEY] = font_id
+    except Exception:
+        pass
+    return font_id
+
+
+def _unregister_character_label_draw_handler():
+    try:
+        handle = bpy.app.driver_namespace.pop(_CHARACTER_LABEL_HANDLER_KEY, None)
+    except Exception:
+        handle = None
+    if handle is not None:
+        try:
+            bpy.types.SpaceView3D.draw_handler_remove(handle, "WINDOW")
+        except Exception:
+            pass
+
+
+def _register_character_label_draw_handler():
+    if getattr(bpy.app, "background", False):
+        return
+    _unregister_character_label_draw_handler()
+    try:
+        handle = bpy.types.SpaceView3D.draw_handler_add(_draw_character_name_labels, (), "WINDOW", "POST_PIXEL")
+        bpy.app.driver_namespace[_CHARACTER_LABEL_HANDLER_KEY] = handle
+    except Exception:
+        pass
+    for screen in _director_view3d_screens():
+        for area in getattr(screen, "areas", []):
+            if getattr(area, "type", "") == "VIEW_3D":
+                try:
+                    area.tag_redraw()
+                except Exception:
+                    pass
+
+
+def _set_simple_drag_runtime_active(active):
+    try:
+        if active:
+            bpy.app.driver_namespace[_SIMPLE_DRAG_RUNTIME_KEY] = True
+        else:
+            bpy.app.driver_namespace.pop(_SIMPLE_DRAG_RUNTIME_KEY, None)
+    except Exception:
+        pass
+
+
+def _simple_drag_runtime_active():
+    try:
+        return bool(bpy.app.driver_namespace.get(_SIMPLE_DRAG_RUNTIME_KEY, False))
+    except Exception:
+        return False
+
+
+def _start_simple_drag_mode_after_load():
+    try:
+        attempts = int(bpy.app.driver_namespace.get(_SIMPLE_DRAG_TIMER_ATTEMPTS_KEY, 0) or 0) + 1
+        bpy.app.driver_namespace[_SIMPLE_DRAG_TIMER_ATTEMPTS_KEY] = attempts
+    except Exception:
+        attempts = 1
+    if _simple_drag_runtime_active():
+        return None
+    window_manager = getattr(bpy.context, "window_manager", None)
+    for window in getattr(window_manager, "windows", []):
+        screen = getattr(window, "screen", None)
+        for area in getattr(screen, "areas", []):
+            if getattr(area, "type", "") != "VIEW_3D":
+                continue
+            region = next((item for item in getattr(area, "regions", []) if getattr(item, "type", "") == "WINDOW"), None)
+            space = next((item for item in getattr(area, "spaces", []) if getattr(item, "type", "") == "VIEW_3D"), None)
+            if region is None or space is None:
+                continue
+            override = bpy.context.copy()
+            override.update({{
+                "window": window,
+                "screen": screen,
+                "area": area,
+                "region": region,
+                "space_data": space,
+                "scene": getattr(window, "scene", bpy.context.scene),
+            }})
+            try:
+                result = bpy.ops.gpt_director.simple_drag_mode(override, "INVOKE_DEFAULT")
+                if "RUNNING_MODAL" in result:
+                    return None
+            except Exception:
+                pass
+    if attempts < 20:
+        return 0.25
+    try:
+        bpy.context.scene.gpt_director_simple_drag_enabled = False
+    except Exception:
+        pass
+    return None
+
+
+def _cancel_simple_drag_mode_start():
+    try:
+        timer = bpy.app.driver_namespace.pop(_SIMPLE_DRAG_TIMER_KEY, None)
+        bpy.app.driver_namespace.pop(_SIMPLE_DRAG_TIMER_ATTEMPTS_KEY, None)
+        if timer is not None and bpy.app.timers.is_registered(timer):
+            bpy.app.timers.unregister(timer)
+    except Exception:
+        pass
+
+
+def _schedule_simple_drag_mode_start():
+    _cancel_simple_drag_mode_start()
+    _set_simple_drag_runtime_active(False)
+    try:
+        bpy.context.scene.gpt_director_simple_drag_enabled = False
+    except Exception:
+        pass
+
+
+@persistent
+def _director_load_post(_loaded_file):
+    try:
+        _remove_legacy_depth_scene_data()
+    except Exception:
+        pass
+    try:
+        _ensure_independent_mannequin_instances()
+    except Exception:
+        pass
+    try:
+        _register_character_label_draw_handler()
+    except Exception:
+        pass
+    try:
+        _set_director_simple_view(bpy.context, True)
+    except Exception:
+        pass
+    _cancel_simple_drag_mode_start()
+    _set_simple_drag_runtime_active(False)
+    try:
+        bpy.context.scene.gpt_director_simple_drag_enabled = False
+    except Exception:
+        pass
+
+
+def _unregister_director_load_post_handler():
+    for handler in list(getattr(bpy.app.handlers, "load_post", [])):
+        if handler is _director_load_post or getattr(handler, "__name__", "") == "_director_load_post":
+            try:
+                bpy.app.handlers.load_post.remove(handler)
+            except Exception:
+                pass
+
+
+def _register_director_load_post_handler():
+    _unregister_director_load_post_handler()
+    try:
+        bpy.app.handlers.load_post.append(_director_load_post)
+    except Exception:
+        pass
+
+
+def _remember_active_character(context, root):
+    if root is None or str(root.get("gpt_director_asset_kind", "")) != "character":
+        return
+    asset_id = str(root.get("gpt_director_asset_id", "")).strip()
+    armature = _character_armature_for_root(root)
+    label = str(root.name or asset_id).replace(" 根控制器", "")
+    if armature is not None:
+        label = str(armature.name or label).replace(" 骨骼控制器", "")
+    try:
+        context.scene.gpt_director_active_character_asset_id = asset_id
+        context.scene.gpt_director_active_character_name = label
+        if armature is not None:
+            context.scene.gpt_director_active_pose = str(armature.get("gpt_director_current_pose", "standing") or "standing")
+    except Exception:
+        pass
+
+
+def _active_character_armature(context):
+    active = getattr(context, "active_object", None)
+    root = _director_drag_root_for_object(active)
+    if root is not None and str(root.get("gpt_director_asset_kind", "")) == "character":
+        _remember_active_character(context, root)
+        armature = _character_armature_for_root(root)
+        if armature is not None:
+            return armature
+    asset_id = str(getattr(context.scene, "gpt_director_active_character_asset_id", "") or "").strip()
+    if asset_id:
+        matching_roots = [
+            root
+            for root in _mannequin_character_roots()
+            if str(root.get("gpt_director_asset_id", "")).strip() == asset_id
+        ]
+        if len(matching_roots) == 1:
+            armature = _character_armature_for_root(matching_roots[0])
+            if armature is not None:
+                return armature
+    armatures = [
+        obj
+        for obj in bpy.data.objects
+        if obj.type == "ARMATURE" and str(obj.get("gpt_director_asset_kind", "")) == "character"
+    ]
+    if len(armatures) == 1:
+        return armatures[0]
+    return None
+
+
+def _apply_mannequin_pose_preset(context, armature, pose):
+    if armature is None or armature.type != "ARMATURE":
+        raise RuntimeError("请先在画面中点一下要调整姿势的人偶")
+    root = _director_drag_root_for_object(armature)
+    if root is None:
+        raise RuntimeError("当前人物缺少独立根控制器，请重新打开导演台自动修复")
+    proxies = [
+        obj
+        for obj in bpy.data.objects
+        if _object_is_descendant_of(obj, root)
+        and str(obj.get("gpt_director_role", "")) == "pose_proxy"
+    ]
+    muted_constraints = []
+    for control in proxies:
+        bone_name = str(control.get("gpt_director_control_bone", "")).strip()
+        pose_bone = armature.pose.bones.get(bone_name) if bone_name else None
+        constraint = pose_bone.constraints.get("GPT 导演台可视控制器") if pose_bone is not None else None
+        if constraint is not None:
+            muted_constraints.append(constraint)
+            constraint.mute = True
+    try:
+        _apply_rigged_mannequin_pose(armature, pose)
+        context.view_layer.update()
+        for control in proxies:
+            bone_name = str(control.get("gpt_director_control_bone", "")).strip()
+            pose_bone = armature.pose.bones.get(bone_name) if bone_name else None
+            if pose_bone is not None:
+                control.matrix_world = armature.matrix_world @ pose_bone.matrix
+    finally:
+        for constraint in muted_constraints:
+            constraint.mute = False
+    armature["gpt_director_current_pose"] = str(pose or "standing")
+    context.scene.gpt_director_active_pose = str(pose or "standing")
+    _remember_active_character(context, root)
+    _set_director_simple_view(context, True)
+    context.view_layer.update()
+    return armature
+
+
+def _add_rigged_mannequin(label, color, location=(0, 0, 0), collection="Director Characters", pose="standing", asset_id="", role="actor", look_yaw=0.0, character_color=""):
     asset_id = asset_id or _safe_id(label, "builtin_actor")
     if not MANNEQUIN_TEMPLATE_PATH or not os.path.exists(MANNEQUIN_TEMPLATE_PATH):
         raise RuntimeError("内置骨骼人偶资源不存在，请重新打开导演台工程以修复资产：" + str(MANNEQUIN_TEMPLATE_PATH))
@@ -16128,6 +16944,18 @@ def _add_rigged_mannequin(label, color, location=(0, 0, 0), collection="Director
             except Exception:
                 pass
         raise RuntimeError("内置骨骼人偶模板缺少骨骼或主体网格")
+
+    rig_ui_objects = [
+        obj
+        for obj in imported
+        if obj.type == "MESH" and obj is not body and obj.parent is armature and bool(obj.hide_render)
+    ]
+    imported = [obj for obj in imported if obj not in rig_ui_objects]
+    for obj in rig_ui_objects:
+        try:
+            bpy.data.objects.remove(obj, do_unlink=True)
+        except Exception:
+            pass
 
     custom_shapes = set(
         pose_bone.custom_shape
@@ -16164,6 +16992,7 @@ def _add_rigged_mannequin(label, color, location=(0, 0, 0), collection="Director
     _configure_mannequin_pose_display(armature)
     _set_mannequin_material_color(body, label, color)
     _apply_rigged_mannequin_pose(armature, pose, look_yaw)
+    armature["gpt_director_current_pose"] = str(pose or "standing")
 
     root = _add_empty_control(label + " 根控制器", (0, 0, 0), asset_id, "character", role)
     _parent_preserve_world(armature, root)
@@ -16173,7 +17002,12 @@ def _add_rigged_mannequin(label, color, location=(0, 0, 0), collection="Director
     controls = [root, armature] + pose_controls
     if ring is not None:
         controls.append(ring)
-    _set_director_clean_view(None, True)
+    color_key = str(character_color or "").strip().lower() or _mannequin_color_key(root)
+    if color_key in {{"blue", "red"}}:
+        match = re.search(r"(\d+)$", str(asset_id or label))
+        character_index = int(match.group(1)) if match else 1
+        _set_character_instance_identity(root, color_key, character_index)
+    _set_director_simple_view(None, True)
     _select_roots([root])
     objects = [root] + imported + pose_controls
     if ring is not None:
@@ -16391,22 +17225,24 @@ def _build_dialogue_lounge_scene():
     right_sofa = _add_sofa_unit("右侧沙发", (1.15, 0.05, 0), "builtin_right_sofa")
     table = _add_round_table_asset("中心茶几", (0, -0.92, 0), "builtin_round_table")
     left_actor = _add_rigged_mannequin(
-        "红色人偶",
+        "女角色1",
         (0.78, 0.18, 0.12, 1),
         location=(-1.15, -0.28, 0),
         pose="seated",
-        asset_id="builtin_red_mannequin",
+        asset_id="builtin_red_mannequin_1",
         role="actor_red",
         look_yaw=12,
+        character_color="red",
     )
     right_actor = _add_rigged_mannequin(
-        "蓝色人偶",
+        "男角色1",
         (0.08, 0.38, 0.84, 1),
         location=(1.15, -0.26, 0),
         pose="seated",
-        asset_id="builtin_blue_mannequin",
+        asset_id="builtin_blue_mannequin_1",
         role="actor_blue",
         look_yaw=-12,
+        character_color="blue",
     )
     _add_three_point_lighting()
     camera = bpy.context.scene.camera
@@ -16428,6 +17264,7 @@ def _build_dialogue_lounge_scene():
     except Exception:
         pass
     _seed_director_metadata_for_lounge(left_actor, right_actor, left_sofa, right_sofa, table)
+    _set_director_simple_view(bpy.context, True)
     _select_roots([left_actor.get("root"), right_actor.get("root"), table.get("root")])
     return dict(left_actor=left_actor, right_actor=right_actor, left_sofa=left_sofa, right_sofa=right_sofa, table=table)
 
@@ -16543,11 +17380,23 @@ class GPT_OT_director_add_blue_mannequin(bpy.types.Operator):
     bl_options = {{"REGISTER", "UNDO"}}
 
     def execute(self, context):
-        bundle = _add_rigged_mannequin("蓝色人偶", (0.08, 0.38, 0.84, 1), location=(-0.8, 0, 0), asset_id="builtin_blue_mannequin")
+        index = _next_mannequin_index("blue")
+        label = _character_label_for_color("blue", index)
+        asset_id = _character_asset_id_for_color("blue", index)
+        bundle = _add_rigged_mannequin(
+            label,
+            (0.08, 0.38, 0.84, 1),
+            location=_mannequin_spawn_location("blue", index),
+            asset_id=asset_id,
+            role="actor_blue",
+            character_color="blue",
+        )
         data = _load_meta()
-        _record_builtin_asset(data, "builtin_blue_mannequin", "蓝色 IK/FK 骨骼人偶", "character", bundle.get("objects") or [], ["Director Characters", "Director Controls", "Director Mannequin Widgets"])
-        _record_builtin_actor(data, "builtin_actor_blue", "蓝色人偶", "演员位", bundle.get("objects") or [])
+        _record_builtin_asset(data, asset_id, label + " / 蓝色 IK/FK 骨骼人偶", "character", bundle.get("objects") or [], ["Director Characters", "Director Controls", "Director Mannequin Widgets"])
+        _record_builtin_actor(data, "builtin_actor_blue_" + str(index), label, "男角色", bundle.get("objects") or [])
         _save_meta(data)
+        _remember_active_character(context, bundle.get("root"))
+        self.report({{"INFO"}}, "已添加并选中 " + label)
         return {{"FINISHED"}}
 
 
@@ -16557,11 +17406,23 @@ class GPT_OT_director_add_red_mannequin(bpy.types.Operator):
     bl_options = {{"REGISTER", "UNDO"}}
 
     def execute(self, context):
-        bundle = _add_rigged_mannequin("红色人偶", (0.78, 0.18, 0.12, 1), location=(0.8, 0, 0), asset_id="builtin_red_mannequin")
+        index = _next_mannequin_index("red")
+        label = _character_label_for_color("red", index)
+        asset_id = _character_asset_id_for_color("red", index)
+        bundle = _add_rigged_mannequin(
+            label,
+            (0.78, 0.18, 0.12, 1),
+            location=_mannequin_spawn_location("red", index),
+            asset_id=asset_id,
+            role="actor_red",
+            character_color="red",
+        )
         data = _load_meta()
-        _record_builtin_asset(data, "builtin_red_mannequin", "红色 IK/FK 骨骼人偶", "character", bundle.get("objects") or [], ["Director Characters", "Director Controls", "Director Mannequin Widgets"])
-        _record_builtin_actor(data, "builtin_actor_red", "红色人偶", "演员位", bundle.get("objects") or [])
+        _record_builtin_asset(data, asset_id, label + " / 红色 IK/FK 骨骼人偶", "character", bundle.get("objects") or [], ["Director Characters", "Director Controls", "Director Mannequin Widgets"])
+        _record_builtin_actor(data, "builtin_actor_red_" + str(index), label, "女角色", bundle.get("objects") or [])
         _save_meta(data)
+        _remember_active_character(context, bundle.get("root"))
+        self.report({{"INFO"}}, "已添加并选中 " + label)
         return {{"FINISHED"}}
 
 
@@ -16634,6 +17495,46 @@ class GPT_OT_director_toggle_clean_view(bpy.types.Operator):
         return {{"FINISHED"}}
 
 
+class GPT_OT_director_set_simple_view(bpy.types.Operator):
+    bl_idname = "gpt_director.set_simple_view"
+    bl_label = "隐藏所有控制线"
+    bl_options = {{"REGISTER", "UNDO"}}
+
+    def execute(self, context):
+        changed = _set_director_simple_view(context, True)
+        self.report({{"INFO"}}, "已隐藏骨骼、IK、名称和关系线：" + str(changed) + " 个辅助对象")
+        return {{"FINISHED"}}
+
+
+class GPT_OT_director_apply_quick_pose(bpy.types.Operator):
+    bl_idname = "gpt_director.apply_quick_pose"
+    bl_label = "应用人物姿势"
+    bl_options = {{"REGISTER", "UNDO"}}
+
+    pose: StringProperty(default="standing")
+
+    def execute(self, context):
+        armature = _active_character_armature(context)
+        if armature is None:
+            self.report({{"WARNING"}}, "请先在画面中点一下要调整姿势的人偶")
+            return {{"CANCELLED"}}
+        labels = {{
+            "standing": "站立",
+            "seated": "坐下",
+            "walking": "行走",
+            "running": "跑步",
+            "waving": "招手",
+            "reclining": "斜躺",
+        }}
+        try:
+            _apply_mannequin_pose_preset(context, armature, self.pose)
+        except Exception as exc:
+            self.report({{"ERROR"}}, "姿势应用失败：" + str(exc))
+            return {{"CANCELLED"}}
+        self.report({{"INFO"}}, "已为 " + armature.name.replace(" 骨骼控制器", "") + " 应用姿势：" + labels.get(self.pose, self.pose))
+        return {{"FINISHED"}}
+
+
 class GPT_OT_director_simple_drag_mode(bpy.types.Operator):
     bl_idname = "gpt_director.simple_drag_mode"
     bl_label = "极简拖动模式"
@@ -16643,8 +17544,22 @@ class GPT_OT_director_simple_drag_mode(bpy.types.Operator):
     _drag_plane_z = 0.0
     _drag_offset = None
     _dragging = False
+    _drag_operation = "MOVE"
+    _rotate_start_mouse_x = 0
+    _rotate_start_z = 0.0
+    _view_rotate_start_mouse_x = 0
+    _view_rotate_start_mouse_y = 0
+    _view_rotate_start = None
+    _view_pan_start_mouse_x = 0
+    _view_pan_start_mouse_y = 0
+    _view_pan_start_location = None
+    _view_pan_start_rotation = None
+    _view_pan_scale = 0.01
 
     def invoke(self, context, event):
+        if _simple_drag_runtime_active():
+            self.report({{"INFO"}}, "鼠标拖动已经开启")
+            return {{"CANCELLED"}}
         region, space = _view3d_window_region_and_space(context)
         if region is None or space is None:
             self.report({{"WARNING"}}, "请在 Blender 3D 视图里启动极简拖动模式")
@@ -16653,42 +17568,132 @@ class GPT_OT_director_simple_drag_mode(bpy.types.Operator):
         self._drag_root = None
         self._drag_offset = None
         self._dragging = False
+        self._drag_operation = "MOVE"
+        self._rotate_start_mouse_x = 0
+        self._rotate_start_z = 0.0
+        self._view_rotate_start_mouse_x = 0
+        self._view_rotate_start_mouse_y = 0
+        self._view_rotate_start = None
+        self._view_pan_start_mouse_x = 0
+        self._view_pan_start_mouse_y = 0
+        self._view_pan_start_location = None
+        self._view_pan_start_rotation = None
+        self._view_pan_scale = 0.01
+        _set_simple_drag_runtime_active(True)
+        context.scene.gpt_director_simple_drag_enabled = True
         context.window_manager.modal_handler_add(self)
-        self.report({{"INFO"}}, "极简拖动模式：左键按住人偶/家具拖动；右键或 Esc 退出")
+        self.report({{"INFO"}}, "模型左拖移动；Shift+左拖旋转；空白左拖旋转视角；右键拖动平移视角")
         return {{"RUNNING_MODAL"}}
 
     def modal(self, context, event):
-        if event.type in {"ESC", "RIGHTMOUSE"}:
+        if event.type == "ESC":
             self._drag_root = None
             self._dragging = False
-            self.report({{"INFO"}}, "已退出极简拖动模式")
+            self._drag_operation = "MOVE"
+            self._view_pan_start_location = None
+            _set_simple_drag_runtime_active(False)
+            context.scene.gpt_director_simple_drag_enabled = False
+            self.report({{"INFO"}}, "已退出位置拖放")
             return {{"CANCELLED"}}
+        event_in_view = _event_in_view3d_window(context, event)
+        if event.type in {"LEFTMOUSE", "RIGHTMOUSE"} and event.value == "PRESS" and not event_in_view:
+            return {{"PASS_THROUGH"}}
+        if event.type in {"LEFTMOUSE", "RIGHTMOUSE"} and event.value == "RELEASE" and not self._dragging:
+            return {{"PASS_THROUGH"}}
+        if event.type == "MOUSEMOVE" and not self._dragging and not event_in_view:
+            return {{"PASS_THROUGH"}}
+        if event.type == "RIGHTMOUSE" and event.value == "PRESS":
+            _region, space = _view3d_window_region_and_space(context)
+            if _region is None or space is None:
+                return {{"RUNNING_MODAL"}}
+            try:
+                self._drag_root = None
+                self._drag_operation = "VIEW_PAN"
+                self._view_pan_start_mouse_x = int(event.mouse_x)
+                self._view_pan_start_mouse_y = int(event.mouse_y)
+                self._view_pan_start_location = space.region_3d.view_location.copy()
+                self._view_pan_start_rotation = space.region_3d.view_rotation.copy()
+                viewport_size = max(1, min(int(_region.width), int(_region.height)))
+                self._view_pan_scale = max(0.0001, float(space.region_3d.view_distance) * 2.0 / viewport_size)
+                self._dragging = True
+            except Exception:
+                self._dragging = False
+            return {{"RUNNING_MODAL"}}
         if event.type == "LEFTMOUSE" and event.value == "PRESS":
             obj, hit_location = _raycast_visible_director_object(context, event)
             root = _director_drag_root_for_object(obj)
             if root is None:
+                _region, space = _view3d_window_region_and_space(context)
+                if space is None:
+                    return {{"RUNNING_MODAL"}}
+                try:
+                    self._drag_operation = "VIEW_ROTATE"
+                    self._view_rotate_start_mouse_x = int(event.mouse_x)
+                    self._view_rotate_start_mouse_y = int(event.mouse_y)
+                    self._view_rotate_start = space.region_3d.view_rotation.copy()
+                    self._dragging = True
+                except Exception:
+                    self._dragging = False
                 return {{"RUNNING_MODAL"}}
-            try:
-                self._drag_plane_z = float(root.location.z)
-            except Exception:
-                self._drag_plane_z = 0.0
-            plane_point = _view3d_plane_intersection(context, event, self._drag_plane_z) or hit_location
-            if plane_point is None:
-                return {{"RUNNING_MODAL"}}
-            try:
+            self._drag_root = root
+            self._dragging = True
+            if event.shift:
+                self._drag_operation = "ROTATE"
+                self._rotate_start_mouse_x = int(event.mouse_x)
+                try:
+                    self._rotate_start_z = float(root.rotation_euler.z)
+                except Exception:
+                    self._rotate_start_z = 0.0
+            else:
+                self._drag_operation = "MOVE"
+                try:
+                    self._drag_plane_z = float(root.location.z)
+                except Exception:
+                    self._drag_plane_z = 0.0
+                plane_point = _view3d_plane_intersection(context, event, self._drag_plane_z) or hit_location
+                if plane_point is None:
+                    self._drag_root = None
+                    self._dragging = False
+                    return {{"RUNNING_MODAL"}}
                 self._drag_offset = root.location.copy() - plane_point
-                self._drag_root = root
-                self._dragging = True
+            try:
                 bpy.ops.object.select_all(action="DESELECT")
                 root.hide_set(False)
                 root.select_set(True)
                 context.view_layer.objects.active = root
                 root.hide_set(True)
             except Exception:
-                self._drag_root = root
-                self._dragging = True
+                pass
+            _remember_active_character(context, root)
+            return {{"RUNNING_MODAL"}}
+        if event.type == "MOUSEMOVE" and self._dragging and self._drag_operation == "VIEW_PAN":
+            _region, space = _view3d_window_region_and_space(context)
+            if space is None or self._view_pan_start_location is None or self._view_pan_start_rotation is None:
+                return {{"RUNNING_MODAL"}}
+            try:
+                delta_x = int(event.mouse_x) - self._view_pan_start_mouse_x
+                delta_y = int(event.mouse_y) - self._view_pan_start_mouse_y
+                inverse_rotation = self._view_pan_start_rotation.inverted()
+                view_right = inverse_rotation @ Vector((1.0, 0.0, 0.0))
+                view_up = inverse_rotation @ Vector((0.0, 1.0, 0.0))
+                space.region_3d.view_location = (
+                    self._view_pan_start_location
+                    - view_right * delta_x * self._view_pan_scale
+                    - view_up * delta_y * self._view_pan_scale
+                )
+                context.area.tag_redraw()
+            except Exception:
+                pass
             return {{"RUNNING_MODAL"}}
         if event.type == "MOUSEMOVE" and self._dragging and self._drag_root is not None:
+            if self._drag_operation == "ROTATE":
+                try:
+                    delta = int(event.mouse_x) - self._rotate_start_mouse_x
+                    self._drag_root.rotation_euler.z = self._rotate_start_z + delta * 0.01
+                    context.view_layer.update()
+                except Exception:
+                    pass
+                return {{"RUNNING_MODAL"}}
             plane_point = _view3d_plane_intersection(context, event, self._drag_plane_z)
             if plane_point is None:
                 return {{"RUNNING_MODAL"}}
@@ -16701,10 +17706,35 @@ class GPT_OT_director_simple_drag_mode(bpy.types.Operator):
             except Exception:
                 pass
             return {{"RUNNING_MODAL"}}
+        if event.type == "MOUSEMOVE" and self._dragging and self._drag_operation == "VIEW_ROTATE":
+            _region, space = _view3d_window_region_and_space(context)
+            if space is None or self._view_rotate_start is None:
+                return {{"RUNNING_MODAL"}}
+            try:
+                delta_x = int(event.mouse_x) - self._view_rotate_start_mouse_x
+                delta_y = int(event.mouse_y) - self._view_rotate_start_mouse_y
+                yaw = Quaternion((0.0, 0.0, 1.0), -delta_x * 0.005)
+                pitch = Quaternion((1.0, 0.0, 0.0), delta_y * 0.005)
+                space.region_3d.view_rotation = yaw @ self._view_rotate_start @ pitch
+                context.area.tag_redraw()
+            except Exception:
+                pass
+            return {{"RUNNING_MODAL"}}
+        if event.type == "RIGHTMOUSE" and event.value == "RELEASE":
+            if self._drag_operation != "VIEW_PAN":
+                return {{"PASS_THROUGH"}}
+            self._drag_root = None
+            self._dragging = False
+            self._drag_operation = "MOVE"
+            self._view_pan_start_location = None
+            self._view_pan_start_rotation = None
+            return {{"RUNNING_MODAL"}}
         if event.type == "LEFTMOUSE" and event.value == "RELEASE":
             self._drag_root = None
             self._drag_offset = None
             self._dragging = False
+            self._drag_operation = "MOVE"
+            self._view_rotate_start = None
             return {{"RUNNING_MODAL"}}
         return {{"PASS_THROUGH"}}
 
@@ -19404,6 +20434,7 @@ class GPT_OT_director_save_metadata(bpy.types.Operator):
     bl_options = {{"REGISTER"}}
 
     def execute(self, context):
+        _ensure_independent_mannequin_instances()
         data = _load_meta()
         objects = []
         for obj in bpy.context.scene.objects:
@@ -19528,6 +20559,62 @@ class GPT_OT_director_render_pending_shots(bpy.types.Operator):
         return {{"CANCELLED"}}
 
 
+def _draw_director_quick_controls(layout, context):
+    layout.operator("gpt_director.add_dialogue_lounge_scene", text="一键生成双人对话场", icon="SCENE_DATA")
+    row = layout.row(align=True)
+    row.operator("gpt_director.add_room_set", text="房间")
+    row.operator("gpt_director.add_street_set", text="街道")
+    row.operator("gpt_director.add_stage_set", text="舞台")
+
+    layout.label(text="人物与家具")
+    row = layout.row(align=True)
+    row.operator("gpt_director.add_blue_mannequin", text="蓝色人偶")
+    row.operator("gpt_director.add_red_mannequin", text="红色人偶")
+    row = layout.row(align=True)
+    row.operator("gpt_director.add_sofa_set", text="沙发茶几")
+    row.operator("gpt_director.add_round_table", text="圆桌")
+
+    control_box = layout.box()
+    control_box.operator("gpt_director.set_simple_view", text="隐藏所有控制线")
+    control_box.label(text="当前人物：" + str(context.scene.gpt_director_active_character_name or "请在画面中点选"))
+    control_box.label(text="人物姿势")
+    row = control_box.row(align=True)
+    for pose_id, pose_label in (("standing", "站立"), ("seated", "坐下"), ("walking", "行走")):
+        op = row.operator("gpt_director.apply_quick_pose", text=pose_label, depress=context.scene.gpt_director_active_pose == pose_id)
+        op.pose = pose_id
+    row = control_box.row(align=True)
+    for pose_id, pose_label in (("running", "跑步"), ("waving", "招手"), ("reclining", "斜躺")):
+        op = row.operator("gpt_director.apply_quick_pose", text=pose_label, depress=context.scene.gpt_director_active_pose == pose_id)
+        op.pose = pose_id
+    control_box.separator()
+    control_box.operator(
+        "gpt_director.simple_drag_mode",
+        text="鼠标拖动已开启" if context.scene.gpt_director_simple_drag_enabled else "开启鼠标拖放位置",
+        depress=context.scene.gpt_director_simple_drag_enabled,
+    )
+    control_box.label(text="模型左拖移动｜Shift+左拖旋转")
+    control_box.label(text="空白左拖旋转视角｜右键拖动平移")
+    control_box.prop(context.scene, "gpt_director_show_advanced_pose_controls", text="高级姿势精调")
+    if context.scene.gpt_director_show_advanced_pose_controls:
+        row = control_box.row(align=True)
+        op = row.operator("gpt_director.select_mannequin_controls", text="当前人物精调控制器")
+        op.asset_id = str(context.scene.gpt_director_active_character_asset_id or "")
+        row = control_box.row(align=True)
+        op = row.operator("gpt_director.toggle_clean_view", text="清爽视图")
+        op.enabled = True
+        op = row.operator("gpt_director.toggle_clean_view", text="显示精调线框")
+        op.enabled = False
+
+    layout.label(text="镜头")
+    row = layout.row(align=True)
+    for preset_id, preset_label in (("wide", "远景"), ("medium", "中景"), ("close", "近景"), ("top", "俯拍")):
+        op = row.operator("gpt_director.camera_preset", text=preset_label)
+        op.preset = preset_id
+    row = layout.row(align=True)
+    row.operator("gpt_director.save_metadata", text="保存工程")
+    row.operator("gpt_director.render_current", text="渲染当前镜头")
+
+
 class GPT_PT_director_panel(bpy.types.Panel):
     bl_label = "Director 导演台"
     bl_idname = "GPT_PT_director_panel"
@@ -19537,7 +20624,14 @@ class GPT_PT_director_panel(bpy.types.Panel):
 
     def draw(self, context):
         layout = self.layout
-        layout.label(text="可拖动、可摆位、可调镜头")
+        layout.label(text="AI 短剧 3D 导演台")
+        _draw_director_quick_controls(layout, context)
+        layout.separator()
+        layout.prop(context.scene, "gpt_director_show_professional_tools", text="专业工程工具")
+        if not context.scene.gpt_director_show_professional_tools:
+            return
+        layout.separator()
+        layout.label(text="专业工程设置")
         layout.prop(context.scene, "gpt_director_shot_name", text="镜头名")
         layout.prop(context.scene, "gpt_director_shot_note", text="备注")
         layout.prop(context.scene, "gpt_director_scene_number", text="场次")
@@ -19594,6 +20688,7 @@ class GPT_PT_director_panel(bpy.types.Panel):
         layout.prop(context.scene, "gpt_director_asset_source_profile", text="开源来源")
         layout.prop(context.scene, "gpt_director_asset_library_path", text="资产库目录")
         layout.operator("gpt_director.scan_asset_library", text="扫描资产库")
+        layout.prop(context.scene, "gpt_director_asset_library_catalog", text="资产分类")
         layout.prop(context.scene, "gpt_director_asset_library_search", text="库资产搜索")
         layout.prop(context.scene, "gpt_director_library_favorites_only", text="只看收藏")
         layout.prop(context.scene, "gpt_director_library_asset_choice", text="库资产")
@@ -19726,29 +20821,6 @@ class GPT_PT_director_panel(bpy.types.Panel):
         row = layout.row(align=True)
         row.operator("gpt_director.update_material_template", text="更新材质")
         row.operator("gpt_director.delete_material_template", text="删除材质")
-        layout.separator()
-        row = layout.row(align=True)
-        row.operator("gpt_director.add_blue_mannequin", text="蓝色骨骼人偶")
-        row.operator("gpt_director.add_red_mannequin", text="红色骨骼人偶")
-        control_box = layout.box()
-        control_box.label(text="彩色控制器：橙色手｜绿色脚｜粉色肘｜蓝色膝")
-        control_box.label(text="对象模式直接拖动；默认隐藏文字标签，视图更干净")
-        row = control_box.row(align=True)
-        op = row.operator("gpt_director.select_mannequin_controls", text="选择红色控制器")
-        op.asset_id = "builtin_red_mannequin"
-        op = row.operator("gpt_director.select_mannequin_controls", text="选择蓝色控制器")
-        op.asset_id = "builtin_blue_mannequin"
-        row = control_box.row(align=True)
-        op = row.operator("gpt_director.toggle_control_labels", text="隐藏文字")
-        op.visible = False
-        op = row.operator("gpt_director.toggle_control_labels", text="显示文字")
-        op.visible = True
-        row = control_box.row(align=True)
-        op = row.operator("gpt_director.toggle_clean_view", text="清爽视图")
-        op.enabled = True
-        op = row.operator("gpt_director.toggle_clean_view", text="显示精调线框")
-        op.enabled = False
-        control_box.operator("gpt_director.simple_drag_mode", text="极简拖动模式：点住模型直接拖")
         row = layout.row(align=True)
         row.operator("gpt_director.add_sofa_set", text="沙发茶几")
         row.operator("gpt_director.add_round_table", text="圆桌")
@@ -19953,6 +21025,8 @@ CLASSES = (
     GPT_OT_director_load_material_template,
     GPT_OT_director_toggle_control_labels,
     GPT_OT_director_toggle_clean_view,
+    GPT_OT_director_set_simple_view,
+    GPT_OT_director_apply_quick_pose,
     GPT_OT_director_simple_drag_mode,
     GPT_OT_director_save_render_template,
     GPT_OT_director_update_render_template,
@@ -20084,7 +21158,15 @@ def register():
         name="开源来源",
         items=_asset_source_profile_enum_items,
     )
-    bpy.types.Scene.gpt_director_asset_library_path = StringProperty(name="资产库目录", default="", subtype="DIR_PATH")
+    bpy.types.Scene.gpt_director_asset_library_path = StringProperty(
+        name="资产库目录",
+        default=DEFAULT_ASSET_LIBRARY_PATH,
+        subtype="DIR_PATH",
+    )
+    bpy.types.Scene.gpt_director_asset_library_catalog = EnumProperty(
+        name="资产分类",
+        items=_asset_library_catalog_enum_items,
+    )
     bpy.types.Scene.gpt_director_asset_library_search = StringProperty(name="库资产搜索", default="")
     bpy.types.Scene.gpt_director_library_favorites_only = BoolProperty(name="只看收藏", default=False)
     bpy.types.Scene.gpt_director_library_asset_choice = EnumProperty(name="库资产", items=_library_asset_enum_items)
@@ -20113,6 +21195,12 @@ def register():
     bpy.types.Scene.gpt_director_pose_template_note = StringProperty(name="姿势备注", default="")
     bpy.types.Scene.gpt_director_pose_template_choice = EnumProperty(name="姿势模板", items=_pose_template_enum_items)
     bpy.types.Scene.gpt_director_selected_pose_template = StringProperty(name="姿势ID/名称", default="")
+    bpy.types.Scene.gpt_director_active_character_asset_id = StringProperty(name="当前人物资产ID", default="")
+    bpy.types.Scene.gpt_director_active_character_name = StringProperty(name="当前人物", default="")
+    bpy.types.Scene.gpt_director_active_pose = StringProperty(name="当前姿势", default="standing")
+    bpy.types.Scene.gpt_director_simple_drag_enabled = BoolProperty(name="位置拖放", default=False)
+    bpy.types.Scene.gpt_director_show_advanced_pose_controls = BoolProperty(name="高级姿势精调", default=False)
+    bpy.types.Scene.gpt_director_show_professional_tools = BoolProperty(name="专业工程工具", default=False)
     bpy.types.Scene.gpt_director_animation_template_name = StringProperty(name="动画片段名", default="动画片段01")
     bpy.types.Scene.gpt_director_animation_template_note = StringProperty(name="动画备注", default="")
     bpy.types.Scene.gpt_director_animation_template_choice = EnumProperty(name="动画片段", items=_animation_template_enum_items)
@@ -20127,9 +21215,25 @@ def register():
         except Exception:
             pass
         bpy.utils.register_class(cls)
+    try:
+        _remove_legacy_depth_scene_data()
+    except Exception:
+        pass
+    try:
+        _ensure_default_asset_library()
+    except Exception:
+        pass
+    _register_director_load_post_handler()
+    _register_character_label_draw_handler()
+    _cancel_simple_drag_mode_start()
+    _set_simple_drag_runtime_active(False)
 
 
 def unregister():
+    _cancel_simple_drag_mode_start()
+    _set_simple_drag_runtime_active(False)
+    _unregister_director_load_post_handler()
+    _unregister_character_label_draw_handler()
     for cls in reversed(CLASSES):
         try:
             bpy.utils.unregister_class(cls)
@@ -20190,6 +21294,7 @@ def unregister():
         del bpy.types.Scene.gpt_director_asset_name
         del bpy.types.Scene.gpt_director_asset_source_profile
         del bpy.types.Scene.gpt_director_asset_library_path
+        del bpy.types.Scene.gpt_director_asset_library_catalog
         del bpy.types.Scene.gpt_director_asset_library_search
         del bpy.types.Scene.gpt_director_library_favorites_only
         del bpy.types.Scene.gpt_director_library_asset_choice
@@ -20218,6 +21323,12 @@ def unregister():
         del bpy.types.Scene.gpt_director_pose_template_note
         del bpy.types.Scene.gpt_director_pose_template_choice
         del bpy.types.Scene.gpt_director_selected_pose_template
+        del bpy.types.Scene.gpt_director_active_character_asset_id
+        del bpy.types.Scene.gpt_director_active_character_name
+        del bpy.types.Scene.gpt_director_active_pose
+        del bpy.types.Scene.gpt_director_simple_drag_enabled
+        del bpy.types.Scene.gpt_director_show_advanced_pose_controls
+        del bpy.types.Scene.gpt_director_show_professional_tools
         del bpy.types.Scene.gpt_director_animation_template_name
         del bpy.types.Scene.gpt_director_animation_template_note
         del bpy.types.Scene.gpt_director_animation_template_choice

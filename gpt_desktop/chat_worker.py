@@ -8,6 +8,8 @@ from .core import (
     extract_api_error,
     image_file_to_base64,
     prepare_image_upload_file,
+    reasoning_effort_for_model,
+    reasoning_effort_not_supported,
     read_uploaded_files_text,
     safe_remove_file,
 )
@@ -124,6 +126,9 @@ class ChatWorker(QThread):
                 "temperature": 0.7,
                 "stream": True,
             }
+            reasoning_effort = reasoning_effort_for_model(self.model, self.base_url, "chat")
+            if reasoning_effort:
+                payload["reasoning_effort"] = reasoning_effort
             # 不要用 timeout=600。
             # 单个 600 秒会导致接口卡住时很久无法释放。
             # 这里拆成：
@@ -138,6 +143,22 @@ class ChatWorker(QThread):
                 timeout=(10, 180),
             )
             self._response = r
+            if r.status_code >= 400 and "reasoning_effort" in payload:
+                first_error = extract_api_error(r)
+                if reasoning_effort_not_supported(r.status_code, first_error):
+                    try:
+                        r.close()
+                    except Exception:
+                        pass
+                    payload.pop("reasoning_effort", None)
+                    r = self._session.post(
+                        url,
+                        headers=headers,
+                        json=payload,
+                        stream=True,
+                        timeout=(10, 180),
+                    )
+                    self._response = r
             if r.status_code >= 400:
                 raise Exception(f"接口错误 {r.status_code}：{extract_api_error(r)}")
 

@@ -5261,6 +5261,10 @@ class WorkflowView(QGraphicsView):
         self.setRenderHints(QPainter.Antialiasing | QPainter.TextAntialiasing)
         self.setDragMode(QGraphicsView.NoDrag)
         self.setViewportUpdateMode(QGraphicsView.BoundingRectViewportUpdate)
+        # The workflow grid is static while nodes are dragged.  Caching it
+        # avoids redrawing every grid line for each small viewport update,
+        # which is especially helpful when the window is streamed over VNC.
+        self.setCacheMode(QGraphicsView.CacheBackground)
         self.setTransformationAnchor(QGraphicsView.NoAnchor)
         self.setResizeAnchor(QGraphicsView.NoAnchor)
         self.setBackgroundBrush(QColor("#0f131a"))

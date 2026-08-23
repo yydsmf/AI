@@ -8,6 +8,7 @@ import uuid
 import hashlib
 import shutil
 import subprocess
+from urllib.parse import urlsplit
 from datetime import datetime
 
 from PySide6.QtCore import Qt, QUrl
@@ -571,6 +572,78 @@ def api_url(base_url, path):
     if base_url.endswith("/v1") and path.startswith("/v1/"):
         return base_url + path[3:]
     return base_url + path
+
+
+# Only models whose reasoning levels were verified through the configured
+# OpenAI-compatible providers are included here. Unknown models keep the old
+# behavior and do not receive an extra request parameter.
+_DEFAULT_REASONING_EFFORTS = {
+    "gpt-5.6-luna": "max",
+    "gpt-5.6-sol": "max",
+    "gpt-5.6-terra": "max",
+    "gpt-5.5": "xhigh",
+}
+
+_PROVIDER_REASONING_EFFORTS = {
+    "api.dxmcs.xin": {
+        "gpt-5.6-luna": "max",
+        "gpt-5.6-sol": "max",
+        "gpt-5.6-terra": "max",
+        "gpt-5.5": "xhigh",
+    },
+    "hubway.cc": {
+        "gpt-5.6-luna": "max",
+        "gpt-5.6-sol": "max",
+        "gpt-5.6-terra": "max",
+        "gpt-5.5": "xhigh",
+    },
+}
+
+# Only direct prose generation and style imitation keep the provider's
+# highest verified setting. Planning, extraction, summaries and state
+# maintenance use the faster high setting.
+_HIGH_REASONING_ACTIONS = {"draft", "style_finalize", "style_rewrite"}
+
+
+def _reasoning_model_key(model):
+    normalized = str(model or "").strip().lower()
+    if normalized in _DEFAULT_REASONING_EFFORTS:
+        return normalized
+    # Keep the mapping useful for the app's cached display aliases without
+    # accidentally matching a different model such as gpt-5.5-mini.
+    for known_model in _DEFAULT_REASONING_EFFORTS:
+        if normalized.startswith(f"{known_model}-免费") or normalized.startswith(f"{known_model}-free"):
+            return known_model
+    return normalized
+
+
+def reasoning_effort_for_model(model, base_url="", action=""):
+    """Return the task-appropriate verified reasoning level."""
+    model_key = _reasoning_model_key(model)
+    try:
+        host = (urlsplit(str(base_url or "").strip()).hostname or "").lower()
+    except Exception:
+        host = ""
+    provider_levels = _PROVIDER_REASONING_EFFORTS.get(host, {})
+    verified_level = provider_levels.get(model_key) or _DEFAULT_REASONING_EFFORTS.get(model_key, "")
+    if not verified_level:
+        return ""
+    if str(action or "").strip() in _HIGH_REASONING_ACTIONS:
+        return verified_level
+    return "high"
+
+
+def reasoning_effort_not_supported(status_code, error_text):
+    try:
+        status = int(status_code or 0)
+    except Exception:
+        status = 0
+    if status not in {400, 404, 422}:
+        return False
+    lowered = str(error_text or "").lower()
+    return "reasoning_effort" in lowered and any(marker in lowered for marker in (
+        "unknown", "unsupported", "invalid", "not allowed", "unrecognized",
+    ))
 
 
 def now_str():

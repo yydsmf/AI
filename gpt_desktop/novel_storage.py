@@ -19,8 +19,12 @@ from .novel_utils import (
 
 
 NOVEL_DIR = os.path.join(HISTORY_DIR, "novel_projects")
+NOVEL_BACKUP_DIR = os.path.join(HISTORY_DIR, "novel_project_backups")
 NOVEL_DRAFT_FILE = os.path.join(HISTORY_DIR, "novel_draft.json")
 NOVEL_LAST_FILE = os.path.join(HISTORY_DIR, "novel_last.json")
+NOVEL_PROJECT_SUMMARY_CACHE_FILE = os.path.join(
+    HISTORY_DIR, "novel_project_summary_cache.json"
+)
 NOVEL_STYLE_LIBRARY_FILE = os.path.join(HISTORY_DIR, "novel_style_profiles.json")
 NOVEL_BUILTIN_STYLE_LIBRARY_FILE = os.path.join(
     os.path.dirname(os.path.abspath(__file__)),
@@ -44,6 +48,9 @@ NOVEL_DIAGNOSTIC_MAX_SNAPSHOTS = 60
 NOVEL_DIAGNOSTIC_SNAPSHOT_TEXT_LIMIT = 180000
 _NOVEL_DIAGNOSTIC_LOCK = threading.Lock()
 _NOVEL_DIAGNOSTIC_HOOKS_INSTALLED = False
+_STYLE_PROFILE_LIBRARY_CACHE_LOCK = threading.Lock()
+_STYLE_PROFILE_LIBRARY_CACHE_SIGNATURE = None
+_STYLE_PROFILE_LIBRARY_CACHE = None
 
 
 def _redact_novel_diagnostic_text(value, limit=4000, strip=True):
@@ -314,6 +321,7 @@ def install_novel_diagnostic_exception_hooks():
 
 def ensure_novel_storage():
     os.makedirs(NOVEL_DIR, exist_ok=True)
+    os.makedirs(NOVEL_BACKUP_DIR, exist_ok=True)
 
 
 def _save_novel_json_strict(path, data):
@@ -321,7 +329,13 @@ def _save_novel_json_strict(path, data):
     _atomic_write_json(path, data)
 
 
-def _normalized_style_profile_record(style_reference, cache_entry, name="", source_project=""):
+def _normalized_style_profile_record(
+    style_reference,
+    cache_entry,
+    name="",
+    source_project="",
+    profile_id="",
+):
     reference = str(style_reference or "").strip()
     if not reference or not isinstance(cache_entry, dict):
         return None
@@ -335,14 +349,91 @@ def _normalized_style_profile_record(style_reference, cache_entry, name="", sour
     status = str(normalized_entry.get("status", "") or "").strip()
     if not profile or (status and status != "complete"):
         return None
+    archive_id = str(profile_id or cache_entry.get("archive_id", "") or reference_hash).strip().lower()
+    if not re.fullmatch(r"[0-9a-f]{64}", archive_id):
+        archive_id = reference_hash
     return {
-        "id": reference_hash,
+        # A library archive is not always identical to its raw sample.  This
+        # lets a new semantic version coexist with the historical archive.
+        "id": archive_id,
         "name": str(name or "").strip() or f"永久文风 {reference_hash[:8]}",
         "reference_hash": reference_hash,
         "style_reference": reference,
         "cache_entry": normalized_entry,
         "source_project": str(source_project or "").strip(),
         "updated_at": str(normalized_entry.get("cached_at", "") or "").strip() or now_str(),
+    }
+
+
+def _style_profile_file_signature(path):
+    try:
+        stat = os.stat(path)
+        return (
+            os.path.abspath(path),
+            True,
+            int(getattr(stat, "st_mtime_ns", stat.st_mtime * 1_000_000_000)),
+            int(stat.st_size),
+        )
+    except Exception:
+        return (os.path.abspath(str(path or "")), False, 0, 0)
+
+
+def _style_profile_library_signature():
+    return tuple(
+        _style_profile_file_signature(path)
+        for path in (NOVEL_BUILTIN_STYLE_LIBRARY_FILE, NOVEL_STYLE_LIBRARY_FILE)
+    )
+
+
+def _invalidate_style_profile_library_cache():
+    global _STYLE_PROFILE_LIBRARY_CACHE_SIGNATURE, _STYLE_PROFILE_LIBRARY_CACHE
+    with _STYLE_PROFILE_LIBRARY_CACHE_LOCK:
+        _STYLE_PROFILE_LIBRARY_CACHE_SIGNATURE = None
+        _STYLE_PROFILE_LIBRARY_CACHE = None
+
+
+def _stored_style_profile_record(item):
+    if not isinstance(item, dict):
+        return None
+    reference = str(item.get("style_reference", "") or "").strip()
+    if not reference:
+        return None
+    reference_hash = hashlib.sha256(reference.encode("utf-8")).hexdigest()
+    stored_reference_hash = str(item.get("reference_hash", "") or "").strip().lower()
+    if re.fullmatch(r"[0-9a-f]{64}", stored_reference_hash):
+        reference_hash = stored_reference_hash
+    cache_entry = item.get("cache_entry", {})
+    if isinstance(cache_entry, dict):
+        normalized_entry = deepcopy(cache_entry)
+        profile = str(normalized_entry.get("profile", "") or "").strip()
+        status = str(normalized_entry.get("status", "") or "").strip()
+    else:
+        profile = str(cache_entry or "").strip()
+        status = ""
+        normalized_entry = {"profile": profile}
+    if not profile or (status and status != "complete"):
+        return None
+    normalized_entry["profile"] = profile
+    if status:
+        normalized_entry["status"] = status
+    archive_id = str(
+        item.get("id", "")
+        or normalized_entry.get("archive_id", "")
+        or reference_hash
+    ).strip().lower()
+    if not re.fullmatch(r"[0-9a-f]{64}", archive_id):
+        archive_id = reference_hash
+    cached_at = str(normalized_entry.get("cached_at", "") or "").strip()
+    updated_at = str(item.get("updated_at", "") or "").strip() or cached_at or now_str()
+    return {
+        "id": archive_id,
+        "name": str(item.get("name", "") or "").strip() or f"永久文风 {reference_hash[:8]}",
+        "reference_hash": reference_hash,
+        "style_reference": reference,
+        "cache_entry": normalized_entry,
+        "source_project": str(item.get("source_project", "") or "").strip(),
+        "created_at": str(item.get("created_at", "") or "").strip() or updated_at,
+        "updated_at": updated_at,
     }
 
 
@@ -354,18 +445,9 @@ def _load_style_profile_library_file(path):
     for item in items if isinstance(items, list) else []:
         if not isinstance(item, dict):
             continue
-        record = _normalized_style_profile_record(
-            item.get("style_reference", ""),
-            item.get("cache_entry", {}),
-            item.get("name", ""),
-            item.get("source_project", ""),
-        )
+        record = _stored_style_profile_record(item)
         if not record or record["id"] in seen:
             continue
-        record["created_at"] = str(item.get("created_at", "") or "").strip() or record["updated_at"]
-        stored_updated_at = str(item.get("updated_at", "") or "").strip()
-        if stored_updated_at:
-            record["updated_at"] = stored_updated_at
         seen.add(record["id"])
         profiles.append(record)
     profiles.sort(key=lambda item: (item.get("name", ""), item.get("id", "")))
@@ -373,14 +455,26 @@ def _load_style_profile_library_file(path):
 
 
 def load_style_profile_library():
+    global _STYLE_PROFILE_LIBRARY_CACHE_SIGNATURE, _STYLE_PROFILE_LIBRARY_CACHE
+    signature = _style_profile_library_signature()
+    with _STYLE_PROFILE_LIBRARY_CACHE_LOCK:
+        if (
+            _STYLE_PROFILE_LIBRARY_CACHE_SIGNATURE == signature
+            and isinstance(_STYLE_PROFILE_LIBRARY_CACHE, list)
+        ):
+            return deepcopy(_STYLE_PROFILE_LIBRARY_CACHE)
     profiles = {}
     for path in (NOVEL_BUILTIN_STYLE_LIBRARY_FILE, NOVEL_STYLE_LIBRARY_FILE):
         for record in _load_style_profile_library_file(path):
             profiles[record["id"]] = record
-    return sorted(
+    result = sorted(
         profiles.values(),
         key=lambda item: (item.get("name", ""), item.get("id", "")),
     )
+    with _STYLE_PROFILE_LIBRARY_CACHE_LOCK:
+        _STYLE_PROFILE_LIBRARY_CACHE_SIGNATURE = signature
+        _STYLE_PROFILE_LIBRARY_CACHE = deepcopy(result)
+    return deepcopy(result)
 
 
 def save_style_profile_library(profiles):
@@ -389,12 +483,15 @@ def save_style_profile_library(profiles):
     for item in profiles if isinstance(profiles, list) else []:
         if not isinstance(item, dict):
             continue
-        record = _normalized_style_profile_record(
-            item.get("style_reference", ""),
-            item.get("cache_entry", {}),
-            item.get("name", ""),
-            item.get("source_project", ""),
-        )
+        record = _stored_style_profile_record(item)
+        if not record:
+            record = _normalized_style_profile_record(
+                item.get("style_reference", ""),
+                item.get("cache_entry", {}),
+                item.get("name", ""),
+                item.get("source_project", ""),
+                item.get("id", ""),
+            )
         if not record or record["id"] in seen:
             continue
         record["created_at"] = str(item.get("created_at", "") or "").strip() or now_str()
@@ -403,6 +500,7 @@ def save_style_profile_library(profiles):
         normalized.append(record)
     normalized.sort(key=lambda item: (item.get("name", ""), item.get("id", "")))
     _save_novel_json_strict(NOVEL_STYLE_LIBRARY_FILE, {"version": 1, "profiles": normalized})
+    _invalidate_style_profile_library_cache()
     return normalized
 
 
@@ -416,8 +514,20 @@ def get_style_profile(profile_id):
     return None
 
 
-def upsert_style_profile(style_reference, cache_entry, name="", source_project=""):
-    record = _normalized_style_profile_record(style_reference, cache_entry, name, source_project)
+def upsert_style_profile(
+    style_reference,
+    cache_entry,
+    name="",
+    source_project="",
+    profile_id="",
+):
+    record = _normalized_style_profile_record(
+        style_reference,
+        cache_entry,
+        name,
+        source_project,
+        profile_id,
+    )
     if not record:
         return ""
     profiles = load_style_profile_library()
@@ -452,7 +562,20 @@ def sync_style_profile_library_from_projects():
         cache = data.get("style_profile_cache", {})
         entry = cache.get(reference_hash, {}) if isinstance(cache, dict) else {}
         title = str(data.get("meta", {}).get("title", "") or "").strip() if isinstance(data.get("meta"), dict) else ""
-        record = _normalized_style_profile_record(reference, entry, title, path)
+        selected_id = str(data.get("style_profile_id", "") or "").strip().lower()
+        selected_record = profiles.get(selected_id, {}) if selected_id else {}
+        selected_matches_reference = (
+            isinstance(selected_record, dict)
+            and selected_record.get("reference_hash") == reference_hash
+        )
+        record = _stored_style_profile_record({
+            "id": selected_id if selected_matches_reference else "",
+            "name": title,
+            "reference_hash": reference_hash,
+            "style_reference": reference,
+            "cache_entry": entry,
+            "source_project": path,
+        })
         if not record:
             continue
         old = profiles.get(record["id"])
@@ -480,13 +603,6 @@ def list_project_files(include_empty=False):
         if not name.lower().endswith(".json"):
             continue
         path = os.path.join(NOVEL_DIR, name)
-        if not include_empty:
-            try:
-                data = load_json_file(path, {})
-                if data.get("auto_saved_reason"):
-                    continue
-            except Exception:
-                pass
         try:
             mtime = os.path.getmtime(path)
         except Exception:
@@ -499,7 +615,10 @@ def list_project_files(include_empty=False):
 def list_project_records(include_empty=False):
     records = []
     for mtime, filename, path in list_project_files(include_empty=include_empty):
-        data = _normalize_project(load_json_file(path, {}))
+        raw = load_json_file(path, {})
+        if isinstance(raw, dict) and raw.get("auto_saved_reason") and not include_empty:
+            continue
+        data = _normalize_project(raw)
         records.append(
             {
                 "mtime": mtime,
@@ -511,30 +630,112 @@ def list_project_records(include_empty=False):
     return records
 
 
+def _project_summary_cache_path():
+    default_project_dir = os.path.join(HISTORY_DIR, "novel_projects")
+    try:
+        if os.path.abspath(NOVEL_DIR) != os.path.abspath(default_project_dir):
+            return os.path.join(os.path.dirname(os.path.abspath(NOVEL_DIR)), "novel_project_summary_cache.json")
+    except Exception:
+        pass
+    return NOVEL_PROJECT_SUMMARY_CACHE_FILE
+
+
+def _load_project_summary_cache():
+    cache = load_json_file(_project_summary_cache_path(), {})
+    if not isinstance(cache, dict) or cache.get("version") != 1:
+        return {}
+    entries = cache.get("entries", {})
+    return entries if isinstance(entries, dict) else {}
+
+
+def _save_project_summary_cache(entries):
+    try:
+        _save_novel_json_strict(_project_summary_cache_path(), {
+            "version": 1,
+            "updated_at": now_str(),
+            "entries": entries if isinstance(entries, dict) else {},
+        })
+    except Exception:
+        pass
+
+
+def _project_summary_signature(path):
+    try:
+        stat = os.stat(path)
+        mtime_ns = int(getattr(stat, "st_mtime_ns", stat.st_mtime * 1_000_000_000))
+        size = int(stat.st_size)
+        return mtime_ns, size
+    except Exception:
+        return 0, 0
+
+
+def _build_project_summary_record(mtime, filename, path, data):
+    data = data if isinstance(data, dict) else {}
+    meta = data.get("meta", {}) if isinstance(data.get("meta"), dict) else {}
+    chapters = data.get("chapters", []) if isinstance(data.get("chapters"), list) else []
+    body_words = 0
+    for chap in chapters:
+        if not isinstance(chap, dict):
+            continue
+        body_words += _body_display_len(chap.get("text", ""))
+    auto_saved_reason = str(data.get("auto_saved_reason", "") or "").strip()
+    return {
+        "mtime": mtime,
+        "filename": filename,
+        "path": path,
+        "title": meta.get("title") or os.path.splitext(filename)[0],
+        "body_words": body_words,
+        "chapters": len(chapters),
+        "auto_saved_reason": auto_saved_reason,
+    }
+
+
 def list_project_summaries(include_empty=False):
     records = []
+    cache = _load_project_summary_cache()
+    next_cache = {}
+    cache_changed = False
     for mtime, filename, path in list_project_files(include_empty=include_empty):
-        raw = load_json_file(path, {})
-        data = raw if isinstance(raw, dict) else {}
-        if data.get("auto_saved_reason") and not include_empty:
-            continue
-        meta = data.get("meta", {}) if isinstance(data.get("meta"), dict) else {}
-        chapters = data.get("chapters", []) if isinstance(data.get("chapters"), list) else []
-        body_words = 0
-        for chap in chapters:
-            if not isinstance(chap, dict):
-                continue
-            body_words += _body_display_len(chap.get("text", ""))
-        records.append(
-            {
-                "mtime": mtime,
-                "filename": filename,
-                "path": path,
-                "title": meta.get("title") or os.path.splitext(filename)[0],
-                "body_words": body_words,
-                "chapters": len(chapters),
+        mtime_ns, size = _project_summary_signature(path)
+        key = os.path.abspath(path)
+        cached = cache.get(key, {}) if isinstance(cache, dict) else {}
+        record = None
+        if (
+            isinstance(cached, dict)
+            and cached.get("mtime_ns") == mtime_ns
+            and cached.get("size") == size
+            and isinstance(cached.get("record"), dict)
+        ):
+            record = deepcopy(cached["record"])
+            record["mtime"] = mtime
+            record["filename"] = filename
+            record["path"] = path
+        else:
+            raw = load_json_file(path, {})
+            record = _build_project_summary_record(
+                mtime,
+                filename,
+                path,
+                raw if isinstance(raw, dict) else {},
+            )
+            cache_changed = True
+        if record.get("auto_saved_reason") and not include_empty:
+            next_cache[key] = {
+                "mtime_ns": mtime_ns,
+                "size": size,
+                "record": record,
             }
-        )
+            continue
+        next_cache[key] = {
+            "mtime_ns": mtime_ns,
+            "size": size,
+            "record": record,
+        }
+        records.append(record)
+    if set(next_cache) != set(cache if isinstance(cache, dict) else {}):
+        cache_changed = True
+    if cache_changed:
+        _save_project_summary_cache(next_cache)
     return records
 
 
@@ -574,15 +775,13 @@ def load_initial_project_data():
         if last_path and os.path.exists(last_path):
             project_data = load_json_file(last_path, {})
             if isinstance(project_data, dict):
-                if _file_mtime_ns(last_path) > _file_mtime_ns(NOVEL_DRAFT_FILE):
-                    project_data = _merge_candidate_analysis_state(project_data, draft_data)
-                    return project_data, last_path
-                draft_data = _merge_candidate_analysis_state(draft_data, project_data)
+                project_data = _merge_candidate_analysis_state(project_data, draft_data)
+                return project_data, last_path
             return draft_data, last_path
         return draft_data, NOVEL_DRAFT_FILE
-    files = list_project_files()
+    files = list_project_summaries()
     if files:
-        _mtime, _name, path = files[0]
+        path = files[0].get("path", "")
         return load_json_file(path, _default_project()), path
     return _default_project(), ""
 
@@ -621,7 +820,7 @@ def auto_preserve_project(data, reason):
         return ""
     data = _normalize_project(data)
     title = data.get("meta", {}).get("title") or "未命名小说"
-    path = unique_project_path(f"{title}_{reason}")
+    path = unique_project_backup_path(title, reason)
     data["auto_saved_reason"] = reason
     save_project_file(path, data)
     return path
@@ -668,6 +867,20 @@ def unique_project_path(title):
     index = 2
     while os.path.exists(path):
         path = os.path.join(NOVEL_DIR, f"{base}_{timestamp}_{index}.json")
+        index += 1
+    return path
+
+
+def unique_project_backup_path(title, reason="备份"):
+    project_name = _safe_name(title) or "未命名小说"
+    backup_dir = os.path.join(NOVEL_BACKUP_DIR, project_name)
+    os.makedirs(backup_dir, exist_ok=True)
+    base = _safe_name(f"{project_name}_{reason}") or f"{project_name}_备份"
+    timestamp = safe_project_timestamp()
+    path = os.path.join(backup_dir, f"{base}_{timestamp}.json")
+    index = 2
+    while os.path.exists(path):
+        path = os.path.join(backup_dir, f"{base}_{timestamp}_{index}.json")
         index += 1
     return path
 

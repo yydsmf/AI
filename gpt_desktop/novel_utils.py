@@ -3,6 +3,7 @@ import re
 import uuid
 import hashlib
 import json
+import math
 from copy import deepcopy
 from collections import Counter
 from difflib import SequenceMatcher
@@ -18,6 +19,43 @@ CHAPTER_ANALYSIS_STATUS_PENDING = "pending"
 CHAPTER_ANALYSIS_STATUS_UNWRITTEN = "unwritten"
 CHAPTER_ANALYSIS_QUICK_SIMILARITY_LOCAL_RATIO_LIMIT = 0.50
 NOVEL_AI_CONTEXT_LIMIT = 120000
+# Continuation data is kept separate from ordinary writing state so a new
+# volume can inherit continuity without importing the previous manuscript.
+VOLUME_CONTINUATION_SCHEMA_VERSION = "1"
+VOLUME_TWO_FRAMEWORK_TEMPLATE = (
+    "小说模板\n"
+    "项目信息：\n"
+    "1、书名\n"
+    "类型\n"
+    "风格\n"
+    "故事核心：一至二句话说明。\n\n"
+    "一、圣经：\n"
+    "小说圣经：核心设定、故事节奏、主题、主线矛盾、结局方向等。\n"
+    "世界观/规则：世界运行规则、势力结构、能力限制、时代背景、地点规则等。\n"
+    "章节规划：整个小说的故事主线，从开始到结束。不要圆满结局，方便续写\n"
+    "二、主要人物（每阶段至少5人）：\n"
+    "姓名\n"
+    "身份\n"
+    "人物目标\n"
+    "隐藏秘密\n"
+    "语言风格\n"
+    "备注\n"
+    "设定：\n"
+    "名称\n"
+    "类型：地点、势力、物品、规则、术语、事件、其它\n"
+    "说明"
+)
+# Volume handoff is a planning request, not a manuscript request. Keep a
+# reserve for prompts and the model response instead of filling the whole
+# application context window with raw project records.
+VOLUME_HANDOFF_SOURCE_CHAR_BUDGET = 105000
+VOLUME_FRAMEWORK_HANDOFF_CHAR_BUDGET = 90000
+VOLUME_HANDOFF_LAST_CHAPTER_CHAR_LIMIT = 24000
+# A volume handoff is sent as a system prompt plus a structured user payload.
+# Keep a fixed reserve so either request remains below the application's
+# 120,000-character context ceiling even when its prompt changes slightly.
+VOLUME_CONTINUATION_REQUEST_CHAR_BUDGET = NOVEL_AI_CONTEXT_LIMIT - 8000
+VOLUME_HANDOFF_RECENT_CHAPTER_COUNT = 8
 # The compact index normally stays close to 15k, but quality-critical reference
 # coverage may grow beyond that. The overall 120k context builder remains the
 # final safety boundary.
@@ -36,6 +74,10 @@ LONG_FORM_MAX_RECORD_UPDATES = 6
 LONG_FORM_MAX_STATE_ITEMS = 10
 LONG_FORM_MAX_FACT_CONTINUITY_DETAILS = 6
 LONG_FORM_FACT_CONTINUITY_DETAIL_LIMIT = 1200
+# The model may return the semantic state delta once and let the client expand
+# deterministic review/index fields. Existing version-2 payloads remain valid.
+LONG_FORM_COMPACT_DELTA_VERSION = 1
+STYLE_FINALIZE_SOURCE_CONTEXT_LIMIT = 60000
 CHAPTER_ANALYSIS_STATUS_LABELS = {
     CHAPTER_ANALYSIS_STATUS_CURRENT: "已AI分析",
     CHAPTER_ANALYSIS_STATUS_SMALL_CHANGE: "小改",
@@ -178,8 +220,11 @@ def _infer_foreshadow_status(item, preserve_manual=True):
     ):
         return "已回收"
     if (
-        any(k in current for k in ("已埋", "已铺垫", "待回收", "未回收", "待兑现"))
-        or status_text in {"open", "active", "buried", "setup"}
+        any(k in current for k in ("已埋", "已埋设", "埋设", "已铺垫", "待回收", "未回收", "待兑现"))
+        or status_text in {
+            "open", "active", "buried", "setup", "seeded", "advanced",
+            "progressed", "reinforced",
+        }
     ):
         return "已埋"
     if any(k in current for k in ("未埋", "未出现", "待埋")) or status_text in {"new", "planned", "unburied"}:
@@ -465,6 +510,285 @@ def _canonicalize_character_record(item):
     return old_name, canonical_name
 
 
+_INTERNAL_CANDIDATE_MARKER_RE = re.compile(
+    r"^(?:(?:补充|新增|补充说明)\s*[：:]\s*)?"
+    r"(?:A\s*I\s*分析\s*候选|文档导入候选)"
+    r"(?:\s*[：:]\s*)?",
+    flags=re.IGNORECASE,
+)
+
+
+def _strip_internal_candidate_markers(value):
+    """Remove internal candidate labels while preserving real record text."""
+    kept = []
+    for raw in str(value or "").splitlines():
+        line = str(raw or "").strip()
+        if not line:
+            continue
+        for _ in range(2):
+            if _compact_text(line).lower() in {"ai分析候选", "文档导入候选"}:
+                line = ""
+                break
+            cleaned = _INTERNAL_CANDIDATE_MARKER_RE.sub("", line, count=1).strip()
+            if cleaned == line:
+                break
+            line = cleaned
+        if line:
+            kept.append(line)
+    return _dedupe_text_lines("\n".join(kept))
+
+
+def _clean_continuation_record_markers(item, text_fields):
+    if not isinstance(item, dict):
+        return deepcopy(item)
+    cleaned = deepcopy(item)
+    for field in text_fields:
+        if field in cleaned:
+            cleaned[field] = _strip_internal_candidate_markers(cleaned.get(field, ""))
+    return cleaned
+
+
+def _normalize_volume_continuity_anchors(value, limit=16):
+    """Normalize temporary cross-volume facts used only by planning calls."""
+    if not isinstance(value, list):
+        return []
+    result = []
+    seen = set()
+    for raw in value:
+        if isinstance(raw, str):
+            raw = {"fact": raw}
+        if not isinstance(raw, dict):
+            continue
+        category = _strip_internal_candidate_markers(
+            raw.get("category", raw.get("type", ""))
+        )
+        fact = _strip_internal_candidate_markers(
+            raw.get("fact", raw.get("statement", raw.get("description", "")))
+        )
+        if not fact:
+            continue
+        key = _compact_text(fact).lower()
+        if not key or key in seen:
+            continue
+        source_chapters = raw.get("source_chapters", raw.get("sources", []))
+        if isinstance(source_chapters, str):
+            source_chapters = [
+                item.strip()
+                for item in re.split(r"[、,，;；\s]+", source_chapters)
+                if item.strip()
+            ]
+        elif not isinstance(source_chapters, list):
+            source_chapters = []
+        source_chapters = [
+            _clip_complete_text(item, 80)
+            for item in source_chapters
+            if str(item or "").strip()
+        ][:8]
+        item = {"fact": _clip_complete_text(fact, 260)}
+        if category:
+            item["category"] = _clip_complete_text(category, 60)
+        if source_chapters:
+            item["source_chapters"] = source_chapters
+        result.append(item)
+        seen.add(key)
+        if len(result) >= max(1, int(limit or 16)):
+            break
+    return result
+
+
+def _compact_volume_continuity_anchors(value, total_limit=3000):
+    anchors = _normalize_volume_continuity_anchors(value)
+    return _compact_volume_handoff_records(
+        anchors,
+        ("category", "fact", "source_chapters"),
+        {"category": 60, "fact": 260, "source_chapters": 180},
+        total_limit,
+        minimal_fields=("fact",),
+    )
+
+
+def _normalize_series_continuation(value):
+    """Normalize volume-continuation metadata without exposing it to body prompts."""
+    if not isinstance(value, dict):
+        return {}
+    result = {}
+    for key in (
+        "schema_version",
+        "series_id",
+        "volume_number",
+        "parent_project_path",
+        "parent_project_title",
+        "parent_snapshot_hash",
+        "template_hash",
+        "created_at",
+        "user_requirements",
+    ):
+        raw = value.get(key, "")
+        if key == "volume_number":
+            try:
+                number = max(1, int(raw or 1))
+            except Exception:
+                number = 1
+            result[key] = number
+            continue
+        text = str(raw or "").strip()
+        if text:
+            result[key] = text
+
+    handoff = value.get("handoff", {})
+    if isinstance(handoff, dict):
+        normalized_handoff = {}
+        try:
+            selection_version = int(handoff.get("foreshadow_selection_version", 0) or 0)
+        except Exception:
+            selection_version = 0
+        if selection_version > 0:
+            normalized_handoff["foreshadow_selection_version"] = selection_version
+        for key in (
+            "volume_summary",
+            "world_state",
+        ):
+            text = str(handoff.get(key, "") or "").strip()
+            if text:
+                normalized_handoff[key] = text
+        for key in ("ending_state", "last_chapter"):
+            item = handoff.get(key, {})
+            if isinstance(item, dict):
+                normalized_handoff[key] = deepcopy(item)
+        inherited_materials = handoff.get("inherited_materials", {})
+        if isinstance(inherited_materials, dict):
+            materials = {}
+            for key in ("bible", "world_rules"):
+                text = str(inherited_materials.get(key, "") or "").strip()
+                if text:
+                    materials[key] = text
+            if materials:
+                normalized_handoff["inherited_materials"] = materials
+        continuity_anchors = _normalize_volume_continuity_anchors(
+            handoff.get("continuity_anchors", [])
+        )
+        if continuity_anchors:
+            normalized_handoff["continuity_anchors"] = continuity_anchors
+        record_text_fields = {
+            "reusable_characters": ("notes",),
+            "reusable_lore": ("description", "story_known"),
+            "reusable_foreshadows": ("description", "revealed", "remaining_secret", "notes"),
+            "deferred_foreshadows": ("description", "revealed", "remaining_secret", "notes"),
+            "resolved_foreshadows": ("description", "revealed", "remaining_secret", "notes", "result"),
+            "discarded_foreshadows": ("description", "revealed", "remaining_secret", "notes", "result"),
+        }
+        for key in (
+            "character_states",
+            "relationship_states",
+            "resolved_threads",
+            "open_threads",
+            "reusable_characters",
+            "reusable_lore",
+            "reusable_foreshadows",
+            "deferred_foreshadows",
+            "resolved_foreshadows",
+            "discarded_foreshadows",
+            "continuity_boundaries",
+        ):
+            items = handoff.get(key, [])
+            if not isinstance(items, list):
+                continue
+            normalized_items = []
+            for item in items:
+                if isinstance(item, dict):
+                    cleaned = _clean_continuation_record_markers(
+                        item,
+                        record_text_fields.get(key, ()),
+                    )
+                elif isinstance(item, str):
+                    cleaned = _strip_internal_candidate_markers(item)
+                else:
+                    continue
+                if str(cleaned or "").strip():
+                    normalized_items.append(cleaned)
+            if key in handoff or normalized_items:
+                normalized_handoff[key] = normalized_items
+
+        terminal_keys = {
+            _volume_handoff_record_key(item)
+            for group_key in ("resolved_foreshadows", "discarded_foreshadows")
+            for item in normalized_handoff.get(group_key, [])
+            if isinstance(item, dict) and _volume_handoff_record_key(item)
+        }
+        normalized_handoff["deferred_foreshadows"] = [
+            item
+            for item in normalized_handoff.get("deferred_foreshadows", [])
+            if not isinstance(item, dict)
+            or (
+                _infer_foreshadow_status(item, preserve_manual=False)
+                not in {"已回收", "无需回收", "废弃"}
+                and _volume_handoff_record_key(item) not in terminal_keys
+            )
+        ]
+        if normalized_handoff:
+            result["handoff"] = normalized_handoff
+    contract = _normalize_creative_intent_contract(value.get("creative_intent_contract", {}))
+    if contract:
+        result["creative_intent_contract"] = contract
+    return result
+
+
+def _normalize_creative_intent_contract(value):
+    """Normalize the user-confirmed story priority used by planning only."""
+    if not isinstance(value, dict):
+        return {}
+
+    aliases = {
+        "primary_line": ("primary_line", "main_line", "core_line", "主线", "核心主线"),
+        "core_relationships": (
+            "core_relationships", "relationship_progression", "核心关系", "关系推进",
+        ),
+        "stage_progression": ("stage_progression", "progression", "阶段推进", "阶段变化"),
+        "reading_experience": (
+            "reading_experience", "reader_experience", "读感", "读者体验",
+        ),
+        "supporting_line_usage": (
+            "supporting_line_usage", "supporting_usage", "辅助线用法", "支线用法",
+        ),
+        "ending_boundaries": (
+            "ending_boundaries", "ending_boundary", "结局边界", "结尾边界",
+        ),
+    }
+
+    result = {}
+    for target, source_keys in aliases.items():
+        for source_key in source_keys:
+            text = str(value.get(source_key, "") or "").strip()
+            if text:
+                result[target] = text
+                break
+
+    supporting_value = None
+    for key in ("supporting_lines", "secondary_lines", "辅助线", "支线"):
+        if key in value:
+            supporting_value = value.get(key)
+            break
+    supporting_lines = _normalize_name_list(supporting_value)
+    if supporting_lines:
+        result["supporting_lines"] = supporting_lines[:16]
+
+    version = str(value.get("version", value.get("schema_version", "")) or "").strip()
+    if version:
+        result["version"] = version
+    source = str(value.get("source", "") or "").strip()
+    if source:
+        result["source"] = source
+    for key in ("generated_at", "confirmed_at", "updated_at"):
+        text = str(value.get(key, "") or "").strip()
+        if text:
+            result[key] = text
+    return result
+
+
+def _volume_two_framework_template_text():
+    return VOLUME_TWO_FRAMEWORK_TEMPLATE
+
+
 def _default_project():
     return {
         "meta": {
@@ -492,10 +816,129 @@ def _default_project():
         "long_form_memory": _default_long_form_memory(),
         "imported_chapter_plan_reference": {},
         "imported_framework_source": {},
+        "framework_import_state": {},
         "chapter_plan_generation_state": {},
+        "chapter_plan_foundation": {},
+        "narrative_strategy_profile": {},
+        "creative_intent_contract": {},
+        "series_continuation": {},
+        "narrative_strategy_confirmation": {},
         "import_candidates": {"characters": [], "lore": [], "foreshadows": [], "project_materials": {}},
         "updated_at": now_str(),
     }
+
+
+def _normalize_narrative_strategy_profile(value):
+    if not isinstance(value, dict):
+        return {}
+    text_fields = (
+        "audience_direction",
+        "genre_world",
+        "core_reader_promise",
+        "primary_story_engine",
+        "secondary_story_engine",
+        "planning_grammar",
+        "pacing_strategy",
+        "low_exposition_strategy",
+        "forbidden_drift",
+    )
+    list_fields = (
+        "satisfaction_currencies",
+        "emotional_resonance_axes",
+        "chapter_variation_pool",
+    )
+    result = {
+        key: str(value.get(key, "") or "").strip()
+        for key in text_fields
+        if str(value.get(key, "") or "").strip()
+    }
+    for key in list_fields:
+        items = _normalize_name_list(value.get(key, []))
+        if items:
+            result[key] = items[:24]
+    version = str(value.get("version", "") or "").strip()
+    if version:
+        result["version"] = version
+    updated_at = str(value.get("updated_at", "") or "").strip()
+    if updated_at:
+        result["updated_at"] = updated_at
+    return result
+
+
+def _clean_chapter_plan_story_boundary(value):
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    technical_markers = (
+        "stages.events",
+        "source_event_ids",
+        "节点id",
+        "json字段",
+        "不虚构来源节点",
+    )
+    parts = re.split(r"(?<=[。！？!?；;])\s*", text)
+    kept = [
+        part.strip()
+        for part in parts
+        if part.strip() and not any(marker in part.lower() for marker in technical_markers)
+    ]
+    cleaned = "".join(kept).strip().rstrip("；; ")
+    if cleaned and cleaned[-1] not in "。！？!?":
+        cleaned += "。"
+    return cleaned
+
+
+def _normalize_chapter_plan_foundation(value):
+    if not isinstance(value, dict):
+        return {}
+    result = {}
+    for key in (
+        "summary", "core_mainline", "ending_promise", "global_hard_boundaries",
+    ):
+        field_value = str(value.get(key, "") or "").strip()
+        if key == "global_hard_boundaries":
+            field_value = _clean_chapter_plan_story_boundary(field_value)
+        if field_value:
+            result[key] = field_value
+    for key in (
+        "target_words", "average_chapter_words", "total_chapter_count", "existing_chapter_count",
+    ):
+        try:
+            result[key] = max(0, int(value.get(key, 0) or 0))
+        except Exception:
+            result[key] = 0
+    profile = _normalize_narrative_strategy_profile(value.get("narrative_strategy_profile", {}))
+    if profile:
+        result["narrative_strategy_profile"] = profile
+    contract = _normalize_creative_intent_contract(value.get("creative_intent_contract", {}))
+    if contract:
+        result["creative_intent_contract"] = contract
+    arc_fields = (
+        "name", "macro_phase", "source_stage", "dominant_line", "supporting_lines",
+        "relationship_goal", "end_state", "goal", "main_conflict", "turning_points",
+        "reader_payoff", "emotional_arc", "pacing_pattern", "exposition_compression",
+        "variation_plan", "investigation_scope", "forbidden",
+    )
+    arcs = []
+    for item in value.get("arcs", []) if isinstance(value.get("arcs"), list) else []:
+        if not isinstance(item, dict):
+            continue
+        try:
+            start = int(item.get("start_chapter", 0) or 0)
+            end = int(item.get("end_chapter", 0) or 0)
+        except Exception:
+            continue
+        if start <= 0 or end < start:
+            continue
+        arc = {"start_chapter": start, "end_chapter": end}
+        for key in arc_fields:
+            field_value = str(item.get(key, "") or "").strip()
+            if field_value:
+                arc[key] = field_value
+        arcs.append(arc)
+    if arcs:
+        result["arcs"] = arcs
+    return result
 
 
 def _default_long_form_memory():
@@ -524,6 +967,7 @@ def _default_long_form_memory():
             "foreshadows": {},
         },
         "issued_state_ids": {
+            "objects": [],
             "conflicts": [],
             "tasks": [],
         },
@@ -562,7 +1006,7 @@ def _normalize_long_form_memory(value):
                 }
     issued_state_ids = value.get("issued_state_ids", {})
     if isinstance(issued_state_ids, dict):
-        for kind in ("conflicts", "tasks"):
+        for kind in ("objects", "conflicts", "tasks"):
             values = issued_state_ids.get(kind, [])
             if isinstance(values, list):
                 base["issued_state_ids"][kind] = sorted({
@@ -655,8 +1099,13 @@ _PRIVATE_PROJECT_NOTE_KEYS = {
     "draft_note",
     "imported_chapter_plan_reference",
     "imported_framework_source",
+    "framework_import_state",
     "style_profile_cache",
     "chapter_plan_generation_state",
+    "chapter_plan_foundation",
+    "narrative_strategy_confirmation",
+    "creative_intent_contract",
+    "series_continuation",
     "auto_expand_resume_required",
 }
 
@@ -689,6 +1138,132 @@ def _new_character(index):
         "voice": "",
         "notes": "",
     }
+
+
+def _character_role_from_string_canon(value):
+    """Extract only an opening identity phrase from a string-form character canon."""
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    opening = re.split(r"[。！？!?；;\n]", text, maxsplit=1)[0].strip(" ，,：:")
+    if not opening or opening.startswith(("本章", "本次", "当前", "此章", "此次")):
+        return ""
+    return opening[:120].strip(" ，,：:")
+
+
+def _apply_character_string_canon(record, canon):
+    """Keep string canon text and fill only an otherwise empty identity field."""
+    if not isinstance(record, dict) or not isinstance(canon, str):
+        return {}
+    text = canon.strip()
+    if not text:
+        return {}
+
+    changed = {}
+    notes = str(record.get("notes", "") or "").strip()
+    if not notes:
+        record["notes"] = text
+        changed["notes"] = text
+    elif text not in notes:
+        record["notes"] = f"{notes}；{text}"
+        changed["notes"] = record["notes"]
+
+    role = _character_role_from_string_canon(text)
+    if role and not str(record.get("role", "") or "").strip():
+        record["role"] = role
+        changed["role"] = role
+    return changed
+
+
+_TEMPORARY_CHARACTER_NAME_MARKERS = (
+    "姓名未明", "姓名不详", "姓名未知", "名字未明", "名字不详", "名字未知",
+    "身份未明", "身份不详", "身份未知", "未命名", "无名", "匿名", "待定",
+)
+_GENERIC_CHARACTER_NAME_LABELS = {
+    "内门弟子", "外门弟子", "内门天才", "外门天才", "陌生人", "神秘人",
+    "黑衣人", "灰衣人", "白衣人", "来客", "路人", "弟子", "长老",
+}
+
+
+def _is_temporary_character_name(value):
+    """Return whether a character label explicitly says its name is unresolved."""
+    text = _clean_entity_name(value)
+    compact = _compact_text(text)
+    return bool(
+        compact
+        and (
+            any(marker in compact for marker in _TEMPORARY_CHARACTER_NAME_MARKERS)
+            or compact in {_compact_text(label) for label in _GENERIC_CHARACTER_NAME_LABELS}
+        )
+    )
+
+
+def _merge_character_identity_text(current, incoming):
+    """Keep established text while absorbing a newer or more specific description."""
+    current = str(current or "").strip()
+    incoming = str(incoming or "").strip()
+    if not incoming:
+        return current
+    if not current:
+        return incoming
+    current_compact = _compact_text(current).casefold()
+    incoming_compact = _compact_text(incoming).casefold()
+    if not current_compact or current_compact == incoming_compact:
+        return current
+    if current_compact in incoming_compact:
+        return incoming
+    if incoming_compact in current_compact:
+        return current
+    return f"{current}；{incoming}"
+
+
+def _merge_character_identity_fields(record, incoming_fields):
+    """Merge explicit identity details while retaining older information."""
+    if not isinstance(record, dict) or not isinstance(incoming_fields, dict):
+        return {}
+
+    changed = {}
+    for field in ("role", "goal", "secret", "voice"):
+        incoming = str(incoming_fields.get(field, "") or "").strip()
+        current = str(record.get(field, "") or "").strip()
+        merged = _merge_character_identity_text(current, incoming)
+        if merged != current:
+            record[field] = merged
+            changed[field] = merged
+
+    incoming_notes = str(incoming_fields.get("notes", "") or "").strip()
+    current_notes = str(record.get("notes", "") or "").strip()
+    merged_notes = _merge_character_identity_text(current_notes, incoming_notes)
+    if merged_notes != current_notes:
+        record["notes"] = merged_notes
+        changed["notes"] = merged_notes
+    return changed
+
+
+def _promote_character_identity(record, incoming_name, incoming_fields=None):
+    """Rename a temporary character and merge explicit identity details, keeping its ID."""
+    if not isinstance(record, dict):
+        return {}
+    old_name = str(record.get("name", "") or "").strip()
+    new_name = _clean_entity_name(incoming_name)
+    if (
+        not old_name
+        or not new_name
+        or _compact_text(old_name).casefold() == _compact_text(new_name).casefold()
+        or not _is_temporary_character_name(old_name)
+        or _is_temporary_character_name(new_name)
+    ):
+        return {}
+
+    changed = {"name": new_name}
+    record["name"] = new_name
+    notes = str(record.get("notes", "") or "").strip()
+    old_label = f"旧名：{old_name}"
+    if old_label not in notes:
+        record["notes"] = f"{notes}\n{old_label}".strip()
+        changed["notes"] = record["notes"]
+    changed.update(_merge_character_identity_fields(record, incoming_fields))
+    return changed
 
 
 def _new_chapter(index):
@@ -903,6 +1478,35 @@ def _normalize_project(data):
     for key in ("bible", "world_rules", "timeline", "foreshadows", "summary"):
         base[key] = _dedupe_text_lines(base.get(key, ""))
     base["long_form_memory"] = _normalize_long_form_memory(data.get("long_form_memory", {}))
+    base["series_continuation"] = _normalize_series_continuation(
+        data.get("series_continuation", {})
+    )
+    base["narrative_strategy_profile"] = _normalize_narrative_strategy_profile(
+        data.get("narrative_strategy_profile", {})
+    )
+    base["creative_intent_contract"] = _normalize_creative_intent_contract(
+        data.get("creative_intent_contract", {})
+    )
+    base["chapter_plan_foundation"] = _normalize_chapter_plan_foundation(
+        data.get("chapter_plan_foundation", {})
+    )
+    strategy_confirmation = data.get("narrative_strategy_confirmation", {})
+    if isinstance(strategy_confirmation, dict):
+        confirmation_status = str(strategy_confirmation.get("status", "") or "").strip()
+        profile_hash = str(strategy_confirmation.get("profile_hash", "") or "").strip().lower()
+        foundation_hash = str(strategy_confirmation.get("foundation_hash", "") or "").strip().lower()
+        normalized_confirmation = {}
+        if confirmation_status in {"pending", "confirmed"}:
+            normalized_confirmation["status"] = confirmation_status
+        if re.fullmatch(r"[0-9a-f]{64}", profile_hash):
+            normalized_confirmation["profile_hash"] = profile_hash
+        if re.fullmatch(r"[0-9a-f]{64}", foundation_hash):
+            normalized_confirmation["foundation_hash"] = foundation_hash
+        for key in ("generated_at", "confirmed_at", "updated_at"):
+            field_value = str(strategy_confirmation.get(key, "") or "").strip()
+            if field_value:
+                normalized_confirmation[key] = field_value
+        base["narrative_strategy_confirmation"] = normalized_confirmation
     style_profile_cache = data.get("style_profile_cache", {})
     if isinstance(style_profile_cache, dict):
         normalized_cache = {}
@@ -947,7 +1551,13 @@ def _normalize_project(data):
                         "sheet": str(unit.get("sheet", "") or "").strip(),
                     }
                     units.append(normalized_unit)
-            if not profile and not units:
+            semantic_archive = {}
+            if isinstance(item, dict):
+                semantic_archive = _normalize_semantic_style_archive(
+                    item,
+                    base.get("style_reference", ""),
+                )
+            if not profile and not units and not semantic_archive:
                 continue
             normalized_item = {"profile": profile}
             if isinstance(item, dict):
@@ -977,6 +1587,26 @@ def _normalize_project(data):
                     normalized_item["style_cards_version"] = style_cards_version
                 if style_cards:
                     normalized_item["style_cards"] = style_cards
+                archive_id = str(item.get("archive_id", "") or "").strip().lower()
+                if re.fullmatch(r"[0-9a-f]{64}", archive_id):
+                    normalized_item["archive_id"] = archive_id
+                if semantic_archive:
+                    normalized_item["style_archive_schema"] = STYLE_SEMANTIC_ARCHIVE_SCHEMA
+                    normalized_item["semantic_archive_version"] = int(
+                        semantic_archive.get("version", STYLE_SEMANTIC_ARCHIVE_VERSION) or STYLE_SEMANTIC_ARCHIVE_VERSION
+                    )
+                    normalized_item["runtime_voice_pack"] = str(
+                        semantic_archive.get("runtime_voice_pack", "") or ""
+                    ).strip()
+                    normalized_item["native_vocabulary_cards"] = deepcopy(
+                        semantic_archive.get("native_vocabulary_cards", [])
+                    )
+                    normalized_item["voice_cards"] = deepcopy(
+                        semantic_archive.get("voice_cards", [])
+                    )
+                    normalized_item["technique_cards"] = deepcopy(
+                        semantic_archive.get("technique_cards", [])
+                    )
                 if units:
                     normalized_item["units"] = units
                 merge_results = [
@@ -1011,19 +1641,12 @@ def _normalize_project(data):
                 "title": _as_text(item.get("title", "")),
                 "target_words": _as_text(item.get("target_words", "")),
                 "narrative_stage": _as_text(item.get("narrative_stage", "")),
-                "chapter_function": _as_text(item.get("chapter_function", "")),
-                "conflict_intensity": _as_text(item.get("conflict_intensity", "")),
-                "setup_ratio": _as_text(item.get("setup_ratio", "")),
-                "character_task": _as_text(item.get("character_task", "")),
-                "mainline_task": _as_text(item.get("mainline_task", "")),
                 "outline": _as_text(item.get("outline", "")),
                 "characters": _normalize_name_list(item.get("characters", [])),
-                "settings": _normalize_name_list(item.get("settings", [])),
                 "ending_hook": _as_text(item.get("ending_hook", "")),
-                "forbidden": _as_text(item.get("forbidden", "")),
                 "source_event_ids": _normalize_name_list(item.get("source_event_ids", [])),
             }
-            if any(str(value or "").strip() for value in chapter.values() if not isinstance(value, list)) or chapter["characters"] or chapter["settings"]:
+            if any(str(value or "").strip() for value in chapter.values() if not isinstance(value, list)) or chapter["characters"]:
                 chapters.append(chapter)
         if chapters:
             normalized_reference["chapters"] = chapters
@@ -1092,6 +1715,19 @@ def _normalize_project(data):
                 if value:
                     normalized_source[key] = value
             base["imported_framework_source"] = normalized_source
+    framework_import_state = data.get("framework_import_state", {})
+    if isinstance(framework_import_state, dict):
+        import_status = str(framework_import_state.get("status", "") or "").strip()
+        if import_status in {"running", "failed", "complete"}:
+            normalized_import_state = {"status": import_status}
+            for key in (
+                "error", "source_hash", "source_title", "source_label", "import_mode",
+                "model", "updated_at",
+            ):
+                field_value = str(framework_import_state.get(key, "") or "").strip()
+                if field_value:
+                    normalized_import_state[key] = field_value
+            base["framework_import_state"] = normalized_import_state
     generation_state = data.get("chapter_plan_generation_state", {})
     if isinstance(generation_state, dict) and generation_state:
         try:
@@ -1107,7 +1743,9 @@ def _normalize_project(data):
         master_plan = deepcopy(generation_state.get("master_plan", {}))
         if not isinstance(master_plan, dict):
             master_plan = {}
-        if version > 0 and status in {"pending", "generating", "failed", "interrupted", "complete"}:
+        if version > 0 and status in {
+            "pending", "awaiting_profile_confirmation", "generating", "failed", "interrupted", "complete"
+        }:
             def state_int(key, default=0):
                 try:
                     return int(generation_state.get(key, default) or default)
@@ -1125,8 +1763,12 @@ def _normalize_project(data):
                 "batch_size": state_int("batch_size", 30),
                 "master_plan": master_plan,
                 "chapters": chapters,
+                "creative_intent_contract": _normalize_creative_intent_contract(
+                    generation_state.get("creative_intent_contract", {})
+                ),
+                "profile_confirmed": bool(generation_state.get("profile_confirmed", False)),
             }
-            for key in ("started_at", "updated_at", "error"):
+            for key in ("started_at", "updated_at", "error", "profile_hash", "foundation_hash"):
                 value = str(generation_state.get(key, "") or "").strip()
                 if value:
                     normalized_state[key] = value
@@ -1139,7 +1781,7 @@ def _normalize_project(data):
                 char["id"] = uuid.uuid4().hex
             for key in ("id", "name", "role", "goal", "secret", "voice", "notes"):
                 char[key] = _as_text(char.get(key, ""))
-            char["notes"] = _dedupe_text_lines(char.get("notes", ""))
+            char["notes"] = _strip_internal_candidate_markers(char.get("notes", ""))
     lore = data.get("lore", [])
     if isinstance(lore, list):
         base["lore"] = [c for c in lore if isinstance(c, dict)]
@@ -1148,8 +1790,8 @@ def _normalize_project(data):
                 item["id"] = uuid.uuid4().hex
             for key in ("id", "name", "type", "description", "story_known"):
                 item[key] = _as_text(item.get(key, ""))
-            item["description"] = _dedupe_text_lines(item.get("description", ""))
-            item["story_known"] = _dedupe_text_lines(item.get("story_known", ""))
+            item["description"] = _strip_internal_candidate_markers(item.get("description", ""))
+            item["story_known"] = _strip_internal_candidate_markers(item.get("story_known", ""))
     chaps = data.get("chapters", [])
     if isinstance(chaps, list):
         base["chapters"] = [c for c in chaps if isinstance(c, dict)]
@@ -1246,10 +1888,10 @@ def _normalize_project(data):
                 item[key] = _as_text(item.get(key, ""))
             item["setup_chapter"] = _normalize_foreshadow_chapter_ref(item.get("setup_chapter", ""))
             item["payoff_chapter"] = _normalize_foreshadow_chapter_ref(item.get("payoff_chapter", ""))
-            item["description"] = _dedupe_text_lines(item.get("description", ""))
-            item["revealed"] = _dedupe_text_lines(item.get("revealed", ""))
-            item["remaining_secret"] = _dedupe_text_lines(item.get("remaining_secret", ""))
-            item["notes"] = _dedupe_text_lines(item.get("notes", ""))
+            item["description"] = _strip_internal_candidate_markers(item.get("description", ""))
+            item["revealed"] = _strip_internal_candidate_markers(item.get("revealed", ""))
+            item["remaining_secret"] = _strip_internal_candidate_markers(item.get("remaining_secret", ""))
+            item["notes"] = _strip_internal_candidate_markers(item.get("notes", ""))
     candidates = data.get("import_candidates", {})
     if isinstance(candidates, dict):
         normalized_candidates = _normalize_import_candidates(candidates)
@@ -1275,6 +1917,1130 @@ def _normalize_project(data):
             break
     base["updated_at"] = str(data.get("updated_at") or now_str())
     return base
+
+
+def _volume_handoff_record(item, fields, field_limit=520):
+    item = item if isinstance(item, dict) else {}
+    result = {}
+    for key in fields:
+        value = item.get(key, "")
+        if isinstance(value, list):
+            values = [
+                deepcopy(child)
+                for child in value
+                if isinstance(child, (dict, str)) and str(child or "").strip()
+            ]
+            if values:
+                result[key] = values
+            continue
+        text = _clip_context_text(value, field_limit, preserve_lines=True).strip()
+        if text:
+            result[key] = text
+    return result
+
+
+def _volume_handoff_json_chars(value):
+    return len(json.dumps(value, ensure_ascii=False, indent=2))
+
+
+def _compact_volume_handoff_records(
+    items,
+    fields,
+    field_limits,
+    total_limit,
+    minimal_fields=None,
+):
+    """Bound a record list by characters while preserving entity names."""
+    items = items if isinstance(items, list) else []
+    fields = tuple(fields or ())
+    field_limits = field_limits if isinstance(field_limits, dict) else {}
+    minimal_fields = tuple(minimal_fields or ("name",))
+
+    def render(scale, only_minimal=False, selected_fields_override=None):
+        rendered = []
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            row = {}
+            selected_fields = (
+                tuple(selected_fields_override)
+                if selected_fields_override is not None
+                else minimal_fields if only_minimal else fields
+            )
+            for key in selected_fields:
+                if key not in item:
+                    continue
+                value = item.get(key, "")
+                if isinstance(value, (int, float)) and not isinstance(value, bool):
+                    row[key] = value
+                    continue
+                if isinstance(value, list):
+                    values = [
+                        deepcopy(child)
+                        for child in value
+                        if isinstance(child, (dict, str)) and str(child or "").strip()
+                    ]
+                    if values:
+                        row[key] = values
+                    continue
+                limit = int(field_limits.get(key, 120) or 120)
+                if only_minimal:
+                    limit = min(limit, 80)
+                else:
+                    limit = max(24, int(limit * scale))
+                text = _clip_complete_text(value, limit, keep_tail=False)
+                if text:
+                    row[key] = text
+            if row:
+                rendered.append(row)
+        return rendered
+
+    total_limit = max(1000, int(total_limit or 0))
+    for scale in (1.0, 0.75, 0.5, 0.35, 0.2):
+        result = render(scale)
+        if _volume_handoff_json_chars(result) <= total_limit:
+            return result
+
+    result = render(1.0, only_minimal=True)
+    if _volume_handoff_json_chars(result) <= total_limit:
+        return result
+
+    # When descriptions alone exceed the group budget, keep every stable
+    # identity before falling back to a sampled list. Most project records use
+    # ``name``, while planning ledgers need the paired ``index``/``title``
+    # identity. Trying the pair first prevents an oversized ledger from
+    # retaining titles while losing the absolute chapter numbers.
+    identity_groups = (
+        ("index", "title"),
+        ("code", "name"),
+        ("id", "name"),
+        ("name",),
+        ("title",),
+        ("code",),
+        ("id",),
+    )
+    for group in identity_groups:
+        if not all(
+            any(
+                isinstance(item, dict)
+                and candidate in item
+                and (
+                    isinstance(item.get(candidate), (int, float))
+                    or bool(str(item.get(candidate, "") or "").strip())
+                )
+                for item in items
+            )
+            for candidate in group
+        ):
+            continue
+        paired = render(1.0, only_minimal=True, selected_fields_override=group)
+        if _volume_handoff_json_chars(paired) <= total_limit:
+            return paired
+
+    # A still oversized group may not fit a stable pair. Keep one stable
+    # identity field as the last structured fallback rather than dropping the
+    # entire record list.
+    identity_field = ""
+    for candidate in ("name", "title", "code", "id", *minimal_fields, *fields):
+        if any(
+            isinstance(item, dict)
+            and candidate in item
+            and (
+                isinstance(item.get(candidate), (int, float))
+                or bool(str(item.get(candidate, "") or "").strip())
+            )
+            for item in items
+        ):
+            identity_field = candidate
+            break
+    if not identity_field:
+        return []
+    result = render(1.0, only_minimal=True, selected_fields_override=(identity_field,))
+    if _volume_handoff_json_chars(result) <= total_limit:
+        return result
+
+    # Names and ordering are more useful than dropping the whole group. This
+    # final fallback keeps a balanced head/tail sample and states the omission.
+    if not result:
+        return []
+    head = max(1, len(result) // 3)
+    tail = max(1, len(result) // 3)
+    while head + tail >= len(result) and (head > 1 or tail > 1):
+        if head >= tail and head > 1:
+            head -= 1
+        elif tail > 1:
+            tail -= 1
+        else:
+            break
+    omitted = max(0, len(result) - head - tail)
+    selected = result[:head] + [{
+        "note": f"中间 {omitted} 条记录已按字符预算省略，名称未参与正文写作。"
+    }] + result[-tail:]
+    while _volume_handoff_json_chars(selected) > total_limit and len(selected) > 3:
+        marker_index = next(
+            (index for index, item in enumerate(selected) if isinstance(item, dict) and "note" in item),
+            -1,
+        )
+        if marker_index > 1:
+            selected.pop(marker_index - 1)
+        elif 0 <= marker_index < len(selected) - 2:
+            selected.pop(marker_index + 1)
+        else:
+            break
+    return selected
+
+
+def _compact_volume_handoff_text_list(items, total_limit, item_limit=320):
+    items = items if isinstance(items, list) else []
+    total_limit = max(300, int(total_limit or 0))
+
+    def render(scale):
+        rows = []
+        limit = max(24, int(item_limit * scale))
+        for item in items:
+            if isinstance(item, dict):
+                text = json.dumps(item, ensure_ascii=False, indent=0)
+            else:
+                text = str(item or "").strip()
+            text = _clip_complete_text(text, limit, keep_tail=False)
+            if text:
+                rows.append(text)
+        return rows
+
+    for scale in (1.0, 0.75, 0.5, 0.35, 0.2):
+        rows = render(scale)
+        if _volume_handoff_json_chars(rows) <= total_limit:
+            return rows
+    rows = render(0.2)
+    while _volume_handoff_json_chars(rows) > total_limit and len(rows) > 2:
+        rows.pop(len(rows) // 2)
+    return rows
+
+
+def _compact_volume_handoff_current_state(value, total_limit=4500):
+    """Compress live continuation state by semantic groups, never as one raw blob."""
+    value = value if isinstance(value, dict) else {}
+    total_limit = max(1200, int(total_limit or 0))
+    snapshot = value.get("state_snapshot", {})
+    snapshot = snapshot if isinstance(snapshot, dict) else {}
+
+    def build(snapshot_limit, facts_limit, history_limit, archives_limit):
+        compact_snapshot = {}
+        for key in ("as_of_chapter_id", "as_of_chapter_index", "story_time", "location", "notes", "updated_at"):
+            raw = snapshot.get(key, "")
+            if isinstance(raw, (int, float)) and not isinstance(raw, bool):
+                compact_snapshot[key] = raw
+            else:
+                text = _clip_context_text(raw, 360, keep_tail=True, preserve_lines=True)
+                if text:
+                    compact_snapshot[key] = text
+        state_list_limits = {
+            "character_states": 900,
+            "relationship_states": 900,
+            "object_states": 600,
+            "active_conflicts": 900,
+            "unresolved_tasks": 900,
+        }
+        for key, group_limit in state_list_limits.items():
+            rows = _compact_volume_handoff_text_list(
+                snapshot.get(key, []),
+                max(180, int(group_limit * snapshot_limit / 4500)),
+                260,
+            )
+            if rows:
+                compact_snapshot[key] = rows
+
+        result = {"state_snapshot": compact_snapshot}
+        for key, limit in (("active_facts", facts_limit), ("fact_history", history_limit)):
+            rows = _compact_volume_handoff_text_list(value.get(key, []), limit, 300)
+            if rows:
+                result[key] = rows
+        archives = _compact_volume_handoff_records(
+            value.get("stage_archives", []),
+            (
+                "id", "start_chapter_index", "end_chapter_index", "summary",
+                "irreversible_facts", "relationship_changes", "unresolved_threads", "next_stage_entry",
+            ),
+            {
+                "id": 40, "start_chapter_index": 24, "end_chapter_index": 24,
+                "summary": 240, "irreversible_facts": 220, "relationship_changes": 200,
+                "unresolved_threads": 220, "next_stage_entry": 200,
+            },
+            archives_limit,
+            minimal_fields=("id", "start_chapter_index", "end_chapter_index", "summary"),
+        )
+        if archives:
+            result["stage_archives"] = archives
+        return result
+
+    for scale in (1.0, 0.7, 0.45, 0.25):
+        result = build(
+            int(4500 * scale),
+            max(300, int(1600 * scale)),
+            max(160, int(500 * scale)),
+            max(300, int(900 * scale)),
+        )
+        if _volume_handoff_json_chars(result) <= total_limit:
+            return result
+    return build(900, 300, 160, 300)
+
+
+def _volume_handoff_record_key(item):
+    item = item if isinstance(item, dict) else {}
+    code = _compact_text(item.get("code", ""))
+    name = _compact_text(item.get("name", ""))
+    return f"code:{code}" if code else f"name:{name}" if name else ""
+
+
+def _dedupe_volume_handoff_terminal_records(*groups):
+    """Merge terminal indexes without reopening or repeating a line."""
+    result = []
+    positions = {}
+    for group in groups:
+        if not isinstance(group, list):
+            continue
+        for raw in group:
+            if not isinstance(raw, dict):
+                continue
+            item = deepcopy(raw)
+            key = _volume_handoff_record_key(item)
+            if not key:
+                continue
+            position = positions.get(key)
+            if position is None:
+                positions[key] = len(result)
+                result.append(item)
+                continue
+            existing = result[position]
+            for field in ("code", "name", "status", "payoff_chapter", "description", "result"):
+                old = str(existing.get(field, "") or "").strip()
+                new = str(item.get(field, "") or "").strip()
+                if not old and new:
+                    existing[field] = new
+                elif new and len(new) > len(old) and old not in new:
+                    existing[field] = new
+    return result
+
+
+def _compact_volume_handoff_source_for_request(source, total_limit=VOLUME_HANDOFF_SOURCE_CHAR_BUDGET):
+    """Apply a deterministic final envelope to the first continuation request."""
+    source = deepcopy(source if isinstance(source, dict) else {})
+    total_limit = max(12000, int(total_limit or VOLUME_HANDOFF_SOURCE_CHAR_BUDGET))
+
+    def size():
+        return _volume_handoff_json_chars(source)
+
+    def compact_state(limit):
+        value = source.get("current_state", {})
+        if _volume_handoff_json_chars(value) <= limit:
+            return
+        source["current_state"] = _compact_volume_handoff_current_state(value, limit)
+
+    def compact_records(
+        characters_limit,
+        lore_limit,
+        active_limit,
+        resolved_limit,
+        discarded_limit,
+        chapter_outline_limit,
+        field_scale=1.0,
+    ):
+        records = source.get("records", {})
+        records = records if isinstance(records, dict) else {}
+        source["records"] = records
+        records["characters"] = _compact_volume_handoff_records(
+            records.get("characters", []),
+            ("name", "role", "goal", "secret", "voice", "notes"),
+            {
+                "name": int(80 * field_scale), "role": int(80 * field_scale),
+                "goal": int(100 * field_scale), "secret": int(100 * field_scale),
+                "voice": int(80 * field_scale), "notes": int(120 * field_scale),
+            },
+            characters_limit,
+            minimal_fields=("name", "role", "goal"),
+        )
+        records["lore"] = _compact_volume_handoff_records(
+            records.get("lore", []),
+            ("name", "type", "description", "story_known"),
+            {
+                "name": int(70 * field_scale), "type": max(16, int(24 * field_scale)),
+                "description": int(80 * field_scale), "story_known": int(60 * field_scale),
+            },
+            lore_limit,
+            minimal_fields=("name", "type"),
+        )
+        records["foreshadows"] = _compact_volume_handoff_records(
+            records.get("foreshadows", []),
+            (
+                "code", "name", "status", "setup_chapter", "payoff_chapter",
+                "description", "revealed", "remaining_secret", "notes",
+            ),
+            {
+                "code": 28, "name": 70, "status": 20, "setup_chapter": 36,
+                "payoff_chapter": 36, "description": 100, "revealed": 80,
+                "remaining_secret": 100, "notes": 70,
+            },
+            active_limit,
+            minimal_fields=("code", "name", "status", "remaining_secret"),
+        )
+        records["resolved_foreshadows"] = _compact_volume_handoff_records(
+            records.get("resolved_foreshadows", []),
+            ("code", "name", "status", "payoff_chapter", "description", "result"),
+            {"code": 28, "name": 70, "status": 20, "payoff_chapter": 36, "description": 60, "result": 80},
+            resolved_limit,
+            minimal_fields=("code", "name", "status", "payoff_chapter", "result"),
+        )
+        records["discarded_foreshadows"] = _compact_volume_handoff_records(
+            records.get("discarded_foreshadows", []),
+            ("code", "name", "status"),
+            {"code": 28, "name": 70, "status": 20},
+            discarded_limit,
+            minimal_fields=("code", "name", "status"),
+        )
+        source["chapter_outlines"] = _compact_volume_handoff_records(
+            source.get("chapter_outlines", []),
+            ("index", "title", "outline"),
+            {
+                "index": 20, "title": 90, "outline": max(120, int(1800 * field_scale)),
+            },
+            chapter_outline_limit,
+            minimal_fields=("index", "title"),
+        )
+        for chapter_key in ("first_chapter", "last_chapter"):
+            chapter = source.get(chapter_key, {})
+            if not isinstance(chapter, dict):
+                continue
+            for key in ("title", "outline"):
+                chapter[key] = _clip_context_text(
+                    chapter.get(key, ""),
+                    max(120, int(900 * field_scale)),
+                    keep_tail=True,
+                    preserve_lines=True,
+                )
+            chapter["text"] = _clip_context_text(
+                chapter.get("text", ""),
+                max(12000, int(24000 * field_scale)),
+                keep_tail=True,
+                preserve_lines=True,
+                preserve_boundaries=True,
+            )
+            source[chapter_key] = chapter
+
+    if size() <= total_limit:
+        return source
+
+    # First remove detail from historical material. The final chapter and
+    # active records remain the highest-value continuity evidence.
+    source["timeline"] = _clip_context_text(source.get("timeline", ""), 4000, keep_tail=True, preserve_lines=True)
+    source["summary"] = _clip_context_text(source.get("summary", ""), 4000, keep_tail=True, preserve_lines=True)
+    compact_state(4200)
+    compact_records(7000, 20000, 9000, 4500, 900, 9000, 1.0)
+    if size() <= total_limit:
+        return source
+
+    # A damaged or unusually dense project gets a second, still structured
+    # reduction. Never turn the whole payload into an arbitrary sliced string.
+    source["source_project"] = {
+        key: _clip_context_text(value, 500 if key == "premise" else 120, preserve_lines=True)
+        for key, value in (source.get("source_project", {}) or {}).items()
+        if str(value or "").strip()
+    }
+    source["bible"] = _clip_context_text(source.get("bible", ""), 3200, keep_tail=True, preserve_lines=True)
+    source["world_rules"] = _clip_context_text(source.get("world_rules", ""), 3200, keep_tail=True, preserve_lines=True)
+    source["timeline"] = _clip_context_text(source.get("timeline", ""), 2800, keep_tail=True, preserve_lines=True)
+    source["summary"] = _clip_context_text(source.get("summary", ""), 2800, keep_tail=True, preserve_lines=True)
+    compact_state(2600)
+    compact_records(4500, 20000, 7000, 3200, 650, 5200, 0.7)
+    if size() <= total_limit:
+        return source
+
+    # Last fallback keeps the continuity anchor usable while making the cap
+    # mathematically reachable for pathological record libraries.
+    source["bible"] = _clip_context_text(source.get("bible", ""), 2200, keep_tail=True, preserve_lines=True)
+    source["world_rules"] = _clip_context_text(source.get("world_rules", ""), 2200, keep_tail=True, preserve_lines=True)
+    source["timeline"] = _clip_context_text(source.get("timeline", ""), 1800, keep_tail=True, preserve_lines=True)
+    source["summary"] = _clip_context_text(source.get("summary", ""), 1800, keep_tail=True, preserve_lines=True)
+    compact_state(1500)
+    compact_records(3200, 20000, 5600, 2400, 500, 3200, 0.45)
+    if isinstance(source.get("last_chapter"), dict):
+        source["last_chapter"]["text"] = _clip_context_text(
+            source["last_chapter"].get("text", ""),
+            16000,
+            keep_tail=True,
+            preserve_lines=True,
+        )
+    if isinstance(source.get("first_chapter"), dict):
+        source["first_chapter"]["text"] = _clip_context_text(
+            source["first_chapter"].get("text", ""),
+            14000,
+            keep_tail=True,
+            preserve_lines=True,
+        )
+    return source
+
+
+def _compact_volume_handoff_for_framework(handoff, total_limit=VOLUME_FRAMEWORK_HANDOFF_CHAR_BUDGET):
+    """Create the second-call view without changing the persisted handoff."""
+    handoff = deepcopy(handoff if isinstance(handoff, dict) else {})
+    # Deferred first-volume foreshadows remain an archive only. They are not
+    # sent to the second-volume framework call and therefore cannot be
+    # mistaken for active sequel tasks.
+    handoff.pop("deferred_foreshadows", None)
+    continuity_anchors = _compact_volume_continuity_anchors(
+        handoff.get("continuity_anchors", []), 3000
+    )
+    if continuity_anchors:
+        handoff["continuity_anchors"] = continuity_anchors
+    else:
+        handoff.pop("continuity_anchors", None)
+    handoff["volume_summary"] = _clip_complete_text(handoff.get("volume_summary", ""), 5000)
+    handoff["world_state"] = _clip_complete_text(handoff.get("world_state", ""), 5000)
+    handoff["open_threads"] = _compact_volume_handoff_text_list(
+        handoff.get("open_threads", []), 5000, 420
+    )
+    handoff["resolved_threads"] = _compact_volume_handoff_text_list(
+        handoff.get("resolved_threads", []), 3500, 300
+    )
+    if "continuity_boundaries" in handoff:
+        handoff["continuity_boundaries"] = _compact_volume_handoff_text_list(
+            handoff.get("continuity_boundaries", []), 4500, 360
+        )
+    handoff["character_states"] = _compact_volume_handoff_text_list(
+        handoff.get("character_states", []), 5000, 360
+    )
+    handoff["relationship_states"] = _compact_volume_handoff_text_list(
+        handoff.get("relationship_states", []), 4000, 360
+    )
+    handoff["reusable_characters"] = _compact_volume_handoff_records(
+        handoff.get("reusable_characters", []),
+        ("name", "role", "goal", "secret", "voice", "notes"),
+        {"name": 80, "role": 80, "goal": 100, "secret": 100, "voice": 80, "notes": 120},
+        9000,
+        minimal_fields=("name", "role", "goal"),
+    )
+    handoff["reusable_lore"] = _compact_volume_handoff_records(
+        handoff.get("reusable_lore", []),
+        ("name", "type", "description", "story_known"),
+        {"name": 70, "type": 24, "description": 80, "story_known": 60},
+        20000,
+        minimal_fields=("name", "type"),
+    )
+    handoff["reusable_foreshadows"] = _compact_volume_handoff_records(
+        handoff.get("reusable_foreshadows", []),
+        (
+            "code", "name", "status", "setup_chapter", "payoff_chapter",
+            "description", "revealed", "remaining_secret", "notes",
+        ),
+        {
+            "code": 28, "name": 70, "status": 20, "setup_chapter": 36,
+            "payoff_chapter": 36, "description": 100, "revealed": 80,
+            "remaining_secret": 100, "notes": 70,
+        },
+        12000,
+        minimal_fields=("code", "name", "status", "remaining_secret"),
+    )
+    handoff["resolved_foreshadows"] = _compact_volume_handoff_records(
+        handoff.get("resolved_foreshadows", []),
+        ("code", "name", "status", "payoff_chapter", "description", "result"),
+        {"code": 28, "name": 70, "status": 20, "payoff_chapter": 36, "description": 60, "result": 80},
+        5000,
+        minimal_fields=("code", "name", "status", "payoff_chapter", "result"),
+    )
+    handoff["discarded_foreshadows"] = _compact_volume_handoff_records(
+        handoff.get("discarded_foreshadows", []),
+        ("code", "name", "status"),
+        {"code": 28, "name": 70, "status": 20},
+        1200,
+        minimal_fields=("code", "name", "status"),
+    )
+    inherited = handoff.get("inherited_materials", {})
+    inherited = inherited if isinstance(inherited, dict) else {}
+    handoff["inherited_materials"] = {
+        "bible": _clip_context_text(inherited.get("bible", ""), 6000, keep_tail=True, preserve_lines=True),
+        "world_rules": _clip_context_text(inherited.get("world_rules", ""), 6000, keep_tail=True, preserve_lines=True),
+    }
+    last_chapter = handoff.get("last_chapter", {})
+    if isinstance(last_chapter, dict):
+        last_chapter["text"] = _clip_context_text(
+            last_chapter.get("text", ""),
+            VOLUME_HANDOFF_LAST_CHAPTER_CHAR_LIMIT,
+            keep_tail=True,
+            preserve_lines=True,
+            preserve_boundaries=True,
+        )
+        handoff["last_chapter"] = last_chapter
+
+    # The group budgets above normally leave ample room. If a model returns
+    # unusually verbose state fields, trim those fields once more before the
+    # request is serialized.
+    if _volume_handoff_json_chars(handoff) > int(total_limit or VOLUME_FRAMEWORK_HANDOFF_CHAR_BUDGET):
+        handoff["volume_summary"] = _clip_complete_text(handoff.get("volume_summary", ""), 3000)
+        handoff["world_state"] = _clip_complete_text(handoff.get("world_state", ""), 3000)
+        handoff["open_threads"] = _compact_volume_handoff_text_list(handoff.get("open_threads", []), 3000, 260)
+        if "continuity_boundaries" in handoff:
+            handoff["continuity_boundaries"] = _compact_volume_handoff_text_list(
+                handoff.get("continuity_boundaries", []), 3000, 260
+            )
+        handoff["reusable_characters"] = _compact_volume_handoff_records(
+            handoff.get("reusable_characters", []),
+            ("name", "role", "goal", "secret", "voice", "notes"),
+            {"name": 70, "role": 60, "goal": 70, "secret": 70, "voice": 60, "notes": 80},
+            6000,
+            minimal_fields=("name", "role"),
+        )
+        handoff["reusable_lore"] = _compact_volume_handoff_records(
+            handoff.get("reusable_lore", []),
+            ("name", "type", "description", "story_known"),
+            {"name": 60, "type": 20, "description": 50, "story_known": 40},
+            12000,
+            minimal_fields=("name", "type"),
+        )
+        handoff["reusable_foreshadows"] = _compact_volume_handoff_records(
+            handoff.get("reusable_foreshadows", []),
+            ("code", "name", "status", "remaining_secret", "description"),
+            {"code": 24, "name": 60, "status": 18, "remaining_secret": 70, "description": 60},
+            9000,
+            minimal_fields=("code", "name", "status"),
+        )
+        handoff["resolved_foreshadows"] = _compact_volume_handoff_records(
+            handoff.get("resolved_foreshadows", []),
+            ("code", "name", "status", "payoff_chapter", "result"),
+            {"code": 24, "name": 60, "status": 18, "payoff_chapter": 30, "result": 60},
+            3000,
+            minimal_fields=("code", "name", "status", "result"),
+        )
+        handoff["discarded_foreshadows"] = _compact_volume_handoff_records(
+            handoff.get("discarded_foreshadows", []),
+            ("code", "name", "status"),
+            {"code": 24, "name": 60, "status": 18},
+            800,
+            minimal_fields=("code", "name", "status"),
+        )
+        handoff["continuity_anchors"] = _compact_volume_continuity_anchors(
+            handoff.get("continuity_anchors", []), 1800
+        )
+        handoff["inherited_materials"] = {
+            "bible": _clip_context_text(inherited.get("bible", ""), 4000, keep_tail=True, preserve_lines=True),
+            "world_rules": _clip_context_text(inherited.get("world_rules", ""), 4000, keep_tail=True, preserve_lines=True),
+        }
+        if isinstance(last_chapter, dict):
+            for key in ("outline", "summary", "key_facts"):
+                last_chapter[key] = _clip_context_text(
+                    last_chapter.get(key, ""), 700, keep_tail=True, preserve_lines=True
+                )
+            handoff["last_chapter"] = last_chapter
+    # Keep the ending anchor well-formed even when a model returns verbose
+    # free-form state fields that were not part of the normal source package.
+    ending_state = handoff.get("ending_state", {})
+    if isinstance(ending_state, dict):
+        handoff["ending_state"] = {
+            key: _clip_context_text(value, 900, keep_tail=True, preserve_lines=True)
+            for key, value in ending_state.items()
+            if str(value or "").strip()
+        }
+    return _enforce_volume_framework_handoff_limit(handoff, total_limit)
+
+
+def _enforce_volume_framework_handoff_limit(handoff, total_limit):
+    """Guarantee the second continuation call keeps structured priorities."""
+    handoff = deepcopy(handoff if isinstance(handoff, dict) else {})
+    total_limit = max(12000, int(total_limit or VOLUME_FRAMEWORK_HANDOFF_CHAR_BUDGET))
+    if _volume_handoff_json_chars(handoff) <= total_limit:
+        return handoff
+
+    handoff["volume_summary"] = _clip_context_text(handoff.get("volume_summary", ""), 1800, keep_tail=True, preserve_lines=True)
+    handoff["world_state"] = _clip_context_text(handoff.get("world_state", ""), 1800, keep_tail=True, preserve_lines=True)
+    handoff["open_threads"] = _compact_volume_handoff_text_list(handoff.get("open_threads", []), 2400, 180)
+    handoff["resolved_threads"] = _compact_volume_handoff_text_list(handoff.get("resolved_threads", []), 1400, 140)
+    if "continuity_boundaries" in handoff:
+        handoff["continuity_boundaries"] = _compact_volume_handoff_text_list(
+            handoff.get("continuity_boundaries", []), 2200, 180
+        )
+    handoff["character_states"] = _compact_volume_handoff_text_list(handoff.get("character_states", []), 2400, 180)
+    handoff["relationship_states"] = _compact_volume_handoff_text_list(handoff.get("relationship_states", []), 1600, 160)
+    handoff["reusable_characters"] = _compact_volume_handoff_records(
+        handoff.get("reusable_characters", []),
+        ("name", "role", "goal", "secret", "voice", "notes"),
+        {"name": 60, "role": 50, "goal": 60, "secret": 60, "voice": 50, "notes": 70},
+        4000,
+        minimal_fields=("name", "role"),
+    )
+    handoff["reusable_lore"] = _compact_volume_handoff_records(
+        handoff.get("reusable_lore", []),
+        ("name", "type", "description", "story_known"),
+        {"name": 50, "type": 20, "description": 45, "story_known": 35},
+        8000,
+        minimal_fields=("name", "type"),
+    )
+    handoff["reusable_foreshadows"] = _compact_volume_handoff_records(
+        handoff.get("reusable_foreshadows", []),
+        ("code", "name", "status", "remaining_secret", "description"),
+        {"code": 24, "name": 55, "status": 18, "remaining_secret": 55, "description": 45},
+        6000,
+        minimal_fields=("code", "name", "status"),
+    )
+    handoff["resolved_foreshadows"] = _compact_volume_handoff_records(
+        handoff.get("resolved_foreshadows", []),
+        ("code", "name", "status", "payoff_chapter", "result", "description"),
+        {"code": 24, "name": 55, "status": 18, "payoff_chapter": 28, "result": 50, "description": 40},
+        2000,
+        minimal_fields=("code", "name", "status", "payoff_chapter", "result"),
+    )
+    handoff["discarded_foreshadows"] = _compact_volume_handoff_records(
+        handoff.get("discarded_foreshadows", []),
+        ("code", "name", "status"),
+        {"code": 24, "name": 55, "status": 18},
+        500,
+        minimal_fields=("code", "name", "status"),
+    )
+    handoff["continuity_anchors"] = _compact_volume_continuity_anchors(
+        handoff.get("continuity_anchors", []), 1200
+    )
+    inherited = handoff.get("inherited_materials", {})
+    inherited = inherited if isinstance(inherited, dict) else {}
+    handoff["inherited_materials"] = {
+        "bible": _clip_context_text(inherited.get("bible", ""), 3000, keep_tail=True, preserve_lines=True),
+        "world_rules": _clip_context_text(inherited.get("world_rules", ""), 3000, keep_tail=True, preserve_lines=True),
+    }
+    ending_state = handoff.get("ending_state", {})
+    ending_state = ending_state if isinstance(ending_state, dict) else {}
+    handoff["ending_state"] = {
+        key: _clip_context_text(value, 500, keep_tail=True, preserve_lines=True)
+        for key, value in ending_state.items()
+        if str(value or "").strip()
+    }
+    last_chapter = handoff.get("last_chapter", {})
+    if isinstance(last_chapter, dict):
+        for key in ("title", "outline", "summary", "key_facts"):
+            last_chapter[key] = _clip_context_text(last_chapter.get(key, ""), 500, keep_tail=True, preserve_lines=True)
+        last_chapter["text"] = _clip_context_text(
+            last_chapter.get("text", ""),
+            16000,
+            keep_tail=True,
+            preserve_lines=True,
+            preserve_boundaries=True,
+        )
+        handoff["last_chapter"] = last_chapter
+    return handoff
+
+
+def _build_volume_opening_handoff_context(project, total_limit=12000):
+    """Build a compact first-volume ending anchor for a sequel's opening."""
+    project = project if isinstance(project, dict) else {}
+    continuation = _normalize_series_continuation(project.get("series_continuation", {}))
+    try:
+        volume_number = int(continuation.get("volume_number", 1) or 1)
+    except Exception:
+        volume_number = 1
+    handoff = continuation.get("handoff", {})
+    handoff = handoff if isinstance(handoff, dict) else {}
+    if volume_number < 2 or not handoff:
+        return ""
+
+    total_limit = max(3000, int(total_limit or 12000))
+    ending_state = handoff.get("ending_state", {})
+    ending_state = ending_state if isinstance(ending_state, dict) else {}
+    compact_ending_state = {
+        str(key): _clip_context_text(value, 700, keep_tail=True, preserve_lines=True)
+        for key, value in ending_state.items()
+        if str(value or "").strip()
+    }
+    last_chapter = handoff.get("last_chapter", {})
+    last_chapter = last_chapter if isinstance(last_chapter, dict) else {}
+    fixed_parts = [
+        "用途：以下内容是上一卷已经发生的连续性证据，只用于确定本卷开场的初始状态；不是要求复述上一卷，也不是新的剧情任务。",
+    ]
+    volume_summary = _clip_context_text(
+        handoff.get("volume_summary", ""), 2600, keep_tail=True, preserve_lines=True
+    )
+    if volume_summary:
+        fixed_parts.append("上一卷交接摘要：\n" + volume_summary)
+    if compact_ending_state:
+        fixed_parts.append(
+            "上一卷卷末即时状态：\n"
+            + json.dumps(compact_ending_state, ensure_ascii=False, indent=2)
+        )
+    for label, key, limit in (
+        ("上一卷最后一章标题", "title", 180),
+        ("上一卷最后一章摘要", "summary", 1800),
+        ("上一卷最后一章关键事实", "key_facts", 2400),
+    ):
+        value = _clip_context_text(
+            last_chapter.get(key, ""), limit, keep_tail=True, preserve_lines=True
+        )
+        if value:
+            fixed_parts.append(f"{label}：\n{value}")
+
+    fixed_text = "\n\n".join(fixed_parts)
+    if len(fixed_text) > total_limit:
+        return _clip_context_text(
+            fixed_text,
+            total_limit,
+            keep_tail=True,
+            preserve_lines=True,
+            preserve_boundaries=True,
+        )
+
+    body = str(last_chapter.get("text", "") or "").strip()
+    body_heading = "上一卷最后一章已发布正文（只继承卷末状态，本卷不要复述）：\n"
+    remaining = total_limit - len(fixed_text) - len(body_heading) - 2
+    if body and remaining >= 600:
+        body = _clip_context_text(
+            body,
+            min(8000, remaining),
+            keep_tail=True,
+            preserve_lines=True,
+            preserve_boundaries=True,
+        )
+        return f"{fixed_text}\n\n{body_heading}{body}"[:total_limit]
+    return fixed_text
+
+
+def _build_volume_handoff_source(project):
+    """Build a bounded, continuity-focused source package for a new volume."""
+    project = project if isinstance(project, dict) else {}
+    meta = project.get("meta", {}) if isinstance(project.get("meta"), dict) else {}
+    chapters = project.get("chapters", [])
+    chapters = chapters if isinstance(chapters, list) else []
+    memory = _normalize_long_form_memory(project.get("long_form_memory", {}))
+    snapshot = deepcopy(memory.get("state_snapshot", {}))
+    if not isinstance(snapshot, dict):
+        snapshot = {}
+
+    written_chapters = [
+        (index, chapter)
+        for index, chapter in enumerate(chapters, 1)
+        if isinstance(chapter, dict) and str(chapter.get("text", "") or "").strip()
+    ]
+    def build_written_chapter_record(index, chapter):
+        record = {
+            "index": index,
+            "title": _clip_complete_text(chapter.get("title", ""), 120),
+            "outline": _strip_volume_handoff_outline_metadata(chapter.get("outline", "")),
+        }
+        record = {
+            key: value
+            for key, value in record.items()
+            if value not in (None, "", [], {})
+        }
+        if record.get("outline"):
+            record["outline"] = _clip_complete_text(record["outline"], 1800)
+        return record
+
+    chapter_outlines = [
+        record
+        for index, chapter in written_chapters
+        for record in [build_written_chapter_record(index, chapter)]
+        if record.get("outline")
+    ]
+
+    def build_full_chapter_record(index, chapter):
+        record = _volume_handoff_record(
+            chapter,
+            ("title", "outline"),
+            field_limit=1600,
+        )
+        record["outline"] = _strip_volume_handoff_outline_metadata(record.get("outline", ""))
+        record["index"] = index
+        record["text"] = _clip_context_text(
+            str(chapter.get("text", "") or "").strip(),
+            VOLUME_HANDOFF_LAST_CHAPTER_CHAR_LIMIT,
+            keep_tail=True,
+            preserve_lines=True,
+            preserve_boundaries=True,
+        )
+        return {
+            key: value
+            for key, value in record.items()
+            if value not in (None, "", [], {})
+        }
+
+    first_chapter = {}
+    last_chapter = {}
+    if written_chapters:
+        first_index, first_source = written_chapters[0]
+        last_index, last_source = written_chapters[-1]
+        first_chapter = build_full_chapter_record(first_index, first_source)
+        last_chapter = build_full_chapter_record(last_index, last_source)
+
+
+    stage_archive_records = []
+    for archive in memory.get("stage_archives", [])[-8:]:
+        if not isinstance(archive, dict):
+            continue
+        stage_archive_records.append(_volume_handoff_record(
+            archive,
+            (
+                "id",
+                "start_chapter_index",
+                "end_chapter_index",
+                "summary",
+                "irreversible_facts",
+                "relationship_changes",
+                "unresolved_threads",
+                "next_stage_entry",
+            ),
+            field_limit=900,
+        ))
+    compact_archives = _compact_volume_handoff_records(
+        stage_archive_records,
+        (
+            "id", "start_chapter_index", "end_chapter_index", "summary",
+            "irreversible_facts", "relationship_changes", "unresolved_threads", "next_stage_entry",
+        ),
+        {
+            "id": 40, "summary": 260, "irreversible_facts": 240,
+            "relationship_changes": 220, "unresolved_threads": 220, "next_stage_entry": 220,
+        },
+        3500,
+        minimal_fields=("id", "start_chapter_index", "end_chapter_index", "summary"),
+    )
+
+    character_records = [
+        _volume_handoff_record(item, ("name", "role", "goal", "secret", "voice", "notes"), field_limit=180)
+        for item in project.get("characters", []) if isinstance(item, dict) and str(item.get("name", "") or "").strip()
+    ]
+    lore_records = [
+        _volume_handoff_record(item, ("name", "type", "description", "story_known"), field_limit=180)
+        for item in project.get("lore", []) if isinstance(item, dict) and str(item.get("name", "") or "").strip()
+    ]
+    raw_foreshadows = project.get("foreshadow_items", [])
+    raw_foreshadows = raw_foreshadows if isinstance(raw_foreshadows, list) else []
+    active_foreshadows = []
+    resolved_foreshadows = []
+    discarded_foreshadows = []
+    foreshadow_fields = (
+        "code", "name", "status", "setup_chapter", "payoff_chapter",
+        "description", "revealed", "remaining_secret", "notes",
+    )
+    for item in raw_foreshadows:
+        if not isinstance(item, dict) or not str(item.get("name", "") or "").strip():
+            continue
+        record = _volume_handoff_record(item, foreshadow_fields, field_limit=220)
+        status = _infer_foreshadow_status(record, preserve_manual=False) or str(record.get("status", "") or "").strip()
+        record["status"] = status
+        if status == "已回收":
+            resolved_foreshadows.append(record)
+        elif status in {"废弃", "无需回收"}:
+            discarded_foreshadows.append(record)
+        else:
+            active_foreshadows.append(record)
+
+    # A new volume keeps terminal-line indexes in private continuation
+    # metadata. Bring those concise indexes forward for a possible third or
+    # later volume, but never place them back into the active foreshadow pool.
+    previous_continuation = _normalize_series_continuation(
+        project.get("series_continuation", {})
+    )
+    previous_handoff = previous_continuation.get("handoff", {})
+    previous_handoff = previous_handoff if isinstance(previous_handoff, dict) else {}
+    active_terminal_keys = {
+        _volume_handoff_record_key(item)
+        for item in active_foreshadows
+        if _volume_handoff_record_key(item)
+    }
+    inherited_resolved = [
+        item for item in previous_handoff.get("resolved_foreshadows", [])
+        if isinstance(item, dict)
+        and _volume_handoff_record_key(item)
+        and _volume_handoff_record_key(item) not in active_terminal_keys
+    ]
+    inherited_discarded = [
+        item for item in previous_handoff.get("discarded_foreshadows", [])
+        if isinstance(item, dict)
+        and _volume_handoff_record_key(item)
+        and _volume_handoff_record_key(item) not in active_terminal_keys
+    ]
+    resolved_foreshadows = _dedupe_volume_handoff_terminal_records(
+        resolved_foreshadows,
+        inherited_resolved,
+    )
+    discarded_foreshadows = _dedupe_volume_handoff_terminal_records(
+        discarded_foreshadows,
+        inherited_discarded,
+    )
+
+    records = {
+        "characters": _compact_volume_handoff_records(
+            character_records,
+            ("name", "role", "goal", "secret", "voice", "notes"),
+            {"name": 80, "role": 80, "goal": 100, "secret": 100, "voice": 80, "notes": 120},
+            8000,
+            minimal_fields=("name", "role", "goal"),
+        ),
+        "lore": _compact_volume_handoff_records(
+            lore_records,
+            ("name", "type", "description", "story_known"),
+            {"name": 70, "type": 24, "description": 80, "story_known": 60},
+            20000,
+            minimal_fields=("name", "type"),
+        ),
+        # Only unresolved foreshadows stay in the active continuation pool.
+        "foreshadows": _compact_volume_handoff_records(
+            active_foreshadows,
+            foreshadow_fields,
+            {
+                "code": 28, "name": 70, "status": 20, "setup_chapter": 36,
+                "payoff_chapter": 36, "description": 100, "revealed": 80,
+                "remaining_secret": 100, "notes": 70,
+            },
+            12000,
+            minimal_fields=("code", "name", "status", "remaining_secret"),
+        ),
+        # Resolved lines are history: keep a one-line index so they are not
+        # reopened in volume 2, but do not spend full-context detail on them.
+        "resolved_foreshadows": _compact_volume_handoff_records(
+            resolved_foreshadows,
+            ("code", "name", "status", "payoff_chapter", "description", "result"),
+            {"code": 28, "name": 70, "status": 20, "payoff_chapter": 36, "description": 60, "result": 80},
+            5000,
+            minimal_fields=("code", "name", "status", "payoff_chapter", "result"),
+        ),
+        "discarded_foreshadows": _compact_volume_handoff_records(
+            discarded_foreshadows,
+            ("code", "name", "status"),
+            {"code": 28, "name": 70, "status": 20},
+            1200,
+            minimal_fields=("code", "name", "status"),
+        ),
+    }
+
+    current_state = {
+        "state_snapshot": snapshot,
+        "active_facts": deepcopy(memory.get("active_facts", [])[-100:]),
+        "fact_history": deepcopy(memory.get("fact_history", [])[-50:]),
+        "stage_archives": compact_archives,
+    }
+    if _volume_handoff_json_chars(current_state) > 4500:
+        current_state = {
+            "compressed_state": _clip_context_text(
+                json.dumps(current_state, ensure_ascii=False, indent=2),
+                4300,
+                keep_tail=True,
+                preserve_lines=True,
+            )
+        }
+
+    source = {
+        "source_project": {
+            "title": str(meta.get("title", "") or "").strip(),
+            "genre": str(meta.get("genre", "") or "").strip(),
+            "style": str(meta.get("style", "") or "").strip(),
+            "pov": str(meta.get("pov", "") or "").strip(),
+            "premise": _clip_context_text(meta.get("premise", ""), 1600, preserve_lines=True),
+            "target_words": str(meta.get("target_words", "") or "").strip(),
+        },
+        "bible": _clip_context_text(project.get("bible", ""), 5000, keep_tail=True, preserve_lines=True),
+        "world_rules": _clip_context_text(project.get("world_rules", ""), 5000, keep_tail=True, preserve_lines=True),
+        "timeline": _clip_context_text(project.get("timeline", ""), 6000, keep_tail=True, preserve_lines=True),
+        "summary": _clip_context_text(project.get("summary", ""), 6000, keep_tail=True, preserve_lines=True),
+        "current_state": current_state,
+        "records": records,
+        "chapter_outlines": _compact_volume_handoff_records(
+            chapter_outlines,
+            ("index", "title", "outline"),
+            {"index": 20, "title": 100, "outline": 1800},
+            24000,
+            minimal_fields=("index", "title"),
+        ),
+        "first_chapter": first_chapter,
+        "last_chapter": last_chapter,
+    }
+    return _compact_volume_handoff_source_for_request(
+        source,
+        VOLUME_HANDOFF_SOURCE_CHAR_BUDGET,
+    )
+
+
+def _build_volume_handoff_record_catalog(project):
+    """Keep full local record details for enriching the model-selected handoff."""
+    project = project if isinstance(project, dict) else {}
+    characters = [
+        _volume_handoff_record(
+            item,
+            ("id", "name", "role", "goal", "secret", "voice", "notes"),
+            field_limit=1800,
+        )
+        for item in project.get("characters", [])
+        if isinstance(item, dict) and str(item.get("name", "") or "").strip()
+    ]
+    lore = [
+        _volume_handoff_record(
+            item,
+            ("id", "name", "type", "description", "story_known"),
+            field_limit=1800,
+        )
+        for item in project.get("lore", [])
+        if isinstance(item, dict) and str(item.get("name", "") or "").strip()
+    ]
+    foreshadows = []
+    for item in project.get("foreshadow_items", []) if isinstance(project.get("foreshadow_items"), list) else []:
+        if not isinstance(item, dict) or not str(item.get("name", "") or "").strip():
+            continue
+        record = _volume_handoff_record(
+            item,
+            (
+                "id", "code", "name", "status", "setup_chapter", "payoff_chapter",
+                "description", "revealed", "remaining_secret", "notes",
+            ),
+            field_limit=1800,
+        )
+        record["status"] = _infer_foreshadow_status(record, preserve_manual=False)
+        foreshadows.append(record)
+    return {
+        "characters": characters,
+        "lore": lore,
+        "foreshadows": foreshadows,
+    }
+
+
+def _rebase_long_form_memory_for_volume_continuation(project):
+    """Carry the current story state into chapter 1 without stale chapter pointers."""
+    source = project if isinstance(project, dict) else {}
+    memory = _normalize_long_form_memory(source.get("long_form_memory", {}))
+    rebased = deepcopy(memory)
+    snapshot = rebased.get("state_snapshot", {})
+    snapshot = deepcopy(snapshot) if isinstance(snapshot, dict) else {}
+    snapshot["as_of_chapter_id"] = ""
+    snapshot["as_of_chapter_index"] = 0
+    snapshot["updated_at"] = now_str()
+    rebased["schema_version"] = "2"
+    rebased["revision"] = 0
+    rebased["state_snapshot"] = snapshot
+    # Historical archives and runtime IDs belong to volume 1. The active
+    # facts/state snapshot are the continuity bridge; new chapters will issue
+    # fresh volume-2 revisions and record references.
+    rebased["fact_history"] = []
+    rebased["stage_archives"] = []
+    rebased["record_runtime"] = {"characters": {}, "lore": {}, "foreshadows": {}}
+    rebased["update_journal"] = []
+    rebased["updated_at"] = now_str()
+    return rebased
+
+
+def _inherit_continuation_record_ids(source_project, target_project):
+    """Keep stable IDs for inherited records so the carried state remains linked."""
+    source_project = source_project if isinstance(source_project, dict) else {}
+    target_project = target_project if isinstance(target_project, dict) else {}
+    for key in ("characters", "lore", "foreshadow_items"):
+        source_items = source_project.get(key, [])
+        target_items = target_project.get(key, [])
+        source_items = source_items if isinstance(source_items, list) else []
+        target_items = target_items if isinstance(target_items, list) else []
+        source_ids = {
+            _compact_text(item.get("name", "")): str(item.get("id", "") or "").strip()
+            for item in source_items
+            if isinstance(item, dict)
+            and _compact_text(item.get("name", ""))
+            and str(item.get("id", "") or "").strip()
+        }
+        for item in target_items:
+            if not isinstance(item, dict):
+                continue
+            record_id = source_ids.get(_compact_text(item.get("name", "")))
+            if record_id:
+                item["id"] = record_id
+    return target_project
 
 
 def _normalize_import_candidates(data):
@@ -1719,7 +3485,7 @@ def _clip_complete_text(value, limit, keep_tail=False, separator=None):
     return text[: max(0, limit - len(marker))].rstrip() + marker
 
 
-def _clip_context_text(value, limit, keep_tail=False, preserve_lines=False):
+def _clip_context_text(value, limit, keep_tail=False, preserve_lines=False, preserve_boundaries=False):
     text = str(value or "").strip()
     limit = int(limit or 0)
     if limit <= 0 or len(text) <= limit:
@@ -1734,7 +3500,7 @@ def _clip_context_text(value, limit, keep_tail=False, preserve_lines=False):
             ]
         if len(lines) > 1:
             if keep_tail:
-                return _clip_lines_balanced(lines, limit)
+                return _clip_lines_balanced(lines, limit, preserve_boundaries=preserve_boundaries)
             return _clip_lines_head(lines, limit)
     marker = "\n……（内容过长，已裁剪）……\n"
     if keep_tail and limit > len(marker) + 200:
@@ -1838,7 +3604,7 @@ def _compact_chapter_key_facts_text(value, max_chars=0, max_items=0):
     return "\n".join(kept).strip()
 
 
-def _clip_lines_balanced(lines, limit, head=8, tail=10):
+def _clip_lines_balanced(lines, limit, head=8, tail=10, preserve_boundaries=False):
     lines = [str(line or "").strip() for line in (lines or []) if str(line or "").strip()]
     limit = int(limit or 0)
     if not lines or limit <= 0:
@@ -1847,10 +3613,21 @@ def _clip_lines_balanced(lines, limit, head=8, tail=10):
     if len(text) <= limit:
         return text
 
-    head_lines = []
-    tail_lines = []
-    head_index = 0
-    tail_index = len(lines) - 1
+    if preserve_boundaries:
+        # Lock both boundaries before spending any budget on the middle. The
+        # volume-ending chapter uses this mode because its opening situation
+        # and final action are both continuity-critical.
+        if len(lines) == 1:
+            return _clip_context_text(text, limit, keep_tail=True)
+        head_lines = [lines[0]]
+        tail_lines = [lines[-1]]
+        head_index = 1
+        tail_index = len(lines) - 2
+    else:
+        head_lines = []
+        tail_lines = []
+        head_index = 0
+        tail_index = len(lines) - 1
 
     def build_text(extra_head=None, extra_tail=None):
         head_part = head_lines + ([extra_head] if extra_head else [])
@@ -1869,11 +3646,47 @@ def _clip_lines_balanced(lines, limit, head=8, tail=10):
             return False
         return len(build_text(extra_tail=lines[tail_index])) <= limit
 
+    # The normal case has enough room for both exact boundary lines.  Keep a
+    # compact boundary fallback for pathological single-line payloads so the
+    # function still honours the hard limit without dropping the ending.
+    if len(build_text()) > limit:
+        marker = f"……（中间 {max(0, len(lines) - 2)} 条已按字符预算压缩省略）……"
+        boundary_budget = max(2, limit - len(marker) - 2)
+        first_budget = max(1, boundary_budget // 2)
+        last_budget = max(1, boundary_budget - first_budget)
+        head_lines = [lines[0][:first_budget]]
+        tail_lines = [lines[-1][-last_budget:]]
+        # The marker length depends on the number of omitted lines. Trim
+        # boundary fragments against the actual rendered result, never by
+        # slicing the completed string, so the ending fragment stays at the
+        # end of the returned context.
+        while len(build_text()) > limit and (len(head_lines[0]) > 1 or len(tail_lines[0]) > 1):
+            overflow = len(build_text()) - limit
+            if len(head_lines[0]) >= len(tail_lines[0]) and len(head_lines[0]) > 1:
+                head_lines[0] = head_lines[0][:-max(1, (overflow + 1) // 2)]
+            elif len(tail_lines[0]) > 1:
+                tail_lines[0] = tail_lines[0][max(1, overflow):]
+            else:
+                break
+        rendered = build_text()
+        if len(rendered) <= limit:
+            return rendered
+        # A limit smaller than the marker itself cannot represent both
+        # boundaries and the omission notice. Preserve the final boundary,
+        # which is the higher-value continuity anchor in this emergency case.
+        return tail_lines[0][-limit:]
+
     while head_index <= tail_index:
         progressed = False
         head_chars = _line_join_length(head_lines)
         tail_chars = _line_join_length(tail_lines)
-        prefer_tail = bool(tail_lines) and tail_chars <= head_chars or not head_lines
+        if preserve_boundaries:
+            prefer_tail = bool(tail_lines) and tail_chars <= head_chars
+        else:
+            # Historical-summary compression intentionally favors the recent
+            # tail until it has an anchor, so old milestones do not consume
+            # the small draft-context budget.
+            prefer_tail = not head_lines or tail_chars <= head_chars
         attempts = ("tail", "head") if prefer_tail else ("head", "tail")
         for side in attempts:
             if side == "head" and can_add_head():
@@ -1889,8 +3702,6 @@ def _clip_lines_balanced(lines, limit, head=8, tail=10):
         if not progressed:
             break
 
-    if not head_lines and not tail_lines:
-        return _clip_context_text(text, limit, keep_tail=True)
     return build_text()
 
 
@@ -2921,6 +4732,8 @@ _PROJECT_SEARCH_SKIP_KEYS = {
     "imported_chapter_plan_reference",
     "imported_framework_source",
     "chapter_plan_generation_state",
+    "creative_intent_contract",
+    "series_continuation",
 }
 
 
@@ -3419,6 +5232,76 @@ def _split_manuscript_into_target_chapters(project, target_words):
     return output
 
 
+def _local_split_chapter_title(text, middle_chars=500, min_chars=5, max_chars=20):
+    """Use a short sentence from the middle of the text as a fast export-only title."""
+    text = str(text or "").strip()
+    if not text:
+        return ""
+    try:
+        middle_chars = max(1, int(middle_chars or 500))
+        min_chars = max(1, int(min_chars or 5))
+        max_chars = max(min_chars, int(max_chars or 20))
+    except (TypeError, ValueError):
+        middle_chars, min_chars, max_chars = 500, 5, 20
+
+    trim_chars = "#\\\"'“”‘’《》【】「」『』（）()[]，,。；;：:、!?！？"
+
+    source_chapter_re = re.compile(
+        r"^\s*第\s*[一二两三四五六七八九十百千万零〇\d]+\s*章\s*[：:、.。\-—]?\s*"
+    )
+
+    def clean(value):
+        source_header = bool(source_chapter_re.match(str(value or "")))
+        value = source_chapter_re.sub("", str(value or ""), count=1)
+        value = re.sub(r"\s+", "", str(value or "")).strip(trim_chars)
+        if "：" in value:
+            prefix, remainder = value.split("：", 1)
+            if 1 <= len(prefix) <= 12:
+                value = remainder
+        elif ":" in value:
+            prefix, remainder = value.split(":", 1)
+            if 1 <= len(prefix) <= 12:
+                value = remainder
+        value = value.strip(trim_chars)
+        if source_header:
+            # A source manuscript often has: "第38章 发怒，‘……’".
+            # Keep the original short heading instead of treating the
+            # following dialogue as one long title.
+            heading = re.split(r"[，,：:；;。！？!?]", value, maxsplit=1)[0]
+            heading = heading.strip(trim_chars)
+            if 2 <= len(heading) <= max_chars:
+                return heading
+        return value
+
+    window_chars = min(len(text), middle_chars)
+    middle_start = max(0, (len(text) - window_chars) // 2)
+    middle_text = text[middle_start:middle_start + window_chars]
+    candidates = []
+    source_headings = []
+    for sentence in re.split(r"[。！？!?；;\n]+", middle_text):
+        if source_chapter_re.match(sentence):
+            heading = clean(sentence)
+            if 2 <= len(heading) <= max_chars:
+                source_headings.append(heading)
+        sentence = clean(sentence)
+        if sentence:
+            candidates.append(sentence)
+
+    for candidate in candidates:
+        if min_chars <= len(candidate) <= max_chars:
+            return candidate
+        if len(candidate) > max_chars:
+            for fragment in re.split(r"[，,：:；;、\"“”‘’「」『』]+", candidate):
+                fragment = clean(fragment)
+                if min_chars <= len(fragment) <= max_chars:
+                    return fragment
+    if source_headings:
+        return source_headings[0]
+    if candidates:
+        return clean(candidates[0][:max_chars])
+    return clean(middle_text[:max_chars])
+
+
 def _chapter_analysis_hash_text(chap, include_linked=True):
     chap = chap if isinstance(chap, dict) else {}
     parts = [
@@ -3776,6 +5659,89 @@ def _strip_static_foreshadow_outline_fields(value):
             skip_list = False
         lines.append(raw_line)
     return "\n".join(lines).strip()
+
+
+_VOLUME_HANDOFF_OUTLINE_DROP_LABELS = (
+    "所属阶段",
+    "原框架阶段",
+    "阶段",
+    "本章功能",
+    "冲突强度",
+    "铺垫比例",
+    "人物任务",
+    "主线任务",
+    "本章主导线",
+    "主导线",
+    "本章涉及设定",
+    "相关设定",
+    "设定",
+    "本章目标",
+    "当章目标",
+    "本章任务",
+    "核心事件",
+    "关键事件",
+    "剧情节点",
+    "故事节点",
+    "事件节点",
+    "主要事件",
+    "发展方向",
+    "情绪目标",
+    "关系推进",
+    "人物关系",
+    "结尾悬念",
+    "结尾钩子",
+    "悬念",
+    "禁止/边界",
+    "禁止",
+    "边界",
+)
+
+
+def _strip_volume_handoff_outline_metadata(value):
+    """Keep chapter-story prose while dropping planning-only outline labels."""
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    lines = []
+    skip_list = False
+    for raw_line in text.splitlines():
+        stripped = raw_line.strip()
+        if not stripped:
+            if not skip_list:
+                lines.append("")
+            continue
+        compact = re.sub(r"\s+", "", stripped)
+        label = next(
+            (
+                candidate
+                for candidate in _VOLUME_HANDOFF_OUTLINE_DROP_LABELS
+                if compact.startswith(candidate + "：")
+                or compact.startswith(candidate + ":")
+                or compact == candidate
+            ),
+            "",
+        )
+        if label:
+            separator_match = re.search(r"[:：]", stripped)
+            tail = stripped[separator_match.end():].strip() if separator_match else ""
+            # A label carrying a short story sentence can still contribute that
+            # sentence; a list-valued planning field is discarded as a whole.
+            if tail and label not in {
+                "所属阶段", "原框架阶段", "阶段", "冲突强度", "铺垫比例",
+                "本章功能", "本章主导线", "主导线", "本章涉及设定", "相关设定",
+                "设定", "结尾悬念", "结尾钩子", "悬念", "禁止/边界", "禁止", "边界",
+            }:
+                lines.append(tail)
+                skip_list = False
+            else:
+                skip_list = not tail
+            continue
+        if skip_list:
+            if stripped.startswith(("-", "•", "*", "·")) or re.match(r"^\d+[.)、．]\s*", stripped):
+                continue
+            skip_list = False
+        lines.append(raw_line)
+    return _dedupe_text_lines("\n".join(lines)).strip()
 
 
 def _chapter_reference_line(
@@ -4384,6 +6350,38 @@ def _build_future_plan_text(chapters, chapter_index, window=4):
     return "\n\n".join(parts) or "暂无"
 
 
+def _chapter_previous_text(project, chapter_index):
+    project = project if isinstance(project, dict) else {}
+    chapters = project.get("chapters", []) if isinstance(project.get("chapters"), list) else []
+    try:
+        index = int(chapter_index or 0)
+    except Exception:
+        return ""
+    if index <= 0 or index >= len(chapters):
+        return ""
+    previous = chapters[index - 1]
+    if not isinstance(previous, dict):
+        return ""
+    return str(previous.get("text", "") or "").strip()
+
+
+def _chapter_previous_opening_boundary_text(project, chapter_index):
+    previous_text = _chapter_previous_text(project, chapter_index)
+    if not previous_text:
+        return ""
+    project = project if isinstance(project, dict) else {}
+    chapters = project.get("chapters", []) if isinstance(project.get("chapters"), list) else []
+    try:
+        index = int(chapter_index or 0)
+    except Exception:
+        return ""
+    if index < 0 or index >= len(chapters) or not isinstance(chapters[index], dict):
+        return ""
+    if _compact_text(chapters[index].get("text", "")):
+        return ""
+    return previous_text
+
+
 def _build_chapter_continuation_text(chapters, chapter_index):
     chapters = chapters if isinstance(chapters, list) else []
     parts = []
@@ -4398,7 +6396,9 @@ def _build_chapter_continuation_text(chapters, chapter_index):
             if prev_tail:
                 title = str(prev.get("title", "") or f"章节 {chapter_index}").strip()
                 parts.append(
-                    f"上一章「{title}」结尾原文（重点继承时间、天气、地点、人物位置、情绪和未完成动作）：\n"
+                    f"上一章「{title}」结尾原文（已发布正文；只继承时间、天气、地点、人物位置、情绪和未完成动作，禁止原样或同义重写）：\n"
+                    "以下文字已经在上一章展示给读者。本章开头必须越过这段已完成文字：上一章以对白结束时，从听者的新反应或新回答开始；"
+                    "以上一章以动作结束时，从动作造成的新结果或新阻力开始；以上一章以声音结束时，从声源揭示或人物听见后的新反应开始。\n"
                     + prev_tail
                 )
     if 0 <= chapter_index < len(chapters):
@@ -4493,12 +6493,31 @@ def _style_text_structure(value):
         r"“[^”]*”|「[^」]*」|『[^』]*』|\"[^\"\n]*\"",
         text,
     )
+    dialogue_turn_lengths = [
+        len(_compact_text(match).strip("“”「」『』\""))
+        for match in dialogue_matches
+    ]
     dialogue_chars = sum(len(_compact_text(match)) for match in dialogue_matches)
     dialogue_paragraphs = sum(
         1 for paragraph in paragraphs
         if any(mark in paragraph for mark in ("“", "”", "「", "」", "『", "』", '"'))
     )
     paragraph_count = len(paragraphs)
+    short_dialogue_run = 0
+    max_short_dialogue_run = 0
+    for paragraph in paragraphs:
+        match = re.fullmatch(
+            r"\s*(?:“([^”]*)”|「([^」]*)」|『([^』]*)』|\"([^\"\n]*)\")\s*",
+            paragraph,
+        )
+        inner = next((group for group in match.groups() if group is not None), "") if match else ""
+        if match and len(_compact_text(inner)) <= 15:
+            short_dialogue_run += 1
+            max_short_dialogue_run = max(max_short_dialogue_run, short_dialogue_run)
+        else:
+            short_dialogue_run = 0
+    dialogue_turn_count = len(dialogue_turn_lengths)
+    short_dialogue_turn_count = sum(length <= 15 for length in dialogue_turn_lengths)
     return {
         "text": text,
         "paragraphs": paragraphs,
@@ -4521,9 +6540,113 @@ def _style_text_structure(value):
         ),
         "sentence_lengths": sentence_lengths,
         "sentence_median": _style_percentile(sentence_lengths, 0.5),
+        "dialogue_chars": dialogue_chars,
         "dialogue_char_pct": dialogue_chars * 100 / total_chars if total_chars else 0.0,
         "dialogue_paragraph_pct": dialogue_paragraphs * 100 / paragraph_count if paragraph_count else 0.0,
+        "dialogue_turn_count": dialogue_turn_count,
+        "dialogue_turn_lengths": dialogue_turn_lengths,
+        "dialogue_turn_median": _style_percentile(dialogue_turn_lengths, 0.5),
+        "dialogue_turns_per_1000": dialogue_turn_count * 1000 / total_chars if total_chars else 0.0,
+        "short_dialogue_turn_count": short_dialogue_turn_count,
+        "short_dialogue_turns_per_1000": (
+            short_dialogue_turn_count * 1000 / total_chars if total_chars else 0.0
+        ),
+        "max_short_dialogue_run": max_short_dialogue_run,
     }
+
+
+def _style_centered_structure_bands(reference, target_chars=0):
+    structure = reference if isinstance(reference, dict) else _style_text_structure(reference)
+    target = max(0, int(target_chars or 0))
+    expected_paragraphs = structure["paragraphs_per_1000"] * target / 1000 if target else 0.0
+    expected_dialogue_turns = structure["dialogue_turns_per_1000"] * target / 1000 if target else 0.0
+    expected_short_dialogue_turns = (
+        structure["short_dialogue_turns_per_1000"] * target / 1000 if target else 0.0
+    )
+    return {
+        "paragraph_low": max(1, round(expected_paragraphs * 0.85)) if expected_paragraphs else 0,
+        "paragraph_high": max(1, round(expected_paragraphs * 1.15)) if expected_paragraphs else 0,
+        "density_low": structure["paragraphs_per_1000"] * 0.85,
+        "density_high": structure["paragraphs_per_1000"] * 1.15,
+        "short_pct_low": max(0.0, structure["short_paragraph_pct"] - 8.0),
+        "short_pct_high": min(100.0, structure["short_paragraph_pct"] + 8.0),
+        "dialogue_pct_low": max(0.0, structure["dialogue_char_pct"] - 8.0),
+        "dialogue_pct_high": min(100.0, structure["dialogue_char_pct"] + 8.0),
+        "dialogue_turn_low": max(0, round(expected_dialogue_turns * 0.80)),
+        "dialogue_turn_high": max(1, round(expected_dialogue_turns * 1.20)) if expected_dialogue_turns else 0,
+        "dialogue_turn_rate_high": max(
+            structure["dialogue_turns_per_1000"] + 4.0,
+            structure["dialogue_turns_per_1000"] * 1.20,
+        ),
+        "short_dialogue_turn_low": max(0, round(expected_short_dialogue_turns * 0.80)),
+        "short_dialogue_turn_high": (
+            max(1, round(expected_short_dialogue_turns * 1.25))
+            if expected_short_dialogue_turns else 0
+        ),
+        "short_dialogue_turn_rate_high": max(
+            structure["short_dialogue_turns_per_1000"] + 3.0,
+            structure["short_dialogue_turns_per_1000"] * 1.25,
+        ),
+    }
+
+
+def _style_fragmentation_drift_flags(reference, candidate):
+    ref = reference if isinstance(reference, dict) else _style_text_structure(reference)
+    current = candidate if isinstance(candidate, dict) else _style_text_structure(candidate)
+    if ref["chars"] < 500 or current["chars"] < 300:
+        return []
+    bands = _style_centered_structure_bands(ref, current["chars"])
+    flags = []
+    if current["paragraphs_per_1000"] > bands["density_high"]:
+        flags.append("段落密度偏高")
+    if current["short_paragraph_pct"] > bands["short_pct_high"]:
+        flags.append("短段比例偏高")
+    if (
+        ref["single_sentence_short_paragraph_pct"] < 55
+        and current["single_sentence_short_paragraph_pct"]
+        - ref["single_sentence_short_paragraph_pct"] > 18
+    ):
+        flags.append("非对白单句短段偏高")
+    if current["dialogue_char_pct"] > bands["dialogue_pct_high"]:
+        flags.append("对白字数占比偏高")
+    if current["dialogue_turns_per_1000"] > bands["dialogue_turn_rate_high"]:
+        flags.append("对白轮数偏多")
+    if current["short_dialogue_turns_per_1000"] > bands["short_dialogue_turn_rate_high"]:
+        flags.append("短对白轮数偏多")
+    return flags
+
+
+def _style_boundary_paragraphs(value, from_start=False, limit=3):
+    paragraphs = _style_text_structure(value)["paragraphs"]
+    try:
+        count = max(1, int(limit or 3))
+    except Exception:
+        count = 3
+    return paragraphs[:count] if from_start else paragraphs[-count:]
+
+
+def _style_boundary_repetition_match(previous_text, current_text):
+    previous_paragraphs = _style_boundary_paragraphs(previous_text, limit=3)
+    current_paragraphs = _style_boundary_paragraphs(current_text, from_start=True, limit=3)
+    for previous in previous_paragraphs:
+        previous_compact = _compact_text(previous)
+        if not previous_compact:
+            continue
+        for current in current_paragraphs:
+            current_compact = _compact_text(current)
+            if not current_compact:
+                continue
+            if previous_compact == current_compact:
+                return {"previous": previous, "current": current}
+            shorter, longer = sorted((previous_compact, current_compact), key=len)
+            if shorter not in longer or not re.search(r"[\w\u4e00-\u9fff]", shorter):
+                continue
+            if len(shorter) >= 4 or (
+                len(shorter) >= 3
+                and (longer.startswith(shorter) or longer.endswith(shorter))
+            ):
+                return {"previous": previous, "current": current}
+    return {}
 
 
 def _style_output_target_from_context(context):
@@ -4549,7 +6672,7 @@ def _style_draft_mismatch_reasons(style_reference, draft_text, output_target=0):
         reasons.append(f"正文总字数不符：目标约{target}字，首次正文约{draft['chars']}字")
     ref_density = reference["paragraphs_per_1000"]
     draft_density = draft["paragraphs_per_1000"]
-    if ref_density and not (ref_density * 0.75 <= draft_density <= ref_density * 1.25):
+    if ref_density and not (ref_density * 0.80 <= draft_density <= ref_density * 1.20):
         reasons.append(
             f"段落密度偏差过大：样本每1000字约{ref_density:.1f}段，首次正文约{draft_density:.1f}段"
         )
@@ -4560,7 +6683,7 @@ def _style_draft_mismatch_reasons(style_reference, draft_text, output_target=0):
         reasons.append(f"段落长度中位数不符：样本约{ref_median}字，首次正文约{draft_median}字")
 
     short_gap = draft["short_paragraph_pct"] - reference["short_paragraph_pct"]
-    if abs(short_gap) > 10:
+    if abs(short_gap) > 8:
         reasons.append(
             f"短段比例不符：样本15字以内段落约占{reference['short_paragraph_pct']:.0f}%，"
             f"首次正文约占{draft['short_paragraph_pct']:.0f}%"
@@ -4589,12 +6712,147 @@ def _style_draft_mismatch_reasons(style_reference, draft_text, output_target=0):
         reasons.append(f"句子长度中位数不符：样本约{ref_sentence}字，首次正文约{draft_sentence}字")
 
     dialogue_gap = abs(draft["dialogue_char_pct"] - reference["dialogue_char_pct"])
-    if dialogue_gap > 10:
+    if dialogue_gap > 8:
         reasons.append(
             f"对白字数占比不符：样本约{reference['dialogue_char_pct']:.0f}%，"
             f"首次正文约{draft['dialogue_char_pct']:.0f}%"
         )
+    bands = _style_centered_structure_bands(reference, draft["chars"])
+    if draft["dialogue_turns_per_1000"] > bands["dialogue_turn_rate_high"]:
+        reasons.append(
+            f"对白轮数偏多：样本每1000字约{reference['dialogue_turns_per_1000']:.1f}轮，"
+            f"首次正文约{draft['dialogue_turns_per_1000']:.1f}轮"
+        )
+    if draft["short_dialogue_turns_per_1000"] > bands["short_dialogue_turn_rate_high"]:
+        reasons.append(
+            f"短对白轮数偏多：样本每1000字约{reference['short_dialogue_turns_per_1000']:.1f}轮，"
+            f"首次正文约{draft['short_dialogue_turns_per_1000']:.1f}轮"
+        )
+    fragmentation_flags = _style_fragmentation_drift_flags(reference, draft)
+    if len(fragmentation_flags) >= 2:
+        reasons.append(
+            "结构多项同时向短碎方向漂移：" + "、".join(fragmentation_flags)
+        )
     return reasons
+
+
+def _style_finalize_preflight_targets(style_reference, candidate_text, output_target=0):
+    reference = _style_text_structure(style_reference)
+    candidate = _style_text_structure(candidate_text)
+    if reference["chars"] < 500 or candidate["chars"] < 300:
+        return ""
+    lines = []
+    target = int(output_target or 0)
+    if target:
+        low = round(target * 0.85)
+        high = round(target * 1.15)
+        if not (low <= candidate["chars"] <= high):
+            direction = "压缩" if candidate["chars"] > high else "补足"
+            lines.append(
+                f"候选正文约{candidate['chars']}字，本次须在不改变剧情的前提下{direction}到{low}-{high}字。"
+            )
+
+    bands = _style_centered_structure_bands(reference, target or candidate["chars"])
+    fragmentation_flags = _style_fragmentation_drift_flags(reference, candidate)
+    if len(fragmentation_flags) >= 2:
+        lines.append(
+            "候选同时出现" + "、".join(fragmentation_flags)
+            + "；本次必须整体减少无效换行和功能性短问短答，不能只修其中一项。"
+        )
+
+    density = reference["paragraphs_per_1000"]
+    if target and density:
+        paragraph_low = bands["paragraph_low"]
+        paragraph_high = max(paragraph_low, bands["paragraph_high"])
+        paragraph_count = int(candidate["paragraph_count"] or 0)
+        if paragraph_count > paragraph_high:
+            lines.append(
+                f"候选有{paragraph_count}个非空段，本次至少合并{paragraph_count - paragraph_high}个普通段，"
+                f"交付时保持{paragraph_low}-{paragraph_high}段。"
+            )
+
+    short_gap = candidate["short_paragraph_pct"] - reference["short_paragraph_pct"]
+    if short_gap > 8:
+        paragraph_count = int(candidate["paragraph_count"] or 0)
+        short_count = sum(length <= 15 for length in candidate["paragraph_lengths"])
+        allowed_high = bands["short_pct_high"] / 100.0
+        merge_count = 0
+        while (
+            merge_count < short_count
+            and paragraph_count - merge_count > 0
+            and (short_count - merge_count) / (paragraph_count - merge_count) > allowed_high
+        ):
+            merge_count += 1
+        if merge_count:
+            lines.append(
+                f"候选15字以内短段占{candidate['short_paragraph_pct']:.0f}%，样本约"
+                f"{reference['short_paragraph_pct']:.0f}%；至少将{merge_count}个普通短段并入相邻相关段落。"
+            )
+
+    median_low = max(1, reference["paragraph_median"] - 8)
+    median_high = reference["paragraph_median"] + 8
+    if not (median_low <= candidate["paragraph_median"] <= median_high):
+        lines.append(
+            f"候选段落中位数约{candidate['paragraph_median']}字，本次须调整到{median_low}-{median_high}字。"
+        )
+    single_short_gap = (
+        candidate["single_sentence_short_paragraph_pct"]
+        - reference["single_sentence_short_paragraph_pct"]
+    )
+    if single_short_gap > 18 and reference["single_sentence_short_paragraph_pct"] < 55:
+        lines.append(
+            f"候选非对白单句短段占{candidate['single_sentence_short_paragraph_pct']:.0f}%，"
+            f"样本约{reference['single_sentence_short_paragraph_pct']:.0f}%；普通说明连续短段必须先合并再交付。"
+        )
+    dialogue_overage = candidate["dialogue_char_pct"] - reference["dialogue_char_pct"]
+    if dialogue_overage > 8:
+        dialogue_high_pct = bands["dialogue_pct_high"]
+        dialogue_high_chars = max(0, math.floor(candidate["chars"] * dialogue_high_pct / 100))
+        dialogue_rewrite_chars = max(
+            0,
+            int(candidate.get("dialogue_chars", 0) or 0) - dialogue_high_chars,
+        )
+        lines.append(
+            f"候选对白字数占{candidate['dialogue_char_pct']:.0f}%，样本约"
+            f"{reference['dialogue_char_pct']:.0f}%；本次至少将{dialogue_rewrite_chars}字普通对白"
+            f"改写为人物化叙述，交付时对白总字数不得超过约{dialogue_high_chars}字。"
+            "保留人物声纹和冲突小场景，优先改写普通核验、汇报、流程命令和重复问答；"
+            "不能只删引号、缩短对白或用新增对白补回。"
+        )
+    if (
+        bands["dialogue_turn_high"]
+        and candidate["dialogue_turn_count"] > bands["dialogue_turn_high"]
+    ):
+        lines.append(
+            f"候选有{candidate['dialogue_turn_count']}轮对白，按样本和本章篇幅约应保持"
+            f"{bands['dialogue_turn_low']}-{bands['dialogue_turn_high']}轮；优先删除或改写只负责确认、"
+            "交接、复问和重复结论的台词，不得删减冲突、关系变化和关键信息。"
+        )
+    if (
+        bands["short_dialogue_turn_high"]
+        and candidate["short_dialogue_turn_count"] > bands["short_dialogue_turn_high"]
+    ):
+        lines.append(
+            f"候选15字以内短对白有{candidate['short_dialogue_turn_count']}轮，样本中心区间约为"
+            f"{bands['short_dialogue_turn_low']}-{bands['short_dialogue_turn_high']}轮；"
+            "将无新增信息的‘可以、好、明白、结果、能否’式功能台词并入动作或相邻完整表达。"
+        )
+    return "\n".join(f"- {line}" for line in lines)
+
+
+def _style_finalize_priority_edit_text(style_reference, candidate_text, output_target=0):
+    preflight = _style_finalize_preflight_targets(
+        style_reference,
+        candidate_text,
+        output_target,
+    )
+    if not preflight:
+        return ""
+    return (
+        "只修正下面这些已经严重偏离样本的结构问题；剧情完整、人物自然反应和场景适配高于数字，不得为了命中指标新增对白、笑点、动作或拆段。\n"
+        + preflight
+        + "\n人物语言声纹只约束已经需要开口的人物。不要为了展示口吻新增台词；普通核验、汇报、程序命令和重复追问优先并回人物化叙述。"
+    )
 
 
 def _style_execution_beats(value):
@@ -4651,68 +6909,303 @@ def _style_max_short_narrative_run(value):
     return longest
 
 
+def _style_voice_evidence_dialogue_spans(value):
+    return [
+        _compact_text(match)
+        for match in re.findall(
+            r"“[^”]*”|「[^」]*」|『[^』]*』|\"[^\"\n]*\"",
+            str(value or ""),
+        )
+        if _compact_text(match)
+    ]
+
+
+def _style_voice_evidence_has_reaction(value):
+    remainder = re.sub(
+        r"“[^”]*”|「[^」]*」|『[^』]*』|\"[^\"\n]*\"",
+        "",
+        str(value or ""),
+    )
+    return len("".join(re.findall(r"[\u3400-\u9fff]", remainder))) >= 4
+
+
+def _style_voice_evidence_literal_scene(value, final_text, min_dialogue_spans=2, max_chars=360):
+    raw = str(value or "").strip()
+    body = str(final_text or "")
+    dialogue_spans = _style_voice_evidence_dialogue_spans(raw)
+    try:
+        minimum = max(1, int(min_dialogue_spans or 1))
+    except Exception:
+        minimum = 2
+    if len(set(dialogue_spans)) < minimum or not body:
+        return ""
+
+    projected_body, positions = _evidence_projection(body, with_positions=True)
+    if not projected_body or not positions:
+        return ""
+    matches = []
+    search_from = 0
+    for span in dialogue_spans:
+        projected_span = _evidence_projection(span)
+        if len(projected_span) < 2:
+            continue
+        start = projected_body.find(projected_span, search_from)
+        if start < 0:
+            continue
+        end = start + len(projected_span) - 1
+        if end >= len(positions):
+            continue
+        matches.append((start, end))
+        search_from = end + 1
+        if len(matches) >= minimum:
+            break
+    if len(matches) < minimum:
+        return ""
+
+    body_start = positions[matches[0][0]]
+    body_end = positions[matches[-1][1]] + 1
+    if body_start > 0 and body[body_start - 1] in "“「『\"":
+        body_start -= 1
+    if body_end < len(body) and body[body_end] in "”」』\"":
+        body_end += 1
+    scene = body[body_start:body_end].strip()
+    if (
+        len(_compact_text(scene)) > max(80, int(max_chars or 360))
+        or len(set(_style_voice_evidence_dialogue_spans(scene))) < minimum
+        or not _long_form_evidence_present(scene, body)
+    ):
+        return ""
+    return scene
+
+
+def _style_finalize_acceptance_flag_failed(value):
+    """Return True only when the model explicitly reports a failed check."""
+    if value is False:
+        return True
+    if isinstance(value, dict):
+        for key in ("passed", "ok", "compatible", "valid"):
+            if value.get(key) is False:
+                return True
+    return False
+
+
+_LITERAL_COUNT_CHINESE_DIGITS = {
+    "零": 0,
+    "〇": 0,
+    "一": 1,
+    "二": 2,
+    "两": 2,
+    "三": 3,
+    "四": 4,
+    "五": 5,
+    "六": 6,
+    "七": 7,
+    "八": 8,
+    "九": 9,
+}
+
+
+def _literal_count_number_to_int(value):
+    text = str(value or "").strip()
+    if not text:
+        return None
+    if re.fullmatch(r"\d{1,3}", text):
+        return int(text)
+    if text in _LITERAL_COUNT_CHINESE_DIGITS:
+        return _LITERAL_COUNT_CHINESE_DIGITS[text]
+    if text == "十":
+        return 10
+    if text.startswith("十") and len(text) == 2 and text[1] in _LITERAL_COUNT_CHINESE_DIGITS:
+        return 10 + _LITERAL_COUNT_CHINESE_DIGITS[text[1]]
+    if text.endswith("十") and len(text) == 2 and text[0] in _LITERAL_COUNT_CHINESE_DIGITS:
+        return _LITERAL_COUNT_CHINESE_DIGITS[text[0]] * 10
+    if (
+        len(text) == 3
+        and text[1] == "十"
+        and text[0] in _LITERAL_COUNT_CHINESE_DIGITS
+        and text[2] in _LITERAL_COUNT_CHINESE_DIGITS
+    ):
+        return _LITERAL_COUNT_CHINESE_DIGITS[text[0]] * 10 + _LITERAL_COUNT_CHINESE_DIGITS[text[2]]
+    return None
+
+
+def _literal_count_claim_issues(final_text):
+    """Normalize deictic literal-count claims without guessing their referent."""
+    body = str(final_text or "")
+    if not body.strip():
+        return []
+    pattern = re.compile(
+        r"(?P<deictic>[这那])(?P<num>\d{1,2}|[零〇一二两三四五六七八九十]{1,3})个字"
+    )
+    issues = []
+    for match in pattern.finditer(body):
+        claimed = _literal_count_number_to_int(match.group("num"))
+        # "这一个字" remains natural and unambiguous. Any larger claimed
+        # count is intentionally generalized instead of trying to infer which
+        # earlier text it refers to.
+        if claimed is None or claimed < 2:
+            continue
+        replacement = f"{match.group('deictic')}几个字"
+        issues.append({
+            "claimed": claimed,
+            "claim_text": match.group(0),
+            "num_text": match.group("num"),
+            "replacement_text": replacement,
+            "start": match.start(),
+            "end": match.end(),
+            "normalization": "deictic_literal_count",
+        })
+    return issues
+
+
+def _repair_literal_count_claims(final_text):
+    body = str(final_text or "").strip()
+    issues = _literal_count_claim_issues(body)
+    if not issues:
+        return body, []
+    repaired = body
+    for item in sorted(issues, key=lambda value: int(value.get("start", 0)), reverse=True):
+        repaired = (
+            repaired[:item["start"]]
+            + item["replacement_text"]
+            + repaired[item["end"]:]
+        )
+    return repaired.strip(), issues
+
+
+def _style_finalize_error_is_hard(value):
+    """Classify only continuity and prose-quality failures as rewrite blockers."""
+    text = str(value or "").strip()
+    if not text:
+        return False
+    return bool(
+        "前两章剧情复演" in text
+        or "终稿逻辑连续性" in text
+        or "文风仿写明确失败" in text
+        or text.startswith("章首承接重复上一章")
+        or text.startswith("跨章期限")
+        or "办案式流程明显扩张" in text
+        or "机械感明显" in text
+    )
+
+
 def _style_finalize_acceptance_errors(
     execution_text,
     final_text,
     acceptance,
     style_reference="",
     output_target=0,
+    project=None,
+    chapter_index=0,
+    style_plan="",
+    profile_text="",
 ):
     body = str(final_text or "").strip()
     beats = _style_execution_beats(execution_text)
     result = acceptance if isinstance(acceptance, dict) else {}
     errors = []
+    target = max(0, int(output_target or 0))
+    body_chars = len(_compact_text(body))
+    if target and body_chars >= 300 and not (
+        target * 0.75 <= body_chars <= target * 1.30
+    ):
+        direction = "压缩" if body_chars > target else "补足"
+        errors.append(
+            f"终稿正文长度明显偏离目标：目标约{target}字，终稿约{body_chars}字；"
+            f"须在不删剧情拍点的前提下{direction}到约{round(target * 0.85)}-"
+            f"{round(target * 1.15)}字"
+        )
     if beats:
-        evidence_items = result.get("beat_evidence", [])
-        if not isinstance(evidence_items, list):
-            evidence_items = []
-        evidence_by_beat = {}
-        for item in evidence_items:
-            if not isinstance(item, dict):
-                continue
-            try:
-                beat_number = int(item.get("beat", 0) or 0)
-            except Exception:
-                beat_number = 0
-            quote = str(item.get("evidence_quote", "") or "").strip()
-            if beat_number and quote and beat_number not in evidence_by_beat:
-                evidence_by_beat[beat_number] = quote
-        for beat in beats:
-            number = beat["beat"]
-            quote = evidence_by_beat.get(number, "")
-            if not quote:
-                errors.append(f"剧情拍点{number}没有终稿证据")
-            else:
-                quote = _literalize_long_form_evidence_quote(quote, body)
-            if quote and (
-                len(_compact_text(quote)) < 8
-                or not _long_form_evidence_present(quote, body)
+        # 剧情拍点只作为正文组织参考，不再要求模型为每个拍点提交逐字证据。
+        # 短对白、短动作和自然合并的剧情表达不应因为证据长度触发整章重写。
+        if _style_finalize_acceptance_flag_failed(
+            result.get("previous_chapter_repetition_check")
+        ):
+            errors.append("前两章剧情复演：终稿仍重复上一章已发布内容")
+        if _style_finalize_acceptance_flag_failed(
+            result.get("logic_continuity_check")
+        ):
+            errors.append(
+                "终稿逻辑连续性明确失败：时间顺序、因果、代词指向或人物状态存在冲突"
+            )
+        if _style_finalize_acceptance_flag_failed(
+            result.get("role_voice_attribution_check")
+        ):
+            errors.append("正文文风仿写明确失败：角色声纹或标志句归属错误")
+    previous_boundary = _chapter_previous_opening_boundary_text(project, chapter_index)
+    if previous_boundary:
+        opening = result.get("opening_continuation", {})
+        opening = opening if isinstance(opening, dict) else {}
+        first_new_sentence = str(opening.get("first_new_sentence", "") or "").strip()
+        new_action_or_result = str(opening.get("new_action_or_result", "") or "").strip()
+        opening_text = "\n".join(_style_boundary_paragraphs(body, from_start=True, limit=3))
+        if first_new_sentence:
+            first_new_sentence = _literalize_long_form_evidence_quote(
+                first_new_sentence,
+                opening_text,
+            )
+            if (
+                len(_compact_text(first_new_sentence)) < 4
+                or not _long_form_evidence_present(first_new_sentence, opening_text)
             ):
-                errors.append(f"剧情拍点{number}的证据不是终稿中8字以上逐字原文")
-        if result.get("previous_chapter_repetition_check") is not True:
-            errors.append("没有确认已删除非必要的前两章剧情复演")
-        if result.get("paragraph_structure_check") is not True:
-            errors.append("没有确认终稿段落结构已按样本复核")
+                errors.append("章首承接首个新句不是终稿前三段中的4字以上逐字原文")
+        if new_action_or_result and len(_compact_text(new_action_or_result)) < 4:
+            errors.append("章首新增变量没有说明新反应、新结果、新阻力或新信息")
+        repetition = _style_boundary_repetition_match(previous_boundary, body)
+        if repetition:
+            repeated = _compact_text(repetition.get("current", ""))[:60]
+            errors.append(f"章首承接重复上一章已发布结尾：{repeated}")
+        timeline_check = result.get("timeline_commitment_check", {})
+        timeline_check = timeline_check if isinstance(timeline_check, dict) else {}
+        prior_commitment = str(
+            timeline_check.get("prior_deadline_or_promise", "") or ""
+        ).strip()
+        current_schedule = str(
+            timeline_check.get("current_schedule", "") or ""
+        ).strip()
+        if _style_finalize_acceptance_flag_failed(timeline_check.get("compatible")):
+            errors.append("跨章期限、承诺与当前时间安排仍不兼容")
 
+    # These are hard prose-quality checks even when the execution parser did
+    # not recover a beat list from a malformed model response.
+    if _style_finalize_acceptance_flag_failed(
+        result.get("procedural_expansion_check")
+    ):
+        errors.append("正文办案式流程明显扩张：非主线核验、交接或记录过程挤占了剧情")
+    if _style_finalize_acceptance_flag_failed(
+        result.get("mechanical_prose_check")
+    ):
+        errors.append("正文机械感明显：同构动作、重复解释或功能性问答形成流程化播报")
     reference = _style_text_structure(style_reference)
     final_structure = _style_text_structure(body)
     if reference["chars"] >= 500 and final_structure["chars"] >= 300:
+        bands = _style_centered_structure_bands(reference, final_structure["chars"])
+        fragmentation_flags = _style_fragmentation_drift_flags(
+            reference,
+            final_structure,
+        )
+        if len(fragmentation_flags) >= 2:
+            errors.append(
+                "终稿结构同时向短碎方向漂移："
+                + "、".join(fragmentation_flags)
+                + "；必须整体减少无效换行和功能性短问短答"
+            )
         ref_density = reference["paragraphs_per_1000"]
         final_density = final_structure["paragraphs_per_1000"]
-        if ref_density and not (ref_density * 0.80 <= final_density <= ref_density * 1.20):
+        if ref_density and not (ref_density * 0.75 <= final_density <= ref_density * 1.25):
             errors.append(
                 f"终稿段落密度未贴近样本：样本每1000字{ref_density:.1f}段，终稿{final_density:.1f}段"
             )
         short_gap = final_structure["short_paragraph_pct"] - reference["short_paragraph_pct"]
-        if abs(short_gap) > 10:
+        if short_gap > 12 or short_gap < -18:
             paragraph_count = int(final_structure["paragraph_count"] or 0)
             short_count = sum(
                 length <= 15 for length in final_structure["paragraph_lengths"]
             )
-            allowed_high = min(100.0, reference["short_paragraph_pct"] + 10.0) / 100.0
+            allowed_high = min(100.0, reference["short_paragraph_pct"] + 12.0) / 100.0
             merge_count = 0
             while (
-                short_gap > 10
+                short_gap > 12
                 and merge_count < short_count
                 and paragraph_count - merge_count > 0
                 and (short_count - merge_count) / (paragraph_count - merge_count) > allowed_high
@@ -4720,7 +7213,7 @@ def _style_finalize_acceptance_errors(
                 merge_count += 1
             merge_hint = (
                 f"；至少把{merge_count}个短段并入相邻相关段落"
-                if short_gap > 10 and merge_count else ""
+                if short_gap > 12 and merge_count else ""
             )
             errors.append(
                 f"终稿短段比例未贴近样本：样本{reference['short_paragraph_pct']:.0f}%，"
@@ -4731,7 +7224,7 @@ def _style_finalize_acceptance_errors(
             final_structure["single_sentence_short_paragraph_pct"]
             - reference["single_sentence_short_paragraph_pct"]
         )
-        if single_short_gap > 12 and reference["single_sentence_short_paragraph_pct"] < 55:
+        if single_short_gap > 18 and reference["single_sentence_short_paragraph_pct"] < 55:
             errors.append(
                 "终稿非对白短单句段明显多于样本，普通说明需要合并"
             )
@@ -4740,6 +7233,71 @@ def _style_finalize_acceptance_errors(
         if final_run >= 3 and final_run > max(2, reference_run + 1):
             errors.append(
                 f"终稿连续非对白短段达到{final_run}段，样本最长约{reference_run}段"
+            )
+        if (
+            final_structure["dialogue_char_pct"]
+            > reference["dialogue_char_pct"] + 12.0
+        ):
+            errors.append(
+                f"终稿对白字数占比明显高于样本：样本{reference['dialogue_char_pct']:.0f}%，"
+                f"终稿{final_structure['dialogue_char_pct']:.0f}%；保留声纹小场景，"
+                "把普通核验、汇报、命令和重复问答合并回人物化叙述"
+            )
+        if final_structure["dialogue_turns_per_1000"] > max(
+            reference["dialogue_turns_per_1000"] + 4.0,
+            reference["dialogue_turns_per_1000"] * 1.30,
+        ):
+            errors.append(
+                f"终稿对白轮数明显高于样本：样本每1000字约"
+                f"{reference['dialogue_turns_per_1000']:.1f}轮，终稿约"
+                f"{final_structure['dialogue_turns_per_1000']:.1f}轮；"
+                "删除或改写只承担确认、交接、复问和重复结论的台词"
+            )
+        if final_structure["short_dialogue_turns_per_1000"] > max(
+            reference["short_dialogue_turns_per_1000"] + 3.0,
+            reference["short_dialogue_turns_per_1000"] * 1.35,
+        ):
+            errors.append(
+                f"终稿短对白轮数明显高于样本：样本每1000字约"
+                f"{reference['short_dialogue_turns_per_1000']:.1f}轮，终稿约"
+                f"{final_structure['short_dialogue_turns_per_1000']:.1f}轮；"
+                "把无新增信息的极短问答并入动作或相邻完整表达"
+            )
+        # The local structural measurements are authoritative for this check.
+        # A model can omit the boolean after completing a valid edit; do not
+        # spend another full-body call solely to repair that self-report.
+    if target and profile_text and style_reference and body:
+        reference_compact = _compact_text(style_reference)
+        body_compact = _compact_text(body)
+        reference_chars = max(1, len(reference_compact))
+        density_drift = []
+        for phrase in _style_profile_extracted_phrases(
+            profile_text,
+            style_reference,
+        )[:120]:
+            sample_count = reference_compact.count(phrase)
+            if sample_count <= 0:
+                continue
+            expected = sample_count * target / reference_chars
+            soft_upper = min(
+                sample_count,
+                max(1, int(math.ceil(expected + 0.5))),
+            )
+            actual_count = body_compact.count(phrase)
+            if actual_count > soft_upper + 1:
+                density_drift.append(
+                    (actual_count - soft_upper, actual_count, phrase, soft_upper)
+                )
+        if density_drift:
+            density_drift.sort(key=lambda item: (-item[0], -item[1], item[2]))
+            details = "、".join(
+                f"{phrase}{actual_count}次/软上沿{soft_upper}次"
+                for _, actual_count, phrase, soft_upper in density_drift[:12]
+            )
+            errors.append(
+                "终稿原生词密度明显高于样本："
+                + details
+                + "；保留语义必要处，其余改用自然句式或省去重复动作标签，不改剧情"
             )
     return errors
 
@@ -4887,6 +7445,9 @@ def _build_style_profile_request_context(style_reference):
 
 STYLE_SHEET_CACHE_VERSION = 3
 STYLE_CARD_CACHE_VERSION = 1
+STYLE_SEMANTIC_ARCHIVE_VERSION = 4
+STYLE_SEMANTIC_ARCHIVE_SCHEMA = "semantic_voice_v4"
+STYLE_SEMANTIC_VOCABULARY_LIMIT = 120
 STYLE_CARD_CATEGORIES = (
     "推理与解释",
     "专业角色对白",
@@ -4907,6 +7468,20 @@ STYLE_CARD_DIMENSIONS = {
     "日常口语与喜剧": "对白",
     "章节收束": "收束/格式",
 }
+STYLE_NARRATIVE_MODES = (
+    "冲突推进",
+    "情绪关系",
+    "动作危机",
+    "喜剧反差",
+    "信息揭示",
+    "调查推理",
+)
+STYLE_PROCEDURAL_CARD_CATEGORIES = {"推理与解释", "专业角色对白"}
+
+STYLE_CONFLICT_VOICE_TERMS = (
+    "冲突", "争执", "互呛", "拆台", "施压", "反制", "反击", "对峙",
+    "质问", "打断", "争夺", "压制", "误会", "翻盘", "拒绝", "否认",
+)
 
 
 def _style_exact_source_excerpt(style_reference, excerpt):
@@ -4914,12 +7489,16 @@ def _style_exact_source_excerpt(style_reference, excerpt):
     value = str(excerpt or "").replace("\r\n", "\n").replace("\r", "\n").strip()
     if not reference or not value:
         return ""
-    exact_at = reference.find(value)
-    if exact_at >= 0:
-        return reference[exact_at:exact_at + len(value)].strip()
-    compact_value = _compact_text(value)
-    if not compact_value:
-        return ""
+    candidates = [value]
+    # Models regularly add a pair of quotation marks around a sampled narration
+    # sentence.  Try the literal excerpt first, then only remove that outer
+    # wrapper.  The returned evidence still always comes from the raw sample.
+    quote_pairs = (("“", "”"), ("‘", "’"), ('"', '"'), ("'", "'"))
+    for opener, closer in quote_pairs:
+        if len(value) > 2 and value.startswith(opener) and value.endswith(closer):
+            unwrapped = value[len(opener):-len(closer)].strip()
+            if unwrapped:
+                candidates.append(unwrapped)
     compact_chars = []
     source_indexes = []
     for source_index, char in enumerate(reference):
@@ -4928,18 +7507,27 @@ def _style_exact_source_excerpt(style_reference, excerpt):
         compact_chars.append(char)
         source_indexes.append(source_index)
     compact_reference = "".join(compact_chars)
-    compact_at = compact_reference.find(compact_value)
-    if compact_at < 0:
-        return ""
-    source_start = source_indexes[compact_at]
-    source_end = source_indexes[compact_at + len(compact_value) - 1] + 1
-    return reference[source_start:source_end].strip()
+    for candidate in candidates:
+        exact_at = reference.find(candidate)
+        if exact_at >= 0:
+            return reference[exact_at:exact_at + len(candidate)].strip()
+        compact_value = _compact_text(candidate)
+        if not compact_value:
+            continue
+        compact_at = compact_reference.find(compact_value)
+        if compact_at < 0:
+            continue
+        source_start = source_indexes[compact_at]
+        source_end = source_indexes[compact_at + len(compact_value) - 1] + 1
+        return reference[source_start:source_end].strip()
+    return ""
 
 
 def _normalize_style_cards(value, style_reference="", max_cards=12):
     items = value if isinstance(value, list) else []
     cards = []
     seen_excerpts = set()
+    used_ids = set()
     limit = max(1, min(20, int(max_cards or 12)))
     for item in items:
         if not isinstance(item, dict):
@@ -4961,8 +7549,15 @@ def _normalize_style_cards(value, style_reference="", max_cards=12):
         if not category:
             continue
         seen_excerpts.add(compact_excerpt)
+        card_id = str(item.get("id", "") or "").strip().upper()
+        if not re.fullmatch(r"SC\d{2}", card_id) or card_id in used_ids:
+            next_number = 1
+            while f"SC{next_number:02d}" in used_ids:
+                next_number += 1
+            card_id = f"SC{next_number:02d}"
+        used_ids.add(card_id)
         cards.append({
-            "id": f"SC{len(cards) + 1:02d}",
+            "id": card_id,
             "category": category,
             "title": str(item.get("title", "") or category).strip()[:80] or category,
             "use_when": str(item.get("use_when", "") or "").strip()[:500],
@@ -4996,6 +7591,374 @@ def _parse_style_cards_result(value, style_reference):
     if not isinstance(data, dict):
         return []
     return _normalize_style_cards(data.get("cards", []), style_reference)
+
+
+def _style_json_data(value):
+    text = str(value or "").strip()
+    if text.startswith("```"):
+        text = re.sub(r"^```(?:json)?\s*", "", text, flags=re.IGNORECASE)
+        text = re.sub(r"\s*```$", "", text)
+    candidates = [text]
+    for pattern in (r"\{.*\}", r"\[.*\]"):
+        match = re.search(pattern, text, flags=re.DOTALL)
+        if match and match.group(0) != text:
+            candidates.append(match.group(0))
+    for candidate in candidates:
+        try:
+            data = json.loads(candidate)
+        except Exception:
+            continue
+        if isinstance(data, (dict, list)):
+            return data
+    return {}
+
+
+def _style_json_object(value):
+    data = _style_json_data(value)
+    if isinstance(data, dict):
+        return data
+    if isinstance(data, list):
+        return {"cards": data}
+    return {}
+
+
+def _style_card_items_from_json(value, *keys):
+    data = _style_json_data(value)
+    if isinstance(data, list):
+        return data
+    if not isinstance(data, dict):
+        return []
+    for key in keys or ("cards",):
+        items = data.get(key)
+        if isinstance(items, list):
+            return items
+    return []
+
+
+def _style_card_field(item, *keys):
+    for key in keys:
+        value = item.get(key)
+        if value not in (None, ""):
+            return value
+    return ""
+
+
+def _style_native_vocabulary_seed_terms(profile_text, style_reference, limit=84):
+    """Return the archive's established original vocabulary in stable order."""
+    try:
+        count = max(1, int(limit or 84))
+    except Exception:
+        count = 84
+    return _style_profile_extracted_phrases(profile_text, style_reference)[:count]
+
+
+def _normalize_native_vocabulary_cards(
+    value,
+    style_reference="",
+    required_terms=None,
+    max_cards=STYLE_SEMANTIC_VOCABULARY_LIMIT,
+):
+    reference = str(style_reference or "").strip()
+    expected = []
+    seen_expected = set()
+    for term in required_terms if isinstance(required_terms, (list, tuple)) else []:
+        normalized = _compact_text(term)
+        if normalized and normalized not in seen_expected:
+            expected.append(normalized)
+            seen_expected.add(normalized)
+    allowed = set(expected)
+    cards = []
+    seen = set()
+    for item in value if isinstance(value, list) else []:
+        if not isinstance(item, dict):
+            continue
+        term = _compact_text(item.get("term", item.get("word", "")))
+        if not term or term in seen or (allowed and term not in allowed):
+            continue
+        if len(term) > 16 or not re.search(r"[\u3400-\u9fff]", term):
+            continue
+        source_value = str(
+            item.get("source_evidence", item.get("source_excerpt", item.get("evidence", "")))
+            or ""
+        ).strip()
+        source_evidence = _style_exact_source_excerpt(reference, source_value) if reference else source_value
+        if reference and (not source_evidence or term not in _compact_text(source_evidence)):
+            continue
+        card = {
+            "term": term,
+            "meaning": str(item.get("meaning", "") or "").strip()[:180],
+            "emotional_temperature": str(item.get("emotional_temperature", "") or "").strip()[:100],
+            "speaker_or_viewpoint": str(item.get("speaker_or_viewpoint", item.get("ownership", "")) or "").strip()[:160],
+            "use_when": str(item.get("use_when", "") or "").strip()[:220],
+            "sentence_position": str(item.get("sentence_position", "") or "").strip()[:130],
+            "natural_collocations": str(item.get("natural_collocations", "") or "").strip()[:200],
+            "avoid_when": str(item.get("avoid_when", "") or "").strip()[:220],
+            "source_evidence": source_evidence[:500],
+        }
+        if not all(card[key] for key in (
+            "meaning", "emotional_temperature", "speaker_or_viewpoint", "use_when",
+            "sentence_position", "natural_collocations", "avoid_when", "source_evidence",
+        )):
+            continue
+        cards.append(card)
+        seen.add(term)
+        if len(cards) >= max(1, int(max_cards or STYLE_SEMANTIC_VOCABULARY_LIMIT)):
+            break
+    if expected:
+        order = {term: index for index, term in enumerate(expected)}
+        cards.sort(key=lambda item: order.get(item["term"], len(order)))
+    return cards
+
+
+def _parse_native_vocabulary_cards_result(value, style_reference, required_terms=None):
+    data = _style_json_object(value)
+    return _normalize_native_vocabulary_cards(
+        data.get("cards", []),
+        style_reference,
+        required_terms=required_terms,
+    )
+
+
+def _normalize_style_voice_cards(value, style_reference="", max_cards=12):
+    reference = str(style_reference or "").strip()
+    cards = []
+    seen = set()
+    for index, item in enumerate(value if isinstance(value, list) else [], 1):
+        if not isinstance(item, dict):
+            continue
+        card_id = str(item.get("id", "") or "").strip().upper()
+        if not re.fullmatch(r"VC\d{2}", card_id) or card_id in seen:
+            card_id = f"VC{index:02d}"
+            while card_id in seen:
+                index += 1
+                card_id = f"VC{index:02d}"
+        source_value = str(_style_card_field(
+            item,
+            "source_evidence", "source_excerpt", "evidence", "source",
+            "原文证据", "原文片段", "证据", "样本证据",
+        ) or "").strip()
+        source_evidence = _style_exact_source_excerpt(reference, source_value) if reference else source_value
+        card = {
+            "id": card_id,
+            "title": str(_style_card_field(item, "title", "name", "标题", "声纹标题") or "").strip()[:80],
+            "owner": str(_style_card_field(item, "owner", "speaker", "viewpoint", "归属", "人物", "视角") or "").strip()[:160],
+            "voice_features": str(_style_card_field(
+                item, "voice_features", "features", "voice", "语言特征", "声纹", "口吻特征"
+            ) or "").strip()[:600],
+            "use_when": str(_style_card_field(item, "use_when", "use", "适用", "适用场景", "什么时候用") or "").strip()[:240],
+            "avoid_when": str(_style_card_field(item, "avoid_when", "avoid", "边界", "不用在", "避免") or "").strip()[:240],
+            "source_evidence": source_evidence[:500],
+        }
+        if not all(card[key] for key in (
+            "title", "owner", "voice_features", "use_when", "avoid_when", "source_evidence",
+        )):
+            continue
+        cards.append(card)
+        seen.add(card_id)
+        if len(cards) >= max(1, int(max_cards or 12)):
+            break
+    return cards
+
+
+def _parse_style_voice_cards_result(value, style_reference):
+    return _normalize_style_voice_cards(
+        _style_card_items_from_json(value, "cards", "voice_cards", "声纹卡", "人物与叙述声纹卡"),
+        style_reference,
+    )
+
+
+def _normalize_style_technique_cards(value, style_reference="", max_cards=12):
+    reference = str(style_reference or "").strip()
+    cards = []
+    seen = set()
+    for index, item in enumerate(value if isinstance(value, list) else [], 1):
+        if not isinstance(item, dict):
+            continue
+        card_id = str(item.get("id", "") or "").strip().upper()
+        if not re.fullmatch(r"TC\d{2}", card_id) or card_id in seen:
+            card_id = f"TC{index:02d}"
+            while card_id in seen:
+                index += 1
+                card_id = f"TC{index:02d}"
+        source_value = str(_style_card_field(
+            item,
+            "source_evidence", "source_excerpt", "evidence", "source",
+            "原文证据", "原文片段", "证据", "样本证据",
+        ) or "").strip()
+        source_evidence = _style_exact_source_excerpt(reference, source_value) if reference else source_value
+        card = {
+            "id": card_id,
+            "title": str(_style_card_field(item, "title", "name", "标题", "技法标题") or "").strip()[:80],
+            "trigger": str(_style_card_field(item, "trigger", "use_when", "适用", "触发条件", "何时使用") or "").strip()[:260],
+            "use_method": str(_style_card_field(item, "use_method", "method", "写法", "使用方法", "技法") or "").strip()[:600],
+            "avoid_when": str(_style_card_field(item, "avoid_when", "avoid", "边界", "不用在", "避免") or "").strip()[:280],
+            "source_evidence": source_evidence[:500],
+        }
+        if not all(card[key] for key in (
+            "title", "trigger", "use_method", "avoid_when", "source_evidence",
+        )):
+            continue
+        cards.append(card)
+        seen.add(card_id)
+        if len(cards) >= max(1, int(max_cards or 12)):
+            break
+    return cards
+
+
+def _parse_style_technique_cards_result(value, style_reference):
+    return _normalize_style_technique_cards(
+        _style_card_items_from_json(value, "cards", "technique_cards", "技法卡", "条件性叙事技法卡"),
+        style_reference,
+    )
+
+
+def _normalize_semantic_style_archive(cache_entry, style_reference=""):
+    entry = cache_entry if isinstance(cache_entry, dict) else {}
+    schema = str(entry.get("style_archive_schema", "") or "").strip()
+    try:
+        if schema == STYLE_SEMANTIC_ARCHIVE_SCHEMA:
+            version = int(entry.get("semantic_archive_version", 0) or 0)
+        else:
+            # Runtime callers may pass the already-normalized semantic archive
+            # returned by this helper.  Accept that shape instead of clearing
+            # the V4 vocabulary and voice cards on a second normalization pass.
+            version = int(entry.get("version", 0) or 0)
+    except Exception:
+        version = 0
+    if schema and schema != STYLE_SEMANTIC_ARCHIVE_SCHEMA:
+        return {}
+    if version < STYLE_SEMANTIC_ARCHIVE_VERSION:
+        return {}
+    vocabulary = _normalize_native_vocabulary_cards(
+        entry.get("native_vocabulary_cards", []), style_reference
+    )
+    voices = _normalize_style_voice_cards(entry.get("voice_cards", []), style_reference)
+    techniques = _normalize_style_technique_cards(entry.get("technique_cards", []), style_reference)
+    runtime_pack = str(entry.get("runtime_voice_pack", "") or "").strip()
+    if not vocabulary or not voices or not techniques or not runtime_pack:
+        return {}
+    return {
+        "version": version,
+        "native_vocabulary_cards": vocabulary,
+        "voice_cards": voices,
+        "technique_cards": techniques,
+        "runtime_voice_pack": runtime_pack,
+    }
+
+
+def _format_native_vocabulary_cards(cards, limit=18000):
+    rows = []
+    for card in _normalize_native_vocabulary_cards(cards):
+        rows.append(
+            f"【{card['term']}】真义：{card['meaning']}；情绪温度：{card['emotional_temperature']}；"
+            f"说话/视角：{card['speaker_or_viewpoint']}；适用：{card['use_when']}；"
+            f"句位：{card['sentence_position']}；自然搭配：{card['natural_collocations']}；"
+            f"不用在：{card['avoid_when']}。"
+        )
+    if not rows:
+        return ""
+    text = (
+        f"以下{len(rows)}项都是作者原样本中实际存在的语言材料，全部保留在本章上下文。"
+        "它们不是每章逐个打卡的词表：当当前人物、情绪和句位吻合时，优先用这里的原生表达替代模型默认的书面话或套路话；"
+        "不吻合就不硬塞。必须按每项的说话归属、情绪温度和不用边界使用，不能把所有词都安给同一个人。\n"
+        + "\n".join(rows)
+    )
+    return text[:max(0, int(limit or 18000))]
+
+
+def _format_style_voice_cards(cards, limit=6000):
+    rows = []
+    for card in _normalize_style_voice_cards(cards):
+        rows.append(
+            f"【{card['id']}｜{card['title']}】归属：{card['owner']}；声纹：{card['voice_features']}；"
+            f"适用：{card['use_when']}；边界：{card['avoid_when']}。"
+        )
+    if not rows:
+        return ""
+    return (
+        "人物声纹是每章常驻的语言层，只在对应人物开口、心理或贴近其视角的叙述出现时落实；"
+        "不为了展示声纹而新增对白、吵架或笑点。"
+        "卡内样本人物名、称呼和关系只用于理解功能口吻，写当前小说时必须映射成当前人物，"
+        "严禁把样本姓名、关系和事件带入正文。\n" + "\n".join(rows)
+    )[:max(0, int(limit or 6000))]
+
+
+def _format_style_technique_cards(cards, limit=6500):
+    rows = []
+    for card in _normalize_style_technique_cards(cards):
+        rows.append(
+            f"【{card['id']}｜{card['title']}】仅当：{card['trigger']}。写法：{card['use_method']}。"
+            f"不用于：{card['avoid_when']}。"
+        )
+    if not rows:
+        return ""
+    return (
+        "以下只是条件性叙事技法，默认不启用。它们不能决定章节发生什么，也不能把普通矛盾改成公开辩论、"
+        "连续拆台、围观合唱或流程核验；只有当前提纲本来就有相同场景且触发条件成立时才可局部借用。\n"
+        + "\n".join(rows)
+    )[:max(0, int(limit or 6500))]
+
+
+def _build_style_semantic_vocabulary_context(style_reference, terms, limit=NOVEL_AI_CONTEXT_LIMIT):
+    reference = str(style_reference or "").strip()
+    terms = [str(term or "").strip() for term in terms if str(term or "").strip()]
+    instruction = (
+        "【任务】\n"
+        "只针对下面列出的作者原生词语或习惯短语建立《词语义卡》，不得新增、删除、合并或替换词条。"
+        "每个词条恰好一张卡，meaning必须写作者实际怎么用而不是字典释义；emotional_temperature写情绪温度；"
+        "speaker_or_viewpoint写适合哪类人物说、内心独白还是贴近角色的旁白；use_when写自然适用场景；"
+        "sentence_position写常落在句首、句中、动作后、对白落点等什么位置；natural_collocations写与动作、语气、"
+        "称呼或前后句的自然搭配；avoid_when写会显得不合人物、不合情绪或误读意思的边界。"
+        "source_evidence必须从完整原文逐字连续截取一段真实上下文，且必须包含该词，不得拼接、改写或补字。"
+        "允许现代口语、粗口、饭圈词和网络词，它们不是污染；不要把所有词解释成搞笑或冲突用语。"
+        "只输出合法JSON：{\"cards\":[{\"term\":\"\",\"meaning\":\"\",\"emotional_temperature\":\"\","
+        "\"speaker_or_viewpoint\":\"\",\"use_when\":\"\",\"sentence_position\":\"\","
+        "\"natural_collocations\":\"\",\"avoid_when\":\"\",\"source_evidence\":\"\"}]}。"
+    )
+    return "\n\n".join(part for part in (
+        "【必须覆盖的词条】\n" + "、".join(terms),
+        "【作者完整原文】\n" + reference,
+        instruction,
+    ) if part)[:int(limit or NOVEL_AI_CONTEXT_LIMIT)]
+
+
+def _build_style_voice_cards_context(style_reference, limit=NOVEL_AI_CONTEXT_LIMIT):
+    instruction = (
+        "【任务】\n"
+        "从作者完整原文建立6至10张《角色与叙述声纹卡》。只提炼语言层：主视角旁白、主角说话、"
+        "不同功能配角的说话方式、冲突中的接话节奏、日常口语和情绪表达。"
+        "不得把连续拆台、围观合唱、反转、流程推进等剧情组织方法写成常驻声纹；也不得把任一声纹写成每章必须有笑点或对话。"
+        "每卡必须给出owner、voice_features、use_when、avoid_when和逐字连续的source_evidence。"
+        "只输出合法JSON：{\"cards\":[{\"id\":\"VC01\",\"title\":\"\",\"owner\":\"\","
+        "\"voice_features\":\"\",\"use_when\":\"\",\"avoid_when\":\"\",\"source_evidence\":\"\"}]}。"
+    )
+    return "\n\n".join(("【作者完整原文】\n" + str(style_reference or "").strip(), instruction))[:int(limit or NOVEL_AI_CONTEXT_LIMIT)]
+
+
+def _build_style_technique_cards_context(style_reference, limit=NOVEL_AI_CONTEXT_LIMIT):
+    instruction = (
+        "【任务】\n"
+        "从作者完整原文建立5至10张《条件性叙事技法卡》。这类卡只能记录在特定场景才可局部使用的组织办法，"
+        "例如公开反应链、字面拆台、身份揭晓、喜剧反差、平台弹幕、危机急停等。"
+        "每张必须把trigger写得具体，把avoid_when写得严格：普通情绪冲突、私人谈话、关系拉扯、日常推进默认不调用。"
+        "技法卡绝不能成为章节模板，不能要求反复证明同一件事，不能把矛盾写成质问—否认—解释—再反驳的辩论流程。"
+        "每卡给出逐字连续source_evidence。只输出合法JSON：{\"cards\":[{\"id\":\"TC01\",\"title\":\"\","
+        "\"trigger\":\"\",\"use_method\":\"\",\"avoid_when\":\"\",\"source_evidence\":\"\"}]}。"
+    )
+    return "\n\n".join(("【作者完整原文】\n" + str(style_reference or "").strip(), instruction))[:int(limit or NOVEL_AI_CONTEXT_LIMIT)]
+
+
+def _build_style_runtime_voice_pack_context(voice_cards, technique_cards, limit=NOVEL_AI_CONTEXT_LIMIT):
+    voices = _format_style_voice_cards(voice_cards, limit=9000)
+    techniques = _format_style_technique_cards(technique_cards, limit=9000)
+    instruction = (
+        "【任务】\n"
+        "根据声纹卡和条件技法卡，写一份1200至2200字的《V4运行时文风总则》。"
+        "只写正文扩写时始终要遵守的语言原则、人物口吻区分、口语与叙述的关系、段落节奏边界，以及条件技法的默认关闭原则。"
+        "不要复述任何原文剧情、人物名、专有物件或逐字证据；不要列出词表；不要把公开围观、连续拆台、反转或喜剧当成每章要求；"
+        "明确普通冲突优先写人物目标、选择、关系变化和直接后果，避免证明链、办案流程和来回讲道理。直接输出运行时总则正文。"
+    )
+    return "\n\n".join(part for part in ("【角色与叙述声纹卡】\n" + voices if voices else "", "【条件性技法卡】\n" + techniques if techniques else "", instruction) if part)[:int(limit or NOVEL_AI_CONTEXT_LIMIT)]
 
 
 def _build_style_cards_context(style_reference, combined_sheet="", persona="", limit=NOVEL_AI_CONTEXT_LIMIT):
@@ -5040,8 +8003,14 @@ def _format_style_cards(cards, limit=6500):
     return "\n\n".join(parts)[:max(0, int(limit or 6500))]
 
 
+def _style_mandatory_voice_cards(cards):
+    # Original excerpts are conditional evidence, not per-chapter quotas.
+    return []
+
+
 def _style_cards_selected_by_plan(cards, style_plan, max_cards=3):
     normalized = _normalize_style_cards(cards)
+    narrative_mode = _style_narrative_mode_from_plan(style_plan)
     requested = []
     for card_id in re.findall(
         r"(?<![A-Za-z0-9])SC\d{2}(?![A-Za-z0-9])",
@@ -5053,19 +8022,150 @@ def _style_cards_selected_by_plan(cards, style_plan, max_cards=3):
             requested.append(card_id)
     cards_by_id = {str(card.get("id", "") or "").upper(): card for card in normalized}
     selected = []
-    selected_dimensions = set()
+    selected_ids = {str(card.get("id", "") or "").upper() for card in selected}
+    selected_dimensions = {
+        dimension
+        for dimension in (
+            STYLE_CARD_DIMENSIONS.get(card.get("category", ""), "叙述/场景")
+            for card in selected
+        )
+        if dimension == "对白"
+    }
+    selection_limit = max(1, int(max_cards or 1))
     for card_id in requested:
         card = cards_by_id.get(card_id)
-        if not card:
+        if not card or card_id in selected_ids:
+            continue
+        category = str(card.get("category", "") or "").strip()
+        if category in STYLE_PROCEDURAL_CARD_CATEGORIES and narrative_mode != "调查推理":
+            continue
+        if (
+            narrative_mode
+            and category == "权威角色命令"
+            and narrative_mode not in {"冲突推进", "动作危机", "调查推理"}
+        ):
+            continue
+        if category == "群体反应" and narrative_mode not in {"冲突推进", "喜剧反差"}:
+            continue
+        if category == "日常口语与喜剧" and narrative_mode not in {"情绪关系", "喜剧反差"}:
             continue
         dimension = STYLE_CARD_DIMENSIONS.get(card.get("category", ""), "叙述/场景")
         if dimension in selected_dimensions:
             continue
         selected.append(card)
+        selected_ids.add(card_id)
         selected_dimensions.add(dimension)
-        if len(selected) >= max(1, int(max_cards or 3)):
+        if len(selected) >= selection_limit:
             break
     return selected
+
+
+def _select_style_execution_cards(cards, chapter_context, max_cards=3):
+    """Choose a few source-evidence cards for direct prose generation.
+
+    This intentionally uses only broad scene cues. The cards are writing
+    evidence, not a plot-routing system, so the selector must not turn every
+    chapter into a procedural checklist.
+    """
+    normalized = _normalize_style_cards(cards)
+    if not normalized:
+        return []
+    text = _compact_text(chapter_context).lower()
+    investigation_terms = (
+        "调查", "查证", "取证", "证据", "案件", "审问", "验尸", "化验",
+        "鉴定", "线索", "嫌疑", "排查", "推理",
+    )
+    is_investigation = any(term in text for term in investigation_terms)
+    available = [
+        card for card in normalized
+        if is_investigation or str(card.get("category", "") or "")
+        not in STYLE_PROCEDURAL_CARD_CATEGORIES
+    ]
+    if not available:
+        available = list(normalized)
+
+    selected = []
+    selected_ids = set()
+
+    def choose(category):
+        for card in available:
+            card_id = str(card.get("id", "") or "").upper()
+            if card_id in selected_ids:
+                continue
+            if str(card.get("category", "") or "") != category:
+                continue
+            selected.append(card)
+            selected_ids.add(card_id)
+            return True
+        return False
+
+    # Natural oral rhythm and individual dialogue are always useful evidence;
+    # this does not require a joke or extra dialogue in the new chapter.
+    choose("日常口语与喜剧")
+
+    if any(term in text for term in ("害怕", "发抖", "哭", "求", "慌", "脸白", "惊恐")):
+        choose("弱势与恐惧对白")
+    elif any(term in text for term in ("命令", "警告", "冷声", "沉声", "吩咐", "不许", "滚")):
+        choose("权威角色命令")
+    else:
+        choose("权威角色命令") or choose("弱势与恐惧对白")
+
+    if any(term in text for term in ("不对", "异常", "忽然", "变了", "露出", "发现", "反常")):
+        choose("异常逐步显形")
+    elif any(term in text for term in ("众人", "所有人", "围观", "宾客", "人群", "大家")):
+        choose("群体反应")
+    elif is_investigation:
+        choose("推理与解释")
+    else:
+        choose("章节收束")
+
+    for card in available:
+        if len(selected) >= max(1, int(max_cards or 1)):
+            break
+        card_id = str(card.get("id", "") or "").upper()
+        if card_id in selected_ids:
+            continue
+        selected.append(card)
+        selected_ids.add(card_id)
+    return selected[:max(1, int(max_cards or 1))]
+
+
+def _style_narrative_mode_from_plan(style_plan):
+    text = str(style_plan or "")
+    match = re.search(
+        r"(?:主叙事模式|本章主模式)\s*[:：｜|]\s*(冲突推进|情绪关系|动作危机|喜剧反差|信息揭示|调查推理)",
+        text,
+    )
+    return match.group(1) if match else ""
+
+
+def _style_narrative_mode_contract(output_target=0, narrative_mode=""):
+    try:
+        target = max(1000, int(output_target or 2000))
+    except Exception:
+        target = 2000
+    normal_budget = min(400, max(120, round(target * 0.08)))
+    investigation_budget = min(700, max(220, round(target * 0.16)))
+    mode = narrative_mode if narrative_mode in STYLE_NARRATIVE_MODES else ""
+    mode_text = (
+        f"本章已确定主叙事模式为“{mode}”，终稿不得被题材名词带偏到其他模式。"
+        if mode else
+        "先从冲突推进、情绪关系、动作危机、喜剧反差、信息揭示、调查推理中只选一个主叙事模式。"
+        "判断依据是本章主要靠什么让读者继续看，不是场景中出现了医院、公司、警察、证据或专业人物。"
+    )
+    return (
+        "【叙事动力与解释预算】\n"
+        + mode_text
+        + "剧情吸引力优先级为：人物反应与冲突、新结果、悬念、必要解释、流程完整性。"
+        "先写人物作出决定、遭遇阻力或看到结果，再补读者此刻非知道不可的最短原因；"
+        "读者从动作、结果和上下文已经能推断的内容必须留白，不能由旁白和角色换一种说法再讲一遍。"
+        f"非调查推理模式全章用于机制、因果和流程说明的文字总量以{normal_budget}字为上限，"
+        "集中判断最多一段、每次不超过两句；不要求写满额度。"
+        f"调查推理模式的说明总量也以{investigation_budget}字为上限，最多两段集中推理；"
+        "只保留会改变人物下一步行动或结论的验证，不追求现实流程完整。"
+        "任何模式都不得为显得严谨而自行增加提纲没有要求的封签编号、分样、审批、交接、见证、记录固定、责任划分或多轮复核。"
+        "专业步骤若不影响本章转折、后续伏笔或人物选择，合并为一句结果；同一判断只能由最合适的人完整说一次。"
+    )
 
 
 def _build_style_profile_units(style_reference, max_units=10, target_chars=2400):
@@ -5241,6 +8341,141 @@ def _compose_style_profile(combined_sheet, persona, chapter_rules=""):
     return "\n\n".join(parts)
 
 
+_STYLE_LAYOUT_METRIC_LABELS = (
+    "段落节奏",
+    "长短段分布",
+    "段落功能分布",
+    "常见段落衔接",
+    "段落节奏骨架",
+    "完整样本结构软参考",
+    "完整样本本地结构目标",
+    "输出前结构防漂移检查",
+)
+
+_STYLE_LAYOUT_METRIC_MARKERS = (
+    "每1000字",
+    "每千字",
+    "非空段",
+    "15字以内",
+    "35字以内",
+    "80字以上",
+    "短对白",
+    "对白轮数",
+    "段落密度",
+    "短段比例",
+    "短段占比",
+    "短句数",
+    "段落长度中位数",
+    "句子长度中位数",
+    "中心区间",
+    "强调短段约",
+)
+
+
+def _remove_style_layout_metrics(value):
+    """Delete paragraph/layout metrics while preserving voice and vocabulary."""
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    kept = []
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line:
+            kept.append(raw_line)
+            continue
+        if any(label in line for label in _STYLE_LAYOUT_METRIC_LABELS):
+            continue
+        if any(marker in line for marker in _STYLE_LAYOUT_METRIC_MARKERS):
+            continue
+        if (
+            ("段落" in line or "短段" in line or "短句" in line)
+            and re.search(r"\d|%|％|约|占比|中位数|中心区间", line)
+        ):
+            continue
+        kept.append(raw_line)
+    return re.sub(r"\n{3,}", "\n\n", "\n".join(kept)).strip()
+
+def _style_generation_issue_text(reasons):
+    lines = []
+    for reason in reasons or []:
+        text = str(reason or "").strip()
+        if not text:
+            continue
+        if any(key in text for key in ("段落密度", "短段比例", "中长段", "短对白", "对白轮数", "对白比例", "对白字数占比")):
+            if "对白" in text:
+                text = "对白与叙述衔接读感漂移：无必要台词或功能性问答偏多，需要减少重复确认。"
+            elif "中长段" in text:
+                text = "叙述承载不足：必要信息被过度碎片化，需要自然合并成完整表达。"
+            else:
+                text = "自然排版读感向短碎方向漂移：无效碎片、功能性问答或同义复述偏多。"
+        lines.append("- " + text)
+    return "\n".join(lines) or "- 本地读感检测无硬性问题"
+
+
+def _style_runtime_profile(profile_text, style_reference="", include_structure=True):
+    """Keep language identity always-on while making plot methods conditional."""
+    text = str(profile_text or "").strip()
+    if not text:
+        return ""
+    text = re.sub(
+        r"(?ms)^【剧情组织人格】\s*.*?(?=^【[^\n】]+】\s*$|\Z)",
+        "",
+        text,
+    ).strip()
+    # Archive prose often uses broad frequency labels without measuring the
+    # whole sample. Keep the described technique and vocabulary, but remove
+    # wording that the writing model can misread as a per-chapter quota.
+    for source, replacement in (
+        ("你大量把", "你只在需要重音时把"),
+        ("你大量使用", "你会按场景使用"),
+        ("你高频让", "你会在场景需要时让"),
+        ("你高频使用", "你会按场景使用"),
+        ("你高频用", "你会按场景用"),
+        ("高频使用", "可使用"),
+        ("规则和解释高频", "规则和解释中可"),
+        ("对白总体偏短、偏口语", "对白允许短句和口语"),
+        ("对白整体偏短、偏口语", "对白允许短句和口语"),
+    ):
+        text = text.replace(source, replacement)
+    if not include_structure:
+        text = _remove_style_layout_metrics(text)
+    reference_structure = _style_text_structure(style_reference)
+    distribution = ""
+    if include_structure and reference_structure["chars"] >= 500:
+        distribution = (
+            f"当前完整样本实际分布：每1000字约"
+            f"{reference_structure['paragraphs_per_1000']:.1f}个非空段，"
+            f"15字以内短段约占{reference_structure['short_paragraph_pct']:.0f}%，"
+            f"对白字数约占{reference_structure['dialogue_char_pct']:.0f}%，"
+            f"每1000字约{reference_structure['dialogue_turns_per_1000']:.1f}轮对白。"
+        )
+    if include_structure:
+        boundary = (
+            "【运行时文风边界｜高于档案中的宽泛习惯】\n"
+            + distribution
+            + "档案中的‘大量、高频、常用、经常、偏短、偏多’只说明这种写法出现时的形态或相对辨识度，"
+            "不能决定它在单章出现多少；频率、段落结构和对白总量一律以完整样本实际分布为准。"
+            "每章常驻的只有作者惯用词、句法松紧、动作与反应词、说话标签、对白长短与停顿、称呼语气和人物接话方式。"
+            "推理链、反复验证、群体同步反应、误读布局、喜剧反差、危机升级、专业排除和等待揭露都属于条件性剧情手法，"
+            "只有当前提纲确实需要且符合片段卡适用边界时才能调用；不得为了证明文风相似而增加对应场面。"
+            "档案中‘你习惯、常用、会用、高频’等表述不构成每章配额。日常口语指人物自然的词序、称呼、语气词和停顿，"
+            "不等于每章必须讲笑话；严肃、危险或情绪落点允许全章没有喜剧。"
+            "剧情准确、人物自然反应和当前场景适配高于任何单项写法手法。"
+        )
+    else:
+        boundary = (
+            "【运行时文风边界｜段落排版指标已删除】\n"
+            "正文生成阶段只接收作者惯用词、句法松紧、动作与反应词、说话标签、称呼语气、人物接话方式和场景适配边界。"
+            "档案中的‘大量、高频、常用、经常、偏短、偏多’只说明这种写法出现时的形态或相对辨识度，"
+            "不能决定它在单章出现多少，也不能把全章写成统一节拍。"
+            "推理链、反复验证、群体同步反应、误读布局、喜剧反差、危机升级、专业排除和等待揭露都属于条件性剧情手法，"
+            "只有当前提纲确实需要且符合片段卡适用边界时才能调用；不得为了证明文风相似而增加对应场面。"
+            "日常口语指人物自然的词序、称呼、语气词和停顿，不等于每章必须讲笑话；严肃、危险或情绪落点允许全章没有喜剧。"
+            "剧情准确、人物自然反应和当前场景适配高于任何单项写法手法。"
+        )
+    return "\n\n".join(part for part in (boundary, text) if part)
+
+
 def _append_ai_style_profile_to_context(context, profile_text, limit=NOVEL_AI_CONTEXT_LIMIT):
     original = str(context or "").strip()
     profile = str(profile_text or "").strip()
@@ -5265,14 +8500,14 @@ def _append_ai_style_profile_to_context(context, profile_text, limit=NOVEL_AI_CO
 def _style_execution_beat_range(context):
     target = _style_output_target_from_context(context)
     if target <= 0:
-        return 6, 12
+        return 5, 9
     if target <= 2500:
-        return 6, 10
+        return 4, 7
     if target <= 5000:
-        return 8, 14
+        return 6, 10
     if target <= 10000:
-        return 10, 18
-    return 12, 24
+        return 8, 14
+    return 10, 18
 
 
 def _style_execution_structure_contract(style_reference, context):
@@ -5285,16 +8520,25 @@ def _style_execution_structure_contract(style_reference, context):
     dialogue_pct = float(structure["dialogue_char_pct"] or 0)
     median = max(1, int(structure["paragraph_median"] or 1))
     target = _style_output_target_from_context(context)
+    bands = _style_centered_structure_bands(structure, target)
     noun_short_limit = max(2, round(max(2000, target or 2000) / 1000))
     lines = [
-        "以下数字来自完整样本，必须原样写进声纹表并作为终稿硬范围，不得自行四舍五入成‘约四成’等宽泛要求：",
-        f"- 每1000字非空段落控制在{density * 0.90:.1f}-{density * 1.10:.1f}段；段落长度中位数控制在{max(1, median - 3)}-{median + 3}字。",
-        f"- 15字以内短段占比控制在{max(0, short_pct - 4):.0f}%-{min(100, short_pct + 4):.0f}%。",
-        f"- 非对白35字以内单句短段占比控制在{max(0, single_short_pct - 5):.0f}%-{min(100, single_short_pct + 5):.0f}%。",
-        f"- 对白字数占比控制在{max(0, dialogue_pct - 5):.0f}%-{min(100, dialogue_pct + 5):.0f}%；超出上限时把普通汇报、清单和解释并回叙述，不删除剧情。",
+        "以下数字来自完整样本，是防止多项同时向短碎方向漂移的中心区间，不是逐项配额；低于下限时不得补对白、笑点、动作或拆段：",
+        f"- 每1000字非空段落中心区间为{bands['density_low']:.1f}-{bands['density_high']:.1f}段；段落长度中位数可参考{max(1, median - 8)}-{median + 8}字。",
+        f"- 15字以内短段占比中心区间为{bands['short_pct_low']:.0f}%-{bands['short_pct_high']:.0f}%。",
+        f"- 非对白35字以内单句短段占比可参考{max(0, single_short_pct - 15):.0f}%-{min(100, single_short_pct + 15):.0f}%。",
+        f"- 对白字数占比中心区间为{bands['dialogue_pct_low']:.0f}%-{bands['dialogue_pct_high']:.0f}%；人物没必要开口时直接用叙述，不为比例制造问答。",
+        (
+            f"- 按本章篇幅，对白约{bands['dialogue_turn_low']}-{bands['dialogue_turn_high']}轮，"
+            f"其中15字以内短对白约{bands['short_dialogue_turn_low']}-{bands['short_dialogue_turn_high']}轮；"
+            "下限只供观察，绝不能为了数量增加台词。"
+            if target and bands["dialogue_turn_high"] else
+            "- 对白轮数和短对白轮数按完整样本密度控制；不为数量增加台词。"
+        ),
         f"- 普通对象名、操作名、阴性结果不得独立成段；约本章篇幅最多保留{noun_short_limit}个非对白名词独段，只留给真正改变认知的首次命名。",
-        "- 交付前逐段扫描：连续3个及以上非对白35字以下段落必须合并到只剩1至2段；章首人物状态、普通转场、操作过程和中间结果不能作为例外。",
+        "- 连续3个及以上普通非对白短段应合并；真正的转折、对白、打断和样本式强调不为统计强行合并。",
         "- 同一人物相邻的两句短对白若每句都不超过15字，必须合成一个对白段，或用承担反应/操作的动作标签连接；只有结巴、打断、裁决和样本明确的命令递进可以分开。",
+        "- 段落密度、短段、对白占比、对白轮数、短对白轮数中有两项以上同时超过中心区间时，必须整体减少无效换行和功能性问答。",
     ]
     return "\n".join(lines)
 
@@ -5305,12 +8549,425 @@ def _style_repetition_boundary_text():
         "删除没有新增动作、信息、决定、后果或情绪转折的同义复述。"
         "同一事实、规则、因果或证据边界原则上只完整说明一次；前文已经说明后，只有出现新证据、新决定或新后果时才能再次提及，"
         "并应直接写新增部分，不重新讲完整背景。"
+        "每个核心结论必须指定一个信息所有者和一次完整揭示：由最合适的人物、行动结果或旁白其中之一承担，其他人物只能给出"
+        "会推动下一步的质疑、反应、决定或后果，不能换一种说法复述；人物已经说清后，旁白不得再补‘真正危险在于’、"
+        "‘这意味着’、‘不是A而是B’之类总结，旁白已经交代后也不得安排角色复述给读者。"
+        "依赖检测、调查、拆封、来电或人物揭晓才能确认的答案，在结果出现前只能写可观察异常和立即行动，不能提前把完整因果说完，"
+        "再让结果或专业人物重复认证。专业结论出现时，把发现与必要后果合并为一次自然表达，下一段立即进入人物决定、冲突或新结果。"
+        "采购、核验、经手、审批、保管、运输等路径若不是本章核心冲突，必须压成一段人物化叙述或一句结果；"
+        "不得用连续短问短答把流程逐项盘完，也不得在叙述列举后再让人物逐项复问。"
+        "章节提纲只提供当前剧情方向，不是专业信息补全任务；提纲只概括为部分资金、相关主体、一次确认或一轮回应时，"
+        "不得为了显得专业而自行补出多组精确金额、持股比例、文件名、时间戳、合同数量、界面字段或完整机构流程。"
+        "只有会直接改变人物选择、关系、代价或章末结果的一项代表性细节可以具体落地，其余直接写结果。"
+        "目标篇幅仍有余量时，优先展开人物取舍、关系后果、情绪共鸣和场景中的具体生活痕迹，不能追加查账、举证、核验或处置步骤补字数。"
         "状态快照、人物卡、设定、伏笔和关键事实是静默连续性约束，不是需要角色用对白或旁白逐条证明已经记住的正文任务。"
         "同一人物连续出现多个同义反应时只保留最有力度且会影响下一步行动的一个；多人反应相同时用一个代表性反应或群体结果承接。"
-        "章节开篇不得再次完整演示上一章已经完成的结论、动作或情绪；只从上一章章末未完成状态继续，"
-        "除非本章出现新的证据、决定或后果。普通说明不得连续拆成大量只有一句话的短段；"
+        "上一章结尾原文是已经向读者发布的边界，不是本章可以复用的起笔素材；章节开篇不得原样或同义重写上一章的末句、"
+        "对白、声音、动作落点、结论或情绪。上一章以对白结束时，从听者的新反应或新回答开始；以动作结束时，从动作造成的"
+        "新结果或新阻力开始；以声音结束时，从声源揭示或人物听见后的新反应开始。只从上一章章末未完成状态继续，"
+        "并让第一段出现新动作、新信息、新决定、新后果或必要情绪转折。普通说明不得连续拆成大量只有一句话的短段；"
         "短段只在样本对应的强调、对白、转折或节奏落点上使用。"
+        "跨越半日以上、跨城或跨线路以后，同一人物再次出场时，必须用一句简洁的时间、地点或行程过渡交代其位置变化；"
+        "不能让人物从上一场景直接无说明地出现在另一座城或另一条线路。"
         "以上边界高于文风画像中对‘真实重复’或‘解释充分’的宽泛描述，但不得删除样本真实存在的强调节奏和有意回环。"
+    )
+
+
+def _style_cjk_ngrams(value, min_length=3, max_length=8):
+    text = _compact_text(value)
+    result = set()
+    low = max(2, int(min_length or 3))
+    high = max(low, int(max_length or 8))
+    for run in re.findall(r"[\u3400-\u9fff]+", text):
+        if len(run) < low:
+            continue
+        for size in range(low, min(high, len(run)) + 1):
+            for start in range(0, len(run) - size + 1):
+                result.add(run[start:start + size])
+    return result
+
+
+def _style_profile_extracted_phrases(profile_text, style_reference):
+    profile = str(profile_text or "")
+    reference_compact = _compact_text(style_reference)
+    evidence_marker = "【证据化作者写作档案】"
+    if evidence_marker in profile:
+        persona = profile.split(evidence_marker, 1)[0].strip()
+        if len(_compact_text(persona)) >= 80:
+            profile = persona
+    voice_marker = "【叙述习惯词与句法声纹】"
+    if voice_marker in profile:
+        profile = profile.split(voice_marker, 1)[1]
+    meta_phrases = {
+        "人物", "对象", "动作", "状态", "判断", "变化", "反应", "场景",
+        "信息", "身份", "地点", "目标", "任务", "完成", "猜出", "成为",
+        "我们", "就在", "之际",
+    }
+    phrases = []
+    seen = set()
+    for raw in re.findall(r'[“「『"]([^”」』"\n]{1,240})[”」』"]', profile):
+        list_like = bool(re.search(r"[／/、，,；;＋+…]", raw))
+        if list_like:
+            candidates = []
+            for part in re.split(r"[／/、，,；;]", raw):
+                part = re.split(r"[＋+]", part, maxsplit=1)[0]
+                candidates.extend(re.findall(r"[\u3400-\u9fff]+", part))
+        else:
+            candidates = [_compact_text(raw).strip("。！？!?：:；;，,、…—- ")]
+        for phrase in candidates:
+            phrase = _compact_text(phrase)
+            if (
+                2 <= len(phrase) <= 8
+                and re.fullmatch(r"[\u3400-\u9fff]+", phrase)
+                and phrase in reference_compact
+                and phrase not in meta_phrases
+                and phrase not in seen
+            ):
+                seen.add(phrase)
+                phrases.append(phrase)
+    return phrases
+
+
+def _style_native_vocabulary_text(
+    profile_text,
+    style_reference,
+    limit=120,
+    output_target=0,
+):
+    phrases = _style_profile_extracted_phrases(profile_text, style_reference)
+    phrases = phrases[:max(1, int(limit or 120))]
+    if not phrases:
+        return ""
+    reference = _compact_text(style_reference)
+    reference_chars = max(1, len(reference))
+    target_chars = max(0, int(output_target or 0))
+    tiers = {"high": [], "medium": [], "low": []}
+    for phrase in phrases:
+        count = reference.count(phrase)
+        rate_per_10000 = count * 10000 / reference_chars
+        item = f"{phrase}×{count}"
+        if target_chars:
+            expected = count * target_chars / reference_chars
+            soft_upper = min(count, max(1, int(math.ceil(expected + 0.5))))
+            item += f"（约{target_chars}字单章通常0-{soft_upper}次）"
+        if count >= 2 and rate_per_10000 >= 3:
+            tiers["high"].append(item)
+        elif count >= 2 and rate_per_10000 >= 1:
+            tiers["medium"].append(item)
+        else:
+            tiers["low"].append(item)
+    rows = []
+    for label, key in (
+        ("高复现原词", "high"),
+        ("中复现原词", "medium"),
+        ("低频场景词", "low"),
+    ):
+        items = tiers[key]
+        if not items:
+            continue
+        rows.append(label + "：" + "、".join(items))
+    return (
+        f"以下{len(phrases)}项均由约{reference_chars}字当前文风样本实际提取，词后×N是它在完整样本中的实际出现次数。"
+        "次数只用于还原相对密度，不是每章配额；不能因为档案把一组词概括为高频，就把组内每个词都当成高频。"
+        "高复现原词可在语义适用时稳定沿用，中复现原词按场景选择，低频场景词只在语义、人物和情绪真正吻合时使用，"
+        "不能把低频词变成每章固定口头禅、转折标签或人物反应。任何一项的正文密度都不得明显高于完整样本。"
+        "这些词都是可主动使用的作者原生口语、习惯词和惯用短语。"
+        "正文遇到语义相同或接近的模型默认表达时，优先保留这些原词，不为追求词汇变化改成更工整、书面或常见的AI措辞。"
+        "现代口语和网络词不因故事时代背景自动书面化；可用于具有现代认知人物的对白、心理和贴近其视角的叙述。"
+        "每章按人物、语义和情绪自然选用，不设最低数量、不轮换打卡，也不为使用某个词新增对白、笑点或剧情。"
+        + (
+            "括号内是按本章目标篇幅换算的软密度上沿，不是禁词或硬配额；真正必要的修辞回环允许自然多一次，"
+            "但不得让同一个低频词、动作标签或判断短语在一章内反复承担相同功能。"
+            if target_chars else ""
+        )
+        + "含样本人物名或专有称呼的短语只能借用句式结构，必须替换为当前小说人物，严禁带入样本人物和事件。\n"
+        + "\n".join(rows)
+    )
+
+
+def _style_recent_vocabulary_usage_text(
+    project,
+    chapter_index,
+    profile_text,
+    style_reference,
+    window=3,
+    limit=12,
+):
+    project = project if isinstance(project, dict) else {}
+    chapters = project.get("chapters", [])
+    chapters = chapters if isinstance(chapters, list) else []
+    try:
+        current_index = max(0, int(chapter_index or 0))
+    except Exception:
+        current_index = 0
+    phrases = _style_profile_extracted_phrases(profile_text, style_reference)
+    if not phrases or current_index <= 0:
+        return ""
+
+    recent = []
+    for index in range(min(current_index, len(chapters)) - 1, -1, -1):
+        chapter = chapters[index] if isinstance(chapters[index], dict) else {}
+        body = str(chapter.get("text", "") or "").strip()
+        if not body:
+            continue
+        recent.append((index, _compact_text(body)))
+        if len(recent) >= max(1, int(window or 3)):
+            break
+    recent.reverse()
+    if not recent:
+        return ""
+
+    reference = _compact_text(style_reference)
+    reference_chars = max(1, len(reference))
+    recent_chars = max(1, sum(len(body) for _, body in recent))
+    rows = []
+    for phrase in phrases:
+        sample_count = reference.count(phrase)
+        chapter_counts = [body.count(phrase) for _, body in recent]
+        recent_count = sum(chapter_counts)
+        if sample_count <= 0 or recent_count <= 0:
+            continue
+        density_ratio = recent_count * reference_chars / (sample_count * recent_chars)
+        detail = "、".join(
+            f"第{index + 1}章{count}次"
+            for (index, _), count in zip(recent, chapter_counts)
+            if count
+        )
+        rows.append((
+            density_ratio,
+            recent_count,
+            phrase,
+            f"{phrase}：完整样本{sample_count}次/{reference_chars}字；"
+            f"最近{len(recent)}章{recent_count}次/{recent_chars}字（{detail}），"
+            f"单位字数密度约为样本的{density_ratio:.1f}倍",
+        ))
+    if not rows:
+        return ""
+    rows.sort(key=lambda item: (-item[0], -item[1], item[2]))
+    selected = rows[:max(1, int(limit or 12))]
+    start = recent[0][0] + 1
+    end = recent[-1][0] + 1
+    return (
+        f"以下是已完成第{start}-{end}章对作者原生用词的实际使用统计，只用于校准近期累计密度。"
+        "它不是禁词表，不设置单词使用上限、连续章节限制、冷却、轮换或最低使用数量。"
+        "任何词在人物、语义和情绪最贴切时仍可自然使用；若某词近期密度明显高于完整样本，"
+        "只在存在同样自然的作者原词或普通表达时优先减少重复，不能机械替换，也不能为降密度改坏人物口吻。"
+        "未列出的词只是最近这些章节没有出现，不代表必须补用。\n"
+        + "\n".join(item[3] for item in selected)
+    )
+
+
+def _mandatory_style_voice_contract(style_cards=None):
+    return (
+        "【常驻人物语言声纹｜每章静默执行】\n"
+        "常驻的是实际说话人物各自的对白长短、停顿、省略、称呼、语气词、接话方式和动作标签，不是固定剧情场面。"
+        "人物开口时必须保持彼此可区分，不得统一写成准确、克制、完整的标准工作句；人物没有必要开口时，不得为了展示声纹新增对白。"
+        "日常口语指符合身份的自然词序、称呼、语气和不完整句，不等于必须出现笑话、误读或俏皮话。"
+        "质疑、拒绝、反驳、群体反应和喜剧反差只有当前提纲本来存在相应冲突且场景适用时才写，不设次数、不要求两轮接话，也不单独制造反应来验收。"
+        "功能型原文片段卡全部按适用与禁用边界选择；没有真正匹配的卡时不选。"
+    )
+
+
+def _ensure_mandatory_style_voice_plan(style_plan):
+    plan = str(style_plan or "").strip()
+    if not plan or "常驻人物语言声纹" in plan:
+        return plan
+    return plan + "\n\n" + _mandatory_style_voice_contract()
+
+
+def _build_legacy_style_execution_context(
+    original_context,
+    profile_text="",
+    style_cards=None,
+    style_reference="",
+    project=None,
+    chapter_index=0,
+    limit=NOVEL_AI_CONTEXT_LIMIT,
+    vocabulary_profile_text="",
+):
+    original = _append_ai_style_profile_to_context(
+        original_context,
+        _style_runtime_profile(profile_text, style_reference, include_structure=False),
+        limit=limit,
+    )
+    beat_low, beat_high = _style_execution_beat_range(original)
+    output_target = _style_output_target_from_context(original)
+    optional_card_high = 1
+    mandatory_voice_contract = _mandatory_style_voice_contract(style_cards)
+    narrative_mode_contract = _style_narrative_mode_contract(output_target)
+    short_noun_limit = max(2, round(max(2000, output_target or 2000) / 1000))
+    cards_text = _format_style_cards(style_cards, limit=6500)
+    structure_contract = _style_execution_structure_contract(style_reference, original)
+    native_vocabulary = _style_native_vocabulary_text(
+        vocabulary_profile_text or profile_text,
+        style_reference,
+        output_target=output_target,
+    )
+    recent_vocabulary = _style_recent_vocabulary_usage_text(
+        project,
+        chapter_index,
+        vocabulary_profile_text or profile_text,
+        style_reference,
+    )
+    instruction = (
+        "【剧情执行稿任务】\n"
+        "本次先完成剧情执行，不交付最终正文。必须严格执行当前章节提纲、前文连续性、人物与设定边界和结尾要求。"
+        "先把人物任务、主线任务、本章目标、必须发生、冲突转折和结尾钩子中指向同一件事的内容合并，"
+        "不要因为它们使用了不同字段名就拆成多个事件。‘必须发生’优先保留，其他字段只补足动机、阻力、结果和边界。"
+        "‘必须发生’及本章目标中用顿号、‘和’、‘并’、‘后’串联的每个观察、动作、发现和结果都属于硬情节成分；"
+        "可以合并到同一个拍点，但不得因合并同义任务而漏掉其中任何一项，也不得用最终结论代替前置观察或触发动作。"
+        f"再把本章整理成{beat_low}-{beat_high}条按发生顺序排列的唯一剧情拍点；"
+        "每条必须带来新动作、新信息、新决定、新后果或必要的情绪转折，不能把同一场对话、同一规则或同一反应拆成多条。"
+        "拍点代表一次场景转折，不代表一条线索、一个核验步骤或一轮问答；同一场景里的触发、阻力、人物回应、"
+        "必要验证和结果必须尽量合并在同一拍点内。证据链中的多个观察可以作为同一转折的内部细节，"
+        "不得为了逐项验收把它们拆成教程式步骤。"
+        "如上下文存在上一章已发布结尾，拍点1必须以‘章首新增变量：’开头，明确写出本章第一个新反应、新结果、新阻力或新信息；"
+        "上一章的末句、触发声、动作落点或同义复述不能算本章拍点。没有上一章已发布正文时，按正常拍点格式执行。"
+        "拍点写清场景、关键行动、对白真正新增的信息、关键变化以及结尾承接，"
+        "清单应足够支持下一次调用无需阅读备用草稿措辞也能从零写作，但不要写成逐句分镜。"
+        "连续性资料只作为事实参考，不得为了证明严谨而改写成对白、说明或新增核验流程。"
+        "已有资料没有确认的内容继续保持未确认，能力、伤势、关系和持有状态没有在本章改变时保持原状；"
+        "不能因为需要制造冲突或解释就把推测写成结论。"
+            "如果当前提纲与既有事实冲突，必须保留既有事实；只有当前正文明确完成改变时才能更新，不能静默覆盖。"
+        "整理拍点前必须静默核对提纲内部逻辑：同一人物不能同时处于已故、昏迷、清醒拒绝或异地出场等互斥状态；"
+        "时间词、年份、先后顺序和因果必须能连成唯一过程；代词若可能指向两个人，拍点中直接使用姓名。"
+        "还必须单独对照前文已经成立的期限、倒计时、预约、承诺和本章计划：凡出现‘N日内、N日后、截至、开门、交付、"
+        "售完、再谈’等时间约束，必须确认本章安排为履约保留了真实可执行的时间；例如前文要求N日内完成，本章不能到N日后才开始执行。"
+        "两者冲突时以已发布正文中的承诺为准，对当前提纲的时间安排做最小调整，不能把冲突原样写进正文。"
+        "提纲自身出现互斥描述时，以已发布正文、当前状态和更具体的已确认事实为准；"
+        "不得为了兼顾两种说法把互斥结果同时写进正文，冲突留给后续逻辑验收与局部修复处理。"
+        + _style_repetition_boundary_text()
+        + "在剧情执行清单之后生成《本章声纹执行表》。这不是通用建议，而是第二次终稿调用必须逐项执行的写法合同。"
+        + narrative_mode_contract
+        + mandatory_voice_contract
+        + (
+            "《本章声纹执行表》的主导语言节奏项还要从【作者原生用词池】中挑出本章语义真正适用的词，"
+            "供备用正文和终稿优先替换模型默认同义表达；必须服从词池标注的完整样本实际次数和复现层级，"
+            "低频场景词不能选作每章固定反应或转折标签；只列自然可用项，不规定出现次数。"
+            if native_vocabulary else ""
+        )
+        + "文风合同只控制表达，不得把连续性资料改写成正文里的合规说明；证据、权限和未知状态只在它们确实改变人物行动或判断时自然出现，"
+        "不得为每个判断都补一遍‘目前只能确认、不能说明、仍待核对’。"
+        "声纹表开头必须严格写‘主叙事模式：六种模式之一’，再用一句话说明本章靠什么吸引读者。"
+        f"如果提供了功能型原文片段卡，只能按本章实际场景选择0至{optional_card_high}张，只填写真实卡号SCxx。"
+        "选择前必须同时核对卡片的适用和禁用边界；任何禁用条件命中时都不得选择，即使卡片语言很像样本。"
+        "片段卡是条件性写法证据，不是每章覆盖清单；没有真正匹配的卡时写‘无’，不能为了证明文风而凑卡。"
+        "每张卡只能绑定一个明确剧情拍点或一段连续小场景，必须写明使用起点、停止位置和只模仿哪种机制，不得作为全章统一模板。"
+        "‘推理与解释’和‘专业角色对白’只有在主叙事模式明确为‘调查推理’，且推理本身就是本章核心推进时才能选择；"
+        "医院、公司、警察、检测、合同或专业人物只是场景道具，不构成选择理由。‘权威角色命令’只有命令本身就是冲突或危机拍点时才能选择。"
+        "‘群体反应’只适用于公开冲突或喜剧误读；‘日常口语与喜剧’只有场景本来允许轻松错位时才能选择，严肃举证、救命决定和情绪重击中不得强塞。"
+        "声纹执行表只包含五项：一、选定片段卡及作用范围，严格写成‘卡号｜作用拍点或场景｜模仿机制｜停止位置’，无则写‘无’；"
+        "二、主导语言节奏，只选1至2种真正适用的句法、动作反应或说话标签，说明适用场景；它们不是待覆盖词表，"
+        "不得为了证明执行而各用一次，也不得指定必须出现的唯一位置；"
+        "非调查推理模式不得预设连续思路段，确实需要判断时最多安排一段且不超过两句；"
+        "调查推理模式最多安排两段集中判断，结论必须立刻改变动作、选择或风险。"
+        f"三、段落节奏，把上方样本结构数字作为防止严重漂移的软参考；普通说明怎样合并，约本章篇幅最多保留{short_noun_limit}个非对白名词独段，"
+        "非对白单句短段不得连续超过2段。专业过程只保留会改变剧情结果的一步，其他步骤合并成结果句；"
+        "不能把每条信息都扩写成‘观察—理解—操作’的固定三段式，也不得为了命中比例新增对白、短段或笑点。"
+        "四、本章核心声纹人物只列1至2人，写‘人物｜句长与停顿｜称呼/语气｜接话方式｜应避免的标准工作句’；"
+        "其他人物静默继承人物卡，不逐人列满、不生成示例台词、不要求每个出场人物开口；"
+        "五、章末具体落点与本章最需要避免的一种模型腔。必须指定最后一个可见、可听或可执行的具体事件；"
+        "如果多路报告在章末连续接入，只先写一个打断现场的声音，再用人物接线、窗口增加或操作被迫改变承接其余报告；"
+        "禁止显式使用‘第一路、第二路、第三路、第四路’或结构完全相同的逐条播报制造机械升级。"
+        "最后1至3段就停在这个具体落点，禁止再追加‘某阶段开始了’‘事情没有结束’‘真正的危机才刚刚开始’等抽象宣告，"
+        "也禁止用‘不是失败/但还不够/倒计时开始’式对称三段总结；若提纲要求阶段升级，必须用实际命令、异常或后果呈现。"
+        "全表控制在300至600字，只保留会真正改变本章读感的少量规则，不写第二份剧情说明书。"
+        + "随后生成一份完整备用正文草稿，供终稿调用失败时兜底。备用草稿只展开唯一剧情拍点，静默遵守边界，"
+        "不得用重复解释、重复反应、往返确认或同义对白补足篇幅。备用正文必须先按【本章写作长度】控制在目标的85%-115%，"
+        "并在交付前只检查是否严重偏离完整样本的段落与对白形态；不能为了命中数字新增短段、对白、冲突或喜剧。"
+        "严格只输出以下三个分区，不输出其他标题、分析、状态JSON或Markdown代码块：\n"
+        f"【剧情执行清单】\n{beat_low}-{beat_high}条唯一剧情拍点\n\n"
+        "【本章声纹执行表】\n主叙事模式、0至1张条件性片段卡、1至2种主导语言节奏、段落中心区间、1至2名核心声纹人物、具体章末落点\n\n"
+        "【备用正文草稿】\n完整正文草稿"
+    )
+    # The planning stage now carries pacing, payoff and emotional architecture.
+    # Keep the prose stage focused on story facts and author voice instead of
+    # re-planning the chapter through a large set of numeric style contracts.
+    instruction = (
+        "【剧情执行稿任务】\n"
+        "本次先整理剧情执行稿并生成备用正文，不交付最终稿。合并提纲里指向同一事件的字段，按自然场景转折列出唯一剧情拍点；"
+        "每个拍点必须产生新动作、新信息、新决定、新后果或必要情绪变化，但不要把观察、验证、问答和结论拆成教程步骤。"
+        "项目中的连续性事实只用于防止写错，不是额外剧情拍点；"
+        "即使同一事实在不同资料中重复出现，也只在剧情真正需要时自然落实一次。"
+        "当前状态快照、下一章记忆选择和未决任务只用于防止连续性错误，不是本章待办清单；"
+        "只有当前章节提纲明确安排执行时才能把其中事项写成剧情，否则保持未决，不得占用剧情拍点、对白或正文篇幅。"
+        "提纲只概括为部分资金、相关主体、一次确认或一轮回应时，不得为了显得专业而自行补出多组精确金额、"
+        "持股比例、文件名、时间戳、合同数量、界面字段或完整机构流程。只有直接改变人物选择、关系、代价或章末结果的一项代表性细节可以具体落地。"
+        "篇幅仍有余量时优先展开人物取舍、关系后果、情绪共鸣和生活痕迹，不追加查账、举证、核验或处置步骤补字数。"
+        "章首从上一章触发后的新反应、新结果或新阻力开始，不复播上一章末句；章末落在具体动作、对白、信息或后果，不追加抽象总结。"
+        "随后给出简短的本章声纹执行表：只写1至2名核心人物的口吻、样本中本章自然适用的习惯用词/口语、叙述与对白衔接方式、章末落点。"
+        "人物对白、冲突声纹、日常口语与喜剧习惯常驻执行；不要求凑词频，不设置段落、短句或对白数量配额，不选择主叙事模式，不强制套片段卡。"
+        "作者画像中‘大量、经常、偏短、偏多’等定性描述只表示相对倾向，不能被放大成整章统一节拍；"
+        "完整样本的自然读感优先；如果正文出现无效碎片、功能性问答堆叠或统一节拍，必须主动合并。"
+        "同一事实的证明边界只完整交代一次；后续角色或专业人员只给新增结果、决定或阻力，不能换一种说法再次解释。"
+        "本章主线不是调查推理时，关于‘能证明什么/不能证明什么’、隐私规则或查询范围最多完整出现一处；机构人物只承担一个改变结果的动作，不能形成流程辩论。"
+        "备用正文必须完整执行剧情拍点，正文写法以作者样本为最高标准；避免重复解释、同义对白、流程复述和替人物讲道理。"
+        "严格只输出以下三个分区，不输出其他标题、分析、状态JSON或Markdown代码块：\n"
+        "【剧情执行清单】\n按发生顺序列出自然数量的唯一剧情拍点\n\n"
+        "【本章声纹执行表】\n核心人物口吻、自然适用的原生词与说话方式、叙述衔接和具体章末落点\n\n"
+        "【备用正文草稿】\n完整正文草稿"
+    )
+    structure_block = f"【完整样本结构软参考｜只防严重漂移】\n{structure_contract}" if structure_contract else ""
+    vocabulary_block = f"【作者原生用词池｜优先替换AI默认措辞】\n{native_vocabulary}" if native_vocabulary else ""
+    recent_vocabulary_block = (
+        f"【最近章节原生用词密度｜只作软校准】\n{recent_vocabulary}"
+        if recent_vocabulary else ""
+    )
+    cards_block = f"【功能型原文片段库｜只选择写法功能，不复制剧情】\n{cards_text}" if cards_text else ""
+    # The base chapter context already carries the sample-derived style
+    # fingerprint. Repeating its numeric structure bands and the entire card
+    # library here made the prose stage behave like a checklist again.
+    budget = max(
+        0,
+        int(limit or NOVEL_AI_CONTEXT_LIMIT) - len(instruction)
+        - len(vocabulary_block) - len(recent_vocabulary_block) - 10,
+    )
+    if len(original) > budget:
+        original = _clip_context_text(original, budget, keep_tail=False, preserve_lines=True)
+    return "\n\n".join(
+        part for part in (
+            original,
+            vocabulary_block,
+            recent_vocabulary_block,
+            instruction,
+        ) if part
+    )[:int(limit or NOVEL_AI_CONTEXT_LIMIT)]
+
+
+def _natural_expression_guidance():
+    """Keep prose grounded in the scene instead of abstract verdicts."""
+    return (
+        "人物、外貌、情绪、关系、物件或场面，不要用生硬或抽象的判断语句直接下结论。"
+        "需要让读者感到好看、难过、尴尬、紧张或某件东西显眼时，"
+        "优先从当前场景写出可见、可听、可感的线索：动作、停顿、目光、语气、感官、选择、他人看见或听见后的"
+        "心理和行为变化，以及这些变化带来的后果。"
+        "不要写“他很难过”，可以让他用袖子擦眼睛、话停在半句或避开某个名字；不要写“她很漂亮”，可以写旁人看见她时"
+        "视线、判断和动作如何改变。"
+        "描写要服从当前人物、关系和现场，不把这些例子当固定动作模板。幽默、吐槽、夸张和比喻可以自由使用；"
+        "根据当前人物、关系和现场自由选择描写落点。"
+    )
+
+
+def _build_full_style_imitation_guidance(style_reference):
+    """Describe how to imitate a complete sample without turning it into a rule sheet."""
+    reference = str(style_reference or "").strip()
+    if not reference:
+        return ""
+    sample_chars = len(_compact_text(reference))
+    return (
+        f"这份样本保留了约{sample_chars}字完整原文。当前项目资料是本章故事事实：已经确定的人名、时间、地点、关系、"
+        "物件、编号、人物状态和已发生事件，随着当前章节继续延展。\n"
+        "把完整样本当作同一位作者正在写另一部作品的连续正文来阅读。顺着全文感受旁白怎样落句，人物怎样接话，"
+        "动作和心理怎样互相接住，口语怎样嵌进人物当下的情绪，场景细节怎样带出人物的选择，以及一个场景怎样自然转入下一个场景。\n"
+        "写当前章节时，让样本中的人物功能映射成当前小说的人物，让样本中的场景和事件映射成当前小说的场景和事件。"
+        "以全文反复出现的语言习惯和每一处细微变化为依据，吸收其中的常用说法、句法松紧、叙述视角、对白间隙、"
+        "情绪递进、信息露出、反应落点和章节收束。\n"
+        "留意同一种情绪在样本中会随着人物关系和现场温度改变落点：有时落在一句接话，有时落在一个动作、一个物件，"
+        "有时由带着停顿的旁白慢慢显出。把这种自然变化带进当前正文，让每一章保留作者的熟悉感，也保留当前人物独有的反应与节奏。\n"
+        "轻松、尴尬、紧张、难过、关系拉扯和情节推进都可以从完整样本里寻找相应的写法，让当前人物按照自己的身份、"
+        "关系与处境自然说话、行动和感受。样本的特色词、口头习惯、停顿方式和叙述温度随着人物和场景自然出现，"
+        "形成一篇属于当前故事、同时读起来像同一位作者写出的正文。\n"
+        + _natural_expression_guidance()
     )
 
 
@@ -5319,87 +8976,53 @@ def _build_style_execution_context(
     profile_text="",
     style_cards=None,
     style_reference="",
+    project=None,
+    chapter_index=0,
     limit=NOVEL_AI_CONTEXT_LIMIT,
+    vocabulary_profile_text="",
+    semantic_archive=None,
 ):
-    original = _append_ai_style_profile_to_context(original_context, profile_text, limit=limit)
-    beat_low, beat_high = _style_execution_beat_range(original)
-    output_target = _style_output_target_from_context(original)
-    if 0 < output_target <= 3000:
-        card_high = 1
-    elif 0 < output_target <= 7000:
-        card_high = 2
-    else:
-        card_high = 3
-    short_noun_limit = max(2, round(max(2000, output_target or 2000) / 1000))
-    cards_text = _format_style_cards(style_cards, limit=6500)
-    structure_contract = _style_execution_structure_contract(style_reference, original)
+    """Build the prose prompt from the full sample instead of a runtime rule pack."""
+    effective_limit = int(limit or NOVEL_AI_CONTEXT_LIMIT)
+    original = str(original_context or "").strip()
+    reference = str(style_reference or "").strip()
+    if reference:
+        style_markers = (
+            "【AI文风画像】",
+            "【风格锁定规则】",
+            "【仿写使用说明】",
+            "【正文风格参考】",
+            "【本章选中的原文片段卡",
+            "【作者原生用词池",
+            "【最近章节原生用词密度",
+            "【V4 人物与叙述声纹",
+            "【V4 条件性叙事技法",
+        )
+        # The draft task mentions these section names in prose. Only remove a
+        # real, line-leading context section, otherwise that prose can cut off
+        # the current chapter, facts, and rules before they reach the model.
+        marker_positions = [
+            match.start()
+            for marker in style_markers
+            for match in re.finditer(rf"(?m)^{re.escape(marker)}", original)
+        ]
+        if marker_positions:
+            original = original[:min(marker_positions)].rstrip()
+        original = "\n\n".join(part for part in (
+            original,
+            "【仿写使用说明】\n" + _build_full_style_imitation_guidance(reference),
+            "【正文风格参考】\n" + reference,
+        ) if part)
     instruction = (
-        "【剧情执行稿任务】\n"
-        "本次先完成剧情执行，不交付最终正文。必须严格执行当前章节提纲、前文连续性、人物与设定边界和结尾要求。"
-        "先把人物任务、主线任务、本章目标、必须发生、冲突转折和结尾钩子中指向同一件事的内容合并，"
-        "不要因为它们使用了不同字段名就拆成多个事件。‘必须发生’优先保留，其他字段只补足动机、阻力、结果和边界。"
-        f"再把本章整理成{beat_low}-{beat_high}条按发生顺序排列的唯一剧情拍点；"
-        "每条必须带来新动作、新信息、新决定、新后果或必要的情绪转折，不能把同一场对话、同一规则或同一反应拆成多条。"
-        "拍点写清场景、关键行动、对白真正新增的信息、因果、物件或证据变化以及结尾承接，"
-        "清单应足够支持下一次调用无需阅读备用草稿措辞也能从零写作，但不要写成逐句分镜。"
-        "在剧情拍点末尾单列‘静默继承边界’，集中记录伤势、能力、责任、证据和连续性限制；"
-        "这些边界只约束写作，不算剧情拍点，也不得为了证明遵守边界而改写成重复对白或说明。"
-        "执行稿必须单列四类硬约束：权限/责任边界、治疗或能力阈值、证据确定性（未知/推测/已证实）、"
-        "章首承接状态。没有正文或既有状态明确授权时，不得把权限写成已获得；"
-        "没有正文明确达到的条件时，不得把治疗、能力或判断写成已经完成；"
-        "‘疑似、可能、未核实、来源不明’不能在执行稿中静默改成确定事实。"
-        "如果当前提纲与既有事实冲突，必须保留既有事实并把冲突写入边界或拍点说明，"
-        "只有当前正文明确完成改变时才能更新，不能静默覆盖。"
-        + _style_repetition_boundary_text()
-        + "在剧情执行清单之后生成《本章声纹执行表》。这不是通用建议，而是第二次终稿调用必须逐项执行的写法合同。"
-        "文风合同只控制表达，不得把静默继承边界改写成正文里的合规说明；证据、权限和未知边界只在它们确实改变人物行动或判断时自然出现，"
-        "不得为每个判断都补一遍‘目前只能确认、不能说明、仍待核对’。"
-        f"如果提供了功能型原文片段卡，按本章实际场景选择0至{card_high}张，只填写真实卡号SCxx；默认只选1张，宁可少选，不得凑数。"
-        "片段卡是纠正模型默认腔的原文证据，不是场景覆盖清单；优先选择最能改变本章默认写法的卡，"
-        "不能因为本章有专业说明或权威命令就机械选择专业/权威卡。若模型本来就容易把该场景写成标准流程或完整命令，"
-        "应优先考虑同样适用、但能补足具体感知、异常显形、口语反应或收束节拍的卡。"
-        "每张卡只能绑定一个明确剧情拍点或一段连续小场景，必须写明使用起点、停止位置和只模仿哪种机制，不得作为全章统一模板。"
-        "同一功能维度最多选1张；‘专业角色对白’和‘权威角色命令’同属对白维度，必须二选一。"
-        "若选择3张，必须分别来自叙述/场景、对白、收束/格式三个维度；没有匹配卡时写‘无’，不得编造卡号，"
-        "也不得选择只因题材名词相似、实际写作功能不匹配的片段。"
-        "声纹执行表必须包含：一、选定片段卡及作用范围，每张严格写成‘卡号｜作用拍点或场景｜模仿机制｜停止位置’；"
-        "二、本章叙述声纹，列3至5个真正适用的惯用词或句式框架及各自唯一落点，并明确至少2处如何把无主语流程说明落回人物当下的观察、犹疑或直白推理；"
-        "至少安排2个45至90字的连续思路段，由明确人物把所见反馈、暂时判断和下一步验证连在一起；"
-        "不得把这些思路压成‘状态A。状态B。结论C。’式整齐调查摘要，也不得用术语清单代替人物理解。"
-        f"三、段落执行，逐字采用上方样本结构硬指标；普通说明怎样合并，约本章篇幅最多保留{short_noun_limit}个非对白名词独段，"
-        "非对白单句短段不得连续超过2段。流程段不能连续只写物件、操作和结果，每个主要信息单元应由‘现场反馈—人物理解或反应—下一步动作’自然连接，"
-        "但不得虚构无关情绪。"
-        "四、角色声纹矩阵，覆盖本章每个实际说话人物；不要复述人物职责、权限或信息边界，只写‘人物｜句式与接话方式｜"
-        "称呼/语气词/动作标签｜一条不超过25字的本章口吻样句｜禁止共用句型’。"
-        "四名及以上人物说话时，最多两人可以持续使用完整、准确、无停顿的工作句；其余人物必须按人物卡和样本分别采用短问、复述关键词、"
-        "半句改口、口语词、被打断、先动作后回答等不同机制，不能只靠医学词与行政词的差别区分。"
-        "矩阵末尾单列‘相近角色对照’，选择最容易同腔的两组人物，让每组两人用各自口吻表达同一条本章信息，直接给出四句短样句；"
-        "再列2至4个不得由多人共享的标准工作句型。矩阵同时标明哪些相邻短对白应写在同一段内，不能为了展示短问短答把每句话都另起一段。"
-        "五、信息揭示与章末收束，必须指定最后一个可见、可听或可执行的具体事件，以及承载它的人物、动作、声音或一句对白；"
-        "如果多路报告在章末连续接入，只先写一个打断现场的声音，再用人物接线、窗口增加或操作被迫改变承接其余报告；"
-        "禁止显式使用‘第一路、第二路、第三路、第四路’或结构完全相同的逐条播报制造机械升级。"
-        "最后1至3段就停在这个具体落点，禁止再追加‘某阶段开始了’‘事情没有结束’‘真正的危机才刚刚开始’等抽象宣告，"
-        "也禁止用‘不是失败/但还不够/倒计时开始’式对称三段总结；若提纲要求阶段升级，必须用实际命令、异常或后果呈现。"
-        "六、本章禁用项，列出作者人格中不适用于本章的局部手法和模型默认写法。全表控制在1600至2300字，"
-        "只提供少量高控制力规则，不写第二份剧情说明书。"
-        + "随后生成一份完整备用正文草稿，供终稿调用失败时兜底。备用草稿只展开唯一剧情拍点，静默遵守边界，"
-        "不得用重复解释、重复反应、往返确认或同义对白补足篇幅。"
-        "严格只输出以下三个分区，不输出其他标题、分析、状态JSON或Markdown代码块：\n"
-        f"【剧情执行清单】\n{beat_low}-{beat_high}条唯一剧情拍点，末尾另列静默继承边界\n\n"
-        "【本章声纹执行表】\n场景绑定片段卡、叙述声纹、段落执行、逐角色声纹矩阵与相近角色对照、具体章末落点、本章禁用项\n\n"
-        "【备用正文草稿】\n完整正文草稿"
+        "【小说正文直写】\n"
+        "根据当前章节资料和前面的完整原样本，写出本章可直接进入小说的正文。"
+        "项目资料中已经确定的人名、时间、地点、关系、物件、编号、人物状态和已发生事件保持原样延续。"
+        "正文从当前章节的状态自然展开。"
     )
-    structure_block = f"【完整样本结构硬指标｜声纹表必须逐字采用】\n{structure_contract}" if structure_contract else ""
-    cards_block = f"【功能型原文片段库｜只选择写法功能，不复制剧情】\n{cards_text}" if cards_text else ""
-    budget = max(
-        0,
-        int(limit or NOVEL_AI_CONTEXT_LIMIT) - len(instruction) - len(structure_block) - len(cards_block) - 6,
-    )
+    budget = max(0, effective_limit - len(instruction) - 2)
     if len(original) > budget:
         original = _clip_context_text(original, budget, keep_tail=False, preserve_lines=True)
-    return "\n\n".join(
-        part for part in (original, structure_block, cards_block, instruction) if part
-    )[:int(limit or NOVEL_AI_CONTEXT_LIMIT)]
+    return "\n\n".join(part for part in (original, instruction) if part)[:effective_limit]
 
 
 def _parse_style_execution_result(value):
@@ -5430,7 +9053,9 @@ def _parse_style_execution_result(value):
             end = matches[index + 1].start() if index + 1 < len(matches) else len(text)
             sections[match.group(1)] = text[match.end():end].strip()
     execution = sections.get("剧情执行清单", "")
-    style_plan = sections.get("本章声纹执行表", "")
+    style_plan = _ensure_mandatory_style_voice_plan(
+        sections.get("本章声纹执行表", "")
+    )
     draft = sections.get("备用正文草稿", "")
     if not draft and text and not matches:
         draft = text
@@ -5557,13 +9182,23 @@ def _build_style_plot_acceptance_context(project, chapter_index, execution_text=
     current_outline = _strip_static_foreshadow_outline_fields(chapter.get("outline", ""))
     current_basis = execution or current_outline or "暂无明确规划"
     current_label = "本章唯一剧情执行清单" if execution else "本章规划验收原文"
+    previous_boundary = _chapter_previous_opening_boundary_text(project, chapter_index)
     parts = [
         "只按已经合并去重的唯一剧情拍点验收本章；原始提纲里人物任务、主线任务、本章目标、必须发生和结尾钩子"
         "如果描述同一事件，不构成多次叙述任务。每个拍点必须在终稿中真实发生，不能只在人物想法、预告或章末说明中提及。"
-        "静默继承边界只要求事实不冲突，不要求正文复述。"
+        "现有连续性事实只用于验收事实是否冲突，不要求正文复述。"
         "同时对照前两章已完成事件，除明确持续动作和必要承接外，不得复演已经完成的冲突、解释、对话结论或结尾钩子。",
         f"【{current_label}】\n{current_basis}",
     ]
+    if previous_boundary:
+        parts.append(
+            "【章首承接硬验收】\n"
+            "上一章结尾已经向读者发布，终稿不能再次写出或同义重写其中的末句、对白、声音、动作落点、结论或情绪。"
+            "本章必须从新反应、新结果、新阻力或新信息起笔；终稿验收必须提供章首前三段中的首个新句逐字证据，"
+            "并用一句话说明这个章首新增变量。合法起笔分别是：对白后的新反应/回答、动作后的新结果/阻力、声音后的声源/新反应。\n"
+            + "上一章已发布结尾的最后三段：\n"
+            + "\n".join(_style_boundary_paragraphs(previous_boundary, limit=3))
+        )
     previous_blocks = []
     for previous_index in range(max(0, chapter_index - 2), chapter_index):
         previous = chapters[previous_index]
@@ -5573,12 +9208,22 @@ def _build_style_plot_acceptance_context(project, chapter_index, execution_text=
         summary = str(previous.get("summary", "") or "").strip()
         body = str(previous.get("text", "") or "").strip()
         completed_events = actual_outline or summary or "暂无"
+        boundary_label = (
+            "章末承接（已发布事实，用于去重）"
+            if previous_index == chapter_index - 1 and body
+            else "章末承接（只用于承接与去重）"
+        )
+        boundary_text = (
+            "\n".join(_style_boundary_paragraphs(body, limit=3))
+            if body else "暂无"
+        )
         previous_blocks.append(
-            "第{}章《{}》\n已完成事件：{}\n章末承接：{}".format(
+            "第{}章《{}》\n已完成事件：{}\n{}：{}".format(
                 previous_index + 1,
                 str(previous.get("title", "") or "").strip(),
                 _clip_context_text(completed_events, 1200, preserve_lines=True) or "暂无",
-                _clip_context_text(body, 600, keep_tail=True, preserve_lines=True) or "暂无",
+                boundary_label,
+                boundary_text,
             )
         )
     if previous_blocks:
@@ -5586,8 +9231,158 @@ def _build_style_plot_acceptance_context(project, chapter_index, execution_text=
     return "\n\n".join(parts)
 
 
+def _context_section_blocks(value):
+    """Return heading-delimited context blocks without changing their content."""
+    text = str(value or "").strip()
+    if not text:
+        return []
+    matches = list(re.finditer(r"(?m)^【([^】\r\n]+)】\s*$", text))
+    if not matches:
+        return []
+    blocks = []
+    for index, match in enumerate(matches):
+        end = matches[index + 1].start() if index + 1 < len(matches) else len(text)
+        title = str(match.group(1) or "").strip()
+        body = text[match.end():end].strip()
+        if title and body:
+            blocks.append((title, f"【{title}】\n{body}"))
+    return blocks
+
+
+def _compact_style_finalize_source_context(
+    original_context,
+    style_reference="",
+    limit=STYLE_FINALIZE_SOURCE_CONTEXT_LIMIT,
+):
+    """Build a continuity-safe packet for body-only finalization.
+
+    The first draft already receives the complete project packet. The
+    finalizer needs the same identity and selected continuity facts, but does
+    not need every copy of the global catalog and planning instructions again.
+    """
+    original = str(original_context or "").strip()
+    blocks = _context_section_blocks(original)
+    if not blocks:
+        if len(original) <= int(limit or STYLE_FINALIZE_SOURCE_CONTEXT_LIMIT):
+            return original
+        return _clip_context_text(
+            original,
+            int(limit or STYLE_FINALIZE_SOURCE_CONTEXT_LIMIT),
+            keep_tail=True,
+            preserve_lines=True,
+        )
+    by_title = {}
+    for title, block in blocks:
+        by_title.setdefault(title, []).append(block)
+
+    selected = []
+    selected_titles = set()
+
+    def add_title(title, budget):
+        values = by_title.get(title, [])
+        if not values:
+            return
+        remaining_budget = max(0, int(budget or 0))
+        for block in values:
+            if remaining_budget <= 0:
+                break
+            body = block.split("\n", 1)[1] if "\n" in block else block
+            clipped = _clip_context_text(
+                body,
+                min(remaining_budget, max(80, int(budget or 0))),
+                preserve_lines=True,
+            )
+            if clipped:
+                selected.append(f"【{title}】\n{clipped}")
+                selected_titles.add(title)
+                remaining_budget -= len(clipped)
+
+    core_budgets = (
+        ("项目核心信息", 500),
+        ("长篇进度 / 节奏", 400),
+        ("长篇继承规则", 700),
+        ("剧情连续性参考", 2200),
+        ("剧情执行硬约束", 2200),
+        ("本章写作长度", 500),
+        ("本次任务", 700),
+        ("当前章节", 4500),
+        ("小说圣经", 1500),
+        ("世界观 / 规则", 1500),
+        ("当前状态快照", 4500),
+        ("全局紧凑状态目录", 2500),
+        ("后续规划参考", 1600),
+        ("后章衔接点", 700),
+        ("活跃连续性事实", 5000),
+        ("近期阶段档案", 2200),
+        ("续写承接点", 2200),
+        ("前文继承摘要", 2500),
+        ("近几章连续性", 2500),
+        ("本章相关人物", 3500),
+        ("本章相关设定", 2200),
+        ("本章相关伏笔", 1200),
+        ("本章唯一剧情执行清单", 3500),
+    )
+    for title, budget in core_budgets:
+        add_title(title, budget)
+
+    style_prefixes = (
+        "AI文风画像",
+        "作者人格",
+        "剧情组织人格",
+        "人物与场景人格",
+        "叙述习惯词与句法声纹",
+        "对白总体声纹",
+        "功能角色说话方式",
+        "格式节奏与使用边界",
+        "风格锁定规则",
+        "正文风格参考",
+        "代表片段",
+        "观众期待值",
+    )
+    core_compacted = "\n\n".join(selected)
+    style_budget = max(
+        0,
+        min(9000, int(limit or STYLE_FINALIZE_SOURCE_CONTEXT_LIMIT) - len(core_compacted) - 800),
+    )
+    style_used = 0
+    for title, block in blocks:
+        if title in selected_titles or not any(title.startswith(prefix) for prefix in style_prefixes):
+            continue
+        remaining = style_budget - style_used
+        if remaining <= 120:
+            break
+        body = block.split("\n", 1)[1] if "\n" in block else block
+        clipped = _clip_context_text(body, remaining, preserve_lines=True)
+        if clipped:
+            selected.append(f"【{title}】\n{clipped}")
+            selected_titles.add(title)
+            style_used += len(clipped)
+
+    has_reference = any(
+        title.startswith("正文风格参考") or title.startswith("代表片段")
+        for title in selected_titles
+    )
+    if not has_reference and style_reference:
+        remaining = max(0, style_budget - style_used)
+        excerpt = _select_style_reference_excerpts(
+            style_reference,
+            original,
+            min(6000, remaining),
+        ) if remaining > 120 else ""
+        if excerpt:
+            selected.append(f"【正文风格参考｜终稿分层选段】\n{excerpt}")
+
+    compacted = "\n\n".join(selected)
+    if not compacted:
+        return original
+    hard_limit = int(limit or STYLE_FINALIZE_SOURCE_CONTEXT_LIMIT)
+    if len(compacted) <= hard_limit:
+        return compacted
+    return _clip_context_text(compacted, hard_limit, keep_tail=True, preserve_lines=True)
+
+
 def _build_chapter_execution_hard_constraints(project, chapter_index):
-    """Expose continuity boundaries as a short checklist for the execution pass."""
+    """Expose selected continuity facts without turning them into a boundary checklist."""
     project = project if isinstance(project, dict) else {}
     chapters = project.get("chapters", []) if isinstance(project.get("chapters"), list) else []
     chapter = (
@@ -5607,13 +9402,12 @@ def _build_chapter_execution_hard_constraints(project, chapter_index):
     except Exception:
         snapshot = {}
     lines = [
-        "以下是剧情执行稿的硬约束清单，只用于防止连续性错误，不是正文任务；未发生变化的内容不要写回正文。",
-        "1. 权限/责任边界：资料没有明确授权、交接或职责转移时，不能把‘可查看、可操作、可决定、由谁负责’写成已经获得或已经转移。",
-        "2. 治疗/能力阈值：资料明确的条件、次数、范围、伤势和能力上限必须原样保留；未达到条件只能写尝试、推测或受限状态，不能写成完成。",
-        "3. 证据确定性：未知、疑似、可能、未核实、来源不明和推断必须保持原确定性；新证据只能更新它明确改变的部分。",
-        "4. 章首承接：上一章结尾的时间、天气、地点、人物位置、身体状态、持有物和未完成动作必须先承接，再推进本章拍点。",
-        "5. 规划冲突：提纲与已发生事实冲突时不能静默覆盖；优先保留更具体、更晚、更接近正文的事实，只有当前章明确发生改变时才更新。",
-        "6. 既有结论去重：前两章已经完成的动作、结论和情绪不能在开篇完整复演，只能引用其结果并写本章新增的动作、信息、决定或后果。",
+        "以下资料只用于核对连续性事实，不是正文需要逐条展示的任务。",
+        "只参考本章提纲真正触及的事实；未触及的职责、规则、物件和旧结论保持原状，不要写进执行清单。",
+        "资料未确认的内容继续保持未确认，人物没有获得的新能力、授权或物品不能凭空获得；伤势和关系没有变化时保持原状。",
+        "这些事实不得被扩写成新增的核对、封存、编号、审批、交接、见证、记录固定或责任说明；现实流程完整不等于剧情完整。",
+        "上一章结尾的时间、地点、人物位置、身体状态、持有物和未完成动作必须自然承接，但不能复播已经发布的末句、动作或结论。",
+        "提纲与已发生事实冲突时保留更具体、更新、更接近正文的记录；前两章已经完成的解释和冲突只继承结果，不重新演一遍。",
     ]
     selected_facts = set(str(value or "").strip() for value in selected.get("fact_ids", []) if str(value or "").strip())
     fact_lines = []
@@ -5664,59 +9458,138 @@ def _build_style_finalize_context(
     style_plan="",
     style_cards=None,
     rescue_from_candidate=False,
+    vocabulary_profile_text="",
 ):
-    original = _append_ai_style_profile_to_context(original_context, profile_text, limit=limit)
+    original = _append_ai_style_profile_to_context(
+        original_context,
+        _style_runtime_profile(profile_text, style_reference, include_structure=False),
+        limit=limit,
+    )
+    if not include_memory:
+        original = _compact_style_finalize_source_context(
+            original,
+            style_reference=style_reference,
+        )
     draft = str(draft_text or "").strip()
     execution = str(execution_text or "").strip()
     chapter_style_plan = str(style_plan or "").strip()
+    voice_identity_required = bool(execution and _compact_text(style_reference))
+    if voice_identity_required:
+        chapter_style_plan = _ensure_mandatory_style_voice_plan(chapter_style_plan)
+    chapter_style_plan = _remove_style_layout_metrics(chapter_style_plan)
+    mandatory_voice_contract = (
+        _mandatory_style_voice_contract(style_cards)
+        if voice_identity_required else ""
+    )
     target = int(output_target or 0) or _style_output_target_from_context(original)
-    if 0 < target <= 3000:
-        style_card_limit = 1
-    elif 0 < target <= 7000:
-        style_card_limit = 2
-    else:
-        style_card_limit = 3
+    narrative_mode = _style_narrative_mode_from_plan(chapter_style_plan)
+    narrative_mode_contract = _style_narrative_mode_contract(target, narrative_mode)
+    style_card_limit = 1
     selected_cards = _style_cards_selected_by_plan(
         style_cards,
         chapter_style_plan,
         max_cards=style_card_limit,
     )
-    selected_cards_text = _format_style_cards(selected_cards, limit=4200)
+    selected_cards_text = _format_style_cards(selected_cards, limit=5600)
+    native_vocabulary = _style_native_vocabulary_text(
+        vocabulary_profile_text or profile_text,
+        style_reference,
+        output_target=target,
+    )
+    recent_vocabulary = _style_recent_vocabulary_usage_text(
+        project,
+        chapter_index,
+        vocabulary_profile_text or profile_text,
+        style_reference,
+    )
     reasons = [str(reason).strip() for reason in (local_reasons or []) if str(reason or "").strip()]
-    reason_text = "\n".join(f"- {reason}" for reason in reasons) or "- 本地结构指标均在允许范围内"
+    reason_text = _style_generation_issue_text(reasons)
+    previous_boundary = _chapter_previous_opening_boundary_text(project, chapter_index)
+    opening_acceptance_text = (
+        "存在上一章已发布结尾时，终稿必须从新反应、新结果、新阻力或新信息起笔；"
+        "上一章的末句、对白、声音、动作落点、结论和情绪不能原样或同义重写。"
+        "合法起笔是对白后的新反应/回答、动作后的新结果/阻力、声音后的声源/新反应。"
+        "验收JSON中的opening_continuation如有填写，证据必须来自章首前三段；字段缺失不等于正文失败，"
+        "但实际复演上一章结尾仍然是硬错误。"
+        if previous_boundary else
+        "本章没有需要验收的上一章章首边界；不要伪造opening_continuation字段。"
+    )
+    acceptance_schema = (
+        "{"
+        + (
+            '"opening_continuation":{"first_new_sentence":"章首前三段中的首个新句逐字原文",'
+            '"new_action_or_result":"该句带来的新反应、新结果、新阻力或新信息"},'
+            '"timeline_commitment_check":{"prior_deadline_or_promise":"前文期限或承诺的简短原意；确无则写无",'
+            '"current_schedule":"终稿采用的当前时间安排；确无则写无","compatible":true},'
+            if previous_boundary else ""
+        )
+        + '"previous_chapter_repetition_check":true,"logic_continuity_check":true,'
+        '"procedural_expansion_check":true,"mechanical_prose_check":true,'
+        '"role_voice_attribution_check":true}'
+    )
+    preflight_text = _style_finalize_preflight_targets(
+        style_reference,
+        draft,
+        target,
+    )
+    priority_edit_text = _style_finalize_priority_edit_text(
+        style_reference,
+        draft,
+        target,
+    )
     reference_structure = _style_text_structure(style_reference)
-    reference_profile = _build_style_reference_profile(style_reference, target) if style_reference else ""
+    draft_structure = _style_text_structure(draft)
+    draft_structure_errors = _style_finalize_acceptance_errors(
+        "",
+        draft,
+        {},
+        style_reference,
+        target,
+    )
+    draft_length_usable = bool(
+        draft_structure["chars"] >= 300
+        and (
+            not target
+            or target * 0.85 <= draft_structure["chars"] <= target * 1.15
+        )
+    )
+    edit_candidate_in_place = bool(
+        execution
+        and draft
+        and not rescue_from_candidate
+        and draft_length_usable
+        and not draft_structure_errors
+    )
+    # A from-execution rewrite does not receive the rejected backup body. Do
+    # not ask the model to merge a specific number of paragraphs or dialogue
+    # turns from text that is intentionally absent from the request.
+    candidate_metrics_relevant = bool(
+        rescue_from_candidate or edit_candidate_in_place or not execution
+    )
+    if not candidate_metrics_relevant:
+        reasons = []
+        reason_text = ""
+        preflight_text = ""
+        priority_edit_text = ""
+    in_place_structure_contract = (
+        "底稿结构已经通过；终稿不得为了留下修改痕迹拆段、补对白或改坏自然节奏。"
+        "只允许保留原有自然排版，或合并确有重复的相邻表达。"
+        if edit_candidate_in_place else ""
+    )
+    reference_profile = (
+        _build_style_reference_profile(style_reference, target, include_structure=False)
+        if style_reference else ""
+    )
     delivery_targets = []
     if target:
         delivery_targets.append(f"终稿正文控制在{round(target * 0.85)}-{round(target * 1.15)}字")
-    if reference_structure["chars"] >= 500:
-        if target:
-            expected_paragraphs = reference_structure["paragraphs_per_1000"] * target / 1000
-            paragraph_low = max(1, round(expected_paragraphs * 0.85))
-            paragraph_high = max(1, round(expected_paragraphs * 1.15))
-            delivery_targets.append(
-                f"非空段落必须控制在{paragraph_low}-{paragraph_high}段；超过{paragraph_high}段视为不合格，交付前先合并"
-            )
-            expected_short = expected_paragraphs * reference_structure["short_paragraph_pct"] / 100
-            delivery_targets.append(
-                f"15字以内短段约{max(0, round(expected_short * 0.80))}-{max(1, round(expected_short * 1.20))}段"
-            )
-        delivery_targets.extend([
-            f"每1000字非空段落必须控制在{reference_structure['paragraphs_per_1000'] * 0.90:.1f}-{reference_structure['paragraphs_per_1000'] * 1.10:.1f}段",
-            f"段落长度中位数必须控制在{max(1, reference_structure['paragraph_median'] - 3)}-{reference_structure['paragraph_median'] + 3}字",
-            f"15字以内短段占比必须控制在{max(0, reference_structure['short_paragraph_pct'] - 4):.0f}%-{min(100, reference_structure['short_paragraph_pct'] + 4):.0f}%",
-            f"非对白35字以内单句短段占比必须控制在{max(0, reference_structure['single_sentence_short_paragraph_pct'] - 5):.0f}%-{min(100, reference_structure['single_sentence_short_paragraph_pct'] + 5):.0f}%",
-            f"句子长度中位数必须控制在{max(1, reference_structure['sentence_median'] - 4)}-{reference_structure['sentence_median'] + 4}字",
-            f"对白字数占比必须控制在{max(0, reference_structure['dialogue_char_pct'] - 5):.0f}%-{min(100, reference_structure['dialogue_char_pct'] + 5):.0f}%；超出上限时合并普通汇报和流程对白，不删除剧情",
-            "连续3个及以上非对白35字以下段落必须合并到只剩1至2段；章首状态、普通转场、操作过程和中间结果不能作为例外",
-            "同一人物相邻的两句15字以内短对白必须合成一个对白段，或用真正承担反应/操作的动作标签连接；结巴、打断、裁决和样本明确的命令递进除外",
-        ])
-        if reference_structure["single_sentence_short_paragraph_pct"] < 55:
-            delivery_targets.extend([
-                "非对白单句短段不得连续超过2段，短段只用于对白、关键发现、裁决、转折或样本明确的节奏落点",
-                "普通说明段每段组织2至4个完整句子；普通名词清单、同类结果和中间结论不得逐项独立成段",
-            ])
+    delivery_targets.extend([
+        "自然排版只跟随样本文本读感，不执行固定换行、短句、对白或结构统计目标",
+        "办案式流程和机械感是硬约束：非主线的查证、审批、封存、交接、记录、责任确认不得扩成流程播报；连续同构动作、重复解释和段尾总结必须压缩",
+        "能不用“几个字/几个词/几个音节”就不用；真要写字数，标点符号、引号和空格都不计入字数",
+    ])
     delivery_text = "\n".join(f"- {item}" for item in delivery_targets)
+    delivery_audit_text = ""
     plot_acceptance = _build_style_plot_acceptance_context(
         project,
         int(chapter_index or 0),
@@ -5725,7 +9598,11 @@ def _build_style_finalize_context(
     repetition_boundary = _style_repetition_boundary_text()
     instruction = (
         "【终稿编辑任务】\n"
-        "先独立核对首次正文是否完整执行本章剧情、人物设定、前文连续性和结尾要求，再对照正文风格样本检查写法。"
+        + (
+            f"【本章首要编辑动作】\n{priority_edit_text}\n"
+            if priority_edit_text else ""
+        )
+        + "先独立核对首次正文是否完整执行本章剧情、人物设定、前文连续性和结尾要求，再对照正文风格样本检查写法。"
         "直接交付修订后的终稿，不要先输出审校报告。剧情正确的内容必须保留，不得为了文风删除、替换、提前或延后既定事件；"
         "只在确有必要时调整叙述方式、句式、段落组织、对白衔接、信息揭示和收束表达。"
         "如果首次正文已经比任何改写更贴近样本，可以原样保留正文。"
@@ -5733,35 +9610,46 @@ def _build_style_finalize_context(
         "并在终稿正文中保留完全相同的连续短句；不得把证据句改写成只存在于其中一个版本的表达。"
         "必须单独完成一次语言声纹校准：按作者人格中的高频/稳定层级，在适用场景沿用样本反复出现的"
         "句首、连接词、动作修饰词、生理反应短语、解释框架和说话标签，不得为了词汇丰富强行换同义词；"
-        "局部或限定场景的词不得硬塞，任何惯用词都不得集中堆砌。"
-        "必须单独完成一次对白声纹校准：结合角色卡语言方式，为主角、权威或专业角色、弱势角色、对手和口语角色"
-        "分别落实样本对应的对白长短、停顿、省略、称呼、语气词、反问、接话和动作插入方式；不能让所有人物一个腔调。"
-        "如果提供【本章声纹执行表】，它是本章最高优先级的写法合同：选定惯用词只能在表中指定的语境落下，"
-        "每个实际说话人物必须按角色声纹矩阵和相近角色对照分别执行；不得把不同人物都改成准确、克制、无停顿的标准工作语言。"
+        "作者人格的宽泛‘高频’概括必须让位于【作者原生用词池】标注的完整样本实际次数；"
+        "局部或限定场景的词不得硬塞，低频词不能变成每章口头禅，任何惯用词都不得集中堆砌或明显超过样本密度。"
+        "必须单独完成一次对白声纹校准：只重点校准声纹表列出的1至2名核心人物，结合角色卡落实其对白长短、"
+        "停顿、省略、称呼、语气词、接话和动作插入方式；其他人物只在剧情必须开口时自然继承人物卡，不能为了区分口吻轮流发言。"
+        + narrative_mode_contract
+        + mandatory_voice_contract
+        + "如果提供【本章声纹执行表】，它只校准同一剧情的语言，不得新增剧情任务；剧情完整、人物自然反应和片段卡适用边界优先。"
+        "核心声纹人物必须保持可区分；其他实际说话人物只需符合身份，没有必要开口的人物不为展示声纹新增台词。"
         "片段卡原文只以【本章选定功能片段卡】实际列出的卡为准；声纹表中提到但未列出的卡视为未选，不执行。"
         "每张选定卡只控制声纹表指定的一个拍点或连续小场景，到表中停止位置立即退出，不能把其判断方式、专业口吻或段落节拍扩散到全章。"
         "只模仿选定卡的组织机制、用词频率和对白节拍，绝不能复制其人物、设定、事件或连续原句。"
-        "静默继承边界只用于防止事实写错，不能逐条显性写进正文；不得给每个判断机械补齐风险边界或写成处置报告。"
-        "流程信息不能连续由无主语被动句、物件清单和标准命令承担；每个主要信息单元都要让现场反馈改变人物的理解、身体或下一步操作，"
-        "并至少两次用45至90字的连续思路段把整理后的旁白结论落回人物当下的直白思路。角色差异必须体现在句法、停顿、称呼和接话，不得只靠职责术语区分。"
+        "连续性事实只用于后续验收和修复，不能逐条显性写进正文；不得给每个判断机械补齐风险说明或写成处置报告。"
+        "专业信息先写它造成的决定、冲突或结果，再补读者非知道不可的最短原因；"
+        "不得自行补齐提纲没有要求的现实处置流程，也不得把同一判断拆给多人重复确认。"
+        "角色差异必须体现在句法、停顿、称呼和接话，不能只靠职责术语区分。"
+        "必须逐段完成逻辑连续性核对：时间词、年份和先后顺序不能互相打架；原因必须先于结果；"
+        "代词必须只有一个明确指向，同时出现两个可能对象时直接写姓名；人物的生死、清醒、伤势、位置、权限和物件持有状态"
+        "必须与已发布正文及当前状态一致。提纲内部存在互斥描述时，以已确认事实为准，正文只保留一种成立状态。"
+        "必须把前两章已经成立的期限、倒计时、预约和承诺与终稿当前时间安排并列核对；若当前计划会占满期限、倒置先后或让承诺无法履行，"
+        "先按已发布正文最小调整当前时间，再在timeline_commitment_check中写出前文约束、终稿安排并确认兼容，不能直接填true。"
         "章首承接状态合并成一个自然中段，不得把人物站姿、伤势、环境和能力状态连续拆成电影分镜。"
-        "同一人物连续说出的15字以内短句必须合成一个对白段，或由真正承担反应/操作的动作标签连接；不能把每句命令、短问和短答都另起一段。"
+        "同一人物连续说出的短促命令、短问和短答必须自然衔接，或由真正承担反应/操作的动作标签连接；不能每句都另起一段。"
         "多路消息在章末接入时禁止使用‘第一路、第二路、第三路、第四路’逐项播报；先用一个声音打断，再由人物动作和窗口变化承接后续升级。"
         "章末必须停在声纹表指定的具体动作、声音、异常、后果或一句人物对白上；落点之后禁止追加抽象阶段宣告、对称三段总结或商业预告句。"
-        "输出前静默检查字数、段落密度、长短段分布、句长、对白比例、习惯用词、对白声纹以及人物、物品、地点、伤势和结尾状态。"
+        "输出前静默检查字数、自然排版读感、句式、对白衔接、习惯用词、对白声纹以及人物、物品、地点、伤势和结尾状态。"
         "必须按【终稿剧情验收清单】逐项确认唯一剧情拍点已经执行，并删除非必要的前两章剧情复演；"
         "终稿前在内部逐段检查净推进：连续两到四段可以共同完成一个强调或情绪单元，"
         "但如果整组内容没有带来新动作、新信息、新决定、新后果或必要情绪转折，就必须删除或并入前文。"
         + repetition_boundary
-        + (f"以下是本次终稿交付门槛，不符合时必须在本次调用内部继续调整后再交付：\n{delivery_text}\n" if delivery_text else "\n")
+        + opening_acceptance_text
+        + (f"以下只用于防止机械漂移，不得为了命中数字制造内容：\n{delivery_text}\n" if delivery_text else "\n")
         +
         "必须严格使用以下六个分区标题，标题不得改名；正文中不要出现分析、评分、修改说明或其他分区标题：\n"
         "【终稿正文】\n可直接写入章节的完整正文\n\n"
         "【终稿验收】\n"
-        '{"beat_evidence":[{"beat":1,"evidence_quote":"终稿中直接证明该拍点已经发生的8-60字逐字原文"}],'
-        '"previous_chapter_repetition_check":true,"paragraph_structure_check":true}\n\n'
-        "beat_evidence必须覆盖剧情执行清单中的每个编号且每个编号只写一次；证据必须直接证明事件已发生，"
-        "不能用人物设想、预告、静默边界或未执行的计划充数。两个check只能在逐段完成对应检查后写true。\n\n"
+        + acceptance_schema + "\n\n"
+        + "剧情执行清单只用于组织本章正文，不要求为每个拍点提交逐字证据；不得因为自然合并表达而重写已经成立的剧情。"
+        "所有check只能在逐段完成对应检查后写true；"
+        "role_voice_attribution_check还必须确认示例句和标志短语没有串给错误人物。"
+        + "人物声纹只检查实际说话人物是否彼此可区分，不要求新增冲突、喜剧、两轮接话或逐字声纹证据。\n\n"
         "【实际提纲】\n用6-10条短剧情拍点概括终稿已经发生的内容，不补写正文外事件\n\n"
         "【本章摘要】\n简短概括终稿核心事件和情绪转折\n\n"
         "【本章需继承的关键事实】\n逐条记录后文必须继承的人物关系、伤势、物品、地点、线索、伏笔和结尾状态\n\n"
@@ -5771,79 +9659,212 @@ def _build_style_finalize_context(
     if not include_memory:
         source_instruction = (
             "以上次终稿为正文底稿，完整保留已经发生的剧情、因果、人物状态、具体信息和章末落点；"
-            "只针对【备用正文的本地检测结果】重新组织段落、合并短段、调整对白衔接和必要句式。"
+            "只针对【备用正文的本地检测结果】调整语言组织、合并无效碎片、校准对白衔接和必要句式。"
             "不得从剧情执行清单重新写一版，也不得删掉或替换原有拍点。"
             if rescue_from_candidate else
+            "备用正文的篇幅与整体读感已经通过本地验收，以它为正文底稿，完整保留已经发生的剧情、因果、"
+            "人物状态、具体信息、自然段落和章末落点；只做确有必要的语言声纹、人物口吻、信息揭示和"
+            "句式校准。不得从零重写，也不得为了显得修改充分而增加对白、拆段或替换原本自然的表达。"
+            + in_place_structure_contract
+            if edit_candidate_in_place else
             "根据剧情执行清单从零写出完整终稿。执行清单只提供剧情事实和顺序，不是可沿用的正文表达；"
-            "不得把备用草稿的句子、短段排列、动作分镜或措辞当成底稿，也不要做逐句润色。"
+            "不得把备用草稿的句子、碎片排列、动作分镜或措辞当成底稿，也不要做逐句润色。"
+            "清单只是场景转折索引，不是一条拍点对应一次换行、一句对白或一次结论总结的模板；"
+            "同一场景内的相邻拍点必须连成自然的冲突单元，写完场景后再从正文中选择验收证据，"
+            "不能围绕验收字段反向拼装正文。"
             if execution else
             "先独立核对首次正文是否完整执行本章剧情、人物设定、前文连续性和结尾要求，再对照正文风格样本检查写法。"
         )
         fallback_instruction = (
             "本次必须保留上次终稿的全部有效剧情，只调整未通过的验收项。"
             if rescue_from_candidate else
+            "如果任何改写会损伤剧情、自然度或现有读感，允许原样保留已经合格的正文；禁止为留下修改痕迹而改写。"
+            if edit_candidate_in_place else
             "必须重新组织整章，不能退回备用正文草稿。"
             if execution else
             "如果首次正文已经比任何改写更贴近样本，可以原样保留。"
         )
         instruction = (
             "【终稿编辑任务】\n"
+            + (
+                f"【本章首要编辑动作】\n{priority_edit_text}\n"
+                if priority_edit_text else ""
+            )
             + source_instruction
             + "本次只负责小说正文，不生成提纲、摘要、关键事实或状态资料。"
             "剧情事件、人物、设定、时间顺序、因果关系和结尾承接必须完整保留；"
-            "在这些内容不变的前提下，可以彻底重组句式、段落、对白衔接、叙述节奏和信息揭示方式。"
-            "不要保留备用草稿或模型默认写法中的碎段、短句强调、分镜动作流或对白比例偏差。"
+            "在这些内容不变的前提下，可以彻底重组句式、自然排版、对白衔接、叙述节奏和信息揭示方式。"
+            "不要保留备用草稿或模型默认写法中的碎片化排版、机械强调、分镜动作流或对白堆砌。"
             + fallback_instruction
             + "必须按作者人格和原文证据校准习惯词、句式框架、说话标签、对白停顿、称呼、语气词和接话方式；"
-            "样本会重复使用的词不应被模型默认同义词替换，局部词不能硬塞，不同人物不能写成同一种口气。"
-            + "【本章声纹执行表】是本章最高优先级写法合同，必须逐项落实选定惯用词的落点、段落执行、相近角色对照和每个说话人物的声纹矩阵。"
+            "样本会重复使用的词不应被模型默认同义词替换，但主导语言节奏不是待覆盖词表；局部词不能硬塞，"
+            "不得把多个习惯词平均撒在整章，不同人物不能写成同一种口气。"
+            + (
+                "逐句检查【作者原生用词池】：凡是正文正在使用模型常见词，而词池中存在语义和人物口吻都匹配的作者原词，"
+                "优先改用作者原词；现代口语可自然进入现代认知人物的对白、心理和贴近其视角的叙述。"
+                "以词池中的完整样本实际次数和复现层级校准密度；低频场景词不能写成每章口头禅、转折标签或固定人物反应。"
+                "不要求覆盖全部词，也不得为了命中词库破坏语义或新增情节。"
+                if native_vocabulary else ""
+            )
+            + narrative_mode_contract
+            + mandatory_voice_contract
+            + "【本章声纹执行表】只校准同一剧情的语言；剧情完整、人物自然反应和片段卡适用边界优先，不能把表内项目改写成新增场面。"
+            + "只重点校准声纹表列出的1至2名核心人物；其他人物只在剧情必须开口时自然继承人物卡，"
+            "没有必要开口的人物不为展示声纹新增台词，也不为了区分口吻轮流发言。"
             "片段卡原文只以【本章选定功能片段卡】实际列出的卡为准；表中提到但未列出的卡视为未选。"
             "每张卡只控制表中指定的一个拍点或连续小场景，到停止位置立即退出，不能把同一种专业判断、命令口吻或段落节拍铺满全章；"
             "只模仿组织机制、用词频率和对白节拍，禁止复制其中人物、设定、事件或连续原句。"
-            "静默继承边界不得逐条显性改写成正文，不得为每个判断机械补齐风险限定。"
-            "流程信息不能连续由无主语被动句、物件清单和标准命令承担；每个主要信息单元都要让现场反馈改变人物的理解、身体或下一步操作，"
-            "并至少两次用45至90字的连续思路段把旁白结论落回人物当下的直白思路。角色差异必须体现在句法、停顿、称呼和接话，不能只靠职责术语区分。"
+            "连续性事实不得逐条显性改写成正文；事实冲突由逻辑验收和局部修复处理，不得为每个判断机械补齐风险限定。"
+            "专业信息先写它造成的决定、冲突或结果，再补读者非知道不可的最短原因；"
+            "不得自行补齐提纲没有要求的现实处置流程，也不得把同一判断拆给多人重复确认。"
+            "角色差异必须体现在句法、停顿、称呼和接话，不能只靠职责术语区分。"
+            "必须逐段核对时间顺序、因果、代词指向和人物生死/清醒/位置/持有状态；"
+            "提纲内部出现互斥描述时，以已发布正文、当前状态和更具体的已确认事实为准，正文只保留一种成立状态。"
             "章首承接状态合并成一个自然中段，不得拆成电影分镜；多路消息在章末接入时禁止用‘第一路、第二路、第三路、第四路’逐项播报，"
             "先用一个声音打断，再由人物动作和窗口变化承接后续升级。"
-            "同一人物连续说出的15字以内短句必须合成一个对白段，或由真正承担反应/操作的动作标签连接，不能每句都另起一段。"
+            "同一人物连续说出的短促命令、短问和短答必须自然衔接，或由真正承担反应/操作的动作标签连接，不能每句都另起一段。"
             "章末必须停在声纹表指定的具体动作、声音、异常、后果或一句人物对白上，禁止再追加抽象阶段宣告或对称三段总结。"
-            + "输出前静默检查字数、段落密度、长短段分布、句长、对白比例、习惯用词、对白声纹以及人物、物品、地点、伤势和结尾状态。"
+            + "输出前静默检查人物、物品、地点、伤势、时间、因果、结尾状态、对白声纹、办案式流程扩张和机械化表达。"
+            + "段落排版指标已删除；自然排版、句式、对白衔接和习惯用词只用于贴近读感，不能据此新增、拆分或删改剧情。"
+            "只有普通说明、同义确认、重复边界说明和无新增信息的功能性问答形成明显机械播报时，才自然合并。"
+            "同一证据或判断的‘能证明什么、不能证明什么’只完整说明一次；后续核验只写新增结果及其造成的选择或后果。"
             + "必须按【终稿剧情验收清单】逐项确认唯一剧情拍点已经执行，并删除非必要的前两章剧情复演。"
-            + "终稿前在内部逐段检查净推进：连续两到四段可以共同完成一个强调或情绪单元，"
+            + "终稿前在内部逐段检查净推进：相邻几段可以共同完成一个强调或情绪单元，"
             "但如果整组内容没有带来新动作、新信息、新决定、新后果或必要情绪转折，就必须删除或并入前文。"
             + repetition_boundary
+            + opening_acceptance_text
             + (
-                f"以下是本次终稿交付门槛，不符合时必须在本次调用内部继续调整后再交付：\n{delivery_text}\n"
+                f"以下只用于防止机械漂移，不得为了命中数字制造内容：\n{delivery_text}\n"
                 if delivery_text else "\n"
             )
+            + delivery_audit_text
             + "严格只输出以下两个分区，不输出提纲、摘要、状态JSON、审校报告、评分、修改说明或Markdown代码块：\n"
             "【终稿正文】\n可直接写入章节的完整正文\n\n"
             "【终稿验收】\n"
-            '{"beat_evidence":[{"beat":1,"evidence_quote":"终稿中直接证明该拍点已经发生的8-60字逐字原文"}],'
-            '"previous_chapter_repetition_check":true,"paragraph_structure_check":true}\n'
-            "beat_evidence必须与剧情执行清单的全部编号一一对应，每项证据都必须是终稿正文中的连续逐字原文，"
-            "并直接证明该拍点已经发生，不能用人物想法、预告、静默边界或计划充数。"
-            "previous_chapter_repetition_check只能在对照前两章并删除无新增变量的复演后写true；"
-            "paragraph_structure_check只能在实际核对段落密度、短段比例和连续短段后写true。"
+            + acceptance_schema + "\n"
+            + "剧情执行清单只用于组织本章正文，不要求逐项提交逐字证据；正文应保留自然的事件合并，不要为了满足验收格式补写解释。"
+            + "人物声纹只检查实际说话人物是否彼此可区分，不要求新增冲突、喜剧、两轮接话或逐字声纹证据。"
+            + "previous_chapter_repetition_check只能在对照前两章并删除无新增变量的复演后写true；"
+            "logic_continuity_check只能在逐段核对时间顺序、因果、代词唯一指向，以及人物生死、清醒、位置、权限和物件持有状态后写true；"
+            "timeline_commitment_check必须先摘出前文已成立的期限或承诺和终稿当前安排；确实都没有时两项写‘无’，"
+            "只要存在期限冲突、倒计时被占满或履约时间不足，就必须先修正文，不能把compatible写成true；"
+            "提纲内部存在互斥描述时，还必须确认终稿只保留与已确认事实一致的一种状态。"
+            "procedural_expansion_check只能在确认没有把非主线调查、核验、审批、封存、交接和记录扩成流程播报后写true；"
+            "mechanical_prose_check只能在确认没有同构动作、重复解释、功能性问答和段尾总结形成机械化播报后写true；"
+            "这两项是硬约束，明确为false时必须修正文；字段缺失不等于失败。"
+            "paragraph_structure_check如模型自行提供，只作诊断，不是重写条件；"
+            "role_voice_attribution_check只能在逐句核对说话人、示例句归属和当前问答逻辑后写true。"
+        )
+    if include_memory:
+        instruction = (
+            "【终稿编辑任务】\n"
+            "依据剧情执行清单和备用正文交付完整终稿。硬性保留本章必须发生、因果顺序、人物状态、物件归属、时间地点和章末承接；"
+            "发现硬矛盾时做最小修复，不新增提纲外流程、解释或事件。"
+            "正文写法以作者样本和本章声纹表为最高标准：常驻执行人物对白、冲突声纹、日常口语和自然适用的作者原生词，"
+            "用它们替换模型惯用表达，但不凑词频、不把低频词写成口头禅。"
+            "项目叙事策略只决定本章兑现与情绪方向，不得显性讲解；优先写选择、动作、关系回应和后果，压缩程序过程、专业说明、重复确认和段尾总结。"
+            "当前状态快照、下一章记忆选择和未决任务只约束连续性，不是本章待办；当前提纲未明确安排的事项必须保持未决，"
+            "不得扩成拍点、对白、核验或处置流程。"
+            "自然排版与句式跟随样本读感变化，不执行固定换行、固定短句、固定对白数量或六种主叙事模式。"
+            "章首从上一章触发后的新变量开始，章末停在具体动作、对白、信息或后果。"
+            "严格输出六个分区：\n"
+            "【终稿正文】\n完整正文\n\n"
+            "【终稿验收】\n" + acceptance_schema + "\n\n"
+            "【实际提纲】\n6-10条概括终稿已发生内容\n\n"
+            "【本章摘要】\n简短概括核心事件与情绪变化\n\n"
+            "【本章需继承的关键事实】\n只写后文必须继承的变化\n\n"
+            "【长篇记忆更新】\n" + _long_form_update_contract_instructions(project or {}, chapter_index)
+        )
+    else:
+        severe_rescue_rewrite = bool(
+            rescue_from_candidate
+            and any(
+                reason.startswith("终稿正文长度明显偏离目标")
+                or reason.startswith("终稿结构同时向短碎方向漂移")
+                for reason in reasons
+            )
+        )
+        vocabulary_density_rescue = bool(
+            rescue_from_candidate
+            and any(
+                reason.startswith("终稿原生词密度明显高于样本")
+                for reason in reasons
+            )
+        )
+        if rescue_from_candidate:
+            if severe_rescue_rewrite:
+                task_heading = "【终稿整章压缩补救】"
+                task_rule = (
+                    "上一版终稿的剧情拍点、因果、人物状态和章末钩子必须全部保留，但原来的无效换行、"
+                    "重复问答、同义解释和模型化动作标签不是必须保留内容。当前长度和自然读感已经明显漂移，"
+                    "必须在本次交付中完成整章压缩重组：合并无效碎片与功能性问答，删除不产生新变量的复述，"
+                    "减少无必要台词；不能只做少量同义改写后原样交付，也不能新增解释、流程或事件。"
+                )
+            else:
+                task_heading = "【终稿局部补救】"
+                task_rule = (
+                    "以上一版终稿为底稿，只修【已确认硬验收问题】列出的硬逻辑、剧情遗漏、明显重复或严重语言漂移。"
+                    "未被问题点涉及的剧情、因果、人物状态、自然段落和作者化表达全部保留；不重新规划，不新增解释、流程或事件。"
+                )
+        elif edit_candidate_in_place:
+            task_heading = "【合格底稿轻量校准】"
+            task_rule = (
+                "当前备用正文的剧情与整体读感已经可用，以它为底稿；允许原样保留合格内容，只校准确有必要的人物口吻、"
+                "作者习惯措辞、重复解释和硬逻辑。不得为了留下修改痕迹而拆段、补对白、重排剧情或从零重写。"
+            )
+        elif execution:
+            task_heading = "【仿写终稿任务】"
+            task_rule = (
+                "根据【剧情执行清单】从零写出完整终稿。清单只规定已经确定的剧情事实、顺序和边界，不是正文措辞或段落模板；"
+                "把相邻拍点组织成自然场景，完整落实必须发生与结束变化，不复播上一章结尾，不遗漏前置动作，也不新增提纲外流程。"
+            )
+        else:
+            task_heading = "【首次正文轻量审校】"
+            task_rule = (
+                "以【首次正文】为底稿，只修硬逻辑、剧情遗漏、明显重复和严重语言漂移；不为段落排版指标重排整章。"
+            )
+        instruction = (
+            task_heading + "\n" + task_rule
+            + (
+                "【原生词密度补救】必须按已确认问题中的具体次数逐项降低，并在交付前重新统计【作者原生用词池】的全部词。"
+                "每项最多保留到该词软上沿再自然多一次；不能把删掉的超密词换成另一个原生词、同义动作标签或判断词，"
+                "也不能通过拆句让同一表达重复出现。语义不需要标签时直接省去，必要处保留，不改变剧情。"
+                if vocabulary_density_rescue else ""
+            )
+            + "正文写法以作者样本、人物口吻、习惯词和自然口语为最高标准；优先用选择、动作、关系回应和后果推进，"
+            "压缩程序过程、专业说明、同义确认、机械总结和替人物讲道理。"
+            "当前状态快照、下一章记忆选择和未决任务只约束连续性，不是本章待办；当前提纲未明确安排的事项必须保持未决，"
+            "不得扩成拍点、对白、核验或处置流程。"
+            "本章主线不是调查推理时，关于‘能证明什么/不能证明什么’、隐私规则或查询范围最多完整出现一处；"
+            "机构人物只承担一个改变结果的动作，不能形成流程辩论。"
+            + delivery_audit_text
+            + "本次只负责小说正文，不生成或修改长期记忆资料。"
+            "严格只输出【终稿正文】和【终稿验收】两个分区；验收JSON为："
+            + acceptance_schema
         )
     candidate_limit = 24000
-    source_text = draft if rescue_from_candidate else (execution or draft)
+    source_text = draft if (rescue_from_candidate or edit_candidate_in_place) else (execution or draft)
     if len(source_text) > candidate_limit:
         half = (candidate_limit - 20) // 2
         source_text = source_text[:half] + "\n……（中段已截断）……\n" + source_text[-half:]
     leading_blocks = [
         f"【终稿剧情验收清单】\n{plot_acceptance}" if plot_acceptance else "",
         f"【文风重复与推进边界】\n{repetition_boundary}",
-        f"【完整样本本地结构目标】\n{reference_profile}" if reference_profile else "",
-        f"【备用正文的本地检测结果｜终稿必须纠正】\n{reason_text}" if execution else
-        f"【首次正文的本地检测结果】\n{reason_text}",
+        f"【作者原生用词池｜优先替换AI默认措辞】\n{native_vocabulary}" if native_vocabulary else "",
+        f"【最近章节原生用词密度｜只作软校准】\n{recent_vocabulary}" if recent_vocabulary else "",
+        f"【完整样本文风语言参考｜段落排版指标已删除】\n{reference_profile}" if reference_profile else "",
+        f"【已确认硬验收问题｜只修这些问题】\n{reason_text}" if rescue_from_candidate and reason_text else "",
         f"【上次终稿｜保留剧情，只修验收问题】\n{source_text}" if rescue_from_candidate else
+        f"【结构已通过的备用正文底稿｜保留剧情与自然段落，只做必要校准】\n{source_text}" if edit_candidate_in_place else
         f"【剧情执行清单｜只继承事实与顺序，必须从零写作】\n{source_text}" if execution else
         f"【首次正文】\n{source_text}",
         f"【本章声纹执行表｜必须逐项落实】\n{chapter_style_plan}" if chapter_style_plan else "",
         f"【本章选定功能片段卡｜只模仿写法，不复制内容】\n{selected_cards_text}" if selected_cards_text else "",
     ]
-    trailing_blocks = [instruction]
+    trailing_blocks = [
+        instruction,
+        "【自然表达边界】\n" + _natural_expression_guidance(),
+    ]
     index_text = str(memory_selection_index or "").strip() if include_memory else ""
     if index_text:
         base_fixed_length = sum(
@@ -5898,7 +9919,14 @@ def _parse_style_finalize_result(value):
         end = matches[index + 1].start() if index + 1 < len(matches) else len(text)
         sections[match.group(1)] = text[match.end():end].strip()
     body = sections.get("终稿正文", "")
-    parsed = bool(body and all(title in sections for title in headings))
+    acceptance = _parse_style_finalize_acceptance(
+        sections.get("终稿验收", "")
+    )
+    # The independent memory-finalize call owns the outline, summary, facts,
+    # and state transaction. A body plus a parseable acceptance block is
+    # therefore a usable style result even when the vendor omits those extra
+    # sections from this response.
+    parsed = bool(body and acceptance)
     if not body and text and not matches:
         body = text
     return {
@@ -5906,9 +9934,7 @@ def _parse_style_finalize_result(value):
         "outline": sections.get("实际提纲", ""),
         "summary": sections.get("本章摘要", ""),
         "key_facts": sections.get("本章需继承的关键事实", ""),
-        "acceptance": _parse_style_finalize_acceptance(
-            sections.get("终稿验收", "")
-        ),
+        "acceptance": acceptance,
         "memory_update": _parse_long_form_memory_update(
             "【长篇记忆更新】\n" + sections.get("长篇记忆更新", "")
             if sections.get("长篇记忆更新", "") else ""
@@ -5943,6 +9969,14 @@ def _style_candidate_rank(style_reference, candidate, output_target=0):
         distance += relative_gap(structure["sentence_median"], reference["sentence_median"]) * 2.0
         distance += abs(structure["dialogue_char_pct"] - reference["dialogue_char_pct"]) / 100 * 1.5
         distance += abs(structure["dialogue_paragraph_pct"] - reference["dialogue_paragraph_pct"]) / 100
+        distance += relative_gap(
+            structure["dialogue_turns_per_1000"],
+            reference["dialogue_turns_per_1000"],
+        ) * 1.5
+        distance += relative_gap(
+            structure["short_dialogue_turns_per_1000"],
+            reference["short_dialogue_turns_per_1000"],
+        ) * 1.5
     return (round(invalid_penalty + distance, 6),)
 
 
@@ -5969,29 +10003,9 @@ def _build_style_rewrite_context(
     candidate = str(draft_text or "").strip()
     reason_lines = "\n".join(f"- {reason}" for reason in reasons if str(reason or "").strip())
     target = int(output_target or 0) or _style_output_target_from_context(original)
-    reference = _style_text_structure(style_reference)
     hard_targets = []
     if target:
         hard_targets.append(f"正文总字数控制在约{round(target * 0.85)}-{round(target * 1.15)}字")
-    if target and reference["chars"] >= 500:
-        expected_paragraphs = reference["paragraphs_per_1000"] * target / 1000
-        paragraph_low = max(1, round(expected_paragraphs * 0.88))
-        paragraph_high = max(paragraph_low, round(expected_paragraphs * 1.12))
-        expected_long = expected_paragraphs * reference["long_paragraph_pct"] / 100
-        long_low = max(1, round(expected_long * 0.70)) if reference["long_paragraph_pct"] >= 5 else 0
-        long_high = max(long_low, round(expected_long * 1.30)) if long_low else 0
-        hard_targets.extend([
-            f"非空段落总数控制在约{paragraph_low}-{paragraph_high}段",
-            f"段落长度中位数接近{reference['paragraph_median']}字",
-            f"15字以内短段占比接近{reference['short_paragraph_pct']:.0f}%",
-            (
-                f"80字以上中长段至少约{long_low}-{long_high}段"
-                if long_low else
-                "按样本比例安排中长段"
-            ),
-            f"句子长度中位数接近{reference['sentence_median']}字",
-            f"对白字数占比接近{reference['dialogue_char_pct']:.0f}%",
-        ])
     hard_target_text = "\n".join(f"- {item}" for item in hard_targets)
     ledger = str(plot_ledger or "").strip()
     instruction = (
@@ -6003,12 +10017,12 @@ def _build_style_rewrite_context(
             if ledger else ""
         )
         +
-        f"检测到的偏差：\n{reason_lines or '- 整体结构与样本偏差明显'}\n"
+        f"检测到的偏差：\n{reason_lines or '- 整体读感与样本偏差明显'}\n"
         + (f"本次硬性验收范围：\n{hard_target_text}\n" if hard_target_text else "")
         +
-        "上述硬性范围是通过门槛，输出前必须静默统计；任何一项未达到就先自行重写，不要提交不合格结果。"
+        "上述硬性范围是通过门槛；任何一项未达到就先自行重写，不要提交不合格结果。"
         "不得用简单合并换行应付验收；需要同步调整习惯用词、句式框架、说话标签、不同人物的对白声纹、"
-        "叙述与对白衔接、背景铺陈和长短段穿插。"
+        "叙述与对白衔接、背景铺陈和自然排版读感。"
         "样本反复使用且适合当前语境的词应原样沿用，不得用模型默认同义词替换；局部词不得硬塞或集中堆砌。"
         "只输出重写后的完整正文，不输出标题、说明、分析、指标或修改记录。"
     )
@@ -6016,7 +10030,7 @@ def _build_style_rewrite_context(
     style_start = original.find(style_marker)
     if style_start >= 0:
         base_context = original[:style_start].strip()
-        style_context = original[style_start:].strip()
+        style_context = _remove_style_layout_metrics(original[style_start:].strip())
     else:
         base_context = original
         style_context = ""
@@ -6041,7 +10055,7 @@ def _build_style_rewrite_context(
     return "\n\n".join(parts)[:int(limit or NOVEL_AI_CONTEXT_LIMIT)]
 
 
-def _build_style_reference_profile(style_reference, output_target=0):
+def _build_style_reference_profile(style_reference, output_target=0, include_structure=True):
     structure = _style_text_structure(style_reference)
     text = structure["text"]
     paragraphs = structure["paragraphs"]
@@ -6103,6 +10117,38 @@ def _build_style_reference_profile(style_reference, output_target=0):
         "怎么", "为什么", "凭什么", "不对", "等等", "算了",
     )
     dialogue_particle_counts = ranked_terms(dialogue_particles, dialogue_compact, minimum=2, limit=10)
+
+    if not include_structure:
+        language_lines = [
+            f"样本文风语言画像（段落排版指标已删除，只保留用词、口吻、动作反应和说话习惯）：样本约{total_chars}字。",
+        ]
+        if total_chars < 500:
+            language_lines.append("样本不足500字，只以样本原文的口吻、句式和表达习惯为准。")
+            return "\n".join(language_lines)
+        if connector_counts:
+            language_lines.append(
+                "高频连接/判断词："
+                + "、".join(term for term, _ in connector_counts[:12])
+                + "。保留作者真实的重复用词倾向，不要为了词汇变化强行换同义词。"
+            )
+        for label, terms in lexical_groups:
+            ranked = ranked_terms(terms, compact)
+            if ranked:
+                language_lines.append(
+                    f"{label}："
+                    + "、".join(term for term, _ in ranked)
+                    + "。只在样本对应的语境使用，不集中堆词。"
+                )
+        language_lines.append(
+            "对白高频口语/接话词："
+            + (
+                "、".join(term for term, _ in dialogue_particle_counts)
+                if dialogue_particle_counts else "未发现稳定高频项"
+            )
+            + "。角色按身份和情绪选择其中一部分，不能让所有人物共享全部口头习惯。"
+        )
+        language_lines.append("段落排版指标已从正文生成资料中删除；格式只按样本文本的自然读感跟随。")
+        return "\n".join(language_lines)
 
     lines = [
         f"样本结构画像（根据当前样本实时计算，不是固定文风模板）：样本约{total_chars}字，共{len(paragraphs)}个非空段落。",
@@ -6414,6 +10460,11 @@ def _long_form_issued_state_ids(project, memory=None):
     issued = memory.get("issued_state_ids", {})
     issued = issued if isinstance(issued, dict) else {}
     result = {
+        "objects": {
+            str(value or "").strip()
+            for value in issued.get("objects", [])
+            if str(value or "").strip()
+        },
         "conflicts": {
             str(value or "").strip()
             for value in issued.get("conflicts", [])
@@ -6426,6 +10477,7 @@ def _long_form_issued_state_ids(project, memory=None):
         },
     }
     existing = _long_form_existing_state_refs(project, memory)
+    result["objects"].update(existing["object_key_by_compact"].values())
     result["conflicts"].update(existing["conflict_ids"])
     result["tasks"].update(existing["task_ids"])
     for chapter in project.get("chapters", []) if isinstance(project.get("chapters"), list) else []:
@@ -6433,6 +10485,11 @@ def _long_form_issued_state_ids(project, memory=None):
             continue
         reconciliation = chapter.get("state_reconciliation", {})
         reconciliation = reconciliation if isinstance(reconciliation, dict) else {}
+        result["objects"].update(
+            str(value or "").strip()
+            for value in reconciliation.get("object_keys", [])
+            if str(value or "").strip()
+        )
         result["conflicts"].update(
             str(value or "").strip()
             for value in reconciliation.get("conflict_ids", [])
@@ -6445,6 +10502,11 @@ def _long_form_issued_state_ids(project, memory=None):
         )
         lifecycle = chapter.get("state_lifecycle_review", {})
         lifecycle = lifecycle if isinstance(lifecycle, dict) else {}
+        result["objects"].update(
+            str(value or "").strip()
+            for value in lifecycle.get("reviewed_object_keys", [])
+            if str(value or "").strip()
+        )
         result["conflicts"].update(
             str(value or "").strip()
             for value in lifecycle.get("reviewed_conflict_ids", [])
@@ -6458,6 +10520,11 @@ def _long_form_issued_state_ids(project, memory=None):
         for event in chapter.get("long_term_events", []) if isinstance(chapter.get("long_term_events"), list) else []:
             storage = event.get("storage", {}) if isinstance(event, dict) else {}
             storage = storage if isinstance(storage, dict) else {}
+            result["objects"].update(
+                str(value or "").strip()
+                for value in storage.get("object_keys", [])
+                if str(value or "").strip()
+            )
             result["conflicts"].update(
                 str(value or "").strip()
                 for value in storage.get("conflict_ids", [])
@@ -6468,6 +10535,13 @@ def _long_form_issued_state_ids(project, memory=None):
                 for value in storage.get("task_ids", [])
                 if str(value or "").strip()
             )
+        selection = chapter.get("memory_selection", {})
+        selection = selection if isinstance(selection, dict) else {}
+        result["objects"].update(
+            str(value or "").strip()
+            for value in selection.get("object_keys", [])
+            if str(value or "").strip()
+        )
     return result
 
 
@@ -6928,6 +11002,97 @@ def _resolve_long_form_record_ref(project, kind, value):
     return ""
 
 
+def _repair_invalid_long_form_record_refs_by_name(project, update):
+    """Replace invented opaque refs only when an exact record name is unique."""
+    project = project if isinstance(project, dict) else {}
+    payload = deepcopy(update) if isinstance(update, dict) else {}
+    reference_maps = _long_form_record_reference_maps(project)
+    project_keys = {
+        "characters": "characters",
+        "lore": "lore",
+        "foreshadows": "foreshadow_items",
+    }
+    unique_names = {}
+    for kind, project_key in project_keys.items():
+        by_name = {}
+        for item in project.get(project_key, []) if isinstance(project.get(project_key), list) else []:
+            if not isinstance(item, dict):
+                continue
+            item_id = str(item.get("id", "") or "").strip()
+            name = str(item.get("name", "") or "").strip()
+            key = _compact_text(
+                _clean_foreshadow_name(name) if kind == "foreshadows" else name
+            ).casefold()
+            if item_id and key:
+                by_name.setdefault(key, set()).add(item_id)
+        unique_names[kind] = {
+            key: next(iter(ids)) for key, ids in by_name.items() if len(ids) == 1
+        }
+
+    candidates = {}
+
+    def remember(kind, ref, name):
+        ref = str(ref or "").strip()
+        name = str(name or "").strip()
+        if not ref or not name or _resolve_long_form_record_ref(project, kind, ref):
+            return
+        name_key = _compact_text(
+            _clean_foreshadow_name(name) if kind == "foreshadows" else name
+        ).casefold()
+        item_id = unique_names.get(kind, {}).get(name_key, "")
+        alias = reference_maps.get(kind, {}).get("id_to_alias", {}).get(item_id, "")
+        if alias:
+            candidates.setdefault(ref, set()).add(alias)
+
+    state_patch = payload.get("state_patch", {})
+    state_patch = state_patch if isinstance(state_patch, dict) else {}
+    for item in state_patch.get("character_states", []) if isinstance(state_patch.get("character_states"), list) else []:
+        if isinstance(item, dict):
+            remember(
+                "characters",
+                item.get("ref", item.get("character_id", "")),
+                item.get("name", item.get("character_name", "")),
+            )
+
+    record_updates = payload.get("record_updates", {})
+    record_updates = record_updates if isinstance(record_updates, dict) else {}
+    for kind in ("characters", "lore"):
+        for item in record_updates.get(kind, []) if isinstance(record_updates.get(kind), list) else []:
+            if not isinstance(item, dict):
+                continue
+            remember(
+                kind,
+                item.get("ref", item.get("id", "")),
+                item.get("name", item.get("character_name", item.get("lore_name", ""))),
+            )
+    for item in payload.get("foreshadow_updates", []) if isinstance(payload.get("foreshadow_updates"), list) else []:
+        if isinstance(item, dict):
+            remember(
+                "foreshadows",
+                item.get("ref", item.get("id", "")),
+                item.get("name", item.get("foreshadow_name", "")),
+            )
+
+    replacements = {
+        ref: next(iter(aliases))
+        for ref, aliases in candidates.items()
+        if len(aliases) == 1
+    }
+    if not replacements:
+        return payload
+
+    def replace_refs(value):
+        if isinstance(value, dict):
+            return {key: replace_refs(item) for key, item in value.items()}
+        if isinstance(value, list):
+            return [replace_refs(item) for item in value]
+        if isinstance(value, str):
+            return replacements.get(value, value)
+        return value
+
+    return replace_refs(payload)
+
+
 def _chapter_outline_named_lore_refs(project, chapter_index):
     project = project if isinstance(project, dict) else {}
     chapters = project.get("chapters", []) if isinstance(project.get("chapters"), list) else []
@@ -7319,10 +11484,8 @@ def _parse_long_form_memory_update(value):
     start = text.find("{")
     if start < 0:
         return {}
-    repaired = False
-    try:
-        data = json.loads(text[start:])
-    except Exception:
+    data, repaired = _load_json_with_single_missing_quote_repair(text[start:])
+    if data is None:
         try:
             data, offset = json.JSONDecoder().raw_decode(text[start:])
             trailing = text[start + offset:].strip()
@@ -7356,6 +11519,9 @@ def _parse_long_form_memory_update(value):
         "next_chapter_memory",
         "schema_version",
         "base_revision",
+        "compact_delta_version",
+        "output_mode",
+        "verification",
     ):
         if key not in update and key in data:
             update[key] = deepcopy(data[key])
@@ -7484,7 +11650,7 @@ def _long_form_update_contract_example(project, chapter_index):
                     "operation": "update|create",
                     "ref": "更新填C引用；新增留空",
                     "key": "新增临时键NC1",
-                    "name": "新增时填写稳定姓名",
+                    "name": "新增时填写稳定姓名；临时人物升级时填写正文明确的新姓名",
                     "state": "当前动态状态，不重写永久身份、长期目标、秘密或语言",
                     "changes": ["本章长期变化"],
                     "canon": {"role": "仅新增时填写", "goal": "", "secret": "", "voice": "", "notes": ""},
@@ -7535,7 +11701,183 @@ def _long_form_update_contract_example(project, chapter_index):
     }
 
 
-def _long_form_update_contract_instructions(project, chapter_index):
+def _long_form_compact_update_contract_instructions(project, chapter_index):
+    project = project if isinstance(project, dict) else {}
+    memory = _normalize_long_form_memory(project.get("long_form_memory", {}))
+    chapters = project.get("chapters", []) if isinstance(project.get("chapters"), list) else []
+    chapter = (
+        chapters[chapter_index]
+        if 0 <= chapter_index < len(chapters) and isinstance(chapters[chapter_index], dict)
+        else {}
+    )
+    selection = chapter.get("memory_selection", {})
+    selection = selection if isinstance(selection, dict) else {}
+    existing_fact_ids = {
+        str(item.get("id", "") or "").strip()
+        for item in memory.get("active_facts", [])
+        if isinstance(item, dict) and str(item.get("id", "") or "").strip()
+    }
+    required_fact_refs = sorted({
+        str(value or "").strip()
+        for value in selection.get("fact_ids", [])
+        if str(value or "").strip() in existing_fact_ids
+    })
+    existing_state_refs = _long_form_existing_state_refs(project, memory)
+    required_objects = []
+    for value in selection.get("object_keys", []) if isinstance(selection.get("object_keys"), list) else []:
+        canonical = existing_state_refs["object_key_by_compact"].get(_compact_text(value), "")
+        if canonical and canonical not in required_objects:
+            required_objects.append(canonical)
+    required_conflicts = sorted({
+        str(value or "").strip()
+        for value in selection.get("conflict_ids", [])
+        if str(value or "").strip() in existing_state_refs["conflict_ids"]
+    })
+    required_tasks = sorted({
+        str(value or "").strip()
+        for value in selection.get("task_ids", [])
+        if str(value or "").strip() in existing_state_refs["task_ids"]
+    })
+    outlined_lore_ids = _chapter_outline_named_lore_refs(project, chapter_index)
+    lore_aliases = _long_form_record_reference_maps(project).get("lore", {}).get(
+        "id_to_alias", {}
+    )
+    outlined_lore_refs = sorted(
+        lore_aliases.get(item_id, item_id) for item_id in outlined_lore_ids
+    )
+    stage_boundary = (chapter_index + 1) % 10 == 0
+    catalog_summary = json.dumps(
+        _long_form_catalog_summary(_long_form_active_catalog(project, memory)),
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+    example = {
+        "schema_version": 2,
+        "base_revision": int(memory.get("revision", 0) or 0),
+        "compact_delta_version": LONG_FORM_COMPACT_DELTA_VERSION,
+        "state_patch": {
+            "story_time": "",
+            "location": "",
+            "character_states": [],
+            "relationship_states": [],
+            "object_states": [],
+            "active_conflicts": [],
+            "unresolved_tasks": [],
+            "notes": "",
+        },
+        "state_retirements": {
+            "character_refs": [],
+            "relationship_refs": [],
+            "object_keys": [],
+            "conflict_ids": [],
+            "task_ids": [],
+        },
+        "fact_updates": [],
+        "record_updates": {"characters": [], "lore": []},
+        "foreshadow_updates": [],
+        "long_term_events": [],
+        "current_chapter_character_refs": [],
+        "stage_archive": ({
+            "summary": "最近十章阶段成果",
+            "irreversible_facts": [],
+            "relationship_changes": [],
+            "unresolved_threads": [],
+            "next_stage_entry": "下一阶段承接点",
+        } if stage_boundary else None),
+        "next_chapter_memory": {
+            "character_refs": [],
+            "lore_refs": [],
+            "foreshadow_refs": [],
+            "fact_refs": [],
+            "stage_archive_refs": ["CURRENT_STAGE"] if stage_boundary else [],
+            "object_keys": [],
+            "conflict_refs": [],
+            "task_refs": [],
+            "reason": "",
+        },
+        "verification": {
+            "checked": True,
+            "coverage_checks": {
+                "named_character_actions": True,
+                "state_changes": True,
+                "evidence_and_unknowns": True,
+                "mechanism_claims_match_body": True,
+                "rules_and_boundaries": True,
+                "foreshadow_and_ending": True,
+            },
+            "runtime_unchanged": {
+                "lore_refs": [],
+                "foreshadow_refs": [],
+            },
+            "resolved_contradictions": [],
+            "notes": "",
+        },
+    }
+    required_state_text = json.dumps({
+        "object_keys": required_objects,
+        "conflict_refs": required_conflicts,
+        "task_refs": required_tasks,
+    }, ensure_ascii=False, separators=(",", ":"))
+    return (
+        "只输出版本2长篇记忆增量的紧凑语义格式。这是严格增量，不是全量总结。"
+        "AI仍负责判断发生了什么、哪些旧状态改变或退出、证据是什么、"
+        "哪些资料传给下一章；程序只根据这些显式决定补齐重复的生命周期数组、核对引用和存储索引。"
+        "不得输出fact_lifecycle_review、state_lifecycle_review、state_reconciliation或完整旧状态，它们由程序机械生成。"
+        "程序生成的fact_lifecycle_review.scope和state_lifecycle_review.scope必须为"
+        f"{LONG_FORM_STAGE_REVIEW_SCOPE if stage_boundary else 'current_chapter'}。"
+        "未出现在增量里的旧资料默认保留并原样继承；只有fact_updates的retire/supersede和state_retirements可以退出旧状态。"
+        "十章边界全部未触及状态由程序原样继承，并按数量和SHA256核验。"
+        f"fact_updates最多{LONG_FORM_MAX_FACT_UPDATES}项，long_term_events最多{LONG_FORM_MAX_LONG_TERM_EVENTS}项，"
+        f"人物、设定、伏笔更新每类最多{LONG_FORM_MAX_RECORD_UPDATES}项，state_patch各数组最多{LONG_FORM_MAX_STATE_ITEMS}项。"
+        "相同语义必须合并，不得在多个同类条目中重复表达。普通章节建议fact_updates 1-4项、long_term_events 1-3项，"
+        "但完整性高于建议数量。JSON应使用紧凑格式，不缩进、不输出空白说明；普通章节目标总长度不超过7000字。"
+        "核对、封存、编号、取样、审批、交接、见证、记录固定和责任说明等一次性操作，默认不构成跨章记忆。"
+        "只有后文必须使用同一批次、准确持有人、访问权限、未完成任务或该操作本身就是伏笔时才单独保存；"
+        "否则把过程合并进它造成的最终结果，不得逐步拆成事实、事件、物件和任务。"
+        "fact_updates的operation只能是add/keep/update/retire/supersede。add和supersede使用NF临时key；"
+        "update/retire/supersede必须填写已有AF-ID、原scope，retire/supersede还要逐字填写previous_fact和reason。"
+        "scope改变、主体改变或资料类型改变时必须add，不能借用旧事实ID。"
+        "不能因为新增了一条更宽泛的概括而退役精确旧事实；仍有效的精确旧事实必须继续保留。"
+        "本章选择索引中未发生变化的已有事实由程序自动保留并生成复核索引，不得为它们输出keep；"
+        "fact_updates只提交正文明确新增、更新、退出或取代的事实。"
+        "record_updates只写人物或设定的动态变化；普通update不得修改canon，create使用NC/NL临时key并填写稳定名称和canon。"
+        "但已有姓名未明或临时称谓人物正式命名时，同一update允许在canon中填写正文明确的新身份资料；程序只补齐空字段，不覆盖已有永久资料。"
+        "如果正文把已有的姓名未明或临时称谓人物正式命名，必须沿用原人物ref并用update填写name为正式姓名，"
+        "不得新建第二张人物卡；只有正文没有对应旧人物时才create。"
+        "不得改写导入的人物卡、设定定义或伏笔计划。新增记录不要生成真实ID，真实ID由程序分配。"
+        "foreshadow_updates只写本章实际埋设、推进、回收或废弃的伏笔；create使用NT临时key。"
+        "state_patch只写本章结束时新增或变化的时间、地点、人物、关系、物件、冲突和任务；"
+        "更新已有冲突或任务必须填写真实ID及previous_conflict/previous_task，新增使用NCF/NTASK临时key。"
+        "所有非keep事实更新、人物/设定/伏笔更新以及state_patch变化都必须附最终正文中的8-60字连续逐字evidence_quote。"
+        "每个会影响后文的事件还必须进入long_term_events一次，并用storage明确指向fact_refs、character_refs、lore_refs、"
+        "foreshadow_refs、object_keys、conflict_refs或task_refs中的真实落点；同一证据涉及多个落点时合并为一个事件。"
+        "所有event及动态更新只能依据最终正文已经公开或明确发生的内容。疑似、可能、比喻、感官相似、来源不明和人物猜测"
+        "不得改成确定机制；原数量、范围、伤势程度、权限和未知边界必须保留。"
+        "不得只因提纲或项目资料出现该名称，就声称正文已经使用、确认或公开它。"
+        + _LONG_TERM_RECORD_CLASSIFICATION_RULES
+        + "current_chapter_character_refs必须列出本章实际行动、说话、来电或提供关键信息的已有/本次新增命名人物。"
+        "verification.checked及六项coverage_checks只能在逐段核对正文后写true。"
+        "verification.runtime_unchanged必须列出本章提纲或long_term_events触及、但正文没有改变运行态的设定和伏笔；"
+        "已经进入record_updates或foreshadow_updates的引用不要再列为unchanged。"
+        f"本章必须复核的已有事实为{json.dumps(required_fact_refs, ensure_ascii=False, separators=(',', ':'))}；"
+        f"必须复核的已有物件/冲突/任务为{required_state_text}；"
+        f"原提纲直接点名、必须给出更新或runtime_unchanged结论的设定ID为{json.dumps(outlined_lore_refs, ensure_ascii=False, separators=(',', ':'))}。"
+        "next_chapter_memory只选择下一章真正需要的引用和状态键；本章新增且会影响下一章的资料必须选入。"
+        "next_chapter_memory可直接使用本次新增的NC/NL/NT/NF临时key，真实ID仍由程序统一分配。"
+        + (
+            "本章是十章边界，stage_archive必须完整总结最近十章，并在需要承接时选择CURRENT_STAGE。"
+            if stage_boundary else
+            "本章不是十章边界，stage_archive必须为null。"
+        )
+        + f"当前全量集合只供程序核验，不得复制到输出：{catalog_summary}。"
+        + "base_revision必须原样填写当前修订号。以下对象必须作为顶层long_form_memory字段的值，不得把这些字段散落到顶层："
+        + json.dumps(example, ensure_ascii=False, separators=(",", ":"))
+    )
+
+
+def _long_form_update_contract_instructions(project, chapter_index, compact=False):
+    if compact:
+        return _long_form_compact_update_contract_instructions(project, chapter_index)
     project = project if isinstance(project, dict) else {}
     memory = _normalize_long_form_memory(project.get("long_form_memory", {}))
     stage_boundary = (int(chapter_index) + 1) % 10 == 0
@@ -7618,6 +11960,8 @@ def _long_form_update_contract_instructions(project, chapter_index):
         f"fact_updates最多{LONG_FORM_MAX_FACT_UPDATES}项，long_term_events最多{LONG_FORM_MAX_LONG_TERM_EVENTS}项，"
         f"人物/设定/伏笔更新每类最多{LONG_FORM_MAX_RECORD_UPDATES}项，state_patch各列表最多{LONG_FORM_MAX_STATE_ITEMS}项。"
         "若同一变化可归并为一条，必须合并；不要为了覆盖正文中的每个句子制造状态条目。"
+        "核对、封存、编号、取样、审批、交接、见证、记录固定和责任说明等一次性操作默认不跨章保存；"
+        "只有后文必须使用同一批次、持有人、权限、未完成任务或伏笔时才单独记录，否则只保留其最终剧情结果。"
         "人物、设定和伏笔更新必须使用【AI资料更新与下一章选择索引】中的C/L/F短引用；新增记录不要生成ID，只填写临时key，真实ID由程序分配。"
         "新增、修改或退出事实必须使用已有AF-ID或新增临时key；source_chapter_id由程序填写。"
         "事实operation只能是add/keep/update/retire/supersede：keep表示复核后继续有效；"
@@ -7648,7 +11992,8 @@ def _long_form_update_contract_instructions(project, chapter_index):
             if stage_boundary else
             "state_lifecycle_review.scope必须为current_chapter；复核本章已选及本章触及的物件、冲突和任务。"
         )
-        + "record_updates只记录动态状态和本章变化；canon只允许create时填写，update时必须为空。"
+        + "record_updates只记录动态状态和本章变化；canon通常只允许create时填写；已有临时人物正式命名时，update可附正文明确的新身份资料，程序只补齐空字段。"
+        "已有临时人物在正文中获得正式姓名时，必须用原ref加name完成同一ID升级；不能把正式姓名另建为新人物。"
         "所有fact_updates、record_updates和foreshadow_updates必须附带最终正文中连续逐字出现的8-60字evidence_quote。"
         "keep不改写事实，可不填evidence_quote；其余事实操作必须有逐字证据。"
         "state_patch只写本章新增或变化的状态，未变化项省略；已结束冲突、任务或对象必须放入state_retirements。"
@@ -7713,11 +12058,1148 @@ def _long_form_update_contract_instructions(project, chapter_index):
     )
 
 
+def _expand_compact_long_form_memory_update(project, chapter_index, update):
+    """Expand a semantic compact delta into the existing version-2 shape.
+
+    The model still supplies every semantic decision and evidence quote. The
+    fields synthesized here are deterministic mirrors used by validation,
+    storage, and the next-chapter selector.
+    """
+    payload = deepcopy(update) if isinstance(update, dict) else {}
+    marker = payload.get("compact_delta_version")
+    if marker != LONG_FORM_COMPACT_DELTA_VERSION and payload.get("output_mode") != "compact_delta_v1":
+        return payload
+
+    project = project if isinstance(project, dict) else {}
+    chapters = project.get("chapters", []) if isinstance(project.get("chapters"), list) else []
+    chapter = (
+        chapters[chapter_index]
+        if 0 <= chapter_index < len(chapters) and isinstance(chapters[chapter_index], dict)
+        else {}
+    )
+    memory = _normalize_long_form_memory(project.get("long_form_memory", {}))
+    selection = chapter.get("memory_selection", {}) if isinstance(chapter, dict) else {}
+    selection = selection if isinstance(selection, dict) else {}
+    existing_state_refs = _long_form_existing_state_refs(project, memory)
+    stage_scope = (
+        LONG_FORM_STAGE_REVIEW_SCOPE
+        if (chapter_index + 1) % 10 == 0
+        else "current_chapter"
+    )
+
+    def unique(values):
+        result = []
+        for value in values if isinstance(values, list) else []:
+            if isinstance(value, (dict, list)):
+                continue
+            text = str(value or "").strip()
+            if text and text not in result:
+                result.append(text)
+        return result
+
+    def append_ref(target, value):
+        if isinstance(value, (dict, list)):
+            return
+        text = str(value or "").strip()
+        if text and text not in target:
+            target.append(text)
+
+    state_patch = payload.get("state_patch", {})
+    state_patch = deepcopy(state_patch) if isinstance(state_patch, dict) else {}
+    retirements = payload.get("state_retirements", {})
+    retirements = deepcopy(retirements) if isinstance(retirements, dict) else {}
+    for key in (
+        "character_refs", "relationship_refs", "object_keys", "conflict_ids", "task_ids"
+    ):
+        retirements.setdefault(key, [])
+    payload["state_patch"] = state_patch
+    payload["state_retirements"] = retirements
+
+    record_updates = payload.get("record_updates", {})
+    record_updates = deepcopy(record_updates) if isinstance(record_updates, dict) else {}
+    record_updates.setdefault("characters", [])
+    record_updates.setdefault("lore", [])
+    payload["record_updates"] = record_updates
+    payload["foreshadow_updates"] = deepcopy(
+        payload.get("foreshadow_updates", [])
+        if isinstance(payload.get("foreshadow_updates", []), list)
+        else []
+    )
+
+    fact_updates = payload.get("fact_updates", [])
+    fact_updates = deepcopy(fact_updates) if isinstance(fact_updates, list) else []
+    payload["fact_updates"] = fact_updates
+
+    reviewed_fact_refs = unique(selection.get("fact_ids", []))
+    touched_fact_refs = []
+    reconciliation = {
+        "checked": False,
+        "coverage_checks": {},
+        "fact_refs": [],
+        "character_refs": [],
+        "lore_refs": [],
+        "foreshadow_refs": [],
+        "relationship_refs": [],
+        "object_keys": [],
+        "conflict_refs": [],
+        "task_refs": [],
+        "record_runtime_review": {},
+        "resolved_contradictions": [],
+        "notes": "",
+    }
+    event_refs = {
+        "fact_refs": [],
+        "character_refs": [],
+        "lore_refs": [],
+        "foreshadow_refs": [],
+        "object_keys": [],
+        "conflict_refs": [],
+        "task_refs": [],
+    }
+
+    for item in fact_updates:
+        if not isinstance(item, dict):
+            continue
+        operation = str(item.get("operation", "") or "").strip().lower()
+        ref = item.get("key", "") if operation in {"add", "supersede"} else item.get("id", "")
+        append_ref(reconciliation["fact_refs"], ref)
+        if operation != "keep" and str(ref or "").strip():
+            append_ref(touched_fact_refs, ref)
+        if operation not in {"add", "supersede"}:
+            append_ref(reviewed_fact_refs, item.get("id", ""))
+
+    def collect_record(kind, output_key):
+        for item in record_updates.get(kind, []) if isinstance(record_updates.get(kind), list) else []:
+            if not isinstance(item, dict):
+                continue
+            operation = str(item.get("operation", "") or "").strip().lower()
+            ref = item.get("key", "") if operation == "create" else item.get("ref", item.get("id", ""))
+            append_ref(reconciliation[output_key], ref)
+
+    collect_record("characters", "character_refs")
+    collect_record("lore", "lore_refs")
+    for item in payload["foreshadow_updates"]:
+        if not isinstance(item, dict):
+            continue
+        operation = str(item.get("operation", "") or "").strip().lower()
+        ref = item.get("key", "") if operation == "create" else item.get("ref", item.get("id", ""))
+        append_ref(reconciliation["foreshadow_refs"], ref)
+
+    for item in state_patch.get("character_states", []) if isinstance(state_patch.get("character_states"), list) else []:
+        if isinstance(item, dict):
+            append_ref(reconciliation["character_refs"], item.get("ref", item.get("character_id", "")))
+    for value in retirements.get("character_refs", []):
+        append_ref(reconciliation["character_refs"], value)
+    for item in state_patch.get("relationship_states", []) if isinstance(state_patch.get("relationship_states"), list) else []:
+        if not isinstance(item, dict):
+            continue
+        refs = item.get("refs", item.get("characters", []))
+        refs = refs if isinstance(refs, list) else str(refs or "").split("|")
+        refs = sorted(str(ref or "").strip() for ref in refs if str(ref or "").strip())
+        if len(refs) >= 2:
+            append_ref(reconciliation["relationship_refs"], "|".join(refs))
+    for value in retirements.get("relationship_refs", []):
+        refs = value if isinstance(value, list) else str(value or "").split("|")
+        refs = sorted(str(ref or "").strip() for ref in refs if str(ref or "").strip())
+        if len(refs) >= 2:
+            append_ref(reconciliation["relationship_refs"], "|".join(refs))
+    for item in state_patch.get("object_states", []) if isinstance(state_patch.get("object_states"), list) else []:
+        if not isinstance(item, dict):
+            continue
+        append_ref(reconciliation["lore_refs"], item.get("lore_ref", item.get("lore_id", "")))
+        append_ref(reconciliation["object_keys"], item.get("key", item.get("name", "")))
+    for value in retirements.get("object_keys", []):
+        append_ref(reconciliation["object_keys"], value)
+    for source_key, retirement_key, output_key in (
+        ("active_conflicts", "conflict_ids", "conflict_refs"),
+        ("unresolved_tasks", "task_ids", "task_refs"),
+    ):
+        for item in state_patch.get(source_key, []) if isinstance(state_patch.get(source_key), list) else []:
+            if isinstance(item, dict):
+                append_ref(reconciliation[output_key], item.get("id", "") or item.get("key", ""))
+        for value in retirements.get(retirement_key, []):
+            append_ref(reconciliation[output_key], value)
+
+    events = payload.get("long_term_events", [])
+    events = deepcopy(events) if isinstance(events, list) else []
+    for event in events:
+        if not isinstance(event, dict):
+            continue
+        storage = event.get("storage", {})
+        if not isinstance(storage, dict):
+            continue
+        for key in event_refs:
+            values = storage.get(key, [])
+            for value in values if isinstance(values, list) else []:
+                append_ref(event_refs[key], value)
+                append_ref(reconciliation[key], value)
+
+    # A lore named in the current outline is a required runtime review even if
+    # the chapter did not change it.
+    for ref in _chapter_outline_named_lore_refs(project, chapter_index):
+        append_ref(reconciliation["lore_refs"], ref)
+    for ref in payload.get("current_chapter_character_refs", []):
+        append_ref(reconciliation["character_refs"], ref)
+
+    verification = payload.get("verification", {})
+    verification = verification if isinstance(verification, dict) else {}
+    reconciliation["checked"] = verification.get("checked") is True
+    coverage_checks = verification.get("coverage_checks", {})
+    reconciliation["coverage_checks"] = (
+        deepcopy(coverage_checks) if isinstance(coverage_checks, dict) else {}
+    )
+    reconciliation["resolved_contradictions"] = unique(
+        verification.get("resolved_contradictions", [])
+    )
+    reconciliation["notes"] = str(verification.get("notes", "") or "").strip()
+    unchanged = verification.get("runtime_unchanged", {})
+    unchanged = unchanged if isinstance(unchanged, dict) else {}
+    unchanged_lore = unique(
+        verification.get("unchanged_lore_refs", unchanged.get("lore_refs", []))
+    )
+    unchanged_foreshadows = unique(
+        verification.get("unchanged_foreshadow_refs", unchanged.get("foreshadow_refs", []))
+    )
+    changed_lore = set()
+    for item in record_updates.get("lore", []) if isinstance(record_updates.get("lore"), list) else []:
+        if isinstance(item, dict):
+            operation = str(item.get("operation", "") or "").strip().lower()
+            ref = item.get("key", "") if operation == "create" else item.get("ref", item.get("id", ""))
+            resolved = _resolve_long_form_record_ref(project, "lore", ref) or str(ref or "").strip()
+            if resolved:
+                changed_lore.add(resolved)
+    changed_foreshadows = set()
+    for item in payload["foreshadow_updates"]:
+        if isinstance(item, dict):
+            operation = str(item.get("operation", "") or "").strip().lower()
+            ref = item.get("key", "") if operation == "create" else item.get("ref", item.get("id", ""))
+            resolved = _resolve_long_form_record_ref(project, "foreshadows", ref) or str(ref or "").strip()
+            if resolved:
+                changed_foreshadows.add(resolved)
+    required_lore = set(reconciliation["lore_refs"])
+    required_foreshadows = set(reconciliation["foreshadow_refs"])
+
+    def canonical_runtime_ref(kind, value):
+        text = str(value or "").strip()
+        return _resolve_long_form_record_ref(project, kind, text) or text
+
+    required_lore_canonical = {
+        canonical_runtime_ref("lore", value) for value in required_lore
+    }
+    required_foreshadows_canonical = {
+        canonical_runtime_ref("foreshadows", value) for value in required_foreshadows
+    }
+
+    def unchanged_runtime_refs(kind, required, required_canonical, changed, explicit):
+        result = []
+        seen = set()
+        for value in explicit:
+            canonical = canonical_runtime_ref(kind, value)
+            if canonical in required_canonical and canonical not in changed and canonical not in seen:
+                result.append(value)
+                seen.add(canonical)
+        # Every required reference is already marked as reviewed. If the
+        # compact delta contains no update for it, omission means unchanged;
+        # this is a structural mirror rather than a new semantic decision.
+        for value in sorted(required):
+            canonical = canonical_runtime_ref(kind, value)
+            if canonical and canonical not in changed and canonical not in seen:
+                result.append(value)
+                seen.add(canonical)
+        return result
+
+    reconciliation["record_runtime_review"] = {
+        "reviewed_lore_refs": sorted(required_lore),
+        "unchanged_lore_refs": unchanged_runtime_refs(
+            "lore",
+            required_lore,
+            required_lore_canonical,
+            changed_lore,
+            unchanged_lore,
+        ),
+        "reviewed_foreshadow_refs": sorted(required_foreshadows),
+        "unchanged_foreshadow_refs": unchanged_runtime_refs(
+            "foreshadows",
+            required_foreshadows,
+            required_foreshadows_canonical,
+            changed_foreshadows,
+            unchanged_foreshadows,
+        ),
+    }
+
+    # The lifecycle arrays are pure mirrors of the selected set plus explicit
+    # changes. Whether a selected item changed is still decided by the model's
+    # fact/state updates; omission means it remains unchanged.
+    existing_fact_ids = {
+        str(item.get("id", "") or "").strip()
+        for item in memory.get("active_facts", [])
+        if isinstance(item, dict) and str(item.get("id", "") or "").strip()
+    }
+    reviewed_fact_refs = [value for value in reviewed_fact_refs if value in existing_fact_ids]
+    for value in touched_fact_refs:
+        if value in existing_fact_ids:
+            append_ref(reviewed_fact_refs, value)
+    payload["fact_lifecycle_review"] = {
+        "scope": stage_scope,
+        "reviewed_refs": reviewed_fact_refs,
+        "notes": "由本章选择和显式事实更新生成结构复核索引",
+    }
+
+    def canonical_object(value):
+        return existing_state_refs["object_key_by_compact"].get(_compact_text(value), "")
+
+    reviewed_objects = []
+    for value in selection.get("object_keys", []):
+        canonical = canonical_object(value)
+        if canonical:
+            append_ref(reviewed_objects, canonical)
+    snapshot = memory.get("state_snapshot", {})
+    snapshot = snapshot if isinstance(snapshot, dict) else {}
+    existing_object_key_by_lore = {
+        str(item.get("lore_id", "") or "").strip(): str(
+            item.get("key", item.get("name", "")) or ""
+        ).strip()
+        for item in snapshot.get("object_states", [])
+        if isinstance(item, dict)
+        and str(item.get("lore_id", "") or "").strip()
+        and str(item.get("key", item.get("name", "")) or "").strip()
+    }
+    for item in state_patch.get("object_states", []) if isinstance(state_patch.get("object_states"), list) else []:
+        if not isinstance(item, dict):
+            continue
+        lore_id = _resolve_long_form_record_ref(
+            project,
+            "lore",
+            item.get("lore_ref", item.get("lore_id", "")),
+        )
+        if lore_id in existing_object_key_by_lore:
+            append_ref(reviewed_objects, existing_object_key_by_lore[lore_id])
+    for value in reconciliation["object_keys"]:
+        canonical = canonical_object(value)
+        if canonical:
+            append_ref(reviewed_objects, canonical)
+    reviewed_conflicts = [
+        value for value in unique(selection.get("conflict_ids", []))
+        if value in existing_state_refs["conflict_ids"]
+    ]
+    reviewed_tasks = [
+        value for value in unique(selection.get("task_ids", []))
+        if value in existing_state_refs["task_ids"]
+    ]
+    for value in reconciliation["conflict_refs"]:
+        if value in existing_state_refs["conflict_ids"]:
+            append_ref(reviewed_conflicts, value)
+    for value in reconciliation["task_refs"]:
+        if value in existing_state_refs["task_ids"]:
+            append_ref(reviewed_tasks, value)
+    payload["state_lifecycle_review"] = {
+        "scope": stage_scope,
+        "reviewed_object_keys": reviewed_objects,
+        "reviewed_conflict_refs": reviewed_conflicts,
+        "reviewed_task_refs": reviewed_tasks,
+        "notes": "由本章选择和显式状态更新生成结构复核索引",
+    }
+    payload["state_reconciliation"] = reconciliation
+    payload.pop("verification", None)
+    payload.pop("compact_delta_version", None)
+    payload.pop("output_mode", None)
+    return payload
+
+
+def _normalize_long_form_state_aliases(update):
+    """Normalize common model synonyms before validation and memory commit."""
+    payload = deepcopy(update) if isinstance(update, dict) else {}
+
+    def first_value(item, keys):
+        for key in keys:
+            value = item.get(key, "")
+            if isinstance(value, (list, dict)):
+                if value:
+                    return value
+                continue
+            if str(value or "").strip():
+                return value
+        return ""
+
+    def ref_list(value):
+        values = value if isinstance(value, list) else [value]
+        result = []
+        for raw in values:
+            for item in re.split(r"[|、,，;；\n]+", str(raw or "")):
+                item = item.strip()
+                if item and item not in result:
+                    result.append(item)
+        return result
+
+    had_state_patch = "state_patch" in payload
+    state_patch = payload.get("state_patch", {})
+    if isinstance(state_patch, dict):
+        state_patch = deepcopy(state_patch)
+        # Repair responses sometimes place these two state collections at the
+        # top level. They are structurally equivalent, but only the canonical
+        # state_patch location may be committed.
+        if not isinstance(state_patch.get("active_conflicts"), list):
+            conflicts = payload.get("conflicts")
+            if isinstance(conflicts, list):
+                state_patch["active_conflicts"] = deepcopy(conflicts)
+        if not isinstance(state_patch.get("unresolved_tasks"), list):
+            tasks = payload.get("tasks")
+            if isinstance(tasks, list):
+                state_patch["unresolved_tasks"] = deepcopy(tasks)
+        for item in state_patch.get("character_states", []) if isinstance(state_patch.get("character_states"), list) else []:
+            if not isinstance(item, dict):
+                continue
+            if not str(item.get("ref", "") or "").strip():
+                item["ref"] = first_value(
+                    item,
+                    (
+                        "character_ref", "character_id", "character", "stable_ref",
+                        "stable_id", "ref_id", "temp_key", "key",
+                    ),
+                )
+            if not str(item.get("state", "") or "").strip():
+                item["state"] = first_value(
+                    item,
+                    ("status", "dynamic", "runtime", "runtime_update", "change", "description"),
+                )
+            if not str(item.get("evidence_quote", "") or "").strip():
+                item["evidence_quote"] = first_value(item, ("evidence", "quote"))
+        for item in state_patch.get("relationship_states", []) if isinstance(state_patch.get("relationship_states"), list) else []:
+            if not isinstance(item, dict):
+                continue
+            refs = first_value(
+                item,
+                ("character_refs", "character_ids", "refs", "characters", "participants"),
+            )
+            if not refs:
+                relationship_ref = first_value(
+                    item,
+                    (
+                        "relationship_ref", "relationship_id", "relationship_key",
+                        "stable_ref", "stable_id", "temp_key", "key", "ref",
+                    ),
+                )
+                refs = re.findall(r"(?<![A-Za-z0-9])C\d{3}(?!\d)", str(relationship_ref or ""))
+            item["refs"] = ref_list(refs)
+            if not str(item.get("state", "") or "").strip():
+                item["state"] = first_value(
+                    item,
+                    ("status", "dynamic", "runtime", "runtime_update", "change", "description"),
+                )
+            if not str(item.get("evidence_quote", "") or "").strip():
+                item["evidence_quote"] = first_value(item, ("evidence", "quote"))
+        for item in state_patch.get("object_states", []) if isinstance(state_patch.get("object_states"), list) else []:
+            if not isinstance(item, dict):
+                continue
+            if not str(item.get("key", "") or "").strip():
+                item["key"] = first_value(
+                    item,
+                    ("object_key", "object_id", "stable_ref", "temp_key", "id", "name"),
+                )
+            if not str(item.get("lore_ref", "") or "").strip():
+                item["lore_ref"] = first_value(
+                    item,
+                    ("lore_ref", "lore_id", "setting_ref", "setting_id"),
+                )
+            if not str(item.get("state", "") or "").strip():
+                item["state"] = first_value(
+                    item,
+                    ("status", "dynamic", "runtime", "runtime_update", "change", "description"),
+                )
+            if not str(item.get("evidence_quote", "") or "").strip():
+                item["evidence_quote"] = first_value(item, ("evidence", "quote"))
+        for item in state_patch.get("active_conflicts", []) if isinstance(state_patch.get("active_conflicts"), list) else []:
+            if not isinstance(item, dict):
+                continue
+            conflict_ref = first_value(
+                item,
+                (
+                    "conflict_id", "conflict_ref", "conflict_key", "ref", "stable_ref",
+                    "stable_id", "temp_key", "key", "id",
+                ),
+            )
+            create_state = (
+                str(item.get("type", item.get("operation", "")) or "").strip().lower() == "create"
+                or str(conflict_ref or "").strip().upper().startswith("NCF")
+            )
+            if create_state:
+                if not str(item.get("key", "") or "").strip():
+                    item["key"] = conflict_ref
+                item["id"] = ""
+            elif not str(item.get("id", "") or "").strip():
+                item["id"] = conflict_ref
+            if not str(item.get("conflict", "") or "").strip():
+                item["conflict"] = first_value(
+                    item,
+                    ("status", "state", "change", "description", "title", "name"),
+                )
+            if not str(item.get("evidence_quote", "") or "").strip():
+                item["evidence_quote"] = first_value(item, ("evidence", "quote"))
+        for item in state_patch.get("unresolved_tasks", []) if isinstance(state_patch.get("unresolved_tasks"), list) else []:
+            if not isinstance(item, dict):
+                continue
+            task_ref = first_value(
+                item,
+                (
+                    "task_id", "task_ref", "task_key", "ref", "stable_ref", "stable_id",
+                    "temp_key", "key", "id",
+                ),
+            )
+            create_state = (
+                str(item.get("type", item.get("operation", "")) or "").strip().lower() == "create"
+                or str(task_ref or "").strip().upper().startswith("NTASK")
+            )
+            if create_state:
+                if not str(item.get("key", "") or "").strip():
+                    item["key"] = task_ref
+                item["id"] = ""
+            elif not str(item.get("id", "") or "").strip():
+                item["id"] = task_ref
+            if not str(item.get("task", "") or "").strip():
+                item["task"] = first_value(
+                    item,
+                    ("status", "state", "change", "description", "title", "name"),
+                )
+            if not str(item.get("evidence_quote", "") or "").strip():
+                item["evidence_quote"] = first_value(item, ("evidence", "quote"))
+        if had_state_patch or state_patch:
+            payload["state_patch"] = state_patch
+
+    # Models may treat an unchanged runtime reference as the review outcome
+    # without copying it into the reviewed list.  These arrays are a semantic
+    # pair: unchanged is a reviewed result, so make that equivalence explicit
+    # before validation and storage.
+    reconciliation = payload.get("state_reconciliation", {})
+    if isinstance(reconciliation, dict):
+        reconciliation = deepcopy(reconciliation)
+        runtime_review = reconciliation.get("record_runtime_review", {})
+        if isinstance(runtime_review, dict):
+            runtime_review = deepcopy(runtime_review)
+            for reviewed_key, unchanged_key in (
+                ("reviewed_lore_refs", "unchanged_lore_refs"),
+                ("reviewed_foreshadow_refs", "unchanged_foreshadow_refs"),
+            ):
+                reviewed = runtime_review.get(reviewed_key, [])
+                reviewed = reviewed if isinstance(reviewed, list) else []
+                seen = {
+                    str(value or "").strip()
+                    for value in reviewed
+                    if str(value or "").strip()
+                }
+                unchanged = runtime_review.get(unchanged_key, [])
+                for value in unchanged if isinstance(unchanged, list) else []:
+                    value = str(value or "").strip()
+                    if value and value not in seen:
+                        reviewed.append(value)
+                        seen.add(value)
+                runtime_review[reviewed_key] = reviewed
+            reconciliation["record_runtime_review"] = runtime_review
+        payload["state_reconciliation"] = reconciliation
+
+    retirements = payload.get("state_retirements", {})
+    if isinstance(retirements, dict):
+        retirements = deepcopy(retirements)
+        for target, aliases in (
+            ("character_refs", ("character_ids", "characters")),
+            ("relationship_refs", ("relationship_ids", "relationships")),
+            ("object_keys", ("object_refs", "object_ids", "objects")),
+            ("conflict_ids", ("conflict_refs", "conflicts")),
+            ("task_ids", ("task_refs", "tasks")),
+        ):
+            if not retirements.get(target):
+                value = first_value(retirements, aliases)
+                if value:
+                    retirements[target] = ref_list(value)
+        payload["state_retirements"] = retirements
+
+    record_updates = payload.get("record_updates", {})
+    if isinstance(record_updates, dict):
+        record_updates = deepcopy(record_updates)
+        if not isinstance(record_updates.get("characters"), list):
+            aliases = first_value(record_updates, ("character_updates", "character_states"))
+            if isinstance(aliases, list):
+                record_updates["characters"] = aliases
+        if not isinstance(record_updates.get("lore"), list):
+            aliases = first_value(record_updates, ("lore_updates", "setting_updates"))
+            if isinstance(aliases, list):
+                record_updates["lore"] = aliases
+        for kind in ("characters", "lore"):
+            raw_items = record_updates.get(kind)
+            if isinstance(raw_items, list):
+                record_updates[kind] = [
+                    item for item in raw_items
+                    if not (
+                        isinstance(item, dict)
+                        and str(item.get("operation", "") or "").strip().lower()
+                        in {"unchanged", "no_change", "keep", "retain"}
+                    )
+                ]
+            for item in record_updates.get(kind, []) if isinstance(record_updates.get(kind), list) else []:
+                if not isinstance(item, dict):
+                    continue
+                operation = str(item.get("operation", "") or "").strip().lower()
+                if operation in {"add", "new", "insert"}:
+                    operation = "create"
+                    item["operation"] = operation
+                elif operation in {"modify", "change", "patch"}:
+                    operation = "update"
+                    item["operation"] = operation
+                if not str(item.get("ref", "") or "").strip() and operation != "create":
+                    kind_specific_ref = (
+                        "character_id" if kind == "characters" else "lore_id"
+                    )
+                    item["ref"] = first_value(
+                        item,
+                        (
+                            "record_ref", "character_ref", "lore_ref", kind_specific_ref, "stable_ref",
+                            "stable_id", "ref_id", "temp_key", "id", "key",
+                        ),
+                    )
+                if kind == "characters" and operation != "create" and not str(item.get("name", "") or "").strip():
+                    item["name"] = first_value(
+                        item,
+                        (
+                            "new_name", "canonical_name", "display_name", "character_name",
+                            "stable_name", "record_name", "real_name",
+                        ),
+                    )
+                if operation == "create" and not str(item.get("key", "") or "").strip():
+                    item["key"] = first_value(
+                        item,
+                        (
+                            "record_key", "stable_ref", "stable_id", "temp_key", "id",
+                            "record_ref", "character_ref", "lore_ref", "ref",
+                        ),
+                    )
+                if operation == "create" and not str(item.get("name", "") or "").strip():
+                    item["name"] = first_value(
+                        item,
+                        (
+                            "record_name", "character_name", "lore_name", "stable_name",
+                            "title", "label",
+                        ),
+                    )
+                dynamic = first_value(item, (
+                    "state", "dynamic", "runtime", "runtime_update", "current_dynamic",
+                    "change",
+                    "latest_state", "new_state", "current_state", "state_update",
+                    "new_status", "status_update", "update", "content", "status",
+                    "description",
+                ))
+                if not dynamic:
+                    changes = item.get("changes", [])
+                    if isinstance(changes, str):
+                        dynamic = changes
+                    elif isinstance(changes, list):
+                        dynamic = "；".join(
+                            str(value or "").strip()
+                            for value in changes
+                            if str(value or "").strip()
+                        )
+                if not str(item.get("state", "") or "").strip():
+                    item["state"] = dynamic
+                if not item.get("changes") and dynamic:
+                    item["changes"] = [str(dynamic)]
+                if not str(item.get("evidence_quote", "") or "").strip():
+                    item["evidence_quote"] = first_value(item, ("evidence", "quote"))
+        payload["record_updates"] = record_updates
+
+    fact_updates = payload.get("fact_updates", [])
+    if "fact_updates" in payload and isinstance(fact_updates, list):
+        fact_updates = deepcopy(fact_updates)
+        for item in fact_updates:
+            if not isinstance(item, dict):
+                continue
+            operation = str(item.get("operation", "") or "").strip().lower()
+            if operation in {"create", "new", "insert"}:
+                operation = "add"
+                item["operation"] = operation
+            elif operation in {"modify", "change", "patch"}:
+                operation = "update"
+                item["operation"] = operation
+            elif operation in {"remove", "delete"}:
+                operation = "retire"
+                item["operation"] = operation
+            elif operation == "replace":
+                operation = "supersede"
+                item["operation"] = operation
+            if operation == "supersede":
+                if not str(item.get("id", "") or "").strip():
+                    item["id"] = first_value(
+                        item,
+                        (
+                            "fact_ref", "fact_id", "stable_ref", "stable_id", "ref_id", "ref",
+                            "supersedes", "supersedes_fact_id", "replaces", "replaced_fact_id",
+                        ),
+                    )
+                if not str(item.get("key", "") or "").strip():
+                    item["key"] = first_value(
+                        item,
+                        (
+                            "new_fact_key", "new_key", "fact_key", "temp_key", "stable_ref",
+                        ),
+                    )
+            elif operation == "add":
+                if not str(item.get("key", "") or "").strip():
+                    item["key"] = first_value(
+                        item,
+                        (
+                            "fact_ref", "fact_id", "fact_key", "stable_ref", "stable_id", "temp_key",
+                            "temp_id", "ref",
+                        ),
+                    )
+            elif operation in {"keep", "update", "retire"}:
+                if not str(item.get("id", "") or "").strip():
+                    item["id"] = first_value(
+                        item,
+                        (
+                            "fact_ref", "fact_id", "stable_ref", "stable_id", "ref_id",
+                            "temp_key", "ref", "key",
+                        ),
+                    )
+            if not str(item.get("fact", "") or "").strip():
+                item["fact"] = first_value(
+                    item,
+                    (
+                        "state", "content", "description", "current_fact",
+                        "new_fact", "update", "value",
+                    ),
+                )
+            if not str(item.get("evidence_quote", "") or "").strip():
+                item["evidence_quote"] = first_value(item, ("evidence", "quote"))
+        payload["fact_updates"] = fact_updates
+
+    foreshadow_updates = payload.get("foreshadow_updates", [])
+    if isinstance(foreshadow_updates, list):
+        foreshadow_updates = [
+            item for item in foreshadow_updates
+            if not (
+                isinstance(item, dict)
+                and str(item.get("operation", "") or "").strip().lower()
+                in {"unchanged", "no_change", "keep", "retain"}
+            )
+        ]
+        payload["foreshadow_updates"] = foreshadow_updates
+    for item in foreshadow_updates if isinstance(foreshadow_updates, list) else []:
+        if not isinstance(item, dict):
+            continue
+        operation = str(item.get("operation", "") or "").strip().lower()
+        if operation in {"add", "new", "insert"}:
+            operation = "create"
+            item["operation"] = operation
+        elif operation in {"modify", "change", "patch", "advance"}:
+            operation = "update"
+            item["operation"] = operation
+        if not str(item.get("ref", "") or "").strip() and str(
+            operation or ""
+        ).strip().lower() != "create":
+            item["ref"] = first_value(
+                item,
+                (
+                    "record_ref", "foreshadow_ref", "foreshadow_id", "stable_ref", "stable_id",
+                    "ref_id", "temp_key", "id", "key", "foreshadow_key",
+                ),
+            )
+        if operation == "create" and not str(
+            item.get("key", "") or ""
+        ).strip():
+            item["key"] = first_value(
+                item,
+                (
+                    "foreshadow_key", "record_ref", "foreshadow_ref", "stable_ref", "stable_id",
+                    "temp_key", "id", "ref",
+                ),
+            )
+        if not str(item.get("name", "") or "").strip():
+            item["name"] = first_value(
+                item,
+                ("title", "stable_name", "foreshadow_name", "label"),
+            )
+        if not str(item.get("description", "") or "").strip():
+            item["description"] = first_value(
+                item,
+                (
+                    "content", "foreshadow", "progress", "dynamic", "current_dynamic",
+                    "update", "detail", "text",
+                ),
+            )
+        if not str(item.get("remaining_secret", "") or "").strip():
+            remaining_secret = first_value(
+                item,
+                ("unrevealed", "unresolved", "remaining", "remaining_unknown"),
+            )
+            if remaining_secret:
+                item["remaining_secret"] = remaining_secret
+        dynamic = first_value(
+            item,
+            (
+                "state", "dynamic", "runtime", "runtime_update", "current_dynamic",
+                "change",
+                "progress", "content", "description", "status",
+            ),
+        )
+        if not str(item.get("state", "") or "").strip():
+            item["state"] = dynamic
+        raw_status = str(item.get("status", "") or "").strip()
+        normalized_status = _infer_foreshadow_status({"status": raw_status}, preserve_manual=False)
+        state_status = _infer_foreshadow_status(
+            {"status": item.get("state", "")},
+            preserve_manual=False,
+        )
+        if raw_status == "未埋" and state_status == "已埋":
+            normalized_status = "已埋"
+        if normalized_status:
+            item["status"] = normalized_status
+        # Both aliases and the canonical status may omit these two required
+        # boundaries. Reuse the model's own progress text; a truly empty
+        # update still fails validation instead of inventing a reveal.
+        if normalized_status in {"已埋", "已回收"}:
+            description = str(item.get("description", "") or "").strip()
+            progress = str(
+                item.get("progress", item.get("update", "")) or ""
+            ).strip()
+            source = (
+                progress or description or str(dynamic or "").strip()
+                or str(first_value(item, ("evidence_quote", "evidence", "quote")) or "").strip()
+            )
+            if source and not str(item.get("revealed", "") or "").strip():
+                item["revealed"] = source
+            if (
+                normalized_status == "已埋"
+                and source
+                and not str(item.get("remaining_secret", "") or "").strip()
+            ):
+                item["remaining_secret"] = (
+                    description
+                    if description and description != source
+                    else "该线索的具体来源、含义和后续真相仍未揭示。"
+                )
+            elif normalized_status == "已回收" and "remaining_secret" not in item:
+                item["remaining_secret"] = ""
+        if not str(item.get("evidence_quote", "") or "").strip():
+            item["evidence_quote"] = first_value(item, ("evidence", "quote"))
+
+    events = payload.get("long_term_events", [])
+    events = deepcopy(events if isinstance(events, list) else [])
+    for item in events:
+        if not isinstance(item, dict):
+            continue
+        if not str(item.get("event", "") or "").strip():
+            item["event"] = first_value(
+                item,
+                ("summary", "content", "description", "title"),
+            )
+        category = str(
+            item.get("category", "")
+            or first_value(item, ("event_category", "type", "kind", "event_type"))
+            or "other"
+        ).strip().lower()
+        category_aliases = {
+            "承诺": "commitment",
+            "证据": "evidence",
+            "能力边界": "ability_boundary",
+            "任务": "task",
+            "伏笔": "foreshadow",
+            "关键物件": "key_object",
+            "物件": "key_object",
+            "关系": "relationship",
+            "事实": "fact",
+            "剧情": "plot",
+            "情节": "plot",
+            "其他": "other",
+        }
+        category = category_aliases.get(category, category)
+        if category not in {
+            "commitment", "evidence", "ability_boundary", "task", "foreshadow",
+            "key_object", "relationship", "other", "fact", "plot",
+        }:
+            category = "other"
+        item["category"] = category
+        if not str(item.get("evidence_quote", "") or "").strip():
+            item["evidence_quote"] = first_value(item, ("evidence", "quote"))
+    payload["long_term_events"] = events
+
+    def normalize_evidence_fields(items):
+        for item in items if isinstance(items, list) else []:
+            if not isinstance(item, dict):
+                continue
+            for key in ("evidence_quote", "evidence", "quote"):
+                value = item.get(key)
+                if isinstance(value, str) and "\\n" in value:
+                    item[key] = value.replace("\\n", "\n").replace("\\r", "\r").replace("\\t", "\t")
+
+    normalize_evidence_fields(payload.get("fact_updates", []))
+    normalize_evidence_fields(payload.get("foreshadow_updates", []))
+    normalize_evidence_fields(payload.get("long_term_events", []))
+    record_updates = payload.get("record_updates", {})
+    if isinstance(record_updates, dict):
+        normalize_evidence_fields(record_updates.get("characters", []))
+        normalize_evidence_fields(record_updates.get("lore", []))
+    state_patch = payload.get("state_patch", {})
+    if isinstance(state_patch, dict):
+        for key in ("character_states", "relationship_states", "object_states", "active_conflicts", "unresolved_tasks"):
+            normalize_evidence_fields(state_patch.get(key, []))
+    return payload
+
+
+def _load_json_with_single_missing_quote_repair(value):
+    """Parse JSON and repair unambiguous missing string-closing quotes."""
+    text = str(value or "").strip()
+    try:
+        return json.loads(text), False
+    except Exception:
+        pass
+
+    # Some compatible APIs omit the ASCII closing quote of evidence_quote
+    # while preserving the following object delimiter. One response can contain
+    # several such omissions, so repair this exact structural shape in one pass.
+    evidence_quote_pattern = re.compile(
+        r'("evidence_quote"\s*:\s*")((?:\\.|[^"\\])*?)(?=}(?:,|\]))'
+    )
+    targeted = evidence_quote_pattern.sub(lambda match: match.group(0) + '"', text)
+    if targeted != text:
+        try:
+            data = json.loads(targeted)
+            if isinstance(data, dict):
+                return data, True
+        except Exception:
+            pass
+    else:
+        targeted = text
+
+    candidates = []
+    in_string = False
+    escaped = False
+    closing_marks = {"”", "’", "」", "』", "》"}
+    for index, char in enumerate(targeted):
+        if in_string:
+            if escaped:
+                escaped = False
+                continue
+            if char == "\\":
+                escaped = True
+                continue
+            if char == '"':
+                in_string = False
+                continue
+            if (
+                char in "}]"
+                and index > 0
+                and targeted[index - 1] in closing_marks
+            ):
+                candidates.append(targeted[:index] + '"' + targeted[index:])
+        elif char == '"':
+            in_string = True
+
+    repaired = []
+    for candidate in candidates:
+        try:
+            data = json.loads(candidate)
+        except Exception:
+            continue
+        if isinstance(data, dict):
+            repaired.append(data)
+            if len(repaired) > 1:
+                return None, False
+    return (repaired[0], True) if len(repaired) == 1 else (None, False)
+
+
+def _stable_long_form_fact_scope(fact):
+    """Create a collision-resistant technical scope when a model omits one."""
+    compact = _compact_text(fact)
+    if not compact:
+        return ""
+    digest = hashlib.sha256(compact.encode("utf-8")).hexdigest()[:16]
+    return f"auto_fact:{digest}"
+
+
+def _backfill_long_form_fact_scopes(memory):
+    """Give legacy facts a stable scope without guessing their narrative topic."""
+    if not isinstance(memory, dict):
+        return memory
+    facts = memory.get("active_facts", [])
+    if not isinstance(facts, list):
+        return memory
+    for item in facts:
+        if not isinstance(item, dict) or str(item.get("scope", "") or "").strip():
+            continue
+        item["scope"] = _stable_long_form_fact_scope(item.get("fact", ""))
+    return memory
+
+
+def _normalize_long_form_fact_update_scopes(project, payload):
+    """Fill omitted update scopes from an existing fact or stable fact text."""
+    if not isinstance(payload, dict):
+        return payload
+    memory = _backfill_long_form_fact_scopes(
+        _normalize_long_form_memory(
+            (project if isinstance(project, dict) else {}).get("long_form_memory", {})
+        )
+    )
+    by_id = {
+        str(item.get("id", "") or "").strip(): item
+        for item in memory.get("active_facts", [])
+        if isinstance(item, dict) and str(item.get("id", "") or "").strip()
+    }
+    by_fact = {
+        _compact_text(item.get("fact", "")): item
+        for item in memory.get("active_facts", [])
+        if isinstance(item, dict) and _compact_text(item.get("fact", ""))
+    }
+    updates = payload.get("fact_updates", [])
+    if not isinstance(updates, list):
+        return payload
+    for item in updates:
+        if not isinstance(item, dict):
+            continue
+        operation = str(item.get("operation", "") or "").strip().lower()
+        if operation not in {"add", "update", "retire", "supersede"}:
+            continue
+        if str(item.get("scope", "") or "").strip():
+            continue
+        existing = by_id.get(str(item.get("id", "") or "").strip())
+        if existing is None:
+            existing = by_fact.get(_compact_text(item.get("fact", "")))
+        scope = str(existing.get("scope", "") or "").strip() if existing else ""
+        if not scope:
+            scope = _stable_long_form_fact_scope(item.get("fact", ""))
+        if scope:
+            item["scope"] = scope
+    return payload
+
+
+def _normalize_long_form_ephemeral_actor_refs(project, payload):
+    """Keep untracked one-scene actors out of the chapter reference indexes.
+
+    This intentionally has a narrow scope.  It only removes a raw actor name
+    when that name appears *solely* in the convenience indexes which describe
+    who appeared in this chapter.  Once a response tries to persist a state,
+    relationship, retirement, or event link for the actor, strict validation
+    still rejects it and asks the model to create a formal character record.
+    """
+    if not isinstance(payload, dict):
+        return payload
+
+    record_updates = payload.get("record_updates", {})
+    record_updates = record_updates if isinstance(record_updates, dict) else {}
+    created_by_name = {}
+    created_keys = set()
+    for item in record_updates.get("characters", []) if isinstance(record_updates.get("characters"), list) else []:
+        if not isinstance(item, dict):
+            continue
+        if str(item.get("operation", "") or "").strip().lower() != "create":
+            continue
+        key = str(item.get("key", "") or "").strip()
+        name = _compact_text(item.get("name", "")).casefold()
+        if key:
+            created_keys.add(key)
+            if name:
+                created_by_name[name] = key
+
+    def normalize_character_ref(value):
+        raw = str(value or "").strip()
+        if not raw:
+            return ""
+        # Preserve established alias forms such as C001.  Other normalizers
+        # deliberately use those aliases throughout the compact state packet.
+        if _resolve_long_form_record_ref(project, "characters", raw):
+            return raw
+        if raw in created_keys:
+            return raw
+        return created_by_name.get(_compact_text(raw).casefold(), "")
+
+    def all_persistent_character_refs():
+        result = set()
+
+        def add(values):
+            for value in values if isinstance(values, list) else []:
+                raw = str(value or "").strip()
+                if raw:
+                    result.add(raw)
+
+        state_patch = payload.get("state_patch", {})
+        if isinstance(state_patch, dict):
+            for item in state_patch.get("character_states", []) if isinstance(state_patch.get("character_states"), list) else []:
+                if isinstance(item, dict):
+                    add([item.get("ref", item.get("character_id", ""))])
+            for item in state_patch.get("relationship_states", []) if isinstance(state_patch.get("relationship_states"), list) else []:
+                if isinstance(item, dict):
+                    add(item.get("refs", item.get("characters", [])))
+        state_retirements = payload.get("state_retirements", {})
+        if isinstance(state_retirements, dict):
+            add(state_retirements.get("character_refs", []))
+        next_memory = payload.get("next_chapter_memory", {})
+        if isinstance(next_memory, dict):
+            add(next_memory.get("character_refs", []))
+        for event in payload.get("long_term_events", []) if isinstance(payload.get("long_term_events"), list) else []:
+            storage = event.get("storage", {}) if isinstance(event, dict) else {}
+            if isinstance(storage, dict):
+                add(storage.get("character_refs", []))
+        for item in record_updates.get("characters", []) if isinstance(record_updates.get("characters"), list) else []:
+            if isinstance(item, dict) and str(item.get("operation", "") or "").strip().lower() == "update":
+                add([item.get("ref", item.get("id", ""))])
+        return result
+
+    persistent_refs = all_persistent_character_refs()
+
+    def filter_index(values):
+        if not isinstance(values, list):
+            return values
+        result = []
+        for value in values:
+            raw = str(value or "").strip()
+            normalized = normalize_character_ref(raw)
+            # An untracked actor is not a long-form character merely because a
+            # hotel scene gave them a job title and one line of dialogue.
+            if not normalized and raw not in persistent_refs:
+                continue
+            output = normalized or raw
+            if output and output not in result:
+                result.append(output)
+        return result
+
+    # A newly created lore record must never expose information the final
+    # prose did not establish.  The literal evidence quote is the narrowest
+    # safe fallback when compatible models omit story_known.
+    for item in record_updates.get("lore", []) if isinstance(record_updates.get("lore"), list) else []:
+        if not isinstance(item, dict):
+            continue
+        if str(item.get("operation", "") or "").strip().lower() != "create":
+            continue
+        if str(item.get("story_known", "") or "").strip():
+            continue
+        evidence = str(
+            item.get("evidence_quote", item.get("evidence", item.get("quote", ""))) or ""
+        ).strip()
+        if evidence:
+            item["story_known"] = evidence
+
+    current_refs = payload.get("current_chapter_character_refs")
+    if isinstance(current_refs, list):
+        payload["current_chapter_character_refs"] = filter_index(current_refs)
+
+    reconciliation = payload.get("state_reconciliation")
+    if isinstance(reconciliation, dict) and isinstance(reconciliation.get("character_refs"), list):
+        reconciliation["character_refs"] = filter_index(reconciliation["character_refs"])
+    return payload
+
+
 def _normalize_long_form_update_payload(project, chapter_index, update):
     payload = deepcopy(update) if isinstance(update, dict) else {}
     payload.pop("_parse_repaired", None)
-    if "state_patch" not in payload and isinstance(payload.get("state_snapshot"), dict):
-        payload["state_patch"] = deepcopy(payload.get("state_snapshot", {}))
+    if (
+        payload.get("compact_delta_version") == LONG_FORM_COMPACT_DELTA_VERSION
+        or payload.get("output_mode") == "compact_delta_v1"
+    ):
+        payload = _normalize_long_form_state_aliases(payload)
+        payload = _expand_compact_long_form_memory_update(project, chapter_index, payload)
+    else:
+        if "state_patch" not in payload and isinstance(payload.get("state_snapshot"), dict):
+            payload["state_patch"] = deepcopy(payload.get("state_snapshot", {}))
+        payload = _normalize_long_form_state_aliases(payload)
+    payload = _repair_invalid_long_form_record_refs_by_name(project, payload)
+    payload = _normalize_long_form_ephemeral_actor_refs(project, payload)
+    payload = _normalize_long_form_fact_update_scopes(project, payload)
     payload.setdefault("state_patch", {})
     payload.setdefault("state_retirements", {})
     payload.setdefault("state_lifecycle_review", {})
@@ -7761,7 +13243,7 @@ def _normalize_long_form_update_payload(project, chapter_index, update):
 
 
 def _normalize_long_form_event_storage_refs(project, chapter_index, update):
-    """Remove only structurally invalid event refs; never infer missing semantic links."""
+    """Normalize event refs and restore only links proven by shared literal evidence."""
     project = project if isinstance(project, dict) else {}
     payload = _normalize_long_form_update_payload(project, chapter_index, update)
     memory = _normalize_long_form_memory(project.get("long_form_memory", {}))
@@ -7882,6 +13364,113 @@ def _normalize_long_form_event_storage_refs(project, chapter_index, update):
                 seen.add(identity)
                 normalized.append(output)
             storage[storage_key] = normalized
+
+    def item_evidence(item):
+        return _compact_text(
+            item.get("evidence_quote", item.get("evidence", item.get("quote", "")))
+        ) if isinstance(item, dict) else ""
+
+    link_requests = []
+
+    def request_link(storage_key, raw_ref, item):
+        if isinstance(item, dict):
+            link_requests.append((storage_key, raw_ref, item))
+
+    for item in payload.get("fact_updates", []) if isinstance(payload.get("fact_updates"), list) else []:
+        if not isinstance(item, dict):
+            continue
+        operation = str(item.get("operation", "") or "").strip().lower()
+        if operation in {"", "keep"}:
+            continue
+        ref = item.get("key", "") if operation in {"add", "supersede"} else item.get("id", "")
+        request_link("fact_refs", ref, item)
+    record_updates = payload.get("record_updates", {})
+    record_updates = record_updates if isinstance(record_updates, dict) else {}
+    for item in record_updates.get("lore", []) if isinstance(record_updates.get("lore"), list) else []:
+        if not isinstance(item, dict):
+            continue
+        operation = str(item.get("operation", "") or "").strip().lower()
+        ref = item.get("key", "") if operation == "create" else item.get("ref", item.get("id", ""))
+        request_link("lore_refs", ref, item)
+    for item in payload.get("foreshadow_updates", []) if isinstance(payload.get("foreshadow_updates"), list) else []:
+        if not isinstance(item, dict):
+            continue
+        operation = str(item.get("operation", "") or "").strip().lower()
+        ref = item.get("key", "") if operation == "create" else item.get("ref", item.get("id", ""))
+        request_link("foreshadow_refs", ref, item)
+    for item in state_patch.get("object_states", []) if isinstance(state_patch.get("object_states"), list) else []:
+        if isinstance(item, dict):
+            request_link("object_keys", item.get("key", item.get("name", "")), item)
+    for source_key, storage_key in (
+        ("active_conflicts", "conflict_refs"),
+        ("unresolved_tasks", "task_refs"),
+    ):
+        for item in state_patch.get(source_key, []) if isinstance(state_patch.get(source_key), list) else []:
+            if isinstance(item, dict):
+                request_link(storage_key, item.get("id", "") or item.get("key", ""), item)
+
+    evidence_anchors = {}
+    for storage_key, raw_ref, item in link_requests:
+        identity, _output = normalize_ref(storage_key, raw_ref)
+        evidence = item_evidence(item)
+        if not identity or len(evidence) < _EVIDENCE_MIN_LITERAL_CHARS:
+            continue
+        anchors = evidence_anchors.setdefault(evidence, [])
+        anchor = (storage_key, identity)
+        if anchor not in anchors:
+            anchors.append(anchor)
+
+    def event_has_ref(event, storage_key, identity):
+        storage = event.get("storage", {}) if isinstance(event, dict) else {}
+        if not isinstance(storage, dict):
+            return False
+        values = storage.get(storage_key, [])
+        if not isinstance(values, list):
+            return False
+        return any(normalize_ref(storage_key, value)[0] == identity for value in values)
+
+    def link_by_literal_evidence(storage_key, raw_ref, item):
+        if not isinstance(item, dict):
+            return
+        identity, output = normalize_ref(storage_key, raw_ref)
+        evidence = item_evidence(item)
+        if not identity or len(evidence) < _EVIDENCE_MIN_LITERAL_CHARS:
+            return
+        match_indexes = []
+        for index, event in enumerate(events):
+            if not isinstance(event, dict) or not isinstance(event.get("storage"), dict):
+                continue
+            event_evidence = item_evidence(event)
+            if len(event_evidence) < _EVIDENCE_MIN_LITERAL_CHARS:
+                continue
+            if evidence == event_evidence or evidence in event_evidence or event_evidence in evidence:
+                match_indexes.append(index)
+        if len(match_indexes) != 1:
+            anchored_indexes = set()
+            for anchor_key, anchor_identity in evidence_anchors.get(evidence, []):
+                if anchor_key == storage_key and anchor_identity == identity:
+                    continue
+                for index, event in enumerate(events):
+                    if event_has_ref(event, anchor_key, anchor_identity):
+                        anchored_indexes.add(index)
+            if len(anchored_indexes) == 1:
+                match_indexes = list(anchored_indexes)
+        if len(match_indexes) != 1:
+            return
+        storage = events[match_indexes[0]]["storage"]
+        values = storage.get(storage_key)
+        if not isinstance(values, list):
+            values = []
+            storage[storage_key] = values
+        existing_identities = {
+            normalize_ref(storage_key, value)[0]
+            for value in values
+        }
+        if identity not in existing_identities:
+            values.append(output)
+
+    for storage_key, raw_ref, item in link_requests:
+        link_by_literal_evidence(storage_key, raw_ref, item)
     return payload
 
 
@@ -7979,6 +13568,8 @@ def _long_form_evidence_present(quote, final_text):
 _EVIDENCE_IGNORED_DIALOGUE_MARKS = frozenset('“”‘’"\'')
 _EVIDENCE_CLAUSE_SPLIT_PATTERN = re.compile(r"[\r\n，。！？；：,!?;:]+")
 _EVIDENCE_MIN_UNIQUE_CLAUSE_CHARS = 8
+_EVIDENCE_MIN_LITERAL_CHARS = 8
+_EVIDENCE_MAX_LITERAL_CHARS = 60
 
 
 def _evidence_projection(value, with_positions=False):
@@ -7993,6 +13584,70 @@ def _evidence_projection(value, with_positions=False):
     return ("".join(chars), positions) if with_positions else "".join(chars)
 
 
+def _expand_unique_short_long_form_evidence(quote, final_text):
+    """Expand a unique short literal to nearby body text without inventing words."""
+    raw_quote = str(quote or "").strip()
+    body = str(final_text or "")
+    projected_quote = _evidence_projection(raw_quote)
+    projected_body, positions = _evidence_projection(body, with_positions=True)
+    if not projected_quote or not positions:
+        return raw_quote
+    exact_line_matches = list(
+        re.finditer(r"(?m)^[ \t]*" + re.escape(raw_quote) + r"[ \t]*$", body)
+    )
+    if len(exact_line_matches) == 1:
+        line_match = exact_line_matches[0]
+        body_start = line_match.start() + len(line_match.group()) - len(line_match.group().lstrip())
+        body_end = body_start + len(raw_quote)
+    else:
+        start = projected_body.find(projected_quote)
+        if start < 0 or projected_body.find(projected_quote, start + 1) >= 0:
+            return raw_quote
+        body_start = positions[start]
+        body_end = positions[start + len(projected_quote) - 1] + 1
+    boundaries = set("。！？!?；;\n")
+
+    left = body_start
+    while left > 0 and body[left - 1] not in boundaries:
+        left -= 1
+    right = body_end
+    while right < len(body) and body[right] not in boundaries:
+        right += 1
+    if right < len(body):
+        right += 1
+
+    def candidate_text(start_index, end_index):
+        return body[start_index:end_index].strip()
+
+    candidate = candidate_text(left, right)
+    while (
+        len(_compact_text(candidate)) < _EVIDENCE_MIN_LITERAL_CHARS
+        and right < len(body)
+    ):
+        next_boundary = right
+        while next_boundary < len(body) and body[next_boundary] not in boundaries:
+            next_boundary += 1
+        if next_boundary < len(body):
+            next_boundary += 1
+        else:
+            next_boundary = len(body)
+        if next_boundary <= right:
+            break
+        right = next_boundary
+        candidate = candidate_text(left, right)
+
+    if len(_compact_text(candidate)) >= _EVIDENCE_MIN_LITERAL_CHARS:
+        if len(_compact_text(candidate)) <= _EVIDENCE_MAX_LITERAL_CHARS:
+            return candidate
+        # Keep a literal local window when the containing sentence is unusually long.
+        window_left = max(0, body_start - _EVIDENCE_MAX_LITERAL_CHARS // 2)
+        window_right = min(len(body), window_left + _EVIDENCE_MAX_LITERAL_CHARS)
+        window = candidate_text(window_left, window_right)
+        if _long_form_evidence_present(window, body):
+            return window
+    return raw_quote
+
+
 def _literalize_long_form_evidence_quote(quote, final_text):
     raw_quote = str(quote or "").strip()
     body = str(final_text or "")
@@ -8000,6 +13655,10 @@ def _literalize_long_form_evidence_quote(quote, final_text):
         return raw_quote
     projected_quote = _evidence_projection(raw_quote)
     projected_body, positions = _evidence_projection(body, with_positions=True)
+    if len(projected_quote) < 4:
+        expanded = _expand_unique_short_long_form_evidence(raw_quote, body)
+        if expanded != raw_quote:
+            return expanded
     if len(projected_quote) < 4 or not positions:
         return raw_quote
     start = projected_body.find(projected_quote)
@@ -8028,6 +13687,23 @@ def _literalize_long_form_evidence_quote(quote, final_text):
         literal = body[positions[clause_start]:positions[clause_end] + 1].strip()
         if _long_form_evidence_present(literal, body):
             return literal
+
+    # A model may concatenate two non-adjacent dialogue fragments in one
+    # evidence field. If no 8-character clause survives, expand a unique
+    # 4-7 character literal fragment to its containing body sentence.
+    short_candidates = []
+    for clause in _EVIDENCE_CLAUSE_SPLIT_PATTERN.split(raw_quote):
+        projected_clause = _evidence_projection(clause)
+        if 4 <= len(projected_clause) < _EVIDENCE_MIN_UNIQUE_CLAUSE_CHARS:
+            short_candidates.append(clause.strip())
+    for clause in sorted(set(short_candidates), key=lambda value: len(_evidence_projection(value)), reverse=True):
+        expanded = _expand_unique_short_long_form_evidence(clause, body)
+        if (
+            expanded != clause
+            and len(_compact_text(expanded)) >= _EVIDENCE_MIN_LITERAL_CHARS
+            and _long_form_evidence_present(expanded, body)
+        ):
+            return expanded
     return raw_quote
 
 
@@ -8108,6 +13784,7 @@ def _resolve_long_form_stored_temp_refs(value, temp_refs):
         "lore_id": "lore", "lore_ref": "lore", "lore_ids": "lore", "lore_refs": "lore",
         "foreshadow_id": "foreshadows", "foreshadow_ref": "foreshadows", "foreshadow_ids": "foreshadows", "foreshadow_refs": "foreshadows",
         "fact_id": "facts", "fact_ref": "facts", "fact_ids": "facts", "fact_refs": "facts",
+        "object_key": "objects", "object_keys": "objects",
         "conflict_id": "conflicts", "conflict_ref": "conflicts", "conflict_ids": "conflicts", "conflict_refs": "conflicts",
         "task_id": "tasks", "task_ref": "tasks", "task_ids": "tasks", "task_refs": "tasks",
     }
@@ -8122,7 +13799,7 @@ def _resolve_long_form_stored_temp_refs(value, temp_refs):
         text = str(raw or "").strip()
         if not text:
             return raw
-        for kind in ("characters", "lore", "foreshadows", "facts", "conflicts", "tasks", "archives"):
+        for kind in ("characters", "lore", "foreshadows", "facts", "objects", "conflicts", "tasks", "archives"):
             resolved = kind_maps.get(kind, {}).get(text.casefold())
             if resolved:
                 return resolved
@@ -8143,6 +13820,7 @@ def _resolve_long_form_stored_temp_refs(value, temp_refs):
                     ("lore", "lore"), ("设定", "lore"),
                     ("foreshadow", "foreshadows"), ("伏笔", "foreshadows"),
                     ("fact", "facts"), ("事实", "facts"),
+                    ("object", "objects"), ("物件", "objects"), ("物品", "objects"),
                 ):
                     if marker in hint:
                         hinted_kind = candidate_kind
@@ -8191,7 +13869,9 @@ def _validate_long_form_memory_update(
     if not isinstance(update, dict) or not update:
         return ["长篇记忆更新为空"]
     payload = _normalize_long_form_update_payload(project, chapter_index, update)
-    memory = _normalize_long_form_memory(project.get("long_form_memory", {}))
+    memory = _backfill_long_form_fact_scopes(
+        _normalize_long_form_memory(project.get("long_form_memory", {}))
+    )
     if require_revision:
         try:
             schema_version = int(payload.get("schema_version", 0) or 0)
@@ -8238,6 +13918,34 @@ def _validate_long_form_memory_update(
         for value in chapter_selection.get("task_ids", [])
         if str(value or "").strip()
     }
+    selection_has_refs = any(
+        isinstance(chapter_selection.get(key), list)
+        and any(str(value or "").strip() for value in chapter_selection.get(key, []))
+        for key in (
+            "fact_ids", "character_ids", "lore_ids", "foreshadow_ids",
+            "object_keys", "conflict_ids", "task_ids",
+        )
+    )
+    previous_chapter = chapters[chapter_index - 1] if chapter_index > 0 else {}
+    missing_committed_handoff = (
+        not selection_has_refs
+        and isinstance(previous_chapter, dict)
+        and str(previous_chapter.get("memory_sync_status", "") or "") == "complete"
+        and int(previous_chapter.get("memory_revision", 0) or 0) > 0
+    )
+    if missing_committed_handoff:
+        # An absent handoff makes the context builder send the full active
+        # memory packet. Mirror that actual visibility for retirement checks;
+        # otherwise a fully evidenced completion is rejected merely because
+        # an imported or externally committed predecessor missed its index.
+        selected_fact_ids = {
+            str(item.get("id", "") or "").strip()
+            for item in memory.get("active_facts", [])
+            if isinstance(item, dict) and str(item.get("id", "") or "").strip()
+        }
+        selected_object_compacts = set(existing_state_refs["object_key_by_compact"])
+        selected_conflict_ids = set(existing_state_refs["conflict_ids"])
+        selected_task_ids = set(existing_state_refs["task_ids"])
 
     proposed_record_keys = {"characters": set(), "lore": set(), "foreshadows": set()}
     proposed_state_keys = {"conflicts": set(), "tasks": set()}
@@ -8349,7 +14057,18 @@ def _validate_long_form_memory_update(
                     expected = str(
                         known_records[item_id].get(text_key, "") or ""
                     ).strip()
-                    if _compact_text(previous) != _compact_text(expected):
+                    previous_compact = _compact_text(previous)
+                    expected_compact = _compact_text(expected)
+                    truncated_prefix = previous_compact.rstrip(".…")
+                    previous_matches = previous_compact == expected_compact
+                    if (
+                        not previous_matches
+                        and len(truncated_prefix) >= 80
+                        and previous_compact != truncated_prefix
+                        and expected_compact.startswith(truncated_prefix)
+                    ):
+                        previous_matches = True
+                    if not previous_matches:
                         errors.append(
                             f"{label}状态第{index}项{previous_key}与旧状态不匹配"
                         )
@@ -8675,21 +14394,82 @@ def _validate_long_form_memory_update(
                 continue
             if operation == "update":
                 ref = str(item.get("ref", item.get("id", "")) or "").strip()
-                if not _resolve_long_form_record_ref(project, kind, ref):
+                resolved_ref = _resolve_long_form_record_ref(project, kind, ref)
+                if not resolved_ref:
                     errors.append(f"{kind}更新第{index}项引用未知记录：{ref}")
+                incoming_name = str(item.get("name", "") or "").strip()
+                is_identity_promotion = False
+                if kind == "characters" and incoming_name and resolved_ref:
+                    record = reference_maps[kind]["id_to_record"].get(resolved_ref, {})
+                    current_name = str(record.get("name", "") or "").strip()
+                    is_identity_promotion = bool(
+                        _compact_text(current_name).casefold()
+                        != _compact_text(incoming_name).casefold()
+                        and _is_temporary_character_name(current_name)
+                        and not _is_temporary_character_name(incoming_name)
+                    )
+                    if (
+                        _compact_text(current_name).casefold()
+                        != _compact_text(incoming_name).casefold()
+                        and (
+                            not _is_temporary_character_name(current_name)
+                            or _is_temporary_character_name(incoming_name)
+                        )
+                    ):
+                        errors.append(
+                            f"characters更新第{index}项只能把临时人物升级为正式姓名："
+                            f"{current_name} -> {incoming_name}"
+                        )
+                changes = item.get("changes", [])
+                has_changes = (
+                    bool(str(changes or "").strip())
+                    if not isinstance(changes, list)
+                    else any(str(value or "").strip() for value in changes)
+                )
+                if (
+                    require_evidence
+                    and not str(item.get("state", "") or "").strip()
+                    and not has_changes
+                    and not incoming_name
+                ):
+                    errors.append(f"{kind}更新第{index}项运行态变化为空")
                 if isinstance(item.get("canon"), dict) and any(
                     str(value or "").strip() for value in item.get("canon", {}).values()
-                ):
+                ) and not is_identity_promotion:
                     errors.append(f"{kind}更新第{index}项不得修改永久canon字段")
             else:
-                key = str(item.get("key", "") or "").strip()
-                if not key or key in temp_record_keys[kind]:
-                    errors.append(f"{kind}更新第{index}项新增key缺失或重复")
-                temp_record_keys[kind].add(key)
                 name = str(item.get("name", "") or "").strip()
-                if not name:
-                    errors.append(f"{kind}更新第{index}项新增名称为空")
-                elif require_evidence:
+                promotion_ref = str(item.get("ref", item.get("id", "")) or "").strip()
+                promotion_id = _resolve_long_form_record_ref(project, kind, promotion_ref)
+                promotion_record = reference_maps[kind]["id_to_record"].get(promotion_id)
+                is_promotion = bool(
+                    kind == "characters"
+                    and promotion_record is not None
+                    and promotion_id
+                )
+                if is_promotion:
+                    current_name = str(promotion_record.get("name", "") or "").strip()
+                    if (
+                        not name
+                        or not _is_temporary_character_name(current_name)
+                        or _is_temporary_character_name(name)
+                    ):
+                        errors.append(
+                            f"characters更新第{index}项create带旧ref时必须是临时人物到正式姓名升级"
+                        )
+                    key = str(item.get("key", "") or "").strip()
+                    if key:
+                        if key in temp_record_keys[kind]:
+                            errors.append(f"{kind}更新第{index}项新增key重复")
+                        temp_record_keys[kind].add(key)
+                else:
+                    key = str(item.get("key", "") or "").strip()
+                    if not key or key in temp_record_keys[kind]:
+                        errors.append(f"{kind}更新第{index}项新增key缺失或重复")
+                    temp_record_keys[kind].add(key)
+                    if not name:
+                        errors.append(f"{kind}更新第{index}项新增名称为空")
+                if name and require_evidence and not is_promotion:
                     compact_name = _compact_text(
                         _clean_foreshadow_name(name) if kind == "foreshadows" else name
                     ).casefold()
@@ -8824,7 +14604,7 @@ def _validate_long_form_memory_update(
             long_term_events = []
         allowed_event_categories = {
             "commitment", "evidence", "ability_boundary", "task",
-            "foreshadow", "key_object", "relationship", "other",
+            "foreshadow", "key_object", "relationship", "other", "fact", "plot",
         }
         for index, item in enumerate(long_term_events, 1):
             label = f"long_term_events第{index}项"
@@ -9296,7 +15076,7 @@ _LONG_FORM_MEMORY_PATCH_FIELDS = (
 
 def _memory_repair_patch_targets(validation_errors):
     bundle_fields = []
-    memory_fields = []
+    direct_memory_fields = []
 
     def add(target, value):
         if value not in target:
@@ -9305,6 +15085,8 @@ def _memory_repair_patch_targets(validation_errors):
     for error in validation_errors or []:
         text = str(error or "")
         lowered = text.lower()
+        if "logic_audit" in lowered or "逻辑审查" in text:
+            add(bundle_fields, "logic_audit")
         if "实际提纲" in text:
             add(bundle_fields, "outline")
         if "本章摘要" in text:
@@ -9312,40 +15094,46 @@ def _memory_repair_patch_targets(validation_errors):
         if "关键事实" in text:
             add(bundle_fields, "key_facts")
         if "schema_version" in lowered:
-            add(memory_fields, "schema_version")
+            add(direct_memory_fields, "schema_version")
         if "base_revision" in lowered:
-            add(memory_fields, "base_revision")
+            add(direct_memory_fields, "base_revision")
         if "state_patch" in lowered or any(
             marker in text for marker in ("人物状态第", "关系状态第", "物品状态第", "冲突状态第", "任务状态第")
         ):
-            add(memory_fields, "state_patch")
+            add(direct_memory_fields, "state_patch")
         if "state_retirements" in lowered or text.startswith("退出"):
-            add(memory_fields, "state_retirements")
+            add(direct_memory_fields, "state_retirements")
         if "state_lifecycle_review" in lowered or "状态生命周期复核" in text:
-            add(memory_fields, "state_lifecycle_review")
+            add(direct_memory_fields, "state_lifecycle_review")
         if "fact_updates" in lowered:
-            add(memory_fields, "fact_updates")
+            add(direct_memory_fields, "fact_updates")
         if "fact_lifecycle_review" in lowered or "事实生命周期复核" in text:
-            add(memory_fields, "fact_lifecycle_review")
+            add(direct_memory_fields, "fact_lifecycle_review")
         if "long_term_events" in lowered:
-            add(memory_fields, "long_term_events")
+            add(direct_memory_fields, "long_term_events")
         if "state_reconciliation" in lowered:
-            add(memory_fields, "state_reconciliation")
+            add(direct_memory_fields, "state_reconciliation")
         if "state_delta" in lowered:
-            add(memory_fields, "state_delta")
+            add(direct_memory_fields, "state_delta")
         if "current_chapter_character" in lowered:
-            add(memory_fields, "current_chapter_character_refs")
+            add(direct_memory_fields, "current_chapter_character_refs")
         if "stage_archive" in lowered:
-            add(memory_fields, "stage_archive")
+            add(direct_memory_fields, "stage_archive")
         if "record_updates" in lowered or "characters更新" in text or "lore更新" in text:
-            add(memory_fields, "record_updates")
-        if "foreshadow_updates" in lowered or "伏笔更新" in text:
-            add(memory_fields, "foreshadow_updates")
+            add(direct_memory_fields, "record_updates")
+        if (
+            "foreshadow_updates" in lowered
+            or "foreshadows更新" in lowered
+            or "伏笔更新" in text
+        ):
+            add(direct_memory_fields, "foreshadow_updates")
         if "next_chapter_memory" in lowered or text.startswith("下一章"):
-            add(memory_fields, "next_chapter_memory")
+            add(direct_memory_fields, "next_chapter_memory")
         if "运行态" in text or "提纲或长期事件" in text:
-            add(memory_fields, "record_updates")
-            add(memory_fields, "state_reconciliation")
+            add(direct_memory_fields, "record_updates")
+            add(direct_memory_fields, "state_reconciliation")
+
+    memory_fields = list(direct_memory_fields)
 
     dependency_fields = {
         "fact_updates": (
@@ -9359,7 +15147,11 @@ def _memory_repair_patch_targets(validation_errors):
     for field in tuple(memory_fields):
         for dependency in dependency_fields.get(field, ()):
             add(memory_fields, dependency)
-    return {"bundle_fields": bundle_fields, "memory_fields": memory_fields}
+    return {
+        "bundle_fields": bundle_fields,
+        "direct_memory_fields": direct_memory_fields,
+        "memory_fields": memory_fields,
+    }
 
 
 def _merge_long_form_memory_repair_patch(memory_update, patch):
@@ -9373,6 +15165,23 @@ def _merge_long_form_memory_repair_patch(memory_update, patch):
         if key in allowed:
             merged[key] = deepcopy(value)
     return merged
+
+
+def _merge_long_form_memory_repair_full(memory_update, repaired_update, validation_errors):
+    repaired_update = repaired_update if isinstance(repaired_update, dict) else {}
+    targets = _memory_repair_patch_targets(validation_errors)
+    direct_fields = targets.get("direct_memory_fields", [])
+    if not direct_fields:
+        return deepcopy(repaired_update)
+    replacements = {
+        key: deepcopy(repaired_update[key])
+        for key in direct_fields
+        if key in repaired_update
+    }
+    return _merge_long_form_memory_repair_patch(
+        memory_update,
+        {"replace": replacements},
+    )
 
 
 def _parse_memory_repair_result(value):
@@ -9390,19 +15199,27 @@ def _parse_memory_repair_result(value):
             "key_facts": "",
             "memory_update": {},
             "memory_patch": {},
+            "logic_audit": {},
+            "prose_review": {"checked": True, "issues": []},
+            "repair_patches": [],
         }
-    try:
-        data, _offset = json.JSONDecoder().raw_decode(text[start:])
-    except Exception:
-        return {
-            "parsed": False,
-            "repair_mode": "",
-            "outline": "",
-            "summary": "",
-            "key_facts": "",
-            "memory_update": {},
-            "memory_patch": {},
-        }
+    data, _locally_repaired = _load_json_with_single_missing_quote_repair(text[start:])
+    if data is None:
+        try:
+            data, _offset = json.JSONDecoder().raw_decode(text[start:])
+        except Exception:
+            return {
+                "parsed": False,
+                "repair_mode": "",
+                "outline": "",
+                "summary": "",
+                "key_facts": "",
+                "memory_update": {},
+                "memory_patch": {},
+                "logic_audit": {},
+                "prose_review": {"checked": True, "issues": []},
+                "repair_patches": [],
+            }
     if not isinstance(data, dict):
         return {
             "parsed": False,
@@ -9412,6 +15229,9 @@ def _parse_memory_repair_result(value):
             "key_facts": "",
             "memory_update": {},
             "memory_patch": {},
+            "logic_audit": {},
+            "prose_review": {"checked": True, "issues": []},
+            "repair_patches": [],
         }
     key_facts = data.get("key_facts", "")
     if isinstance(key_facts, list):
@@ -9427,15 +15247,22 @@ def _parse_memory_repair_result(value):
         )
     memory_update = data.get("long_form_memory", {})
     memory_patch = data.get("long_form_memory_patch", data.get("memory_patch", {}))
+    logic_audit = data.get("logic_audit", {})
+    prose_review = data.get("prose_review", {"checked": True, "issues": []})
+    repair_patches = data.get("repair_patches", [])
     patch_replacements = (
         memory_patch.get("replace", memory_patch)
         if isinstance(memory_patch, dict) else {}
     )
-    patch_mode = isinstance(memory_patch, dict) and bool(patch_replacements)
+    memory_patch_mode = isinstance(memory_patch, dict) and bool(patch_replacements)
+    bundle_patch_mode = "long_form_memory" not in data and any(
+        key in data for key in ("outline", "summary", "key_facts", "logic_audit")
+    )
+    patch_mode = memory_patch_mode or bundle_patch_mode
     bundle_content_present = any(
         str(data.get(key, "") or "").strip()
         for key in ("outline", "summary", "key_facts")
-    )
+    ) or (isinstance(logic_audit, dict) and bool(logic_audit))
     return {
         "parsed": (
             patch_mode or bundle_content_present
@@ -9447,7 +15274,222 @@ def _parse_memory_repair_result(value):
         "key_facts": str(key_facts or "").strip(),
         "memory_update": deepcopy(memory_update) if isinstance(memory_update, dict) else {},
         "memory_patch": deepcopy(memory_patch) if isinstance(memory_patch, dict) else {},
+        "logic_audit": deepcopy(logic_audit) if isinstance(logic_audit, dict) else {},
+        "prose_review": deepcopy(prose_review) if isinstance(prose_review, dict) else {"checked": True, "issues": []},
+        "repair_patches": deepcopy(repair_patches) if isinstance(repair_patches, list) else [],
     }
+
+
+_CHAPTER_LOGIC_AUDIT_CATEGORIES = {
+    "chronology",
+    "causality",
+    "character_state",
+    "character_location",
+    "object_state",
+    "object_ownership",
+    "spatial_state",
+    "pronoun_reference",
+    "knowledge_permission",
+}
+
+
+def _chapter_logic_audit_validation_errors(final_text, audit):
+    """Validate quoted hard contradictions without judging story semantics locally."""
+    body = str(final_text or "").strip()
+    if not isinstance(audit, dict):
+        return ["logic_audit必须为对象"]
+    errors = []
+    if audit.get("checked") is not True:
+        errors.append("logic_audit.checked必须为true")
+    issues = audit.get("issues", [])
+    if not isinstance(issues, list):
+        return errors + ["logic_audit.issues必须为数组"]
+    if len(issues) > 3:
+        errors.append("logic_audit.issues最多只能包含3项明确硬矛盾")
+    for index, item in enumerate(issues[:3], 1):
+        if not isinstance(item, dict):
+            errors.append(f"logic_audit第{index}项必须为对象")
+            continue
+        severity = str(item.get("severity", "") or "").strip().lower()
+        category = str(item.get("category", "") or "").strip().lower()
+        earlier_quote = str(item.get("earlier_quote", "") or "").strip()
+        later_quote = str(item.get("later_quote", "") or "").strip()
+        explanation = str(item.get("explanation", "") or "").strip()
+        if severity not in {"critical", "major"}:
+            errors.append(f"logic_audit第{index}项severity必须为critical或major")
+        if category not in _CHAPTER_LOGIC_AUDIT_CATEGORIES:
+            errors.append(f"logic_audit第{index}项category无效")
+        if len(_compact_text(earlier_quote)) < 4 or earlier_quote not in body:
+            errors.append(f"logic_audit第{index}项earlier_quote不是正文中4字以上逐字原文")
+        if len(_compact_text(later_quote)) < 4 or later_quote not in body:
+            errors.append(f"logic_audit第{index}项later_quote不是正文中4字以上逐字原文")
+        if len(_compact_text(explanation)) < 6:
+            errors.append(f"logic_audit第{index}项缺少明确矛盾说明")
+        if earlier_quote in body and later_quote in body:
+            earlier_pos = body.find(earlier_quote)
+            later_start = earlier_pos + (1 if earlier_quote == later_quote else 0)
+            later_pos = body.find(later_quote, max(0, later_start))
+            if earlier_pos < 0 or later_pos < earlier_pos:
+                errors.append(f"logic_audit第{index}项前后证据顺序无效")
+    return errors
+
+
+def _chapter_logic_audit_blocking_issues(audit):
+    if not isinstance(audit, dict) or audit.get("checked") is not True:
+        return []
+    return [
+        deepcopy(item)
+        for item in audit.get("issues", [])
+        if isinstance(item, dict)
+        and str(item.get("severity", "") or "").strip().lower() in {"critical", "major"}
+    ][:3]
+
+
+def _apply_chapter_prose_repair_patches(final_text, patches):
+    """Apply only safe, model-authored local prose replacements.
+
+    The model decides whether a passage is repetitive or mechanical. Local code
+    only ensures that a suggested patch points to one small, unambiguous span of
+    the current chapter before it is applied.
+    """
+    body = str(final_text or "").strip()
+    patches = patches if isinstance(patches, list) else []
+    if not patches:
+        return body, []
+    errors = []
+    if len(patches) > 3:
+        return body, ["正文局部修补最多只能包含3项"]
+    replacements = []
+    for index, patch in enumerate(patches, 1):
+        if not isinstance(patch, dict):
+            errors.append(f"正文局部修补第{index}项必须为对象")
+            continue
+        before = str(patch.get("before", "") or "").strip()
+        after = str(patch.get("after", "") or "").strip()
+        reason = str(patch.get("reason", "") or "").strip()
+        if len(_compact_text(before)) < 8:
+            errors.append(f"正文局部修补第{index}项before过短")
+            continue
+        if len(before) > 900:
+            errors.append(f"正文局部修补第{index}项替换范围过大")
+            continue
+        if body.count(before) != 1:
+            errors.append(f"正文局部修补第{index}项before必须在正文中逐字且唯一出现")
+            continue
+        if not after or after == before:
+            errors.append(f"正文局部修补第{index}项没有有效替换内容")
+            continue
+        if len(after) > max(1600, len(before) * 3):
+            errors.append(f"正文局部修补第{index}项替换范围过大")
+            continue
+        if len(_compact_text(reason)) < 4:
+            errors.append(f"正文局部修补第{index}项缺少修补原因")
+            continue
+        if any(marker in before or marker in after for marker in ("```", "【审", "【修", "{\"", "\"patch")):
+            errors.append(f"正文局部修补第{index}项混入了分析或结构化内容")
+            continue
+        start = body.find(before)
+        replacements.append((start, start + len(before), after, index))
+    ordered = sorted(replacements)
+    for previous, current in zip(ordered, ordered[1:]):
+        if current[0] < previous[1]:
+            errors.append(f"正文局部修补第{previous[3]}和第{current[3]}项范围重叠")
+    if errors:
+        return body, errors
+    repaired = body
+    for start, end, after, _index in sorted(replacements, reverse=True):
+        repaired = repaired[:start] + after + repaired[end:]
+    repaired = repaired.strip()
+    if repaired == body:
+        return body, ["正文局部修补没有产生变化"]
+    return repaired, []
+
+
+def _parse_chapter_logic_repair_result(value):
+    text = str(value or "").strip()
+    fence_match = re.match(r"^```(?:json)?\s*(.*?)\s*```$", text, re.IGNORECASE | re.DOTALL)
+    if fence_match:
+        text = fence_match.group(1).strip()
+    start = text.find("{")
+    if start < 0:
+        return {"parsed": False, "patches": []}
+    try:
+        data, _offset = json.JSONDecoder().raw_decode(text[start:])
+    except Exception:
+        return {"parsed": False, "patches": []}
+    if not isinstance(data, dict) or not isinstance(data.get("patches"), list):
+        return {"parsed": False, "patches": []}
+    return {"parsed": True, "patches": deepcopy(data.get("patches", []))}
+
+
+def _apply_chapter_logic_repair_patches(final_text, issues, patches):
+    """Apply model-authored exact replacements; local code makes no semantic decision."""
+    body = str(final_text or "").strip()
+    issues = issues if isinstance(issues, list) else []
+    patches = patches if isinstance(patches, list) else []
+    errors = []
+    expected_indexes = set(range(1, len(issues) + 1))
+    by_index = {}
+    for position, patch in enumerate(patches, 1):
+        if not isinstance(patch, dict):
+            errors.append(f"局部修复第{position}项必须为对象")
+            continue
+        try:
+            issue_index = int(patch.get("issue_index", 0) or 0)
+        except Exception:
+            issue_index = 0
+        if issue_index not in expected_indexes or issue_index in by_index:
+            errors.append(f"局部修复第{position}项issue_index无效或重复")
+            continue
+        by_index[issue_index] = patch
+    missing = sorted(expected_indexes - set(by_index))
+    if missing:
+        errors.append("局部修复缺少问题编号：" + "、".join(str(value) for value in missing))
+
+    replacements = []
+    for issue_index in sorted(by_index):
+        patch = by_index[issue_index]
+        issue = issues[issue_index - 1] if issue_index <= len(issues) else {}
+        original_quote = str(patch.get("original_quote", "") or "").strip()
+        replacement_text = str(patch.get("replacement_text", "") or "").strip()
+        if len(_compact_text(original_quote)) < 4:
+            errors.append(f"局部修复问题{issue_index}的original_quote过短")
+            continue
+        if body.count(original_quote) != 1:
+            errors.append(f"局部修复问题{issue_index}的original_quote必须在正文中逐字且唯一出现")
+            continue
+        earlier_quote = str(issue.get("earlier_quote", "") or "").strip()
+        later_quote = str(issue.get("later_quote", "") or "").strip()
+        if not any(
+            evidence and (evidence in original_quote or original_quote in evidence)
+            for evidence in (earlier_quote, later_quote)
+        ):
+            errors.append(f"局部修复问题{issue_index}没有覆盖审查证据")
+            continue
+        if replacement_text == original_quote:
+            errors.append(f"局部修复问题{issue_index}没有实际修改")
+            continue
+        if len(replacement_text) > max(1200, len(original_quote) * 3):
+            errors.append(f"局部修复问题{issue_index}替换内容过长，不符合最小修改")
+            continue
+        if any(marker in replacement_text for marker in ("```", "【逻辑", "【修复", "修改说明")):
+            errors.append(f"局部修复问题{issue_index}混入了分析或格式说明")
+            continue
+        start = body.find(original_quote)
+        replacements.append((start, start + len(original_quote), replacement_text, issue_index))
+
+    ordered = sorted(replacements)
+    for previous, current in zip(ordered, ordered[1:]):
+        if current[0] < previous[1]:
+            errors.append(f"局部修复问题{previous[3]}和{current[3]}的替换范围重叠")
+    if errors:
+        return body, errors
+    repaired = body
+    for start, end, replacement_text, _issue_index in sorted(replacements, reverse=True):
+        repaired = repaired[:start] + replacement_text + repaired[end:]
+    if repaired == body:
+        return body, ["局部修复没有改变正文"]
+    return repaired.strip(), []
 
 
 def _build_memory_repair_selection(
@@ -10069,6 +16111,7 @@ def _build_long_form_memory_patch_context(
     outline,
     summary,
     key_facts,
+    logic_audit,
     memory_update,
     validation_errors,
 ):
@@ -10080,26 +16123,40 @@ def _build_long_form_memory_patch_context(
     chapters = project.get("chapters", []) if isinstance(project.get("chapters"), list) else []
     chapter = chapters[chapter_index] if 0 <= chapter_index < len(chapters) else {}
     next_chapter = chapters[chapter_index + 1] if chapter_index + 1 < len(chapters) else {}
+    bundle_values = {
+        "outline": outline,
+        "summary": summary,
+        "key_facts": key_facts,
+        "logic_audit": deepcopy(logic_audit) if isinstance(logic_audit, dict) else {},
+    }
     original_bundle = {
-        key: {"outline": outline, "summary": summary, "key_facts": key_facts}.get(key, "")
+        key: deepcopy(bundle_values.get(key, ""))
         for key in targets["bundle_fields"]
     }
-    manifest = _memory_repair_reference_manifest(project, chapter_index, memory_update)
-    compact_memory_update = _compact_memory_repair_update_for_context(
-        project,
-        chapter_index,
-        memory_update,
-        manifest=manifest,
+    manifest = (
+        _memory_repair_reference_manifest(project, chapter_index, memory_update)
+        if targets["memory_fields"] else {}
+    )
+    compact_memory_update = (
+        _compact_memory_repair_update_for_context(
+            project,
+            chapter_index,
+            memory_update,
+            manifest=manifest,
+        )
+        if targets["memory_fields"] else {}
     )
     original_memory = {
         key: deepcopy(compact_memory_update.get(key))
         for key in targets["memory_fields"]
         if key in compact_memory_update
     }
-    output_example = {
-        key: "返回完整修复值"
-        for key in targets["bundle_fields"]
-    }
+    output_example = {}
+    for key in targets["bundle_fields"]:
+        output_example[key] = (
+            {"checked": True, "issues": []}
+            if key == "logic_audit" else "返回完整修复值"
+        )
     if targets["memory_fields"]:
         output_example["long_form_memory_patch"] = {
             "replace": {
@@ -10119,7 +16176,12 @@ def _build_long_form_memory_patch_context(
         "不得把本次新增的NCF/NTASK临时key写入生命周期复核。"
         "state_reconciliation.relationship_refs必须使用C001|C002格式并按引用排序。"
         "新增冲突或任务不得猜测CF-ID/TASK-ID；id留空并分别填写NCF1/NTASK1临时key，"
-        "再在long_term_events和state_reconciliation中引用同一个临时key。"
+        "必须放入state_patch.active_conflicts或state_patch.unresolved_tasks，再在long_term_events和state_reconciliation中引用同一个临时key；"
+        "禁止把conflicts或tasks放在long_form_memory顶层。"
+        "record_updates只允许create/update；本章没有动态变化的已有人物或设定不要写入record_updates，"
+        "若正文明确给已有姓名未明或临时称谓人物补出正式姓名，必须使用原人物引用和name更新卡片名称，保留原ID、运行态和旧称；"
+        "只在state_reconciliation.record_runtime_review中列为unchanged。"
+        "修复时必须原样保留原结果中已有的NF/NL/NCF/NTASK/NT临时key，不得为了修复字段而重命名、另造同义临时key。"
         "fact_updates使用retire或supersede时必须保留被处理的已有AF-ID，逐字复制原scope和previous_fact，"
         "同时填写非空reason和正文逐字证据；supersede还要填写新的NF临时key和同scope新fact，该NF必须同步进入long_term_events.storage.fact_refs和"
         "state_reconciliation.fact_refs。"
@@ -10153,19 +16215,22 @@ def _build_long_form_memory_patch_context(
             6000,
             False,
         ),
-        (
-            "待修复的原状态字段",
-            json.dumps(original_memory, ensure_ascii=False, separators=(",", ":")),
-            20000,
-            False,
-        ),
-        (
-            "机械引用清单",
-            json.dumps(manifest, ensure_ascii=False, separators=(",", ":")),
-            18000,
-            False,
-        ),
     ]
+    if targets["memory_fields"]:
+        sections.extend([
+            (
+                "待修复的原状态字段",
+                json.dumps(original_memory, ensure_ascii=False, separators=(",", ":")),
+                20000,
+                False,
+            ),
+            (
+                "机械引用清单",
+                json.dumps(manifest, ensure_ascii=False, separators=(",", ":")),
+                18000,
+                False,
+            ),
+        ])
     if "next_chapter_memory" in targets["memory_fields"]:
         sections.append((
             "下一章边界",
@@ -10186,6 +16251,7 @@ def _build_long_form_memory_repair_context(
     outline="",
     summary="",
     key_facts="",
+    logic_audit=None,
     memory_update=None,
     validation_errors=None,
 ):
@@ -10197,6 +16263,7 @@ def _build_long_form_memory_repair_context(
         outline,
         summary,
         key_facts,
+        logic_audit,
         memory_update,
         validation_errors,
     )
@@ -10221,18 +16288,25 @@ def _build_long_form_memory_repair_context(
         manifest=repair_manifest,
     )
     memory_sections = _long_form_memory_sections(project, repair_selection)
-    contract = _long_form_update_contract_instructions(project, chapter_index)
+    contract = _long_form_update_contract_instructions(project, chapter_index, compact=True)
     error_text = "\n".join(f"- {str(item)}" for item in validation_errors or []) or "- 原终稿未返回可验证的版本2记忆增量"
     output_requirements = (
         "【输出要求】\n必须输出一个合法JSON对象，顶层结构为"
-        '{"outline":"6-10条实际提纲","summary":"本章摘要","key_facts":["事实"],"long_form_memory":{...}}。'
+        '{"logic_audit":{"checked":true,"issues":[]},"outline":"6-10条实际提纲",'
+        '"summary":"本章摘要","key_facts":["事实"],"long_form_memory":{...}}。'
+        "logic_audit必须独立逐段检查最终正文内部的时间因果、人物生死/清醒/位置、物件存在/移动/开合/持有人、"
+        "进出场、知识权限和代词指向；只报告有前后正文逐字证据的critical或major硬矛盾，最多3项。"
+        "每项结构为severity、category、earlier_quote、later_quote、explanation；没有明确矛盾时issues为空。"
+        "category只能使用chronology、causality、character_state、character_location、object_state、object_ownership、"
+        "spatial_state、pronoun_reference或knowledge_permission。"
+        "不能把文风、剧情选择、人物判断失误或现实流程不完整当成逻辑矛盾。"
         "每条evidence_quote必须从【最终正文】中原样复制一个连续子串，保留原文全部中文引号、标点和换行；"
         "尤其不得把正文中的“对白”改成不带引号的对白。输出前必须按字面检查该字符串能在最终正文中直接找到；"
         "找不到合格逐字证据时删除对应更新，不得概括、拼接或改写证据。"
         "long_form_memory严格执行以下契约：\n" + contract
     )
     source_sections = [
-        ("任务", "只修复本章提纲、摘要、关键事实和长篇记忆增量，不得重写正文，不得新增正文没有发生的事件。", 600, False),
+        ("任务", "只修复本章逻辑审查、提纲、摘要、关键事实和长篇记忆增量，不得重写正文，不得新增正文没有发生的事件。", 700, False),
         ("原结果问题", error_text, 6000, False),
         (
             "当前章节",
@@ -10268,6 +16342,46 @@ def _build_long_form_memory_repair_context(
         ("近期阶段档案", memory_sections["近期阶段档案"], 12000, True),
     ]
     return _assemble_bounded_long_form_context(source_sections, output_requirements)
+
+
+def _build_chapter_logic_repair_context(project, chapter_index, final_text, issues):
+    project = project if isinstance(project, dict) else {}
+    chapters = project.get("chapters", []) if isinstance(project.get("chapters"), list) else []
+    chapter = (
+        chapters[chapter_index]
+        if 0 <= chapter_index < len(chapters) and isinstance(chapters[chapter_index], dict)
+        else {}
+    )
+    selected_issues = [
+        deepcopy(item) for item in issues if isinstance(item, dict)
+    ][:3]
+    requirements = (
+        "【输出要求】\n只修复审查已经用前后逐字证据确认的硬矛盾，不重新审稿，不扩写、删减或重组其他段落。"
+        "每个问题只选择能解除矛盾的最小连续原文范围；优先替换后出现的冲突动作或状态，保留既定剧情结果、人物口吻、"
+        "段落节奏和附近措辞。不得补充解释、流程、总结、伏笔或新事件，也不得把修复写成角色讲道理。"
+        "original_quote必须从最终正文逐字复制且在全文中只出现一次，并且覆盖该问题的earlier_quote或later_quote；"
+        "replacement_text只填写可直接放回原位置的小说正文，可以为空表示删除一段明确多余的冲突文字。"
+        "严格输出一个合法JSON对象，不输出Markdown、分析或完整正文。输出结构："
+        '{"patches":[{"issue_index":1,"original_quote":"正文中唯一出现的连续原文",'
+        '"replacement_text":"最小修复后的正文"}]}。'
+        "patches必须与问题编号一一对应，不得新增审查没有列出的问题。"
+    )
+    sections = [
+        (
+            "任务",
+            f"对第{chapter_index + 1}章《{chapter.get('title', '')}》执行一次证据限定的局部逻辑修复。",
+            800,
+            False,
+        ),
+        (
+            "已确认硬矛盾",
+            json.dumps(selected_issues, ensure_ascii=False, separators=(",", ":")),
+            5000,
+            False,
+        ),
+        ("最终正文", final_text, 34000, True),
+    ]
+    return _assemble_bounded_long_form_context(sections, requirements)
 
 
 def _build_long_form_memory_finalize_context(project, chapter_index, final_text):
@@ -10308,14 +16422,23 @@ def _build_long_form_memory_finalize_context(project, chapter_index, final_text)
             "_relationships_within_selection": True,
         })
     selected_memory = _long_form_memory_sections(project, finalize_selection)
-    contract = _long_form_update_contract_instructions(project, chapter_index)
+    contract = _long_form_update_contract_instructions(project, chapter_index, compact=True)
     stage_boundary = (chapter_index + 1) % 10 == 0
     task = (
         "只读取已经完成的【最终正文】，独立生成实际提纲、本章摘要、需继承关键事实和版本2长篇记忆增量；"
         "不得重写正文，不得把原规划提纲或下一章资料中的未来事件写成已经发生。\n"
-        "输出前必须在内部逐段建立事件核对表，至少检查：人物实际出场、说话、来电和带来的新信息；"
-        "伤势、能力、关系、位置、物件和任务变化；新线索、证据、异常、记录缺失/覆盖/删除/清空、"
-        "未知来源和责任边界；新设施、规则和跨章关键物；伏笔推进或回收；章节结尾仍在持续的动作与风险。\n"
+        "生成状态资料前，先独立审查最终正文内部是否存在有前后逐字原文直接证明的硬矛盾。"
+        "重点检查同一人物的生死、清醒、伤势和位置，物件的存在、撤走、开合、损毁、移动和持有人，"
+        "人物进出场、时间先后、原因结果、明确知识或权限以及代词唯一指向。"
+        "只有前文已经建立一个确定状态、后文又在没有任何过渡的情况下使用互斥状态，才列为问题；"
+        "不得把人物判断失误、行为不够聪明、现实流程不完整、表达可优化、可能存在但没有证据的风险或单纯文风问题列为矛盾。"
+        "最多列3项critical或major问题，每项必须分别逐字引用较早和较晚的正文证据；没有明确硬矛盾时issues必须为空。\n"
+        "输出前在内部逐段检查人物实际出场和带来的新信息，以及伤势、能力、关系、位置、关键物、未决任务、"
+        "伏笔和章末持续风险是否真的发生变化。只记录后续章节若不知道就会写错的结果，不记录正文的办理过程。\n"
+        "会影响后文判断的线索、异常以及记录缺失/覆盖/删除/清空必须保留其结果和未决状态，"
+        "但不要保存发现它们时的逐步核验流程。\n"
+        "核对、封存、编号、取样、审批、交接、见证、记录固定和责任说明等一次性步骤，除非后文必须继续使用同一批次、"
+        "持有人、权限、未完成任务或伏笔，否则只能并入最终结果，不能分别进入关键事实、事件、物件和任务。\n"
         "正文明确出现且会影响后文的每一项，都必须进入摘要或关键事实，并至少落入active fact、人物/设定运行态、"
         "伏笔、对象、冲突、任务或阶段档案中的一个真实存储位置；不能只出现在long_term_events清单里。\n"
         "正文中实际行动、说话、来电或提供关键信息的已有命名人物，必须进入current_chapter_character_refs和"
@@ -10327,25 +16450,40 @@ def _build_long_form_memory_finalize_context(project, chapter_index, final_text)
         "更新已有事实时必须对照索引中的原scope和精确内容，保留仍然有效的数量、程度、范围、部位、对象和不确定性；"
         "不得用更短的宽泛概括覆盖精确旧事实。全局紧凑状态目录中的每条引用都是真实存在的当前状态；"
         "普通章和十章边界都只提交本章选择、触及、新增、修订或退出的状态。十章边界的其他全部状态由程序原样继承并核验哈希。"
+        "章首已经存在且章末没有变化的伤势、能力、关系、位置、规则和限制，即使正文再次表现，也不得重复进入fact_updates、"
+        "record_updates、state_patch或long_term_events；只把实际出场人物放入current_chapter_character_refs，并在必要的"
+        "unchanged复核项中确认。角色只完成一次检测、汇报、送达或普通执行动作，也不构成人物运行态更新。"
     )
     compact_target = (
         "本章不是十章边界。完整性优先，但只返回本章真正新增、改变、明确结束或被正文直接核对且后文必须继承的最小增量；"
-        "不得为了接近上限填满数组。建议fact_updates 3-6项、long_term_events 2-5项、"
+        "不得为了接近上限填满数组。建议fact_updates 1-4项、long_term_events 1-3项、"
         "record_updates的人物与设定各0-3项、伏笔0-2项、state_patch各列表0-5项。"
         "人物仅行动、说话或提供信息时只进入current_chapter_character_refs与state_reconciliation.character_refs；"
         "只有章末持续状态、公开层或关系确有变化才写record_updates或state_patch。"
         "相同语义不得同时拆成多条事实、事件和状态；可以交叉引用，但每个分区只承担自己的存储职责。"
-        "stage_archive必须为null。目标JSON总长度不超过18000字；确有彼此独立且后文必须继承的关键变化时可以突破建议数量，但不得省略。"
+        "stage_archive必须为null。目标JSON总长度不超过8000字；确有彼此独立且后文必须继承的关键变化时可以突破建议数量，但不得省略。"
         if not stage_boundary else
         "本章是十章边界。除完整stage_archive外，其他分区仍只返回本章新增、改变、结束或直接核对的最小增量；"
-        "不得回显最近十章或全量状态，未触及资料由程序原样继承。"
+        "不得回显最近十章或全量状态，未触及资料由程序原样继承。建议fact_updates 1-4项、long_term_events 1-3项、"
+        "record_updates的人物与设定各0-3项、伏笔0-2项；章首已有且本章未改变的状态不得重复更新。"
     )
     output_requirements = (
         "【输出要求】\n严格输出一个合法JSON对象，顶层结构为"
-        '{"outline":"6-10条实际提纲","summary":"本章摘要","key_facts":["事实"],"long_form_memory":{...}}。'
-        "outline、summary和key_facts只能概括最终正文已经发生的内容。summary控制在800字以内；"
-        "key_facts通常控制在4-16条，每条只保留一个后文必须继承的合并事实，同一事件的背景、判断和结果不得拆成多条。"
-        "确有超过16项彼此独立且都会影响后文时必须保留，不得为了数字上限丢失关键连续性。"
+        '{"logic_audit":{"checked":true,"issues":[{"severity":"critical|major",'
+        '"category":"chronology|causality|character_state|character_location|object_state|object_ownership|spatial_state|pronoun_reference|knowledge_permission",'
+        '"earlier_quote":"较早的正文逐字原文","later_quote":"较晚的正文逐字原文","explanation":"两种状态为何不能同时成立"}]},'
+        '"prose_review":{"checked":true,"issues":["仅记录可逐字定位的读感问题"]},'
+        '"repair_patches":[{"before":"正文中唯一出现的原句片段","after":"局部替换文本","reason":"重复说明|流程赘述|机械短碎|局部语言冲突"}],'
+        '"outline":"6-10条实际提纲","summary":"本章摘要","key_facts":["事实"],"long_form_memory":{...}}。'
+        "logic_audit只审查最终正文内部已经发生的直接矛盾，不评价文风和剧情选择；checked必须为true。"
+        "prose_review只记录有明确原文位置的重复说明、无结果流程赘述、机械短碎或局部语言冲突；"
+        "正常留白、剧情选择、文风偏好和现实流程不完整都不是问题。repair_patches通常为空；"
+        "只有确实需要修补且before在最终正文中逐字唯一出现时才返回，最多3项。"
+        "每项只能做一处局部替换，不能改剧情事实、人物决定、时间线、关系结果、伏笔或章末结果，"
+        "更不能重写整段或整章。"
+        "outline、summary和key_facts只能概括最终正文已经发生的内容。summary控制在500字以内；"
+        "key_facts通常控制在3-8条，每条只保留一个后文必须继承的合并事实，同一事件的背景、过程、判断和结果不得拆成多条。"
+        "确有超过8项彼此独立且都会影响后文时必须保留，不得为了数字上限丢失关键连续性。"
         "每条evidence_quote必须从最终正文逐字复制连续的8-60字原文，保留原标点和引号；"
         "找不到逐字证据时不得生成对应动态更新。"
         + compact_target
@@ -10782,6 +16920,113 @@ def _next_prefixed_id(items, prefix):
     return f"{prefix}-{highest + 1:04d}"
 
 
+def _long_form_object_name_is_placeholder(name, key=""):
+    compact_name = _compact_text(name)
+    compact_key = _compact_text(key)
+    return (
+        not compact_name
+        or compact_name.casefold() == compact_key.casefold()
+        or bool(
+            re.fullmatch(
+                r"NOBJ(?:-[A-Z0-9]+)*\d+",
+                compact_name,
+                re.IGNORECASE,
+            )
+        )
+    )
+
+
+def _long_form_object_name_matches_state(name, state):
+    compact_name = _compact_text(name)
+    compact_state = _compact_text(state)
+    if not compact_name or not compact_state:
+        return False
+    if compact_name.casefold() in compact_state.casefold():
+        return True
+    for width in (4, 3):
+        if len(compact_name) < width:
+            continue
+        if any(
+            compact_name[index:index + width].casefold() in compact_state.casefold()
+            for index in range(len(compact_name) - width + 1)
+        ):
+            return True
+    generic_pairs = {
+        "物件", "当前", "已经", "仍在", "相关", "记录", "状态",
+        "文书", "订单", "契约", "货单", "资料", "证物", "证据",
+    }
+    return any(
+        marker not in generic_pairs
+        and marker.casefold() in compact_state.casefold()
+        for marker in (
+            compact_name[index:index + 2]
+            for index in range(max(0, len(compact_name) - 1))
+        )
+    )
+
+
+def _long_form_same_object_entity(existing, incoming):
+    existing = existing if isinstance(existing, dict) else {}
+    incoming = incoming if isinstance(incoming, dict) else {}
+    old_lore = str(existing.get("lore_id", "") or "").strip()
+    new_lore = str(incoming.get("lore_id", "") or "").strip()
+    if old_lore and new_lore:
+        return old_lore == new_lore
+
+    old_key = str(existing.get("key", "") or "").strip()
+    new_key = str(incoming.get("key", "") or "").strip()
+    old_name = _compact_text(existing.get("name", ""))
+    new_name = _compact_text(incoming.get("name", ""))
+
+    old_placeholder = _long_form_object_name_is_placeholder(old_name, old_key)
+    new_placeholder = _long_form_object_name_is_placeholder(new_name, new_key)
+    if old_placeholder and not new_placeholder:
+        return _long_form_object_name_matches_state(
+            new_name, existing.get("state", "")
+        )
+    if new_placeholder and not old_placeholder:
+        return _long_form_object_name_matches_state(
+            old_name, incoming.get("state", "")
+        )
+    if old_placeholder and new_placeholder:
+        old_state = _compact_text(existing.get("state", ""))
+        new_state = _compact_text(incoming.get("state", ""))
+        if not old_state or not new_state:
+            return old_key.casefold() == new_key.casefold()
+        shorter, longer = sorted((old_state, new_state), key=len)
+        if len(shorter) >= 8 and shorter.casefold() in longer.casefold():
+            return True
+        return SequenceMatcher(None, old_state, new_state).ratio() >= 0.42
+    if old_name.casefold() == new_name.casefold():
+        return True
+    shorter, longer = sorted((old_name, new_name), key=len)
+    return len(shorter) >= 4 and shorter.casefold() in longer.casefold()
+
+
+def _next_long_form_object_key(issued_keys, preferred_key=""):
+    values = {
+        str(value or "").strip()
+        for value in issued_keys or []
+        if str(value or "").strip()
+    }
+    preferred = str(preferred_key or "").strip()
+    match = re.match(r"^(.*?)(\d+)$", preferred)
+    if match:
+        root = match.group(1)
+        width = len(match.group(2))
+    else:
+        root = "NOBJ-NF"
+        width = 1
+    pattern = re.compile(rf"^{re.escape(root)}(\d+)$", re.IGNORECASE)
+    highest = 0
+    for value in values:
+        current = pattern.match(value)
+        if current:
+            highest = max(highest, int(current.group(1)))
+            width = max(width, len(current.group(1)))
+    return root + str(highest + 1).zfill(width)
+
+
 def _append_record_runtime(memory, kind, item_id, chapter, chapter_index, state="", changes=None, evidence=""):
     runtime = memory.setdefault("record_runtime", {}).setdefault(kind, {})
     entry = runtime.setdefault(str(item_id), {"state": "", "developments": []})
@@ -10827,6 +17072,19 @@ def _merge_long_form_state_patch(
         existing = snapshot.get(snapshot_key, []) if isinstance(snapshot.get(snapshot_key), list) else []
         order = []
         records = {}
+
+        def store(item_key, item):
+            value = deepcopy(item)
+            if snapshot_key == "object_states" and item_key in records:
+                previous = records[item_key]
+                for field in ("lore_id", "key", "name"):
+                    if (
+                        not str(value.get(field, "") or "").strip()
+                        and str(previous.get(field, "") or "").strip()
+                    ):
+                        value[field] = previous[field]
+            records[item_key] = value
+
         for item in existing:
             if not isinstance(item, dict):
                 continue
@@ -10835,7 +17093,7 @@ def _merge_long_form_state_patch(
                 continue
             if item_key not in records:
                 order.append(item_key)
-            records[item_key] = deepcopy(item)
+            store(item_key, item)
         for item in patch.get(incoming_key, []) if isinstance(patch.get(incoming_key), list) else []:
             normalized = normalizer(item)
             if not normalized:
@@ -10845,7 +17103,7 @@ def _merge_long_form_state_patch(
                 continue
             if item_key not in records:
                 order.append(item_key)
-            records[item_key] = normalized
+            store(item_key, normalized)
         snapshot[snapshot_key] = [records[item_key] for item_key in order if item_key in records]
 
     character_names = {
@@ -10919,9 +17177,82 @@ def _merge_long_form_state_patch(
         return result if (lore_id or name) and state else None
 
     def object_key(item):
-        return str(item.get("lore_id", "") or item.get("key", "") or _compact_text(item.get("name", ""))).strip()
+        return str(item.get("key", "") or item.get("lore_id", "") or _compact_text(item.get("name", ""))).strip()
 
-    merge_items("object_states", "object_states", object_key, normalize_object)
+    existing_objects = snapshot.get("object_states", [])
+    existing_objects = existing_objects if isinstance(existing_objects, list) else []
+    object_order = []
+    object_records = {}
+
+    def store_object(item_key, item):
+        value = deepcopy(item)
+        if item_key in object_records:
+            previous = object_records[item_key]
+            for field in ("lore_id", "key", "name"):
+                if (
+                    not str(value.get(field, "") or "").strip()
+                    and str(previous.get(field, "") or "").strip()
+                ):
+                    value[field] = previous[field]
+            if (
+                _long_form_object_name_is_placeholder(
+                    value.get("name", ""), value.get("key", item_key)
+                )
+                and not _long_form_object_name_is_placeholder(
+                    previous.get("name", ""), previous.get("key", item_key)
+                )
+            ):
+                value["name"] = previous["name"]
+        object_records[item_key] = value
+
+    for item in existing_objects:
+        if not isinstance(item, dict):
+            continue
+        item_key = object_key(item)
+        if not item_key:
+            continue
+        if item_key not in object_records:
+            object_order.append(item_key)
+        store_object(item_key, item)
+    issued_state_ids["objects"].update(object_records)
+
+    incoming_objects = patch.get("object_states", [])
+    incoming_objects = incoming_objects if isinstance(incoming_objects, list) else []
+    for item in incoming_objects:
+        normalized = normalize_object(item)
+        if not normalized:
+            continue
+        requested_key = object_key(normalized)
+        if not requested_key:
+            continue
+        assigned_key = requested_key
+        existing = object_records.get(requested_key)
+        if (
+            existing is not None
+            and not _long_form_same_object_entity(existing, normalized)
+        ) or (
+            existing is None
+            and requested_key in issued_state_ids["objects"]
+        ):
+            assigned_key = _next_long_form_object_key(
+                issued_state_ids["objects"],
+                requested_key,
+            )
+            normalized["key"] = assigned_key
+            if _long_form_object_name_is_placeholder(
+                normalized.get("name", ""), requested_key
+            ):
+                normalized["name"] = assigned_key
+            temp_refs.setdefault("objects", {})[requested_key] = assigned_key
+        if assigned_key not in object_records:
+            object_order.append(assigned_key)
+        store_object(assigned_key, normalized)
+        issued_state_ids["objects"].add(assigned_key)
+    snapshot["object_states"] = [
+        object_records[item_key]
+        for item_key in object_order
+        if item_key in object_records
+    ]
     retired_object_keys = {_compact_text(value) for value in retirements.get("object_keys", []) if str(value or "").strip()}
     snapshot["object_states"] = [
         item for item in snapshot.get("object_states", [])
@@ -11079,12 +17410,14 @@ def _merge_cumulative_story_text(existing, incoming):
 def _apply_long_form_memory_update_unchecked(project, chapter_index, payload, update_hash):
     chapters = project["chapters"]
     chapter = chapters[chapter_index]
-    memory = _normalize_long_form_memory(project.get("long_form_memory", {}))
+    memory = _backfill_long_form_fact_scopes(
+        _normalize_long_form_memory(project.get("long_form_memory", {}))
+    )
     revision_before = int(memory.get("revision", 0) or 0)
     reference_maps = _long_form_record_reference_maps(project)
     temp_refs = {
         "characters": {}, "lore": {}, "foreshadows": {}, "facts": {},
-        "archives": {}, "conflicts": {}, "tasks": {},
+        "archives": {}, "objects": {}, "conflicts": {}, "tasks": {},
     }
     touched_refs = {"characters": [], "lore": [], "foreshadows": []}
     touched_fact_ids = []
@@ -11108,7 +17441,12 @@ def _apply_long_form_memory_update_unchecked(project, chapter_index, payload, up
                 record = reference_maps[kind]["id_to_record"].get(item_id)
             else:
                 name = str(item.get("name", "") or "").strip()
-                record = by_name.get(_compact_text(name).casefold())
+                item_id = _resolve_long_form_record_ref(
+                    project, kind, item.get("ref", item.get("id", ""))
+                )
+                record = reference_maps[kind]["id_to_record"].get(item_id)
+                if record is None:
+                    record = by_name.get(_compact_text(name).casefold())
                 if record is None and name:
                     record = factory(len(records))
                     record["id"] = uuid.uuid4().hex
@@ -11127,6 +17465,10 @@ def _apply_long_form_memory_update_unchecked(project, chapter_index, payload, up
                     temp_refs[kind][key] = item_id
             if not isinstance(record, dict) or not item_id:
                 continue
+            if kind == "characters":
+                identity_fields = item.get("canon", item.get("fields", {}))
+                _promote_character_identity(record, item.get("name"), identity_fields)
+                _apply_character_string_canon(record, identity_fields)
             if item_id not in touched_refs[kind]:
                 touched_refs[kind].append(item_id)
             state = str(item.get("state", "") or "").strip()
@@ -11192,7 +17534,10 @@ def _apply_long_form_memory_update_unchecked(project, chapter_index, payload, up
             touched_refs["foreshadows"].append(item_id)
         status = str(item.get("status", "") or "").strip()
         if status in {"未埋", "已埋", "已回收", "无需回收", "废弃"}:
-            record["status"] = status
+            # A later response may describe an already-planted clue as
+            # "未埋" again. Keep the lifecycle monotonic unless the model
+            # explicitly advances or retires it.
+            record["status"] = _merge_foreshadow_status(record.get("status", ""), status)
         chapter_label = _chapter_label(chapter_index + 1, chapter)
         setup_chapter = _normalize_foreshadow_chapter_ref(item.get("setup_chapter", ""))
         payoff_chapter = _normalize_foreshadow_chapter_ref(item.get("payoff_chapter", ""))
@@ -11408,7 +17753,9 @@ def _apply_long_form_memory_update_unchecked(project, chapter_index, payload, up
     state_lifecycle_review = payload.get("state_lifecycle_review", {})
     if isinstance(state_lifecycle_review, dict):
         reviewed_objects = [
-            str(value or "").strip()
+            temp_refs.get("objects", {}).get(
+                str(value or "").strip(), str(value or "").strip()
+            )
             for value in state_lifecycle_review.get("reviewed_object_keys", [])
             if str(value or "").strip()
         ] if isinstance(state_lifecycle_review.get("reviewed_object_keys", []), list) else []
@@ -11477,7 +17824,7 @@ def _apply_long_form_memory_update_unchecked(project, chapter_index, payload, up
                     if ref_text in fact_by_id or ref_text in historical_fact_ids
                     else temp_refs["facts"].get(ref_text, "")
                 )
-            elif kind in {"conflicts", "tasks"}:
+            elif kind in {"objects", "conflicts", "tasks"}:
                 item_id = temp_refs[kind].get(ref_text, ref_text)
             else:
                 item_id = ref_text
@@ -11642,7 +17989,10 @@ def _apply_long_form_memory_update_unchecked(project, chapter_index, payload, up
         selection["object_keys"] = []
         object_values = next_memory.get("object_keys", [])
         for value in object_values if isinstance(object_values, list) else []:
-            canonical = object_key_by_compact.get(_compact_text(value), "")
+            resolved_value = temp_refs["objects"].get(
+                str(value or "").strip(), str(value or "").strip()
+            )
+            canonical = object_key_by_compact.get(_compact_text(resolved_value), "")
             if canonical and canonical not in selection["object_keys"]:
                 selection["object_keys"].append(canonical)
         for value in event_selection_refs["object_keys"]:
@@ -11654,8 +18004,10 @@ def _apply_long_form_memory_update_unchecked(project, chapter_index, payload, up
         for item in state_patch.get("object_states", []) if isinstance(state_patch.get("object_states"), list) else []:
             if not isinstance(item, dict):
                 continue
+            requested_key = str(item.get("key", item.get("name", "")) or "").strip()
+            resolved_key = temp_refs["objects"].get(requested_key, requested_key)
             canonical = object_key_by_compact.get(
-                _compact_text(item.get("key", item.get("name", ""))), ""
+                _compact_text(resolved_key), ""
             )
             if canonical and canonical not in selection["object_keys"]:
                 selection["object_keys"].append(canonical)
@@ -12003,6 +18355,9 @@ def _build_chapter_ai_context(project, chapter_index, action):
     continuation_text = _build_chapter_continuation_text(chapters, chapter_index)
     next_chapter_anchor_text = _build_next_chapter_anchor_text(chapters, chapter_index)
     future_plan_text = _build_future_plan_text(chapters, chapter_index)
+    volume_opening_handoff = str(
+        project.get("volume_opening_handoff_context", "") or ""
+    ).strip()
     has_current_text = bool(_compact_text(chap.get("text", "")))
     reverse_from_body = action in {"outline", "summary"} and has_current_text
     draft_words_label = _draft_words_label(chap.get("draft_words", ""))
@@ -12012,11 +18367,14 @@ def _build_chapter_ai_context(project, chapter_index, action):
     draft_words_remaining_label = f"{draft_words_remaining}字" if draft_words_remaining else ""
     style_reference = str(project.get("style_reference", "") or "").strip()
     stage_boundary = (chapter_index + 1) % 10 == 0
+    no_text_count_rule = (
+        "能不用“几个字/几个词/几个音节”就不用；真要写字数，标点符号、引号和空格都不计入字数。"
+    )
     draft_task = (
         "请根据当前章节的章节提纲和已有正文草稿续写正文。正文草稿已有内容时，只输出可以直接接在草稿末尾的新正文，"
-        "不要重复、概括或改写已有正文；开头要优先承接【续写承接点】里的当前正文结尾原文。"
-        "如果章节提纲包含“所属阶段/本章功能/冲突强度/铺垫比例/人物任务/主线任务/结尾钩子”，"
-        "必须优先按这些章节规划字段执行；阶段规则只控制节奏、密度和钩子，不得改写本章提纲核心事件。"
+        "不要重复、概括或改写已有正文；开头要优先承接【续写承接点】里的当前正文结尾原文，"
+        "当前草稿结尾已经写出的句子、动作和结论也不能再次原样或同义重写。"
+        "章节提纲中的核心方向、已发生事实和承接点优先；历史规划元数据只作参考，不要逐项执行、解释或扩展成任务清单。"
         "旧提纲中若残留固定伏笔编号、伏笔任务或伏笔动作，只作历史文本参考，不能当作本章硬任务；"
         "伏笔推进与回收以动态伏笔调度参考和正文自然性为准。"
         "必须继承承接点里的时间、天气、地点、人物位置、情绪和未完成动作；如果上一章写明雨已停或场景已变化，"
@@ -12040,9 +18398,11 @@ def _build_chapter_ai_context(project, chapter_index, action):
         "写每一场时优先让人物在具体环境里做事、被打断、受阻、临时反应，不要只用旁白解释情绪和局势。"
         "参考【本章写作长度】安排详略，但不要为了贴字数牺牲完整场景、冲突收束和正文质量；只输出正文内容。"
         if has_current_text else
-        "请根据当前章节的章节提纲生成正文草稿。若有上一章结尾，请让开篇自然承接上一章的情绪、场景或悬念。"
-        "如果章节提纲包含“所属阶段/本章功能/冲突强度/铺垫比例/人物任务/主线任务/结尾钩子”，"
-        "必须优先按这些章节规划字段执行；阶段规则只控制节奏、密度和钩子，不得改写本章提纲核心事件。"
+        "请根据当前章节的章节提纲生成正文草稿。若有上一章结尾，开篇必须自然承接上一章的状态，"
+        "但上一章结尾原文已经发布，不能原样或同义重写末句、对白、声音、动作落点、结论或情绪；"
+        "必须从对白后的新反应/回答、动作后的新结果/阻力、声音后的声源/新反应中选择一种起笔，"
+        "并让第一段出现新动作、新信息、新决定、新后果或必要情绪转折。"
+        "章节提纲中的核心方向、已发生事实和承接点优先；历史规划元数据只作参考，不要逐项执行、解释或扩展成任务清单。"
         "旧提纲中若残留固定伏笔编号、伏笔任务或伏笔动作，只作历史文本参考，不能当作本章硬任务；"
         "伏笔推进与回收以动态伏笔调度参考和正文自然性为准。"
         "必须继承上一章结尾的时间、天气、地点、人物位置、情绪和未完成动作；如果上一章写明雨已停或场景已变化，"
@@ -12072,18 +18432,16 @@ def _build_chapter_ai_context(project, chapter_index, action):
         draft_task = (
             (
                 "请根据当前章节提纲和已有正文草稿续写正文。已有正文时，只输出可以直接接在草稿末尾的新正文，"
-                "不要重复、概括或改写已有正文；开头必须自然承接【续写承接点】里的最后状态。"
+                "开头承接【续写承接点】里的最后状态。"
                 if has_current_text else
-                "请根据当前章节提纲生成完整正文草稿；若有上一章结尾，开篇必须自然承接其最后状态。"
+                "请根据当前章节提纲生成完整正文草稿；若有上一章结尾，开篇承接其最后状态，并从当前状态自然发展出新的反应、结果、阻力、选择或信息。"
             )
-            + "剧情事件、人物设定、世界规则、关键事实、人物位置、身体状态、持有物品和未完成动作必须按项目资料执行。"
-            "如果章节提纲包含所属阶段、本章功能、冲突强度、人物任务、主线任务、本章目标或结尾钩子，"
-            "先合并其中指向同一事件的内容，只用去重后的事件约束本章剧情边界和顺序，不得把字段复述次数当成正文强调次数。"
-            "旧提纲中的固定伏笔编号不构成硬任务，伏笔只能在符合当前场景和人物动机时自然推进。"
-            "【正文风格参考】是唯一写法标准；不得额外套用口语化、网文感、高密度推进、多动作、多对白、少解释、短句、"
-            "电影化、分镜化或其他默认写作原则，也不得为了所谓去AI味改变样本的叙述方式。"
-            "参考【本章写作长度】安排内容总量，但优先保证本章剧情完整。只输出正文，不输出标题、说明或分析。"
+            + "当前项目资料决定故事事实。提纲、已发布正文、状态快照和连续性资料里已经明确写出的专名、日期、时刻、地点、房间号、"
+            "物件编号、金额、关系称谓、人物位置、身体状态、持有物品、已发生事件和未完成动作，都是本章需要延续的事实。"
+            "以【仿写使用说明】和【正文风格参考】中的完整原样本作为写法来源，让当前人物和当前事件自然长出相同作者的叙述、对白和情绪组织。"
+            "参考【本章写作长度】安排内容总量，输出可直接进入小说的正文。"
         )
+    draft_task += no_text_count_rule
     task_map = {
         "outline": (
             "请为当前章节生成章节提纲。当前章节已有正文草稿时，必须以正文草稿为唯一事实来源，"
@@ -12107,7 +18465,7 @@ def _build_chapter_ai_context(project, chapter_index, action):
             '{"summary":"本章摘要","key_facts":["后续必须继承的事实"],'
             '"linked_characters":["实际出现或被直接推动的具体人物名"],"long_form_memory":{...}}。'
             "long_form_memory严格执行以下版本2契约："
-            + _long_form_update_contract_instructions(project, chapter_index)
+            + _long_form_update_contract_instructions(project, chapter_index, compact=True)
         ),
         "script_to_novel": (
             "请把当前章节/分集里的剧本内容改编成小说正文。"
@@ -12130,14 +18488,6 @@ def _build_chapter_ai_context(project, chapter_index, action):
             "严格继承原剧本的场景、对白、动作和节奏；不要写创作建议。"
         ),
     }
-    if action == "draft" and str(project.get("style_reference", "") or "").strip():
-        draft_task += (
-            "本次存在【正文风格参考】时，写法优先级最高：除本章剧情事件、人物设定、世界规则、连续性事实必须按当前项目资料执行外，"
-            "叙事口吻、段落长短、换行频率、句式节奏、对白比例、情绪表达方式、信息揭示手法、冲突推进密度、场景细节颗粒度、"
-            "悬念落点和章节收束方式，都要尽量贴近【正文风格参考】。"
-            "如果通用正文风格、去 AI 味要求、网文感要求或你自己的默认表达习惯与【正文风格参考】冲突，以【正文风格参考】为准。"
-        )
-        task_map["draft"] = draft_task
     task_text = task_map.get(action, str(action or "").strip() or "请根据当前资料完成本章写作任务。")
 
     inheritance_rule_lines = [
@@ -12146,6 +18496,8 @@ def _build_chapter_ai_context(project, chapter_index, action):
         "不得改写已发生事实；如果资料冲突，优先保留更具体、更新、更接近当前章节的记录。",
         "续写时要继承人物公开目标、故事内已知动机、称呼和语言风格，以及伤势、物品、地点、关系和情绪变化。",
         "跨章开头必须继承上一章结尾状态：时间、天气、地点、人物位置、人物手中物品、身体状态和未完成动作不能凭空回退。",
+        "上一章结尾原文已经发布，不能把末句、对白、声音、动作落点、结论或情绪再次原样或同义写出；"
+        "下一章必须从新反应、新结果、新阻力或新信息开始，不能让同一触发句同时作为上一章结尾和下一章开头。",
         "状态快照、活跃事实、人物卡、设定和伏笔用于静默保证连续性；未在本章发生变化的旧信息不是正文任务，"
         "不得为了证明记住资料而让旁白或人物重新解释。只有新证据、新决定、新后果或当前行动确实依赖时才简短引用。",
         "伏笔只在合适章节推进；已回收/无需回收/废弃伏笔不要重复当新线索。缺资料时保持克制，不要补出会影响后文的新设定。",
@@ -12177,6 +18529,10 @@ def _build_chapter_ai_context(project, chapter_index, action):
         current_lines.append("章节提纲：已省略；本次必须仅根据正文草稿反向整理，避免旧提纲或后续规划影响结果。")
     else:
         current_lines.append(f"章节提纲：{clean_context_text(chapter_outline_for_context, 6000)}")
+        current_lines.append(
+            "明确事实锁定：章节提纲、已有正文、状态快照与连续性资料中已明确写出的专名、日期、时刻、地点、"
+            "房间号、物件编号、金额、关系称谓和条件，正文涉及到时必须逐字继承；未明确具体值的内容才可自然补足。"
+        )
     current_lines.append(f"正文草稿：{_clip_context_text(chap.get('text', ''), current_text_limit, keep_tail=True)}")
     if reverse_from_body:
         current_lines.extend([
@@ -12252,7 +18608,7 @@ def _build_chapter_ai_context(project, chapter_index, action):
         common_sections.insert(
             3,
             (
-                "剧情执行硬约束",
+                "剧情连续性参考",
                 _build_chapter_execution_hard_constraints(project, chapter_index),
                 4200,
                 False,
@@ -12275,53 +18631,18 @@ def _build_chapter_ai_context(project, chapter_index, action):
     if action == "draft":
         common_sections.insert(3, ("本章写作长度", chapter_length_section, 500, False))
         if style_reference:
-            style_target = draft_words_remaining if has_current_text and draft_words_remaining else draft_words_target
-            style_target = int(style_target or 0)
-            style_profile = _build_style_reference_profile(style_reference, style_target)
-            selected_style_reference = (
-                style_reference if len(style_reference) <= 8000 else
-                _select_style_reference_excerpts(style_reference, chapter_match_text, 6000)
-            )
-            style_lock_context = (
-                "本章进入风格锁定模式。剧情事件、人物设定、世界规则、连续性事实必须按当前项目资料执行；"
-                "除此之外，正文写法必须优先模仿【正文风格参考】。\n"
-                f"{style_profile}\n"
-                + (
-                    f"当前文风样本全文约{len(_compact_text(style_reference))}字；上述文风指纹按全文计算，"
-                    "【正文风格参考】只放入按段落功能分层选出的代表片段。生成时以全文指纹为总体标准，"
-                    "不要把某一个代表片段的局部剧情节奏误当成全部文风。\n"
-                    if selected_style_reference != style_reference else ""
-                )
-                +
-                "文风重复与推进边界："
-                + _style_repetition_boundary_text()
-                + "\n"
-                "重点贴近：叙事口吻、段落长短、换行频率、句式节奏、对白比例、描写颗粒度、人物与环境反应的组织方式、"
-                "情节或情绪推进密度、信息揭示顺序、情绪表达方式、章节收束方式。\n"
-                "进一步观察并模仿统计数字无法覆盖的写法，包括叙述与对白如何衔接、描写落在何种细节、"
-                "何时解释背景、何时留白、段落如何起落；不要把任何题材偏好或固定网文模板强加给样本。\n"
-                "前文正文只用于继承事实、状态和未完成动作；当它的写法与当前样本不同，以当前样本为准。\n"
-                "写完后先静默检查整体段落密度、长短段分布、句式和对白比例是否接近样本，偏差明显时自行重写再输出。\n"
-                "如果通用正文风格、去 AI 味要求、网文感要求与样本冲突，一律以样本写法为准。\n"
-                "只输出当前小说正文，不输出风格分析、说明或对照。"
-            )
-            style_reference_context = (
-                (
-                    f"以下内容从约{len(_compact_text(style_reference))}字完整样本中按对白、动作、说明、情绪和收束分层选取，"
-                    "各代表片段彼此独立，不要把它们当作连续剧情。\n"
-                    if selected_style_reference != style_reference else
-                    "以下样本是本次正文扩写的强制写法参照。"
-                )
-                + "剧情、人物、设定和连续性事实按当前项目资料执行；"
-                "除剧情内容外，正文的叙事口吻、段落长短、换行频率、句式节奏、对白比例、情绪表达方式、信息揭示手法、"
-                "冲突推进密度、场景细节颗粒度、悬念落点和章节收束方式，都要尽量贴近这个样本。"
-                "不得复用样本里的具体情节、人物关系、句子、比喻或专有名词；不要把样本剧情搬进当前小说。\n\n"
-                + selected_style_reference
-            )
-            style_sections = [
-                ("风格锁定规则", style_lock_context, 2200, False),
-                ("正文风格参考", style_reference_context, 12000, False),
-            ]
+            style_sections.extend([
+                ("仿写使用说明", _build_full_style_imitation_guidance(style_reference), 1200, False),
+                ("正文风格参考", style_reference, len(style_reference) + 64, False),
+            ])
+        # Keep this after the raw sample so direct drafting receives it even
+        # when the style-finalize pass is intentionally skipped.
+        style_sections.append((
+            "正文自然表达边界",
+            _natural_expression_guidance(),
+            900,
+            False,
+        ))
     memory_sections = _long_form_memory_sections(project, memory_selection)
     if reverse_from_body:
         knowledge_sections = [
@@ -12362,7 +18683,12 @@ def _build_chapter_ai_context(project, chapter_index, action):
             ),
         )
     if action == "draft":
-        knowledge_sections.insert(4, ("后续规划 / 边界", future_plan_text, 5000, True))
+        if chapter_index == 0 and volume_opening_handoff:
+            knowledge_sections.insert(
+                4,
+                ("上一卷卷末承接事实", volume_opening_handoff, 12000, True),
+            )
+        knowledge_sections.insert(4, ("后续规划参考", future_plan_text, 5000, True))
         if next_chapter_anchor_text:
             knowledge_sections.insert(5, ("后章衔接点", next_chapter_anchor_text, 900, False))
     current_section_item = (
@@ -12390,7 +18716,9 @@ def _build_chapter_ai_context(project, chapter_index, action):
     out = []
     used = 0
     seen_context_lines = set()
-    raw_context_titles = {"当前章节", "正文风格参考"}
+    # This short trailing guide intentionally repeats the corresponding part
+    # of the imitation note so it remains visible after the raw sample.
+    raw_context_titles = {"当前章节", "正文风格参考", "正文自然表达边界"}
     style_titles = {title for title, _content, _limit, _keep_tail in style_sections}
     style_reserve = sum(
         min(len(content), limit) + len(title) + 8

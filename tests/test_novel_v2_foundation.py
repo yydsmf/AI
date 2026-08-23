@@ -623,6 +623,61 @@ class NovelV2FoundationTests(unittest.TestCase):
         self.assertEqual(len(project["characters"]), 1)
         self.assertEqual(project["characters"][0]["name"], "林律师")
         self.assertEqual(project["characters"][0]["goal"], "保护证人")
+
+        project["characters"].append(
+            {
+                "id": "empty-character",
+                "name": "内门弟子（姓名未明）",
+                "role": "",
+                "goal": "",
+                "secret": "",
+                "voice": "",
+                "notes": "",
+            }
+        )
+        tab._v2_apply_record_updates(
+            {
+                "characters": [{
+                    "operation": "create",
+                    "name": "内门弟子（姓名未明）",
+                    "canon": "玄铁宗内门弟子；姓名、修为和来意未明",
+                }]
+            },
+            chapter["id"],
+        )
+        self.assertEqual(
+            project["characters"][-1]["role"],
+            "玄铁宗内门弟子",
+        )
+        self.assertEqual(project["characters"][-1]["notes"], "玄铁宗内门弟子；姓名、修为和来意未明")
+        temporary_id = project["characters"][-1]["id"]
+        tab._v2_apply_record_updates(
+            {
+                "characters": [{
+                "operation": "update",
+                "id": temporary_id,
+                "name": "顾沉舟",
+                "fields": {
+                    "role": "被新描述覆盖的身份",
+                    "goal": "证明自己的实力",
+                    "voice": "说话简短直接",
+                    "notes": "正式姓名已进入宗门名册",
+                },
+                "evidence": "顾沉舟承认败北",
+            }]
+            },
+            chapter["id"],
+        )
+        self.assertEqual(project["characters"][-1]["id"], temporary_id)
+        self.assertEqual(project["characters"][-1]["name"], "顾沉舟")
+        self.assertEqual(
+            project["characters"][-1]["role"],
+            "玄铁宗内门弟子；被新描述覆盖的身份",
+        )
+        self.assertEqual(project["characters"][-1]["goal"], "证明自己的实力")
+        self.assertEqual(project["characters"][-1]["voice"], "说话简短直接")
+        self.assertIn("正式姓名已进入宗门名册", project["characters"][-1]["notes"])
+        self.assertIn("旧名：内门弟子（姓名未明）", project["characters"][-1]["notes"])
         self.assertEqual(len(project["lore"]), 1)
         self.assertEqual(project["lore"][0]["name"], "青色锁链")
         self.assertEqual(project["characters"][0]["evidence"][0]["chapter_id"], chapter["id"])
@@ -636,6 +691,55 @@ class NovelV2FoundationTests(unittest.TestCase):
         self.assertIn("未解真相不能只放unresolved_tasks", postwrite_prompt)
         self.assertIn("跨章关键物件不能只放状态", postwrite_prompt)
         self.assertIn("持续角色不能只放character_states", postwrite_prompt)
+
+    def test_v2_draft_hides_duplicate_preview_after_body_is_saved(self):
+        class FakeText:
+            def __init__(self, text=""):
+                self.text = text
+
+            def toPlainText(self):
+                return self.text
+
+            def setPlainText(self, text):
+                self.text = text
+
+            def clear(self):
+                self.text = ""
+
+        tab = NovelWritingV2Tab.__new__(NovelWritingV2Tab)
+        project = _default_project()
+        chapter = _new_chapter(0)
+        chapter["draft_words"] = "2000"
+        project["chapters"] = [chapter]
+        tab.current_project = project
+        tab.current_chapter_index = 0
+        tab._v2_pipeline_retry_counts = {}
+        tab._v2_pipeline_chapter_id = chapter["id"]
+        tab._v2_draft_segment_count = 1
+        tab._v2_draft_segment_index = 1
+        tab._v2_draft_completed_segments = 0
+        tab._v2_pipeline_length_repair_attempted = False
+        tab.chapter_text = FakeText()
+        tab.chapter_ai_preview = FakeText("刚生成的正文")
+        tab.chapter_ai_stream_text = "刚生成的正文"
+        tab._chapter_ai_resume_prefix = "刚生成的正文"
+        tab._set_text_without_signals = lambda widget, text: widget.setPlainText(text)
+        tab._mark_chapter_dirty = lambda: None
+        tab._flush_current_editors = lambda: None
+        tab._set_partial_chapter_ai_preview_state = lambda _enabled: None
+        tab._v2_current_chapter = lambda: chapter
+        tab._v2_draft_target_bounds = lambda _draft_words: (2000, 1800, 2400)
+        next_actions = []
+        tab._start_v2_pipeline_action = next_actions.append
+        tab._fail_v2_pipeline = lambda *_args, **_kwargs: self.fail("draft should not fail")
+
+        tab._on_v2_pipeline_ready("draft", "刚生成的正文")
+
+        self.assertEqual(tab.chapter_text.toPlainText(), "刚生成的正文")
+        self.assertEqual(tab.chapter_ai_preview.toPlainText(), "")
+        self.assertEqual(tab.chapter_ai_stream_text, "")
+        self.assertEqual(tab._chapter_ai_resume_prefix, "")
+        self.assertEqual(next_actions, ["pov_audit"])
 
     def test_300k_scale_contexts_stay_bounded_and_keep_current_chapter_complete(self):
         project = _default_project()

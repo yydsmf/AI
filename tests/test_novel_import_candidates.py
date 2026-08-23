@@ -1,107 +1,67 @@
 import unittest
 
 from gpt_desktop.novel_import import (
+    _merge_framework_chapter_plans,
     _apply_import_candidates,
     _candidate_analysis_dossier_text,
     _candidate_analysis_text,
-    _extract_structured_framework_chapter_plan,
+    _extract_import_candidates,
     _foreshadow_review_chapter_chunks,
     _foreshadow_review_context,
     _foreshadow_review_dossier_text,
     _normalize_ai_candidates,
-    _merge_framework_chapter_plans,
+    _is_framework_scope_title,
 )
 from gpt_desktop.novel_utils import _new_chapter, _normalize_project
 from gpt_desktop.novel_utils import _sanitize_import_candidates_for_long_form
 
 
 class NovelImportCandidateTests(unittest.TestCase):
-    def test_structured_framework_keeps_explicit_chapters_and_stage_event_ids_separate(self):
-        text = """四、阶段规划
-第一阶段：开局
-章节：第1—3章
-1. 主角苏醒。
-2. 女主登场。
-3. 首次救人。
-第二阶段：扩展
-章节：第4—6章
-1. 进入富豪圈。
-2. 得到第一株老药。
-3. 查到穿越线索。
-六、开篇建议标题
-1. 第一章：医圣归来
-2. 第二章：肇事千金来了
-"""
-
-        plan = _extract_structured_framework_chapter_plan(text)
-
-        self.assertEqual(len(plan["stages"]), 2)
-        self.assertEqual(len(plan["chapters"]), 2)
-        self.assertEqual([item["index"] for item in plan["chapters"]], [1, 2])
-        self.assertEqual(plan["chapters"][0]["title"], "医圣归来")
-        self.assertEqual(plan["chapters"][1]["title"], "肇事千金来了")
-        self.assertEqual(
-            [event["id"] for event in plan["stages"][0]["events"]],
-            ["S01-E01", "S01-E02", "S01-E03"],
-        )
-        self.assertEqual(plan["stages"][1]["events"][0]["text"], "进入富豪圈。")
-        self.assertEqual(plan["stages"][1]["events"][-1]["text"], "查到穿越线索。")
-
-    def test_structured_framework_does_not_guess_when_numbered_events_are_incomplete(self):
-        text = """第一阶段：开局
-章节：第1—3章
-1. 主角苏醒。
-3. 首次救人。
-"""
-
-        plan = _extract_structured_framework_chapter_plan(text)
-
-        self.assertEqual(plan["chapters"], [])
-        self.assertEqual(plan["stages"], [])
-
-    def test_structured_framework_allows_event_count_to_differ_from_stage_chapter_count(self):
-        plan = _extract_structured_framework_chapter_plan("""第一阶段：开局
-章节：第1—5章
-1. 主角苏醒。
-2. 女主登场。
-3. 首次救人。
-""")
-
-        self.assertEqual(len(plan["stages"]), 1)
-        self.assertEqual(plan["stages"][0]["start_chapter"], 1)
-        self.assertEqual(plan["stages"][0]["end_chapter"], 5)
-        self.assertEqual(len(plan["stages"][0]["events"]), 3)
-
-    def test_structured_framework_plan_keeps_events_out_of_explicit_chapter_merge(self):
-        structured = _extract_structured_framework_chapter_plan("""第一阶段：开局
-章节：第1—2章
-1. 主角苏醒。
-2. 女主登场。
-六、开篇标题
-1. 第一章：医圣归来
-""")
+    def test_framework_plan_keeps_ai_stages_when_source_has_no_explicit_stage_ranges(self):
         ai_plan = {
-            "summary": "AI阶段摘要",
-            "chapters": [
-                {
-                    "index": 1,
-                    "title": "医圣归来",
-                    "outline": "AI补充医院冲突。",
-                    "chapter_function": "建立主角",
-                }
-            ],
+            "summary": "全书分三阶段推进。",
+            "stages": [{
+                "id": "S01",
+                "name": "开篇试探",
+                "start_chapter": 1,
+                "end_chapter": 10,
+                "events": [{"id": "S01-E01", "order": 1, "text": "主角发现异常。"}],
+            }],
+            "chapters": [],
         }
 
-        merged = _merge_framework_chapter_plans(ai_plan, structured)
+        merged = _merge_framework_chapter_plans(ai_plan, {"summary": "", "chapters": [], "stages": []})
 
-        self.assertEqual(len(merged["chapters"]), 1)
-        self.assertEqual(merged["chapters"][0]["title"], "医圣归来")
-        self.assertEqual(merged["chapters"][0]["outline"], "AI补充医院冲突。")
-        self.assertEqual(merged["chapters"][0]["source_event_ids"], [])
-        self.assertEqual(len(merged["stages"]), 1)
-        self.assertEqual(
-            [event["text"] for event in merged["stages"][0]["events"]],
-            ["主角苏醒。", "女主登场。"],
+        self.assertEqual(merged["stages"], ai_plan["stages"])
+
+    def test_framework_scope_title_detection_distinguishes_single_chapters(self):
+        self.assertTrue(_is_framework_scope_title("4—10章：新婚立威"))
+        self.assertTrue(_is_framework_scope_title("第51—100章"))
+        self.assertTrue(_is_framework_scope_title("第二卷：首辅夫人搞钱"))
+        self.assertFalse(_is_framework_scope_title("第一章：新婚夜，她被指控通奸"))
+        self.assertFalse(_is_framework_scope_title("半日查出三千两亏空"))
+
+    def test_framework_tables_are_not_forced_into_generic_candidates(self):
+        text = """二、主要人物
+第二阶段：单元委托与名声扩散
+| 姓名 | 身份 | 人物目标 | 隐藏秘密 | 语言风格 | 备注 |
+|---|---|---|---|---|---|
+| 唐果 | 女主播客户 | 摆脱合同陷阱和情感诈骗 | 她曾配合公司骗过粉丝 | 快语速，外向伪装坚强 | 单元案关键人物 |
+| 蒋书宁 | 职场新人 | 证明上司骚扰事实 | 她偷偷录音但不敢拿出来 | 怯弱细声，后期坚定 | 现实向情绪点 |
+| 何雅琴 | 豪门原配 | 找丈夫转移资产证据 | 她并不想离婚，只想保住女儿 | 端庄克制，句句留余地 | 展现复杂女性选择 |
+设定一
+名称
+谎言回收店
+"""
+
+        candidates = _extract_import_candidates(text)
+
+        self.assertFalse(
+            any(
+                "原框架明确人物表" in str(item.get("notes", ""))
+                for item in candidates["characters"]
+                if isinstance(item, dict)
+            )
         )
 
     def test_candidate_analysis_text_includes_linked_characters(self):
@@ -416,6 +376,57 @@ class NovelImportCandidateTests(unittest.TestCase):
         self.assertIn("补充：真相揭晓。", normalized["foreshadows"][0]["description"])
         self.assertEqual(normalized["project_materials"]["summary"].count("皇商账册缺页牵出旧案。"), 1)
 
+    def test_normalize_ai_candidates_drops_internal_empty_candidate_markers(self):
+        normalized = _normalize_ai_candidates({
+            "characters": [{
+                "name": "苏晚晴",
+                "notes": "人物关系已改变。\n补充：AI 分析候选",
+            }],
+            "foreshadows": [{
+                "name": "未完关系",
+                "description": "AI 分析候选\n判断依据：双方仍未完成选择。",
+            }],
+        })
+
+        self.assertEqual(normalized["characters"][0]["notes"], "人物关系已改变。")
+        self.assertEqual(
+            normalized["foreshadows"][0]["description"],
+            "判断依据：双方仍未完成选择。",
+        )
+        self.assertNotIn("AI 分析候选", repr(normalized))
+
+    def test_apply_import_candidates_drops_marker_but_keeps_real_supplement(self):
+        project = {
+            "characters": [{
+                "name": "苏晚晴",
+                "notes": "原有备注。\n补充：AI 分析候选",
+            }],
+            "foreshadow_items": [{
+                "name": "未完关系",
+                "description": "原有说明。",
+            }],
+        }
+        candidates = {
+            "characters": [{
+                "name": "苏晚晴",
+                "notes": "补充：AI 分析候选\n新的真实状态。",
+            }],
+            "foreshadows": [{
+                "name": "未完关系",
+                "description": "补充：AI 分析候选\n判断依据：双方仍未完成选择。",
+            }],
+        }
+
+        _apply_import_candidates(
+            project,
+            candidates,
+            {"characters": [0], "foreshadows": [0]},
+        )
+
+        self.assertNotIn("AI 分析候选", repr(project))
+        self.assertIn("补充：新的真实状态。", project["characters"][0]["notes"])
+        self.assertIn("补充：判断依据：双方仍未完成选择。", project["foreshadow_items"][0]["description"])
+
     def test_normalize_ai_candidates_keeps_lore_description_without_semantic_filtering(self):
         data = {
             "lore": [
@@ -554,6 +565,18 @@ class NovelImportCandidateTests(unittest.TestCase):
         item = normalized["foreshadows"][0]
         self.assertEqual(item["setup_chapter"], "第7章")
         self.assertEqual(item["payoff_chapter"], "第14章")
+
+    def test_normalize_ai_candidates_keeps_existing_foreshadow_code(self):
+        normalized = _normalize_ai_candidates({
+            "foreshadows": [{
+                "code": "F0012",
+                "name": "旧案线索",
+                "status": "已埋",
+                "description": "第二卷继续追踪。",
+            }]
+        })
+
+        self.assertEqual(normalized["foreshadows"][0]["code"], "F0012")
 
     def test_normalize_project_formats_numeric_foreshadow_chapters(self):
         project = _normalize_project({

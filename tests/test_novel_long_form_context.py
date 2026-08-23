@@ -5,6 +5,7 @@ from copy import deepcopy
 from gpt_desktop.novel_utils import (
     LONG_FORM_CONTEXT_SAFETY_MARGIN,
     LONG_FORM_CONTEXT_SOFT_LIMIT,
+    LONG_FORM_COMPACT_DELTA_VERSION,
     LONG_FORM_MEMORY_FINALIZE_INDEX_LIMIT,
     LONG_FORM_MEMORY_IDENTITY_INDEX_LIMIT,
     LONG_FORM_RECONCILIATION_CONTEXT_LIMIT,
@@ -14,17 +15,24 @@ from gpt_desktop.novel_utils import (
     STYLE_CARD_CACHE_VERSION,
     STYLE_SHEET_CACHE_VERSION,
     _append_ai_style_profile_to_context,
+    _apply_character_string_canon,
     _apply_long_form_memory_update,
+    _apply_chapter_logic_repair_patches,
+    _apply_chapter_prose_repair_patches,
     _build_chapter_ai_context,
+    _build_chapter_logic_repair_context,
     _build_long_form_memory_finalize_context,
     _build_long_form_memory_reconcile_context,
     _build_long_form_selection_index,
     _build_long_form_state_directory,
     _build_long_form_memory_repair_context,
     _build_style_finalize_context,
+    _format_style_cards,
+    _compact_style_finalize_source_context,
     _build_style_baseline_context,
     _build_style_cards_context,
     _build_style_execution_context,
+    _build_legacy_style_execution_context,
     _build_foreshadow_notes_draft,
     _build_project_summary_draft,
     _build_style_rewrite_context,
@@ -40,32 +48,97 @@ from gpt_desktop.novel_utils import (
     _build_writing_check_text,
     _infer_foreshadow_status,
     _new_chapter,
+    _promote_character_identity,
+    _normalize_project,
     _parse_style_audit_result,
     _parse_style_cards_result,
     _parse_style_execution_result,
     _parse_style_finalize_result,
     _parse_long_form_memory_update,
+    _parse_chapter_logic_repair_result,
     _parse_memory_repair_result,
     _parse_memory_reconciliation_result,
+    _parse_style_technique_cards_result,
+    _parse_style_voice_cards_result,
     _resolve_long_form_record_ref,
     _merge_long_form_memory_repair_patch,
+    _merge_long_form_memory_repair_full,
     _merge_long_form_memory_reconciliation_patch,
+    _merge_long_form_state_patch,
     _memory_repair_patch_targets,
     _literalize_long_form_memory_evidence,
+    _chapter_logic_audit_blocking_issues,
+    _chapter_logic_audit_validation_errors,
+    _normalize_long_form_state_aliases,
     _long_form_memory_sections,
     _normalize_long_form_event_storage_refs,
+    _normalize_long_form_update_payload,
     _normalize_long_form_structural_refs,
     _validate_long_form_memory_update,
+    _normalize_semantic_style_archive,
     _select_style_reference_excerpts,
+    _select_style_execution_cards,
     _style_draft_mismatch_reasons,
     _style_finalize_acceptance_errors,
+    _style_finalize_error_is_hard,
+    _style_finalize_preflight_targets,
+    _repair_literal_count_claims,
     _style_cards_selected_by_plan,
     _style_candidate_rank,
     _style_candidate_needs_rescue,
+    _style_native_vocabulary_text,
+    _style_recent_vocabulary_usage_text,
 )
 
 
 class NovelLongFormContextTests(unittest.TestCase):
+    def test_narrative_strategy_profile_persists_but_is_excluded_from_runtime_chapter_context(self):
+        male = self._project_with_current_chapter(_new_chapter(0))
+        male["narrative_strategy_profile"] = {
+            "version": "1",
+            "audience_direction": "男频",
+            "genre_world": "都市高武",
+            "primary_story_engine": "能力成长与身份跃迁",
+            "secondary_story_engine": "同伴关系",
+            "core_reader_promise": "每章获得可见成长或局势反转",
+            "satisfaction_currencies": ["能力突破", "身份认可"],
+            "emotional_resonance_axes": ["守住同伴"],
+            "chapter_variation_pool": ["危机反制", "资源争夺"],
+            "low_exposition_strategy": "规则只在行动后果中露出",
+        }
+        female = deepcopy(male)
+        female["narrative_strategy_profile"] = {
+            "version": "1",
+            "audience_direction": "女频",
+            "genre_world": "古言甜宠",
+            "primary_story_engine": "关系选择与身份重建",
+            "secondary_story_engine": "家业成长",
+            "core_reader_promise": "关系回应与尊严恢复同步兑现",
+            "satisfaction_currencies": ["关系确认", "尊严恢复"],
+            "emotional_resonance_axes": ["被理解与被选择"],
+            "chapter_variation_pool": ["误解松动", "共同选择"],
+            "low_exposition_strategy": "用人物选择代替背景说明",
+        }
+
+        normalized = _normalize_project(male)
+        normalized_female = _normalize_project(female)
+
+        self.assertEqual(
+            normalized["narrative_strategy_profile"]["primary_story_engine"],
+            "能力成长与身份跃迁",
+        )
+        self.assertEqual(
+            normalized_female["narrative_strategy_profile"]["primary_story_engine"],
+            "关系选择与身份重建",
+        )
+        for action in ("draft", "outline", "summary"):
+            male_context = _build_chapter_ai_context(normalized, 0, action)
+            female_context = _build_chapter_ai_context(normalized_female, 0, action)
+            self.assertNotIn("【项目叙事策略画像】", male_context)
+            self.assertNotIn("能力突破", male_context)
+            self.assertNotIn("关系确认", female_context)
+            self.assertEqual(male_context, female_context)
+
     def _project_with_current_chapter(self, current):
         return {
             "meta": {
@@ -149,6 +222,1156 @@ class NovelLongFormContextTests(unittest.TestCase):
             "stage_archive": None,
             "next_chapter_memory": {},
         }
+
+    def test_compact_delta_expands_to_strict_v2_and_normalizes_alias_review(self):
+        chapter = _new_chapter(0)
+        chapter["outline"] = "赵明启动城门禁制。"
+        project = self._project_with_current_chapter(chapter)
+        project["lore"] = [{
+            "id": "lore-gate",
+            "name": "城门禁制",
+            "type": "规则",
+        }]
+        project["long_form_memory"] = {
+            "schema_version": "2",
+            "revision": 4,
+            "state_snapshot": {},
+            "active_facts": [],
+            "stage_archives": [],
+        }
+        final_text = "赵明按下铜印，城门禁制随即亮起青光。"
+        compact = {
+            "schema_version": 2,
+            "base_revision": 4,
+            "compact_delta_version": LONG_FORM_COMPACT_DELTA_VERSION,
+            "state_patch": {},
+            "state_retirements": {},
+            "fact_updates": [],
+            "record_updates": {
+                "characters": [],
+                "lore": [{
+                    "operation": "update",
+                    "ref": "L001",
+                    "state": "本章已经启动",
+                    "evidence_quote": "城门禁制随即亮起青光",
+                }],
+            },
+            "foreshadow_updates": [],
+            "long_term_events": [{
+                "event": "城门禁制被启动",
+                "category": "ability_boundary",
+                "evidence_quote": "城门禁制随即亮起青光",
+                "storage": {
+                    "fact_refs": [],
+                    "character_refs": [],
+                    "lore_refs": ["L001"],
+                    "foreshadow_refs": [],
+                    "object_keys": [],
+                    "conflict_refs": [],
+                    "task_refs": [],
+                },
+            }],
+            "current_chapter_character_refs": [],
+            "stage_archive": None,
+            "next_chapter_memory": {
+                "character_refs": [],
+                "lore_refs": [],
+                "foreshadow_refs": [],
+                "fact_refs": [],
+                "stage_archive_refs": [],
+                "object_keys": [],
+                "conflict_refs": [],
+                "task_refs": [],
+                "reason": "",
+            },
+            "verification": {
+                "checked": True,
+                "coverage_checks": {
+                    "named_character_actions": True,
+                    "state_changes": True,
+                    "evidence_and_unknowns": True,
+                    "mechanism_claims_match_body": True,
+                    "rules_and_boundaries": True,
+                    "foreshadow_and_ending": True,
+                },
+                # Deliberately use the real ID here while the update uses L001.
+                "runtime_unchanged": {"lore_refs": ["lore-gate"], "foreshadow_refs": []},
+                "resolved_contradictions": [],
+                "notes": "已对账",
+            },
+        }
+
+        normalized = _normalize_long_form_update_payload(project, 0, compact)
+
+        self.assertNotIn("compact_delta_version", normalized)
+        self.assertEqual(normalized["state_lifecycle_review"]["scope"], "current_chapter")
+        self.assertEqual(
+            normalized["state_reconciliation"]["record_runtime_review"]["unchanged_lore_refs"],
+            [],
+        )
+        errors = _validate_long_form_memory_update(
+            project,
+            0,
+            normalized,
+            final_text=final_text,
+            require_revision=True,
+            require_evidence=True,
+        )
+        self.assertEqual(errors, [])
+
+    def test_compact_delta_new_fact_is_stored_and_selected_for_next_chapter(self):
+        current = _new_chapter(0)
+        next_chapter = _new_chapter(1)
+        next_chapter["outline"] = "下一章继续处理密信。"
+        project = self._project_with_current_chapter(current)
+        project["chapters"] = [current, next_chapter]
+        project["long_form_memory"] = {
+            "schema_version": "2",
+            "revision": 2,
+            "state_snapshot": {},
+            "active_facts": [],
+            "stage_archives": [],
+        }
+        final_text = "赵明把密信锁进铁匣，决定明早亲自送往王城。"
+        compact = {
+            "schema_version": 2,
+            "base_revision": 2,
+            "compact_delta_version": LONG_FORM_COMPACT_DELTA_VERSION,
+            "state_patch": {},
+            "state_retirements": {},
+            "fact_updates": [{
+                "operation": "add",
+                "key": "NF1",
+                "scope": "evidence:密信持有",
+                "fact": "赵明已经把密信锁进铁匣",
+                "evidence_quote": "赵明把密信锁进铁匣",
+            }],
+            "record_updates": {"characters": [], "lore": []},
+            "foreshadow_updates": [],
+            "long_term_events": [{
+                "event": "密信被锁进铁匣并由赵明保管",
+                "category": "evidence",
+                "evidence_quote": "赵明把密信锁进铁匣",
+                "storage": {
+                    "fact_refs": ["NF1"],
+                    "character_refs": [],
+                    "lore_refs": [],
+                    "foreshadow_refs": [],
+                    "object_keys": [],
+                    "conflict_refs": [],
+                    "task_refs": [],
+                },
+            }],
+            "current_chapter_character_refs": [],
+            "stage_archive": None,
+            "next_chapter_memory": {
+                "character_refs": [],
+                "lore_refs": [],
+                "foreshadow_refs": [],
+                "fact_refs": ["NF1"],
+                "stage_archive_refs": [],
+                "object_keys": [],
+                "conflict_refs": [],
+                "task_refs": [],
+                "reason": "下一章继续处理密信",
+            },
+            "verification": {
+                "checked": True,
+                "coverage_checks": {
+                    "named_character_actions": True,
+                    "state_changes": True,
+                    "evidence_and_unknowns": True,
+                    "mechanism_claims_match_body": True,
+                    "rules_and_boundaries": True,
+                    "foreshadow_and_ending": True,
+                },
+                "runtime_unchanged": {"lore_refs": [], "foreshadow_refs": []},
+                "resolved_contradictions": [],
+                "notes": "已对账",
+            },
+        }
+
+        normalized = _normalize_long_form_update_payload(project, 0, compact)
+        errors = _validate_long_form_memory_update(
+            project,
+            0,
+            normalized,
+            final_text=final_text,
+            require_revision=True,
+            require_evidence=True,
+        )
+        self.assertEqual(errors, [])
+        self.assertTrue(_apply_long_form_memory_update(project, 0, normalized))
+        self.assertEqual(len(project["long_form_memory"]["active_facts"]), 1)
+        fact_id = project["long_form_memory"]["active_facts"][0]["id"]
+        self.assertTrue(fact_id.startswith("AF-"))
+        self.assertIn(fact_id, project["chapters"][1]["memory_selection"]["fact_ids"])
+
+    def test_compact_delta_new_state_keys_do_not_enter_existing_state_lifecycle(self):
+        project = self._project_with_current_chapter(_new_chapter(0))
+        project["long_form_memory"] = {
+            "schema_version": "2",
+            "revision": 1,
+            "state_snapshot": {},
+            "active_facts": [],
+            "stage_archives": [],
+        }
+        final_text = "赵明把密信锁进铁匣后，追兵已经逼近城门。"
+        compact = {
+            "schema_version": 2,
+            "base_revision": 1,
+            "compact_delta_version": LONG_FORM_COMPACT_DELTA_VERSION,
+            "state_patch": {
+                "object_states": [{
+                    "key": "密信铁匣",
+                    "name": "铁匣",
+                    "state": "由赵明持有并已经上锁",
+                }],
+                "active_conflicts": [{
+                    "id": "",
+                    "key": "NCF1",
+                    "conflict": "追兵已经逼近城门",
+                }],
+                "unresolved_tasks": [{
+                    "id": "",
+                    "key": "NTASK1",
+                    "task": "明早把密信送往王城",
+                }],
+            },
+            "state_retirements": {},
+            "fact_updates": [],
+            "record_updates": {"characters": [], "lore": []},
+            "foreshadow_updates": [],
+            "long_term_events": [{
+                "event": "密信被锁入铁匣，同时追兵逼近",
+                "category": "key_object",
+                "evidence_quote": "赵明把密信锁进铁匣后，追兵已经逼近城门",
+                "storage": {
+                    "fact_refs": [],
+                    "character_refs": [],
+                    "lore_refs": [],
+                    "foreshadow_refs": [],
+                    "object_keys": ["密信铁匣"],
+                    "conflict_refs": ["NCF1"],
+                    "task_refs": ["NTASK1"],
+                },
+            }],
+            "current_chapter_character_refs": [],
+            "stage_archive": None,
+            "next_chapter_memory": {},
+            "verification": {
+                "checked": True,
+                "coverage_checks": {
+                    "named_character_actions": True,
+                    "state_changes": True,
+                    "evidence_and_unknowns": True,
+                    "mechanism_claims_match_body": True,
+                    "rules_and_boundaries": True,
+                    "foreshadow_and_ending": True,
+                },
+                "runtime_unchanged": {"lore_refs": [], "foreshadow_refs": []},
+                "resolved_contradictions": [],
+                "notes": "已对账",
+            },
+        }
+
+        normalized = _normalize_long_form_update_payload(project, 0, compact)
+
+        lifecycle = normalized["state_lifecycle_review"]
+        self.assertEqual(lifecycle["reviewed_object_keys"], [])
+        self.assertEqual(lifecycle["reviewed_conflict_refs"], [])
+        self.assertEqual(lifecycle["reviewed_task_refs"], [])
+        self.assertEqual(
+            _validate_long_form_memory_update(
+                project,
+                0,
+                normalized,
+                final_text=final_text,
+                require_revision=True,
+                require_evidence=True,
+            ),
+            [],
+        )
+
+    def test_complete_v2_memory_update_remains_unchanged_and_valid(self):
+        project = self._project_with_current_chapter(_new_chapter(0))
+        project["long_form_memory"] = {"schema_version": "2", "revision": 3}
+        update = self._strict_update(project)
+
+        normalized = _normalize_long_form_update_payload(project, 0, update)
+
+        self.assertEqual(normalized, update)
+        self.assertEqual(
+            _validate_long_form_memory_update(
+                project,
+                0,
+                normalized,
+                final_text="本章正文已经完成。",
+                require_revision=True,
+                require_evidence=True,
+            ),
+            [],
+        )
+
+    def test_memory_update_normalizes_common_model_state_aliases(self):
+        current = _new_chapter(0)
+        next_chapter = _new_chapter(1)
+        project = self._project_with_current_chapter(current)
+        project["chapters"] = [current, next_chapter]
+        project["characters"] = [
+            {"id": "character-one", "name": "甲"},
+            {"id": "character-two", "name": "乙"},
+        ]
+        project["long_form_memory"] = {
+            "schema_version": "2",
+            "revision": 0,
+            "state_snapshot": {},
+            "active_facts": [],
+            "stage_archives": [],
+        }
+        final_text = "甲握住玉佩，乙允许验查，追兵逼近，明日必须查清来路。"
+        update = {
+            "schema_version": 2,
+            "base_revision": 0,
+            "compact_delta_version": LONG_FORM_COMPACT_DELTA_VERSION,
+            "state_patch": {
+                "character_states": [{
+                    "character_ref": "C001",
+                    "status": "甲已经握住玉佩并准备验查。",
+                }],
+                "relationship_states": [{
+                    "ref": "C001|C002",
+                    "refs": [],
+                    "status": "甲与乙暂时形成合作。",
+                }],
+                "object_states": [{
+                    "object_key": "玉佩",
+                    "name": "玉佩",
+                    "status": "由甲持有。",
+                }],
+                "active_conflicts": [{
+                    "key": "NCF1",
+                    "title": "追兵逼近",
+                    "status": "冲突仍在持续。",
+                }],
+                "unresolved_tasks": [{
+                    "key": "NTASK1",
+                    "title": "查清来路",
+                    "status": "尚未完成。",
+                }],
+            },
+            "state_retirements": {},
+            "fact_updates": [],
+            "record_updates": {"characters": [], "lore": []},
+            "foreshadow_updates": [],
+            "long_term_events": [{
+                "event": "追兵逼近，甲必须查清来路。",
+                "category": "plot",
+                "evidence_quote": "追兵逼近",
+                "storage": {
+                    "fact_refs": [],
+                    "character_refs": ["C001", "C002"],
+                    "lore_refs": [],
+                    "foreshadow_refs": [],
+                    "object_keys": ["玉佩"],
+                    "conflict_refs": ["NCF1"],
+                    "task_refs": ["NTASK1"],
+                },
+            }],
+            "current_chapter_character_refs": ["C001", "C002"],
+            "stage_archive": None,
+            "next_chapter_memory": {
+                "character_refs": ["C001", "C002"],
+                "lore_refs": [],
+                "foreshadow_refs": [],
+                "fact_refs": [],
+                "stage_archive_refs": [],
+                "object_keys": ["玉佩"],
+                "conflict_refs": ["NCF1"],
+                "task_refs": ["NTASK1"],
+                "reason": "承接追兵线索。",
+            },
+            "verification": {
+                "checked": True,
+                "coverage_checks": {
+                    "named_character_actions": True,
+                    "state_changes": True,
+                    "evidence_and_unknowns": True,
+                    "mechanism_claims_match_body": True,
+                    "rules_and_boundaries": True,
+                    "foreshadow_and_ending": True,
+                },
+                "runtime_unchanged": {"lore_refs": [], "foreshadow_refs": []},
+                "resolved_contradictions": [],
+                "notes": "已复核",
+            },
+        }
+
+        normalized = _normalize_long_form_structural_refs(
+            project,
+            0,
+            _normalize_long_form_update_payload(project, 0, update),
+        )
+
+        self.assertEqual(normalized["state_patch"]["character_states"][0]["ref"], "C001")
+        self.assertEqual(normalized["state_patch"]["character_states"][0]["state"], "甲已经握住玉佩并准备验查。")
+        self.assertEqual(normalized["state_patch"]["relationship_states"][0]["refs"], ["C001", "C002"])
+        self.assertEqual(normalized["state_patch"]["active_conflicts"][0]["conflict"], "冲突仍在持续。")
+        self.assertEqual(normalized["state_patch"]["unresolved_tasks"][0]["task"], "尚未完成。")
+        self.assertEqual(
+            _validate_long_form_memory_update(
+                project,
+                0,
+                normalized,
+                final_text=final_text,
+                require_revision=True,
+                require_evidence=True,
+            ),
+            [],
+        )
+
+    def test_memory_update_normalizes_key_title_content_and_omitted_scope_aliases(self):
+        current = _new_chapter(0)
+        next_chapter = _new_chapter(1)
+        project = self._project_with_current_chapter(current)
+        project["chapters"] = [current, next_chapter]
+        project["characters"] = [
+            {"id": "character-one", "name": "甲"},
+            {"id": "character-two", "name": "乙"},
+        ]
+        project["lore"] = [{"id": "lore-one", "name": "旧设定"}]
+        project["foreshadow_items"] = []
+        project["long_form_memory"] = {
+            "schema_version": "2",
+            "revision": 0,
+            "state_snapshot": {},
+            "active_facts": [],
+            "stage_archives": [],
+        }
+        raw = {
+            "schema_version": 2,
+            "base_revision": 0,
+            "compact_delta_version": LONG_FORM_COMPACT_DELTA_VERSION,
+            "state_patch": {
+                "character_states": [{"key": "C001", "status": "甲已握住玉佩。"}],
+                "relationship_states": [{
+                    "relationship_key": "NR_C001_C002_01",
+                    "type": "create",
+                    "state": "甲与乙开始合作。",
+                }],
+                "active_conflicts": [{
+                    "conflict_key": "NCF_JADE_CASE",
+                    "type": "create",
+                    "state": "玉佩来路仍有争议。",
+                }],
+                "unresolved_tasks": [{
+                    "task_key": "NTASK_FIND_JADE_SOURCE",
+                    "type": "create",
+                    "state": "需要查清玉佩来源。",
+                }],
+            },
+            "fact_updates": [{
+                "operation": "add",
+                "fact_key": "NF001",
+                "fact": "甲已经握住玉佩。",
+                "evidence_quote": "甲握住\\n玉佩",
+            }],
+            "record_updates": {
+                "characters": [],
+                "lore": [{
+                    "operation": "update",
+                    "key": "L001",
+                    "runtime_update": "旧设定在本章被重新确认。",
+                    "evidence_quote": "旧设定",
+                }],
+            },
+            "foreshadow_updates": [{
+                "operation": "create",
+                "foreshadow_key": "NT001",
+                "stable_name": "玉佩背后的秘密",
+                "content": "玉佩来源仍未揭示。",
+                "status": "埋设",
+                "evidence_quote": "玉佩背后的秘密",
+            }],
+            "long_term_events": [{
+                "summary": "玉佩线索出现。",
+                "evidence_quote": "甲握住玉佩",
+                "storage": {
+                    "fact_refs": ["NF001"],
+                    "character_refs": ["C001"],
+                    "lore_refs": [],
+                    "foreshadow_refs": ["NT001"],
+                    "object_keys": [],
+                    "conflict_refs": [],
+                    "task_refs": [],
+                },
+            }],
+        }
+
+        normalized = _normalize_long_form_update_payload(project, 0, raw)
+
+        self.assertEqual(normalized["state_patch"]["character_states"][0]["ref"], "C001")
+        self.assertEqual(
+            normalized["state_patch"]["relationship_states"][0]["refs"],
+            ["C001", "C002"],
+        )
+        self.assertEqual(normalized["state_patch"]["active_conflicts"][0]["id"], "")
+        self.assertEqual(normalized["state_patch"]["active_conflicts"][0]["key"], "NCF_JADE_CASE")
+        self.assertEqual(normalized["state_patch"]["unresolved_tasks"][0]["id"], "")
+        self.assertEqual(
+            normalized["state_patch"]["unresolved_tasks"][0]["key"],
+            "NTASK_FIND_JADE_SOURCE",
+        )
+        self.assertEqual(normalized["record_updates"]["lore"][0]["ref"], "L001")
+        self.assertEqual(
+            normalized["record_updates"]["lore"][0]["state"],
+            "旧设定在本章被重新确认。",
+        )
+        self.assertEqual(normalized["fact_updates"][0]["key"], "NF001")
+        self.assertEqual(normalized["fact_updates"][0]["evidence_quote"], "甲握住\n玉佩")
+        foreshadow = normalized["foreshadow_updates"][0]
+        self.assertEqual(foreshadow["name"], "玉佩背后的秘密")
+        self.assertEqual(foreshadow["description"], "玉佩来源仍未揭示。")
+        self.assertEqual(foreshadow["key"], "NT001")
+        self.assertEqual(foreshadow["status"], "已埋")
+        self.assertTrue(foreshadow["revealed"])
+        self.assertTrue(foreshadow["remaining_secret"])
+        self.assertEqual(normalized["long_term_events"][0]["event"], "玉佩线索出现。")
+        self.assertEqual(normalized["long_term_events"][0]["category"], "other")
+        self.assertTrue(normalized["fact_updates"][0]["scope"].startswith("auto_fact:"))
+
+    def test_memory_repair_parser_fixes_one_unambiguous_missing_json_quote(self):
+        malformed = (
+            '{"outline":"实际提纲","summary":"本章摘要","key_facts":["关键事实"],'
+            '"long_form_memory":{"note":"她说，“别碰。”}}'
+        )
+
+        parsed = _parse_memory_repair_result(malformed)
+
+        self.assertTrue(parsed["parsed"])
+        self.assertEqual(parsed["outline"], "实际提纲")
+        self.assertEqual(parsed["summary"], "本章摘要")
+        self.assertEqual(parsed["key_facts"], "1. 关键事实")
+        self.assertEqual(parsed["memory_update"]["note"], "她说，“别碰。”")
+
+    def test_memory_repair_parser_fixes_multiple_missing_evidence_quotes(self):
+        malformed = (
+            '{"outline":"实际提纲","summary":"本章摘要","key_facts":["关键事实"],'
+            '"logic_audit":{"checked":true,"issues":[]},"long_form_memory":{'
+            '"fact_updates":[{"evidence_quote":"“第一句。”},{"evidence_quote":"普通证据。"}]}}'
+        )
+
+        parsed = _parse_memory_repair_result(malformed)
+
+        self.assertTrue(parsed["parsed"])
+        self.assertEqual(
+            [item["evidence_quote"] for item in parsed["memory_update"]["fact_updates"]],
+            ["“第一句。”", "普通证据。"],
+        )
+
+    def test_memory_repair_parser_treats_logic_audit_only_result_as_patch(self):
+        parsed = _parse_memory_repair_result(
+            '{"logic_audit":{"checked":true,"issues":[]}}'
+        )
+
+        self.assertTrue(parsed["parsed"])
+        self.assertEqual(parsed["repair_mode"], "patch")
+        self.assertTrue(parsed["logic_audit"]["checked"])
+
+    def test_state_aliases_accept_kind_specific_record_ids(self):
+        normalized = _normalize_long_form_state_aliases({
+            "record_updates": {
+                "characters": [{
+                    "operation": "update",
+                    "character_id": "C001",
+                    "dynamic": "人物状态变化。",
+                }],
+                "lore": [{
+                    "operation": "update",
+                    "lore_id": "L001",
+                    "dynamic": "设定状态变化。",
+                }],
+            },
+        })
+
+        self.assertEqual(normalized["record_updates"]["characters"][0]["ref"], "C001")
+        self.assertEqual(normalized["record_updates"]["lore"][0]["ref"], "L001")
+
+    def test_invalid_opaque_character_ref_uses_unique_exact_name_alias(self):
+        chapter = _new_chapter(0)
+        project = self._project_with_current_chapter(chapter)
+        project["characters"] = [{"id": "char-luo", "name": "罗东家"}]
+        invalid_ref = "invented-character-id"
+
+        normalized = _normalize_long_form_update_payload(project, 0, {
+            "state_patch": {
+                "character_states": [{
+                    "character_id": invalid_ref,
+                    "name": "罗东家",
+                    "state": "本章退出谈判主导位置。",
+                }],
+            },
+            "current_chapter_character_refs": [invalid_ref],
+            "long_term_events": [{
+                "event": "罗东家退出谈判主导位置。",
+                "storage": {"character_refs": [invalid_ref]},
+            }],
+            "next_chapter_memory": {"character_refs": [invalid_ref]},
+        })
+
+        self.assertEqual(normalized["state_patch"]["character_states"][0]["ref"], "C001")
+        self.assertEqual(normalized["current_chapter_character_refs"], ["C001"])
+        self.assertEqual(
+            normalized["long_term_events"][0]["storage"]["character_refs"],
+            ["C001"],
+        )
+        self.assertEqual(normalized["next_chapter_memory"]["character_refs"], ["C001"])
+
+    def test_state_aliases_accept_stable_ref_and_temp_key_variants(self):
+        normalized = _normalize_long_form_state_aliases({
+            "state_patch": {
+                "character_states": [{"stable_ref": "C001", "runtime_update": "本章出场。"}],
+            },
+            "fact_updates": [{
+                "operation": "add",
+                "temp_key": "NF001",
+                "fact": "新事实",
+            }],
+            "record_updates": {
+                "characters": [{
+                    "operation": "update",
+                    "stable_ref": "C001",
+                    "runtime": "人物状态变化。",
+                }],
+                "lore": [{
+                    "operation": "update",
+                    "stable_ref": "L001",
+                    "runtime_update": "设定状态变化。",
+                }],
+            },
+            "foreshadow_updates": [{
+                "operation": "create",
+                "temp_key": "NT001",
+                "stable_name": "新伏笔",
+                "status": "埋设",
+                "progress": "本章发现线索仍有缺口。",
+            }],
+            "conflicts": [{
+                "operation": "add",
+                "key": "NCF001",
+                "conflict": "冲突仍在继续。",
+            }],
+            "tasks": [{
+                "operation": "add",
+                "key": "NTASK001",
+                "task": "需要继续核查。",
+            }],
+        })
+
+        self.assertEqual(normalized["state_patch"]["character_states"][0]["ref"], "C001")
+        self.assertEqual(normalized["fact_updates"][0]["key"], "NF001")
+        self.assertEqual(normalized["record_updates"]["characters"][0]["ref"], "C001")
+        self.assertEqual(
+            normalized["record_updates"]["characters"][0]["state"],
+            "人物状态变化。",
+        )
+        self.assertEqual(normalized["record_updates"]["lore"][0]["ref"], "L001")
+        self.assertEqual(normalized["foreshadow_updates"][0]["key"], "NT001")
+        self.assertEqual(
+            normalized["foreshadow_updates"][0]["description"],
+            "本章发现线索仍有缺口。",
+        )
+        self.assertTrue(normalized["foreshadow_updates"][0]["revealed"])
+        self.assertTrue(normalized["foreshadow_updates"][0]["remaining_secret"])
+        self.assertEqual(normalized["state_patch"]["active_conflicts"][0]["key"], "NCF001")
+        self.assertEqual(normalized["state_patch"]["active_conflicts"][0]["id"], "")
+        self.assertEqual(normalized["state_patch"]["unresolved_tasks"][0]["key"], "NTASK001")
+        self.assertEqual(normalized["state_patch"]["unresolved_tasks"][0]["id"], "")
+
+    def test_state_aliases_accept_generic_ref_for_existing_conflicts_and_tasks(self):
+        normalized = _normalize_long_form_state_aliases({
+            "state_patch": {
+                "active_conflicts": [{
+                    "ref": "CF-0006",
+                    "id": "",
+                    "operation": "update",
+                    "conflict": "旧冲突已经推进。",
+                }],
+                "unresolved_tasks": [{
+                    "ref": "TASK-0010",
+                    "id": "",
+                    "operation": "update",
+                    "task": "旧任务进入下一阶段。",
+                }],
+            },
+        })
+
+        self.assertEqual(
+            normalized["state_patch"]["active_conflicts"][0]["id"],
+            "CF-0006",
+        )
+        self.assertEqual(
+            normalized["state_patch"]["unresolved_tasks"][0]["id"],
+            "TASK-0010",
+        )
+
+    def test_state_aliases_normalize_pipe_delimited_relationship_refs(self):
+        normalized = _normalize_long_form_state_aliases({
+            "state_patch": {
+                "relationship_states": [
+                    {"refs": "C001|C005", "state": "父女公开对立。"},
+                    {"refs": ["C001|C008"], "state": "共同核验封条。"},
+                ],
+            },
+        })
+
+        relationships = normalized["state_patch"]["relationship_states"]
+        self.assertEqual(relationships[0]["refs"], ["C001", "C005"])
+        self.assertEqual(relationships[1]["refs"], ["C001", "C008"])
+
+    def test_state_aliases_normalize_relationship_participants(self):
+        normalized = _normalize_long_form_state_aliases({
+            "state_patch": {
+                "relationship_states": [{
+                    "participants": ["C002", "C010"],
+                    "refs": [],
+                    "state": "二人因账本去向产生新的分歧。",
+                }],
+            },
+        })
+
+        self.assertEqual(
+            normalized["state_patch"]["relationship_states"][0]["refs"],
+            ["C002", "C010"],
+        )
+
+    def test_state_aliases_normalize_foreshadow_advance_operation(self):
+        normalized = _normalize_long_form_state_aliases({
+            "foreshadow_updates": [{
+                "operation": "advance",
+                "ref": "F005",
+                "status": "已埋",
+                "progress": "旧账本的残页出现新的朱砂印记。",
+            }],
+        })
+
+        foreshadow = normalized["foreshadow_updates"][0]
+        self.assertEqual(foreshadow["operation"], "update")
+        self.assertEqual(foreshadow["ref"], "F005")
+
+    def test_state_aliases_normalize_change_for_runtime_state_collections(self):
+        normalized = _normalize_long_form_state_aliases({
+            "state_patch": {
+                "character_states": [{"ref": "C001", "change": "主角暂住听雨楼。"}],
+                "relationship_states": [{
+                    "participants": ["C001", "C002"],
+                    "change": "二人恢复夫妻关系但仍分居。",
+                }],
+                "object_states": [{"key": "NOBJ-1", "change": "名册已交由御史台封存。"}],
+                "active_conflicts": [{"id": "CF-1", "change": "孙氏去向仍待核验。"}],
+                "unresolved_tasks": [{"id": "TASK-1", "change": "追查孙氏当前下落。"}],
+            },
+            "record_updates": {
+                "characters": [
+                    {"operation": "update", "ref": "C001", "change": "暂住听雨楼。"},
+                    {"operation": "create", "key": "NC-1", "stable_name": "孙氏"},
+                ],
+                "lore": [{"operation": "update", "ref": "L001", "change": "御史台封存名册。"}],
+            },
+            "foreshadow_updates": [{
+                "operation": "update",
+                "ref": "F001",
+                "change": "孙氏尚在人世的线索得到推进。",
+            }],
+            "long_term_events": [{
+                "event": "孙氏接受官面保护。",
+                "type": "证人保护与责任边界",
+            }],
+        })
+
+        state_patch = normalized["state_patch"]
+        self.assertEqual(state_patch["character_states"][0]["state"], "主角暂住听雨楼。")
+        self.assertEqual(state_patch["relationship_states"][0]["refs"], ["C001", "C002"])
+        self.assertEqual(state_patch["relationship_states"][0]["state"], "二人恢复夫妻关系但仍分居。")
+        self.assertEqual(state_patch["object_states"][0]["state"], "名册已交由御史台封存。")
+        self.assertEqual(state_patch["active_conflicts"][0]["conflict"], "孙氏去向仍待核验。")
+        self.assertEqual(state_patch["unresolved_tasks"][0]["task"], "追查孙氏当前下落。")
+        self.assertEqual(normalized["record_updates"]["characters"][0]["state"], "暂住听雨楼。")
+        self.assertEqual(normalized["record_updates"]["characters"][1]["name"], "孙氏")
+        self.assertEqual(normalized["record_updates"]["lore"][0]["state"], "御史台封存名册。")
+        self.assertEqual(normalized["foreshadow_updates"][0]["state"], "孙氏尚在人世的线索得到推进。")
+        self.assertEqual(normalized["long_term_events"][0]["category"], "other")
+
+    def test_state_aliases_normalize_superseded_fact_and_recovered_foreshadow(self):
+        normalized = _normalize_long_form_state_aliases({
+            "fact_updates": [{
+                "operation": "supersede",
+                "key": "NF-087-002",
+                "supersedes": "AF-0340",
+                "fact": "公议已经举行。",
+            }],
+            "foreshadow_updates": [{
+                "operation": "update",
+                "ref": "F001",
+                "status": "已回收",
+                "progress": "封条断痕已确认来自二次开启。",
+            }],
+        })
+
+        self.assertEqual(normalized["fact_updates"][0]["id"], "AF-0340")
+        foreshadow = normalized["foreshadow_updates"][0]
+        self.assertEqual(foreshadow["revealed"], "封条断痕已确认来自二次开启。")
+        self.assertIn("remaining_secret", foreshadow)
+        self.assertEqual(foreshadow["remaining_secret"], "")
+
+    def test_state_patch_deduplicates_explicit_object_key_and_keeps_lore_link(self):
+        chapter = _new_chapter(0)
+        project = self._project_with_current_chapter(chapter)
+        project["lore"] = [{"id": "lore-bottle", "name": "宫制药瓶"}]
+        memory = {
+            "state_snapshot": {
+                "object_states": [
+                    {
+                        "lore_id": "lore-bottle",
+                        "key": "NOBJ-CH53-002",
+                        "name": "宫制药瓶",
+                        "state": "药瓶刚刚出现。",
+                    },
+                    {
+                        "lore_id": "",
+                        "key": "NOBJ-CH53-002",
+                        "name": "宫制药瓶",
+                        "state": "药瓶形制已经验真。",
+                    },
+                ],
+            },
+        }
+
+        _merge_long_form_state_patch(project, memory, chapter, 0, {}, {})
+
+        objects = memory["state_snapshot"]["object_states"]
+        self.assertEqual(len(objects), 1)
+        self.assertEqual(objects[0]["key"], "NOBJ-CH53-002")
+        self.assertEqual(objects[0]["lore_id"], "lore-bottle")
+        self.assertEqual(objects[0]["state"], "药瓶形制已经验真。")
+
+    def test_state_aliases_backfill_empty_canonical_state_and_evidence_fields(self):
+        normalized = _normalize_long_form_state_aliases({
+            "state_patch": {
+                "character_states": [{
+                    "ref": "C001",
+                    "state": "",
+                    "runtime_update": "人物已经改为留守账房。",
+                    "evidence_quote": "",
+                    "evidence": "她把账房钥匙收进袖中",
+                }],
+                "relationship_states": [{
+                    "refs": ["C001", "C002"],
+                    "state": "",
+                    "description": "二人暂时形成合作。",
+                    "evidence_quote": "",
+                    "quote": "这次我与你一道去",
+                }],
+                "object_states": [{
+                    "key": "OBJ-ledger",
+                    "state": "",
+                    "status": "账册已经封存。",
+                    "evidence_quote": "",
+                    "evidence": "账册重新锁入木匣",
+                }],
+            },
+            "fact_updates": [{
+                "operation": "add",
+                "key": "NF1",
+                "fact": "账册已经封存。",
+                "evidence_quote": "",
+                "quote": "账册重新锁入木匣",
+            }],
+            "record_updates": {
+                "characters": [{
+                    "operation": "update",
+                    "ref": "C001",
+                    "state": "",
+                    "runtime_update": "人物已经改为留守账房。",
+                    "evidence_quote": "",
+                    "evidence": "她把账房钥匙收进袖中",
+                }],
+                "lore": [],
+            },
+            "foreshadow_updates": [{
+                "operation": "update",
+                "ref": "F001",
+                "state": "",
+                "progress": "账册封条出现一道新断痕。",
+                "evidence_quote": "",
+                "quote": "封条上多了一道新断痕",
+            }],
+        })
+
+        state_patch = normalized["state_patch"]
+        self.assertEqual(state_patch["character_states"][0]["state"], "人物已经改为留守账房。")
+        self.assertEqual(state_patch["character_states"][0]["evidence_quote"], "她把账房钥匙收进袖中")
+        self.assertEqual(state_patch["relationship_states"][0]["state"], "二人暂时形成合作。")
+        self.assertEqual(state_patch["relationship_states"][0]["evidence_quote"], "这次我与你一道去")
+        self.assertEqual(state_patch["object_states"][0]["state"], "账册已经封存。")
+        self.assertEqual(state_patch["object_states"][0]["evidence_quote"], "账册重新锁入木匣")
+        self.assertEqual(normalized["fact_updates"][0]["evidence_quote"], "账册重新锁入木匣")
+        self.assertEqual(normalized["record_updates"]["characters"][0]["state"], "人物已经改为留守账房。")
+        self.assertEqual(
+            normalized["record_updates"]["characters"][0]["evidence_quote"],
+            "她把账房钥匙收进袖中",
+        )
+        self.assertEqual(normalized["foreshadow_updates"][0]["state"], "账册封条出现一道新断痕。")
+        self.assertEqual(normalized["foreshadow_updates"][0]["evidence_quote"], "封条上多了一道新断痕")
+
+    def test_state_aliases_treat_ncf_and_ntask_ids_as_new_temporary_keys(self):
+        normalized = _normalize_long_form_state_aliases({
+            "state_patch": {
+                "active_conflicts": [{
+                    "id": "NCF-CH56-001",
+                    "conflict": "账册争夺尚未结束。",
+                }],
+                "unresolved_tasks": [{
+                    "id": "NTASK-CH56-001",
+                    "task": "追查封条断痕来源。",
+                }],
+            },
+        })
+
+        conflict = normalized["state_patch"]["active_conflicts"][0]
+        task = normalized["state_patch"]["unresolved_tasks"][0]
+        self.assertEqual(conflict["key"], "NCF-CH56-001")
+        self.assertEqual(conflict["id"], "")
+        self.assertEqual(task["key"], "NTASK-CH56-001")
+        self.assertEqual(task["id"], "")
+
+    def test_runtime_unchanged_refs_are_also_normalized_as_reviewed(self):
+        normalized = _normalize_long_form_state_aliases({
+            "state_reconciliation": {
+                "record_runtime_review": {
+                    "reviewed_lore_refs": ["L013"],
+                    "unchanged_lore_refs": ["L007", "L020"],
+                    "reviewed_foreshadow_refs": [],
+                    "unchanged_foreshadow_refs": ["F008"],
+                },
+            },
+        })
+
+        runtime_review = normalized["state_reconciliation"]["record_runtime_review"]
+        self.assertEqual(
+            runtime_review["reviewed_lore_refs"],
+            ["L013", "L007", "L020"],
+        )
+        self.assertEqual(runtime_review["reviewed_foreshadow_refs"], ["F008"])
+
+        unchanged = _normalize_long_form_state_aliases({
+            "record_updates": {
+                "characters": [{"operation": "unchanged", "stable_ref": "C001"}],
+                "lore": [],
+            },
+        })
+        self.assertEqual(unchanged["record_updates"]["characters"], [])
+
+    def test_fact_state_alias_and_canonical_buried_foreshadow_are_normalized(self):
+        normalized = _normalize_long_form_state_aliases({
+            "fact_updates": [{
+                "operation": "update",
+                "fact_id": "AF-0028",
+                "state": "白家副单已经完成双份封存",
+            }],
+            "foreshadow_updates": [{
+                "operation": "update",
+                "foreshadow_id": "F028",
+                "status": "已埋",
+                "progress": "副单末栏出现沈家旁支宅院",
+                "description": "实际收货人与宅院用途仍未查明",
+            }],
+            "record_updates": {
+                "characters": [],
+                "lore": [{
+                    "operation": "create",
+                    "lore_ref": "NL-CH28-001",
+                    "title": "宫中蜡料副单",
+                    "new_state": "副单夹行记载小蜡三匣",
+                }],
+            },
+        })
+
+        fact = normalized["fact_updates"][0]
+        self.assertEqual(fact["id"], "AF-0028")
+        self.assertEqual(fact["fact"], "白家副单已经完成双份封存")
+        foreshadow = normalized["foreshadow_updates"][0]
+        self.assertEqual(foreshadow["ref"], "F028")
+        self.assertEqual(foreshadow["revealed"], "副单末栏出现沈家旁支宅院")
+        self.assertEqual(foreshadow["remaining_secret"], "实际收货人与宅院用途仍未查明")
+        lore = normalized["record_updates"]["lore"][0]
+        self.assertEqual(lore["key"], "NL-CH28-001")
+        self.assertEqual(lore["name"], "宫中蜡料副单")
+        self.assertEqual(lore["state"], "副单夹行记载小蜡三匣")
+        self.assertNotIn("story_known", lore)
+
+    def test_compact_review_omission_means_required_runtime_record_is_unchanged(self):
+        chapter = _new_chapter(0)
+        project = self._project_with_current_chapter(chapter)
+        project["foreshadow_items"] = [{
+            "id": "foreshadow-a", "name": "副单收货地", "status": "已埋",
+        }]
+        project["long_form_memory"] = {
+            "schema_version": "2", "revision": 0, "state_snapshot": {},
+            "active_facts": [], "stage_archives": [],
+        }
+        update = self._strict_update(project)
+        update["compact_delta_version"] = LONG_FORM_COMPACT_DELTA_VERSION
+        update.pop("state_reconciliation")
+        update.pop("state_lifecycle_review")
+        update.pop("fact_lifecycle_review")
+        update["long_term_events"] = [{
+            "event": "副单收货地点仍待核验",
+            "category": "foreshadow",
+            "evidence_quote": "副单末栏出现沈家旁支宅院",
+            "storage": {
+                "fact_refs": [], "character_refs": [], "lore_refs": [],
+                "foreshadow_refs": ["foreshadow-a"], "object_keys": [],
+                "conflict_refs": [], "task_refs": [],
+            },
+        }]
+        update["verification"] = {
+            "checked": True,
+            "coverage_checks": {
+                "named_character_actions": True,
+                "state_changes": True,
+                "evidence_and_unknowns": True,
+                "mechanism_claims_match_body": True,
+                "rules_and_boundaries": True,
+                "foreshadow_and_ending": True,
+            },
+            "runtime_unchanged": {"lore_refs": [], "foreshadow_refs": []},
+            "resolved_contradictions": [],
+            "notes": "已复核，运行态未变化",
+        }
+
+        normalized = _normalize_long_form_update_payload(project, 0, update)
+
+        runtime_review = normalized["state_reconciliation"]["record_runtime_review"]
+        self.assertEqual(runtime_review["reviewed_foreshadow_refs"], ["foreshadow-a"])
+        self.assertEqual(runtime_review["unchanged_foreshadow_refs"], ["foreshadow-a"])
+        self.assertEqual(
+            _validate_long_form_memory_update(
+                project, 0, normalized,
+                final_text="副单末栏出现沈家旁支宅院，实际用途仍待核验。",
+                require_revision=True,
+                require_evidence=True,
+            ),
+            [],
+        )
+
+    def test_unique_short_evidence_is_expanded_from_literal_body(self):
+        body = "陆停舟的手指无力垂下。\n\n粮。\n\n陆停舟再没有动静。"
+        normalized = _literalize_long_form_memory_evidence({
+            "fact_updates": [{"evidence_quote": "粮。"}],
+        }, body)
+
+        quote = normalized["fact_updates"][0]["evidence_quote"]
+        self.assertGreaterEqual(len("".join(quote.split())), 8)
+        self.assertIn(quote, body)
+
+    def test_noncontiguous_dialogue_evidence_salvages_unique_short_clause(self):
+        body = (
+            "车马管事低声道：少夫人，那次送得准时，周氏赏过我银子……\n\n"
+            "他又说：我见过……接头人姓……\n\n话音突然断了。"
+        )
+        normalized = _literalize_long_form_memory_evidence({
+            "fact_updates": [{
+                "evidence_quote": "少夫人，那次送得准时，周氏赏过我银子……我见过……接头人姓……",
+            }],
+        }, body)
+
+        quote = normalized["fact_updates"][0]["evidence_quote"]
+        self.assertGreaterEqual(len("".join(quote.split())), 8)
+        self.assertIn(quote, body)
+
+    def test_fact_supersede_and_unrevealed_foreshadow_aliases_keep_identity(self):
+        normalized = _normalize_long_form_state_aliases({
+            "fact_updates": [{
+                "operation": "supersede",
+                "fact_ref": "AF-0005",
+                "new_fact_key": "NF001",
+                "fact": "事实已经推进。",
+            }],
+            "foreshadow_updates": [{
+                "operation": "update",
+                "ref_id": "F001",
+                "status": "未埋",
+                "state": "progressed",
+                "update": "本章进一步推进线索。",
+                "revealed": "线索已出现。",
+                "unrevealed": "真相仍未明。",
+            }],
+        })
+
+        fact = normalized["fact_updates"][0]
+        self.assertEqual(fact["id"], "AF-0005")
+        self.assertEqual(fact["key"], "NF001")
+        self.assertEqual(normalized["foreshadow_updates"][0]["ref"], "F001")
+        self.assertEqual(normalized["foreshadow_updates"][0]["status"], "已埋")
+        self.assertEqual(
+            normalized["foreshadow_updates"][0]["description"],
+            "本章进一步推进线索。",
+        )
+        self.assertEqual(
+            normalized["foreshadow_updates"][0]["remaining_secret"],
+            "真相仍未明。",
+        )
+
+    def test_style_finalize_compacts_duplicate_context_but_keeps_continuity_and_style(self):
+        redundant = "重复规划资料标记。" * 10000
+        padding = "用于模拟长篇中后期资料增长。" * 2000
+        original = "\n\n".join([
+            "【当前章节】\n本章唯一章节标记：城门前的铜印。\n" + padding,
+            "【当前状态快照】\n状态唯一标记：赵明仍持有密信。\n" + padding,
+            "【剧情连续性参考】\n权限与证据边界唯一标记。\n" + padding,
+            "【后章衔接点】\n下一章开头唯一衔接标记。\n" + padding,
+            "【本章相关人物】\n人物唯一标记：赵明。\n" + padding,
+            "【本章相关设定】\n设定唯一标记：城门禁制。\n" + padding,
+            "【本章相关伏笔】\n伏笔唯一标记：缺失的半页账册。\n" + padding,
+            "【正文风格参考】\n样本写法唯一标记：先写动作，再落到人物判断。\n" + padding,
+            "【重复规划资料】\n" + redundant,
+        ])
+
+        compacted = _compact_style_finalize_source_context(
+            original,
+            style_reference="样本写法唯一标记：先写动作，再落到人物判断。",
+        )
+
+        for marker in (
+            "本章唯一章节标记",
+            "状态唯一标记",
+            "权限与证据边界唯一标记",
+            "下一章开头唯一衔接标记",
+            "人物唯一标记",
+            "设定唯一标记",
+            "伏笔唯一标记",
+            "样本写法唯一标记",
+        ):
+            self.assertIn(marker, compacted)
+        self.assertNotIn("重复规划资料标记", compacted)
+        self.assertLessEqual(len(compacted), 60000)
+        self.assertLess(len(compacted), len(original) * 0.7)
+
+    def test_style_finalize_preflight_reports_concrete_short_paragraph_merges(self):
+        reference = "\n".join(
+            "样本中的连续叙述段落会把现场反馈、人物判断和下一步动作放在同一段里。"
+            "样本中的连续叙述段落会把现场反馈、人物判断和下一步动作放在同一段里。"
+            for _ in range(10)
+        )
+        candidate = "\n".join("这是一个短段。" for _ in range(100))
+
+        result = _style_finalize_preflight_targets(reference, candidate, output_target=600)
+
+        self.assertIn("至少合并", result)
+        self.assertIn("至少将", result)
+        self.assertRegex(result, r"至少合并\d+个普通段")
+        self.assertRegex(result, r"至少将\d+个普通短段并入")
 
     def _large_250_chapter_state_project(self):
         chapters = [_new_chapter(index) for index in range(250)]
@@ -753,7 +1976,7 @@ class NovelLongFormContextTests(unittest.TestCase):
         self.assertIn("项目总目标字数：20万字", context)
         self.assertIn("不要把项目总字数当作单章输出字数", context)
 
-    def test_draft_context_includes_uncompressed_style_reference_only_for_draft(self):
+    def test_draft_context_includes_full_raw_style_reference_only_for_draft(self):
         current = _new_chapter(0)
         current["title"] = "第一章 入城"
         current["outline"] = "主角入城调查旧案。"
@@ -763,29 +1986,63 @@ class NovelLongFormContextTests(unittest.TestCase):
         draft_context = _build_chapter_ai_context(project, 0, "draft")
         outline_context = _build_chapter_ai_context(project, 0, "outline")
 
+        guidance = self._context_section(draft_context, "仿写使用说明")
         self.assertIn("【正文风格参考】", draft_context)
-        self.assertIn("【风格锁定规则】", draft_context)
+        self.assertIn("【仿写使用说明】", draft_context)
+        self.assertIn("【正文自然表达边界】", draft_context)
         self.assertIn("第一段样本文。\n\n第二段样本文，保留段落格式。", draft_context)
-        self.assertIn("不得复用样本里的具体情节", draft_context)
-        self.assertIn("写法优先级最高", draft_context)
-        self.assertIn("以【正文风格参考】为准", draft_context)
-        self.assertIn("除剧情内容外", draft_context)
-        self.assertIn("样本结构画像（根据当前样本实时计算，不是固定文风模板）", draft_context)
-        self.assertIn("样本不足500字", draft_context)
-        self.assertIn("前文正文只用于继承事实", draft_context)
-        self.assertIn("不要把任何题材偏好或固定网文模板强加给样本", draft_context)
-        self.assertIn("偏差明显时自行重写再输出", draft_context)
-        self.assertIn("【正文风格参考】是唯一写法标准", draft_context)
-        self.assertNotIn("正文风格：口语化、自然、有网文阅读感", draft_context)
-        self.assertNotIn("保持剧情高密度推进", draft_context)
-        self.assertNotIn("每1000字约28-38段", draft_context)
-        self.assertNotIn("不要像游戏系统播报", draft_context)
+        self.assertIn("完整原文", guidance)
+        self.assertIn("当前项目资料是本章故事事实", guidance)
+        self.assertIn("她很漂亮", guidance)
+        self.assertIn("他很难过", guidance)
+        self.assertIn("他用袖子擦眼睛", guidance)
+        self.assertIn("不把这些例子当固定动作模板", guidance)
+        self.assertNotIn("空得很有存在感", draft_context)
+        self.assertNotIn("沉默很有情绪", draft_context)
+        self.assertIn("幽默、吐槽、夸张和比喻可以自由使用", guidance)
+        self.assertGreaterEqual(len(guidance), 500)
+        self.assertLessEqual(len(guidance), 1000)
+        self.assertNotIn("【风格锁定规则】", draft_context)
+        self.assertNotIn("【AI文风画像】", draft_context)
+        self.assertNotIn("【作者原生用词池", draft_context)
+        self.assertNotIn("【V4 人物与叙述声纹", draft_context)
+        self.assertNotIn("【V4 条件性叙事技法", draft_context)
+        self.assertNotIn("段落节奏骨架", draft_context)
         self.assertGreater(draft_context.rfind("【正文风格参考】"), draft_context.find("【当前章节】"))
-        self.assertGreater(draft_context.rfind("【风格锁定规则】"), draft_context.find("【当前章节】"))
+        self.assertGreater(draft_context.rfind("【仿写使用说明】"), draft_context.find("【当前章节】"))
+        self.assertGreater(draft_context.rfind("【正文自然表达边界】"), draft_context.rfind("【正文风格参考】"))
         self.assertNotIn("【正文风格参考】", outline_context)
-        self.assertNotIn("【风格锁定规则】", outline_context)
+        self.assertNotIn("【仿写使用说明】", outline_context)
+        self.assertNotIn("【正文自然表达边界】", outline_context)
 
-    def test_style_profile_changes_with_the_current_reference(self):
+    def test_style_execution_context_keeps_chapter_after_task_mentions_style_headings(self):
+        original = "\n\n".join([
+            "【项目核心信息】\n书名：测试小说",
+            (
+                "【本次任务】\n"
+                "以【仿写使用说明】和【正文风格参考】中的完整原样本作为写法来源。"
+            ),
+            "【当前章节】\n章节标题：房卡从掌心掉下来\n关联人物：沈知夏、林薇",
+            "【世界观 / 规则】\n谎言成物需要女主亲耳听见谎言，且会带来耳鸣。",
+            "【仿写使用说明】\n旧说明，不应在最终上下文重复保留。",
+            "【正文风格参考】\n旧样本文本，不应在最终上下文重复保留。",
+        ])
+
+        context = _build_style_execution_context(
+            original,
+            style_reference="新样本文本。",
+        )
+
+        self.assertIn("【当前章节】", context)
+        self.assertIn("房卡从掌心掉下来", context)
+        self.assertIn("沈知夏、林薇", context)
+        self.assertIn("【世界观 / 规则】", context)
+        self.assertIn("新样本文本。", context)
+        self.assertNotIn("旧说明，不应在最终上下文重复保留。", context)
+        self.assertNotIn("旧样本文本，不应在最终上下文重复保留。", context)
+        self.assertLess(context.find("【当前章节】"), context.rfind("【仿写使用说明】"))
+
+    def test_draft_style_guidance_stays_simple_for_different_samples(self):
         current = _new_chapter(0)
         current["title"] = "第一章 入城"
         current["outline"] = "主角入城调查旧案。"
@@ -804,13 +2061,16 @@ class NovelLongFormContextTests(unittest.TestCase):
         dense_context = _build_chapter_ai_context(dense_project, 0, "draft")
         long_context = _build_chapter_ai_context(long_project, 0, "draft")
 
-        dense_profile = self._context_section(dense_context, "风格锁定规则")
-        long_profile = self._context_section(long_context, "风格锁定规则")
-        self.assertIn("根据当前样本实时计算", dense_profile)
-        self.assertIn("本次预计输出约3000字时", dense_profile)
-        self.assertNotEqual(dense_profile, long_profile)
-        self.assertNotIn("族群处境", dense_profile)
-        self.assertNotIn("游戏系统播报", long_profile)
+        dense_guidance = self._context_section(dense_context, "仿写使用说明")
+        long_guidance = self._context_section(long_context, "仿写使用说明")
+        for guidance in (dense_guidance, long_guidance):
+            self.assertGreaterEqual(len(guidance), 500)
+            self.assertLessEqual(len(guidance), 1000)
+            self.assertIn("完整原文", guidance)
+            self.assertNotIn("段落排版指标", guidance)
+            self.assertNotIn("语言画像", guidance)
+        self.assertIn(dense_project["style_reference"], dense_context)
+        self.assertIn(long_project["style_reference"], long_context)
 
     def test_full_author_sheet_contexts_cover_baseline_evidence_merge_persona_and_rules(self):
         reference = "\n\n".join(
@@ -936,7 +2196,7 @@ class NovelLongFormContextTests(unittest.TestCase):
 
         selected = _style_cards_selected_by_plan(
             cards,
-            "SC03用于命令，SC02用于说明，SC01用于显形，SC04用于章末。",
+            "主叙事模式：调查推理\nSC03用于命令，SC02用于说明，SC01用于显形，SC04用于章末。",
         )
 
         self.assertEqual([item["id"] for item in selected], ["SC03", "SC01", "SC04"])
@@ -945,7 +2205,31 @@ class NovelLongFormContextTests(unittest.TestCase):
             ["权威角色命令", "推理与解释", "章节收束"],
         )
 
-    def test_short_chapter_finalize_hard_limits_selected_style_cards_to_one(self):
+    def test_format_style_cards_preserves_ids_after_subset_selection(self):
+        excerpt = "这是一段用于测试文风卡编号稳定性的作者原文。" * 12
+        cards = [
+            {
+                "id": "SC03",
+                "category": "权威角色命令",
+                "title": "冲突声纹",
+                "source_excerpt": excerpt + "甲",
+            },
+            {
+                "id": "SC07",
+                "category": "日常口语与喜剧",
+                "title": "口语声纹",
+                "source_excerpt": excerpt + "乙",
+            },
+        ]
+
+        formatted = _format_style_cards(cards)
+
+        self.assertIn("【SC03｜权威角色命令｜冲突声纹】", formatted)
+        self.assertIn("【SC07｜日常口语与喜剧｜口语声纹】", formatted)
+        self.assertNotIn("【SC01｜", formatted)
+        self.assertNotIn("【SC02｜", formatted)
+
+    def test_short_chapter_finalize_keeps_conflict_voice_card_with_plot_card(self):
         first_excerpt = "第一张原文卡用于异常显形，连续展示人物看到反馈、形成判断并继续验证。" * 8
         second_excerpt = "第二张原文卡用于权威命令，连续展示命令对象、反馈状态和组织变化。" * 8
         cards = [
@@ -973,6 +2257,54 @@ class NovelLongFormContextTests(unittest.TestCase):
 
         self.assertIn(first_excerpt, context)
         self.assertNotIn(second_excerpt, context)
+
+    def test_male_style_only_selects_scene_matched_card(self):
+        excerpt = "男频原文片段持续展示人物动作、对白停顿、冲突反应和自然口语节拍。" * 10
+        cards = [
+            {"id": "SC01", "category": "推理与解释", "title": "阶段推理", "source_excerpt": excerpt + "甲"},
+            {
+                "id": "SC06", "category": "群体反应", "title": "围观群体充当误会裁判",
+                "use_when": "公开争执和澄清失败", "voice_features": "误会、反问和立场冲突",
+                "source_excerpt": excerpt + "乙",
+            },
+            {
+                "id": "SC07", "category": "日常口语与喜剧", "title": "半句撤回诱导补全",
+                "use_when": "熟人闲谈和轻喜剧", "voice_features": "家常称呼、停顿和反差答案",
+                "source_excerpt": excerpt + "丙",
+            },
+        ]
+
+        selected = _style_cards_selected_by_plan(
+            cards,
+            "主叙事模式：调查推理\nSC01用于本章推理。",
+            max_cards=1,
+        )
+
+        self.assertEqual([item["category"] for item in selected], ["推理与解释"])
+
+    def test_female_style_only_selects_scene_matched_card(self):
+        excerpt = "女频原文片段持续展示人物互呛、动作反制、接话方式和日常喜剧节拍。" * 10
+        cards = [
+            {"id": "SC01", "category": "异常逐步显形", "title": "异常揭晓", "source_excerpt": excerpt + "甲"},
+            {
+                "id": "SC03", "category": "权威角色命令", "title": "命令施压遭动作反制",
+                "use_when": "对手施压和主角夺回控制", "voice_features": "礼貌打断、反击和拆台",
+                "source_excerpt": excerpt + "乙",
+            },
+            {
+                "id": "SC07", "category": "日常口语与喜剧", "title": "字面动作连续拆台",
+                "use_when": "日常互呛和轻度冲突", "voice_features": "短句、反问和反差急停",
+                "source_excerpt": excerpt + "丙",
+            },
+        ]
+
+        selected = _style_cards_selected_by_plan(
+            cards,
+            "主叙事模式：信息揭示\nSC01用于异常揭晓。",
+            max_cards=1,
+        )
+
+        self.assertEqual([item["category"] for item in selected], ["异常逐步显形"])
 
     def test_local_style_fingerprint_reports_lexical_and_dialogue_voice(self):
         reference = (
@@ -1004,9 +2336,10 @@ class NovelLongFormContextTests(unittest.TestCase):
         context = _build_chapter_ai_context(project, 0, "draft")
 
         self.assertLessEqual(len(context), NOVEL_AI_CONTEXT_LIMIT)
-        self.assertIn("【风格锁定规则】", context)
+        self.assertIn("【仿写使用说明】", context)
         self.assertIn("【正文风格参考】", context)
-        self.assertIn("风格样本唯一标记", context)
+        self.assertIn(project["style_reference"], context)
+        self.assertNotIn("【作者原生用词池", context)
 
     def test_style_pipeline_can_use_more_than_legacy_59000_character_limit(self):
         original = "【当前章节资料】\n" + "人物、设定、伏笔和连续性资料。" * 4000
@@ -1020,7 +2353,7 @@ class NovelLongFormContextTests(unittest.TestCase):
         self.assertIn("【作者写作档案】", context)
         self.assertIn("【与本章写作功能接近的原文证据】", context)
 
-    def test_large_style_sample_uses_full_fingerprint_and_stratified_excerpts(self):
+    def test_large_style_sample_keeps_complete_raw_text_in_draft_context(self):
         current = _new_chapter(0)
         current["title"] = "第一章 冲突"
         current["outline"] = "主角闯入神庙救人，质问祭司，并发现契约规则。"
@@ -1041,21 +2374,19 @@ class NovelLongFormContextTests(unittest.TestCase):
         project["style_reference"] = reference
 
         context = _build_chapter_ai_context(project, 0, "draft")
-        selected = _select_style_reference_excerpts(reference, current["outline"], 6000)
-        profile = self._context_section(context, "风格锁定规则")
 
         self.assertGreater(len(reference), 8000)
-        self.assertLessEqual(len(selected), 6000)
-        self.assertIn("样本开头唯一标记", selected)
-        self.assertIn("样本结尾唯一标记", selected)
         self.assertIn("样本开头唯一标记", context)
         self.assertIn("样本结尾唯一标记", context)
-        self.assertIn("代表片段", context)
-        self.assertNotIn(reference, context)
-        self.assertIn("文风指纹按全文计算", profile)
-        self.assertIn("段落功能分布", profile)
-        self.assertIn("常见段落衔接", profile)
-        self.assertIn("高频连接/判断词", profile)
+        self.assertIn(reference, context)
+        self.assertIn("【仿写使用说明】", context)
+        self.assertNotIn("代表片段", context)
+        self.assertNotIn("【风格锁定规则】", context)
+        self.assertNotIn("【AI文风画像】", context)
+        full_fingerprint = _build_style_reference_profile(reference, 3000)
+        self.assertIn("段落功能分布", full_fingerprint)
+        self.assertIn("常见段落衔接", full_fingerprint)
+        self.assertIn("段落节奏骨架", full_fingerprint)
 
     def test_large_style_excerpt_selector_preserves_start_end_and_budget(self):
         reference = "\n\n".join(
@@ -1171,17 +2502,26 @@ class NovelLongFormContextTests(unittest.TestCase):
         parsed = _parse_style_finalize_result(returned)
 
         self.assertIn("【终稿编辑任务】", context)
-        self.assertIn("对白字数占比不符", context)
-        self.assertIn("终稿正文控制在2550-3450字", context)
-        self.assertIn("本次终稿交付门槛", context)
-        self.assertIn("非对白35字以内单句短段占比", context)
-        self.assertIn("所有evidence_quote必须从首次正文逐字复制", context)
+        self.assertNotIn("对白字数占比不符", context)
+        self.assertNotIn("终稿正文控制在2550-3450字", context)
+        self.assertIn("自然排版与句式跟随样本读感变化", context)
+        self.assertNotIn("非对白35字以内单句短段占比", context)
+        self.assertNotIn("beat_evidence", context)
+        self.assertNotIn('"opening_continuation"', context)
         self.assertLessEqual(len(context), NOVEL_AI_CONTEXT_LIMIT)
         self.assertTrue(parsed["parsed"])
         self.assertEqual(parsed["text"], "终稿第一段。\n\n终稿第二段。")
         self.assertTrue(parsed["acceptance"]["paragraph_structure_check"])
         self.assertIn("主角留在原地", parsed["key_facts"])
         self.assertEqual(parsed["memory_update"]["state_snapshot"]["location"], "原地")
+
+        partial = _parse_style_finalize_result(
+            "【终稿正文】\n只返回正文。\n\n"
+            "【终稿验收】\n"
+            '{"previous_chapter_repetition_check":true,"paragraph_structure_check":true}'
+        )
+        self.assertTrue(partial["parsed"])
+        self.assertEqual(partial["text"], "只返回正文。")
 
     def test_body_only_style_finalize_context_does_not_mix_in_memory_transaction(self):
         reference = "\n".join(
@@ -1208,13 +2548,46 @@ class NovelLongFormContextTests(unittest.TestCase):
         self.assertLessEqual(len(context), NOVEL_AI_CONTEXT_LIMIT)
         self.assertIn("【终稿正文】", context)
         self.assertIn("本次只负责小说正文", context)
-        self.assertIn("段落密度偏差过大", context)
+        self.assertNotIn("段落密度偏差过大", context)
+        self.assertNotIn("对白比例不足", context)
         self.assertIn(draft, context)
         self.assertNotIn("【AI资料更新与下一章选择索引】", context)
         self.assertNotIn("【长篇记忆更新】", context)
         self.assertNotIn("不应进入纯正文终稿", context)
         self.assertIn("【终稿验收】", context)
         self.assertNotIn('"long_form_memory"', context)
+
+    def test_style_finalize_severe_rescue_allows_whole_chapter_compression(self):
+        reference = "\n".join(
+            f"样本第{index}段把人物反应和事情结果自然写在一起。"
+            for index in range(80)
+        )
+        candidate = "\n\n".join(
+            f"第{index}个短段。" for index in range(180)
+        )
+        context = _build_style_finalize_context(
+            "【当前章节】\n本章扩写字数：3000字",
+            candidate,
+            "你的习惯词包括：“立刻”。",
+            reference + "她立刻离开。",
+            [
+                "终稿正文长度明显偏离目标：目标约3000字，终稿约5000字",
+                "终稿结构同时向短碎方向漂移：段落密度偏高、短段比例偏高",
+                "终稿原生词密度明显高于样本：立刻8次/软上沿1次",
+            ],
+            3000,
+            project=self._project_with_current_chapter(_new_chapter(0)),
+            chapter_index=0,
+            include_memory=False,
+            execution_text="1. 人物完成本章决定。",
+            rescue_from_candidate=True,
+        )
+
+        self.assertIn("【终稿整章压缩补救】", context)
+        self.assertIn("原来的无效换行", context)
+        self.assertIn("不能只做少量同义改写", context)
+        self.assertIn("重新统计【作者原生用词池】的全部词", context)
+        self.assertIn("不能把删掉的超密词换成另一个原生词", context)
 
     def test_style_execution_builds_fact_ledger_and_keeps_backup_body_separate(self):
         reference = "\n".join(
@@ -1238,13 +2611,14 @@ class NovelLongFormContextTests(unittest.TestCase):
             "voice_features": "如果……就……；这说明；随后验证",
             "source_excerpt": card_excerpt,
         }]
-        context = _build_style_execution_context(
+        context = _build_legacy_style_execution_context(
             "【当前章节】\n本章扩写字数：2000字\n本章需要保全证据并制服来客。\n\n【正文风格参考】\n" + reference,
             "【作者人格】\n你使用连续叙述。",
             style_cards=style_cards,
             style_reference=reference,
         )
         style_plan = (
+            "主叙事模式：调查推理\n"
             "选定片段卡：SC01，用于主角根据脚印核验证据。\n"
             "段落执行：普通说明段每段2至4句，非对白单句短段不得连续超过2段。\n"
             "角色声纹矩阵：主角用短问和阶段判断；来客先停顿再否认。"
@@ -1262,21 +2636,18 @@ class NovelLongFormContextTests(unittest.TestCase):
         self.assertLessEqual(len(context), NOVEL_AI_CONTEXT_LIMIT)
         self.assertIn("【剧情执行稿任务】", context)
         self.assertIn("【AI文风画像】", context)
-        self.assertIn("6-10条唯一剧情拍点", context)
-        self.assertIn("静默继承边界", context)
-        self.assertIn("不同字段名就拆成多个事件", context)
-        self.assertIn("修辞性重复", context)
-        self.assertIn("【功能型原文片段库", context)
+        self.assertIn("按自然场景转折列出唯一剧情拍点", context)
+        self.assertNotIn("静默连续性边界", context)
+        self.assertIn("不要把观察、验证、问答和结论拆成教程步骤", context)
+        self.assertNotIn("【功能型原文片段库", context)
         self.assertIn("严格只输出以下三个分区", context)
-        self.assertIn("角色声纹矩阵", context)
-        self.assertIn("同一功能维度最多选1张", context)
-        self.assertIn("相近角色对照", context)
-        self.assertIn("具体事件", context)
-        self.assertIn("完整样本结构硬指标", context)
-        self.assertIn("对白字数占比控制在", context)
-        self.assertIn("一条不超过25字的本章口吻样句", context)
-        self.assertIn("默认只选1张", context)
-        self.assertIn("合成一个对白段", context)
+        self.assertIn("只写1至2名核心人物的口吻", context)
+        self.assertNotIn("完整样本结构软参考", context)
+        self.assertIn("人物对白、冲突声纹、日常口语与喜剧习惯常驻执行", context)
+        self.assertIn("不设置段落、短句或对白数量配额", context)
+        self.assertIn("未决任务只用于防止连续性错误，不是本章待办清单", context)
+        self.assertIn("当前章节提纲明确安排执行时", context)
+        self.assertIn("项目中的连续性事实只用于防止写错，不是额外剧情拍点", context)
         self.assertTrue(parsed["parsed"])
         self.assertTrue(parsed["style_plan_parsed"])
         self.assertIn("融资冻结电话", parsed["execution"])
@@ -1296,23 +2667,126 @@ class NovelLongFormContextTests(unittest.TestCase):
             style_cards=style_cards,
         )
         self.assertIn("剧情执行清单｜只继承事实与顺序，必须从零写作", finalize)
-        self.assertIn("不能退回备用正文草稿", finalize)
         self.assertIn("【文风重复与推进边界】", finalize)
         self.assertIn("新动作、新信息、新决定、新后果", finalize)
         self.assertIn("【本章声纹执行表｜必须逐项落实】", finalize)
         self.assertIn("【本章选定功能片段卡", finalize)
-        self.assertIn("一个拍点或连续小场景", finalize)
-        self.assertIn("禁止再追加抽象阶段宣告", finalize)
-        self.assertIn("同一人物连续说出的15字以内短句", finalize)
         self.assertIn(card_excerpt, finalize)
-        self.assertIn("普通说明段每段组织2至4个完整句子", finalize)
-        self.assertIn("不得逐项独立成段", finalize)
         self.assertNotIn("来客撞开房门。主角先护住证据", finalize)
+        self.assertNotIn("【备用正文的本地检测结果", finalize)
+        self.assertNotIn("【首轮终稿结构预检", finalize)
+        self.assertIn("logic_continuity_check", finalize)
+        self.assertIn("把相邻拍点组织成自然场景", finalize)
+        self.assertNotIn("【输出前结构防漂移检查】", finalize)
+        self.assertIn("段落排版指标已删除", finalize)
+        self.assertIn("隐私规则或查询范围最多完整出现一处", finalize)
 
-        medium = _build_style_execution_context("本章扩写字数：5000字")
-        long = _build_style_execution_context("本章扩写字数：10000字")
-        self.assertIn("8-14条唯一剧情拍点", medium)
-        self.assertIn("10-18条唯一剧情拍点", long)
+        medium = _build_legacy_style_execution_context("本章扩写字数：5000字")
+        long = _build_legacy_style_execution_context("本章扩写字数：10000字")
+        self.assertIn("自然数量的唯一剧情拍点", medium)
+        self.assertIn("自然数量的唯一剧情拍点", long)
+
+    def test_narrative_mode_blocks_procedural_cards_outside_investigation(self):
+        def card(card_id, category, title):
+            return {
+                "id": card_id,
+                "category": category,
+                "title": title,
+                "use_when": "适用场景",
+                "avoid_when": "不适用场景",
+                "voice_features": title,
+                "source_excerpt": (f"{title}。人物立即作出反应并推动下一步变化。" * 12),
+            }
+
+        cards = [
+            card("SC01", "推理与解释", "逐层推理"),
+            card("SC02", "专业角色对白", "专业流程"),
+            card("SC05", "异常逐步显形", "异常显形"),
+            card("SC06", "群体反应", "冲突现场反应"),
+            card("SC07", "日常口语与喜剧", "日常口语反差"),
+        ]
+
+        revealed = _style_cards_selected_by_plan(
+            cards,
+            "主叙事模式：信息揭示\n选定片段卡：SC01、SC02、SC05",
+            max_cards=1,
+        )
+        investigated = _style_cards_selected_by_plan(
+            cards,
+            "主叙事模式：调查推理\n选定片段卡：SC01、SC02",
+            max_cards=1,
+        )
+
+        self.assertEqual([item["id"] for item in revealed], ["SC05"])
+        self.assertEqual([item["id"] for item in investigated], ["SC01"])
+
+    def test_style_context_uses_entertainment_priority_without_forced_long_reasoning(self):
+        reference = "人物先动手阻止，随后只用一句话点出危险。" * 80
+        context = _build_style_execution_context(
+            "【当前章节】\n本章扩写字数：2000字\n医院送来一批补品，主角发现异常。",
+            (
+                "【作者人格】\n【剧情组织人格】\n"
+                "你每章都按观察—假说—检验—反馈—复盘—行动推进。\n"
+                "【对白总体声纹】\n你的对白总体偏短、偏口语。\n"
+                "【格式节奏与使用边界】\n你大量把时间、判断和动作拆成一行一句。\n"
+                "【人物与场景人格】\n你高频让围观者承担群体反应。"
+            ),
+            style_reference=reference,
+        )
+
+        self.assertIn(reference, context)
+        self.assertIn("【仿写使用说明】", context)
+        self.assertIn("完整原样本", context)
+        self.assertNotIn("【AI文风画像】", context)
+        self.assertNotIn("【作者原生用词池", context)
+        self.assertNotIn("【V4 人物与叙述声纹", context)
+        self.assertNotIn("【V4 条件性叙事技法", context)
+        self.assertNotIn("观察—假说—检验—反馈—复盘—行动", context)
+        self.assertNotIn("你大量把", context)
+        self.assertNotIn("你的对白总体偏短、偏口语", context)
+        self.assertNotIn("你高频让", context)
+        self.assertNotIn("专业流程才保留", context)
+        self.assertNotIn("剧情执行清单", context)
+        self.assertNotIn("备用正文草稿", context)
+
+        finalize = _build_style_finalize_context(
+            "【当前章节】\n本章扩写字数：2000字",
+            "主角发现补品异常，当场叫停。",
+            style_reference="人物先动手阻止，随后只用一句话点出危险。" * 80,
+            output_target=2000,
+            include_memory=False,
+            execution_text="1. 主角发现异常并叫停补品。",
+            style_plan="主叙事模式：信息揭示\n本章靠异常和人物反应推进。",
+        )
+        self.assertNotIn("本章已确定主叙事模式为", finalize)
+        self.assertIn("【仿写终稿任务】", finalize)
+        self.assertIn("段落排版指标已删除", finalize)
+        self.assertNotIn("每1000字约", finalize)
+        self.assertNotIn("15字以内短段", finalize)
+        self.assertNotIn("段落节奏骨架", finalize)
+        self.assertNotIn("至少两次用45至90字", finalize)
+
+    def test_female_style_runtime_keeps_voice_without_forcing_comedy_or_group_reactions(self):
+        reference = "她没有解释，只把称呼压得很轻，停了一下才接话。" * 80
+        context = _build_style_execution_context(
+            "【当前章节】\n本章扩写字数：2000字\n女主独自面对一场严肃告别。",
+            (
+                "【作者人格】\n"
+                "【剧情组织人格】\n"
+                "每个场景都安排连续拆台、围观群体反应和喜剧反差。\n"
+                "【对白总体声纹】\n"
+                "人物保留家常称呼、语气词、停顿和接话方式。"
+            ),
+            style_reference=reference,
+        )
+
+        self.assertIn(reference, context)
+        self.assertIn("【仿写使用说明】", context)
+        self.assertNotIn("每个场景都安排连续拆台", context)
+        self.assertNotIn("围观群体反应和喜剧反差", context)
+        self.assertNotIn("人物保留家常称呼、语气词、停顿和接话方式", context)
+        self.assertNotIn("【V4 人物与叙述声纹", context)
+        self.assertNotIn("【V4 条件性叙事技法", context)
 
     def test_style_execution_parser_selects_last_complete_restart(self):
         first = (
@@ -1351,7 +2825,8 @@ class NovelLongFormContextTests(unittest.TestCase):
         self.assertTrue(parsed["parsed"])
         self.assertEqual(parsed["complete_set_count"], 1)
         self.assertIn("第一版拍点", parsed["execution"])
-        self.assertEqual(parsed["style_plan"], "第一版声纹。")
+        self.assertTrue(parsed["style_plan"].startswith("第一版声纹。"))
+        self.assertIn("常驻人物语言声纹", parsed["style_plan"])
         self.assertEqual(parsed["draft"], "第一版正文完成。")
 
     def test_memory_finalize_context_focuses_on_final_body_and_event_coverage(self):
@@ -1396,10 +2871,74 @@ class NovelLongFormContextTests(unittest.TestCase):
         self.assertIn("记录缺失/覆盖/删除/清空", context)
         self.assertIn("实际行动、说话、来电", context)
         self.assertIn("current_chapter_character_refs", context)
+        self.assertIn("章首已经存在且章末没有变化的伤势", context)
+        self.assertIn("只完成一次检测、汇报、送达或普通执行动作", context)
         self.assertIn("C002=夏正霆", context)
         self.assertIn("下一章边界（只用于选择需继承资料）", context)
         self.assertIn("女主回家处理融资危机", context)
         self.assertIn('"long_form_memory"', context)
+        self.assertIn('"logic_audit"', context)
+        self.assertIn("物件的存在、撤走、开合、损毁、移动和持有人", context)
+        self.assertIn("不得把人物判断失误", context)
+
+    def test_logic_audit_requires_ordered_literal_evidence_and_supports_local_patch(self):
+        final_text = (
+            "两扇屏风被撤下，厅中再无遮挡。\n\n"
+            "采买管事急得扑向屏风边缘，想从后门逃走。"
+        )
+        audit = {
+            "checked": True,
+            "issues": [{
+                "severity": "major",
+                "category": "object_state",
+                "earlier_quote": "两扇屏风被撤下",
+                "later_quote": "采买管事急得扑向屏风边缘",
+                "explanation": "屏风已经撤走，后文不能继续扑向其边缘。",
+            }],
+        }
+
+        self.assertEqual(_chapter_logic_audit_validation_errors(final_text, audit), [])
+        self.assertEqual(len(_chapter_logic_audit_blocking_issues(audit)), 1)
+        patches = [{
+            "issue_index": 1,
+            "original_quote": "采买管事急得扑向屏风边缘",
+            "replacement_text": "采买管事急得扑向后门",
+        }]
+        repaired, errors = _apply_chapter_logic_repair_patches(
+            final_text, audit["issues"], patches
+        )
+
+        self.assertEqual(errors, [])
+        self.assertIn("采买管事急得扑向后门", repaired)
+        self.assertNotIn("扑向屏风边缘", repaired)
+
+    def test_logic_repair_context_and_parser_only_exchange_exact_patches(self):
+        chapter = _new_chapter(0)
+        chapter["title"] = "管事互咬"
+        project = self._project_with_current_chapter(chapter)
+        final_text = "两扇屏风被撤下。\n采买管事扑向屏风边缘。"
+        issues = [{
+            "severity": "major",
+            "category": "object_state",
+            "earlier_quote": "两扇屏风被撤下",
+            "later_quote": "采买管事扑向屏风边缘",
+            "explanation": "已撤走的屏风不能再次被使用。",
+        }]
+
+        context = _build_chapter_logic_repair_context(project, 0, final_text, issues)
+        parsed = _parse_chapter_logic_repair_result(json.dumps({
+            "patches": [{
+                "issue_index": 1,
+                "original_quote": "采买管事扑向屏风边缘",
+                "replacement_text": "采买管事扑向后门",
+            }],
+        }, ensure_ascii=False))
+
+        self.assertIn("不重新审稿，不扩写、删减或重组其他段落", context)
+        self.assertIn("不得补充解释、流程、总结、伏笔或新事件", context)
+        self.assertNotIn("正文风格参考", context)
+        self.assertTrue(parsed["parsed"])
+        self.assertEqual(parsed["patches"][0]["issue_index"], 1)
 
     def test_long_form_memory_update_is_parsed_and_applied_without_local_inference(self):
         chapter = _new_chapter(0)
@@ -1683,6 +3222,20 @@ class NovelLongFormContextTests(unittest.TestCase):
         self.assertEqual(update["next_chapter_memory"]["character_refs"], [])
         self.assertTrue(update["_parse_repaired"])
 
+    def test_parser_keeps_compact_marker_and_verification_when_model_flattens_root(self):
+        raw = json.dumps({
+            "schema_version": 2,
+            "base_revision": 0,
+            "compact_delta_version": LONG_FORM_COMPACT_DELTA_VERSION,
+            "state_patch": {},
+            "verification": {"checked": True},
+        }, ensure_ascii=False)
+
+        update = _parse_long_form_memory_update(raw)
+
+        self.assertEqual(update["compact_delta_version"], LONG_FORM_COMPACT_DELTA_VERSION)
+        self.assertEqual(update["verification"]["checked"], True)
+
     def test_memory_repair_context_and_parser_use_version_two_contract(self):
         chapter = _new_chapter(0)
         chapter["title"] = "密信"
@@ -1760,6 +3313,28 @@ class NovelLongFormContextTests(unittest.TestCase):
         )
         self.assertNotIn("unknown_field", merged)
 
+    def test_logic_audit_repair_uses_bundle_only_patch_context(self):
+        chapter = _new_chapter(0)
+        project = self._project_with_current_chapter(chapter)
+        memory_update = self._strict_update(project)
+
+        context = _build_long_form_memory_repair_context(
+            project,
+            0,
+            "赵明进入王城并取出旧案卷宗。",
+            outline="赵明进入王城。",
+            summary="赵明取得旧案卷宗。",
+            key_facts="赵明已经取得旧案卷宗。",
+            logic_audit={},
+            memory_update=memory_update,
+            validation_errors=["logic_audit.checked必须为true"],
+        )
+
+        self.assertIn("【状态增量修复补丁】", context)
+        self.assertIn('"logic_audit":{"checked":true,"issues":[]}', context)
+        self.assertNotIn("【待修复的原状态字段】", context)
+        self.assertNotIn("【机械引用清单】", context)
+
     def test_memory_repair_patch_targets_include_cross_field_dependencies(self):
         targets = _memory_repair_patch_targets([
             "fact_updates第9项scope与旧事实不匹配，必须使用supersede",
@@ -1774,6 +3349,50 @@ class NovelLongFormContextTests(unittest.TestCase):
                 "state_reconciliation",
             ],
         )
+
+    def test_full_memory_repair_only_applies_direct_error_fields(self):
+        original = {
+            "foreshadow_updates": [{"ref": "", "operation": "update"}],
+            "long_term_events": [{
+                "event": "上一项任务完成",
+                "storage": {"task_refs": ["TASK-0001"], "foreshadow_refs": ["F002"]},
+            }],
+        }
+        repaired = {
+            "foreshadow_updates": [{"record_ref": "F002", "operation": "update"}],
+            "long_term_events": [{
+                "event": "上一项任务完成",
+                "storage": {"task_refs": [], "foreshadow_refs": ["F002"]},
+            }],
+        }
+
+        merged = _merge_long_form_memory_repair_full(
+            original,
+            repaired,
+            ["foreshadows更新第1项引用未知记录："],
+        )
+
+        self.assertEqual(merged["foreshadow_updates"], repaired["foreshadow_updates"])
+        self.assertEqual(
+            merged["long_term_events"][0]["storage"]["task_refs"],
+            ["TASK-0001"],
+        )
+        targets = _memory_repair_patch_targets([
+            "foreshadows更新第1项引用未知记录：",
+        ])
+        self.assertEqual(targets["direct_memory_fields"], ["foreshadow_updates"])
+        self.assertIn("long_term_events", targets["memory_fields"])
+
+    def test_foreshadow_update_accepts_record_ref_alias(self):
+        normalized = _normalize_long_form_state_aliases({
+            "foreshadow_updates": [{
+                "record_ref": "F002",
+                "operation": "update",
+                "dynamic": "伏笔继续推进。",
+            }],
+        })
+
+        self.assertEqual(normalized["foreshadow_updates"][0]["ref"], "F002")
 
     def test_known_reference_errors_use_compact_memory_patch_context(self):
         chapter = _new_chapter(0)
@@ -2387,6 +4006,238 @@ class NovelLongFormContextTests(unittest.TestCase):
         self.assertEqual(saved_fact_ids, ["AF-0001"])
         self.assertNotIn("NF1", saved_fact_ids)
 
+    def test_event_storage_restores_lore_and_object_links_with_unique_literal_evidence(self):
+        chapter = _new_chapter(0)
+        chapter["memory_selection"] = {
+            "lore_ids": ["lore-a"],
+            "object_keys": ["OBJ-1"],
+        }
+        project = self._project_with_current_chapter(chapter)
+        project["lore"] = [{
+            "id": "lore-a", "name": "旧账簿", "type": "证据",
+        }]
+        project["long_form_memory"] = {
+            "schema_version": "2",
+            "revision": 0,
+            "state_snapshot": {
+                "object_states": [{
+                    "key": "OBJ-1", "name": "旧账簿", "lore_id": "lore-a",
+                    "state": "账簿仍处于封存状态",
+                }],
+            },
+            "active_facts": [],
+            "stage_archives": [],
+        }
+        update = self._strict_update(project)
+        evidence = "旧账簿的封签已经断裂"
+        update["record_updates"]["lore"] = [{
+            "operation": "update",
+            "ref": "lore-a",
+            "state": "封签已经断裂",
+            "changes": ["封签状态改变"],
+            "evidence_quote": evidence,
+        }]
+        update["state_patch"] = {
+            "object_states": [{
+                "key": "OBJ-1",
+                "lore_ref": "lore-a",
+                "state": "封签已经断裂",
+                "evidence_quote": evidence,
+            }],
+        }
+        update["state_lifecycle_review"]["reviewed_object_keys"] = ["OBJ-1"]
+        update["state_reconciliation"]["record_runtime_review"] = {
+            "reviewed_lore_refs": ["lore-a"],
+            "unchanged_lore_refs": [],
+            "reviewed_foreshadow_refs": [],
+            "unchanged_foreshadow_refs": [],
+        }
+        update["long_term_events"] = [{
+            "event": "旧账簿封签断裂",
+            "category": "key_object",
+            "evidence_quote": evidence,
+            "storage": {
+                "fact_refs": [], "character_refs": [], "lore_refs": [],
+                "foreshadow_refs": [], "object_keys": [],
+                "conflict_refs": [], "task_refs": [],
+            },
+        }]
+
+        normalized = _normalize_long_form_structural_refs(project, 0, update)
+
+        storage = normalized["long_term_events"][0]["storage"]
+        self.assertEqual(storage["lore_refs"], ["lore-a"])
+        self.assertEqual(storage["object_keys"], ["OBJ-1"])
+        self.assertEqual(
+            _validate_long_form_memory_update(
+                project, 0, normalized,
+                final_text=evidence + "，姜晚棠立即重新封存。",
+                require_revision=True,
+                require_evidence=True,
+            ),
+            [],
+        )
+
+    def test_event_storage_uses_exact_evidence_anchor_only_for_one_event(self):
+        chapter = _new_chapter(0)
+        chapter["memory_selection"] = {
+            "fact_ids": ["AF-0163"],
+            "object_keys": ["NOBJ-CH39-003"],
+        }
+        project = self._project_with_current_chapter(chapter)
+        project["long_form_memory"] = {
+            "schema_version": "2",
+            "revision": 39,
+            "state_snapshot": {
+                "object_states": [{
+                    "key": "NOBJ-CH39-003",
+                    "name": "棠记开铺章程",
+                    "state": "章程已在药铺公开",
+                }],
+            },
+            "active_facts": [{
+                "id": "AF-0163",
+                "scope": "object:棠记开铺章程",
+                "fact": "棠记开铺章程已经公开",
+            }],
+            "stage_archives": [],
+        }
+        update = self._strict_update(project)
+        shared_evidence = "留样、平价售卖、开铺章程，是棠记自己的规矩"
+        event_evidence = "救济可以合作，名声与责任不能混账"
+        update["fact_updates"] = [{
+            "operation": "update",
+            "id": "AF-0163",
+            "scope": "object:棠记开铺章程",
+            "fact": "棠记开铺章程被确认为独立规则",
+            "evidence_quote": shared_evidence,
+        }]
+        update["fact_lifecycle_review"]["reviewed_refs"] = ["AF-0163"]
+        update["state_patch"] = {
+            "object_states": [{
+                "key": "NOBJ-CH39-003",
+                "state": "章程被带到善宴并确认为棠记独立规则",
+                "evidence_quote": shared_evidence,
+            }],
+        }
+        update["state_lifecycle_review"]["reviewed_object_keys"] = ["NOBJ-CH39-003"]
+        update["long_term_events"] = [{
+            "event": "姜晚棠在善宴公开分清名声与责任",
+            "category": "other",
+            "evidence_quote": event_evidence,
+            "storage": {
+                "fact_refs": [], "character_refs": [], "lore_refs": [],
+                "foreshadow_refs": [], "object_keys": ["NOBJ-CH39-003"],
+                "conflict_refs": [], "task_refs": [],
+            },
+        }]
+
+        normalized = _normalize_long_form_structural_refs(project, 0, update)
+
+        self.assertEqual(
+            normalized["long_term_events"][0]["storage"]["fact_refs"],
+            ["AF-0163"],
+        )
+        self.assertEqual(
+            _validate_long_form_memory_update(
+                project, 0, normalized,
+                final_text=event_evidence + "。" + shared_evidence + "。",
+                require_revision=True,
+                require_evidence=True,
+            ),
+            [],
+        )
+
+        ambiguous = deepcopy(update)
+        ambiguous["long_term_events"].append({
+            "event": "章程随后被送回棠记保存",
+            "category": "key_object",
+            "evidence_quote": "账房将四份册页重新收进木匣",
+            "storage": {
+                "fact_refs": [], "character_refs": [], "lore_refs": [],
+                "foreshadow_refs": [], "object_keys": ["NOBJ-CH39-003"],
+                "conflict_refs": [], "task_refs": [],
+            },
+        })
+        ambiguous = _normalize_long_form_structural_refs(project, 0, ambiguous)
+        self.assertEqual(
+            [
+                event["storage"]["fact_refs"]
+                for event in ambiguous["long_term_events"]
+            ],
+            [[], []],
+        )
+
+    def test_new_fact_temp_id_alias_is_normalized_to_key(self):
+        chapter = _new_chapter(0)
+        project = self._project_with_current_chapter(chapter)
+        project["long_form_memory"] = {
+            "schema_version": "2",
+            "revision": 40,
+            "state_snapshot": {},
+            "active_facts": [],
+            "stage_archives": [],
+        }
+        update = self._strict_update(project)
+        update["fact_updates"] = [{
+            "operation": "add",
+            "key": "",
+            "temp_id": "NF-CH41-001",
+            "scope": "evidence:sealed_letter",
+            "fact": "密信封口出现新的断痕",
+            "evidence_quote": "封口多了一道新断痕",
+        }]
+
+        normalized = _normalize_long_form_update_payload(project, 0, update)
+
+        self.assertEqual(normalized["fact_updates"][0]["key"], "NF-CH41-001")
+
+    def test_missing_handoff_uses_full_visible_state_for_evidenced_retirement(self):
+        previous = _new_chapter(0)
+        previous["memory_sync_status"] = "complete"
+        previous["memory_revision"] = 1
+        chapter = _new_chapter(1)
+        chapter["memory_selection"] = {}
+        project = self._project_with_current_chapter(chapter)
+        project["chapters"] = [previous, chapter]
+        project["long_form_memory"] = {
+            "schema_version": "2",
+            "revision": 1,
+            "state_snapshot": {
+                "unresolved_tasks": [{
+                    "id": "TASK-0021",
+                    "task": "亲自随第二批香料验货",
+                }],
+            },
+            "active_facts": [],
+            "stage_archives": [],
+        }
+        update = self._strict_update(project, 1)
+        evidence = "姜晚棠已经完成第二批香料验货"
+        update["state_retirements"] = {"task_ids": ["TASK-0021"]}
+        update["state_lifecycle_review"]["reviewed_task_refs"] = ["TASK-0021"]
+        update["state_reconciliation"]["task_refs"] = ["TASK-0021"]
+        update["long_term_events"] = [{
+            "event": "第二批香料验货完成",
+            "category": "task",
+            "evidence_quote": evidence,
+            "storage": {
+                "fact_refs": [], "character_refs": [], "lore_refs": [],
+                "foreshadow_refs": [], "object_keys": [],
+                "conflict_refs": [], "task_refs": ["TASK-0021"],
+            },
+        }]
+
+        self.assertEqual(
+            _validate_long_form_memory_update(
+                project, 1, update,
+                final_text=evidence + "，并保留全部验货记录。",
+                require_revision=True,
+                require_evidence=True,
+            ),
+            [],
+        )
+
     def test_structural_normalization_completes_reconciliation_refs_without_ai(self):
         chapter = _new_chapter(0)
         project = self._project_with_current_chapter(chapter)
@@ -2455,6 +4306,66 @@ class NovelLongFormContextTests(unittest.TestCase):
             ),
             [],
         )
+
+    def test_task_previous_text_accepts_only_a_long_exact_ellipsis_prefix(self):
+        chapter = _new_chapter(0)
+        project = self._project_with_current_chapter(chapter)
+        old_task = (
+            "继续调查上游闸机、旧维护道和原始开闸者，并在不破坏封存证据的前提下"
+            "维持通气、封堵和伤员救援，同时核验全部经手记录与联络节点；继续追查"
+            "水运控制关系、临时换船手续、沿途行栈和全部封条编号。"
+        )
+        project["long_form_memory"] = {
+            "schema_version": "2",
+            "revision": 0,
+            "state_snapshot": {
+                "unresolved_tasks": [{"id": "TASK-0099", "task": old_task}],
+            },
+        }
+        update = self._strict_update(project)
+        update["state_patch"] = {
+            "unresolved_tasks": [{
+                "id": "TASK-0099",
+                "previous_task": old_task[:84] + "…",
+                "task": "继续救援伤员，并核验开闸者和全部经手记录。",
+            }],
+        }
+        update["state_lifecycle_review"]["reviewed_task_refs"] = ["TASK-0099"]
+        update["state_reconciliation"]["task_refs"] = ["TASK-0099"]
+        update["long_term_events"] = [{
+            "event": "救援与开闸调查继续推进",
+            "category": "task",
+            "evidence_quote": "继续救援伤员，并核验开闸者",
+            "storage": {
+                "fact_refs": [], "character_refs": [], "lore_refs": [],
+                "foreshadow_refs": [], "object_keys": [], "conflict_refs": [],
+                "task_refs": ["TASK-0099"],
+            },
+        }]
+
+        errors = _validate_long_form_memory_update(
+            project,
+            0,
+            update,
+            final_text="众人继续救援伤员，并核验开闸者和全部经手记录。",
+            require_revision=True,
+            require_evidence=True,
+        )
+
+        self.assertFalse(any("previous_task与旧状态不匹配" in error for error in errors))
+        update["state_patch"]["unresolved_tasks"][0]["previous_task"] = (
+            "继续调查另一处完全无关的记录和人员，并把错误内容扩展到足够长的八十个字符"
+            "以证明校验不会仅凭省略号放行任何不相干文本。…"
+        )
+        errors = _validate_long_form_memory_update(
+            project,
+            0,
+            update,
+            final_text="众人继续救援伤员，并核验开闸者和全部经手记录。",
+            require_revision=True,
+            require_evidence=True,
+        )
+        self.assertTrue(any("previous_task与旧状态不匹配" in error for error in errors))
 
     def test_tenth_chapter_lifecycle_review_only_requires_selected_active_facts(self):
         chapters = [_new_chapter(index) for index in range(10)]
@@ -2556,7 +4467,7 @@ class NovelLongFormContextTests(unittest.TestCase):
             [],
         )
 
-    def test_new_lore_requires_story_known_for_story_layer_continuity(self):
+    def test_new_lore_uses_literal_evidence_when_story_known_is_omitted(self):
         chapter = _new_chapter(0)
         project = self._project_with_current_chapter(chapter)
         body = "赵明确认禁地日落后不得进入，并把规则写进案卷。"
@@ -2584,7 +4495,24 @@ class NovelLongFormContextTests(unittest.TestCase):
             project, 0, update, final_text=body, require_revision=True, require_evidence=True
         )
 
-        self.assertTrue(any("缺少story_known" in error for error in errors))
+        self.assertFalse(any("缺少story_known" in error for error in errors))
+        normalized = _normalize_long_form_update_payload(project, 0, update)
+        self.assertEqual(
+            normalized["record_updates"]["lore"][0]["story_known"],
+            "赵明确认禁地日落后不得进入",
+        )
+
+    def test_ephemeral_actor_refs_do_not_block_memory_commit(self):
+        chapter = _new_chapter(0)
+        project = self._project_with_current_chapter(chapter)
+        project["characters"] = [{"id": "C001", "name": "赵明"}]
+        update = self._strict_update(project)
+        update["current_chapter_character_refs"] = ["C001", "前台经理"]
+        update["state_reconciliation"]["character_refs"] = ["C001", "前台经理"]
+        normalized = _normalize_long_form_update_payload(project, 0, update)
+
+        self.assertEqual(normalized["current_chapter_character_refs"], ["C001"])
+        self.assertEqual(normalized["state_reconciliation"]["character_refs"], ["C001"])
 
     def test_state_reconciliation_must_cover_new_conflict_and_task_keys(self):
         chapter = _new_chapter(0)
@@ -2769,8 +4697,11 @@ class NovelLongFormContextTests(unittest.TestCase):
         errors = _validate_long_form_memory_update(
             project, 0, update, final_text=body, require_revision=True, require_evidence=True
         )
-        self.assertTrue(any("已埋但revealed为空" in error for error in errors))
-        self.assertTrue(any("已埋但缺少remaining_secret" in error for error in errors))
+        self.assertEqual(errors, [])
+        normalized = _normalize_long_form_update_payload(project, 0, update)
+        normalized_foreshadow = normalized["foreshadow_updates"][0]
+        self.assertEqual(normalized_foreshadow["revealed"], "午夜钟声已经出现")
+        self.assertIn("仍未揭示", normalized_foreshadow["remaining_secret"])
 
         update["foreshadow_updates"][0]["revealed"] = "赵明与周青听见旧钟在午夜无风自鸣"
         update["foreshadow_updates"][0]["remaining_secret"] = "钟声来源尚未揭示"
@@ -2916,7 +4847,7 @@ class NovelLongFormContextTests(unittest.TestCase):
         self.assertFalse(malformed["pass"])
         self.assertEqual(malformed["score"], 0)
 
-    def test_chapter_draft_context_obeys_planned_stage_fields(self):
+    def test_chapter_draft_context_treats_legacy_planning_fields_as_reference(self):
         current = _new_chapter(0)
         current["title"] = "第一章 风雨入城"
         current["outline"] = (
@@ -2934,8 +4865,8 @@ class NovelLongFormContextTests(unittest.TestCase):
 
         context = _build_chapter_ai_context(project, 0, "draft")
 
-        self.assertIn("必须优先按这些章节规划字段执行", context)
-        self.assertIn("阶段规则只控制节奏、密度和钩子", context)
+        self.assertIn("历史规划元数据只作参考", context)
+        self.assertIn("不要逐项执行、解释或扩展成任务清单", context)
         self.assertIn("所属阶段：强钩子阶段", context)
         self.assertIn("本章功能：开局爆点", context)
         self.assertIn("冲突强度：高", context)
@@ -3667,6 +5598,9 @@ class NovelLongFormContextTests(unittest.TestCase):
         self.assertIn("上一章「第六十章 雨夜追问」结尾", context)
         self.assertIn("纸包里露出半枚虎符", context)
         self.assertIn("自然承接上一章", context)
+        self.assertIn("已发布正文", context)
+        self.assertIn("禁止原样或同义重写", context)
+        self.assertIn("从动作造成的新结果或新阻力开始", context)
 
     def test_chapter_context_includes_next_chapter_head_when_rewriting_empty_middle_chapter(self):
         previous = _new_chapter(0)
@@ -3926,7 +5860,7 @@ class NovelLongFormContextTests(unittest.TestCase):
 
         context = _build_chapter_ai_context(project, 0, "draft")
 
-        self.assertIn("【后续规划 / 边界】", context)
+        self.assertIn("【后续规划参考】", context)
         self.assertIn("后续近章规划", context)
         self.assertIn("当前章只能铺垫", context)
         self.assertIn("虎符来源", context)
@@ -5561,13 +7495,14 @@ class NovelLongFormContextTests(unittest.TestCase):
                 "evidence_quote": "赵明进入仓库，并在墙后找到了暗格",
             }],
             "previous_chapter_repetition_check": True,
+            "logic_continuity_check": True,
             "paragraph_structure_check": True,
         }
 
         errors = _style_finalize_acceptance_errors(
             execution, body, acceptance, reference, len(body)
         )
-        self.assertTrue(any("剧情拍点2" in error for error in errors))
+        self.assertEqual(errors, [])
 
         acceptance["beat_evidence"].append({
             "beat": 2,
@@ -5578,11 +7513,925 @@ class NovelLongFormContextTests(unittest.TestCase):
         )
         self.assertEqual(errors, [])
 
+        errors = _style_finalize_acceptance_errors(
+            execution,
+            body,
+            acceptance,
+            reference,
+            len(body),
+            style_plan="角色声纹矩阵：赵明只使用短问。",
+        )
+        self.assertEqual(errors, [])
+        acceptance["role_voice_attribution_check"] = True
+        self.assertEqual(
+            _style_finalize_acceptance_errors(
+                execution,
+                body,
+                acceptance,
+                reference,
+                len(body),
+                style_plan="角色声纹矩阵：赵明只使用短问。",
+            ),
+            [],
+        )
+
+        acceptance.pop("logic_continuity_check")
+        errors = _style_finalize_acceptance_errors(
+            execution, body, acceptance, reference, len(body)
+        )
+        self.assertEqual(errors, [])
+        acceptance["logic_continuity_check"] = True
+
+        acceptance.pop("paragraph_structure_check")
+        errors = _style_finalize_acceptance_errors(
+            execution, body, acceptance, reference, len(body)
+        )
+        self.assertEqual(errors, [])
+
         fragmented = "\n".join(f"短段推进{index}。" for index in range(100))
         errors = _style_finalize_acceptance_errors(
             execution, fragmented, acceptance, reference, len(fragmented)
         )
         self.assertTrue(any("段落密度" in error or "短段" in error for error in errors))
+
+    def test_style_finalize_acceptance_blocks_published_boundary_replay(self):
+        previous = _new_chapter(0)
+        previous["text"] = "医生刚把手收回。\n\n“他还没死。”\n\n滴——"
+        current = _new_chapter(1)
+        project = self._project_with_current_chapter(current)
+        project["chapters"] = [previous, current]
+        execution = "1. 章首新增变量：护士循声查看监护屏，并发现新的血氧变化。"
+        repeated_body = "滴——监护仪再次响起。\n\n护士猛地抬头，顺着声音看向监护屏。"
+        acceptance = {
+            "beat_evidence": [{
+                "beat": 1,
+                "evidence_quote": "护士猛地抬头，顺着声音看向监护屏",
+            }],
+            "opening_continuation": {
+                "first_new_sentence": "滴——监护仪再次响起",
+                "new_action_or_result": "监护仪发出新的报警",
+            },
+            "timeline_commitment_check": {
+                "prior_deadline_or_promise": "无",
+                "current_schedule": "无",
+                "compatible": True,
+            },
+            "previous_chapter_repetition_check": True,
+            "logic_continuity_check": True,
+            "paragraph_structure_check": True,
+        }
+
+        errors = _style_finalize_acceptance_errors(
+            execution,
+            repeated_body,
+            acceptance,
+            project=project,
+            chapter_index=1,
+        )
+
+        self.assertTrue(any("章首承接重复上一章已发布结尾" in error for error in errors))
+
+        clean_body = "护士猛地抬头，顺着蜂鸣声看向监护屏。\n\n屏幕上的血氧数值突然开始回升。"
+        acceptance["beat_evidence"][0]["evidence_quote"] = "护士猛地抬头，顺着蜂鸣声看向监护屏"
+        acceptance["opening_continuation"] = {
+            "first_new_sentence": "护士猛地抬头，顺着蜂鸣声看向监护屏",
+            "new_action_or_result": "护士对声音作出新反应并发现血氧回升",
+        }
+        timeline_check = acceptance.pop("timeline_commitment_check")
+        errors = _style_finalize_acceptance_errors(
+            execution,
+            clean_body,
+            acceptance,
+            project=project,
+            chapter_index=1,
+        )
+        self.assertEqual(errors, [])
+        acceptance["timeline_commitment_check"] = timeline_check
+        errors = _style_finalize_acceptance_errors(
+            execution,
+            clean_body,
+            acceptance,
+            project=project,
+            chapter_index=1,
+        )
+        self.assertEqual(errors, [])
+
+    def test_style_finalize_acceptance_does_not_force_voice_scenes_or_evidence(self):
+        execution = "1. 赵明拒绝对方索要账册，并当场指出问题。"
+        body = (
+            "“把账册交出来。”\n\n"
+            "赵明把账册按回桌上。\n\n"
+            "“不是，你当我看不懂这点把戏？”\n\n"
+            "对面的人顿时噎住。"
+        )
+        acceptance = {
+            "beat_evidence": [{
+                "beat": 1,
+                "evidence_quote": "赵明把账册按回桌上",
+            }],
+            "previous_chapter_repetition_check": True,
+            "logic_continuity_check": True,
+            "paragraph_structure_check": True,
+            "role_voice_attribution_check": True,
+        }
+        style_plan = "【常驻人物语言声纹｜每章静默执行】只校准实际说话人物。"
+
+        errors = _style_finalize_acceptance_errors(
+            execution,
+            body,
+            acceptance,
+            "样本文风。",
+            style_plan=style_plan,
+        )
+
+        self.assertEqual(errors, [])
+        self.assertNotIn("mandatory_voice_evidence", acceptance)
+
+    def test_style_finalize_acceptance_keeps_procedural_and_mechanical_checks_hard(self):
+        execution = "1. 赵明当场拒绝对方，把账册按回桌上。"
+        body = (
+            "赵明把账册按回桌上。\n\n"
+            "“这件事到此为止。”\n\n"
+            "对方刚要开口，门外已经有人推门进来。"
+        )
+        acceptance = {
+            "previous_chapter_repetition_check": True,
+            "logic_continuity_check": True,
+        }
+
+        self.assertEqual(
+            _style_finalize_acceptance_errors(execution, body, acceptance),
+            [],
+        )
+
+        acceptance["procedural_expansion_check"] = False
+        errors = _style_finalize_acceptance_errors(execution, body, acceptance)
+        self.assertTrue(any("办案式流程明显扩张" in error for error in errors))
+
+        acceptance["procedural_expansion_check"] = True
+        acceptance["mechanical_prose_check"] = False
+        errors = _style_finalize_acceptance_errors(execution, body, acceptance)
+        self.assertTrue(any("机械感明显" in error for error in errors))
+
+    def test_style_finalize_acceptance_ignores_legacy_voice_evidence(self):
+        execution = "1. 裴明拒绝对方插手路线，并接受损耗责任。"
+        body = (
+            "裴明按住路单。\n\n"
+            "“裴家的船，裴家自己选人，您最好别问。”\n\n"
+            "这话听着客气，其实是在拒绝她插手。\n\n"
+            "姜禾点头。\n\n"
+            "“不问路线。赔船，我也不问。”\n\n"
+            "裴明的笑意当场卡住。"
+        )
+        acceptance = {
+            "beat_evidence": [{
+                "beat": 1,
+                "evidence_quote": "裴家的船，裴家自己选人",
+            }],
+            "mandatory_voice_evidence": {"legacy": "ignored"},
+            "previous_chapter_repetition_check": True,
+            "logic_continuity_check": True,
+            "paragraph_structure_check": True,
+            "role_voice_attribution_check": True,
+        }
+
+        self.assertEqual(
+            _style_finalize_acceptance_errors(
+                execution,
+                body,
+                acceptance,
+                "样本文风。",
+                style_plan="【常驻人物语言声纹｜每章静默执行】只校准实际说话人物。",
+            ),
+            [],
+        )
+
+    def test_style_native_vocabulary_uses_only_phrases_extracted_from_profile(self):
+        reference = "弹幕问尊嘟假嘟。她气笑了，好嘛，事情继续。与此同时，旁人离开。"
+        profile = "你的习惯词包括：“尊嘟假嘟”“气笑了”“好嘛”。"
+
+        vocabulary = _style_native_vocabulary_text(profile, reference)
+
+        self.assertIn("以下3项", vocabulary)
+        self.assertIn("尊嘟假嘟", vocabulary)
+        self.assertIn("气笑了", vocabulary)
+        self.assertIn("好嘛", vocabulary)
+        self.assertNotIn("与此同时", vocabulary)
+        self.assertIn("字当前文风样本", vocabulary)
+        self.assertIn("低频场景词", vocabulary)
+        self.assertIn("尊嘟假嘟×1", vocabulary)
+        self.assertIn("好嘛×1", vocabulary)
+        self.assertIn("不能把低频词变成每章固定口头禅", vocabulary)
+        self.assertIn("优先保留这些原词", vocabulary)
+        self.assertIn("不设最低数量", vocabulary)
+
+    def test_style_native_vocabulary_uses_real_sample_frequency_tiers(self):
+        reference = ("她直接回绝，又直接离开。" * 12) + "好嘛，事情又变了。"
+        profile = "你的习惯词包括：“直接”“好嘛”。"
+
+        vocabulary = _style_native_vocabulary_text(profile, reference)
+
+        self.assertIn("高复现原词：直接×24", vocabulary)
+        self.assertIn("低频场景词：好嘛×1", vocabulary)
+        self.assertIn("任何一项的正文密度都不得明显高于完整样本", vocabulary)
+
+        scaled = _style_native_vocabulary_text(
+            profile,
+            reference,
+            output_target=5000,
+        )
+        self.assertRegex(scaled, r"直接×24（约5000字单章通常0-\d+次）")
+        self.assertIn("好嘛×1（约5000字单章通常0-1次）", scaled)
+        self.assertIn("软密度上沿，不是禁词或硬配额", scaled)
+
+    def test_style_finalize_acceptance_reports_only_clear_native_word_overuse(self):
+        reference = (
+            ("她看清情况以后才作决定。" * 900)
+            + ("她立刻停下。" * 10)
+            + ("她直接回绝。" * 30)
+            + "好嘛。"
+        )
+        profile = "你的习惯词包括：“立刻”“直接”“好嘛”。"
+
+        def density_errors(text):
+            errors = _style_finalize_acceptance_errors(
+                "",
+                text,
+                {},
+                reference,
+                1000,
+                profile_text=profile,
+            )
+            return [
+                error for error in errors
+                if error.startswith("终稿原生词密度明显高于样本")
+            ]
+
+        natural = ("她想清楚以后继续往前走。" * 75) + "好嘛。她立刻停下。"
+        self.assertEqual(density_errors(natural), [])
+
+        within_high_frequency_band = (
+            ("她想清楚以后继续往前走。" * 72)
+            + ("她直接回绝。" * 4)
+        )
+        self.assertEqual(density_errors(within_high_frequency_band), [])
+
+        overused = (
+            ("她想清楚以后继续往前走。" * 72)
+            + "好嘛。好嘛。好嘛。好嘛。"
+        )
+        errors = density_errors(overused)
+        self.assertEqual(len(errors), 1)
+        self.assertIn("好嘛4次/软上沿1次", errors[0])
+        self.assertIn("保留语义必要处", errors[0])
+
+    def test_style_native_vocabulary_splits_grouped_voice_terms_and_skips_evidence(self):
+        reference = (
+            "随后他继续向前，然后停下，再然后转身。突然灯灭，紧接着门响。"
+            "顿时众人安静，下一瞬间又恢复喧闹。不会吧，不对，事情还有变化。"
+            "红色纸片落在任务目标旁。"
+        ) * 4
+        profile = (
+            "【作者人格】\n"
+            "【叙述习惯词与句法声纹】\n"
+            "你的高频连接词是：“随后／然后／再然后＋动作”“突然／紧接着＋刺激”。"
+            "状态重判使用：“顿时／瞬间”。\n"
+            "【对白总体声纹】\n"
+            "证据不足时使用：“不会吧……／……不对”。\n"
+            "【功能角色说话方式】\n"
+            "一线汇报采用：“地点／目标＋发现情况＋请求行动”。\n"
+            "【证据化作者写作档案】\n"
+            "逐字证据：“红色纸片”“任务”。"
+        )
+
+        vocabulary = _style_native_vocabulary_text(profile, reference)
+
+        for phrase in ("随后", "然后", "再然后", "突然", "紧接着", "顿时", "瞬间", "不会吧", "不对"):
+            self.assertIn(phrase + "×4", vocabulary)
+        self.assertNotIn("红色纸片", vocabulary)
+        self.assertNotIn("任务×", vocabulary)
+        self.assertNotIn("目标×", vocabulary)
+
+    def test_recent_style_vocabulary_usage_is_soft_density_context(self):
+        chapters = [_new_chapter(index) for index in range(4)]
+        chapters[0]["text"] = "好嘛。她直接回绝。"
+        chapters[1]["text"] = "好嘛。她直接离开。"
+        chapters[2]["text"] = "好嘛。她直接关门。"
+        project = self._project_with_current_chapter(chapters[-1])
+        project["chapters"] = chapters
+        reference = "好嘛。" + ("她直接回绝，又直接离开。" * 20)
+        profile = "你的习惯词包括：“好嘛”、“直接”。"
+
+        usage = _style_recent_vocabulary_usage_text(
+            project, 3, profile, reference
+        )
+
+        self.assertIn("已完成第1-3章", usage)
+        self.assertIn("好嘛：完整样本1次", usage)
+        self.assertIn("第1章1次、第2章1次、第3章1次", usage)
+        self.assertIn("不是禁词表", usage)
+        self.assertIn("不设置单词使用上限", usage)
+        self.assertIn("不能机械替换", usage)
+
+        execution_context = _build_style_execution_context(
+            "【当前章节】\n本章扩写字数：2000字",
+            profile_text=profile,
+            style_reference=reference,
+            project=project,
+            chapter_index=3,
+        )
+        finalize_context = _build_style_finalize_context(
+            "【当前章节】\n本章扩写字数：2000字",
+            "她准备推门。",
+            profile_text=profile,
+            style_reference=reference,
+            project=project,
+            chapter_index=3,
+            execution_text="1. 她推门进入。",
+        )
+        self.assertNotIn("【最近章节原生用词密度｜只作软校准】", execution_context)
+        self.assertIn(reference, execution_context)
+        self.assertIn("【最近章节原生用词密度｜只作软校准】", finalize_context)
+
+    def test_style_context_requires_explicit_cross_location_transition(self):
+        context = _build_style_execution_context(
+            "【当前章节】\n本章扩写字数：2000字",
+            style_reference="人物观察现场以后再作决定。" * 80,
+        )
+
+        self.assertIn("项目资料中已经确定的人名、时间、地点、关系、物件、编号、人物状态和已发生事件", context)
+        self.assertIn("保持原样延续", context)
+        self.assertIn("人物观察现场以后再作决定。" * 80, context)
+        self.assertNotIn("如需切换时空", context)
+        finalize_context = _build_style_finalize_context(
+            "【当前章节】\n本章扩写字数：2000字",
+            "人物观察现场以后再作决定。",
+            style_reference="人物观察现场以后再作决定。" * 80,
+            include_memory=False,
+            execution_text="1. 人物作出本章决定。",
+        )
+        self.assertIn("当前提纲未明确安排的事项必须保持未决", finalize_context)
+        self.assertIn("【自然表达边界】", finalize_context)
+        self.assertIn("她很漂亮", finalize_context)
+        self.assertIn("他很难过", finalize_context)
+        self.assertIn("他人看见或听见后的心理和行为变化", finalize_context)
+        self.assertNotIn("空得很有存在感", finalize_context)
+
+    def test_direct_style_context_uses_source_cards_without_procedural_routing(self):
+        def card(card_id, category, title):
+            return {
+                "id": card_id,
+                "category": category,
+                "title": title,
+                "use_when": "适用场景",
+                "avoid_when": "不适用场景",
+                "voice_features": title,
+                "source_excerpt": (f"{title}。人物停了一下，顺着对方的话接下去，场面却没有停。" * 10),
+            }
+
+        cards = [
+            card("SC01", "推理与解释", "核验过程"),
+            card("SC02", "专业角色对白", "专业追问"),
+            card("SC03", "日常口语与喜剧", "口语接话"),
+            card("SC04", "章节收束", "动作收束"),
+        ]
+        chapter_context = "【当前章节】\n本章扩写字数：2000字\n家宴上，女主决定当众拒绝对方。"
+        selected = _select_style_execution_cards(cards, chapter_context, max_cards=3)
+        selected_ids = [item["id"] for item in selected]
+        context = _build_style_execution_context(
+            chapter_context,
+            style_cards=cards,
+            style_reference="她看了对方一眼，没急着说话，先把人晾在原地。" * 80,
+        )
+
+        self.assertNotIn("SC01", selected_ids)
+        self.assertNotIn("SC02", selected_ids)
+        self.assertIn("SC03", selected_ids)
+        self.assertIn("【仿写使用说明】", context)
+        self.assertIn("她看了对方一眼，没急着说话，先把人晾在原地。" * 80, context)
+        self.assertIn("【小说正文直写】", context)
+        self.assertNotIn("【本章选中的原文片段卡", context)
+        self.assertNotIn("人物反应必须承接上一段已经成立的外显状态和人物立场", context)
+        self.assertNotIn("“笑不出来了”不是禁用词", context)
+        self.assertNotIn("【剧情执行稿任务】", context)
+        self.assertNotIn("【备用正文草稿】", context)
+
+    def test_v4_voice_cards_parse_array_and_chinese_field_aliases(self):
+        style_reference = (
+            "少年抬手拦住门，声音压得很低。"
+            "别急，先看看他们到底想让谁站出来。"
+            "旁边的人冷笑一声：想屁吃呢，这账轮不到你替他们背。"
+        ) * 20
+        raw = json.dumps([
+            {
+                "id": "VC01",
+                "标题": "低声拦门",
+                "归属": "主角近身对白",
+                "声纹": "短句压住场面，先拦动作再给判断。",
+                "适用场景": "主角在危急前一秒制止同伴。",
+                "边界": "不要写成流程核验或长篇解释。",
+                "原文证据": "少年抬手拦住门，声音压得很低。",
+            },
+            {
+                "id": "VC02",
+                "标题": "口语反顶",
+                "归属": "同伴或主角反击对白",
+                "声纹": "用口语短句把锅推回去。",
+                "适用场景": "对方试图甩锅或压人时。",
+                "边界": "不要每章硬塞吵架。",
+                "原文证据": "想屁吃呢，这账轮不到你替他们背。",
+            },
+        ], ensure_ascii=False)
+
+        cards = _parse_style_voice_cards_result(raw, style_reference)
+
+        self.assertEqual(len(cards), 2)
+        self.assertEqual(cards[0]["title"], "低声拦门")
+        self.assertEqual(cards[1]["owner"], "同伴或主角反击对白")
+
+    def test_v4_technique_cards_parse_named_payload_aliases(self):
+        style_reference = (
+            "门外脚步声一停，屋里所有人都跟着闭了嘴。"
+            "她没有解释，只把盒子往桌上一推。"
+        ) * 20
+        raw = json.dumps({
+            "条件性叙事技法卡": [{
+                "id": "TC01",
+                "标题": "动作压场",
+                "触发条件": "场面已经僵住，需要用动作而不是解释推进。",
+                "写法": "先写外部动静让气氛收紧，再用一个动作改变局面。",
+                "边界": "不要展开办案式核验。",
+                "证据": "她没有解释，只把盒子往桌上一推。",
+            }]
+        }, ensure_ascii=False)
+
+        cards = _parse_style_technique_cards_result(raw, style_reference)
+
+        self.assertEqual(len(cards), 1)
+        self.assertEqual(cards[0]["title"], "动作压场")
+        self.assertIn("动作", cards[0]["use_method"])
+
+    def test_direct_style_context_injects_semantic_archive_without_sample_names_as_facts(self):
+        style_reference = (
+            "谢弥抬眼，慢吞吞来了句：好嘛，这事还能这么玩。"
+            "围观的人一下噎住，场面忽然安静。"
+        ) * 80
+        semantic_archive = {
+            "style_archive_schema": "semantic_voice_v4",
+            "semantic_archive_version": 4,
+            "runtime_voice_pack": "贴近主视角的口语化判断，不写成长篇讲理。",
+            "native_vocabulary_cards": [{
+                "term": "好嘛",
+                "meaning": "用于发现局面荒唐后的短促接话。",
+                "emotional_temperature": "轻微无语，带吐槽感。",
+                "speaker_or_viewpoint": "主视角或贴近主视角旁白。",
+                "use_when": "角色发现对方逻辑离谱但暂时不急着长篇解释。",
+                "sentence_position": "多在短句句首或反应句开头。",
+                "natural_collocations": "好嘛，这下更热闹了。",
+                "avoid_when": "沉重生死场景或正式告别时不用。",
+                "source_evidence": "谢弥抬眼，慢吞吞来了句：好嘛，这事还能这么玩。",
+            }],
+            "voice_cards": [{
+                "id": "VC01",
+                "title": "主视角短促吐槽",
+                "owner": "谢弥",
+                "voice_features": "短句反应，口语吐槽，不自证。",
+                "use_when": "主视角被离谱局面顶到眼前时。",
+                "avoid_when": "不要为了展示吐槽新增对白。",
+                "source_evidence": "谢弥抬眼，慢吞吞来了句：好嘛，这事还能这么玩。",
+            }],
+            "technique_cards": [{
+                "id": "TC01",
+                "title": "围观噎住",
+                "trigger": "现场已有围观者且一句话改变气氛。",
+                "use_method": "只写一次群体反应，立刻回到人物选择。",
+                "avoid_when": "没有公开场面时不用。",
+                "source_evidence": "围观的人一下噎住，场面忽然安静。",
+            }],
+        }
+        context = _build_style_execution_context(
+            "【当前章节】\n本章扩写字数：2000字\n女主准备拒绝家族安排。",
+            profile_text="旧画像",
+            style_reference=style_reference,
+            semantic_archive=semantic_archive,
+        )
+
+        self.assertIn(style_reference, context)
+        self.assertIn("【仿写使用说明】", context)
+        self.assertNotIn("【作者原生用词池", context)
+        self.assertNotIn("【V4 人物与叙述声纹", context)
+        self.assertNotIn("【V4 条件性叙事技法", context)
+        self.assertNotIn("【好嘛】真义", context)
+
+    def test_direct_style_context_keeps_already_normalized_semantic_archive(self):
+        style_reference = (
+            "谢弥抬眼，慢吞吞来了句：好嘛，这事还能这么玩。"
+            "围观的人一下噎住，场面忽然安静。"
+        ) * 80
+        raw_archive = {
+            "style_archive_schema": "semantic_voice_v4",
+            "semantic_archive_version": 4,
+            "runtime_voice_pack": "贴近主视角的口语化判断，不写成长篇讲理。",
+            "native_vocabulary_cards": [{
+                "term": "好嘛",
+                "meaning": "用于发现局面荒唐后的短促接话。",
+                "emotional_temperature": "轻微无语，带吐槽感。",
+                "speaker_or_viewpoint": "主视角或贴近主视角旁白。",
+                "use_when": "角色发现对方逻辑离谱但暂时不急着长篇解释。",
+                "sentence_position": "多在短句句首或反应句开头。",
+                "natural_collocations": "好嘛，这下更热闹了。",
+                "avoid_when": "沉重生死场景或正式告别时不用。",
+                "source_evidence": "谢弥抬眼，慢吞吞来了句：好嘛，这事还能这么玩。",
+            }],
+            "voice_cards": [{
+                "id": "VC01",
+                "title": "主视角短促吐槽",
+                "owner": "谢弥",
+                "voice_features": "短句反应，口语吐槽，不自证。",
+                "use_when": "主视角被离谱局面顶到眼前时。",
+                "avoid_when": "不要为了展示吐槽新增对白。",
+                "source_evidence": "谢弥抬眼，慢吞吞来了句：好嘛，这事还能这么玩。",
+            }],
+            "technique_cards": [{
+                "id": "TC01",
+                "title": "围观噎住",
+                "trigger": "现场已有围观者且一句话改变气氛。",
+                "use_method": "只写一次群体反应，立刻回到人物选择。",
+                "avoid_when": "没有公开场面时不用。",
+                "source_evidence": "围观的人一下噎住，场面忽然安静。",
+            }],
+        }
+        normalized_archive = _normalize_semantic_style_archive(raw_archive, style_reference)
+        context = _build_style_execution_context(
+            "【当前章节】\n本章扩写字数：2000字\n女主准备拒绝家族安排。",
+            profile_text="旧画像",
+            style_reference=style_reference,
+            semantic_archive=normalized_archive,
+        )
+
+        self.assertIn(style_reference, context)
+        self.assertIn("【仿写使用说明】", context)
+        self.assertNotIn("【作者原生用词池", context)
+        self.assertNotIn("【V4 人物与叙述声纹", context)
+        self.assertNotIn("【V4 条件性叙事技法", context)
+        self.assertNotIn("【好嘛】真义", context)
+
+    def test_chapter_prose_repair_patches_only_accept_small_unique_replacements(self):
+        body = "夏晚晴抬眼看他，没急着接话。\n\n她把杯子放回桌上，转身就走。"
+        repaired, errors = _apply_chapter_prose_repair_patches(body, [{
+            "before": "夏晚晴抬眼看他，没急着接话。",
+            "after": "夏晚晴抬眼看他，指尖在杯沿轻敲了一下。",
+            "reason": "补足动作承接",
+        }])
+        self.assertEqual(errors, [])
+        self.assertIn("指尖在杯沿轻敲", repaired)
+        self.assertNotIn("没急着接话", repaired)
+
+        duplicate, duplicate_errors = _apply_chapter_prose_repair_patches(
+            "这句话需要重复出现。\n\n这句话需要重复出现。",
+            [{
+                "before": "这句话需要重复出现。",
+                "after": "这句话已经改过。",
+                "reason": "删除重复",
+            }],
+        )
+        self.assertEqual(duplicate, "这句话需要重复出现。\n\n这句话需要重复出现。")
+        self.assertIn("逐字且唯一出现", duplicate_errors[0])
+
+        oversized, oversized_errors = _apply_chapter_prose_repair_patches(
+            "甲" * 901,
+            [{
+                "before": "甲" * 901,
+                "after": "乙",
+                "reason": "压缩段落",
+            }],
+        )
+        self.assertEqual(oversized, "甲" * 901)
+        self.assertIn("替换范围过大", oversized_errors[0])
+
+        _, too_many_errors = _apply_chapter_prose_repair_patches(body, [{}] * 4)
+        self.assertEqual(too_many_errors, ["正文局部修补最多只能包含3项"])
+
+        _, structured_errors = _apply_chapter_prose_repair_patches(body, [{
+            "before": "她把杯子放回桌上，转身就走。",
+            "after": "【修补说明】她把杯子放回桌上。",
+            "reason": "保留动作",
+        }])
+        self.assertIn("混入了分析或结构化内容", structured_errors[0])
+
+    def test_style_finalize_context_omits_metrics_for_unseen_rejected_candidate(self):
+        reference = "\n".join(
+            f"人物看清第{index}处变化以后，才作出下一步决定。"
+            for index in range(80)
+        )
+        candidate = "\n\n".join(
+            f"“第{index}项核完了吗？”\n\n“核完了。”"
+            for index in range(80)
+        )
+
+        context = _build_style_finalize_context(
+            "【当前章节】\n本章扩写字数：2000字",
+            candidate,
+            style_reference=reference,
+            local_reasons=_style_draft_mismatch_reasons(reference, candidate, 2000),
+            output_target=2000,
+            include_memory=False,
+            execution_text="1. 人物完成现场核验。",
+            style_plan="常驻人物语言声纹。",
+        )
+
+        self.assertNotIn("【本章首要编辑动作】", context)
+        self.assertNotIn("【备用正文的本地检测结果", context)
+        self.assertNotIn("【首轮终稿结构预检", context)
+        self.assertIn("人物口吻", context)
+        self.assertNotRegex(context, r"至少将\d+字普通对白改写为人物化叙述")
+        self.assertNotRegex(context, r"对白总字数不得超过约\d+字")
+        self.assertIn("【仿写终稿任务】", context)
+        self.assertIn("根据【剧情执行清单】从零写出完整终稿", context)
+
+    def test_memory_update_normalizes_created_foreshadow_ref_as_temporary_key(self):
+        chapter = _new_chapter(0)
+        chapter["text"] = "账目最终指向御前长期药材采买。"
+        project = self._project_with_current_chapter(chapter)
+        update = self._strict_update(project, 0)
+        update["foreshadow_updates"] = [{
+            "ref": "NT-001-001",
+            "operation": "create",
+            "name": "药材采买真实用途",
+            "status": "已埋",
+            "dynamic": "真实用途仍待核验。",
+            "evidence_quote": "御前长期药材采买",
+        }]
+        update["state_reconciliation"]["foreshadow_refs"] = ["NT-001-001"]
+        update["next_chapter_memory"]["foreshadow_refs"] = ["NT-001-001"]
+        for event in update["long_term_events"]:
+            event.setdefault("storage", {})["foreshadow_refs"] = ["NT-001-001"]
+
+        normalized = _normalize_long_form_update_payload(project, 0, update)
+
+        self.assertEqual(normalized["foreshadow_updates"][0]["key"], "NT-001-001")
+        errors = _validate_long_form_memory_update(
+            project,
+            0,
+            normalized,
+            final_text=chapter["text"],
+            require_revision=True,
+            require_evidence=True,
+        )
+        self.assertFalse(any(
+            "新增key缺失或重复" in error
+            or "引用未知记录：NT-001-001" in error
+            or "foreshadows引用无效：NT-001-001" in error
+            for error in errors
+        ))
+
+    def test_style_finalize_acceptance_flags_excessive_functional_dialogue(self):
+        reference = "\n".join(
+            f"人物观察现场变化，并根据第{index}项结果作出新的决定。"
+            for index in range(60)
+        )
+        body = "\n".join(
+            f"“第{index}项已经核完，请继续登记下一项结果。”"
+            for index in range(60)
+        )
+
+        errors = _style_finalize_acceptance_errors(
+            "",
+            body,
+            {},
+            reference,
+        )
+
+        self.assertTrue(any("对白字数占比明显高于样本" in error for error in errors))
+
+    def test_style_finalize_acceptance_flags_large_length_drift(self):
+        reference = "\n".join(
+            f"样本第{index}段会把动作、判断和后果自然写在一起。"
+            for index in range(80)
+        )
+        body = "正文内容" * 1800
+
+        errors = _style_finalize_acceptance_errors(
+            "",
+            body,
+            {},
+            reference,
+            output_target=5000,
+        )
+
+        self.assertTrue(any("正文长度明显偏离目标" in error for error in errors))
+
+    def test_deictic_literal_count_claims_are_normalized_before_memory_finalize(self):
+        body = (
+            "“知夏，我不知道是谁要害我们。”\n\n"
+            "来了。\n\n"
+            "又是“害我们”。\n\n"
+            "这四个字用得很妙。"
+        )
+
+        repaired, issues = _repair_literal_count_claims(body)
+
+        self.assertEqual(len(issues), 1)
+        self.assertIn("这几个字用得很妙。", repaired)
+        self.assertNotIn("这四个字用得很妙。", repaired)
+
+    def test_deictic_literal_count_claims_do_not_infer_an_earlier_quote(self):
+        body = (
+            "主视觉叫“长久”。\n\n"
+            "副标题是顾承泽选的：余生只你一人。\n\n"
+            "当初他发来这八个字的时候，沈知夏盯着手机沉默了三秒。"
+        )
+
+        repaired, issues = _repair_literal_count_claims(body)
+
+        self.assertEqual(len(issues), 1)
+        self.assertIn("当初他发来这几个字的时候", repaired)
+        self.assertNotIn("这八个字", repaired)
+
+    def test_deictic_literal_count_claims_handle_arabic_and_that_forms(self):
+        body = "这二个字，那3个字，还有这两个字，都写得很扎眼。"
+
+        repaired, issues = _repair_literal_count_claims(body)
+
+        self.assertEqual(len(issues), 3)
+        self.assertEqual(repaired, "这几个字，那几个字，还有这几个字，都写得很扎眼。")
+
+    def test_general_or_single_literal_count_claims_are_left_unchanged(self):
+        body = "这个标题一共六个字。这一个字写得很重。那一个字也不能动。"
+
+        repaired, issues = _repair_literal_count_claims(body)
+
+        self.assertEqual(issues, [])
+        self.assertEqual(repaired, body)
+
+    def test_style_fragmentation_guard_catches_paragraph_and_dialogue_drift_together(self):
+        reference = "\n".join(
+            (
+                f"样本第{index}段，人物先看清现场变化，再根据已经发生的结果作出决定。"
+                "叙述会把反应、判断和下一步动作自然放在同一段里。"
+            )
+            for index in range(40)
+        )
+        candidate_lines = ["“可以。”" for _ in range(60)]
+        candidate_lines.extend(f"人物停下第{index}步。" for index in range(40))
+        candidate = "\n".join(candidate_lines)
+
+        reasons = _style_draft_mismatch_reasons(reference, candidate, len(candidate))
+        errors = _style_finalize_acceptance_errors("", candidate, {}, reference)
+
+        self.assertTrue(any("结构多项同时向短碎方向漂移" in reason for reason in reasons))
+        self.assertTrue(any("终稿结构同时向短碎方向漂移" in error for error in errors))
+
+    def test_style_finalize_preflight_reports_centered_dialogue_merge_targets(self):
+        reference = "\n".join(
+            (
+                f"样本第{index}段，人物先处理眼前变化，再顺着结果采取下一步行动。"
+                + ("“先看结果再说。”" if index % 4 == 0 else "")
+            )
+            for index in range(60)
+        )
+        candidate = "\n".join(
+            f"“第{index}项可以了吗？”\n“可以。”"
+            for index in range(70)
+        )
+
+        result = _style_finalize_preflight_targets(
+            reference,
+            candidate,
+            output_target=len(candidate),
+        )
+
+        self.assertIn("交付时保持", result)
+        self.assertIn("轮对白", result)
+        self.assertIn("短对白", result)
+        self.assertIn("功能台词并入动作或相邻完整表达", result)
+
+    def test_style_finalize_preflight_never_adds_dialogue_to_quiet_candidate(self):
+        reference = "\n".join(
+            f"“第{index}件事现在就处理。”人物随即转身安排后续动作。"
+            for index in range(60)
+        )
+        candidate = "\n".join(
+            (
+                f"人物处理完第{index}处变化以后，顺着现场留下的结果继续向前。"
+                "他没有额外解释，只把下一步行动落实下来。"
+            )
+            for index in range(12)
+        )
+
+        result = _style_finalize_preflight_targets(
+            reference,
+            candidate,
+            output_target=len(candidate),
+        )
+
+        self.assertNotIn("增加对白", result)
+        self.assertNotIn("补足对白", result)
+        self.assertNotIn("拆分段落", result)
+
+    def test_style_finalize_edits_structurally_valid_candidate_in_place(self):
+        reference = "\n".join(
+            f"样本第{index}段把人物反应、现场变化和下一步行动自然写在同一段里。"
+            for index in range(60)
+        )
+        candidate_lines = [
+            f"正文第{index}段把人物反应、现场变化和下一步行动自然写在同一段里。"
+            for index in range(60)
+        ]
+        candidate_lines[10] = "赵明核完账册，确认封签已经断裂，随后把证据收回手边。"
+        candidate = "\n".join(candidate_lines)
+
+        context = _build_style_finalize_context(
+            "【当前章节】\n本章扩写字数：2000字",
+            candidate,
+            style_reference=reference,
+            local_reasons=[],
+            output_target=len(candidate),
+            include_memory=False,
+            execution_text="1. 赵明核对账册并确认封签断裂。",
+            style_plan="核心声纹人物：赵明使用简短判断。",
+        )
+
+        self.assertIn("【结构已通过的备用正文底稿", context)
+        self.assertIn(candidate, context)
+        self.assertIn("【合格底稿轻量校准】", context)
+        self.assertIn("不得为了留下修改痕迹而拆段", context)
+        self.assertIn("允许原样保留合格内容", context)
+        self.assertIn("自然段落", context)
+        self.assertNotIn("终稿不得增加非空段落数", context)
+        self.assertNotIn("【剧情执行清单｜只继承事实与顺序，必须从零写作】", context)
+
+    def test_style_finalize_acceptance_blocks_non_dialogue_single_sentence_drift(self):
+        reference = "\n".join(
+            (
+                f"样本第{index}段先写现场变化，再写人物判断，最后让动作自然落到下一步。"
+                "这些内容放在同一个连续段落里。"
+            )
+            for index in range(40)
+        )
+        candidate_lines = [
+            f"正文第{index}段先写现场变化，再写人物判断，最后让动作自然落到下一步。"
+            for index in range(40)
+        ]
+        for index in range(40):
+            candidate_lines.extend([
+                f"人物看了第{index}眼。",
+                f"他随后走了第{index}步。",
+            ])
+        candidate = "\n".join(candidate_lines)
+
+        errors = _style_finalize_acceptance_errors("", candidate, {}, reference)
+
+        self.assertTrue(any("非对白短单句段" in error for error in errors))
+
+    def test_style_finalize_acceptance_requires_opening_evidence_only_for_new_later_chapter(self):
+        first = _new_chapter(0)
+        first_project = self._project_with_current_chapter(first)
+        execution = "1. 主角推开诊室门并看见病床。"
+        body = "主角推开诊室门，第一眼便看见病床上的人。"
+        acceptance = {
+            "beat_evidence": [{"beat": 1, "evidence_quote": "主角推开诊室门，第一眼便看见病床上的人"}],
+            "previous_chapter_repetition_check": True,
+            "logic_continuity_check": True,
+            "paragraph_structure_check": True,
+        }
+
+        self.assertEqual(
+            _style_finalize_acceptance_errors(
+                execution,
+                body,
+                acceptance,
+                project=first_project,
+                chapter_index=0,
+            ),
+            [],
+        )
+
+        previous = _new_chapter(0)
+        previous["text"] = "门外忽然传来一声闷响。"
+        current = _new_chapter(1)
+        project = self._project_with_current_chapter(current)
+        project["chapters"] = [previous, current]
+        errors = _style_finalize_acceptance_errors(
+            execution,
+            body,
+            acceptance,
+            project=project,
+            chapter_index=1,
+        )
+        self.assertEqual(errors, [])
+
+        current["text"] = "本章已经写出的开头。"
+        self.assertEqual(
+            _style_finalize_acceptance_errors(
+                execution,
+                body,
+                acceptance,
+                project=project,
+                chapter_index=1,
+            ),
+            [],
+        )
 
     def test_retired_conflict_and_task_ids_are_never_reissued(self):
         previous = _new_chapter(0)
@@ -5615,6 +8464,116 @@ class NovelLongFormContextTests(unittest.TestCase):
         self.assertIn("CF-0009", project["long_form_memory"]["issued_state_ids"]["conflicts"])
         self.assertIn("TASK-0012", project["long_form_memory"]["issued_state_ids"]["tasks"])
 
+    def test_different_object_reusing_existing_key_gets_new_permanent_key(self):
+        current = _new_chapter(0)
+        current["memory_selection"] = {"object_keys": ["NOBJ-NF1"]}
+        following = _new_chapter(1)
+        project = self._project_with_current_chapter(current)
+        project["chapters"] = [current, following]
+        project["long_form_memory"] = {
+            "schema_version": "2",
+            "revision": 5,
+            "state_snapshot": {
+                "object_states": [
+                    {
+                        "key": "NOBJ-NF6",
+                        "name": "棠记首张半年长单",
+                        "state": "已收首月定银，未来半年按月交付。",
+                    },
+                    {
+                        "key": "NOBJ-NF7",
+                        "name": "棠记产权及经营契约文书",
+                        "state": "产权文书及长期采购契约均已落印生效。",
+                    },
+                ],
+                "active_conflicts": [],
+                "unresolved_tasks": [],
+            },
+            "issued_state_ids": {
+                "objects": [f"NOBJ-NF{index}" for index in range(1, 8)],
+                "conflicts": [],
+                "tasks": [],
+            },
+        }
+        update = self._strict_update(project)
+        update["state_patch"] = {
+            "object_states": [{
+                "key": "NOBJ-NF6",
+                "name": "NOBJ-NF6",
+                "state": "姜晚棠现持有旧订单副本，记载香料与麻袋同车交往永丰货栈。",
+            }],
+        }
+        update["state_lifecycle_review"]["reviewed_object_keys"] = ["NOBJ-NF6"]
+        update["state_reconciliation"]["object_keys"] = ["NOBJ-NF6"]
+        update["long_term_events"] = [{
+            "event": "姜晚棠取得旧订单副本。",
+            "storage": {"object_keys": ["NOBJ-NF6"]},
+        }]
+        update["state_delta"] = {
+            "objects": [{"object_key": "NOBJ-NF6", "change": "取得旧订单副本"}],
+        }
+        update["next_chapter_memory"] = {
+            "object_keys": ["NOBJ-NF6"],
+            "reason": "下一章继续查验旧订单。",
+        }
+
+        self.assertTrue(_apply_long_form_memory_update(project, 0, update))
+
+        objects = {
+            item["key"]: item
+            for item in project["long_form_memory"]["state_snapshot"]["object_states"]
+        }
+        self.assertEqual(objects["NOBJ-NF6"]["name"], "棠记首张半年长单")
+        self.assertEqual(objects["NOBJ-NF7"]["name"], "棠记产权及经营契约文书")
+        self.assertEqual(objects["NOBJ-NF8"]["name"], "NOBJ-NF8")
+        self.assertIn("NOBJ-NF8", project["long_form_memory"]["issued_state_ids"]["objects"])
+        chapter = project["chapters"][0]
+        self.assertEqual(chapter["long_term_events"][0]["storage"]["object_keys"], ["NOBJ-NF8"])
+        self.assertEqual(chapter["state_reconciliation"]["object_keys"], ["NOBJ-NF8"])
+        self.assertEqual(chapter["state_lifecycle_review"]["reviewed_object_keys"], ["NOBJ-NF8"])
+        self.assertEqual(chapter["state_delta"]["objects"][0]["object_key"], "NOBJ-NF8")
+        self.assertIn("NOBJ-NF8", project["chapters"][1]["memory_selection"]["object_keys"])
+
+    def test_placeholder_name_update_keeps_matching_object_identity(self):
+        current = _new_chapter(0)
+        project = self._project_with_current_chapter(current)
+        project["long_form_memory"] = {
+            "schema_version": "2",
+            "revision": 3,
+            "state_snapshot": {
+                "object_states": [{
+                    "key": "NOBJ-NF6",
+                    "name": "棠记首张半年长单",
+                    "state": "已收首月定银，未来半年按月交付。",
+                }],
+                "active_conflicts": [],
+                "unresolved_tasks": [],
+            },
+            "issued_state_ids": {
+                "objects": ["NOBJ-NF6"],
+                "conflicts": [],
+                "tasks": [],
+            },
+        }
+        update = self._strict_update(project)
+        update["state_patch"] = {
+            "object_states": [{
+                "key": "NOBJ-NF6",
+                "name": "NOBJ-NF6",
+                "state": "半年长单已完成首月交付，下一批仍按原约履行。",
+            }],
+        }
+        update["state_lifecycle_review"]["reviewed_object_keys"] = ["NOBJ-NF6"]
+        update["state_reconciliation"]["object_keys"] = ["NOBJ-NF6"]
+
+        self.assertTrue(_apply_long_form_memory_update(project, 0, update))
+
+        objects = project["long_form_memory"]["state_snapshot"]["object_states"]
+        self.assertEqual(len(objects), 1)
+        self.assertEqual(objects[0]["key"], "NOBJ-NF6")
+        self.assertEqual(objects[0]["name"], "棠记首张半年长单")
+        self.assertIn("已完成首月交付", objects[0]["state"])
+
     def test_new_character_temp_ref_is_mapped_before_fact_scope_is_saved(self):
         chapter = _new_chapter(0)
         project = self._project_with_current_chapter(chapter)
@@ -5637,6 +8596,91 @@ class NovelLongFormContextTests(unittest.TestCase):
         saved = project["long_form_memory"]["active_facts"][0]
         self.assertEqual(saved["scope"], "character:C001:medical_status")
         self.assertNotIn("NC1", saved["scope"])
+
+    def test_character_create_accepts_string_canon_without_leaving_an_empty_card(self):
+        current = _new_chapter(0)
+        following = _new_chapter(1)
+        project = self._project_with_current_chapter(current)
+        project["chapters"] = [current, following]
+        update = self._strict_update(project)
+        update["record_updates"]["characters"] = [{
+            "operation": "create",
+            "key": "NC1",
+            "stable_name": "小吴",
+            "canon": "曾跟着张莉工作的助理；本章被直接指向转发录制安排，动机尚未确认。",
+            "state": "被直接指向转发录制安排，具体内容和动机尚未确认。",
+            "evidence_quote": "小吴已经把它送到了张莉手里。",
+        }]
+        update["current_chapter_character_refs"] = ["NC1"]
+
+        self.assertTrue(_apply_long_form_memory_update(project, 0, update))
+
+        created = next(item for item in project["characters"] if item["name"] == "小吴")
+        self.assertEqual(created["role"], "曾跟着张莉工作的助理")
+        self.assertEqual(
+            created["notes"],
+            "曾跟着张莉工作的助理；本章被直接指向转发录制安排，动机尚未确认。",
+        )
+        self.assertTrue(any(str(value or "").strip() for value in created.values()))
+
+        existing = {
+            "id": "existing-character",
+            "name": "魏管事",
+            "role": "",
+            "goal": "已有目标",
+            "secret": "",
+            "voice": "",
+            "notes": "",
+        }
+        project["characters"].append(existing)
+        _apply_character_string_canon(
+            existing,
+            "玄铁宗外门管事，魏骁之父。本章处理月例争议。",
+        )
+        self.assertEqual(existing["role"], "玄铁宗外门管事，魏骁之父")
+        self.assertEqual(existing["goal"], "已有目标")
+        self.assertIn("本章处理月例争议", existing["notes"])
+
+    def test_temporary_character_can_be_promoted_without_changing_record_id(self):
+        chapter = _new_chapter(0)
+        chapter["text"] = "顾沉舟认输后，转身离开擂台。"
+        project = self._project_with_current_chapter(chapter)
+        existing = {
+            "id": "temporary-character",
+            "name": "内门弟子（姓名未明）",
+            "role": "玄铁宗内门弟子",
+            "goal": "",
+            "secret": "",
+            "voice": "",
+            "notes": "玄铁宗内门弟子；姓名、修为和来意未明",
+        }
+        project["characters"] = [existing]
+        update = self._strict_update(project)
+        update["record_updates"]["characters"] = [{
+            "operation": "update",
+            "ref": existing["id"],
+            "name": "顾沉舟",
+            "canon": {
+                "role": "玄铁宗内门弟子，入门不到两年",
+                "goal": "查清内门大比背后的异常",
+                "voice": "说话简短直接",
+                "notes": "正式姓名已进入宗门名册",
+            },
+            "state": "正式姓名已明确并承认挑战失败。",
+            "changes": ["正式姓名由临时称谓升级为顾沉舟"],
+            "evidence_quote": "顾沉舟认输后",
+        }]
+        update["current_chapter_character_refs"] = [existing["id"]]
+
+        self.assertTrue(_apply_long_form_memory_update(project, 0, update))
+        promoted = project["characters"][0]
+        self.assertEqual(promoted["id"], "temporary-character")
+        self.assertEqual(promoted["name"], "顾沉舟")
+        self.assertEqual(promoted["role"], "玄铁宗内门弟子，入门不到两年")
+        self.assertEqual(promoted["goal"], "查清内门大比背后的异常")
+        self.assertEqual(promoted["voice"], "说话简短直接")
+        self.assertIn("正式姓名已进入宗门名册", promoted["notes"])
+        self.assertIn("旧名：内门弟子（姓名未明）", promoted["notes"])
 
     def test_fact_retirement_requires_selected_id_exact_scope_and_previous_fact(self):
         chapter = _new_chapter(0)
@@ -5736,7 +8780,15 @@ class NovelLongFormContextTests(unittest.TestCase):
         self.assertIn("前两章已完成内容", context)
         self.assertIn("主角取得卷宗", context)
         self.assertIn("证人交代线索", context)
-        self.assertIn("删除非必要的前两章剧情复演", context)
+        self.assertIn("不得复演已经完成的冲突、解释、对话结论或结尾钩子", context)
+        self.assertIn("【章首承接硬验收】", context)
+        self.assertIn("上一章已发布结尾的最后三段", context)
+        self.assertIn('"opening_continuation"', context)
+        self.assertIn("first_new_sentence", context)
+        self.assertIn("章首新增变量", context)
+        self.assertIn('"timeline_commitment_check"', context)
+        self.assertIn("前文期限或承诺", context)
+        self.assertIn('"timeline_commitment_check"', context)
         self.assertNotIn("摘要：主角取得卷宗", context)
         self.assertNotIn("关键事实：", context)
 
@@ -5759,12 +8811,12 @@ class NovelLongFormContextTests(unittest.TestCase):
 
         context = _build_chapter_ai_context(project, 0, "draft")
 
-        self.assertIn("【剧情执行硬约束】", context)
-        self.assertIn("权限/责任边界", context)
-        self.assertIn("治疗/能力阈值", context)
-        self.assertIn("证据确定性", context)
+        self.assertIn("【剧情连续性参考】", context)
+        self.assertIn("资料未确认的内容继续保持未确认", context)
+        self.assertIn("新能力、授权或物品不能凭空获得", context)
+        self.assertIn("现实流程完整不等于剧情完整", context)
         self.assertIn("脑图来源仍未核实", context)
-        self.assertIn("不能静默覆盖", context)
+        self.assertIn("提纲与已发生事实冲突时保留", context)
 
     def test_style_checks_detect_excess_single_sentence_short_paragraphs(self):
         reference = "\n".join(("这是一段连续说明文字，保持相对完整的叙述结构和信息顺序。" * 2) for _ in range(30))

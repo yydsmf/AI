@@ -14,6 +14,7 @@ from .core import (
     save_config,
     schedule_windows_process_force_exit,
 )
+from .device_status import DeviceStatusBar
 from .image_tab import ImageGeneratorTab
 from .novel_adaptation_tab import NovelAdaptationTab
 from .novel_storage import install_novel_diagnostic_exception_hooks
@@ -58,6 +59,7 @@ def fit_window_to_screen(window, preferred_width, preferred_height, min_width=10
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
+        self._kiosk_mode = os.environ.get("GPT_TOOLBOX_KIOSK", "").strip() == "1"
         self._shutdown_prepared = False
         self._skip_windows_force_exit = False
         self.setWindowTitle(f"{APP_NAME} v{APP_VERSION}")
@@ -90,6 +92,10 @@ class MainWindow(QMainWindow):
         self.tabs.addTab(self.adaptation_tab, "改编")
         self.tabs.addTab(self.agent_tab, "智能体")
         layout.addWidget(self.tabs)
+        self.device_status_bar = None
+        if os.environ.get("GPT_TOOLBOX_DEVICE_STATUS", "").strip() == "1":
+            self.device_status_bar = DeviceStatusBar(self)
+            layout.addWidget(self.device_status_bar)
 
         self.image_tab.request_settings.connect(self.open_provider_manager)
         self.video_tab.request_settings.connect(self.open_provider_manager)
@@ -105,6 +111,11 @@ class MainWindow(QMainWindow):
         QTimer.singleShot(0, self.video_tab.load_models)
         QTimer.singleShot(0, self.adaptation_tab.load_models)
         self.agent_tab.bar.set_status("未刷新模型列表")
+
+    def changeEvent(self, event):
+        super().changeEvent(event)
+        if self._kiosk_mode and event.type() == QEvent.WindowStateChange and not self.isFullScreen():
+            QTimer.singleShot(0, self.showFullScreen)
 
     def on_cache_cleared(self, kind):
         """
@@ -189,6 +200,11 @@ class MainWindow(QMainWindow):
             worker.quit()
         except Exception:
             pass
+        try:
+            if worker.isRunning() and not worker.wait(5000):
+                log_debug("退出时后台任务未在 5 秒内停止")
+        except Exception as e:
+            log_debug("退出时等待后台任务停止失败", e)
 
     def _stop_worker_attrs(self, obj, names):
         for name in names:
@@ -246,6 +262,10 @@ class MainWindow(QMainWindow):
                     "auto_summary_worker",
                     "auto_outline_worker",
                     "read_aloud_worker",
+                    "volume_handoff_worker",
+                    "volume_intent_worker",
+                    "volume_framework_worker",
+                    "volume_framework_audit_worker",
                 ),
             )
             for worker in list(getattr(self.novel_writing_tab, "read_aloud_retired_workers", [])):
@@ -298,6 +318,10 @@ class MainWindow(QMainWindow):
             log_debug("退出前清理智能体任务失败", e)
 
     def closeEvent(self, event):
+        if self._kiosk_mode:
+            event.ignore()
+            QTimer.singleShot(0, self.showFullScreen)
+            return
         try:
             self.prepare_for_shutdown()
             if not self._skip_windows_force_exit:
@@ -532,7 +556,10 @@ def main():
         log_debug("安装中文右键菜单失败", e)
 
     win = MainWindow()
-    win.show()
+    if win._kiosk_mode:
+        win.showFullScreen()
+    else:
+        win.show()
     sys.exit(app.exec())
 
 

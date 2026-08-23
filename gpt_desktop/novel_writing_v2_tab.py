@@ -145,8 +145,13 @@ from .novel_v2_utils import (
     _target_words,
     FRAMEWORK_IMPORT_TYPE,
 )
+from .novel_utils import (
+    _apply_character_string_canon,
+    _local_split_chapter_title,
+    _promote_character_identity,
+)
 from .widgets import ProviderModelBar, WideComboBox
-from .workers import EdgeTTSWorker, NovelAnalysisWorker, NovelCandidatePostprocessWorker, NovelChapterPlanWorker, NovelChapterTitleWorker, NovelForeshadowReviewPostprocessWorker, NovelForeshadowReviewWorker, NovelFrameworkImportWorker, NovelWritingWorker
+from .workers import EdgeTTSWorker, NovelAnalysisWorker, NovelCandidatePostprocessWorker, NovelChapterPlanWorker, NovelForeshadowReviewPostprocessWorker, NovelForeshadowReviewWorker, NovelFrameworkImportWorker, NovelWritingWorker
 from .novel_v2_workers import (
     NovelV2RollingPlanWorker,
     NovelV2StructuredWorker,
@@ -578,25 +583,16 @@ class NovelWritingV2Tab(SimpleModelBarMixin, QWidget):
         layout.setContentsMargins(10, 10, 10, 10)
         layout.setSpacing(8)
 
-        title_row = QHBoxLayout()
-        title = QLabel("小说项目")
-        title.setObjectName("sub_title")
-        title_row.addWidget(title)
-        layout.addLayout(title_row)
-
         layout.addLayout(self._project_button_grid((
             ("新建", self.new_project, "新建一个小说项目，当前内容会先自动保存"),
-            ("保存项目", self.save_current_project, "保存当前小说项目"),
         ), columns=2))
 
         layout.addLayout(self._project_button_grid((
             ("删除", self.delete_selected_project, "删除左侧列表中选中的小说项目"),
-            ("清空草稿", self.clear_current_draft, "清空当前自动草稿和编辑区，不删除已保存项目"),
+            ("导入Word/TXT", self.import_word_or_txt_script, "从 Word 或 TXT 文档导入小说、剧本或框架正文"),
         ), columns=2))
 
         layout.addLayout(self._project_button_grid((
-            ("导入 Word", self.import_word_script, "从 Word 文档导入小说或剧本正文"),
-            ("导入 TXT", self.import_txt_script, "从 TXT 文本导入小说或剧本正文"),
             ("导入项目", self.import_project, "导入小说项目 JSON 文件"),
             ("导出项目", self.export_project, "导出当前小说项目 JSON 文件"),
         ), columns=2))
@@ -869,7 +865,7 @@ class NovelWritingV2Tab(SimpleModelBarMixin, QWidget):
         for index, action in enumerate(actions):
             text, callback = action[:2]
             tooltip = action[2] if len(action) > 2 else ""
-            btn = self._ghost_button(text, callback, tooltip)
+            btn = action[3] if len(action) > 3 and action[3] is not None else self._ghost_button(text, callback, tooltip)
             btn.setMinimumWidth(96)
             grid.addWidget(btn, index // columns, index % columns)
         return grid
@@ -1248,7 +1244,7 @@ class NovelWritingV2Tab(SimpleModelBarMixin, QWidget):
                 "根据项目信息、圣经、世界观、人物、设定、时间线和伏笔生成章节名与章节提纲；生成后先预览，确认后再写入章节列表。",
             )),
             (1, 0, self._ghost_button("删除", self.delete_chapter)),
-            (1, 1, self._ghost_button("拆分导出", self.split_current_chapter, "按整本小说正文重切为约定字数的章节并导出 Word")),
+            (1, 1, self._ghost_button("拆分导出", self.split_current_chapter, "按整本小说正文重切为约定字数，本地快速取名并导出 Word")),
         )
         for row, column, btn in chapter_action_buttons:
             chapter_action_grid.addWidget(btn, row, column)
@@ -1880,7 +1876,7 @@ class NovelWritingV2Tab(SimpleModelBarMixin, QWidget):
             finally:
                 self.project_list.blockSignals(False)
         if hasattr(self, "project_hint"):
-            self.project_hint.setText("当前没有已保存项目；点击“保存项目”可保存当前草稿。" if not records else "单击列表可打开已保存小说。")
+            self.project_hint.setText("当前没有已保存项目；当前内容会自动保存到草稿。" if not records else "单击列表可打开已保存小说。")
 
     def _refresh_current_project_list_item_from_memory(self):
         if not hasattr(self, "project_list"):
@@ -2568,7 +2564,7 @@ class NovelWritingV2Tab(SimpleModelBarMixin, QWidget):
 
     def split_current_chapter(self):
         if self.chapter_title_worker is not None and self.chapter_title_worker.isRunning():
-            self.set_status_tip("正在生成拆分章节标题，请稍等。")
+            self.set_status_tip("拆分导出正在处理中，请稍等。")
             return
         self._save_chapter_from_editor()
         chapters = self.current_project.get("chapters", [])
@@ -2596,35 +2592,17 @@ class NovelWritingV2Tab(SimpleModelBarMixin, QWidget):
             QMessageBox.information(self, "拆分提示", "没有可导出的正文内容。")
             return
         title = self._project_title()
-        provider, model, error = self._current_novel_ai_selection()
-        if error:
-            self.set_ai_settings_expanded(True)
-            message = f"章节标题生成失败，请重试。\n\n失败原因：{error}"
-            self.set_status_tip("章节标题生成失败，已停止拆分导出。")
-            QMessageBox.warning(self, "章节标题生成失败", message)
-            return
         self._pending_split_export = {
             "title": title,
             "target_words": target_words,
             "chapters": deepcopy(split_chapters),
         }
-        self.chapter_title_worker = NovelChapterTitleWorker(
-            provider.get("base_url", ""),
-            provider.get("api_key", ""),
-            model,
-            title,
-            self.genre_edit.text().strip() if hasattr(self, "genre_edit") else "",
-            self.style_edit.text().strip() if hasattr(self, "style_edit") else "",
-            split_chapters,
-            provider.get("proxy_url", ""),
-            self._provider_proxy_mode(provider),
-        )
-        self.chapter_title_worker.progress.connect(self.set_status_tip)
-        self.chapter_title_worker.result_ready.connect(self.on_split_chapter_titles_ready)
-        self.chapter_title_worker.failed.connect(self.on_split_chapter_titles_failed)
-        self.chapter_title_worker.finished.connect(self._cleanup_chapter_title_worker)
-        self.set_status_tip(f"正在为 {len(split_chapters)} 个拆分章节生成标题...")
-        self.chapter_title_worker.start()
+        titles = [
+            _local_split_chapter_title(chapter.get("text", ""))
+            for chapter in split_chapters
+        ]
+        self.set_status_tip(f"正在本地快速生成 {len(split_chapters)} 个拆分章节名...")
+        self.on_split_chapter_titles_ready(titles)
 
     def on_split_chapter_titles_ready(self, titles):
         pending = getattr(self, "_pending_split_export", {}) or {}
@@ -5968,6 +5946,13 @@ class NovelWritingV2Tab(SimpleModelBarMixin, QWidget):
         self.set_chapter_ai_panel_expanded(False)
         self.set_status_tip(status_text)
 
+    def _clear_v2_applied_body_preview(self):
+        """Keep the assistant panel transient once the same body is saved above."""
+        self.chapter_ai_stream_text = ""
+        self.chapter_ai_preview.clear()
+        self._set_partial_chapter_ai_preview_state(False)
+        self._chapter_ai_resume_prefix = ""
+
     def _fail_v2_pipeline(self, action, error, needs_attention=False):
         error_text = clean_error_text(error)
         self._v2_pipeline_active = False
@@ -6010,7 +5995,7 @@ class NovelWritingV2Tab(SimpleModelBarMixin, QWidget):
                 operation = str(update.get("operation", "") or "").strip().lower()
                 if operation in {"", "none"}:
                     continue
-                item_id = str(update.get("id", "") or "").strip()
+                item_id = str(update.get("id", update.get("ref", "")) or "").strip()
                 name = str(update.get("name", "") or "").strip()
                 record = by_id.get(item_id)
                 if record is None and name:
@@ -6025,11 +6010,24 @@ class NovelWritingV2Tab(SimpleModelBarMixin, QWidget):
                     continue
                 changed_fields = {}
                 fields = update.get("fields", {}) if isinstance(update.get("fields"), dict) else update
+                identity_promoted = False
+                if collection_key == "characters":
+                    changed_fields.update(_promote_character_identity(record, name, fields))
+                    identity_promoted = "name" in changed_fields
                 for field in allowed_fields:
                     value = str(fields.get(field, "") or "").strip()
-                    if value and value != str(record.get(field, "") or "").strip():
+                    current = str(record.get(field, "") or "").strip()
+                    can_write = (value and not current) if identity_promoted else (value and value != current)
+                    if can_write:
                         record[field] = value
                         changed_fields[field] = value
+                if collection_key == "characters":
+                    changed_fields.update(
+                        _apply_character_string_canon(
+                            record,
+                            update.get("canon", update.get("fields")),
+                        )
+                    )
                 if changed_fields:
                     evidence = record.setdefault("evidence", [])
                     if isinstance(evidence, list):
@@ -6251,6 +6249,7 @@ class NovelWritingV2Tab(SimpleModelBarMixin, QWidget):
                 self._set_text_without_signals(self.chapter_text, body)
                 self._mark_chapter_dirty()
                 self._flush_current_editors()
+                self._clear_v2_applied_body_preview()
                 if self._v2_draft_segment_count > 1:
                     self._v2_draft_completed_segments = self._v2_draft_segment_index
                     if self._v2_draft_completed_segments < self._v2_draft_segment_count:
@@ -6275,6 +6274,7 @@ class NovelWritingV2Tab(SimpleModelBarMixin, QWidget):
                     self._set_text_without_signals(self.chapter_text, body)
                     self._mark_chapter_dirty()
                     self._flush_current_editors()
+                    self._clear_v2_applied_body_preview()
                     self._fail_v2_pipeline(
                         "length_repair",
                         f"AI篇幅压缩后正文仍为{_body_display_len(body)}字，超过允许上限{upper}字。",
@@ -6284,6 +6284,7 @@ class NovelWritingV2Tab(SimpleModelBarMixin, QWidget):
                 self._set_text_without_signals(self.chapter_text, body)
                 self._mark_chapter_dirty()
                 self._flush_current_editors()
+                self._clear_v2_applied_body_preview()
                 self._start_v2_pipeline_action("pov_audit")
                 return
             if action == "pov_audit":
@@ -6347,6 +6348,7 @@ class NovelWritingV2Tab(SimpleModelBarMixin, QWidget):
                 self._set_text_without_signals(self.chapter_text, body)
                 self._mark_chapter_dirty()
                 self._flush_current_editors()
+                self._clear_v2_applied_body_preview()
                 chapter = self._v2_current_chapter() or {}
                 _target, _lower, upper = self._v2_draft_target_bounds(chapter.get("draft_words", ""))
                 if upper and _body_display_len(body) > upper:
@@ -7722,7 +7724,7 @@ class NovelWritingV2Tab(SimpleModelBarMixin, QWidget):
         except Exception as e:
             log_debug("小说最近项目记录清理失败", e)
         self._update_stats_label()
-        self.set_status_tip("已新建为自动草稿；点击“保存项目”可加入项目列表。")
+        self.set_status_tip("已新建为自动草稿，编辑内容会自动保存。")
 
     def clear_current_draft(self):
         ret = QMessageBox.question(
@@ -7801,6 +7803,32 @@ class NovelWritingV2Tab(SimpleModelBarMixin, QWidget):
         self._save_draft_snapshot()
         self._notify_project_store_changed()
         self.set_status_tip("小说项目已导入。")
+
+    def import_word_or_txt_script(self):
+        path = self._get_open_path(
+            "导入 Word/TXT",
+            "Word/TXT 文档 (*.docx *.txt);;Word 文档 (*.docx);;TXT 文本 (*.txt)",
+        )
+        if not path:
+            return
+        suffix = os.path.splitext(path)[1].lower()
+        if suffix == ".docx":
+            source_label = "Word"
+            reader = _read_docx_text
+        elif suffix == ".txt":
+            source_label = "TXT"
+            reader = _read_txt_text
+        else:
+            QMessageBox.warning(self, "导入失败", "请选择 Word（.docx）或 TXT（.txt）文件。")
+            return
+        try:
+            text = reader(path)
+            if not text.strip():
+                QMessageBox.warning(self, "导入失败", f"{source_label} 文件没有可读取的正文。")
+                return
+            self._import_script_text(text, path, source_label)
+        except Exception as e:
+            QMessageBox.warning(self, "导入失败", str(e))
 
     def import_word_script(self):
         path = self._get_open_path("导入 Word 剧本", "Word 文档 (*.docx)")

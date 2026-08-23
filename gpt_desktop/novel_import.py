@@ -81,14 +81,72 @@ _FRAMEWORK_STAGE_HEADING_RE = re.compile(
     r"^第\s*([一二两三四五六七八九十百千万零〇\d]+)\s*(阶段|卷|篇|部)\s*[：:]\s*(.+)$"
 )
 _FRAMEWORK_CHAPTER_RANGE_RE = re.compile(
-    r"(?:章节|章数|范围)\s*[：:]\s*第?\s*([一二两三四五六七八九十百千万零〇\d]+)\s*"
+    r"^(?:(?:章节|章数|范围)\s*[：:]\s*)?第?\s*"
+    r"([一二两三四五六七八九十百千万零〇\d]+)\s*章?\s*"
     r"[—–~～\-至到]\s*第?\s*([一二两三四五六七八九十百千万零〇\d]+)\s*章"
+    r"(?:\s*[：:]\s*(.+))?$"
 )
 _FRAMEWORK_NUMBERED_EVENT_RE = re.compile(r"^(\d{1,5})\s*[.．、)）]\s*(.+)$")
 _FRAMEWORK_MAJOR_HEADING_RE = re.compile(r"^[一二两三四五六七八九十百千万]+、\s*\S+")
 _FRAMEWORK_EXPLICIT_TITLE_RE = re.compile(
-    r"^\d{1,5}\s*[.．、)）]\s*第\s*([一二两三四五六七八九十百千万零〇\d]+)\s*章\s*[：:]\s*(.+)$"
+    r"^(?:\d{1,5}\s*[.．、)）]\s*)?第\s*"
+    r"([一二两三四五六七八九十百千万零〇\d]+)\s*章\s*[：:]\s*(.+)$"
 )
+_FRAMEWORK_SCOPE_HEADING_RE = re.compile(
+    r"^第\s*[一二两三四五六七八九十百千万零〇\d]+\s*(?:阶段|卷|篇|部)(?:\s*[：:].*)?$"
+)
+_FRAMEWORK_PLACEHOLDER_CHAPTER_TITLE_RE = re.compile(
+    r"^(?:第?\s*[一二两三四五六七八九十百千万零〇\d]+\s*[章节]|章节\s*[一二两三四五六七八九十百千万零〇\d]+)$"
+)
+_FRAMEWORK_EVENT_SECTION_LABELS = {
+    "核心目标",
+    "主要剧情",
+    "第一卷中期剧情",
+    "卷尾反转",
+    "卷尾反转：",
+    "感情高潮",
+    "女主高光",
+    "最终开放式结尾",
+}
+
+
+def _is_framework_scope_title(value):
+    text = str(value or "").strip()
+    text = text.strip(" \t\r\n\"'“”‘’《》「」『』【】[]()（）")
+    text = re.sub(r"^\s*\d{1,5}\s*[.．、)）]\s*", "", text)
+    return bool(
+        _FRAMEWORK_CHAPTER_RANGE_RE.match(text)
+        or _FRAMEWORK_SCOPE_HEADING_RE.match(text)
+    )
+
+
+def _is_framework_placeholder_chapter_title(value):
+    text = str(value or "").strip()
+    text = text.strip(" \t\r\n\"'“”‘’《》「」『』【】[]()（）")
+    text = re.sub(r"[：:、.．,，。;；\-—]+$", "", text).strip()
+    return bool(_FRAMEWORK_PLACEHOLDER_CHAPTER_TITLE_RE.match(text))
+
+
+def _framework_stage_event_texts(lines):
+    values = []
+    seen = set()
+    for raw_line in lines:
+        line = str(raw_line or "").strip()
+        if not line or _FRAMEWORK_MAJOR_HEADING_RE.match(line):
+            break
+        if _FRAMEWORK_EXPLICIT_TITLE_RE.match(line) or _is_framework_scope_title(line):
+            continue
+        if line in _FRAMEWORK_EVENT_SECTION_LABELS:
+            continue
+        numbered = _FRAMEWORK_NUMBERED_EVENT_RE.match(line)
+        if numbered:
+            line = str(numbered.group(2) or "").strip()
+        line = line.lstrip("> ").strip()
+        if not line or line in seen:
+            continue
+        seen.add(line)
+        values.append(line)
+    return values
 
 
 def _extract_structured_framework_chapter_plan(text):
@@ -100,34 +158,99 @@ def _extract_structured_framework_chapter_plan(text):
             continue
         chapter_index = _chinese_numeral_to_int(match.group(1))
         title = str(match.group(2) or "").strip()
-        if chapter_index and title:
+        if chapter_index and title and int(chapter_index) not in explicit_titles:
             explicit_titles[int(chapter_index)] = title
 
-    stage_positions = [
-        index for index, line in enumerate(lines) if _FRAMEWORK_STAGE_HEADING_RE.match(line)
-    ]
+    stage_positions = [index for index, line in enumerate(lines) if _FRAMEWORK_STAGE_HEADING_RE.match(line)]
     stages = []
+
+    def append_stage(name, start_chapter, end_chapter, event_texts):
+        event_texts = [str(value or "").strip() for value in event_texts if str(value or "").strip()]
+        if not event_texts or start_chapter <= 0 or end_chapter < start_chapter:
+            return
+        stage_id = f"S{len(stages) + 1:02d}"
+        stages.append({
+            "id": stage_id,
+            "name": str(name or f"第{start_chapter}-{end_chapter}章").strip(),
+            "start_chapter": int(start_chapter),
+            "end_chapter": int(end_chapter),
+            "events": [
+                {
+                    "id": f"{stage_id}-E{event_index:02d}",
+                    "order": event_index,
+                    "text": event_text,
+                }
+                for event_index, event_text in enumerate(event_texts, 1)
+            ],
+        })
+
     for stage_offset, stage_position in enumerate(stage_positions):
         stage_match = _FRAMEWORK_STAGE_HEADING_RE.match(lines[stage_position])
         if not stage_match:
             continue
         block_end = stage_positions[stage_offset + 1] if stage_offset + 1 < len(stage_positions) else len(lines)
-        range_position = -1
-        range_match = None
-        for index in range(stage_position + 1, min(block_end, stage_position + 8)):
-            match = _FRAMEWORK_CHAPTER_RANGE_RE.search(lines[index])
-            if match:
-                range_position = index
-                range_match = match
-                break
-        if range_match is None:
+        ranges = []
+        for index in range(stage_position + 1, block_end):
+            match = _FRAMEWORK_CHAPTER_RANGE_RE.match(lines[index])
+            if not match:
+                continue
+            start_chapter = _chinese_numeral_to_int(match.group(1))
+            end_chapter = _chinese_numeral_to_int(match.group(2))
+            if not start_chapter or not end_chapter or end_chapter < start_chapter:
+                continue
+            ranges.append({
+                "position": index,
+                "start_chapter": int(start_chapter),
+                "end_chapter": int(end_chapter),
+                "title": str(match.group(3) or "").strip(),
+            })
+        if not ranges:
             continue
-        start_chapter = _chinese_numeral_to_int(range_match.group(1))
-        end_chapter = _chinese_numeral_to_int(range_match.group(2))
-        if not start_chapter or not end_chapter or end_chapter < start_chapter:
+
+        parent = ranges[0]
+        start_chapter = parent["start_chapter"]
+        end_chapter = parent["end_chapter"]
+        stage_label = f"第{stage_match.group(1)}{stage_match.group(2)}：{stage_match.group(3).strip()}"
+        child_ranges = []
+        previous_end = start_chapter - 1
+        for item in ranges[1:]:
+            if not item["title"]:
+                continue
+            if item["start_chapter"] < start_chapter or item["end_chapter"] > end_chapter:
+                continue
+            if item["start_chapter"] <= previous_end:
+                continue
+            child_ranges.append(item)
+            previous_end = item["end_chapter"]
+
+        if child_ranges:
+            opening_end = child_ranges[0]["start_chapter"] - 1
+            opening_events = [
+                explicit_titles[index]
+                for index in sorted(explicit_titles)
+                if start_chapter <= index <= opening_end
+            ]
+            append_stage(f"{stage_label}（开篇）", start_chapter, opening_end, opening_events)
+            for child_index, child in enumerate(child_ranges):
+                child_block_end = (
+                    child_ranges[child_index + 1]["position"]
+                    if child_index + 1 < len(child_ranges)
+                    else block_end
+                )
+                child_events = _framework_stage_event_texts(
+                    lines[child["position"] + 1:child_block_end]
+                )
+                child_label = f"第{child['start_chapter']}-{child['end_chapter']}章：{child['title']}"
+                append_stage(
+                    child_label,
+                    child["start_chapter"],
+                    child["end_chapter"],
+                    child_events,
+                )
             continue
+
         numbered_events = {}
-        for index in range(range_position + 1, block_end):
+        for index in range(parent["position"] + 1, block_end):
             line = lines[index]
             if _FRAMEWORK_MAJOR_HEADING_RE.match(line):
                 break
@@ -143,22 +266,12 @@ def _extract_structured_framework_chapter_plan(text):
         event_count = max(numbered_events)
         if sorted(numbered_events) != list(range(1, event_count + 1)):
             continue
-        stage_label = f"第{stage_match.group(1)}{stage_match.group(2)}：{stage_match.group(3).strip()}"
-        stage_id = f"S{len(stages) + 1:02d}"
-        stages.append({
-            "id": stage_id,
-            "name": stage_label,
-            "start_chapter": int(start_chapter),
-            "end_chapter": int(end_chapter),
-            "events": [
-                {
-                    "id": f"{stage_id}-E{relative_index:02d}",
-                    "order": relative_index,
-                    "text": numbered_events[relative_index],
-                }
-                for relative_index in range(1, event_count + 1)
-            ],
-        })
+        append_stage(
+            stage_label,
+            start_chapter,
+            end_chapter,
+            [numbered_events[relative_index] for relative_index in range(1, event_count + 1)],
+        )
 
     chapters = []
     for chapter_index in sorted(explicit_titles):
@@ -241,7 +354,17 @@ def _merge_framework_chapter_plans(ai_plan, structured_plan):
     summary = structured_summary
     if ai_summary and ai_summary not in summary:
         summary = f"{summary}\n\nAI阶段摘要：\n{ai_summary}".strip()
-    result = {"summary": summary, "chapters": merged, "stages": deepcopy(structured_plan.get("stages", []))}
+    structured_stages = structured_plan.get("stages", [])
+    structured_stages = structured_stages if isinstance(structured_stages, list) else []
+    ai_stages = ai_plan.get("stages", [])
+    ai_stages = ai_stages if isinstance(ai_stages, list) else []
+    result = {
+        "summary": summary,
+        "chapters": merged,
+        # The source parser is authoritative when it found explicit stage
+        # ranges. Otherwise retain the AI's source-grounded stage response.
+        "stages": deepcopy(structured_stages or ai_stages),
+    }
     if not result["chapters"] and not result["stages"]:
         return deepcopy(ai_plan)
     return result
@@ -429,6 +552,12 @@ def _project_material_key(value):
 
 
 _LORE_DESCRIPTION_PLACEHOLDERS = {"AI 分析候选", "文档导入候选"}
+_CANDIDATE_INTERNAL_MARKER_RE = re.compile(
+    r"^(?:(?:补充|新增|补充说明)\s*[：:]\s*)?"
+    r"(?:A\s*I\s*分析\s*候选|文档导入候选)"
+    r"(?:\s*[：:]\s*)?",
+    flags=re.IGNORECASE,
+)
 _LOW_VALUE_DOSSIER_TEXTS = {
     "偏远地点暂不影响主线",
     "普通背景线索暂不影响主线",
@@ -777,6 +906,27 @@ def _lore_description_core(value):
     return text
 
 
+def _strip_internal_candidate_markers(value):
+    """Remove internal empty-candidate labels without removing real notes."""
+    kept = []
+    for raw in str(value or "").splitlines():
+        line = str(raw or "").strip()
+        if not line:
+            continue
+        for _ in range(2):
+            compact = _compact_text(line)
+            if compact in {"AI分析候选", "文档导入候选"}:
+                line = ""
+                break
+            cleaned = _CANDIDATE_INTERNAL_MARKER_RE.sub("", line, count=1).strip()
+            if cleaned == line:
+                break
+            line = cleaned
+        if line:
+            kept.append(line)
+    return _dedupe_text_lines("\n".join(kept))
+
+
 def _stable_lore_description_delta(value):
     kept = []
     placeholder_keys = {_compact_text(item) for item in _LORE_DESCRIPTION_PLACEHOLDERS}
@@ -817,8 +967,8 @@ def _normalize_ai_candidates(data):
         return target
 
     def merge_candidate_text(existing, incoming, append=False):
-        old = str(existing or "").strip()
-        new = str(incoming or "").strip()
+        old = _strip_internal_candidate_markers(existing)
+        new = _strip_internal_candidate_markers(incoming)
         if append:
             cleaned_old = _dedupe_text_lines(old)
             if not new:
@@ -840,9 +990,13 @@ def _normalize_ai_candidates(data):
     def merge_into_group(group_key, item):
         if not isinstance(item, dict):
             return
+        item = dict(item)
+        if group_key == "characters":
+            item["notes"] = _strip_internal_candidate_markers(item.get("notes", ""))
         if group_key == "lore":
-            item = dict(item)
             item["description"] = _stable_lore_description_delta(item.get("description", ""))
+        elif group_key == "foreshadows":
+            item["description"] = _strip_internal_candidate_markers(item.get("description", ""))
         name = str(item.get("name", "") or "").strip()
         if not name:
             return
@@ -930,9 +1084,9 @@ def _normalize_ai_candidates(data):
             "goal": str(_candidate_field(item, "goal", "目标", "人物目标", "动机", "诉求") or ""),
             "secret": str(_candidate_field(item, "secret", "秘密", "隐藏秘密", "隐情") or ""),
             "voice": str(_candidate_field(item, "voice", "语言风格", "说话风格", "口吻") or ""),
-            "notes": str(_candidate_field(item, "notes", "备注", "说明", "关系变化", "人物关系", "description") or "AI 分析候选"),
+            "notes": str(_candidate_field(item, "notes", "备注", "说明", "关系变化", "人物关系", "description") or ""),
         }
-        char_item, lore_item = _prepare_character_candidate(normalized_item, default_notes="AI 分析候选")
+        char_item, lore_item = _prepare_character_candidate(normalized_item, default_notes="")
         if char_item:
             attach_candidate_metadata(char_item, item)
             merge_into_group("characters", char_item)
@@ -943,7 +1097,7 @@ def _normalize_ai_candidates(data):
         normalized_item = {
             "name": name,
             "type": str(_candidate_field(item, "type", "类型", "类别", "设定类型") or "其他"),
-            "description": str(_candidate_field(item, "description", "说明", "描述", "设定说明", "备注", "规则") or "AI 分析候选"),
+            "description": str(_candidate_field(item, "description", "说明", "描述", "设定说明", "备注", "规则") or ""),
         }
         attach_candidate_metadata(normalized_item, item)
         merge_into_group("lore", normalized_item)
@@ -967,7 +1121,7 @@ def _normalize_ai_candidates(data):
             "目标编号",
         ) or "").strip()
         evidence = str(_candidate_field(item, "evidence", "依据章节", "证据", "章节依据", "证据章节") or "").strip()
-        description = str(_candidate_field(item, "description", "说明", "描述", "伏笔说明", "备注") or "AI 分析候选")
+        description = str(_candidate_field(item, "description", "说明", "描述", "伏笔说明", "备注") or "")
         for label, value in (
             ("体检建议", review_action),
             ("合并目标", merge_target),
@@ -987,6 +1141,9 @@ def _normalize_ai_candidates(data):
             ),
             "description": description,
         }
+        source_code = _normalize_foreshadow_code(item.get("code", ""))
+        if source_code:
+            normalized["code"] = source_code
         if merge_target:
             normalized["_merge_target"] = merge_target
         if merge_target_code:
@@ -1046,25 +1203,25 @@ def _apply_import_candidates(project, candidates, checked):
     chapter_labels = _chapter_source_label_map(project)
 
     def useful(value):
-        text = str(value or "").strip()
-        return text and text not in {"AI 分析候选", "文档导入候选"}
+        return bool(_strip_internal_candidate_markers(value))
 
     def merge_text(existing, incoming, append=False):
-        old = str(existing or "").strip()
-        new = str(incoming or "").strip()
+        raw_old = str(existing or "").strip()
+        old = _strip_internal_candidate_markers(raw_old)
+        new = _strip_internal_candidate_markers(incoming)
         if append:
             cleaned_old = _dedupe_text_lines(old)
             if not useful(new):
-                return cleaned_old, cleaned_old != old
+                return cleaned_old, cleaned_old != raw_old
             if not cleaned_old or cleaned_old in {"AI 分析候选", "文档导入候选"}:
                 cleaned_new = _dedupe_text_lines(new)
                 return cleaned_new, cleaned_new != old
             merged, did_change = _merge_text_lines_without_duplicates(cleaned_old, new)
-            return merged, did_change or merged != old
+            return merged, did_change or merged != raw_old
         if not useful(new):
-            return old, False
+            return old, old != raw_old
         if not old or old in {"AI 分析候选", "文档导入候选"}:
-            return new, True
+            return new, new != raw_old
         if new == old or new in old:
             return old, False
         if append and old not in new:
@@ -1099,8 +1256,12 @@ def _apply_import_candidates(project, candidates, checked):
             if key == "lore" and field == "description":
                 incoming_value = _stable_lore_description_delta(incoming_value)
             if key == "foreshadows" and field == "description" and field in append_fields:
+                existing_description = _strip_internal_candidate_markers(
+                    target_item.get(field, "")
+                )
+                incoming_value = _strip_internal_candidate_markers(incoming_value)
                 merged, did_change = _merge_foreshadow_description_without_bloat(
-                    target_item.get(field, ""),
+                    existing_description,
                     incoming_value,
                     incoming_source,
                 )

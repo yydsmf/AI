@@ -197,10 +197,12 @@ class NovelV2WritingWorker(NovelWritingWorker):
                 '"priority":"必须处理|高|常规|低|休眠","horizon":"下一窗口|当前阶段|后期|开放结局",'
                 '"evidence":"正文中的直接证据"}],'
                 '"record_updates":{"characters":[{"operation":"create|update|none","id":"已有人物ID或空",'
-                '"name":"","fields":{"role":"","goal":"","secret":"","voice":"","notes":""},'
+                '"name":"新增人物姓名；临时人物升级时填写正文明确的正式姓名",'
+                '"fields":{"role":"","goal":"","secret":"","voice":"","notes":""},'
                 '"evidence":"正文证据"}],"lore":[{"operation":"create|update|none","id":"已有设定ID或空",'
                 '"name":"","fields":{"type":"","description":""},"evidence":"正文证据"}]}}。'
                 "只更新正文有明确证据的记录；同一伏笔优先使用已有ID，短期悬念和一次性程序细节不要创建长期伏笔。"
+                "如果正文给已有的姓名未明或临时称谓人物补出正式姓名，必须沿用原人物ID并用update填写name，保留原卡和运行态，不能create重复人物。"
                 "人物和设定优先更新已有ID；只有后续会持续使用且现有资料确实没有对应记录时才create。"
                 "一次性路人、临时物品、气氛细节和本章即可消化的信息只放关键事实，不创建长期记录。"
                 "必须逐项检查正文中新出现或发生长期变化的内容，不能只写进state_snapshot、unresolved_tasks或state_delta而漏掉长期档案。"

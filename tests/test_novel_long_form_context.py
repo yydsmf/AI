@@ -16,6 +16,7 @@ from gpt_desktop.novel_utils import (
     STYLE_SHEET_CACHE_VERSION,
     _append_ai_style_profile_to_context,
     _apply_character_string_canon,
+    _character_identity_fields_from_item,
     _apply_long_form_memory_update,
     _apply_chapter_logic_repair_patches,
     _apply_chapter_prose_repair_patches,
@@ -64,6 +65,7 @@ from gpt_desktop.novel_utils import (
     _merge_long_form_memory_repair_patch,
     _merge_long_form_memory_repair_full,
     _merge_long_form_memory_reconciliation_patch,
+    _normalize_long_form_reconciliation_patch,
     _merge_long_form_state_patch,
     _memory_repair_patch_targets,
     _literalize_long_form_memory_evidence,
@@ -769,6 +771,78 @@ class NovelLongFormContextTests(unittest.TestCase):
             ["“第一句。”", "普通证据。"],
         )
 
+    def test_memory_repair_parser_selects_real_json_after_placeholder_json(self):
+        placeholder = {
+            "long_form_memory_patch": {
+                "replace": {
+                    "record_updates": "返回该字段的完整替换值",
+                    "state_reconciliation": "返回该字段的完整替换值",
+                }
+            }
+        }
+        actual = {
+            "long_form_memory_patch": {
+                "replace": {
+                    "record_updates": {"characters": [], "lore": []},
+                    "state_reconciliation": {"checked": True, "lore_refs": []},
+                }
+            }
+        }
+
+        parsed = _parse_memory_repair_result(
+            json.dumps(placeholder, ensure_ascii=False)
+            + "\n"
+            + json.dumps(actual, ensure_ascii=False)
+        )
+
+        self.assertTrue(parsed["parsed"])
+        self.assertEqual(parsed["repair_mode"], "patch")
+        self.assertEqual(
+            parsed["memory_patch"]["replace"]["record_updates"],
+            {"characters": [], "lore": []},
+        )
+
+    def test_memory_repair_parser_keeps_one_normal_json_unchanged(self):
+        parsed = _parse_memory_repair_result(
+            '{"long_form_memory_patch":{"replace":{"record_updates":{"characters":[]}}}}'
+        )
+
+        self.assertTrue(parsed["parsed"])
+        self.assertEqual(
+            parsed["memory_patch"]["replace"]["record_updates"],
+            {"characters": []},
+        )
+
+    def test_memory_repair_parser_wraps_bare_replace_after_commentary_json(self):
+        parsed = _parse_memory_repair_result(
+            '{"commentary":"正在修复"}'
+            '{"replace":{"record_updates":{"characters":[]},"state_reconciliation":{"checked":true}}}'
+        )
+
+        self.assertTrue(parsed["parsed"])
+        self.assertEqual(parsed["repair_mode"], "patch")
+        self.assertEqual(
+            parsed["memory_patch"]["replace"]["state_reconciliation"],
+            {"checked": True},
+        )
+
+    def test_memory_repair_parser_wraps_direct_memory_fields(self):
+        parsed = _parse_memory_repair_result(
+            '{"state_reconciliation":{"checked":true,"lore_refs":[]},'
+            '"next_chapter_memory":{"lore_refs":[]}}'
+        )
+
+        self.assertTrue(parsed["parsed"])
+        self.assertEqual(parsed["repair_mode"], "patch")
+        self.assertEqual(
+            parsed["memory_patch"]["replace"]["state_reconciliation"],
+            {"checked": True, "lore_refs": []},
+        )
+        self.assertEqual(
+            parsed["memory_patch"]["replace"]["next_chapter_memory"],
+            {"lore_refs": []},
+        )
+
     def test_memory_repair_parser_treats_logic_audit_only_result_as_patch(self):
         parsed = _parse_memory_repair_result(
             '{"logic_audit":{"checked":true,"issues":[]}}'
@@ -1171,6 +1245,31 @@ class NovelLongFormContextTests(unittest.TestCase):
             },
         })
         self.assertEqual(unchanged["record_updates"]["characters"], [])
+
+    def test_runtime_conclusions_are_normalized_to_review_arrays(self):
+        normalized = _normalize_long_form_state_aliases({
+            "state_reconciliation": {
+                "lore_refs": ["opaque-lore-ref"],
+                "record_runtime_review": {
+                    "runtime_conclusions": [
+                        {"ref": "L011", "conclusion": "updated"},
+                        {"ref": "L006", "conclusion": "unchanged"},
+                        {"ref": "opaque-lore-ref", "conclusion": "updated"},
+                        {"foreshadow_ref": "F008", "conclusion": "不变"},
+                    ],
+                },
+            },
+        })
+
+        runtime_review = normalized["state_reconciliation"]["record_runtime_review"]
+        self.assertEqual(
+            runtime_review["reviewed_lore_refs"],
+            ["L011", "L006", "opaque-lore-ref"],
+        )
+        self.assertEqual(runtime_review["unchanged_lore_refs"], ["L006"])
+        self.assertEqual(runtime_review["reviewed_foreshadow_refs"], ["F008"])
+        self.assertEqual(runtime_review["unchanged_foreshadow_refs"], ["F008"])
+        self.assertEqual(len(runtime_review["runtime_conclusions"]), 4)
 
     def test_fact_state_alias_and_canonical_buried_foreshadow_are_normalized(self):
         normalized = _normalize_long_form_state_aliases({
@@ -3331,7 +3430,10 @@ class NovelLongFormContextTests(unittest.TestCase):
         )
 
         self.assertIn("【状态增量修复补丁】", context)
-        self.assertIn('"logic_audit":{"checked":true,"issues":[]}', context)
+        self.assertIn("每个需要修复的字段直接填写真实、完整、可校验的对象或数组", context)
+        self.assertIn("顶层使用long_form_memory_patch对象，其下使用replace对象", context)
+        self.assertIn("只有清单中的required_object_keys才能进入object_keys", context)
+        self.assertNotIn('"logic_audit":{"checked":true,"issues":[]}', context)
         self.assertNotIn("【待修复的原状态字段】", context)
         self.assertNotIn("【机械引用清单】", context)
 
@@ -3710,6 +3812,116 @@ class NovelLongFormContextTests(unittest.TestCase):
         self.assertIn(new_character["id"], next_selection["character_ids"])
         self.assertIn(new_lore["id"], next_selection["lore_ids"])
 
+    def test_new_state_temp_refs_resolve_in_events_reconciliation_lifecycle_and_next_selection(self):
+        current = _new_chapter(0)
+        following = _new_chapter(1)
+        project = self._project_with_current_chapter(current)
+        project["chapters"] = [current, following]
+        project["long_form_memory"] = {
+            "schema_version": "2",
+            "revision": 0,
+            "state_snapshot": {},
+            "active_facts": [],
+            "stage_archives": [],
+        }
+        update = self._strict_update(project)
+        update["state_patch"] = {
+            "active_conflicts": [{"key": "NCF1", "conflict": "对方已经封锁城门"}],
+            "unresolved_tasks": [{"key": "NTASK1", "task": "天亮前找到备用入口"}],
+        }
+        update["state_reconciliation"]["conflict_refs"] = ["NCF1"]
+        update["state_reconciliation"]["task_refs"] = ["NTASK1"]
+        update["state_lifecycle_review"]["reviewed_conflict_refs"] = ["NCF1"]
+        update["state_lifecycle_review"]["reviewed_task_refs"] = ["NTASK1"]
+        update["long_term_events"] = [{
+            "event": "城门封锁，备用入口成为下一步任务",
+            "category": "task",
+            "storage": {
+                "fact_refs": [], "character_refs": [], "lore_refs": [],
+                "foreshadow_refs": [], "object_keys": [],
+                "conflict_refs": ["NCF1"], "task_refs": ["NTASK1"],
+            },
+        }]
+        update["next_chapter_memory"] = {
+            "conflict_refs": ["NCF1"],
+            "task_refs": ["NTASK1"],
+        }
+
+        self.assertTrue(_apply_long_form_memory_update(project, 0, update))
+
+        snapshot = project["long_form_memory"]["state_snapshot"]
+        conflict_id = snapshot["active_conflicts"][0]["id"]
+        task_id = snapshot["unresolved_tasks"][0]["id"]
+        self.assertTrue(conflict_id.startswith("CF-"))
+        self.assertTrue(task_id.startswith("TASK-"))
+        self.assertEqual(
+            project["chapters"][0]["state_lifecycle_review"]["reviewed_conflict_ids"],
+            [conflict_id],
+        )
+        self.assertEqual(
+            project["chapters"][0]["state_lifecycle_review"]["reviewed_task_ids"],
+            [task_id],
+        )
+        event_storage = project["chapters"][0]["long_term_events"][0]["storage"]
+        self.assertEqual(event_storage["conflict_ids"], [conflict_id])
+        self.assertEqual(event_storage["task_ids"], [task_id])
+        next_selection = project["chapters"][1]["memory_selection"]
+        self.assertIn(conflict_id, next_selection["conflict_ids"])
+        self.assertIn(task_id, next_selection["task_ids"])
+
+    def test_empty_state_tasks_are_dropped_without_persisting_new_refs(self):
+        chapter = _new_chapter(0)
+        project = self._project_with_current_chapter(chapter)
+        update = self._strict_update(project)
+        update["state_patch"] = {
+            "unresolved_tasks": [{"key": "NTASK-EMPTY", "task": ""}],
+        }
+        update["state_reconciliation"]["task_refs"] = ["NTASK-EMPTY"]
+        update["state_lifecycle_review"]["reviewed_task_refs"] = ["NTASK-EMPTY"]
+        update["next_chapter_memory"] = {"task_refs": ["NTASK-EMPTY"]}
+        update["long_term_events"] = [{
+            "event": "空任务不应形成长期事件",
+            "category": "task",
+            "storage": {
+                "fact_refs": [], "character_refs": [], "lore_refs": [],
+                "foreshadow_refs": [], "object_keys": [],
+                "conflict_refs": [], "task_refs": ["NTASK-EMPTY"],
+            },
+        }]
+
+        normalized = _normalize_long_form_update_payload(project, 0, update)
+
+        self.assertEqual(normalized["state_patch"]["unresolved_tasks"], [])
+        self.assertNotIn("NTASK-EMPTY", normalized["state_reconciliation"]["task_refs"])
+        self.assertNotIn("NTASK-EMPTY", normalized["state_lifecycle_review"]["reviewed_task_refs"])
+        self.assertNotIn("NTASK-EMPTY", normalized["next_chapter_memory"]["task_refs"])
+        self.assertNotIn("NTASK-EMPTY", normalized["long_term_events"][0]["storage"]["task_refs"])
+
+    def test_unbound_record_alias_is_not_accepted_as_object_key(self):
+        chapter = _new_chapter(0)
+        project = self._project_with_current_chapter(chapter)
+        project["lore"] = [{"id": "L010", "name": "疑似设定"}]
+        project["long_form_memory"] = {
+            "schema_version": "2",
+            "revision": 0,
+            "state_snapshot": {
+                "object_states": [{"key": "L010", "name": "疑似物件", "state": "仍在现场"}],
+            },
+            "active_facts": [],
+            "stage_archives": [],
+        }
+        update = self._strict_update(project)
+        update["state_reconciliation"]["object_keys"] = ["L010"]
+
+        normalized = _normalize_long_form_structural_refs(project, 0, update)
+        errors = _validate_long_form_memory_update(
+            project, 0, normalized, final_text="现场仍然保留疑似物件。",
+            require_revision=True, require_evidence=True,
+        )
+
+        self.assertEqual(normalized["state_reconciliation"]["object_keys"], ["L010"])
+        self.assertTrue(any("object_keys引用未知物件" in error for error in errors))
+
     def test_tenth_chapter_rejects_empty_archive_and_unknown_archive_selection(self):
         chapters = [_new_chapter(index) for index in range(11)]
         project = self._project_with_current_chapter(chapters[9])
@@ -4078,6 +4290,66 @@ class NovelLongFormContextTests(unittest.TestCase):
             [],
         )
 
+    def test_structural_refs_move_record_aliases_out_of_object_namespaces(self):
+        chapter = _new_chapter(0)
+        project = self._project_with_current_chapter(chapter)
+        project["lore"] = [
+            {"id": f"lore-{index:02d}", "name": f"设定{index}"}
+            for index in range(1, 11)
+        ] + [{
+            "id": "lore-card",
+            "name": "谎言房卡",
+        }]
+        project["foreshadow_items"] = [{
+            "id": "foreshadow-card",
+            "name": "房卡来源",
+        }]
+        project["long_form_memory"] = {
+            "schema_version": "2",
+            "revision": 14,
+            "state_snapshot": {
+                "object_states": [{
+                    "key": "OBJ-ROOM-CARD",
+                    "name": "房卡实体",
+                    "state": "仍在沈知夏手中",
+                }],
+            },
+            "active_facts": [],
+            "stage_archives": [],
+        }
+        update = self._strict_update(project)
+        update["state_reconciliation"]["object_keys"] = [
+            "L011",
+            "F001",
+            "OBJ-ROOM-CARD",
+            "UNKNOWN-OBJECT",
+        ]
+        update["next_chapter_memory"] = {
+            "object_keys": ["L011", "F001", "OBJ-ROOM-CARD"],
+        }
+
+        normalized = _normalize_long_form_structural_refs(project, 0, update)
+
+        reconciliation = normalized["state_reconciliation"]
+        self.assertEqual(
+            reconciliation["object_keys"],
+            ["OBJ-ROOM-CARD", "UNKNOWN-OBJECT"],
+        )
+        self.assertEqual(reconciliation["lore_refs"], ["L011"])
+        self.assertEqual(reconciliation["foreshadow_refs"], ["F001"])
+        self.assertEqual(
+            normalized["next_chapter_memory"]["object_keys"],
+            ["OBJ-ROOM-CARD"],
+        )
+        self.assertEqual(
+            normalized["next_chapter_memory"]["lore_refs"],
+            ["L011"],
+        )
+        self.assertEqual(
+            normalized["next_chapter_memory"]["foreshadow_refs"],
+            ["F001"],
+        )
+
     def test_event_storage_uses_exact_evidence_anchor_only_for_one_event(self):
         chapter = _new_chapter(0)
         chapter["memory_selection"] = {
@@ -4191,6 +4463,65 @@ class NovelLongFormContextTests(unittest.TestCase):
         normalized = _normalize_long_form_update_payload(project, 0, update)
 
         self.assertEqual(normalized["fact_updates"][0]["key"], "NF-CH41-001")
+
+    def test_supersede_new_fact_key_wins_over_echoed_old_fact_id(self):
+        chapter = _new_chapter(0)
+        project = self._project_with_current_chapter(chapter)
+        normalized = _normalize_long_form_update_payload(project, 0, {
+            "fact_updates": [{
+                "operation": "supersede",
+                "id": "AF-0063",
+                "key": "AF-0063",
+                "new_fact_key": "NF-0040",
+            }],
+        })
+
+        fact_update = normalized["fact_updates"][0]
+        self.assertEqual(fact_update["id"], "AF-0063")
+        self.assertEqual(fact_update["key"], "NF-0040")
+
+    def test_new_object_is_available_to_lifecycle_review(self):
+        chapter = _new_chapter(0)
+        project = self._project_with_current_chapter(chapter)
+        project["long_form_memory"] = {
+            "schema_version": "2",
+            "revision": 0,
+            "state_snapshot": {"object_states": []},
+            "active_facts": [],
+            "stage_archives": [],
+        }
+        update = self._strict_update(project)
+        evidence = "黑色玉匣已经被林辰收进袖中"
+        update["state_patch"] = {
+            "object_states": [{
+                "key": "OBJ-NEW-1",
+                "name": "黑色玉匣",
+                "state": "已被林辰收进袖中",
+                "evidence_quote": evidence,
+            }],
+        }
+        update["state_lifecycle_review"]["reviewed_object_keys"] = ["OBJ-NEW-1"]
+        update["state_reconciliation"]["object_keys"] = ["OBJ-NEW-1"]
+        update["long_term_events"] = [{
+            "event": "林辰收起黑色玉匣",
+            "category": "key_object",
+            "evidence_quote": evidence,
+            "storage": {
+                "fact_refs": [], "character_refs": [], "lore_refs": [],
+                "foreshadow_refs": [], "object_keys": ["OBJ-NEW-1"],
+                "conflict_refs": [], "task_refs": [],
+            },
+        }]
+
+        self.assertEqual(
+            _validate_long_form_memory_update(
+                project, 0, update,
+                final_text=evidence + "。",
+                require_revision=True,
+                require_evidence=True,
+            ),
+            [],
+        )
 
     def test_missing_handoff_uses_full_visible_state_for_evidenced_retirement(self):
         previous = _new_chapter(0)
@@ -8682,6 +9013,98 @@ class NovelLongFormContextTests(unittest.TestCase):
         self.assertIn("正式姓名已进入宗门名册", promoted["notes"])
         self.assertIn("旧名：内门弟子（姓名未明）", promoted["notes"])
 
+    def test_character_identity_fields_accept_legacy_top_level_and_nested_shapes(self):
+        self.assertEqual(
+            _character_identity_fields_from_item({
+                "role": "宗门管事",
+                "goal": "保住儿子的外门位置",
+                "secret": "曾私下替人改过名册",
+                "voice": "先客气后强硬",
+            }),
+            {
+                "role": "宗门管事",
+                "goal": "保住儿子的外门位置",
+                "secret": "曾私下替人改过名册",
+                "voice": "先客气后强硬",
+            },
+        )
+        self.assertEqual(
+            _character_identity_fields_from_item({
+                "canon": {"goal": "守住擂台名次", "voice": "说话干脆"},
+                "identity_patch": {"secret": "曾败给主角"},
+            }),
+            {"goal": "守住擂台名次", "voice": "说话干脆", "secret": "曾败给主角"},
+        )
+        self.assertEqual(
+            _character_identity_fields_from_item({
+                "canon": {
+                    "role": "仅新增时填写",
+                    "goal": "正文明确的目标；无证据留空",
+                    "voice": "正文中足够明显的语言/口吻特征；证据不足留空",
+                }
+            }),
+            {},
+        )
+
+    def test_character_update_backfills_empty_identity_fields_without_overwriting_existing(self):
+        chapter = _new_chapter(0)
+        chapter["text"] = "魏管事压低声音道：‘先把月例补上，别让外门乱起来。’"
+        project = self._project_with_current_chapter(chapter)
+        existing = {
+            "id": "character-1",
+            "name": "魏管事",
+            "role": "玄铁宗外门管事",
+            "goal": "保住儿子的外门位置",
+            "secret": "",
+            "voice": "",
+            "notes": "魏骁之父",
+        }
+        project["characters"] = [existing]
+        update = self._strict_update(project)
+        update["record_updates"]["characters"] = [{
+            "operation": "update",
+            "ref": existing["id"],
+            "state": "本章承认月例处理有误并要求补发。",
+            "identity_patch": {
+                "goal": "想继续维持外门月例的控制权",
+                "secret": "曾私下替儿子从新人月例中扣取好处",
+                "voice": "先客气施压，受阻后转为冷硬",
+            },
+            "evidence_quote": "魏管事压低声音道",
+        }]
+        update["current_chapter_character_refs"] = [existing["id"]]
+
+        self.assertTrue(_apply_long_form_memory_update(project, 0, update))
+        saved = project["characters"][0]
+        self.assertEqual(saved["goal"], "保住儿子的外门位置；想继续维持外门月例的控制权")
+        self.assertEqual(saved["secret"], "曾私下替儿子从新人月例中扣取好处")
+        self.assertEqual(saved["voice"], "先客气施压，受阻后转为冷硬")
+
+    def test_character_create_maps_top_level_identity_fields_into_card(self):
+        chapter = _new_chapter(0)
+        chapter["text"] = "宁川抬手压住碎石，冷声让众人退开。"
+        project = self._project_with_current_chapter(chapter)
+        update = self._strict_update(project)
+        update["record_updates"]["characters"] = [{
+            "operation": "create",
+            "key": "NC1",
+            "name": "宁川",
+            "role": "青岳宗护道修士",
+            "goal": "护住宗门弟子并夺取遗迹机缘",
+            "secret": "真实境界高于公开说法",
+            "voice": "少言，命令式",
+            "state": "在遗迹入口以山岳力量压制碎石。",
+            "evidence_quote": "宁川抬手压住碎石",
+        }]
+        update["current_chapter_character_refs"] = ["NC1"]
+
+        self.assertTrue(_apply_long_form_memory_update(project, 0, update))
+        saved = next(item for item in project["characters"] if item["name"] == "宁川")
+        self.assertEqual(saved["role"], "青岳宗护道修士")
+        self.assertEqual(saved["goal"], "护住宗门弟子并夺取遗迹机缘")
+        self.assertEqual(saved["secret"], "真实境界高于公开说法")
+        self.assertEqual(saved["voice"], "少言，命令式")
+
     def test_fact_retirement_requires_selected_id_exact_scope_and_previous_fact(self):
         chapter = _new_chapter(0)
         project = self._project_with_current_chapter(chapter)
@@ -8865,6 +9288,7 @@ class NovelLongFormContextTests(unittest.TestCase):
         self.assertLessEqual(len(context), LONG_FORM_RECONCILIATION_CONTEXT_LIMIT)
         self.assertIn("只审查第十章边界的状态语义", context)
         self.assertIn("只返回能由最终正文逐字证实", context)
+        self.assertIn('每项必须填写operation:"update"、ref和evidence_quote', context)
         self.assertTrue(parsed["parsed"])
         self.assertEqual(parsed["corrections"]["fact_updates"], [])
 
@@ -8901,6 +9325,219 @@ class NovelLongFormContextTests(unittest.TestCase):
         self.assertEqual(merged["state_patch"]["location"], "华京")
         self.assertEqual(merged["state_patch"]["story_time"], "当夜")
         self.assertEqual(merged["stage_archive"]["summary"], "保留原阶段档案")
+
+    def test_reconciliation_normalizes_missing_operations_and_short_refs_before_merge(self):
+        chapter = _new_chapter(0)
+        project = self._project_with_current_chapter(chapter)
+        project["lore"] = [
+            {"id": f"lore-{index}", "name": f"设定{index}"}
+            for index in range(1, 6)
+        ]
+        project["foreshadow_items"] = [
+            {"id": "f-1", "code": "F0001", "name": "伏笔一"},
+            {"id": "f-2", "code": "F0002", "name": "伏笔二"},
+            {"id": "f-3", "code": "F0003", "name": "伏笔三"},
+        ]
+        patch = {
+            "record_updates": {
+                "lore": [{
+                    "lore_id": "L005",
+                    "update": "设定在本章表现出新的限制。",
+                    "evidence_quote": "新的限制",
+                }],
+            },
+            "foreshadow_updates": [{
+                "id": "F003",
+                "update": "伏笔出现新的直接证据。",
+                "evidence_quote": "直接证据",
+            }],
+        }
+
+        normalized = _normalize_long_form_reconciliation_patch(project, patch)
+        lore_update = normalized["record_updates"]["lore"][0]
+        foreshadow_update = normalized["foreshadow_updates"][0]
+        self.assertEqual(lore_update["operation"], "update")
+        self.assertEqual(lore_update["ref"], "lore-5")
+        self.assertEqual(lore_update["state"], "设定在本章表现出新的限制。")
+        self.assertEqual(foreshadow_update["operation"], "update")
+        self.assertEqual(foreshadow_update["ref"], "f-3")
+        self.assertEqual(foreshadow_update["state"], "伏笔出现新的直接证据。")
+
+        original = {
+            "schema_version": 2,
+            "base_revision": 0,
+            "foreshadow_updates": [],
+            "record_updates": {"characters": [], "lore": []},
+            "long_term_events": [{
+                "event": "伏笔三出现新证据。",
+                "evidence_quote": "直接证据",
+                "storage": {"foreshadow_refs": ["f-3"]},
+            }],
+            "state_reconciliation": {"foreshadow_refs": []},
+        }
+        merged = _merge_long_form_memory_reconciliation_patch(
+            original, patch, project=project
+        )
+        merged = _normalize_long_form_structural_refs(project, 0, merged)
+        self.assertEqual(merged["foreshadow_updates"][0]["operation"], "update")
+        self.assertEqual(merged["foreshadow_updates"][0]["ref"], "f-3")
+        self.assertEqual(
+            merged["long_term_events"][0]["storage"]["foreshadow_refs"],
+            ["f-3"],
+        )
+
+    def test_legacy_reconciliation_patch_passes_full_validation_after_normalization(self):
+        chapter = _new_chapter(0)
+        project = self._project_with_current_chapter(chapter)
+        project["foreshadow_items"] = [{
+            "id": "f-3", "code": "F0003", "name": "玉佩线索",
+        }]
+        project["long_form_memory"] = {
+            "schema_version": "2", "revision": 0,
+            "state_snapshot": {}, "active_facts": [],
+        }
+        final_text = "石台上的玉佩线索在本章得到直接证据。"
+        original = self._strict_update(project, 0)
+        original["long_term_events"] = [{
+            "event": "玉佩线索在本章得到直接证据",
+            "category": "foreshadow",
+            "evidence_quote": final_text,
+            "storage": {
+                "fact_refs": [], "character_refs": [], "lore_refs": [],
+                "foreshadow_refs": ["f-3"], "object_keys": [],
+                "conflict_refs": [], "task_refs": [],
+            },
+        }]
+        original["state_reconciliation"]["foreshadow_refs"] = ["f-3"]
+        original["state_reconciliation"]["record_runtime_review"] = {
+            "reviewed_lore_refs": [],
+            "unchanged_lore_refs": [],
+            "reviewed_foreshadow_refs": ["f-3"],
+            "unchanged_foreshadow_refs": [],
+        }
+        # This is the legacy shape observed in the failed real response.
+        legacy_patch = {
+            "foreshadow_updates": [{
+                "id": "F003",
+                "update": "完整玉佩线索已经得到直接证据。",
+                "evidence_quote": final_text,
+            }],
+        }
+
+        merged = _merge_long_form_memory_reconciliation_patch(
+            original, legacy_patch, project=project
+        )
+        errors = _validate_long_form_memory_update(
+            project, 0, merged, final_text=final_text,
+            require_revision=True, require_evidence=True,
+        )
+
+        self.assertEqual(errors, [])
+        self.assertEqual(
+            merged["foreshadow_updates"][0]["ref"], "f-3"
+        )
+        self.assertEqual(
+            merged["long_term_events"][0]["storage"]["foreshadow_refs"],
+            ["f-3"],
+        )
+
+    def test_reconciliation_keeps_evidence_bound_to_final_chapter(self):
+        chapter = _new_chapter(0)
+        project = self._project_with_current_chapter(chapter)
+        project["foreshadow_items"] = [{
+            "id": "f-1", "code": "F0001", "name": "旧线索",
+        }]
+        project["long_form_memory"] = {
+            "schema_version": "2", "revision": 0,
+            "state_snapshot": {}, "active_facts": [],
+        }
+        final_text = "本章发生了明确的当前事实。"
+        update = self._strict_update(project, 0)
+        update["foreshadow_updates"] = [{
+            "operation": "update",
+            "ref": "f-1",
+            "state": "旧线索在本章得到推进。",
+            # This is deliberately only available in an earlier chapter.
+            "evidence_quote": "上一章才出现的证据",
+        }]
+        update["long_term_events"] = [{
+            "event": "旧线索在本章得到推进",
+            "category": "foreshadow",
+            "evidence_quote": final_text,
+            "storage": {
+                "fact_refs": [], "character_refs": [], "lore_refs": [],
+                "foreshadow_refs": ["f-1"], "object_keys": [],
+                "conflict_refs": [], "task_refs": [],
+            },
+        }]
+        update["state_reconciliation"]["foreshadow_refs"] = ["f-1"]
+        update["state_reconciliation"]["record_runtime_review"] = {
+            "reviewed_lore_refs": [],
+            "unchanged_lore_refs": [],
+            "reviewed_foreshadow_refs": ["f-1"],
+            "unchanged_foreshadow_refs": [],
+        }
+
+        errors = _validate_long_form_memory_update(
+            project, 0, update, final_text=final_text,
+            require_revision=True, require_evidence=True,
+        )
+
+        self.assertTrue(any("foreshadows更新第1项缺少正文逐字证据" in error for error in errors))
+
+    def test_reconciliation_prompt_marks_recent_chapters_as_non_evidence(self):
+        chapters = [_new_chapter(index) for index in range(10)]
+        project = self._project_with_current_chapter(chapters[-1])
+        project["chapters"] = chapters
+        update = self._strict_update(project, 9)
+
+        context = _build_long_form_memory_reconcile_context(
+            project, 9, "当前章正文证据", update
+        )
+
+        self.assertIn("证据来源有严格分区", context)
+        self.assertIn("禁止从其中复制任何证据", context)
+        self.assertIn("仅供比对，禁止作为证据", context)
+
+    def test_memory_finalize_parser_repairs_one_missing_root_delimiter(self):
+        response = {
+            "logic_audit": {"checked": True, "issues": []},
+            "prose_review": {"checked": True, "issues": []},
+            "repair_patches": [],
+            "outline": "本章提纲",
+            "summary": "本章摘要",
+            "key_facts": ["本章事实"],
+            "long_form_memory": {
+                "schema_version": 2,
+                "base_revision": 29,
+                "state_patch": {},
+            },
+        }
+        raw = json.dumps(response, ensure_ascii=False)[:-1]
+
+        parsed = _parse_memory_repair_result(raw)
+
+        self.assertTrue(parsed["parsed"])
+        self.assertEqual(parsed["repair_mode"], "full")
+        self.assertEqual(parsed["outline"], "本章提纲")
+        self.assertEqual(parsed["summary"], "本章摘要")
+        self.assertEqual(parsed["key_facts"], "1. 本章事实")
+        self.assertEqual(parsed["memory_update"]["base_revision"], 29)
+
+    def test_reconciliation_does_not_guess_unknown_reference_operation(self):
+        project = self._project_with_current_chapter(_new_chapter(0))
+        patch = {
+            "foreshadow_updates": [{
+                "id": "F999",
+                "update": "无法对应到已有伏笔。",
+                "evidence_quote": "无法对应",
+            }],
+        }
+
+        normalized = _normalize_long_form_reconciliation_patch(project, patch)
+        item = normalized["foreshadow_updates"][0]
+        self.assertEqual(item.get("id"), "F999")
+        self.assertNotIn("operation", item)
 
     def test_saved_state_delta_resolves_new_conflict_and_task_temp_refs(self):
         chapter = _new_chapter(0)

@@ -1291,7 +1291,97 @@ class NovelAnalysisWorkerTests(unittest.TestCase):
         worker.run()
 
         self.assertEqual(errors, [])
-        self.assertEqual(results, [("draft", content)])
+        self.assertEqual(results, [("draft", "黑暗中响起声音。\n\n滴——")])
+        self.assertEqual(worker.diagnostics["prose_delivery_source"], "structured_backup_draft")
+        self.assertTrue(worker.diagnostics["prose_metadata_stripped"])
+
+    def test_style_draft_worker_delivers_only_wrapped_prose(self):
+        context = "【小说正文直写】\n【正文风格参考】\n样本"
+        worker = NovelWritingWorker("http://example.test", "key", "model", "draft", context)
+        content = (
+            "<NOVEL_PROSE_START>\n"
+            "收银台的扫描声停了下来。\n\n她抬头看向门口。"
+            "\n<NOVEL_PROSE_END>"
+        )
+        worker._session = _FakeStreamSession([
+            "data: " + json.dumps({
+                "choices": [{
+                    "delta": {"content": content},
+                    "finish_reason": "stop",
+                }]
+            }, ensure_ascii=False),
+            "data: [DONE]",
+        ])
+        errors = []
+        results = []
+        worker.failed.connect(errors.append)
+        worker.result_ready.connect(lambda action, value: results.append((action, value)))
+
+        worker.run()
+
+        self.assertEqual(errors, [])
+        self.assertEqual(
+            results,
+            [("draft", "收银台的扫描声停了下来。\n\n她抬头看向门口。")],
+        )
+        self.assertEqual(worker.diagnostics["prose_delivery_source"], "direct_prose_boundary")
+
+    def test_style_draft_worker_drops_preamble_and_postamble_without_retry(self):
+        context = "【小说正文直写】\n【正文风格参考】\n样本"
+        worker = NovelWritingWorker("http://example.test", "key", "model", "draft", context)
+        content = (
+            "我会先处理这一章的冲突，然后开始正文。\n"
+            "<NOVEL_PROSE_START>\n"
+            "她把门推开，先听见屋里有人笑。\n"
+            "<NOVEL_PROSE_END>\n"
+            "以上是正文，请继续检查风格。"
+        )
+        worker._session = _FakeStreamSession([
+            "data: " + json.dumps({
+                "choices": [{
+                    "delta": {"content": content},
+                    "finish_reason": "stop",
+                }]
+            }, ensure_ascii=False),
+            "data: [DONE]",
+        ])
+        errors = []
+        results = []
+        worker.failed.connect(errors.append)
+        worker.result_ready.connect(lambda action, value: results.append((action, value)))
+
+        worker.run()
+
+        self.assertEqual(errors, [])
+        self.assertEqual(
+            results,
+            [("draft", "她把门推开，先听见屋里有人笑。")],
+        )
+        self.assertTrue(worker.diagnostics["prose_metadata_stripped"])
+
+    def test_style_draft_worker_rejects_planning_preamble_as_body(self):
+        context = "【小说正文直写】\n【正文风格参考】\n样本"
+        worker = NovelWritingWorker("http://example.test", "key", "model", "draft", context)
+        content = "我会从收银台后的新反应切入。收银台的扫描声停了下来。"
+        worker._session = _FakeStreamSession([
+            "data: " + json.dumps({
+                "choices": [{
+                    "delta": {"content": content},
+                    "finish_reason": "stop",
+                }]
+            }, ensure_ascii=False),
+            "data: [DONE]",
+        ])
+        errors = []
+        results = []
+        worker.failed.connect(errors.append)
+        worker.result_ready.connect(lambda action, value: results.append((action, value)))
+
+        worker.run()
+
+        self.assertEqual(results, [])
+        self.assertTrue(errors)
+        self.assertIn("正文交付边界不完整", errors[0])
 
     def test_structured_draft_worker_rejects_incomplete_sections(self):
         context = "【剧情执行稿任务】\n严格输出三个分区。"

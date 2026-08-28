@@ -48,6 +48,79 @@ from gpt_desktop.workers import EdgeTTSWorker
 
 
 class NovelWritingStateTests(unittest.TestCase):
+    def test_late_chapter_callback_is_discarded_after_project_switch(self):
+        chapter = _new_chapter(0)
+
+        class Worker:
+            diagnostic_request_id = "request-a"
+            diagnostic_project_path = "/tmp/project-a.json"
+            diagnostic_chapter_id = chapter["id"]
+            diagnostic_task_generation = 1
+            action = "memory_finalize"
+
+        worker = Worker()
+        tab = NovelWritingTab.__new__(NovelWritingTab)
+        tab.current_project = {"chapters": [chapter]}
+        tab.current_chapter_index = 0
+        tab.current_project_path = "/tmp/project-b.json"
+        tab.writing_worker = worker
+        tab._chapter_ai_task_generation = 2
+        tab._chapter_ai_diagnostic_request_id = "request-b"
+        events = []
+        tab.sender = lambda: worker
+        tab._log_novel_diagnostic = lambda event, **details: events.append((event, details))
+
+        self.assertFalse(tab._chapter_ai_callback_is_current())
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0][0], "chapter_ai_stale_callback_discarded")
+
+    def test_staged_memory_commit_does_not_mutate_live_project_before_apply(self):
+        chapter = _new_chapter(0)
+        chapter["text"] = "旧正文"
+        chapter["outline"] = "本章提纲"
+        project = {
+            "chapters": [chapter],
+            "long_form_memory": {"revision": 0},
+        }
+        tab = NovelWritingTab.__new__(NovelWritingTab)
+        tab.current_project = project
+        tab.current_chapter_index = 0
+        tab._chapter_ai_sequence_started_outline = ""
+        class Editor:
+            def __init__(self, value):
+                self.value = value
+
+            def toPlainText(self):
+                return self.value
+
+        tab.chapter_text = Editor("旧正文")
+        bundle = {
+            "outline": "更新提纲",
+            "summary": "本章摘要",
+            "key_facts": "关键事实",
+            "memory_update": {"test": True},
+        }
+
+        def fake_apply(staged, index, update):
+            staged["chapters"][index]["memory_sync_status"] = "complete"
+            staged["chapters"][index]["memory_revision"] = 1
+            return True
+
+        with patch("gpt_desktop.novel_writing_tab._apply_long_form_memory_update", side_effect=fake_apply):
+            staged, changed, text, outline, summary, facts = tab._prepare_staged_memory_commit(
+                "新正文", bundle, include_prose=True, include_outline=True
+            )
+
+        self.assertTrue(changed)
+        self.assertEqual(text, "旧正文\n\n新正文")
+        self.assertEqual(outline, "更新提纲")
+        self.assertEqual(summary, "本章摘要")
+        self.assertEqual(facts, "关键事实")
+        self.assertEqual(project["chapters"][0]["text"], "旧正文")
+        self.assertEqual(project["chapters"][0]["memory_sync_status"], "pending")
+        self.assertEqual(project["chapters"][0]["memory_revision"], 0)
+        self.assertEqual(staged["chapters"][0]["text"], "旧正文\n\n新正文")
+
     def test_background_context_result_requires_same_project_and_chapter(self):
         first = _new_chapter(0)
         second = _new_chapter(1)
@@ -114,6 +187,59 @@ class NovelWritingStateTests(unittest.TestCase):
         tab.current_project_path = "/tmp/other.json"
         tab._update_detached_auto_source_lock()
         self.assertFalse(tab.chapter_ai_stop_btn.visible)
+
+    def test_detached_auto_status_mirrors_stream_chars_stage_and_queue_progress(self):
+        class RunningDetached:
+            _status_message = "正在扩写正文..."
+            _status_stage_key = "chapter-12:draft"
+            _status_stage_label = "正文直写"
+            _status_stage_started_at = 123.0
+            _status_stage_started_wall = 456.0
+            _status_stage_scope_label = "第12章《新章》"
+            _status_stage_active = True
+            _status_history = [{"label": "上一阶段"}]
+            _status_workflow_active = True
+            _status_workflow_kind = "auto_expand"
+            _status_workflow_started_at = 100.0
+            _status_workflow_started_wall = 400.0
+            _status_last_run_elapsed = 0.0
+            _status_received_chars = 2929
+
+            def _status_current_chapter_scope(self):
+                return "chapter-12", "第12章《新章》"
+
+            def _auto_expand_all_chapter_progress(self):
+                return 12, 250
+
+        tab = NovelWritingTab.__new__(NovelWritingTab)
+        tab._is_detached_auto_runner = False
+        tab._detached_auto_runner = RunningDetached()
+        tab._detached_auto_project_path = "/tmp/source.json"
+        tab.current_project_path = "/tmp/source.json"
+        refreshed = []
+        tab._refresh_status_display = lambda: refreshed.append(True)
+
+        self.assertTrue(tab._sync_detached_auto_status(tab._detached_auto_runner))
+        self.assertEqual(tab._status_received_chars, 2929)
+        self.assertEqual(tab._status_stage_label, "正文直写")
+        self.assertEqual(tab._detached_auto_status_auto_progress, (12, 250))
+        self.assertEqual(tab._detached_auto_status_scope_label, "第12章《新章》")
+        self.assertEqual(len(refreshed), 1)
+
+        tab.current_project_path = "/tmp/other.json"
+        tab._status_received_chars = 0
+        self.assertFalse(tab._sync_detached_auto_status(tab._detached_auto_runner))
+        self.assertEqual(tab._status_received_chars, 0)
+
+        tab._detached_auto_status_mirrored = True
+        tab._status_message = "正在扩写正文..."
+        tab._status_stage_started_wall = 456.0
+        tab._status_received_chars = 2929
+        tab._refresh_status_display = lambda: None
+        tab._clear_detached_auto_status_mirror()
+        self.assertEqual(tab._status_message, "")
+        self.assertEqual(tab._status_received_chars, 0)
+        self.assertEqual(tab._status_stage_started_wall, 0.0)
 
     def test_detached_auto_completion_keeps_other_project_open(self):
         class FinishedRunner:
@@ -233,6 +359,23 @@ class NovelWritingStateTests(unittest.TestCase):
             ),
             "incomplete_output",
         )
+
+    def test_memory_failure_diagnostics_exclude_body_requests(self):
+        memory_failure = {
+            "event": "memory_validation_failed",
+            "level": "warning",
+            "pipeline": {"action": "memory_repair"},
+            "details": {"validation_errors": ["object_keys引用未知物件"]},
+        }
+        body_failure = {
+            "event": "chapter_ai_request_failed",
+            "level": "error",
+            "pipeline": {"action": "draft"},
+            "details": {"error": "正文请求失败"},
+        }
+
+        self.assertTrue(NovelWritingTab._should_log_memory_failure(memory_failure))
+        self.assertFalse(NovelWritingTab._should_log_memory_failure(body_failure))
 
     def test_status_tracker_records_chapter_stage_time_ranges(self):
         chapter = _new_chapter(0)
@@ -4427,11 +4570,25 @@ class NovelWritingStateTests(unittest.TestCase):
         self.assertIn("只审查第十章边界的状态语义", started[0][1])
         self.assertEqual(chapter["memory_reconciliation_status"], "pending")
 
-    def test_boundary_reconciliation_failure_commits_original_valid_bundle(self):
+    def test_boundary_reconciliation_failure_keeps_package_for_next_resume(self):
         chapter = _new_chapter(9)
         tab = NovelWritingTab.__new__(NovelWritingTab)
-        tab.current_project = {"chapters": [chapter]}
+        tab.current_project = {
+            "chapters": [chapter],
+            "long_form_memory": {"revision": 9},
+        }
         tab.current_chapter_index = 0
+        tab.current_project_path = "/tmp/project.json"
+        tab._current_chapter_id = lambda: chapter["id"]
+        tab._current_chapter_ai_task_context = lambda: {}
+        tab._persist_ai_generation_state = lambda: None
+        tab._note_project_dirty = lambda: None
+        tab._log_novel_diagnostic = lambda *_args, **_kwargs: None
+        tab._set_partial_chapter_ai_preview_state = lambda *_args, **_kwargs: None
+        tab._reset_chapter_ai_sequence = lambda: None
+        tab._set_chapter_ai_actions_enabled = lambda *_args, **_kwargs: None
+        tab.set_status_tip = lambda *_args, **_kwargs: None
+        tab.chapter_ai_preview = _FakePlainTextEdit("")
         bundle = {"summary": "摘要", "memory_update": {"schema_version": 2}}
         tab._chapter_ai_memory_pending = {
             "chapter_id": chapter["id"], "final_text": "终稿正文。", "bundle": bundle,
@@ -4445,9 +4602,130 @@ class NovelWritingStateTests(unittest.TestCase):
 
         self.assertEqual(chapter["memory_reconciliation_status"], "failed")
         self.assertIn("接口暂时失败", chapter["memory_reconciliation_error"])
-        self.assertEqual(applied, [("终稿正文。", bundle, True)])
+        self.assertEqual(applied, [])
+        checkpoint = chapter["ai_generation_checkpoint"]
+        self.assertEqual(checkpoint["stage"], "memory_reconcile")
+        self.assertEqual(checkpoint["bundle"], bundle)
+        self.assertEqual(checkpoint["final_text"], "终稿正文。")
+        self.assertTrue(chapter["auto_expand_resume_required"])
 
-    def test_boundary_reconciliation_api_failure_does_not_stop_auto_expand(self):
+    def test_saved_reconciliation_checkpoint_is_selected_before_new_draft(self):
+        chapter = _new_chapter(9)
+        chapter.update({
+            "outline": "本章边界提纲",
+            "memory_reconciliation_status": "failed",
+            "ai_generation_checkpoint": {
+                "version": 3,
+                "stage": "memory_reconcile",
+                "chapter_id": chapter["id"],
+                "chapter_index": 0,
+                "project_path": "/tmp/project.json",
+                "final_text": "已经完成的正文。",
+                "final_text_sha256": NovelWritingTab._chapter_ai_checkpoint_hash("已经完成的正文。"),
+                "outline_sha256": NovelWritingTab._chapter_ai_checkpoint_hash("本章边界提纲"),
+                "base_memory_revision": 9,
+                "bundle": {"memory_update": {"schema_version": 2}},
+                "transaction_id": "memory-sync-test",
+            },
+        })
+        tab = NovelWritingTab.__new__(NovelWritingTab)
+        tab.current_project = {
+            "chapters": [chapter],
+            "long_form_memory": {"revision": 9},
+        }
+        tab.current_chapter_index = 0
+        tab.current_project_path = "/tmp/project.json"
+
+        checkpoint = tab._validated_memory_reconciliation_checkpoint()
+
+        self.assertIsNotNone(checkpoint)
+        self.assertEqual(checkpoint["stage"], "memory_reconcile")
+        self.assertEqual(tab._auto_expand_pending_indexes(), [0])
+
+    def test_manual_sequence_resumes_saved_reconciliation_without_new_draft(self):
+        chapter = _new_chapter(0)
+        chapter.update({
+            "outline": "边界提纲",
+            "memory_reconciliation_status": "failed",
+            "ai_generation_checkpoint": {
+                "version": 3,
+                "stage": "memory_reconcile",
+                "chapter_id": chapter["id"],
+                "chapter_index": 0,
+                "project_path": "/tmp/project.json",
+                "final_text": "保留的完整正文。",
+                "final_text_sha256": NovelWritingTab._chapter_ai_checkpoint_hash("保留的完整正文。"),
+                "outline_sha256": NovelWritingTab._chapter_ai_checkpoint_hash("边界提纲"),
+                "base_memory_revision": 9,
+                "bundle": {"memory_update": {"schema_version": 2}},
+                "transaction_id": "memory-sync-test",
+            },
+        })
+        tab = NovelWritingTab.__new__(NovelWritingTab)
+        tab.current_project = {"chapters": [chapter], "long_form_memory": {"revision": 9}}
+        tab.current_chapter_index = 0
+        tab.current_project_path = "/tmp/project.json"
+        tab.chapter_outline = _FakePlainTextEdit("边界提纲")
+        tab.chapter_ai_preview = _FakePlainTextEdit("")
+        tab._current_novel_ai_selection = lambda: ({"id": "provider"}, "model", "")
+        tab._flush_current_editors = lambda: None
+        tab._reset_chapter_ai_sequence = lambda: None
+        tab._reset_chapter_ai_style_retry = lambda: None
+        tab._set_partial_chapter_ai_preview_state = lambda *_args, **_kwargs: None
+        tab._mark_current_chapter_ai_sync_pending = lambda _chapter: None
+        resumed_calls = []
+        tab._start_memory_reconciliation = lambda text, bundle, resumed=False: resumed_calls.append(
+            (text, bundle, resumed)
+        )
+
+        tab._start_chapter_ai_sequence()
+
+        self.assertEqual(resumed_calls, [("保留的完整正文。", {"memory_update": {"schema_version": 2}}, True)])
+
+    def test_legacy_committed_reconciliation_resume_keeps_memory_sync_complete(self):
+        chapter = _new_chapter(9)
+        chapter.update({
+            "memory_sync_status": "complete",
+            "memory_reconciliation_status": "pending",
+        })
+        tab = NovelWritingTab.__new__(NovelWritingTab)
+        tab._chapter_ai_memory_pending = {"already_committed": True}
+        tab._note_project_dirty = lambda: None
+        tab._persist_ai_generation_state = lambda: None
+
+        tab._mark_current_chapter_ai_sync_pending(chapter)
+
+        self.assertEqual(chapter["memory_sync_status"], "complete")
+        self.assertTrue(chapter["auto_expand_resume_required"])
+
+    def test_legacy_committed_boundary_checkpoint_marker_is_preserved_on_failure(self):
+        chapter = _new_chapter(9)
+        tab = NovelWritingTab.__new__(NovelWritingTab)
+        tab.current_project = {"chapters": [chapter], "long_form_memory": {"revision": 40}}
+        tab.current_chapter_index = 0
+        tab.current_project_path = "/tmp/project.json"
+        tab._current_chapter_id = lambda: chapter["id"]
+        tab._current_chapter_ai_task_context = lambda: {}
+        tab._persist_ai_generation_state = lambda: None
+        tab._note_project_dirty = lambda: None
+        tab._log_novel_diagnostic = lambda *_args, **_kwargs: None
+        tab._set_partial_chapter_ai_preview_state = lambda *_args, **_kwargs: None
+        tab._reset_chapter_ai_sequence = lambda: None
+        tab._set_chapter_ai_actions_enabled = lambda *_args, **_kwargs: None
+        tab.set_status_tip = lambda *_args, **_kwargs: None
+        tab.chapter_ai_preview = _FakePlainTextEdit("")
+        tab._chapter_ai_memory_pending = {
+            "chapter_id": chapter["id"],
+            "final_text": "终稿正文。",
+            "bundle": {"memory_update": {"schema_version": 2}},
+            "already_committed": True,
+        }
+
+        tab._apply_memory_reconciliation_fallback("接口暂时失败")
+
+        self.assertTrue(chapter["ai_generation_checkpoint"]["already_committed"])
+
+    def test_boundary_reconciliation_api_failure_delegates_to_checkpoint_fallback(self):
         tab = NovelWritingTab.__new__(NovelWritingTab)
         tab._chapter_ai_running_action = "memory_reconcile"
         tab._chapter_ai_sequence_active = True
@@ -4462,7 +4740,7 @@ class NovelWritingStateTests(unittest.TestCase):
 
         self.assertEqual(stopped, [])
         self.assertEqual(len(fallback), 1)
-        self.assertIn("已采用原本通过校验的状态增量", fallback[0])
+        self.assertIn("已保留原本通过校验的状态包等待下次对账", fallback[0])
 
     def test_no_style_tenth_chapter_summary_also_starts_boundary_reconciliation(self):
         chapters = [_new_chapter(index) for index in range(10)]

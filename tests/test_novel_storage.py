@@ -209,12 +209,64 @@ class NovelStorageTests(unittest.TestCase):
                 for name, value in old_values.items():
                     setattr(novel_storage, name, value)
 
+    def test_memory_diagnostic_log_is_separate_bounded_and_redacted(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            old_values = {
+                name: getattr(novel_storage, name)
+                for name in (
+                    "NOVEL_DIAGNOSTIC_DIR",
+                    "NOVEL_MEMORY_DIAGNOSTIC_LOG_FILE",
+                    "NOVEL_MEMORY_DIAGNOSTIC_BACKUP_FILE",
+                    "NOVEL_MEMORY_DIAGNOSTIC_MAX_BYTES",
+                )
+            }
+            try:
+                novel_storage.NOVEL_DIAGNOSTIC_DIR = tmp
+                novel_storage.NOVEL_MEMORY_DIAGNOSTIC_LOG_FILE = os.path.join(
+                    tmp, "memory_sync_failures.jsonl"
+                )
+                novel_storage.NOVEL_MEMORY_DIAGNOSTIC_BACKUP_FILE = os.path.join(
+                    tmp, "memory_sync_failures.jsonl.1"
+                )
+                novel_storage.NOVEL_MEMORY_DIAGNOSTIC_MAX_BYTES = 240
+
+                path = novel_storage.append_novel_memory_diagnostic_event({
+                    "event": "memory_validation_failed",
+                    "level": "warning",
+                    "api_key": "sk-secret-key",
+                    "error": "Authorization: Bearer sk-secret-key",
+                    "body": "正文不应写入专项日志",
+                    "chapter": {"index": 15},
+                })
+                self.assertEqual(path, novel_storage.NOVEL_MEMORY_DIAGNOSTIC_LOG_FILE)
+                events = novel_storage.read_novel_memory_diagnostic_events(limit=10)
+                self.assertEqual(events[0]["event"], "memory_validation_failed")
+                raw = json.dumps(events, ensure_ascii=False)
+                self.assertNotIn("sk-secret-key", raw)
+                self.assertNotIn("正文不应写入专项日志", raw)
+
+                novel_storage.append_novel_memory_diagnostic_event({
+                    "event": "memory_sync_failed",
+                    "error": "第二条",
+                    "chapter": {"index": 16},
+                })
+                self.assertTrue(
+                    os.path.exists(novel_storage.NOVEL_MEMORY_DIAGNOSTIC_BACKUP_FILE)
+                )
+                self.assertEqual(
+                    [item["event"] for item in novel_storage.read_novel_memory_diagnostic_events(10)],
+                    ["memory_validation_failed", "memory_sync_failed"],
+                )
+            finally:
+                for name, value in old_values.items():
+                    setattr(novel_storage, name, value)
+
     def test_project_save_propagates_atomic_write_failure(self):
         with patch.object(novel_storage, "_atomic_write_json", side_effect=OSError("disk full")):
             with self.assertRaisesRegex(OSError, "disk full"):
                 novel_storage.save_project_file("/tmp/novel-project.json", {"meta": {}})
 
-    def test_latest_model_exchange_is_overwritten_as_a_single_rolling_snapshot(self):
+    def test_latest_model_exchange_keeps_request_scoped_snapshots(self):
         with tempfile.TemporaryDirectory() as tmp:
             old_path = novel_storage.NOVEL_DIAGNOSTIC_LATEST_EXCHANGE_FILE
             try:
@@ -226,10 +278,21 @@ class NovelStorageTests(unittest.TestCase):
                     "request-2", {"user_context": "第二份", "partial_output": "结果二"}
                 )
 
-                with open(path, "r", encoding="utf-8") as handle:
+                with open(novel_storage.NOVEL_DIAGNOSTIC_LATEST_EXCHANGE_FILE, "r", encoding="utf-8") as handle:
                     latest = json.load(handle)
                 self.assertEqual(latest["request_id"], "request-2")
                 self.assertEqual(latest["partial_output"], "结果二")
+                request_one = os.path.join(
+                    tmp, "model_exchanges", "request-1.json"
+                )
+                request_two = os.path.join(
+                    tmp, "model_exchanges", "request-2.json"
+                )
+                self.assertTrue(os.path.exists(request_one))
+                self.assertTrue(os.path.exists(request_two))
+                self.assertTrue(path.endswith("request-1.json"))
+                with open(request_one, "r", encoding="utf-8") as handle:
+                    self.assertEqual(json.load(handle)["partial_output"], "结果一")
             finally:
                 novel_storage.NOVEL_DIAGNOSTIC_LATEST_EXCHANGE_FILE = old_path
 

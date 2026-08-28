@@ -1240,6 +1240,54 @@ def _merge_character_identity_fields(record, incoming_fields):
     return changed
 
 
+def _character_identity_fields_from_item(item):
+    """Read character identity fields from current and legacy response shapes."""
+    if not isinstance(item, dict):
+        return {}
+
+    aliases = {
+        "role": ("role", "identity", "character_role", "身份", "角色定位", "人物身份", "定位"),
+        "goal": ("goal", "target", "motive", "motivation", "objective", "目标", "人物目标", "动机", "诉求"),
+        "secret": ("secret", "hidden_secret", "private_secret", "秘密", "隐藏秘密", "隐情"),
+        "voice": ("voice", "language_style", "speaking_style", "tone", "语言风格", "说话风格", "口吻", "语气"),
+        "notes": ("notes", "说明", "备注", "人物关系", "关系变化"),
+    }
+    sources = []
+    for key in ("identity_patch", "canon", "fields"):
+        value = item.get(key)
+        if isinstance(value, dict):
+            sources.append(value)
+    sources.append(item)
+
+    placeholder_markers = (
+        "仅新增时填写",
+        "正文明确的身份",
+        "正文明确的目标",
+        "正文明确且值得保留的隐情",
+        "正文中足够明显的语言/口吻特征",
+        "无证据留空",
+        "证据不足留空",
+    )
+
+    def usable(value):
+        value = str(value or "").strip()
+        if not value or any(marker in value for marker in placeholder_markers):
+            return ""
+        return value
+
+    result = {}
+    for field, field_aliases in aliases.items():
+        for source in sources:
+            for key in field_aliases:
+                value = usable(source.get(key, ""))
+                if value:
+                    result[field] = value
+                    break
+            if field in result:
+                break
+    return result
+
+
 def _promote_character_identity(record, incoming_name, incoming_fields=None):
     """Rename a temporary character and merge explicit identity details, keeping its ID."""
     if not isinstance(record, dict):
@@ -9018,6 +9066,9 @@ def _build_style_execution_context(
         "根据当前章节资料和前面的完整原样本，写出本章可直接进入小说的正文。"
         "项目资料中已经确定的人名、时间、地点、关系、物件、编号、人物状态和已发生事件保持原样延续。"
         "正文从当前章节的状态自然展开。"
+        f"输出必须严格使用{NOVEL_PROSE_START_MARKER}和{NOVEL_PROSE_END_MARKER}包住正文；"
+        "包络外不输出任何说明，包络内不写‘我会’‘接下来’‘本章将’等规划、分析或执行稿内容，"
+        "只写可以直接进入小说的正文。"
     )
     budget = max(0, effective_limit - len(instruction) - 2)
     if len(original) > budget:
@@ -9071,6 +9122,97 @@ def _parse_style_execution_result(value):
         ),
         "style_plan_parsed": bool(style_plan),
         "complete_set_count": len(complete_sets),
+    }
+
+
+NOVEL_PROSE_START_MARKER = "<NOVEL_PROSE_START>"
+NOVEL_PROSE_END_MARKER = "<NOVEL_PROSE_END>"
+
+
+def _extract_prose_delivery_result(value, require_marker=False):
+    """Return only the body allowed to enter the writing pipeline."""
+    raw = str(value or "").strip()
+    if not raw:
+        return {
+            "ok": False,
+            "text": "",
+            "source": "empty",
+            "execution": "",
+            "style_plan": "",
+            "error": "AI 正文交付边界不完整：返回为空。",
+        }
+
+    has_structured_sections = bool(re.search(
+        r"【(?:剧情执行清单|本章声纹执行表|备用正文草稿)】",
+        raw,
+    ))
+    if has_structured_sections:
+        parsed = _parse_style_execution_result(raw)
+        draft = str(parsed.get("draft", "") or "").strip()
+        if parsed.get("parsed") and parsed.get("style_plan_parsed") and draft:
+            return {
+                "ok": True,
+                "text": draft,
+                "source": "structured_backup_draft",
+                "execution": str(parsed.get("execution", "") or "").strip(),
+                "style_plan": str(parsed.get("style_plan", "") or "").strip(),
+                "error": "",
+            }
+        return {
+            "ok": False,
+            "text": "",
+            "source": "structured_incomplete",
+            "execution": "",
+            "style_plan": "",
+            "error": "AI 剧情执行稿结构不完整，正文交付边界没有提供完整备用正文。",
+        }
+
+    if require_marker:
+        start_index = raw.find(NOVEL_PROSE_START_MARKER)
+        end_index = (
+            raw.find(
+                NOVEL_PROSE_END_MARKER,
+                start_index + len(NOVEL_PROSE_START_MARKER),
+            )
+            if start_index >= 0 else -1
+        )
+        if start_index < 0 or end_index < 0:
+            return {
+                "ok": False,
+                "text": "",
+                "source": "direct_boundary_missing",
+                "execution": "",
+                "style_plan": "",
+                "error": "AI 正文交付边界不完整：直写正文必须只放在正文包络内。",
+            }
+        prose = raw[
+            start_index + len(NOVEL_PROSE_START_MARKER):end_index
+        ].strip()
+        if not prose:
+            return {
+                "ok": False,
+                "text": "",
+                "source": "direct_boundary_empty",
+                "execution": "",
+                "style_plan": "",
+                "error": "AI 正文交付边界不完整：正文包络内为空。",
+            }
+        return {
+            "ok": True,
+            "text": prose,
+            "source": "direct_prose_boundary",
+            "execution": "",
+            "style_plan": "",
+            "error": "",
+        }
+
+    return {
+        "ok": True,
+        "text": raw,
+        "source": "plain_compatibility",
+        "execution": "",
+        "style_plan": "",
+        "error": "",
     }
 
 
@@ -11653,7 +11795,13 @@ def _long_form_update_contract_example(project, chapter_index):
                     "name": "新增时填写稳定姓名；临时人物升级时填写正文明确的新姓名",
                     "state": "当前动态状态，不重写永久身份、长期目标、秘密或语言",
                     "changes": ["本章长期变化"],
-                    "canon": {"role": "仅新增时填写", "goal": "", "secret": "", "voice": "", "notes": ""},
+                    "canon": {
+                        "role": "正文明确的身份",
+                        "goal": "正文明确的目标；无证据留空",
+                        "secret": "正文明确且值得保留的隐情；无证据留空",
+                        "voice": "正文中足够明显的语言/口吻特征；证据不足留空",
+                        "notes": "正文明确的关系、经历或其他长期信息",
+                    },
                     "evidence_quote": "最终正文中的逐字短句",
                 }
             ],
@@ -11840,8 +11988,8 @@ def _long_form_compact_update_contract_instructions(project, chapter_index):
         "不能因为新增了一条更宽泛的概括而退役精确旧事实；仍有效的精确旧事实必须继续保留。"
         "本章选择索引中未发生变化的已有事实由程序自动保留并生成复核索引，不得为它们输出keep；"
         "fact_updates只提交正文明确新增、更新、退出或取代的事实。"
-        "record_updates只写人物或设定的动态变化；普通update不得修改canon，create使用NC/NL临时key并填写稳定名称和canon。"
-        "但已有姓名未明或临时称谓人物正式命名时，同一update允许在canon中填写正文明确的新身份资料；程序只补齐空字段，不覆盖已有永久资料。"
+        "record_updates只写人物或设定的动态变化。新人物create使用NC/NL临时key并填写稳定名称和canon；人物canon的role、goal、secret、voice、notes逐项只填写最终正文能够支持的内容，不能为了填满字段猜测。"
+        "已有人物若正文补出了此前空缺的身份、目标、秘密或语言风格，使用identity_patch逐项补齐；程序保留已有内容，并只追加正文有证据的新补充，不覆盖或替换旧资料。已有姓名未明或临时称谓人物正式命名时，继续沿用原人物ref并用name升级同一ID。"
         "如果正文把已有的姓名未明或临时称谓人物正式命名，必须沿用原人物ref并用update填写name为正式姓名，"
         "不得新建第二张人物卡；只有正文没有对应旧人物时才create。"
         "不得改写导入的人物卡、设定定义或伏笔计划。新增记录不要生成真实ID，真实ID由程序分配。"
@@ -11983,6 +12131,9 @@ def _long_form_update_contract_instructions(project, chapter_index, compact=Fals
             "fact_lifecycle_review.scope必须为current_chapter，只复核当前章相关事实。"
         )
         + "必须填写state_lifecycle_review；其中只能引用全局紧凑状态目录里本次调用前已经存在的物件键、CF-ID和TASK-ID，"
+        "引用字段严格分区：lore_refs只能填写人物设定库中的设定编号或设定别名；"
+        "object_keys只能填写状态快照或本次state_patch中真实存在的具体物件键；"
+        "设定ID、伏笔ID、事实ID和设定名称即使指向某个物品，也不得放入object_keys；没有真实物件状态时object_keys必须为空。"
         "不得填写本次新增的NCF/NTASK临时key。"
         f"三组复核数组至少必须完整包含：{required_state_review_text}；"
         + (
@@ -11992,7 +12143,7 @@ def _long_form_update_contract_instructions(project, chapter_index, compact=Fals
             if stage_boundary else
             "state_lifecycle_review.scope必须为current_chapter；复核本章已选及本章触及的物件、冲突和任务。"
         )
-        + "record_updates只记录动态状态和本章变化；canon通常只允许create时填写；已有临时人物正式命名时，update可附正文明确的新身份资料，程序只补齐空字段。"
+        + "record_updates只记录动态状态和本章变化；新人物使用canon逐项填写正文有证据的身份、目标、秘密、语言风格和备注，不能猜测。已有角色只在正文补出原卡空缺信息时使用identity_patch逐项补齐，程序保留已有内容并追加明确的新补充，不覆盖或替换旧资料。已有临时人物正式命名时也使用原ref和identity_patch完成同一ID升级。"
         "已有临时人物在正文中获得正式姓名时，必须用原ref加name完成同一ID升级；不能把正式姓名另建为新人物。"
         "所有fact_updates、record_updates和foreshadow_updates必须附带最终正文中连续逐字出现的8-60字evidence_quote。"
         "keep不改写事实，可不填evidence_quote；其余事实操作必须有逐字证据。"
@@ -12575,6 +12726,101 @@ def _normalize_long_form_state_aliases(update):
         runtime_review = reconciliation.get("record_runtime_review", {})
         if isinstance(runtime_review, dict):
             runtime_review = deepcopy(runtime_review)
+            runtime_conclusions = runtime_review.get("runtime_conclusions", [])
+            if isinstance(runtime_conclusions, list):
+                known_lore_refs = {
+                    str(value or "").strip()
+                    for value in ref_list(reconciliation.get("lore_refs", []))
+                    if str(value or "").strip()
+                }
+                known_foreshadow_refs = {
+                    str(value or "").strip()
+                    for value in ref_list(reconciliation.get("foreshadow_refs", []))
+                    if str(value or "").strip()
+                }
+                reviewed_by_kind = {
+                    "lore": runtime_review.get("reviewed_lore_refs", []),
+                    "foreshadows": runtime_review.get("reviewed_foreshadow_refs", []),
+                }
+                unchanged_by_kind = {
+                    "lore": runtime_review.get("unchanged_lore_refs", []),
+                    "foreshadows": runtime_review.get("unchanged_foreshadow_refs", []),
+                }
+                for kind in reviewed_by_kind:
+                    if not isinstance(reviewed_by_kind[kind], list):
+                        reviewed_by_kind[kind] = []
+                    if not isinstance(unchanged_by_kind[kind], list):
+                        unchanged_by_kind[kind] = []
+
+                def append_runtime_ref(target, value):
+                    value = str(value or "").strip()
+                    if value and value not in target:
+                        target.append(value)
+
+                for item in runtime_conclusions:
+                    if isinstance(item, dict):
+                        ref = first_value(
+                            item,
+                            (
+                                "ref", "record_ref", "lore_ref", "foreshadow_ref",
+                                "id", "key",
+                            ),
+                        )
+                        conclusion = str(
+                            first_value(item, ("conclusion", "result", "status", "state"))
+                            or ""
+                        ).strip().lower()
+                        kind_hint = str(
+                            first_value(item, ("kind", "type", "record_type", "category"))
+                            or ""
+                        ).strip().lower()
+                        if any(
+                            str(item.get(key, "") or "").strip()
+                            for key in ("foreshadow_ref", "foreshadow_id", "foreshadow")
+                        ) or any(marker in kind_hint for marker in ("foreshadow", "伏笔")):
+                            kind = "foreshadows"
+                        elif any(marker in kind_hint for marker in ("lore", "setting", "设定")):
+                            kind = "lore"
+                        else:
+                            kind = ""
+                    else:
+                        ref = item
+                        conclusion = ""
+                        kind = ""
+                    refs = ref_list(ref)
+                    for value in refs:
+                        if not kind:
+                            if value in known_foreshadow_refs or value.startswith("F"):
+                                kind = "foreshadows"
+                            elif value in known_lore_refs or value.startswith("L"):
+                                kind = "lore"
+                            elif value in {
+                                str(item or "").strip()
+                                for item in reviewed_by_kind["foreshadows"]
+                                if str(item or "").strip()
+                            }:
+                                kind = "foreshadows"
+                            elif value in {
+                                str(item or "").strip()
+                                for item in reviewed_by_kind["lore"]
+                                if str(item or "").strip()
+                            }:
+                                kind = "lore"
+                        if not kind:
+                            continue
+                        append_runtime_ref(reviewed_by_kind[kind], value)
+                        if (
+                            "unchanged" in conclusion
+                            or "未变化" in conclusion
+                            or "未改变" in conclusion
+                            or "不变" in conclusion
+                            or "same" == conclusion
+                        ):
+                            append_runtime_ref(unchanged_by_kind[kind], value)
+                runtime_review["reviewed_lore_refs"] = reviewed_by_kind["lore"]
+                runtime_review["reviewed_foreshadow_refs"] = reviewed_by_kind["foreshadows"]
+                runtime_review["unchanged_lore_refs"] = unchanged_by_kind["lore"]
+                runtime_review["unchanged_foreshadow_refs"] = unchanged_by_kind["foreshadows"]
             for reviewed_key, unchanged_key in (
                 ("reviewed_lore_refs", "unchanged_lore_refs"),
                 ("reviewed_foreshadow_refs", "unchanged_foreshadow_refs"),
@@ -12644,6 +12890,22 @@ def _normalize_long_form_state_aliases(update):
                 elif operation in {"modify", "change", "patch"}:
                     operation = "update"
                     item["operation"] = operation
+                if kind == "characters":
+                    identity_fields = _character_identity_fields_from_item(item)
+                    if operation == "create":
+                        if identity_fields:
+                            canon = item.get("canon")
+                            canon = deepcopy(canon) if isinstance(canon, dict) else {}
+                            for field, value in identity_fields.items():
+                                if not str(canon.get(field, "") or "").strip():
+                                    canon[field] = value
+                            item["canon"] = canon
+                    elif identity_fields:
+                        # Older responses put identity fields at the top level or
+                        # under canon/fields. Normalize them into the explicit
+                        # supplement channel so update validation stays strict.
+                        item["identity_patch"] = identity_fields
+                        item["canon"] = {}
                 if not str(item.get("ref", "") or "").strip() and operation != "create":
                     kind_specific_ref = (
                         "character_id" if kind == "characters" else "lore_id"
@@ -12732,13 +12994,20 @@ def _normalize_long_form_state_aliases(update):
                             "supersedes", "supersedes_fact_id", "replaces", "replaced_fact_id",
                         ),
                     )
-                if not str(item.get("key", "") or "").strip():
-                    item["key"] = first_value(
-                        item,
-                        (
-                            "new_fact_key", "new_key", "fact_key", "temp_key", "stable_ref",
-                        ),
-                    )
+                # A supersede has two different references: id points to the
+                # old AF record, while key is the new temporary NF record.
+                # Some model responses echo the old id into key and put the
+                # real new key in new_fact_key.
+                new_fact_key = first_value(
+                    item,
+                    (
+                        "new_fact_key", "new_key", "fact_key", "temp_key",
+                    ),
+                )
+                if new_fact_key:
+                    item["key"] = new_fact_key
+                elif not str(item.get("key", "") or "").strip():
+                    item["key"] = first_value(item, ("stable_ref",))
             elif operation == "add":
                 if not str(item.get("key", "") or "").strip():
                     item["key"] = first_value(
@@ -12940,6 +13209,44 @@ def _normalize_long_form_state_aliases(update):
         for key in ("character_states", "relationship_states", "object_states", "active_conflicts", "unresolved_tasks"):
             normalize_evidence_fields(state_patch.get(key, []))
     return payload
+
+
+def _load_json_with_trailing_delimiter_repair(value):
+    """Parse JSON when the only loss is an unambiguous trailing delimiter."""
+    text = str(value or "").strip()
+    if not text:
+        return None, False
+    stack = []
+    in_string = False
+    escaped = False
+    pairs = {"}": "{", "]": "["}
+    for char in text:
+        if in_string:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                in_string = False
+            continue
+        if char == '"':
+            in_string = True
+        elif char in "[{":
+            stack.append(char)
+        elif char in "]}":
+            if not stack or stack[-1] != pairs[char]:
+                return None, False
+            stack.pop()
+    if in_string or escaped or not stack:
+        return None, False
+    repaired = text + "".join(
+        "]" if char == "[" else "}" for char in reversed(stack)
+    )
+    try:
+        data = json.loads(repaired)
+    except Exception:
+        return None, False
+    return (data, True) if isinstance(data, dict) else (None, False)
 
 
 def _load_json_with_single_missing_quote_repair(value):
@@ -13197,6 +13504,7 @@ def _normalize_long_form_update_payload(project, chapter_index, update):
         if "state_patch" not in payload and isinstance(payload.get("state_snapshot"), dict):
             payload["state_patch"] = deepcopy(payload.get("state_snapshot", {}))
         payload = _normalize_long_form_state_aliases(payload)
+    payload = _drop_empty_long_form_state_items(project, payload)
     payload = _repair_invalid_long_form_record_refs_by_name(project, payload)
     payload = _normalize_long_form_ephemeral_actor_refs(project, payload)
     payload = _normalize_long_form_fact_update_scopes(project, payload)
@@ -13239,6 +13547,115 @@ def _normalize_long_form_update_payload(project, chapter_index, update):
     payload.setdefault("long_term_events", [])
     payload.setdefault("state_reconciliation", {})
     payload.setdefault("next_chapter_memory", {})
+    return payload
+
+
+def _drop_empty_long_form_state_items(project, payload):
+    """Drop empty conflict/task rows without inventing a state decision.
+
+    An empty row has no semantic update to persist. When it carries a new
+    temporary key, remove only references that were generated for that same
+    row; unrelated unknown references must remain visible to validation.
+    """
+    if not isinstance(payload, dict):
+        return payload
+    state_patch = payload.get("state_patch")
+    if not isinstance(state_patch, dict):
+        return payload
+
+    dropped = {"conflicts": set(), "tasks": set()}
+    for state_key, text_key, kind in (
+        ("active_conflicts", "conflict", "conflicts"),
+        ("unresolved_tasks", "task", "tasks"),
+    ):
+        values = state_patch.get(state_key)
+        if not isinstance(values, list):
+            continue
+        kept = []
+        for item in values:
+            if not isinstance(item, dict):
+                kept.append(item)
+                continue
+            if str(item.get(text_key, "") or "").strip():
+                kept.append(item)
+                continue
+            ref = str(item.get("id", "") or item.get("key", "") or "").strip()
+            if ref:
+                dropped[kind].add(ref.casefold())
+        state_patch[state_key] = kept
+
+    if not any(dropped.values()):
+        return payload
+
+    existing_state_refs = _long_form_existing_state_refs(
+        project,
+        _normalize_long_form_memory(
+            project.get("long_form_memory", {})
+            if isinstance(project, dict) else {}
+        ),
+    )
+    existing_ids_by_kind = {
+        "conflicts": {
+            str(value or "").strip().casefold()
+            for value in existing_state_refs.get("conflict_ids", set())
+            if str(value or "").strip()
+        },
+        "tasks": {
+            str(value or "").strip().casefold()
+            for value in existing_state_refs.get("task_ids", set())
+            if str(value or "").strip()
+        },
+    }
+    new_refs = {
+        kind: {
+            value.casefold()
+            for value in refs
+            if value.casefold() not in existing_ids_by_kind.get(kind, set())
+        }
+        for kind, refs in dropped.items()
+    }
+
+    def remove_refs(values, kind):
+        if not isinstance(values, list):
+            return values
+        blocked = new_refs.get(kind, set())
+        return [
+            value for value in values
+            if str(value or "").strip().casefold() not in blocked
+        ]
+
+    reconciliation = payload.get("state_reconciliation")
+    if isinstance(reconciliation, dict):
+        reconciliation["conflict_refs"] = remove_refs(
+            reconciliation.get("conflict_refs", []), "conflicts"
+        )
+        reconciliation["task_refs"] = remove_refs(
+            reconciliation.get("task_refs", []), "tasks"
+        )
+    next_memory = payload.get("next_chapter_memory")
+    if isinstance(next_memory, dict):
+        for key in ("conflict_refs", "conflict_ids"):
+            next_memory[key] = remove_refs(next_memory.get(key, []), "conflicts")
+        for key in ("task_refs", "task_ids"):
+            next_memory[key] = remove_refs(next_memory.get(key, []), "tasks")
+    lifecycle = payload.get("state_lifecycle_review")
+    if isinstance(lifecycle, dict):
+        lifecycle["reviewed_conflict_refs"] = remove_refs(
+            lifecycle.get("reviewed_conflict_refs", []), "conflicts"
+        )
+        lifecycle["reviewed_task_refs"] = remove_refs(
+            lifecycle.get("reviewed_task_refs", []), "tasks"
+        )
+    for event in payload.get("long_term_events", []) if isinstance(payload.get("long_term_events"), list) else []:
+        if not isinstance(event, dict) or not isinstance(event.get("storage"), dict):
+            continue
+        storage = event["storage"]
+        storage["conflict_refs"] = remove_refs(
+            storage.get("conflict_refs", []), "conflicts"
+        )
+        storage["task_refs"] = remove_refs(
+            storage.get("task_refs", []), "tasks"
+        )
     return payload
 
 
@@ -13285,6 +13702,8 @@ def _normalize_long_form_event_storage_refs(project, chapter_index, update):
     state_patch = payload.get("state_patch", {})
     state_patch = state_patch if isinstance(state_patch, dict) else {}
     canonical_object_keys = {}
+    object_key_by_lore_id = {}
+    ambiguous_object_lore_ids = set()
     for source in (snapshot.get("object_states", []), state_patch.get("object_states", [])):
         for item in source if isinstance(source, list) else []:
             if not isinstance(item, dict):
@@ -13474,6 +13893,26 @@ def _normalize_long_form_event_storage_refs(project, chapter_index, update):
     return payload
 
 
+def _long_form_object_record_namespace(project, item):
+    """Return a record namespace when an object key is not a proven object key."""
+    if not isinstance(item, dict):
+        return ""
+    raw_key = str(item.get("key", item.get("name", "")) or "").strip()
+    if not raw_key:
+        return ""
+    for kind in ("characters", "lore", "foreshadows"):
+        record_id = _resolve_long_form_record_ref(project, kind, raw_key)
+        if not record_id:
+            continue
+        if kind == "lore":
+            lore_ref = item.get("lore_ref", item.get("lore_id", ""))
+            bound_lore_id = _resolve_long_form_record_ref(project, "lore", lore_ref)
+            if bound_lore_id and bound_lore_id == record_id:
+                return ""
+        return kind
+    return ""
+
+
 def _normalize_long_form_structural_refs(project, chapter_index, update):
     payload = _normalize_long_form_event_storage_refs(project, chapter_index, update)
     reconciliation = payload.get("state_reconciliation", {})
@@ -13557,6 +13996,120 @@ def _normalize_long_form_structural_refs(project, chapter_index, update):
                 append_unique(output_key, item.get("id", "") or item.get("key", ""))
         for value in retirements.get(retirement_key, []) if isinstance(retirements.get(retirement_key), list) else []:
             append_unique(output_key, value)
+
+    # Keep reference namespaces separate. Models occasionally copy a lore alias
+    # such as L011 into object_keys because the lore record describes a physical
+    # item. Only remove values that are proven record references; unknown values
+    # remain visible to validation instead of being silently discarded.
+    memory = _normalize_long_form_memory(project.get("long_form_memory", {}))
+    snapshot = memory.get("state_snapshot", {}) if isinstance(memory, dict) else {}
+    snapshot = snapshot if isinstance(snapshot, dict) else {}
+    state_patch = payload.get("state_patch", {})
+    state_patch = state_patch if isinstance(state_patch, dict) else {}
+    canonical_object_keys = {}
+    object_key_by_lore_id = {}
+    ambiguous_object_lore_ids = set()
+    for source in (
+        snapshot.get("object_states", []),
+        state_patch.get("object_states", []),
+    ):
+        for item in source if isinstance(source, list) else []:
+            if not isinstance(item, dict):
+                continue
+            raw_key = str(item.get("key", item.get("name", "")) or "").strip()
+            compact_key = _compact_text(raw_key)
+            if compact_key and compact_key not in canonical_object_keys:
+                canonical_object_keys[compact_key] = raw_key
+            lore_ref = str(item.get("lore_id", item.get("lore_ref", "")) or "").strip()
+            lore_id = _resolve_long_form_record_ref(project, "lore", lore_ref)
+            if lore_id and raw_key:
+                if lore_id in object_key_by_lore_id and object_key_by_lore_id[lore_id] != raw_key:
+                    ambiguous_object_lore_ids.add(lore_id)
+                else:
+                    object_key_by_lore_id[lore_id] = raw_key
+
+    def record_namespace(raw_value):
+        raw_value = str(raw_value or "").strip()
+        if not raw_value:
+            return ""
+        if _resolve_long_form_record_ref(project, "lore", raw_value):
+            return "lore"
+        if _resolve_long_form_record_ref(project, "foreshadows", raw_value):
+            return "foreshadows"
+        return ""
+
+    def existing_object_for_record(raw_value, namespace):
+        if namespace != "lore":
+            return ""
+        lore_id = _resolve_long_form_record_ref(project, "lore", raw_value)
+        if not lore_id or lore_id in ambiguous_object_lore_ids:
+            return ""
+        return object_key_by_lore_id.get(lore_id, "")
+
+    def append_owner_reference(owner, key, value):
+        values = owner.get(key)
+        if not isinstance(values, list):
+            values = []
+            owner[key] = values
+        value = str(value or "").strip()
+        if value and value not in values:
+            values.append(value)
+
+    def normalize_object_references(owner, key, preserve_record_namespace=False):
+        values = owner.get(key)
+        if not isinstance(values, list):
+            return
+        normalized = []
+        for value in values:
+            raw_value = str(value or "").strip()
+            if not raw_value:
+                continue
+            namespace = record_namespace(raw_value)
+            if namespace:
+                output = existing_object_for_record(raw_value, namespace)
+                if output:
+                    if output not in normalized:
+                        normalized.append(output)
+                    continue
+                # A same-named object already exists but has no unambiguous
+                # lore binding. Keep the raw key so strict validation reports
+                # the namespace collision instead of guessing its identity.
+                if canonical_object_keys.get(_compact_text(raw_value), ""):
+                    output = raw_value
+                    if output not in normalized:
+                        normalized.append(output)
+                    continue
+                target_key = (
+                    "lore_refs" if namespace == "lore" else "foreshadow_refs"
+                )
+                append_unique(
+                    target_key,
+                    raw_value,
+                )
+                if preserve_record_namespace:
+                    append_owner_reference(owner, target_key, raw_value)
+                continue
+            output = canonical_object_keys.get(_compact_text(raw_value), "") or raw_value
+            if output not in normalized:
+                normalized.append(output)
+        owner[key] = normalized
+
+    normalize_object_references(
+        reconciliation,
+        "object_keys",
+        preserve_record_namespace=True,
+    )
+    lifecycle_review = payload.get("state_lifecycle_review", {})
+    if isinstance(lifecycle_review, dict):
+        normalize_object_references(lifecycle_review, "reviewed_object_keys")
+    next_memory = payload.get("next_chapter_memory", {})
+    if isinstance(next_memory, dict):
+        normalize_object_references(
+            next_memory,
+            "object_keys",
+            preserve_record_namespace=True,
+        )
+    normalize_object_references(retirements, "object_keys")
     return payload
 
 
@@ -13851,6 +14404,21 @@ def _resolve_long_form_stored_temp_refs(value, temp_refs):
         return current
 
     return walk(value)
+
+
+def _resolve_long_form_temp_ref(temp_refs, kind, value, default=""):
+    """Resolve a transaction-local key without changing unknown references."""
+    text = str(value or "").strip()
+    mapping = temp_refs.get(kind, {}) if isinstance(temp_refs, dict) else {}
+    if not text or not isinstance(mapping, dict):
+        return default
+    if text in mapping:
+        return mapping[text]
+    folded = text.casefold()
+    for key, item_id in mapping.items():
+        if str(key or "").strip().casefold() == folded:
+            return item_id
+    return default
 
 
 def _validate_long_form_memory_update(
@@ -14160,9 +14728,20 @@ def _validate_long_form_memory_update(
             }
 
         existing_object_keys = existing_state_refs["object_key_by_compact"]
+        reviewable_object_keys = dict(existing_object_keys)
+        # The lifecycle review may mention an object introduced in the same
+        # state patch. Add only genuine object keys here; lore/character
+        # record ids remain invalid object references.
+        for item in state_patch.get("object_states", []) if isinstance(state_patch.get("object_states"), list) else []:
+            if not isinstance(item, dict):
+                continue
+            raw_key = str(item.get("key", item.get("name", "")) or "").strip()
+            compact_key = _compact_text(raw_key)
+            if compact_key and not _long_form_object_record_namespace(project, item):
+                reviewable_object_keys.setdefault(compact_key, raw_key)
         unknown_reviewed_objects = sorted(
             value for value in reviewed["object_keys"]
-            if _compact_text(value) not in existing_object_keys
+            if _compact_text(value) not in reviewable_object_keys
         )
         if unknown_reviewed_objects:
             errors.append("状态生命周期复核引用未知物件：" + "、".join(unknown_reviewed_objects[:8]))
@@ -14426,11 +15005,20 @@ def _validate_long_form_memory_update(
                     if not isinstance(changes, list)
                     else any(str(value or "").strip() for value in changes)
                 )
+                has_identity_patch = bool(
+                    kind == "characters"
+                    and isinstance(item.get("identity_patch"), dict)
+                    and any(
+                        str(value or "").strip()
+                        for value in item.get("identity_patch", {}).values()
+                    )
+                )
                 if (
                     require_evidence
                     and not str(item.get("state", "") or "").strip()
                     and not has_changes
                     and not incoming_name
+                    and not has_identity_patch
                 ):
                     errors.append(f"{kind}更新第{index}项运行态变化为空")
                 if isinstance(item.get("canon"), dict) and any(
@@ -14534,6 +15122,29 @@ def _validate_long_form_memory_update(
         for item in state_patch.get("object_states", [])
         if isinstance(item, dict) and _compact_text(item.get("key", item.get("name", "")))
     )
+    invalid_object_namespace_keys = set()
+    for source in (
+        snapshot_for_review.get("object_states", []),
+        state_patch.get("object_states", []),
+    ):
+        for item in source if isinstance(source, list) else []:
+            if not isinstance(item, dict):
+                continue
+            compact_key = _compact_text(item.get("key", item.get("name", "")))
+            if compact_key and _long_form_object_record_namespace(project, item):
+                invalid_object_namespace_keys.add(compact_key)
+    valid_object_keys.difference_update(invalid_object_namespace_keys)
+    for index, item in enumerate(
+        state_patch.get("object_states", [])
+        if isinstance(state_patch.get("object_states"), list) else [],
+        1,
+    ):
+        namespace = _long_form_object_record_namespace(project, item)
+        if namespace:
+            raw_key = str(item.get("key", item.get("name", "")) or "").strip()
+            errors.append(
+                f"物品状态第{index}项不能直接使用{namespace}记录编号作为物件键：{raw_key}"
+            )
     valid_conflict_refs = {
         str(item.get("id", "") or "").strip()
         for item in snapshot_for_review.get("active_conflicts", [])
@@ -15185,54 +15796,155 @@ def _merge_long_form_memory_repair_full(memory_update, repaired_update, validati
 
 
 def _parse_memory_repair_result(value):
+    def empty_result():
+        return {
+            "parsed": False,
+            "repair_mode": "",
+            "outline": "",
+            "summary": "",
+            "key_facts": "",
+            "memory_update": {},
+            "memory_patch": {},
+            "logic_audit": {},
+            "prose_review": {"checked": True, "issues": []},
+            "repair_patches": [],
+        }
+
+    def is_placeholder(value):
+        if not isinstance(value, str):
+            return False
+        text = value.strip()
+        return (
+            text in {"...", "…", "待填写"}
+            or "返回该字段的完整替换值" in text
+            or "返回完整修复值" in text
+        )
+
+    def candidate_score(data):
+        if not isinstance(data, dict):
+            return -1
+        direct_memory_keys = {
+            key for key in _LONG_FORM_MEMORY_PATCH_FIELDS
+            if key in data
+        }
+        if not any(
+            key in data
+            for key in (
+                "long_form_memory_patch", "memory_patch", "long_form_memory",
+                "outline", "summary", "key_facts", "logic_audit", "replace",
+            )
+        ) and not direct_memory_keys:
+            return -1
+        score = 1
+        patch = data.get("long_form_memory_patch", data.get("memory_patch", {}))
+        if not patch and isinstance(data.get("replace"), dict):
+            patch = {"replace": data["replace"]}
+        if not patch and direct_memory_keys:
+            patch = {
+                "replace": {
+                    key: data[key]
+                    for key in direct_memory_keys
+                }
+            }
+        if isinstance(patch, dict):
+            replacements = patch.get("replace", patch)
+            if isinstance(replacements, dict) and replacements:
+                if any(is_placeholder(item) for item in replacements.values()):
+                    return -1
+                score += 20
+                score += 100
+                if all(isinstance(item, (dict, list)) for item in replacements.values()):
+                    score += 10
+        memory_update = data.get("long_form_memory", {})
+        if isinstance(memory_update, dict) and memory_update:
+            score += 80
+        if any(str(data.get(key, "") or "").strip() for key in ("outline", "summary", "key_facts")):
+            score += 20
+        if isinstance(data.get("logic_audit"), dict) and data.get("logic_audit"):
+            score += 20
+        bundle_values = [
+            data.get(key)
+            for key in ("outline", "summary", "key_facts")
+            if key in data
+        ]
+        if bundle_values and all(
+            isinstance(item, str) and is_placeholder(item)
+            for item in bundle_values
+        ):
+            return -1
+        return score
+
     text = str(value or "").strip()
     fence_match = re.match(r"^```(?:json)?\s*(.*?)\s*```$", text, re.IGNORECASE | re.DOTALL)
     if fence_match:
         text = fence_match.group(1).strip()
     start = text.find("{")
     if start < 0:
-        return {
-            "parsed": False,
-            "repair_mode": "",
-            "outline": "",
-            "summary": "",
-            "key_facts": "",
-            "memory_update": {},
-            "memory_patch": {},
-            "logic_audit": {},
-            "prose_review": {"checked": True, "issues": []},
-            "repair_patches": [],
-        }
-    data, _locally_repaired = _load_json_with_single_missing_quote_repair(text[start:])
-    if data is None:
-        try:
-            data, _offset = json.JSONDecoder().raw_decode(text[start:])
-        except Exception:
-            return {
-                "parsed": False,
-                "repair_mode": "",
-                "outline": "",
-                "summary": "",
-                "key_facts": "",
-                "memory_update": {},
-                "memory_patch": {},
-                "logic_audit": {},
-                "prose_review": {"checked": True, "issues": []},
-                "repair_patches": [],
-            }
+        return empty_result()
+
+    data = None
+    try:
+        data = json.loads(text[start:])
+    except Exception:
+        pass
+
     if not isinstance(data, dict):
-        return {
-            "parsed": False,
-            "repair_mode": "",
-            "outline": "",
-            "summary": "",
-            "key_facts": "",
-            "memory_update": {},
-            "memory_patch": {},
-            "logic_audit": {},
-            "prose_review": {"checked": True, "issues": []},
-            "repair_patches": [],
+        data, _locally_repaired = _load_json_with_trailing_delimiter_repair(text[start:])
+    if not isinstance(data, dict):
+        decoder = json.JSONDecoder()
+        candidates = []
+        cursor = start
+        while cursor < len(text):
+            root_start = text.find("{", cursor)
+            if root_start < 0:
+                break
+            try:
+                candidate, offset = decoder.raw_decode(text, root_start)
+            except Exception:
+                cursor = root_start + 1
+                continue
+            if isinstance(candidate, dict) and candidate not in candidates:
+                candidates.append(candidate)
+            cursor = max(root_start + 1, offset)
+        if candidates:
+            scored = [(candidate_score(item), item) for item in candidates]
+            best_score, data = max(scored, key=lambda item: item[0])
+            if best_score < 0:
+                data = None
+
+    if not isinstance(data, dict):
+        data, _locally_repaired = _load_json_with_single_missing_quote_repair(text[start:])
+    if not isinstance(data, dict):
+        return empty_result()
+
+    if candidate_score(data) < 0:
+        return empty_result()
+    if (
+        isinstance(data.get("replace"), dict)
+        and "long_form_memory_patch" not in data
+        and "memory_patch" not in data
+    ):
+        data = {
+            "long_form_memory_patch": {
+                "replace": deepcopy(data["replace"]),
+            }
         }
+    elif (
+        "long_form_memory_patch" not in data
+        and "memory_patch" not in data
+    ):
+        direct_memory = {
+            key: deepcopy(data[key])
+            for key in _LONG_FORM_MEMORY_PATCH_FIELDS
+            if key in data
+        }
+        if direct_memory:
+            data = {
+                key: deepcopy(data[key])
+                for key in ("outline", "summary", "key_facts", "logic_audit")
+                if key in data
+            }
+            data["long_form_memory_patch"] = {"replace": direct_memory}
     key_facts = data.get("key_facts", "")
     if isinstance(key_facts, list):
         key_facts = "\n".join(
@@ -16151,19 +16863,6 @@ def _build_long_form_memory_patch_context(
         for key in targets["memory_fields"]
         if key in compact_memory_update
     }
-    output_example = {}
-    for key in targets["bundle_fields"]:
-        output_example[key] = (
-            {"checked": True, "issues": []}
-            if key == "logic_audit" else "返回完整修复值"
-        )
-    if targets["memory_fields"]:
-        output_example["long_form_memory_patch"] = {
-            "replace": {
-                key: "返回该字段的完整替换值"
-                for key in targets["memory_fields"]
-            }
-        }
     requirements = (
         "【状态增量修复补丁】\n"
         "只修复列出的错误字段，不得重写正文，不得重写或复述整份长篇记忆。"
@@ -16186,8 +16885,14 @@ def _build_long_form_memory_patch_context(
         "同时填写非空reason和正文逐字证据；supersede还要填写新的NF临时key和同scope新fact，该NF必须同步进入long_term_events.storage.fact_refs和"
         "state_reconciliation.fact_refs。"
         "涉及evidence_quote时必须从最终正文逐字复制连续原文。"
-        "严格只输出一个合法JSON对象，不输出Markdown、解释或额外字段。输出结构："
-        + json.dumps(output_example, ensure_ascii=False, separators=(",", ":"))
+        "长篇记忆修复结果的固定结构是：顶层使用long_form_memory_patch对象，其下使用replace对象；"
+        "每个需要修复的长篇记忆顶层字段只能作为replace的键出现，不能把state_reconciliation、next_chapter_memory或其他长篇字段直接放在顶层。"
+        "机械引用清单是引用分类的唯一依据：只有清单中的required_object_keys才能进入object_keys；"
+        "lore_refs只能填写设定记录的编号或别名，object_keys只能填写物件状态目录中的真实键；"
+        "设定ID、伏笔ID或设定名称对应的记录即使名称像物件，也只能进入对应的lore_refs或foreshadow_refs，不能进入object_keys。"
+        "严格只输出一个合法JSON对象，不输出Markdown、代码块、解释、占位符或额外字段；"
+        "每个需要修复的字段直接填写真实、完整、可校验的对象或数组，不要先输出示例对象，"
+        "也不要输出commentary或连续输出多个JSON对象。"
     )
     sections = [
         ("任务", "修复已完成终稿所附状态事务中的指定字段，修复后程序会重新执行完整校验。", 800, False),
@@ -16556,10 +17261,107 @@ def _parse_memory_reconciliation_result(value):
     return {"parsed": True, "corrections": deepcopy(corrections)}
 
 
-def _merge_long_form_memory_reconciliation_patch(memory_update, patch):
+def _normalize_long_form_reconciliation_patch(project, patch):
+    """Normalize the narrow correction contract before merging it.
+
+    Reconciliation is forbidden from creating records. That makes a missing
+    operation deterministic when an existing reference resolves and the row
+    contains an actual correction. Unknown references remain untouched so the
+    normal validator can reject them instead of guessing.
+    """
+    payload = deepcopy(patch) if isinstance(patch, dict) else {}
+    nested = payload.get("replace")
+    target = deepcopy(nested) if isinstance(nested, dict) else payload
+
+    def first_value(item, keys):
+        for key in keys:
+            value = item.get(key, "")
+            if isinstance(value, (list, dict)):
+                if value:
+                    return value
+                continue
+            if str(value or "").strip():
+                return value
+        return ""
+
+    def normalize_operation(value):
+        operation = str(value or "").strip().lower()
+        if operation in {"modify", "change", "patch", "advance", "reinforce", "partial_payoff", "payoff", "discard"}:
+            return "update"
+        if operation in {"add", "new", "insert"}:
+            return "create"
+        return operation
+
+    def normalize_items(kind, items):
+        if not isinstance(items, list):
+            return items
+        aliases = {
+            "characters": ("ref", "character_ref", "character_id", "record_ref", "id", "key"),
+            "lore": ("ref", "lore_ref", "lore_id", "record_ref", "id", "key"),
+            "foreshadows": (
+                "ref", "foreshadow_ref", "foreshadow_id", "record_ref", "id", "key",
+            ),
+        }[kind]
+        result = []
+        for raw in items:
+            if not isinstance(raw, dict):
+                result.append(raw)
+                continue
+            item = deepcopy(raw)
+            ref = str(first_value(item, aliases) or "").strip()
+            resolved = _resolve_long_form_record_ref(project, kind, ref) if ref else ""
+            if resolved:
+                item["ref"] = resolved
+            operation = normalize_operation(item.get("operation", ""))
+            if not operation and resolved:
+                has_correction = any(
+                    str(item.get(key, "") or "").strip()
+                    for key in (
+                        "update", "dynamic", "runtime", "runtime_update", "state",
+                        "change", "progress", "description", "previous", "previous_fact",
+                        "previous_conflict", "previous_task", "evidence_quote", "evidence",
+                    )
+                )
+                if has_correction:
+                    operation = "update"
+            if operation:
+                item["operation"] = operation
+            if operation == "update" and not str(item.get("state", "") or "").strip():
+                update_text = first_value(
+                    item,
+                    ("dynamic", "runtime_update", "runtime", "change", "progress", "update", "description"),
+                )
+                if update_text:
+                    item["state"] = update_text
+            result.append(item)
+        return result
+
+    record_updates = target.get("record_updates")
+    if isinstance(record_updates, dict):
+        record_updates = deepcopy(record_updates)
+        record_updates["characters"] = normalize_items(
+            "characters", record_updates.get("characters", [])
+        )
+        record_updates["lore"] = normalize_items(
+            "lore", record_updates.get("lore", [])
+        )
+        target["record_updates"] = record_updates
+    target["foreshadow_updates"] = normalize_items(
+        "foreshadows", target.get("foreshadow_updates", [])
+    )
+
+    if isinstance(nested, dict):
+        payload["replace"] = target
+        return payload
+    return target
+
+
+def _merge_long_form_memory_reconciliation_patch(memory_update, patch, project=None):
     """Merge a small boundary correction without replacing the original valid delta."""
     merged = deepcopy(memory_update) if isinstance(memory_update, dict) else {}
-    patch = patch if isinstance(patch, dict) else {}
+    patch = _normalize_long_form_reconciliation_patch(project, patch) if isinstance(project, dict) else (
+        deepcopy(patch) if isinstance(patch, dict) else {}
+    )
     corrections = patch.get("replace", patch) if isinstance(patch.get("replace"), dict) else patch
     if not isinstance(corrections, dict):
         return merged
@@ -16855,6 +17657,13 @@ def _build_long_form_memory_reconcile_context(
         '"foreshadow_updates":[],"state_reconciliation":{}}}。'
         "只返回能由最终正文逐字证实、且能修正原增量语义的最小纠错项；没有错误就返回空数组和空对象。"
         "不要返回完整状态，不要重写未出错的更新，不要新建人物/设定/伏笔，不要凭空增加事实。"
+        "证据来源有严格分区：evidence_quote只能从【最终正文】逐字连续复制；"
+        "【最近十章正文、摘要与关键事实】只用于比较前后状态，禁止从其中复制任何证据，"
+        "即使该句确实出现在前文，也不能作为本章纠错证据。输出前必须确认每条evidence_quote都能在最终正文中直接找到。"
+        "对已有设定或伏笔的修正必须使用record_updates.lore或foreshadow_updates；每项必须填写operation:\"update\"、"
+        "ref和evidence_quote，ref使用状态引用索引中的C/L/F短引用（例如L005、F003），不要使用lore_id、foreshadow_id或自然语言名称。"
+        "对账阶段禁止operation:\"create\"；没有可靠的已有引用就不要输出该项。动态文字统一放在state字段，"
+        "不要只使用update、dynamic或progress作为字段名。"
         "fact_updates沿用原契约字段：update/retire/supersede必须填写已有AF-ID、原scope、原previous_fact、"
         "修正后的fact或退出reason以及最终正文连续证据。"
         "修正已有CF/TASK时必须填写真实id，并分别原样填写previous_conflict或previous_task；退出则写入state_retirements。"
@@ -16879,7 +17688,7 @@ def _build_long_form_memory_reconcile_context(
             24000,
             False,
         ),
-        ("最近十章正文、摘要与关键事实", recent_ten_text, 56000, True),
+        ("最近十章正文、摘要与关键事实（仅供比对，禁止作为证据）", recent_ten_text, 56000, True),
         ("已选活跃事实", memory_sections["活跃连续性事实"], 12000, False),
         (
             "章节边界",
@@ -17062,7 +17871,7 @@ def _merge_long_form_state_patch(
     def resolve_record(kind, ref):
         return (
             _resolve_long_form_record_ref(project, kind, ref)
-            or temp_refs.get(kind, {}).get(str(ref or "").strip(), "")
+            or _resolve_long_form_temp_ref(temp_refs, kind, ref)
         )
     for key in ("story_time", "location", "notes"):
         if key in patch and str(patch.get(key, "") or "").strip():
@@ -17451,7 +18260,11 @@ def _apply_long_form_memory_update_unchecked(project, chapter_index, payload, up
                     record = factory(len(records))
                     record["id"] = uuid.uuid4().hex
                     record["name"] = name
-                    canon = item.get("canon", item.get("fields", {}))
+                    canon = (
+                        _character_identity_fields_from_item(item)
+                        if kind == "characters"
+                        else item.get("canon", item.get("fields", {}))
+                    )
                     if isinstance(canon, dict):
                         for field in canon_fields:
                             value = str(canon.get(field, "") or "").strip()
@@ -17466,9 +18279,17 @@ def _apply_long_form_memory_update_unchecked(project, chapter_index, payload, up
             if not isinstance(record, dict) or not item_id:
                 continue
             if kind == "characters":
-                identity_fields = item.get("canon", item.get("fields", {}))
-                _promote_character_identity(record, item.get("name"), identity_fields)
-                _apply_character_string_canon(record, identity_fields)
+                identity_fields = _character_identity_fields_from_item(item)
+                if operation == "update":
+                    _promote_character_identity(record, item.get("name"), identity_fields)
+                    _merge_character_identity_fields(record, identity_fields)
+                else:
+                    _promote_character_identity(record, item.get("name"), identity_fields)
+                    _merge_character_identity_fields(record, identity_fields)
+                raw_identity = item.get("identity_patch")
+                if not isinstance(raw_identity, (dict, str)):
+                    raw_identity = item.get("canon", item.get("fields", {}))
+                _apply_character_string_canon(record, raw_identity)
             if item_id not in touched_refs[kind]:
                 touched_refs[kind].append(item_id)
             state = str(item.get("state", "") or "").strip()
@@ -17753,19 +18574,23 @@ def _apply_long_form_memory_update_unchecked(project, chapter_index, payload, up
     state_lifecycle_review = payload.get("state_lifecycle_review", {})
     if isinstance(state_lifecycle_review, dict):
         reviewed_objects = [
-            temp_refs.get("objects", {}).get(
-                str(value or "").strip(), str(value or "").strip()
+            _resolve_long_form_temp_ref(
+                temp_refs, "objects", value, str(value or "").strip()
             )
             for value in state_lifecycle_review.get("reviewed_object_keys", [])
             if str(value or "").strip()
         ] if isinstance(state_lifecycle_review.get("reviewed_object_keys", []), list) else []
         reviewed_conflicts = [
-            str(value or "").strip()
+            _resolve_long_form_temp_ref(
+                temp_refs, "conflicts", value, str(value or "").strip()
+            )
             for value in state_lifecycle_review.get("reviewed_conflict_refs", [])
             if str(value or "").strip()
         ] if isinstance(state_lifecycle_review.get("reviewed_conflict_refs", []), list) else []
         reviewed_tasks = [
-            str(value or "").strip()
+            _resolve_long_form_temp_ref(
+                temp_refs, "tasks", value, str(value or "").strip()
+            )
             for value in state_lifecycle_review.get("reviewed_task_refs", [])
             if str(value or "").strip()
         ] if isinstance(state_lifecycle_review.get("reviewed_task_refs", []), list) else []
@@ -17816,16 +18641,16 @@ def _apply_long_form_memory_update_unchecked(project, chapter_index, payload, up
             if kind in {"characters", "lore", "foreshadows"}:
                 item_id = (
                     _resolve_long_form_record_ref(project, kind, ref_text)
-                    or temp_refs[kind].get(ref_text, "")
+                    or _resolve_long_form_temp_ref(temp_refs, kind, ref_text)
                 )
             elif kind == "facts":
                 item_id = (
                     ref_text
                     if ref_text in fact_by_id or ref_text in historical_fact_ids
-                    else temp_refs["facts"].get(ref_text, "")
+                    else _resolve_long_form_temp_ref(temp_refs, "facts", ref_text)
                 )
             elif kind in {"objects", "conflicts", "tasks"}:
-                item_id = temp_refs[kind].get(ref_text, ref_text)
+                item_id = _resolve_long_form_temp_ref(temp_refs, kind, ref_text, ref_text)
             else:
                 item_id = ref_text
             if item_id and item_id not in resolved:
@@ -17906,7 +18731,7 @@ def _apply_long_form_memory_update_unchecked(project, chapter_index, payload, up
     current_refs = payload.get("current_chapter_character_refs", [])
     current_ids = []
     for ref in current_refs if isinstance(current_refs, list) else []:
-        item_id = _resolve_long_form_record_ref(project, "characters", ref) or temp_refs["characters"].get(str(ref or ""), "")
+        item_id = _resolve_long_form_record_ref(project, "characters", ref) or _resolve_long_form_temp_ref(temp_refs, "characters", ref)
         if item_id and item_id not in current_ids:
             current_ids.append(item_id)
     character_names = {
@@ -17951,7 +18776,7 @@ def _apply_long_form_memory_update_unchecked(project, chapter_index, payload, up
             values = next_memory.get(input_key, next_memory.get(legacy_key, []))
             ids = []
             for ref in values if isinstance(values, list) else []:
-                item_id = _resolve_long_form_record_ref(project, kind, ref) or temp_refs[kind].get(str(ref or ""), "")
+                item_id = _resolve_long_form_record_ref(project, kind, ref) or _resolve_long_form_temp_ref(temp_refs, kind, ref)
                 if item_id and item_id not in ids:
                     ids.append(item_id)
             for item_id in touched_refs[kind]:
@@ -17965,7 +18790,7 @@ def _apply_long_form_memory_update_unchecked(project, chapter_index, payload, up
         valid_fact_ids = {str(item.get("id", "") or "") for item in memory.get("active_facts", []) if isinstance(item, dict)}
         selection["fact_ids"] = []
         for ref in fact_values if isinstance(fact_values, list) else []:
-            item_id = str(ref or "") if str(ref or "") in valid_fact_ids else temp_refs["facts"].get(str(ref or ""), "")
+            item_id = str(ref or "") if str(ref or "") in valid_fact_ids else _resolve_long_form_temp_ref(temp_refs, "facts", ref)
             if item_id and item_id not in selection["fact_ids"]:
                 selection["fact_ids"].append(item_id)
         for item_id in touched_fact_ids:
@@ -17978,10 +18803,10 @@ def _apply_long_form_memory_update_unchecked(project, chapter_index, payload, up
         valid_archive_ids = {str(item.get("id", "") or "") for item in memory.get("stage_archives", []) if isinstance(item, dict)}
         selection["stage_archive_ids"] = []
         for ref in archive_values if isinstance(archive_values, list) else []:
-            item_id = str(ref or "") if str(ref or "") in valid_archive_ids else temp_refs["archives"].get(str(ref or ""), "")
+            item_id = str(ref or "") if str(ref or "") in valid_archive_ids else _resolve_long_form_temp_ref(temp_refs, "archives", ref)
             if item_id and item_id not in selection["stage_archive_ids"]:
                 selection["stage_archive_ids"].append(item_id)
-        current_archive_id = temp_refs["archives"].get("CURRENT_STAGE", "")
+        current_archive_id = _resolve_long_form_temp_ref(temp_refs, "archives", "CURRENT_STAGE")
         if current_archive_id and current_archive_id not in selection["stage_archive_ids"]:
             selection["stage_archive_ids"].append(current_archive_id)
         active_state_refs = _long_form_existing_state_refs(project, memory)
@@ -17989,8 +18814,8 @@ def _apply_long_form_memory_update_unchecked(project, chapter_index, payload, up
         selection["object_keys"] = []
         object_values = next_memory.get("object_keys", [])
         for value in object_values if isinstance(object_values, list) else []:
-            resolved_value = temp_refs["objects"].get(
-                str(value or "").strip(), str(value or "").strip()
+            resolved_value = _resolve_long_form_temp_ref(
+                temp_refs, "objects", value, str(value or "").strip()
             )
             canonical = object_key_by_compact.get(_compact_text(resolved_value), "")
             if canonical and canonical not in selection["object_keys"]:
@@ -18005,7 +18830,9 @@ def _apply_long_form_memory_update_unchecked(project, chapter_index, payload, up
             if not isinstance(item, dict):
                 continue
             requested_key = str(item.get("key", item.get("name", "")) or "").strip()
-            resolved_key = temp_refs["objects"].get(requested_key, requested_key)
+            resolved_key = _resolve_long_form_temp_ref(
+                temp_refs, "objects", requested_key, requested_key
+            )
             canonical = object_key_by_compact.get(
                 _compact_text(resolved_key), ""
             )
@@ -18026,7 +18853,7 @@ def _apply_long_form_memory_update_unchecked(project, chapter_index, payload, up
             values = next_memory.get(input_key, next_memory.get(legacy_key, []))
             for value in values if isinstance(values, list) else []:
                 ref = str(value or "").strip()
-                item_id = temp_refs[temp_kind].get(ref, ref)
+                item_id = _resolve_long_form_temp_ref(temp_refs, temp_kind, ref, ref)
                 if item_id in active_ids and item_id not in selection[output_key]:
                     selection[output_key].append(item_id)
             for item_id in event_selection_refs[output_key]:
@@ -18036,7 +18863,7 @@ def _apply_long_form_memory_update_unchecked(project, chapter_index, payload, up
                 if not isinstance(item, dict):
                     continue
                 ref = str(item.get("id", "") or item.get("key", "") or "").strip()
-                item_id = temp_refs[temp_kind].get(ref, ref)
+                item_id = _resolve_long_form_temp_ref(temp_refs, temp_kind, ref, ref)
                 if item_id in active_ids and item_id not in selection[output_key]:
                     selection[output_key].append(item_id)
         selection["_restrict_state"] = True

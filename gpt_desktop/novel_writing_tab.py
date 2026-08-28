@@ -89,6 +89,7 @@ from .novel_storage import (
     save_named_project,
     save_novel_diagnostic_latest_exchange,
     save_novel_diagnostic_snapshot,
+    append_novel_memory_diagnostic_event,
     save_project_file,
     sync_style_profile_library_from_projects,
     upsert_style_profile,
@@ -1590,6 +1591,30 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
     request_settings = Signal()
     MODEL_CONFIG_SECTION = "novel"
     FALLBACK_MODELS = ["gpt-4o-mini", "gpt-4.1-mini", "gpt-4o"]
+    _MEMORY_POSTPROCESS_ACTIONS = frozenset({
+        "memory_finalize",
+        "memory_reconcile",
+        "memory_repair",
+        "logic_repair",
+        "memory_sync",
+        "summary",
+    })
+    _MEMORY_FAILURE_EVENTS = frozenset({
+        "memory_validation_failed",
+        "memory_sync_failed",
+        "memory_reconciliation_fallback",
+        "chapter_logic_repair_started",
+        "chapter_logic_repair_applied",
+        "chapter_prose_repair_patch_skipped",
+        "chapter_prose_repair_patch_applied",
+        "literal_count_claim_normalized",
+        "auto_expand_postwrite_validation_failed",
+        "auto_expand_chapter_save_failed",
+        "auto_expand_resume_state_save_failed",
+        "ai_generation_checkpoint_save_failed",
+        "auto_chapter_summary_failed",
+        "auto_chapter_summary_validation_failed",
+    })
 
     def __init__(self, config=None, parent=None, background_runner=False):
         super().__init__(parent)
@@ -1661,6 +1686,7 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
         self.candidate_postprocess_state = {}
         self._analysis_stop_requested_by_user = False
         self._chapter_ai_stop_requested_by_user = False
+        self._chapter_ai_last_memory_repair_signature = ""
         self._chapter_ai_preview_action = ""
         self._chapter_ai_preview_chapter_id = ""
         self._chapter_ai_preview_is_partial = False
@@ -1671,6 +1697,8 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
         self._chapter_ai_running_chapter_id = ""
         self._chapter_ai_diagnostic_request_id = ""
         self._chapter_ai_diagnostic_started_at = 0.0
+        self._chapter_ai_task_generation = 0
+        self._chapter_ai_active_task = {}
         self._chapter_ai_transient_retry_counts = {}
         self._chapter_ai_transient_retry_pending = False
         self._chapter_ai_transient_retry_token = 0
@@ -1721,6 +1749,12 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
         self._status_workflow_started_wall = 0.0
         self._status_last_run_elapsed = 0.0
         self._status_received_chars = 0
+        # The foreground tab mirrors status from the detached auto-expansion
+        # runner so it follows the same display path as single-chapter writing.
+        self._detached_auto_status_scope_id = ""
+        self._detached_auto_status_scope_label = ""
+        self._detached_auto_status_auto_progress = (0, 0)
+        self._detached_auto_status_mirrored = False
         self._novel_diagnostic_counter = 0
         self._novel_diagnostic_session_id = hashlib.sha256(
             f"{time.time_ns()}:{id(self)}".encode("utf-8")
@@ -2841,10 +2875,129 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
                 },
                 "details": details,
             }
+            if self._should_log_memory_failure(record):
+                append_novel_memory_diagnostic_event(
+                    self._compact_memory_failure_record(record)
+                )
             return append_novel_diagnostic_event(record)
         except Exception as exc:
             log_debug("小说诊断日志写入失败", exc)
             return ""
+
+    @classmethod
+    def _should_log_memory_failure(cls, record):
+        if not isinstance(record, dict):
+            return False
+        event = str(record.get("event", "") or "").strip()
+        level = str(record.get("level", "") or "").strip().lower()
+        details = record.get("details", {})
+        details = details if isinstance(details, dict) else {}
+        pipeline = record.get("pipeline", {})
+        pipeline = pipeline if isinstance(pipeline, dict) else {}
+        action = str(
+            details.get("action", "")
+            or pipeline.get("action", "")
+            or ""
+        ).strip()
+        if event in cls._MEMORY_FAILURE_EVENTS:
+            return True
+        if action not in cls._MEMORY_POSTPROCESS_ACTIONS:
+            return False
+        return level in {"warning", "error", "fatal"} or any(
+            marker in event for marker in ("failed", "failure", "retry", "invalid", "parse")
+        )
+
+    @staticmethod
+    def _compact_memory_failure_record(record):
+        details = record.get("details", {}) if isinstance(record, dict) else {}
+        details = details if isinstance(details, dict) else {}
+        allowed_detail_keys = {
+            "error", "error_category", "validation_errors", "issue_categories",
+            "issue_count", "validation_attempt", "repair_attempt", "repair_mode",
+            "retryable", "retry_scheduled", "retry_attempt", "finalize_attempt",
+            "patch_count", "validation_errors", "repair_triggered", "fallback_status",
+            "reason", "reason_code", "memory_status", "memory_revision",
+            "final_text_chars", "final_text_sha256", "before_chars", "after_chars",
+            "before_sha256", "after_sha256", "partial_output_chars",
+            "diagnostic_snapshot_path", "prose_patch_applied",
+            "transaction_id", "repair_targets", "bundle_summary",
+            "state_before", "state_after", "parsed", "output_chars",
+            "output_sha256", "validation_error_count", "audit_error_count",
+            "bundle_error_count", "checkpoint_summary", "package_status",
+            "package_summary", "resume_required",
+        }
+        compact_details = {
+            key: deepcopy(value)
+            for key, value in details.items()
+            if key in allowed_detail_keys
+        }
+        worker = details.get("worker_diagnostics", {})
+        if isinstance(worker, dict):
+            worker_keys = {
+                "http_status", "response_chars", "response_utf8_bytes", "elapsed_ms",
+                "time_to_headers_ms", "time_to_first_piece_ms", "finish_reason",
+                "invalid_sse_json_lines", "ignored_reasoning_chars",
+                "response_char_limit_exceeded", "json_response_format_fallback",
+                "json_response_format_transport_fallback", "reasoning_effort_requested",
+                "max_output_tokens", "request_timeout_seconds", "content_type",
+            }
+            compact_details["worker_diagnostics"] = {
+                key: deepcopy(value) for key, value in worker.items() if key in worker_keys
+            }
+        project = record.get("project", {}) if isinstance(record, dict) else {}
+        chapter = record.get("chapter", {}) if isinstance(record, dict) else {}
+        memory = record.get("memory", {}) if isinstance(record, dict) else {}
+        pipeline = record.get("pipeline", {}) if isinstance(record, dict) else {}
+        provider = record.get("provider", {}) if isinstance(record, dict) else {}
+        return {
+            "record_type": "novel_memory_failure",
+            "event": str(record.get("event", "unknown") or "unknown"),
+            "level": str(record.get("level", "info") or "info"),
+            "session_id": str(record.get("session_id", "") or ""),
+            "request_id": str(record.get("request_id", "") or ""),
+            "mode": (
+                "auto_expand"
+                if isinstance(pipeline, dict) and pipeline.get("auto_expand_active")
+                else "single_chapter"
+            ),
+            "project": {
+                "title": str(project.get("title", "") or "") if isinstance(project, dict) else "",
+                "path": str(project.get("path", "") or "") if isinstance(project, dict) else "",
+            },
+            "chapter": {
+                "index": int(chapter.get("index", 0) or 0) if isinstance(chapter, dict) else 0,
+                "id": str(chapter.get("id", "") or "") if isinstance(chapter, dict) else "",
+                "title": str(chapter.get("title", "") or "") if isinstance(chapter, dict) else "",
+                "memory_sync_status": str(chapter.get("memory_sync_status", "") or "")
+                if isinstance(chapter, dict) else "",
+                "memory_revision": int(chapter.get("memory_revision", 0) or 0)
+                if isinstance(chapter, dict) else 0,
+            },
+            "memory": {
+                "revision": int(memory.get("revision", 0) or 0) if isinstance(memory, dict) else 0,
+                "snapshot_chapter_index": int(memory.get("snapshot_chapter_index", 0) or 0)
+                if isinstance(memory, dict) else 0,
+                "snapshot_chapter_id": str(memory.get("snapshot_chapter_id", "") or "")
+                if isinstance(memory, dict) else "",
+            },
+            "pipeline": {
+                "action": str(pipeline.get("action", "") or "") if isinstance(pipeline, dict) else "",
+                "sequence_active": bool(pipeline.get("sequence_active", False))
+                if isinstance(pipeline, dict) else False,
+                "auto_expand_active": bool(pipeline.get("auto_expand_active", False))
+                if isinstance(pipeline, dict) else False,
+                "auto_expand_completed": int(pipeline.get("auto_expand_completed", 0) or 0)
+                if isinstance(pipeline, dict) else 0,
+                "auto_expand_total": int(pipeline.get("auto_expand_total", 0) or 0)
+                if isinstance(pipeline, dict) else 0,
+            },
+            "provider": {
+                "id": str(provider.get("id", "") or "") if isinstance(provider, dict) else "",
+                "name": str(provider.get("name", "") or "") if isinstance(provider, dict) else "",
+                "model": str(provider.get("model", "") or "") if isinstance(provider, dict) else "",
+            },
+            "details": compact_details,
+        }
 
     def _get_export_path(self, dialog_title, suggested_name, default_ext, file_filter):
         safe_title = _safe_name(suggested_name) or "novel"
@@ -4717,6 +4870,18 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
         QTimer.singleShot(0, cleanup)
 
     def _load_project_data(self, data, path="", defer_helpers=False):
+        if not getattr(self, "_is_detached_auto_runner", False):
+            foreground_worker = getattr(self, "writing_worker", None)
+            has_foreground_task = bool(
+                foreground_worker is not None
+                or getattr(self, "_chapter_ai_memory_pending", {})
+                or getattr(self, "_chapter_ai_sequence_active", False)
+                or getattr(self, "_chapter_ai_transient_retry_pending", False)
+            )
+            if has_foreground_task:
+                self._invalidate_foreground_chapter_ai_task(
+                    "加载新项目数据，旧前台章节任务已失效"
+                )
         perf_start = time.perf_counter()
         source_name = os.path.basename(str(path or "")) or "草稿"
         file_size = ""
@@ -9076,6 +9241,20 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
         if not isinstance(chapter, dict):
             return
         chapter["auto_expand_resume_required"] = True
+        pending = getattr(self, "_chapter_ai_memory_pending", {})
+        if (
+            isinstance(pending, dict)
+            and pending.get("already_committed")
+            and str(chapter.get("memory_sync_status", "") or "") == "complete"
+        ):
+            # A legacy boundary checkpoint may be created after the state
+            # transaction already committed. Keep that marker idempotent
+            # while only the semantic reconciliation is resumed.
+            chapter["memory_sync_error"] = ""
+            if hasattr(self, "_note_project_dirty"):
+                self._note_project_dirty()
+            self._persist_ai_generation_state()
+            return
         chapter["memory_sync_status"] = "pending"
         chapter["memory_sync_error"] = ""
         if hasattr(self, "_note_project_dirty"):
@@ -9096,6 +9275,13 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
     def _auto_expand_chapter_needs_work(self, chapter):
         if not isinstance(chapter, dict):
             return False
+        if (
+            str(chapter.get("memory_reconciliation_status", "") or "") in {"pending", "failed"}
+            and isinstance(chapter.get("ai_generation_checkpoint"), dict)
+            and str(chapter.get("ai_generation_checkpoint", {}).get("stage", "") or "")
+            == "memory_reconcile"
+        ):
+            return True
         if not str(chapter.get("text", "") or "").strip():
             return True
         if self._auto_expand_chapter_has_committed_memory(chapter):
@@ -9301,11 +9487,11 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
             return
         active = runner._status_has_active_work()
         if active:
-            if os.path.abspath(str(self.current_project_path or "")) == str(
-                getattr(self, "_detached_auto_project_path", "") or ""
-            ):
-                self.set_status_tip(str(getattr(runner, "_status_message", "") or "后台自动扩写进行中..."))
+            self._sync_detached_auto_status(runner)
             return
+        # Copy the terminal state before releasing the runner so the final
+        # stage duration and total queue progress remain visible.
+        self._sync_detached_auto_status(runner)
         timer = getattr(self, "_detached_auto_timer", None)
         if timer is not None:
             timer.stop()
@@ -9327,6 +9513,80 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
             if isinstance(data, dict):
                 self._load_project_data(data, source_path, defer_helpers=True)
         self.set_status_tip(message)
+
+    def _detached_auto_status_is_current(self, runner=None):
+        if getattr(self, "_is_detached_auto_runner", False):
+            return False
+        runner = runner if runner is not None else getattr(self, "_detached_auto_runner", None)
+        source = os.path.abspath(str(getattr(self, "_detached_auto_project_path", "") or ""))
+        current = os.path.abspath(str(getattr(self, "current_project_path", "") or ""))
+        return bool(runner is not None and source and source == current)
+
+    def _sync_detached_auto_status(self, runner):
+        """Mirror detached expansion status into the visible project tab."""
+        if not self._detached_auto_status_is_current(runner):
+            return False
+        status_fields = (
+            "_status_message",
+            "_status_stage_key",
+            "_status_stage_label",
+            "_status_stage_started_at",
+            "_status_stage_started_wall",
+            "_status_stage_scope_label",
+            "_status_stage_active",
+            "_status_history",
+            "_status_workflow_active",
+            "_status_workflow_kind",
+            "_status_workflow_started_at",
+            "_status_workflow_started_wall",
+            "_status_last_run_elapsed",
+            "_status_received_chars",
+        )
+        for field in status_fields:
+            value = getattr(runner, field, None)
+            setattr(self, field, deepcopy(value) if field == "_status_history" else value)
+        try:
+            scope_id, scope_label = runner._status_current_chapter_scope()
+        except Exception:
+            scope_id, scope_label = "", ""
+        self._detached_auto_status_scope_id = str(scope_id or "")
+        self._detached_auto_status_scope_label = str(scope_label or "")
+        try:
+            progress = runner._auto_expand_all_chapter_progress()
+        except Exception:
+            progress = (0, 0)
+        if not isinstance(progress, (tuple, list)) or len(progress) != 2:
+            progress = (0, 0)
+        self._detached_auto_status_auto_progress = (
+            int(progress[0] or 0),
+            int(progress[1] or 0),
+        )
+        self._detached_auto_status_mirrored = True
+        self._refresh_status_display()
+        return True
+
+    def _clear_detached_auto_status_mirror(self):
+        if not bool(getattr(self, "_detached_auto_status_mirrored", False)):
+            return
+        self._detached_auto_status_mirrored = False
+        self._detached_auto_status_scope_id = ""
+        self._detached_auto_status_scope_label = ""
+        self._detached_auto_status_auto_progress = (0, 0)
+        self._status_message = ""
+        self._status_stage_key = ""
+        self._status_stage_label = ""
+        self._status_stage_started_at = 0.0
+        self._status_stage_started_wall = 0.0
+        self._status_stage_scope_label = ""
+        self._status_stage_active = False
+        self._status_workflow_active = False
+        self._status_workflow_kind = ""
+        self._status_workflow_started_at = 0.0
+        self._status_workflow_started_wall = 0.0
+        self._status_last_run_elapsed = 0.0
+        self._status_received_chars = 0
+        self._status_history = []
+        self._refresh_status_display()
 
     def _set_detached_auto_source_read_only(self, locked):
         """Keep the source project viewable while preventing foreground writes."""
@@ -9368,6 +9628,8 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
         source = os.path.abspath(str(getattr(self, "_detached_auto_project_path", "") or ""))
         current = os.path.abspath(str(getattr(self, "current_project_path", "") or ""))
         locked = bool(source and current == source)
+        if not locked:
+            self._clear_detached_auto_status_mirror()
         self._set_detached_auto_source_read_only(locked)
         detached_runner = getattr(self, "_detached_auto_runner", None)
         detached_active = False
@@ -9559,6 +9821,25 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
             self._stop_auto_expand_all("自动扩写已停止：完成章节与当前任务不一致。")
             return
         chapter = self.current_project.get("chapters", [])[self.current_chapter_index]
+        boundary_reconciliation_status = str(
+            chapter.get("memory_reconciliation_status", "") or ""
+        )
+        if (
+            (self.current_chapter_index + 1) % 10 == 0
+            and boundary_reconciliation_status in {"pending", "failed"}
+        ):
+            self._log_novel_diagnostic(
+                "auto_expand_paused_for_memory_reconciliation",
+                level="warning",
+                chapter_id=str(chapter.get("id", "") or ""),
+                reconciliation_status=boundary_reconciliation_status,
+                reason="十章边界对账未完成，保留恢复检查点后暂停自动扩写",
+            )
+            self._stop_auto_expand_all(
+                f"自动扩写已暂停：第{self.current_chapter_index + 1}章十章边界对账未完成；"
+                "下次启动时将从对账继续。"
+            )
+            return
         memory = self.current_project.get("long_form_memory", {}) if isinstance(self.current_project, dict) else {}
         snapshot = memory.get("state_snapshot", {}) if isinstance(memory, dict) else {}
         memory_revision = int(memory.get("revision", 0) or 0) if isinstance(memory, dict) else 0
@@ -9664,8 +9945,150 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
         self._chapter_ai_style_execution = ""
         self._chapter_ai_memory_finalize_attempted = False
         self._chapter_ai_memory_repair_attempts = 0
+        self._chapter_ai_last_memory_repair_signature = ""
         self._chapter_ai_logic_repair_attempts = 0
         self._chapter_ai_memory_pending = {}
+
+    @staticmethod
+    def _canonical_project_path(path):
+        raw = str(path or "").strip()
+        return os.path.abspath(os.path.realpath(raw)) if raw else ""
+
+    def _current_chapter_ai_task_context(self):
+        task = getattr(self, "_chapter_ai_active_task", {})
+        return deepcopy(task) if isinstance(task, dict) else {}
+
+    def _log_stale_chapter_ai_callback(self, worker, reason):
+        worker_path = self._canonical_project_path(
+            getattr(worker, "diagnostic_project_path", "") if worker is not None else ""
+        )
+        worker_chapter_id = str(
+            getattr(worker, "diagnostic_chapter_id", "") if worker is not None else ""
+        )
+        worker_request_id = str(
+            getattr(worker, "diagnostic_request_id", "") if worker is not None else ""
+        )
+        self._log_novel_diagnostic(
+            "chapter_ai_stale_callback_discarded",
+            level="warning",
+            action=str(getattr(worker, "action", "") or ""),
+            request_id=worker_request_id,
+            callback_project_path=worker_path,
+            callback_chapter_id=worker_chapter_id,
+            callback_task_generation=int(
+                getattr(worker, "diagnostic_task_generation", 0) or 0
+            ) if worker is not None else 0,
+            current_project_path=self._canonical_project_path(
+                getattr(self, "current_project_path", "")
+            ),
+            current_chapter_id=self._current_chapter_id(),
+            current_task_generation=int(
+                getattr(self, "_chapter_ai_task_generation", 0) or 0
+            ),
+            reason=str(reason or "")[:500],
+        )
+
+    def _chapter_ai_callback_is_current(self):
+        """Reject late worker signals before they can touch the visible project."""
+        worker = None
+        try:
+            candidate = self.sender()
+            if candidate is not None and hasattr(candidate, "diagnostic_request_id"):
+                worker = candidate
+        except Exception:
+            worker = None
+        if worker is None:
+            # Direct method calls in tests and non-Qt integrations do not have a
+            # sender. Keep those calls compatible with the pre-worker API.
+            return True
+        current_worker = getattr(self, "writing_worker", None)
+        current_path = self._canonical_project_path(
+            getattr(self, "current_project_path", "")
+        )
+        callback_path = self._canonical_project_path(
+            getattr(worker, "diagnostic_project_path", "")
+        )
+        callback_chapter_id = str(
+            getattr(worker, "diagnostic_chapter_id", "") or ""
+        )
+        callback_generation = int(
+            getattr(worker, "diagnostic_task_generation", 0) or 0
+        )
+        current_generation = int(
+            getattr(self, "_chapter_ai_task_generation", 0) or 0
+        )
+        current_chapter_id = self._current_chapter_id()
+        callback_request_id = str(
+            getattr(worker, "diagnostic_request_id", "") or ""
+        )
+        current_request_id = str(
+            getattr(self, "_chapter_ai_diagnostic_request_id", "") or ""
+        )
+        valid = bool(
+            worker is current_worker
+            and callback_path == current_path
+            and callback_chapter_id == current_chapter_id
+            and callback_generation == current_generation
+            and callback_request_id == current_request_id
+        )
+        if not valid:
+            reasons = []
+            if worker is not current_worker:
+                reasons.append("worker已不是当前任务")
+            if callback_path != current_path:
+                reasons.append("项目路径不一致")
+            if callback_chapter_id != current_chapter_id:
+                reasons.append("章节不一致")
+            if callback_generation != current_generation:
+                reasons.append("任务代次不一致")
+            if callback_request_id != current_request_id:
+                reasons.append("请求ID不一致")
+            self._log_stale_chapter_ai_callback(worker, "；".join(reasons))
+        return valid
+
+    def _invalidate_foreground_chapter_ai_task(self, reason=""):
+        """Invalidate foreground callbacks when replacing the open project."""
+        self._chapter_ai_task_generation = int(
+            getattr(self, "_chapter_ai_task_generation", 0) or 0
+        ) + 1
+        self._chapter_ai_active_task = {}
+        self._chapter_ai_memory_pending = {}
+        self._chapter_ai_running_action = ""
+        self._chapter_ai_running_context = ""
+        self._chapter_ai_running_chapter_id = ""
+        self._chapter_ai_diagnostic_request_id = ""
+        self._chapter_ai_diagnostic_started_at = 0.0
+        self._chapter_ai_transient_retry_pending = False
+        self._chapter_ai_transient_retry_token = int(
+            getattr(self, "_chapter_ai_transient_retry_token", 0) or 0
+        ) + 1
+        self._reset_chapter_ai_sequence()
+        self._reset_chapter_ai_style_retry()
+        workers = []
+        current_worker = getattr(self, "writing_worker", None)
+        if current_worker is not None:
+            workers.append(current_worker)
+        workers.extend(
+            worker for worker in (getattr(self, "writing_retired_workers", []) or [])
+            if worker is not None and worker not in workers
+        )
+        for worker in workers:
+            try:
+                if worker.isRunning():
+                    if hasattr(worker, "stop"):
+                        worker.stop()
+                    else:
+                        worker.requestInterruption()
+            except Exception as exc:
+                log_debug("切换项目时中止旧章节任务失败", exc)
+        self._chapter_ai_stop_requested_by_user = False
+        self._set_chapter_ai_actions_enabled(True)
+        self._log_novel_diagnostic(
+            "chapter_ai_task_invalidated",
+            action="chapter_ai",
+            reason=str(reason or "")[:500],
+            task_generation=int(self._chapter_ai_task_generation),
+        )
 
     def _start_style_locked_draft(self, context):
         project = self._ai_project_snapshot()
@@ -10016,6 +10439,126 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
     def _chapter_ai_checkpoint_hash(value):
         return hashlib.sha256(str(value or "").encode("utf-8")).hexdigest()
 
+    @staticmethod
+    def _novel_memory_bundle_summary(bundle):
+        """Return a content-free structural summary for memory diagnostics."""
+        bundle = bundle if isinstance(bundle, dict) else {}
+        update = bundle.get("memory_update", {})
+        update = update if isinstance(update, dict) else {}
+        state_patch = update.get("state_patch", {})
+        state_patch = state_patch if isinstance(state_patch, dict) else {}
+        record_updates = update.get("record_updates", {})
+        record_updates = record_updates if isinstance(record_updates, dict) else {}
+        reconciliation = update.get("state_reconciliation", {})
+        reconciliation = reconciliation if isinstance(reconciliation, dict) else {}
+        next_memory = update.get("next_chapter_memory", {})
+        next_memory = next_memory if isinstance(next_memory, dict) else {}
+
+        def count(value):
+            return len(value) if isinstance(value, list) else 0
+
+        def count_map(value, keys):
+            return {key: count(value.get(key, [])) for key in keys}
+
+        try:
+            update_hash = hashlib.sha256(
+                json.dumps(update, ensure_ascii=False, sort_keys=True, default=str).encode("utf-8")
+            ).hexdigest()
+        except Exception:
+            update_hash = ""
+        return {
+            "outline_chars": len(str(bundle.get("outline", "") or "")),
+            "summary_chars": len(str(bundle.get("summary", "") or "")),
+            "key_facts_chars": len(str(bundle.get("key_facts", "") or "")),
+            "logic_audit_present": isinstance(bundle.get("logic_audit"), dict)
+            and bool(bundle.get("logic_audit")),
+            "repair_patches": count(bundle.get("repair_patches", [])),
+            "memory_update_sha256": update_hash,
+            "schema_version": update.get("schema_version", ""),
+            "base_revision": update.get("base_revision", ""),
+            "state_patch_counts": count_map(
+                state_patch,
+                (
+                    "character_states", "relationship_states", "object_states",
+                    "active_conflicts", "unresolved_tasks",
+                ),
+            ),
+            "record_update_counts": {
+                "characters": count(record_updates.get("characters", [])),
+                "lore": count(record_updates.get("lore", [])),
+                "foreshadows": count(update.get("foreshadow_updates", [])),
+            },
+            "fact_updates": count(update.get("fact_updates", [])),
+            "long_term_events": count(update.get("long_term_events", [])),
+            "reconciliation_counts": count_map(
+                reconciliation,
+                (
+                    "fact_refs", "character_refs", "lore_refs", "foreshadow_refs",
+                    "relationship_refs", "object_keys", "conflict_refs", "task_refs",
+                ),
+            ),
+            "next_chapter_counts": count_map(
+                next_memory,
+                (
+                    "fact_refs", "character_refs", "lore_refs", "foreshadow_refs",
+                    "object_keys", "conflict_refs", "task_refs",
+                ),
+            ),
+        }
+
+    def _novel_memory_state_summary(self, project=None, chapter_index=None):
+        project = project if isinstance(project, dict) else getattr(self, "current_project", {})
+        project = project if isinstance(project, dict) else {}
+        chapters = project.get("chapters", []) if isinstance(project.get("chapters"), list) else []
+        try:
+            index = int(
+                getattr(self, "current_chapter_index", -1)
+                if chapter_index is None else chapter_index
+            )
+        except (TypeError, ValueError):
+            index = -1
+        chapter = chapters[index] if 0 <= index < len(chapters) and isinstance(chapters[index], dict) else {}
+        memory = project.get("long_form_memory", {})
+        memory = memory if isinstance(memory, dict) else {}
+        snapshot = memory.get("state_snapshot", {})
+        snapshot = snapshot if isinstance(snapshot, dict) else {}
+
+        def count(value):
+            return len(value) if isinstance(value, list) else 0
+
+        return {
+            "chapter_body_chars": len(str(chapter.get("text", "") or "")),
+            "chapter_summary_chars": len(str(chapter.get("summary", "") or "")),
+            "chapter_key_facts_chars": len(str(chapter.get("key_facts", "") or "")),
+            "memory_sync_status": str(chapter.get("memory_sync_status", "") or ""),
+            "chapter_memory_revision": int(chapter.get("memory_revision", 0) or 0),
+            "chapter_memory_update_hash": str(chapter.get("memory_update_hash", "") or ""),
+            "global_memory_revision": int(memory.get("revision", 0) or 0),
+            "snapshot_chapter_index": int(snapshot.get("as_of_chapter_index", 0) or 0),
+            "snapshot_chapter_id": str(snapshot.get("as_of_chapter_id", "") or ""),
+            "snapshot_counts": {
+                "active_facts": count(memory.get("active_facts", [])),
+                "character_states": count(snapshot.get("character_states", [])),
+                "relationship_states": count(snapshot.get("relationship_states", [])),
+                "object_states": count(snapshot.get("object_states", [])),
+                "active_conflicts": count(snapshot.get("active_conflicts", [])),
+                "unresolved_tasks": count(snapshot.get("unresolved_tasks", [])),
+                "long_term_events": count(chapter.get("long_term_events", [])),
+            },
+        }
+
+    @staticmethod
+    def _novel_memory_repair_targets(errors):
+        targets = []
+        for value in errors if isinstance(errors, list) else []:
+            text = str(value or "").strip()
+            if not text:
+                continue
+            target = re.split(r"[：:]", text, maxsplit=1)[0].strip()
+            if target and target not in targets:
+                targets.append(target)
+        return targets[:30]
+
     def _persist_ai_generation_state(self):
         if not hasattr(self, "current_project_path") or not hasattr(self, "_draft_saved_once"):
             return
@@ -10047,11 +10590,35 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
         memory = memory if isinstance(memory, dict) else {}
         previous = chapter.get("ai_generation_checkpoint", {})
         previous = previous if isinstance(previous, dict) else {}
+        pending = getattr(self, "_chapter_ai_memory_pending", {})
+        pending = pending if isinstance(pending, dict) else {}
+        task = self._current_chapter_ai_task_context()
         checkpoint = {
-            "version": 1,
+            "version": 2,
             "stage": "memory_finalize",
             "status": str(status or "pending"),
+            "project_path": str(
+                pending.get("project_path", "")
+                or task.get("project_path", "")
+                or getattr(self, "current_project_path", "")
+                or ""
+            ),
             "chapter_id": str(chapter.get("id", "") or ""),
+            "chapter_index": int(
+                pending.get("chapter_index", self.current_chapter_index)
+                or self.current_chapter_index
+            ),
+            "request_id": str(
+                pending.get("request_id", "")
+                or task.get("request_id", "")
+                or ""
+            ),
+            "task_generation": int(
+                pending.get("task_generation", 0)
+                or task.get("task_generation", 0)
+                or 0
+            ),
+            "mode": str(pending.get("mode", "style") or "style"),
             "final_text": text,
             "final_text_sha256": self._chapter_ai_checkpoint_hash(text),
             "source_text_sha256": self._chapter_ai_checkpoint_hash(chapter.get("text", "")),
@@ -10062,6 +10629,12 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
                 if isinstance(getattr(self, "_chapter_ai_provider", {}), dict) else ""
             ),
             "model": str(getattr(self, "_chapter_ai_model", "") or ""),
+            "transaction_id": str(
+                pending.get("transaction_id", "")
+                or getattr(self, "_chapter_ai_memory_transaction_id", "")
+                or previous.get("transaction_id", "")
+                or ""
+            ),
             "created_at": str(previous.get("created_at", "") or now_str()),
             "updated_at": now_str(),
         }
@@ -10072,6 +10645,140 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
             self._note_project_dirty()
         self._persist_ai_generation_state()
         return True
+
+    def _store_memory_reconciliation_checkpoint(self, final_text, bundle, status="failed", error=""):
+        """Persist a validated chapter package until its boundary audit succeeds."""
+        chapters = self.current_project.get("chapters", []) if isinstance(self.current_project, dict) else []
+        if not (0 <= self.current_chapter_index < len(chapters)):
+            return False
+        chapter = chapters[self.current_chapter_index]
+        if not isinstance(chapter, dict):
+            return False
+        text = str(final_text or "").strip()
+        if not text or not isinstance(bundle, dict):
+            return False
+        memory = self.current_project.get("long_form_memory", {})
+        memory = memory if isinstance(memory, dict) else {}
+        previous = chapter.get("ai_generation_checkpoint", {})
+        previous = previous if isinstance(previous, dict) else {}
+        pending = getattr(self, "_chapter_ai_memory_pending", {})
+        pending = pending if isinstance(pending, dict) else {}
+        task = self._current_chapter_ai_task_context()
+        checkpoint = {
+            "version": 3,
+            "stage": "memory_reconcile",
+            "status": str(status or "failed"),
+            "project_path": str(
+                pending.get("project_path", "")
+                or task.get("project_path", "")
+                or getattr(self, "current_project_path", "")
+                or ""
+            ),
+            "chapter_id": str(chapter.get("id", "") or ""),
+            "chapter_index": int(
+                pending.get("chapter_index", self.current_chapter_index)
+                or self.current_chapter_index
+            ),
+            "request_id": str(
+                pending.get("request_id", "")
+                or task.get("request_id", "")
+                or ""
+            ),
+            "task_generation": int(
+                pending.get("task_generation", 0)
+                or task.get("task_generation", 0)
+                or 0
+            ),
+            "final_text": text,
+            "final_text_sha256": self._chapter_ai_checkpoint_hash(text),
+            "source_text_sha256": self._chapter_ai_checkpoint_hash(chapter.get("text", "")),
+            "outline_sha256": self._chapter_ai_checkpoint_hash(chapter.get("outline", "")),
+            "base_memory_revision": int(memory.get("revision", 0) or 0),
+            "provider": str(
+                (getattr(self, "_chapter_ai_provider", {}) or {}).get("name", "")
+                if isinstance(getattr(self, "_chapter_ai_provider", {}), dict) else ""
+            ),
+            "model": str(getattr(self, "_chapter_ai_model", "") or ""),
+            "transaction_id": str(
+                pending.get("transaction_id", "")
+                or getattr(self, "_chapter_ai_memory_transaction_id", "")
+                or previous.get("transaction_id", "")
+                or ""
+            ),
+            "bundle": deepcopy(bundle),
+            "created_at": str(previous.get("created_at", "") or now_str()),
+            "updated_at": now_str(),
+        }
+        if error:
+            checkpoint["error"] = str(error)[:1000]
+        if pending.get("already_committed"):
+            # Preserve the legacy committed-state marker when a boundary
+            # retry itself fails and has to be resumed again.
+            checkpoint["already_committed"] = True
+        chapter["ai_generation_checkpoint"] = checkpoint
+        chapter["auto_expand_resume_required"] = True
+        if hasattr(self, "_note_project_dirty"):
+            self._note_project_dirty()
+        self._persist_ai_generation_state()
+        self._log_novel_diagnostic(
+            "memory_reconciliation_checkpoint_saved",
+            level="warning",
+            action="memory_reconcile",
+            transaction_id=str(checkpoint.get("transaction_id", "") or ""),
+            status=str(status or "failed"),
+            error=clean_error_text(error),
+            final_text_chars=len(text),
+            bundle_summary=self._novel_memory_bundle_summary(bundle),
+            resume_required=True,
+        )
+        return True
+
+    def _validated_memory_reconciliation_checkpoint(self):
+        chapters = self.current_project.get("chapters", []) if isinstance(self.current_project, dict) else []
+        if not (0 <= self.current_chapter_index < len(chapters)):
+            return None
+        chapter = chapters[self.current_chapter_index]
+        if not isinstance(chapter, dict):
+            return None
+        checkpoint = chapter.get("ai_generation_checkpoint", {})
+        if not isinstance(checkpoint, dict) or str(checkpoint.get("stage", "") or "") != "memory_reconcile":
+            return None
+        text = str(checkpoint.get("final_text", "") or "").strip()
+        bundle = checkpoint.get("bundle")
+        memory = self.current_project.get("long_form_memory", {})
+        memory = memory if isinstance(memory, dict) else {}
+        try:
+            checkpoint_revision = int(checkpoint.get("base_memory_revision", -1) or 0)
+            memory_revision = int(memory.get("revision", 0) or 0)
+            raw_checkpoint_index = checkpoint.get("chapter_index", -1)
+            checkpoint_index = int(
+                raw_checkpoint_index if raw_checkpoint_index is not None else -1
+            )
+        except (TypeError, ValueError):
+            return None
+        checkpoint_project_path = self._canonical_project_path(checkpoint.get("project_path", ""))
+        current_project_path = self._canonical_project_path(getattr(self, "current_project_path", ""))
+        project_matches = (
+            not checkpoint_project_path
+            or not current_project_path
+            or checkpoint_project_path == current_project_path
+        )
+        valid = bool(
+            int(checkpoint.get("version", 0) or 0) == 3
+            and str(checkpoint.get("chapter_id", "") or "") == str(chapter.get("id", "") or "")
+            and checkpoint_index == int(self.current_chapter_index)
+            and project_matches
+            and text
+            and str(checkpoint.get("final_text_sha256", "") or "")
+            == self._chapter_ai_checkpoint_hash(text)
+            and str(checkpoint.get("outline_sha256", "") or "")
+            == self._chapter_ai_checkpoint_hash(chapter.get("outline", ""))
+            and checkpoint_revision == memory_revision
+            and isinstance(bundle, dict)
+            and isinstance(bundle.get("memory_update"), dict)
+            and str(chapter.get("memory_reconciliation_status", "") or "") in {"pending", "failed"}
+        )
+        return deepcopy(checkpoint) if valid else None
 
     def _memory_finalize_checkpoint_text(self, chapter):
         if not isinstance(chapter, dict):
@@ -10097,11 +10804,29 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
             memory_revision = int(memory.get("revision", 0) or 0)
         except Exception:
             memory_revision = 0
+        checkpoint_project_path = self._canonical_project_path(
+            checkpoint.get("project_path", "")
+        )
+        current_project_path = self._canonical_project_path(
+            getattr(self, "current_project_path", "")
+        )
+        project_matches = (
+            checkpoint_version < 2
+            or bool(checkpoint_project_path and current_project_path)
+            and checkpoint_project_path == current_project_path
+        )
+        chapter_index_matches = (
+            checkpoint_version < 2
+            or int(checkpoint.get("chapter_index", -1) or -1)
+            == int(getattr(self, "current_chapter_index", -1) or -1)
+        )
         source_matches = checkpoint_source_hash == current_text_hash or current_text_hash == final_text_hash
         valid = (
-            checkpoint_version == 1
+            checkpoint_version in {1, 2}
             and str(checkpoint.get("stage", "") or "") == "memory_finalize"
             and str(checkpoint.get("chapter_id", "") or "") == str(chapter.get("id", "") or "")
+            and project_matches
+            and chapter_index_matches
             and bool(text)
             and str(checkpoint.get("final_text_sha256", "") or "") == final_text_hash
             and source_matches
@@ -10126,6 +10851,13 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
             return False
         chapter = chapters[self.current_chapter_index]
         if not isinstance(chapter, dict) or not chapter.get("ai_generation_checkpoint"):
+            return False
+        checkpoint = chapter.get("ai_generation_checkpoint", {})
+        if (
+            isinstance(checkpoint, dict)
+            and str(checkpoint.get("stage", "") or "") == "memory_reconcile"
+            and str(chapter.get("memory_reconciliation_status", "") or "") != "complete"
+        ):
             return False
         chapter["ai_generation_checkpoint"] = {}
         if hasattr(self, "_note_project_dirty"):
@@ -10158,8 +10890,21 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
             )
             text = repaired_text
         self._chapter_ai_memory_finalize_attempted = True
+        chapters = self.current_project.get("chapters", []) if isinstance(self.current_project, dict) else []
+        checkpoint = (
+            chapters[self.current_chapter_index].get("ai_generation_checkpoint", {})
+            if 0 <= self.current_chapter_index < len(chapters)
+            and isinstance(chapters[self.current_chapter_index], dict)
+            and isinstance(chapters[self.current_chapter_index].get("ai_generation_checkpoint"), dict)
+            else {}
+        )
+        self._chapter_ai_memory_transaction_id = str(
+            checkpoint.get("transaction_id", "")
+            or self._next_novel_diagnostic_request_id("memory-sync")
+        )
         self._chapter_ai_memory_pending = {
             "chapter_id": self._current_chapter_id(),
+            "transaction_id": self._chapter_ai_memory_transaction_id,
             "final_text": text,
             "bundle": {},
             "errors": [],
@@ -10168,7 +10913,6 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
             "reconciliation_started": False,
             "prose_patch_applied": bool(prose_patch_applied),
         }
-        chapters = self.current_project.get("chapters", []) if isinstance(self.current_project, dict) else []
         if 0 <= self.current_chapter_index < len(chapters) and isinstance(chapters[self.current_chapter_index], dict):
             chapter = chapters[self.current_chapter_index]
             if (self.current_chapter_index + 1) % 10 == 0:
@@ -10198,7 +10942,7 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
             status_text,
         )
 
-    def _start_memory_reconciliation(self, final_text, bundle):
+    def _start_memory_reconciliation(self, final_text, bundle, resumed=False):
         pending = getattr(self, "_chapter_ai_memory_pending", {})
         if not isinstance(pending, dict) or pending.get("chapter_id") != self._current_chapter_id():
             self._fail_memory_sync("章节已切换，无法启动边界状态对账")
@@ -10223,7 +10967,11 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
         self._start_chapter_ai_worker(
             "memory_reconcile",
             context,
-            "十章边界状态已通过结构校验，正在执行一次语义对账（只修正状态，不阻断正文）...",
+            (
+                "正在恢复上次未完成的十章边界对账，不重写正文和状态整理..."
+                if resumed else
+                "十章边界状态已通过结构校验，正在执行一次语义对账（只修正状态，不阻断正文）..."
+            ),
         )
 
     def _apply_memory_reconciliation_fallback(self, message, status="failed"):
@@ -10231,6 +10979,24 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
         if not isinstance(pending, dict):
             self._fail_memory_sync(message)
             return
+        transaction_id = str(pending.get("transaction_id", "") or "")
+        state_before = self._novel_memory_state_summary()
+        self._log_novel_diagnostic(
+            "memory_reconciliation_fallback",
+            level="warning",
+            action="memory_reconcile",
+            transaction_id=transaction_id,
+            fallback_status=str(status or "failed"),
+            error=clean_error_text(message),
+            repair_triggered=False,
+            committed=False,
+            commit_mode="deferred_until_reconciliation_success",
+            resume_required=True,
+            state_before=state_before,
+            bundle_summary=self._novel_memory_bundle_summary(
+                pending.get("bundle", {}) if isinstance(pending.get("bundle"), dict) else {}
+            ),
+        )
         final_text = str(pending.get("final_text", "") or "").strip()
         bundle = deepcopy(pending.get("bundle", {})) if isinstance(pending.get("bundle"), dict) else {}
         chapters = self.current_project.get("chapters", []) if isinstance(self.current_project, dict) else []
@@ -10238,22 +11004,57 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
             chapter = chapters[self.current_chapter_index]
             chapter["memory_reconciliation_status"] = str(status or "failed")
             chapter["memory_reconciliation_error"] = str(message or "")[:1000]
-        mode = str(pending.get("mode", "style") or "style")
+            chapter["memory_sync_status"] = "failed"
+            chapter["memory_sync_error"] = str(message or "")[:1000]
+        checkpoint_saved = bool(
+            final_text
+            and bundle
+            and self._store_memory_reconciliation_checkpoint(
+                final_text,
+                bundle,
+                status=status,
+                error=message,
+            )
+        )
         self._chapter_ai_memory_pending = {}
-        if final_text and bundle:
-            if mode == "summary":
-                self._apply_repaired_summary_result(bundle)
-            else:
-                self._apply_style_final_result(final_text, bundle, memory_validated=True)
-        else:
+        self._chapter_ai_style_workflow_active = False
+        self._set_partial_chapter_ai_preview_state(False)
+        self._reset_chapter_ai_sequence()
+        if final_text:
+            self.chapter_ai_preview.setPlainText(final_text)
+        if not checkpoint_saved:
             self._fail_memory_sync(message)
+            return
+        if getattr(self, "_auto_expand_all_active", False):
+            self._stop_auto_expand_all(
+                f"自动扩写已暂停：第{self.current_chapter_index + 1}章十章边界对账失败；"
+                "下次启动时将从对账继续，不会重写正文。"
+            )
+        self._set_chapter_ai_actions_enabled(True)
+        self.set_status_tip(
+            "十章边界对账未完成，已保留正文、状态包和恢复检查点；"
+            "下次单章扩写或自动扩写启动时将从对账继续。"
+        )
 
     def _handle_memory_reconciliation_ready(self, content):
         pending = getattr(self, "_chapter_ai_memory_pending", {})
         if not isinstance(pending, dict) or pending.get("chapter_id") != self._current_chapter_id():
             self._fail_memory_sync("章节已切换，对账结果未应用")
             return
+        transaction_id = str(pending.get("transaction_id", "") or "")
         parsed = _parse_memory_reconciliation_result(content)
+        corrections = parsed.get("corrections", {}) if isinstance(parsed, dict) else {}
+        corrections = corrections if isinstance(corrections, dict) else {}
+        self._log_novel_diagnostic(
+            "memory_reconciliation_output_parsed",
+            action="memory_reconcile",
+            transaction_id=transaction_id,
+            parsed=bool(parsed.get("parsed")) if isinstance(parsed, dict) else False,
+            output_chars=len(str(content or "")),
+            output_sha256=self._chapter_ai_checkpoint_hash(content),
+            correction_keys=sorted(str(key) for key in corrections.keys())[:30],
+            correction_count=len(corrections),
+        )
         if not parsed.get("parsed"):
             self._apply_memory_reconciliation_fallback("边界语义对账结果无法解析")
             return
@@ -10262,6 +11063,7 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
         merged_update = _merge_long_form_memory_reconciliation_patch(
             original_bundle.get("memory_update", {}) if isinstance(original_bundle, dict) else {},
             parsed.get("corrections", {}),
+            project=self.current_project if isinstance(getattr(self, "current_project", None), dict) else None,
         )
         merged_update = _literalize_long_form_memory_evidence(merged_update, final_text)
         if isinstance(getattr(self, "current_project", None), dict):
@@ -10274,8 +11076,18 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
         bundle["memory_update"] = merged_update
         errors = self._memory_bundle_validation_errors(final_text, bundle)
         if errors:
+            self._log_novel_diagnostic(
+                "memory_reconciliation_validation_failed",
+                level="warning",
+                action="memory_reconcile",
+                transaction_id=transaction_id,
+                validation_errors=errors,
+                repair_targets=self._novel_memory_repair_targets(errors),
+                bundle_summary=self._novel_memory_bundle_summary(bundle),
+                state_before=self._novel_memory_state_summary(),
+            )
             self._apply_memory_reconciliation_fallback(
-                "对账纠错补丁未通过完整校验，已采用原状态增量：" + "；".join(errors)
+                "对账纠错补丁未通过完整校验，已保留原状态包等待下次对账：" + "；".join(errors)
             )
             return
         chapters = self.current_project.get("chapters", []) if isinstance(self.current_project, dict) else []
@@ -10296,12 +11108,20 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
             self._fail_memory_sync("章节已切换，状态整理结果未应用")
             return
         parsed = _parse_memory_repair_result(content)
+        memory_update = deepcopy(parsed.get("memory_update", {})) \
+            if isinstance(parsed.get("memory_update"), dict) else {}
+        if parsed.get("repair_mode") == "patch":
+            # A compatible response may contain a complete long_form_memory
+            # object without the outer response brace. Keep it in the normal
+            # validation path instead of treating the package as empty.
+            memory_update = _merge_long_form_memory_repair_patch(
+                {}, parsed.get("memory_patch", {})
+            )
         bundle = {
             "outline": str(parsed.get("outline", "") or "").strip(),
             "summary": str(parsed.get("summary", "") or "").strip(),
             "key_facts": str(parsed.get("key_facts", "") or "").strip(),
-            "memory_update": deepcopy(parsed.get("memory_update", {}))
-            if isinstance(parsed.get("memory_update"), dict) else {},
+            "memory_update": memory_update,
             "logic_audit": deepcopy(parsed.get("logic_audit", {}))
             if isinstance(parsed.get("logic_audit"), dict) else {},
             "prose_review": deepcopy(parsed.get("prose_review", {}))
@@ -10310,23 +11130,93 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
             if isinstance(parsed.get("repair_patches"), list) else [],
         }
         final_text = str(pending.get("final_text", "") or "").strip()
+        transaction_id = str(pending.get("transaction_id", "") or "")
+        self._log_novel_diagnostic(
+            "memory_finalize_output_parsed",
+            action="memory_finalize",
+            transaction_id=transaction_id,
+            parsed=bool(parsed.get("parsed")),
+            output_chars=len(str(content or "")),
+            output_sha256=self._chapter_ai_checkpoint_hash(content),
+            bundle_summary=self._novel_memory_bundle_summary(bundle),
+        )
         if not parsed.get("parsed"):
-            self._start_memory_repair(
-                final_text,
-                bundle,
-                ["独立状态整理结果无法解析（JSON格式错误）"],
-                "style",
+            self._log_novel_diagnostic(
+                "memory_finalize_empty_package",
+                level="warning",
+                action="memory_finalize",
+                transaction_id=transaction_id,
+                parsed=False,
+                package_status="parse_failed",
+                output_chars=len(str(content or "")),
+                output_sha256=self._chapter_ai_checkpoint_hash(content),
+                final_text_chars=len(final_text),
+                package_summary=self._novel_memory_bundle_summary(bundle),
+                resume_required=True,
             )
+            self._fail_memory_sync("独立状态整理结果无法解析（JSON格式错误）")
+            return
+        package_summary = self._novel_memory_bundle_summary(bundle)
+        package_count_groups = (
+            package_summary.get("state_patch_counts", {}),
+            package_summary.get("record_update_counts", {}),
+            package_summary.get("reconciliation_counts", {}),
+            package_summary.get("next_chapter_counts", {}),
+        )
+        package_has_delta = any(
+            int(value or 0) > 0
+            for group in package_count_groups
+            if isinstance(group, dict)
+            for value in group.values()
+        ) or int(package_summary.get("fact_updates", 0) or 0) > 0 \
+            or int(package_summary.get("long_term_events", 0) or 0) > 0 \
+            or bool(bundle.get("memory_update", {}).get("stage_archive")) \
+            or bool(bundle.get("memory_update", {}).get("state_delta"))
+        package_has_text = any(
+            int(package_summary.get(key, 0) or 0) > 0
+            for key in ("outline_chars", "summary_chars", "key_facts_chars")
+        )
+        if not package_has_text and not package_has_delta:
+            self._log_novel_diagnostic(
+                "memory_finalize_empty_package",
+                level="warning",
+                action="memory_finalize",
+                transaction_id=transaction_id,
+                parsed=True,
+                package_status="empty",
+                output_chars=len(str(content or "")),
+                output_sha256=self._chapter_ai_checkpoint_hash(content),
+                final_text_chars=len(final_text),
+                package_summary=package_summary,
+                resume_required=True,
+            )
+            self._fail_memory_sync("独立状态整理结果为空，已保留正文并等待下次状态整理")
             return
         audit_errors = _chapter_logic_audit_validation_errors(
             final_text, bundle.get("logic_audit", {})
         )
-        if audit_errors:
-            self._start_memory_repair(final_text, bundle, audit_errors, "style")
-            return
         logic_issues = _chapter_logic_audit_blocking_issues(bundle.get("logic_audit", {}))
+        # A confirmed prose contradiction must be repaired before validating
+        # its derived state bundle: the repair may change the evidence that
+        # supports the summary and long-form memory update.
         if logic_issues:
             self._start_chapter_logic_repair(final_text, bundle, logic_issues)
+            return
+        bundle_errors = self._memory_bundle_validation_errors(final_text, bundle)
+        validation_errors = list(dict.fromkeys(audit_errors + bundle_errors))
+        if validation_errors:
+            self._log_novel_diagnostic(
+                "memory_finalize_validation_collected",
+                level="warning",
+                action="memory_finalize",
+                transaction_id=transaction_id,
+                validation_error_count=len(validation_errors),
+                validation_errors=validation_errors,
+                repair_targets=self._novel_memory_repair_targets(validation_errors),
+                audit_error_count=len(audit_errors),
+                bundle_error_count=len(bundle_errors),
+            )
+            self._start_memory_repair(final_text, bundle, validation_errors, "style")
             return
         patches = bundle.get("repair_patches", [])
         if patches and not pending.get("prose_patch_applied"):
@@ -10351,10 +11241,6 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
                 patch_count=len(patches),
                 validation_errors=patch_errors,
             )
-        errors = self._memory_bundle_validation_errors(final_text, bundle)
-        if errors:
-            self._start_memory_repair(final_text, bundle, errors, "style")
-            return
         if (self.current_chapter_index + 1) % 10 == 0 and not pending.get("reconciliation_started"):
             self._start_memory_reconciliation(final_text, bundle)
             return
@@ -10415,6 +11301,11 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
         )
         self._chapter_ai_memory_pending = {
             "chapter_id": self._current_chapter_id(),
+            "transaction_id": str(
+                previous_pending.get("transaction_id", "")
+                or getattr(self, "_chapter_ai_memory_transaction_id", "")
+                or self._next_novel_diagnostic_request_id("memory-sync")
+            ),
             "final_text": str(final_text or "").strip(),
             "bundle": deepcopy(bundle) if isinstance(bundle, dict) else {},
             "errors": validation_errors,
@@ -10462,6 +11353,10 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
         )
         self._chapter_ai_memory_pending = {
             "chapter_id": self._current_chapter_id(),
+            "transaction_id": str(
+                getattr(self, "_chapter_ai_memory_pending", {}).get("transaction_id", "")
+                if isinstance(getattr(self, "_chapter_ai_memory_pending", {}), dict) else ""
+            ) or self._next_novel_diagnostic_request_id("memory-sync"),
             "final_text": str(final_text or "").strip(),
             "bundle": deepcopy(bundle) if isinstance(bundle, dict) else {},
             "errors": [],
@@ -10524,12 +11419,48 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
         self._start_memory_finalize(repaired_text)
 
     def _fail_memory_sync(self, message):
+        pending = getattr(self, "_chapter_ai_memory_pending", {})
+        pending = pending if isinstance(pending, dict) else {}
+        pending_path = self._canonical_project_path(pending.get("project_path", ""))
+        current_path = self._canonical_project_path(
+            getattr(self, "current_project_path", "")
+        )
+        pending_chapter_id = str(pending.get("chapter_id", "") or "")
+        pending_generation = int(pending.get("task_generation", 0) or 0)
+        if pending and (
+            (pending_path and pending_path != current_path)
+            or (pending_chapter_id and pending_chapter_id != self._current_chapter_id())
+            or (
+                pending_generation
+                and pending_generation
+                != int(getattr(self, "_chapter_ai_task_generation", 0) or 0)
+            )
+        ):
+            self._log_novel_diagnostic(
+                "chapter_ai_stale_failure_discarded",
+                level="warning",
+                action="memory_sync",
+                request_id=str(pending.get("request_id", "") or ""),
+                reason=str(message or "")[:500],
+                pending_project_path=pending_path,
+                current_project_path=current_path,
+                pending_chapter_id=pending_chapter_id,
+                current_chapter_id=self._current_chapter_id(),
+                pending_task_generation=pending_generation,
+                current_task_generation=int(
+                    getattr(self, "_chapter_ai_task_generation", 0) or 0
+                ),
+            )
+            return
         chapters = self.current_project.get("chapters", []) if isinstance(self.current_project, dict) else []
         if 0 <= self.current_chapter_index < len(chapters) and isinstance(chapters[self.current_chapter_index], dict):
             chapters[self.current_chapter_index]["memory_sync_status"] = "failed"
             chapters[self.current_chapter_index]["memory_sync_error"] = str(message or "")[:1000]
-        pending = getattr(self, "_chapter_ai_memory_pending", {})
-        final_text = str(pending.get("final_text", "") or "").strip() if isinstance(pending, dict) else ""
+        final_text = str(pending.get("final_text", "") or "").strip()
+        transaction_id = str(
+            pending.get("transaction_id", "")
+            if isinstance(pending, dict) else ""
+        )
         if final_text:
             self.chapter_ai_preview.setPlainText(final_text)
             self._store_memory_finalize_checkpoint(
@@ -10560,9 +11491,29 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
             request_id=request_id,
             error=clean_error_text(message),
             error_category="memory_state",
+            transaction_id=transaction_id,
             repair_attempts=int(getattr(self, "_chapter_ai_memory_repair_attempts", 0) or 0),
             final_text_chars=len(final_text),
             final_text_sha256=self._chapter_ai_checkpoint_hash(final_text) if final_text else "",
+            repair_targets=self._novel_memory_repair_targets(
+                pending.get("errors", []) if isinstance(pending, dict) else []
+            ),
+            bundle_summary=self._novel_memory_bundle_summary(
+                pending.get("bundle", {}) if isinstance(pending, dict) else {}
+            ),
+            state_before=self._novel_memory_state_summary(),
+            checkpoint_summary={
+                "present": bool(final_text),
+                "chars": len(final_text),
+                "sha256": self._chapter_ai_checkpoint_hash(final_text) if final_text else "",
+                "status": str(
+                    chapters[self.current_chapter_index].get("ai_generation_checkpoint", {}).get("status", "")
+                    if 0 <= self.current_chapter_index < len(chapters)
+                    and isinstance(chapters[self.current_chapter_index], dict)
+                    and isinstance(chapters[self.current_chapter_index].get("ai_generation_checkpoint"), dict)
+                    else ""
+                ),
+            },
             diagnostic_snapshot_path=snapshot_path,
         )
         self._chapter_ai_style_workflow_active = False
@@ -10586,7 +11537,35 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
         parsed = _parse_memory_repair_result(content)
         bundle = deepcopy(pending.get("bundle", {})) if isinstance(pending.get("bundle"), dict) else {}
         final_text = str(pending.get("final_text", "") or "").strip()
+        transaction_id = str(pending.get("transaction_id", "") or "")
+        self._log_novel_diagnostic(
+            "memory_repair_output_parsed",
+            action="memory_repair",
+            transaction_id=transaction_id,
+            parsed=bool(parsed.get("parsed")),
+            output_chars=len(str(content or "")),
+            output_sha256=self._chapter_ai_checkpoint_hash(content),
+            bundle_summary=self._novel_memory_bundle_summary(bundle),
+        )
         if not parsed.get("parsed"):
+            parse_signature = hashlib.sha256(
+                json.dumps(
+                    {
+                        "final_text": self._chapter_ai_checkpoint_hash(final_text),
+                        "output": self._chapter_ai_checkpoint_hash(content),
+                        "error": "状态修复结果无法解析（JSON格式错误）",
+                    },
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode("utf-8")
+            ).hexdigest()
+            if parse_signature == getattr(
+                self, "_chapter_ai_last_memory_repair_signature", ""
+            ):
+                self._fail_memory_sync("状态修复结果重复且仍无法解析")
+                return
+            self._chapter_ai_last_memory_repair_signature = parse_signature
             if int(getattr(self, "_chapter_ai_memory_repair_attempts", 0) or 0) < 2:
                 retry_errors = [
                     str(item) for item in pending.get("errors", []) if str(item or "").strip()
@@ -10624,11 +11603,51 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
             audit_errors.extend(_chapter_logic_audit_validation_errors(
                 final_text, bundle.get("logic_audit", {})
             ))
-        if audit_errors:
-            if int(getattr(self, "_chapter_ai_memory_repair_attempts", 0) or 0) < 2:
-                self._start_memory_repair(final_text, bundle, audit_errors, pending.get("mode", "style"))
+        bundle_errors = self._memory_bundle_validation_errors(final_text, bundle)
+        validation_errors = list(dict.fromkeys(audit_errors + bundle_errors))
+        if validation_errors:
+            self._log_novel_diagnostic(
+                "memory_repair_validation_collected",
+                level="warning",
+                action="memory_repair",
+                transaction_id=transaction_id,
+                validation_error_count=len(validation_errors),
+                validation_errors=validation_errors,
+                repair_targets=self._novel_memory_repair_targets(validation_errors),
+                audit_error_count=len(audit_errors),
+                bundle_error_count=len(bundle_errors),
+            )
+            validation_signature = hashlib.sha256(
+                json.dumps(
+                    {
+                        "final_text": self._chapter_ai_checkpoint_hash(final_text),
+                        "errors": validation_errors,
+                        "bundle": bundle,
+                    },
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                    default=str,
+                ).encode("utf-8")
+            ).hexdigest()
+            if validation_signature == getattr(
+                self, "_chapter_ai_last_memory_repair_signature", ""
+            ):
+                self._log_novel_diagnostic(
+                    "memory_repair_duplicate_output_stopped",
+                    level="warning",
+                    action="memory_repair",
+                    transaction_id=transaction_id,
+                    validation_errors=validation_errors,
+                    final_text_sha256=self._chapter_ai_checkpoint_hash(final_text),
+                )
+                self._fail_memory_sync("状态修复结果与上次完全相同，已停止重复推理")
                 return
-            self._fail_memory_sync("；".join(audit_errors))
+            self._chapter_ai_last_memory_repair_signature = validation_signature
+            if int(getattr(self, "_chapter_ai_memory_repair_attempts", 0) or 0) < 2:
+                self._start_memory_repair(final_text, bundle, validation_errors, pending.get("mode", "style"))
+                return
+            self._fail_memory_sync("；".join(validation_errors))
             return
         logic_issues = (
             _chapter_logic_audit_blocking_issues(bundle.get("logic_audit", {}))
@@ -10637,12 +11656,15 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
         if logic_issues:
             self._start_chapter_logic_repair(final_text, bundle, logic_issues)
             return
-        errors = self._memory_bundle_validation_errors(final_text, bundle)
-        if errors:
-            if int(getattr(self, "_chapter_ai_memory_repair_attempts", 0) or 0) < 2:
-                self._start_memory_repair(final_text, bundle, errors, pending.get("mode", "style"))
-                return
-            self._fail_memory_sync("；".join(errors))
+        # A repair response is still a memory-finalize result. At a ten-chapter
+        # boundary it must pass the same reconciliation gate as the first
+        # response; otherwise a repaired bundle can commit while the boundary
+        # remains pending without a resumable checkpoint.
+        if (
+            (self.current_chapter_index + 1) % 10 == 0
+            and not pending.get("reconciliation_started")
+        ):
+            self._start_memory_reconciliation(final_text, bundle)
             return
         self._chapter_ai_memory_pending = {}
         self.chapter_ai_preview.setPlainText(final_text)
@@ -10651,20 +11673,89 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
         else:
             self._apply_style_final_result(final_text, bundle, memory_validated=True)
 
-    def _apply_repaired_summary_result(self, bundle):
-        if isinstance(getattr(self, "current_project", None), dict):
-            memory_changed = _apply_long_form_memory_update(
-                self.current_project,
-                self.current_chapter_index,
-                bundle.get("memory_update", {}) if isinstance(bundle, dict) else {},
-            )
-        else:
-            memory_changed = True
+    def _prepare_staged_memory_commit(self, final_text, bundle, include_prose=False, include_outline=False):
+        """Build the complete chapter update without mutating the live project."""
+        if not isinstance(getattr(self, "current_project", None), dict):
+            return None, False, "", "", "", ""
+        raw_chapter_index = getattr(self, "current_chapter_index", -1)
+        chapter_index = int(raw_chapter_index if raw_chapter_index is not None else -1)
+        chapters = self.current_project.get("chapters", [])
+        if not isinstance(chapters, list) or not (0 <= chapter_index < len(chapters)):
+            return None, False, "", "", "", ""
+        staged_project = deepcopy(self.current_project)
+        memory_changed = _apply_long_form_memory_update(
+            staged_project,
+            chapter_index,
+            bundle.get("memory_update", {}) if isinstance(bundle, dict) else {},
+        )
         if not memory_changed:
-            self._fail_memory_sync("修复后的状态事务未能提交")
-            return
+            return None, False, "", "", "", ""
+        staged_chapter = staged_project.get("chapters", [])[chapter_index]
+        old_text = str(
+            self.chapter_text.toPlainText()
+            if hasattr(self, "chapter_text") else staged_chapter.get("text", "")
+        ).strip()
+        final_text = str(final_text or "").strip()
+        new_text = (
+            _append_text_without_duplicate_overlap(old_text, final_text)
+            if include_prose else str(staged_chapter.get("text", "") or "").strip()
+        )
+        if include_prose:
+            staged_chapter["text"] = new_text
+        bundle = bundle if isinstance(bundle, dict) else {}
+        outline = str(bundle.get("outline", "") or "").strip()
         summary = str(bundle.get("summary", "") or "").strip()
         key_facts = str(bundle.get("key_facts", "") or "").strip()
+        if include_outline and outline and not str(
+            getattr(self, "_chapter_ai_sequence_started_outline", "") or ""
+        ).strip():
+            staged_chapter["outline"] = outline
+        if summary:
+            staged_chapter["summary"] = summary
+        if key_facts:
+            staged_chapter["key_facts"] = key_facts
+        return staged_project, True, new_text, outline, summary, key_facts
+
+    def _apply_repaired_summary_result(self, bundle):
+        pending = getattr(self, "_chapter_ai_memory_pending", {})
+        pending = pending if isinstance(pending, dict) else {}
+        transaction_id = str(
+            pending.get("transaction_id", "")
+            or getattr(self, "_chapter_ai_memory_transaction_id", "")
+        )
+        state_before = self._novel_memory_state_summary()
+        self._log_novel_diagnostic(
+            "memory_transaction_started",
+            action="memory_sync",
+            transaction_id=transaction_id,
+            bundle_summary=self._novel_memory_bundle_summary(bundle),
+            state_before=state_before,
+        )
+        final_text = str(pending.get("final_text", "") or "").strip()
+        staged_project, memory_changed, _new_text, _outline, summary, key_facts = (
+            self._prepare_staged_memory_commit(final_text, bundle)
+        )
+        if not memory_changed:
+            self._log_novel_diagnostic(
+                "memory_transaction_failed",
+                level="error",
+                action="memory_sync",
+                transaction_id=transaction_id,
+                state_before=state_before,
+                state_after=self._novel_memory_state_summary(),
+                bundle_summary=self._novel_memory_bundle_summary(bundle),
+            )
+            self._fail_memory_sync("修复后的状态事务未能提交")
+            return
+        self.current_project = staged_project
+        self._log_novel_diagnostic(
+            "memory_transaction_committed",
+            action="memory_sync",
+            transaction_id=transaction_id,
+            state_before=state_before,
+            state_after=self._novel_memory_state_summary(),
+            bundle_summary=self._novel_memory_bundle_summary(bundle),
+        )
         if summary:
             self._set_text_without_signals(self.chapter_summary, summary)
         if key_facts:
@@ -10693,10 +11784,59 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
         self.set_chapter_ai_panel_expanded(True)
         self._status_begin_workflow("chapter_ai")
         chapter_id = self._current_chapter_id()
+        raw_chapter_index = getattr(self, "current_chapter_index", -1)
+        chapter_index = int(raw_chapter_index if raw_chapter_index is not None else -1)
+        project_path = self._canonical_project_path(
+            getattr(self, "current_project_path", "")
+        )
         request_id = self._next_novel_diagnostic_request_id("chapter-ai")
+        self._chapter_ai_task_generation = int(
+            getattr(self, "_chapter_ai_task_generation", 0) or 0
+        ) + 1
+        task_generation = int(self._chapter_ai_task_generation)
         diagnostic_started_at = time.perf_counter()
         self._chapter_ai_diagnostic_request_id = request_id
         self._chapter_ai_diagnostic_started_at = diagnostic_started_at
+        chapter = {}
+        chapters = self.current_project.get("chapters", []) if isinstance(self.current_project, dict) else []
+        if 0 <= chapter_index < len(chapters) and isinstance(chapters[chapter_index], dict):
+            chapter = chapters[chapter_index]
+        active_task = {
+            "project_path": project_path,
+            "chapter_id": chapter_id,
+            "chapter_index": chapter_index,
+            "action": str(action or ""),
+            "request_id": request_id,
+            "task_generation": task_generation,
+            "source_text_sha256": hashlib.sha256(
+                str(chapter.get("text", "") or "").encode("utf-8", errors="replace")
+            ).hexdigest(),
+            "outline_sha256": hashlib.sha256(
+                str(chapter.get("outline", "") or "").encode("utf-8", errors="replace")
+            ).hexdigest(),
+            "base_memory_revision": int(
+                (self.current_project.get("long_form_memory", {}) or {}).get(
+                    "revision", 0
+                ) or 0
+            ) if isinstance(self.current_project, dict) and isinstance(
+                self.current_project.get("long_form_memory", {}), dict
+            ) else 0,
+        }
+        self._chapter_ai_active_task = active_task
+        pending = getattr(self, "_chapter_ai_memory_pending", {})
+        if isinstance(pending, dict) and pending:
+            pending.update(
+                {
+                    "project_path": project_path,
+                    "chapter_index": chapter_index,
+                    "request_id": request_id,
+                    "task_generation": task_generation,
+                    "source_text_sha256": active_task["source_text_sha256"],
+                    "outline_sha256": active_task["outline_sha256"],
+                    "base_memory_revision": active_task["base_memory_revision"],
+                }
+            )
+            self._chapter_ai_memory_pending = pending
         if not transient_retry:
             retry_counts = getattr(self, "_chapter_ai_transient_retry_counts", None)
             if isinstance(retry_counts, dict):
@@ -10749,6 +11889,20 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
             raise
         self.writing_worker.diagnostic_request_id = request_id
         self.writing_worker.diagnostic_started_at = diagnostic_started_at
+        self.writing_worker.diagnostic_project_path = project_path
+        self.writing_worker.diagnostic_chapter_id = chapter_id
+        self.writing_worker.diagnostic_chapter_index = chapter_index
+        self.writing_worker.diagnostic_task_generation = task_generation
+        self.writing_worker.diagnostic_task_context = deepcopy(active_task)
+        if isinstance(getattr(self.writing_worker, "diagnostics", None), dict):
+            self.writing_worker.diagnostics.update(
+                {
+                    "project_path": project_path,
+                    "chapter_id": chapter_id,
+                    "chapter_index": chapter_index,
+                    "task_generation": task_generation,
+                }
+            )
         self._connect_novel_worker_status(self.writing_worker)
         self.writing_worker.chunk.connect(self.on_chapter_ai_chunk)
         self.writing_worker.result_ready.connect(self.on_chapter_ai_ready)
@@ -10766,6 +11920,8 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
             action=action,
             chapter_id=chapter_id,
             request_id=request_id,
+            project_path=project_path,
+            task_generation=task_generation,
             transient_retry=bool(transient_retry),
             retry_attempt=retry_attempt,
             context_chars=len(context_text),
@@ -10837,6 +11993,7 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
             "response stream was interrupted",
             "stream was interrupted",
             "未完整结束",
+            "正文交付边界不完整",
             "剧情执行稿结构不完整",
             "没有返回有效内容",
             "输出异常膨胀",
@@ -11037,6 +12194,44 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
             and isinstance(chapters[self.current_chapter_index], dict)
             else {}
         )
+        reconciliation_checkpoint = self._validated_memory_reconciliation_checkpoint()
+        if reconciliation_checkpoint:
+            self._chapter_ai_provider = provider
+            self._chapter_ai_model = model
+            self._reset_chapter_ai_sequence()
+            self._reset_chapter_ai_style_retry()
+            self._chapter_ai_sequence_active = True
+            self._chapter_ai_sequence_chapter_id = self._current_chapter_id()
+            self._chapter_ai_sequence_started_outline = self.chapter_outline.toPlainText().strip()
+            self._set_partial_chapter_ai_preview_state(False)
+            self._chapter_ai_resume_prefix = ""
+            final_text = str(reconciliation_checkpoint.get("final_text", "") or "").strip()
+            bundle = deepcopy(reconciliation_checkpoint.get("bundle", {}))
+            self._chapter_ai_memory_transaction_id = str(
+                reconciliation_checkpoint.get("transaction_id", "")
+                or self._next_novel_diagnostic_request_id("memory-sync")
+            )
+            self._chapter_ai_memory_pending = {
+                "chapter_id": self._current_chapter_id(),
+                "transaction_id": self._chapter_ai_memory_transaction_id,
+                "final_text": final_text,
+                "bundle": bundle,
+                "errors": [],
+                "mode": str(reconciliation_checkpoint.get("mode", "style") or "style"),
+                "logic_audit_required": False,
+                "reconciliation_started": False,
+                "resumed_reconciliation": True,
+                "already_committed": bool(
+                    reconciliation_checkpoint.get("already_committed", False)
+                ),
+            }
+            self._mark_current_chapter_ai_sync_pending(chapter)
+            self._chapter_ai_style_workflow_active = (
+                str(self._chapter_ai_memory_pending.get("mode", "style") or "style") == "style"
+            )
+            self.chapter_ai_preview.setPlainText(final_text)
+            self._start_memory_reconciliation(final_text, bundle, resumed=True)
+            return
         has_committed_marker = self._chapter_has_committed_memory_marker(chapter)
         if has_committed_marker:
             if self._auto_expand_chapter_has_committed_memory(chapter):
@@ -11268,6 +12463,8 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
         return True
 
     def on_chapter_ai_chunk(self, piece):
+        if not self._chapter_ai_callback_is_current():
+            return
         piece = str(piece or "")
         if not piece:
             return
@@ -11344,22 +12541,55 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
             if errors:
                 self._start_memory_repair(text, bundle, errors)
                 return
-        if isinstance(getattr(self, "current_project", None), dict):
-            memory_changed = _apply_long_form_memory_update(
-                self.current_project,
-                self.current_chapter_index,
-                bundle.get("memory_update", {}) if isinstance(bundle, dict) else {},
-            )
-        else:
-            memory_changed = True
+        pending = getattr(self, "_chapter_ai_memory_pending", {})
+        pending = pending if isinstance(pending, dict) else {}
+        transaction_id = str(
+            pending.get("transaction_id", "")
+            or getattr(self, "_chapter_ai_memory_transaction_id", "")
+        )
+        state_before = self._novel_memory_state_summary()
+        self._log_novel_diagnostic(
+            "memory_transaction_started",
+            action="memory_sync",
+            transaction_id=transaction_id,
+            bundle_summary=self._novel_memory_bundle_summary(bundle),
+            state_before=state_before,
+        )
+        (
+            staged_project,
+            memory_changed,
+            new_text,
+            outline,
+            summary,
+            key_facts,
+        ) = self._prepare_staged_memory_commit(
+            text,
+            bundle,
+            include_prose=True,
+            include_outline=True,
+        )
         if not memory_changed:
+            self._log_novel_diagnostic(
+                "memory_transaction_failed",
+                level="error",
+                action="memory_sync",
+                transaction_id=transaction_id,
+                state_before=state_before,
+                state_after=self._novel_memory_state_summary(),
+                bundle_summary=self._novel_memory_bundle_summary(bundle),
+            )
             self._fail_memory_sync("状态事务未能提交")
             return
-        old_text = self.chapter_text.toPlainText().strip()
-        self.chapter_text.setPlainText(_append_text_without_duplicate_overlap(old_text, text))
-        outline = str(bundle.get("outline", "") or "").strip() if isinstance(bundle, dict) else ""
-        summary = str(bundle.get("summary", "") or "").strip() if isinstance(bundle, dict) else ""
-        key_facts = str(bundle.get("key_facts", "") or "").strip() if isinstance(bundle, dict) else ""
+        self.current_project = staged_project
+        self._log_novel_diagnostic(
+            "memory_transaction_committed",
+            action="memory_sync",
+            transaction_id=transaction_id,
+            state_before=state_before,
+            state_after=self._novel_memory_state_summary(),
+            bundle_summary=self._novel_memory_bundle_summary(bundle),
+        )
+        self.chapter_text.setPlainText(new_text)
         if outline and not str(getattr(self, "_chapter_ai_sequence_started_outline", "") or "").strip():
             self.chapter_outline.setPlainText(outline)
         if summary:
@@ -11433,6 +12663,8 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
         return marked
 
     def on_chapter_ai_ready(self, action, content):
+        if not self._chapter_ai_callback_is_current():
+            return
         self._clear_transient_chapter_ai_retry(action)
         self.set_chapter_ai_panel_expanded(True)
         raw_final_text = str(content or "").strip() or self.chapter_ai_stream_text.strip()
@@ -11717,6 +12949,8 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
             self.set_status_tip(f"AI {labels.get(action, '内容')}已生成，可确认后应用。")
 
     def on_chapter_ai_failed(self, err):
+        if not self._chapter_ai_callback_is_current():
+            return
         action = getattr(self, "_chapter_ai_running_action", "")
         sequence_active = bool(getattr(self, "_chapter_ai_sequence_active", False))
         err_text = clean_error_text(err)
@@ -11810,7 +13044,7 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
             return
         if action == "memory_reconcile":
             self._apply_memory_reconciliation_fallback(
-                "边界语义对账调用失败，已采用原本通过校验的状态增量：" + clean_error_text(err)
+                "边界语义对账调用失败，已保留原本通过校验的状态包等待下次对账：" + clean_error_text(err)
             )
             return
         if action in {"memory_finalize", "memory_repair", "logic_repair"}:
@@ -12024,6 +13258,14 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
         summary_text, key_facts_text, linked_names = self._split_chapter_summary_bundle(content)
         memory_update = _parse_long_form_memory_update(content)
         if not summary_text and not key_facts_text and not linked_names and not memory_update:
+            self._log_novel_diagnostic(
+                "auto_chapter_summary_invalid_output",
+                level="error",
+                action="summary",
+                chapter_id=self._current_chapter_id(),
+                error="自动摘要结果为空或无法解析",
+                error_category="invalid_output",
+            )
             return False
         body_editor = getattr(self, "chapter_text", None)
         if body_editor is not None:
@@ -12045,6 +13287,14 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
             if strict_sync else []
         )
         if validation_errors:
+            self._log_novel_diagnostic(
+                "auto_chapter_summary_validation_failed",
+                level="warning",
+                action="summary",
+                chapter_id=self._current_chapter_id(),
+                validation_errors=validation_errors,
+                repair_triggered=bool(getattr(self, "_chapter_ai_sequence_active", False)),
+            )
             chapters = self.current_project.get("chapters", []) if isinstance(self.current_project, dict) else []
             if 0 <= self.current_chapter_index < len(chapters) and isinstance(chapters[self.current_chapter_index], dict):
                 chapters[self.current_chapter_index]["memory_sync_status"] = "failed"
@@ -12083,12 +13333,25 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
         summary_unchanged = current_summary == getattr(self, "_auto_summary_started_summary", "")
         key_facts_unchanged = current_key_facts == getattr(self, "_auto_summary_started_key_facts", "")
         linked_unchanged = current_linked == getattr(self, "_auto_summary_started_linked", "")
+        staged_project = deepcopy(self.current_project)
         memory_changed = _apply_long_form_memory_update(
-            self.current_project,
+            staged_project,
             self.current_chapter_index,
             memory_update,
         )
         if memory_changed:
+            staged_chapters = staged_project.get("chapters", [])
+            staged_chapter = (
+                staged_chapters[self.current_chapter_index]
+                if 0 <= self.current_chapter_index < len(staged_chapters)
+                and isinstance(staged_chapters[self.current_chapter_index], dict)
+                else {}
+            )
+            if summary_text and summary_unchanged:
+                staged_chapter["summary"] = summary_text
+            if key_facts_text and key_facts_unchanged:
+                staged_chapter["key_facts"] = key_facts_text
+            self.current_project = staged_project
             self._refresh_long_form_record_views()
         changed = memory_changed
         if summary_text and summary_unchanged:
@@ -12152,7 +13415,16 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
         return memory_changed
 
     def on_auto_chapter_summary_failed(self, err):
-        log_debug("小说章节自动摘要失败", clean_error_text(err))
+        error = clean_error_text(err)
+        self._log_novel_diagnostic(
+            "auto_chapter_summary_failed",
+            level="error",
+            action="summary",
+            chapter_id=str(getattr(self, "_auto_summary_chapter_id", "") or ""),
+            error=error,
+            error_category=self._novel_diagnostic_error_category(error),
+        )
+        log_debug("小说章节自动摘要失败", error)
 
     def _cleanup_auto_summary_worker(self):
         worker = self.sender()
@@ -15065,6 +16337,11 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
         return "状态更新", "status"
 
     def _status_current_chapter_scope(self):
+        if self._detached_auto_status_is_current():
+            scope_id = str(getattr(self, "_detached_auto_status_scope_id", "") or "")
+            scope_label = str(getattr(self, "_detached_auto_status_scope_label", "") or "")
+            if scope_id or scope_label:
+                return scope_id, scope_label
         project = self.current_project if isinstance(getattr(self, "current_project", None), dict) else {}
         chapters = project.get("chapters", []) if isinstance(project.get("chapters"), list) else []
         try:
@@ -15131,6 +16408,13 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
         self._status_workflow_active = False
 
     def _status_has_active_work(self):
+        detached = getattr(self, "_detached_auto_runner", None)
+        if self._detached_auto_status_is_current(detached):
+            try:
+                if detached._status_has_active_work():
+                    return True
+            except Exception:
+                pass
         if any(bool(getattr(self, name, False)) for name in (
             "_auto_expand_all_active",
             "_auto_expand_all_waiting_next",
@@ -15298,9 +16582,13 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
             self.status_label.setToolTip(display_message)
 
         progress_parts = []
-        auto_active = bool(getattr(self, "_auto_expand_all_active", False))
+        detached_auto_active = self._detached_auto_status_is_current()
+        auto_active = bool(getattr(self, "_auto_expand_all_active", False)) or detached_auto_active
         if auto_active or message.startswith("自动扩写"):
-            current, total = self._auto_expand_all_chapter_progress()
+            if detached_auto_active:
+                current, total = getattr(self, "_detached_auto_status_auto_progress", (0, 0))
+            else:
+                current, total = self._auto_expand_all_chapter_progress()
             if message.startswith("自动扩写完成") and total:
                 current = total
             if current and total:

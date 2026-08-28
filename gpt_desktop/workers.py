@@ -52,13 +52,15 @@ from .novel_utils import (
     _clean_chapter_plan_story_boundary,
     _clip_context_text,
     _dedupe_volume_handoff_terminal_records,
+    _extract_prose_delivery_result,
     _infer_foreshadow_status,
     _merge_text_lines_without_duplicates,
     _merge_foreshadow_description_without_bloat,
     _merge_foreshadow_status,
     _normalize_creative_intent_contract,
     _normalize_volume_continuity_anchors,
-    _parse_style_execution_result,
+    NOVEL_PROSE_END_MARKER,
+    NOVEL_PROSE_START_MARKER,
 )
 from .novel_import import (
     _foreshadow_candidate_is_terminal_review,
@@ -5252,6 +5254,9 @@ class NovelWritingWorker(QThread):
                 "你是长篇小说正文起草与仿写助手。当前项目资料决定故事事实，完整原样本提供本次仿写的写法来源。"
                 "已经确定的人名、时间、地点、关系、物件、编号、人物状态和已发生事件随着当前章节自然延续。"
                 "把完整样本中的叙述、对白、情绪和场景组织方式自然转化为当前人物和当前事件，写出可直接进入小说的正文。"
+                f"只输出小说正文，并严格使用{NOVEL_PROSE_START_MARKER}和{NOVEL_PROSE_END_MARKER}包住正文；"
+                "包络外不得输出‘我会’‘接下来’‘本章将’等规划说明、分析、提纲、执行过程或致读者文字，"
+                "包络内也只能是可直接进入小说的正文。"
             )
         prompts = {
             "outline": (
@@ -5595,23 +5600,24 @@ class NovelWritingWorker(QThread):
             if not stopped and not self._stream_finished_normally(done_received, finish_reason):
                 raise Exception(self._incomplete_stream_error(finish_reason))
             validation_text = content
-            if self.action == "draft" and "【剧情执行稿任务】" in self.context:
-                execution_result = _parse_style_execution_result(content)
-                validation_text = str(execution_result.get("draft", "") or "").strip()
-                if not (
-                    execution_result.get("parsed")
-                    and execution_result.get("style_plan_parsed")
-                    and validation_text
-                ):
-                    raise Exception(
-                        "AI 剧情执行稿结构不完整，已丢弃本次半成品，请重新扩写正文。"
-                    )
-            if (
-                self.action in {"draft", "style_rewrite"}
-                and not stopped
-                and not self._draft_ending_looks_complete(validation_text)
-            ):
-                raise Exception("AI 正文似乎还没有写完，已保留当前预览内容，可点续写正文继续。")
+            prose_delivery = None
+            if self.action == "draft":
+                prose_delivery = _extract_prose_delivery_result(
+                    content,
+                    require_marker=(
+                        "【剧情执行稿任务】" not in self.context
+                        and "【小说正文直写】" in self.context
+                    ),
+                )
+                if not prose_delivery.get("ok"):
+                    raise Exception(str(prose_delivery.get("error", "AI 正文交付边界不完整。")))
+                validation_text = str(prose_delivery.get("text", "") or "").strip()
+                self.diagnostics.update({
+                    "raw_response_chars": len(content),
+                    "delivered_prose_chars": len(validation_text),
+                    "prose_delivery_source": str(prose_delivery.get("source", "") or ""),
+                    "prose_metadata_stripped": bool(validation_text != content.strip()),
+                })
             self.diagnostics.update({
                 "outcome": "stopped" if stopped else "success",
                 "finish_reason": finish_reason,
@@ -5621,7 +5627,14 @@ class NovelWritingWorker(QThread):
                 "elapsed_ms": round((time.perf_counter() - started) * 1000, 1),
                 "finished_at": now_str(),
             })
-            self.result_ready.emit(self.action, content)
+            if (
+                self.action in {"draft", "style_rewrite"}
+                and not stopped
+                and not self._draft_ending_looks_complete(validation_text)
+            ):
+                raise Exception("AI 正文似乎还没有写完，已保留当前预览内容，可点续写正文继续。")
+            delivered_content = validation_text if self.action == "draft" else content
+            self.result_ready.emit(self.action, delivered_content)
         except Exception as e:
             stopped = bool(self._stop_requested or self.isInterruptionRequested())
             self.diagnostics.update({

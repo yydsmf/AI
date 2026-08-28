@@ -43,7 +43,14 @@ NOVEL_DIAGNOSTIC_LATEST_SNAPSHOT_FILE = os.path.join(
 NOVEL_DIAGNOSTIC_LATEST_EXCHANGE_FILE = os.path.join(
     NOVEL_DIAGNOSTIC_DIR, "latest_model_exchange.json"
 )
+NOVEL_MEMORY_DIAGNOSTIC_LOG_FILE = os.path.join(
+    NOVEL_DIAGNOSTIC_DIR, "memory_sync_failures.jsonl"
+)
+NOVEL_MEMORY_DIAGNOSTIC_BACKUP_FILE = os.path.join(
+    NOVEL_DIAGNOSTIC_DIR, "memory_sync_failures.jsonl.1"
+)
 NOVEL_DIAGNOSTIC_MAX_BYTES = 12 * 1024 * 1024
+NOVEL_MEMORY_DIAGNOSTIC_MAX_BYTES = 8 * 1024 * 1024
 NOVEL_DIAGNOSTIC_MAX_SNAPSHOTS = 60
 NOVEL_DIAGNOSTIC_SNAPSHOT_TEXT_LIMIT = 180000
 _NOVEL_DIAGNOSTIC_LOCK = threading.Lock()
@@ -166,6 +173,85 @@ def append_novel_diagnostic_event(event):
         return ""
 
 
+def append_novel_memory_diagnostic_event(event):
+    """Append a compact post-write state failure record, excluding prose/context."""
+    if not isinstance(event, dict):
+        event = {"event": str(event or "unknown")}
+    record = _sanitize_novel_diagnostic_value(event)
+    if not isinstance(record, dict):
+        record = {"event": "unknown", "detail": record}
+    for key in (
+        "system_prompt", "user_context", "sent_user_context", "partial_output",
+        "validation_payload", "body", "text", "final_text", "output",
+    ):
+        record.pop(key, None)
+    record.setdefault("schema_version", 1)
+    record.setdefault("record_type", "novel_memory_failure")
+    record.setdefault("recorded_at", now_str())
+    record.setdefault("event", "unknown")
+    record.setdefault(
+        "event_id",
+        hashlib.sha256(
+            f"memory:{time.time_ns()}:{os.getpid()}:{threading.get_ident()}".encode("utf-8")
+        ).hexdigest()[:20],
+    )
+    record.setdefault("process_id", os.getpid())
+    record.setdefault("thread_name", threading.current_thread().name)
+    try:
+        line = json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\n"
+        with _NOVEL_DIAGNOSTIC_LOCK:
+            os.makedirs(NOVEL_DIAGNOSTIC_DIR, exist_ok=True)
+            if (
+                os.path.exists(NOVEL_MEMORY_DIAGNOSTIC_LOG_FILE)
+                and os.path.getsize(NOVEL_MEMORY_DIAGNOSTIC_LOG_FILE)
+                + len(line.encode("utf-8"))
+                > NOVEL_MEMORY_DIAGNOSTIC_MAX_BYTES
+            ):
+                try:
+                    if os.path.exists(NOVEL_MEMORY_DIAGNOSTIC_BACKUP_FILE):
+                        os.remove(NOVEL_MEMORY_DIAGNOSTIC_BACKUP_FILE)
+                    os.replace(
+                        NOVEL_MEMORY_DIAGNOSTIC_LOG_FILE,
+                        NOVEL_MEMORY_DIAGNOSTIC_BACKUP_FILE,
+                    )
+                except Exception:
+                    pass
+            with open(NOVEL_MEMORY_DIAGNOSTIC_LOG_FILE, "a", encoding="utf-8") as handle:
+                handle.write(line)
+        return NOVEL_MEMORY_DIAGNOSTIC_LOG_FILE
+    except Exception:
+        return ""
+
+
+def read_novel_memory_diagnostic_events(limit=200):
+    """Read compact post-write state failures from the current and rotated logs."""
+    try:
+        limit = max(1, min(2000, int(limit or 200)))
+    except Exception:
+        limit = 200
+    lines = []
+    for path in (
+        NOVEL_MEMORY_DIAGNOSTIC_BACKUP_FILE,
+        NOVEL_MEMORY_DIAGNOSTIC_LOG_FILE,
+    ):
+        if not os.path.exists(path):
+            continue
+        try:
+            with open(path, "r", encoding="utf-8") as handle:
+                lines.extend(handle.readlines())
+        except Exception:
+            continue
+    events = []
+    for line in lines[-limit:]:
+        try:
+            item = json.loads(line)
+        except Exception:
+            continue
+        if isinstance(item, dict):
+            events.append(item)
+    return events
+
+
 def read_novel_diagnostic_events(limit=200):
     try:
         limit = max(1, min(2000, int(limit or 200)))
@@ -256,12 +342,18 @@ def save_novel_diagnostic_snapshot(request_id, payload):
 
 
 def save_novel_diagnostic_latest_exchange(request_id, payload):
-    """Keep only the latest completed model exchange for post-processing crash diagnosis."""
+    """Keep a request-scoped exchange and update the rolling latest pointer."""
     _safe_request_id, snapshot = _prepare_novel_diagnostic_snapshot(request_id, payload)
+    exchange_dir = os.path.join(
+        os.path.dirname(NOVEL_DIAGNOSTIC_LATEST_EXCHANGE_FILE),
+        "model_exchanges",
+    )
+    request_path = os.path.join(exchange_dir, f"{_safe_request_id}.json")
     try:
         with _NOVEL_DIAGNOSTIC_LOCK:
+            _write_novel_diagnostic_json(request_path, snapshot)
             _write_novel_diagnostic_json(NOVEL_DIAGNOSTIC_LATEST_EXCHANGE_FILE, snapshot)
-        return NOVEL_DIAGNOSTIC_LATEST_EXCHANGE_FILE
+        return request_path
     except Exception:
         return ""
 

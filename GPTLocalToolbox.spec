@@ -7,7 +7,7 @@ from PyInstaller.utils.hooks import collect_data_files, collect_submodules
 
 project_dir = Path(SPECPATH).resolve()
 icon_file = project_dir / "app_icon_trimmed.icns"
-app_version = "1.0.23"
+app_version = "1.0.24"
 blender_resources_dir = project_dir / "gpt_desktop" / "resources" / "blender"
 novel_resources_dir = project_dir / "gpt_desktop" / "resources" / "novel"
 blender_resource_names = (

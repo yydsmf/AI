@@ -241,6 +241,142 @@ class NovelWritingStateTests(unittest.TestCase):
         self.assertEqual(tab._status_received_chars, 0)
         self.assertEqual(tab._status_stage_started_wall, 0.0)
 
+    def test_detached_auto_failure_uses_status_tip_without_modal_warning(self):
+        tab = NovelWritingTab.__new__(NovelWritingTab)
+        tab._is_detached_auto_runner = True
+        tab._status_message = "正在扩写正文..."
+        statuses = []
+
+        def set_status(text):
+            tab._status_message = text
+            statuses.append(text)
+
+        tab.set_status_tip = set_status
+
+        with patch("gpt_desktop.novel_writing_tab.QMessageBox.warning") as warning:
+            tab._show_chapter_ai_failure("stream_read_error: connection lost")
+
+        warning.assert_not_called()
+        self.assertEqual(len(statuses), 1)
+        self.assertIn("后台自动扩写已停止", statuses[0])
+        self.assertIn("stream_read_error", statuses[0])
+
+    def test_detached_auto_runner_is_created_without_widget_parent(self):
+        created = []
+
+        class FakeSignal:
+            def connect(self, callback):
+                self.callback = callback
+
+        class FakeTimer:
+            def __init__(self, parent):
+                self.parent = parent
+                self.timeout = FakeSignal()
+
+            def setInterval(self, interval):
+                self.interval = interval
+
+            def start(self):
+                self.started = True
+
+        class FakeRunner:
+            def __init__(self, config, parent, background_runner=False):
+                created.append((config, parent, background_runner))
+                self.current_project = {"meta": {"title": "测试小说"}}
+
+            def _load_project_data(self, data, source_path, defer_helpers=False):
+                self.current_project = data
+
+            def hide(self):
+                pass
+
+            def _start_auto_expand_all_local(self):
+                pass
+
+        tab = NovelWritingTab.__new__(NovelWritingTab)
+        tab.config = {"novel": {"model": "test"}}
+        tab._detached_auto_runner = None
+        tab._detached_auto_project_path = ""
+        tab._save_current_work = lambda *_args, **_kwargs: "/tmp/source.json"
+        tab._update_detached_auto_source_lock = lambda: None
+        tab.set_status_tip = lambda _text: None
+
+        project = {"meta": {"title": "测试小说"}, "chapters": []}
+        with patch("gpt_desktop.novel_writing_tab.NovelWritingTab", FakeRunner), patch(
+            "gpt_desktop.novel_writing_tab.QTimer", FakeTimer
+        ), patch("gpt_desktop.novel_writing_tab.load_json_file", return_value=project):
+            tab._launch_detached_auto_expand("/tmp/source.json")
+
+        self.assertEqual(len(created), 1)
+        self.assertIsNone(created[0][1])
+        self.assertTrue(created[0][2])
+
+    def test_detached_auto_runner_waits_for_writing_worker_cleanup(self):
+        class FinishedWorker:
+            def isRunning(self):
+                return False
+
+        class FakeTimer:
+            def __init__(self):
+                self.stopped = False
+
+            def stop(self):
+                self.stopped = True
+
+            def deleteLater(self):
+                pass
+
+        runner = NovelWritingTab.__new__(NovelWritingTab)
+        runner._is_detached_auto_runner = True
+        runner._detached_auto_runner = None
+        runner._auto_expand_all_active = False
+        runner._auto_expand_all_waiting_next = False
+        runner._chapter_ai_sequence_active = False
+        runner._chapter_ai_transient_retry_pending = False
+        runner._chapter_plan_auto_active = False
+        runner.writing_worker = FinishedWorker()
+        runner.writing_retired_workers = []
+        runner.chapter_plan_worker = None
+        runner.context_build_worker = None
+        runner._status_message = "AI 写作失败：stream_read_error"
+        runner._save_current_project_snapshot_if_named = lambda: None
+        runner_deleted = []
+        runner.deleteLater = lambda: runner_deleted.append(True)
+
+        tab = NovelWritingTab.__new__(NovelWritingTab)
+        tab._detached_auto_runner = runner
+        tab._detached_auto_timer = FakeTimer()
+        tab._detached_auto_project_path = "/tmp/source.json"
+        tab.current_project_path = "/tmp/other.json"
+        tab._update_detached_auto_source_lock = lambda: None
+        tab._notify_project_store_changed = lambda: None
+        tab.set_status_tip = lambda _text: None
+
+        tab._poll_detached_auto_expand()
+
+        self.assertIs(tab._detached_auto_runner, runner)
+        self.assertEqual(runner_deleted, [])
+
+        runner.writing_worker = None
+        tab._poll_detached_auto_expand()
+
+        self.assertIsNone(tab._detached_auto_runner)
+        self.assertEqual(runner_deleted, [True])
+
+    def test_status_active_work_includes_retired_writing_workers(self):
+        runner = NovelWritingTab.__new__(NovelWritingTab)
+        runner._is_detached_auto_runner = True
+        runner._detached_auto_runner = None
+        runner.writing_worker = None
+        runner.writing_retired_workers = [object()]
+        runner.chapter_plan_worker = None
+        runner.context_build_worker = None
+
+        self.assertTrue(runner._status_has_active_work())
+
+        runner.writing_retired_workers.clear()
+        self.assertFalse(runner._status_has_active_work())
+
     def test_detached_auto_completion_keeps_other_project_open(self):
         class FinishedRunner:
             def __init__(self):

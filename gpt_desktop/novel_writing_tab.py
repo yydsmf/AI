@@ -8993,7 +8993,7 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
                         f"自动扩写已停止：第{self.current_chapter_index + 1}章上下文组装失败。"
                     )
                 self._reset_chapter_ai_sequence()
-                QMessageBox.warning(self, "AI 写作失败", str(exc))
+                self._show_chapter_ai_failure(str(exc))
                 return False
             if mode == "style_draft":
                 chapters = self.current_project.get("chapters", [])
@@ -9112,7 +9112,7 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
             )
         self._reset_chapter_ai_sequence()
         self._set_chapter_ai_actions_enabled(True)
-        QMessageBox.warning(self, "AI 写作失败", str(error))
+        self._show_chapter_ai_failure(str(error))
 
     def _cleanup_chapter_context_worker(self):
         worker = self.sender()
@@ -9449,7 +9449,7 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
             data = load_json_file(source_path, None)
             if not isinstance(data, dict):
                 raise RuntimeError("无法读取要自动扩写的项目。")
-            runner = NovelWritingTab(deepcopy(self.config), self, background_runner=True)
+            runner = NovelWritingTab(deepcopy(self.config), None, background_runner=True)
             runner._save_draft_snapshot = lambda: None
             runner._notify_project_store_changed = lambda: None
             runner._load_project_data(data, source_path, defer_helpers=True)
@@ -9513,6 +9513,17 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
             if isinstance(data, dict):
                 self._load_project_data(data, source_path, defer_helpers=True)
         self.set_status_tip(message)
+
+    def _show_chapter_ai_failure(self, message):
+        error_text = clean_error_text(message)
+        if getattr(self, "_is_detached_auto_runner", False):
+            current_status = str(getattr(self, "_status_message", "") or "").strip()
+            if not current_status or not any(
+                marker in current_status for marker in ("失败", "停止", "中止")
+            ):
+                self.set_status_tip(f"后台自动扩写已停止：{error_text[:120]}")
+            return
+        QMessageBox.warning(self, "AI 写作失败", error_text)
 
     def _detached_auto_status_is_current(self, runner=None):
         if getattr(self, "_is_detached_auto_runner", False):
@@ -12166,7 +12177,7 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
     def _start_chapter_ai_sequence(self):
         if self.current_chapter_index < 0:
             self._set_chapter_ai_actions_enabled(True)
-            QMessageBox.warning(self, "AI 写作失败", "请先选择一个章节。")
+            self._show_chapter_ai_failure("请先选择一个章节。")
             return
         if (
             getattr(self, "_auto_expand_all_active", False)
@@ -12183,7 +12194,7 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
             self._set_chapter_ai_actions_enabled(True)
             self.set_ai_settings_expanded(True)
             self.set_status_tip(f"AI 写作失败：{error}")
-            QMessageBox.warning(self, "AI 写作失败", error)
+            self._show_chapter_ai_failure(error)
             return
         if hasattr(self, "_loading"):
             self._flush_current_editors()
@@ -12346,7 +12357,7 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
         if error:
             self.set_ai_settings_expanded(True)
             self.set_status_tip(f"AI 写作失败：{error}")
-            QMessageBox.warning(self, "AI 写作失败", error)
+            self._show_chapter_ai_failure(error)
             return
         self._chapter_ai_provider = provider
         self._chapter_ai_model = model
@@ -13020,7 +13031,7 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
             self._set_partial_chapter_ai_preview_state(False)
             self._reset_chapter_ai_sequence()
             self.set_status_tip("剧情执行稿结构不完整，半成品已丢弃；请重新扩写本章。")
-            QMessageBox.warning(self, "AI 写作失败", err_text)
+            self._show_chapter_ai_failure(err_text)
             return
         if action in {"style_baseline", "style_sheet", "style_sheet_merge", "style_persona", "style_cards"} and getattr(
             self, "_chapter_ai_style_workflow_active", False
@@ -13094,7 +13105,7 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
                 action_text = "可重新扩写正文" if action == "draft" else f"可重新生成{action_label}"
             status = f"AI 写作失败，{kept_hint}{action_text}：{err_text[:80]}"
         self.set_status_tip(status)
-        QMessageBox.warning(self, "AI 写作失败", err_text)
+        self._show_chapter_ai_failure(err_text)
 
     def _cleanup_writing_worker(self):
         worker = self.sender()
@@ -16423,10 +16434,19 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
             "_chapter_plan_auto_active",
         )):
             return True
+        retired_workers = getattr(self, "writing_retired_workers", None)
+        if isinstance(retired_workers, list) and any(
+            worker is not None for worker in retired_workers
+        ):
+            return True
         for name in ("writing_worker", "chapter_plan_worker", "context_build_worker"):
             worker = getattr(self, name, None)
             if worker is None:
                 continue
+            if name == "writing_worker":
+                # The finished signal clears this reference asynchronously. A
+                # stopped worker is therefore still part of runner teardown.
+                return True
             try:
                 if worker.isRunning():
                     return True

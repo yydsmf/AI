@@ -604,6 +604,10 @@ _PROVIDER_REASONING_EFFORTS = {
 # maintenance use the faster high setting.
 _HIGH_REASONING_ACTIONS = {"draft", "style_finalize", "style_rewrite"}
 
+# Keep import classification and both chapter-planning passes at the stable
+# high tier even when a provider advertises a higher model-specific setting.
+_FIXED_HIGH_REASONING_ACTIONS = {"框架分类", "全书阶段规划", "章节规划"}
+
 
 def _reasoning_model_key(model):
     normalized = str(model or "").strip().lower()
@@ -628,6 +632,8 @@ def reasoning_effort_for_model(model, base_url="", action=""):
     verified_level = provider_levels.get(model_key) or _DEFAULT_REASONING_EFFORTS.get(model_key, "")
     if not verified_level:
         return ""
+    if str(action or "").strip() in _FIXED_HIGH_REASONING_ACTIONS:
+        return "high"
     if str(action or "").strip() in _HIGH_REASONING_ACTIONS:
         return verified_level
     return "high"

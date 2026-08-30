@@ -5,6 +5,7 @@ import unittest
 from unittest.mock import patch
 
 import gpt_desktop.workers as workers_module
+from gpt_desktop.core import reasoning_effort_for_model
 
 from gpt_desktop.workers import (
     NovelAnalysisWorker,
@@ -22,6 +23,16 @@ from gpt_desktop.workers import (
 
 
 class NovelAnalysisWorkerTests(unittest.TestCase):
+    def test_framework_and_chapter_planning_reasoning_is_fixed_at_high(self):
+        for action in ("框架分类", "全书阶段规划", "章节规划"):
+            with self.subTest(action=action):
+                self.assertEqual(
+                    reasoning_effort_for_model(
+                        "gpt-5.6-sol", "https://api.dxmcs.xin", action
+                    ),
+                    "high",
+                )
+
     def test_volume_handoff_run_finalizes_success_diagnostics(self):
         worker = NovelVolumeHandoffWorker(
             "http://example.test",

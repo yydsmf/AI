@@ -2100,7 +2100,7 @@ class NovelLongFormContextTests(unittest.TestCase):
         self.assertNotIn("沉默很有情绪", draft_context)
         self.assertIn("幽默、吐槽、夸张和比喻可以自由使用", guidance)
         self.assertGreaterEqual(len(guidance), 500)
-        self.assertLessEqual(len(guidance), 1000)
+        self.assertLessEqual(len(guidance), 1200)
         self.assertNotIn("【风格锁定规则】", draft_context)
         self.assertNotIn("【AI文风画像】", draft_context)
         self.assertNotIn("【作者原生用词池", draft_context)
@@ -2164,7 +2164,7 @@ class NovelLongFormContextTests(unittest.TestCase):
         long_guidance = self._context_section(long_context, "仿写使用说明")
         for guidance in (dense_guidance, long_guidance):
             self.assertGreaterEqual(len(guidance), 500)
-            self.assertLessEqual(len(guidance), 1000)
+            self.assertLessEqual(len(guidance), 1200)
             self.assertIn("完整原文", guidance)
             self.assertNotIn("段落排版指标", guidance)
             self.assertNotIn("语言画像", guidance)

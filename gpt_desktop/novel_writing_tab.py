@@ -229,12 +229,20 @@ NOVEL_PERF_LOG_ENABLED = str(os.environ.get("GPT_NOVEL_PERF_LOG", "") or "").str
 }
 
 _SORT_MISSING_ORDER = 10 ** 9
-_CHAPTER_PLAN_BATCH_SIZE = 30
+_CHAPTER_PLAN_BATCH_SIZE = 50
 # Leave room for the chapter-planning system prompt and request envelope.
 # The returned context itself remains below the application's 120,000-char
 # limit even for large existing projects and imported frameworks.
 _CHAPTER_PLAN_CONTEXT_CHAR_BUDGET = NOVEL_AI_CONTEXT_LIMIT - 10000
 _CHAPTER_PLAN_BATCH_STATE_VERSION = 3
+
+
+def _canonical_chapter_plan_event_id(value):
+    normalized = str(value or "").strip().upper()
+    match = re.fullmatch(r"STAGE_(\d{2}-E\d{2})", normalized)
+    if match:
+        return f"S{match.group(1)}"
+    return normalized
 
 _CREATIVE_INTENT_FIELDS = (
     ("primary_line", "本卷主线"),
@@ -7382,7 +7390,7 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
             for event in item.get("events", []) if isinstance(item.get("events", []), list) else []:
                 if not isinstance(event, dict):
                     continue
-                event_id = str(event.get("id", "") or "").strip().upper()
+                event_id = _canonical_chapter_plan_event_id(event.get("id", ""))
                 event_text = self._chapter_plan_clip_text(event.get("text", ""), 600)
                 if not event_id or not event_text:
                     continue
@@ -7466,7 +7474,7 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
             for event in item.get("events", []) if isinstance(item.get("events", []), list) else []:
                 if not isinstance(event, dict):
                     continue
-                event_id = str(event.get("id", "") or "").strip().upper()
+                event_id = _canonical_chapter_plan_event_id(event.get("id", ""))
                 event_text = str(event.get("text", "") or "").strip()
                 if not event_id or not event_text or event_id in catalog:
                     continue
@@ -7518,7 +7526,10 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
                 chapter_index = int(item.get("index", 0) or 0)
             except Exception:
                 chapter_index = 0
-            ids = [value.upper() for value in _normalize_name_list(item.get("source_event_ids", []))]
+            ids = [
+                _canonical_chapter_plan_event_id(value)
+                for value in _normalize_name_list(item.get("source_event_ids", []))
+            ]
             if len(ids) != len(set(ids)):
                 return f"第{chapter_index}章重复填写了同一原始事件ID。"
             for position, event_id in enumerate(ids):
@@ -7659,14 +7670,14 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
                     "通用前10%/中70%/后20%只控制节奏，不能触发题材切换。"
                 ),
                 "strategy_rule": (
-                    "先依据受众方向、题材世界、主副叙事发动机和情绪语调确定本项目自己的规划原则。"
-                    "章节围绕人物欲望、阻力、选择、关系变化和结果自然推进，不套固定场景、冲突或结尾模板。"
+                    "先依据meta中的题材、风格、叙事人称，以及项目自己的读者承诺和故事发动机理解这本小说。"
+                    "规划事实保持准确，outline的讲述口吻也必须属于当前项目，不能换成通用策划说明或统一网文腔。"
                     "项目资料中的专业、商业、制度和案件内容只是事实参考，只有直接改变人物选择或关系结果时才取用最少部分。"
                 ),
                 "reader_experience_rule": (
-                    "所有项目都要保持快节奏、高爽感、低说明性叙事和情绪共鸣，但实现方式必须服从题材。"
-                    "这里提供的是读感方向，不是逐章公式：快节奏指读者持续看到新的局面，爽感可来自能力、身份、资源、关系确认、"
-                    "尊严恢复、喜剧或发现；设定和专业信息只是连续性参考，不要求每章主动使用或解释。"
+                    "按当前项目已经确认的题材与风格形成阅读感。轻松故事可以从人物偏见、误会、反差和荒诞后果中生出趣味；"
+                    "其他题材顺着自身的悬念、情感、成长或生活质感来讲，不要求不同小说共享同一种节奏和爽点。"
+                    "设定和专业信息只是连续性参考，不要求每章主动使用或解释。"
                 ),
                 "stage_boundary_rule": (
                     "当前阶段的稀疏节点之间只能深化当前阶段的人物、关系、对抗和后果；"
@@ -7783,8 +7794,10 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
             "情绪方向和节奏原则；后续规划只能使用这些原则，不得把它们展开成固定场景轮换表或逐章任务。\n\n"
             "若creative_intent_contract非空，它是用户已确认的最高优先级创作方向：主线和结局边界不得被交接资料、"
             "圣经中的旧剧情权重、原框架辅助线或AI重新推断的narrative_strategy_profile替换；辅助线只能推动主线发生变化。\n\n"
-            "注意：章节规划只给出本章主线方向、人物处境或关系推进、可能形成的新局面与结尾悬念；不要把正文细拆成必须完成的动作、"
-            "对白、程序或固定拍点。本章相关资料若自然出现在返回内容中，保留其原有语义，不要把它们改写成固定动作清单；"
+            "注意：结构字段负责守住本章主线、阶段、事件和结尾边界；outline负责用当前小说自己的口吻讲述这一章。"
+            "把meta.genre、meta.style和人物气质真正体现在outline的用词、观察角度和叙述温度里，像作者在讲下一章故事，"
+            "不要像编辑解释本章功能。不要把正文细拆成必须完成的动作、对白、程序或固定拍点；"
+            "本章相关资料若自然出现在返回内容中，保留其原有语义，不要把它们改写成固定动作清单；"
             "伏笔由扩写正文时根据当时的开放伏笔动态调度。\n\n"
             "如果存在cross_volume_continuity，其中的anchors只是上一卷事实参考：用于避免人物关系、生活分工和既有习惯被写反，"
             "不要逐条复述、不要把它们改写成章节任务，也不要在本章规划中强行安排它们。\n\n"
@@ -7890,6 +7903,14 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
             (offset, min(batch_size, chapter_count - offset))
             for offset in range(0, chapter_count, batch_size)
         ]
+
+    @staticmethod
+    def _chapter_plan_state_batch_size(state):
+        state = state if isinstance(state, dict) else {}
+        try:
+            return max(1, int(state.get("batch_size", _CHAPTER_PLAN_BATCH_SIZE) or _CHAPTER_PLAN_BATCH_SIZE))
+        except Exception:
+            return _CHAPTER_PLAN_BATCH_SIZE
 
     def _persist_chapter_plan_generation_state(self, state):
         if not isinstance(getattr(self, "current_project", None), dict):
@@ -8387,9 +8408,10 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
             )
             status = "正在生成全书走向、叙事画像和阶段规划..."
         else:
-            batch_count = min(_CHAPTER_PLAN_BATCH_SIZE, remaining)
-            ranges = self._chapter_plan_batch_ranges(requested)
-            batch_number = len(generated) // _CHAPTER_PLAN_BATCH_SIZE + 1
+            batch_size = self._chapter_plan_state_batch_size(state)
+            batch_count = min(batch_size, remaining)
+            ranges = self._chapter_plan_batch_ranges(requested, batch_size)
+            batch_number = len(generated) // batch_size + 1
             total_batches = len(ranges)
             self._chapter_plan_request_kind = "batch"
             context = self._chapter_plan_batch_context(state, batch_count)
@@ -8641,7 +8663,7 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
             state["profile_hash"] = self._narrative_strategy_profile_hash(confirmed_profile)
         generated = state.get("chapters", []) if isinstance(state.get("chapters"), list) else []
         expected = min(
-            _CHAPTER_PLAN_BATCH_SIZE,
+            self._chapter_plan_state_batch_size(state),
             int(state.get("requested_chapter_count", 0) or 0) - len(generated),
         )
         if len(chapters) != expected:
@@ -8893,6 +8915,10 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
     def _discard_partial_preview_for_auto_rewrite(self, source="auto_expand"):
         if not self._has_partial_chapter_ai_preview():
             return False
+        # The user (or the automatic queue) is explicitly restarting a
+        # half-finished AI result. Carry that intent into the sequence entry
+        # so an existing chapter body is rewritten only in this case.
+        self._chapter_ai_force_rewrite = True
         action = str(getattr(self, "_chapter_ai_preview_action", "") or "draft")
         preview_text = str(self.chapter_ai_preview.toPlainText() or "").strip()
         request_id = str(getattr(self, "_chapter_ai_diagnostic_request_id", "") or "")
@@ -12205,6 +12231,8 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
             and isinstance(chapters[self.current_chapter_index], dict)
             else {}
         )
+        force_rewrite = bool(getattr(self, "_chapter_ai_force_rewrite", False))
+        self._chapter_ai_force_rewrite = False
         reconciliation_checkpoint = self._validated_memory_reconciliation_checkpoint()
         if reconciliation_checkpoint:
             self._chapter_ai_provider = provider
@@ -12270,11 +12298,10 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
         if had_memory_checkpoint and not checkpoint_text:
             self._clear_memory_finalize_checkpoint(persist=True)
         # A validated memory checkpoint contains a complete, style-finalized
-        # body. Resume only its state transaction; partial previews and stale
-        # checkpoints still rebuild the chapter from a clean outline.
-        if not checkpoint_text and (had_memory_checkpoint or existing_body):
-            rewrite_on_ready = True
-            existing_body = ""
+        # body. Resume only its state transaction. A body without a checkpoint
+        # is user-authored (or already delivered) content and must go straight
+        # to metadata and state finalization; only a stale/invalid checkpoint
+        # is eligible for a clean rewrite.
         self._chapter_ai_provider = provider
         self._chapter_ai_model = model
         self._reset_chapter_ai_sequence()
@@ -12290,6 +12317,15 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
             self._chapter_ai_style_workflow_active = True
             self._start_memory_finalize(checkpoint_text, resumed=True)
             return
+        if existing_body and not had_memory_checkpoint and not force_rewrite:
+            self._mark_current_chapter_ai_sync_pending(chapter)
+            self._chapter_ai_style_workflow_active = True
+            self._start_memory_finalize(
+                existing_body,
+                resumed=bool(getattr(self, "_auto_expand_all_active", False)),
+            )
+            return
+        rewrite_on_ready = bool(had_memory_checkpoint or force_rewrite)
         context_snapshot = self._ai_project_snapshot()
         if rewrite_on_ready:
             snapshot_chapters = context_snapshot.get("chapters", [])

@@ -442,9 +442,9 @@ class NovelWritingStateTests(unittest.TestCase):
             },
         }
 
-        context = tab._chapter_plan_project_context(500000, 5000, 100, 30)
+        context = tab._chapter_plan_project_context(500000, 5000, 100, 50)
 
-        self.assertEqual(tab._chapter_plan_batch_ranges(100), [(0, 30), (30, 30), (60, 30), (90, 10)])
+        self.assertEqual(tab._chapter_plan_batch_ranges(100), [(0, 50), (50, 50)])
         self.assertIn('"average_chapter_words": 5000', context)
         self.assertIn('"estimated_total_chapters": 100', context)
         self.assertIn("关系选择与成长", context)
@@ -747,8 +747,7 @@ class NovelWritingStateTests(unittest.TestCase):
         ranges = tab._chapter_plan_batch_ranges(250)
 
         self.assertEqual(ranges, [
-            (0, 30), (30, 30), (60, 30), (90, 30), (120, 30),
-            (150, 30), (180, 30), (210, 30), (240, 10),
+            (0, 50), (50, 50), (100, 50), (150, 50), (200, 50),
         ])
 
     def test_numbered_export_chapter_title_uses_chinese_order_without_duplicate_prefix(self):
@@ -1757,7 +1756,7 @@ class NovelWritingStateTests(unittest.TestCase):
         self.assertTrue(chapter["auto_expand_resume_required"])
         self.assertEqual(chapter["memory_sync_status"], "pending")
 
-    def test_manual_sequence_rewrites_existing_uncommitted_body_from_clean_editors(self):
+    def test_manual_sequence_preserves_existing_body_for_metadata(self):
         chapter = _new_chapter(0)
         chapter["outline"] = "保留的完整章节提纲"
         chapter["text"] = "未完成正文"
@@ -1783,24 +1782,22 @@ class NovelWritingStateTests(unittest.TestCase):
         tab.chapter_key_facts = _FakePlainTextEdit(chapter["key_facts"])
         tab.chapter_ai_preview = _FakePlainTextEdit("")
         tab._chapter_ai_buttons_by_action = {}
-        context_state = []
-        tab._chapter_ai_context_with_preview = lambda _action: context_state.append((
-            chapter["text"],
-            tab.chapter_text.toPlainText(),
-            chapter["summary"],
-            tab.chapter_summary.toPlainText(),
-        )) or "干净重写上下文"
         started = []
-        tab._start_style_locked_draft = lambda context: started.append(context)
+        tab._chapter_ai_context_with_preview = lambda _action: self.fail(
+            "已有正文不应重新进入初稿流程"
+        )
+        tab._start_memory_finalize = lambda text, resumed=False: started.append((text, resumed))
 
         tab._start_chapter_ai_sequence()
 
-        self.assertEqual(context_state, [("", "", "", "")])
-        self.assertEqual(started, ["干净重写上下文"])
+        self.assertEqual(started, [("未完成正文", False)])
+        self.assertEqual(chapter["text"], "未完成正文")
+        self.assertEqual(chapter["summary"], "未完成摘要")
+        self.assertEqual(chapter["key_facts"], "未完成关键事实")
         self.assertEqual(chapter["outline"], "保留的完整章节提纲")
-        self.assertEqual(chapter["actual_linked_character_ids"], [])
-        self.assertEqual(chapter["state_delta"], {})
-        self.assertEqual(chapter["long_term_events"], [])
+        self.assertEqual(chapter["actual_linked_character_ids"], ["C1"])
+        self.assertEqual(chapter["state_delta"], {"characters": [{"id": "C1"}]})
+        self.assertEqual(chapter["long_term_events"], [{"event": "未提交事件"}])
         self.assertEqual(chapter["memory_sync_status"], "pending")
         self.assertTrue(chapter["auto_expand_resume_required"])
 
@@ -1860,7 +1857,7 @@ class NovelWritingStateTests(unittest.TestCase):
         self.assertIn("长期状态已提交", stopped[0])
         self.assertFalse(getattr(tab, "_chapter_ai_sequence_active", False))
 
-    def test_context_build_failure_does_not_overwrite_previous_memory_status(self):
+    def test_existing_body_enters_state_finalization_without_overwrite(self):
         chapter = _new_chapter(0)
         chapter["text"] = "上下文失败前的未完成正文"
         chapter["summary"] = "上下文失败前的摘要"
@@ -1878,19 +1875,23 @@ class NovelWritingStateTests(unittest.TestCase):
         tab.chapter_key_facts = _FakePlainTextEdit(chapter["key_facts"])
         tab.chapter_ai_preview = _FakePlainTextEdit("")
         tab._chapter_ai_buttons_by_action = {}
-        tab._chapter_ai_context_with_preview = lambda _action: (_ for _ in ()).throw(ValueError("上下文失败"))
-        tab._log_novel_diagnostic = lambda *_args, **_kwargs: None
+        tab._chapter_ai_context_with_preview = lambda _action: self.fail(
+            "已有正文不应重新构建正文上下文"
+        )
+        tab._persist_ai_generation_state = lambda: None
+        finalized = []
+        tab._start_memory_finalize = lambda text, resumed=False: finalized.append((text, resumed))
 
-        with patch("gpt_desktop.novel_writing_tab.QMessageBox.warning"):
-            tab._start_chapter_ai_sequence()
+        tab._start_chapter_ai_sequence()
 
-        self.assertEqual(chapter["memory_sync_status"], "failed")
-        self.assertEqual(chapter["memory_sync_error"], "原状态错误")
+        self.assertEqual(finalized, [("上下文失败前的未完成正文", False)])
+        self.assertEqual(chapter["memory_sync_status"], "pending")
+        self.assertEqual(chapter["memory_sync_error"], "")
         self.assertEqual(chapter["text"], "上下文失败前的未完成正文")
         self.assertEqual(tab.chapter_text.toPlainText(), "上下文失败前的未完成正文")
         self.assertEqual(chapter["summary"], "上下文失败前的摘要")
         self.assertEqual(chapter["key_facts"], "上下文失败前的关键事实")
-        self.assertFalse(chapter["auto_expand_resume_required"])
+        self.assertTrue(chapter["auto_expand_resume_required"])
 
     def test_auto_expand_existing_body_can_recover_without_outline(self):
         chapter = _new_chapter(0)
@@ -2352,6 +2353,32 @@ class NovelWritingStateTests(unittest.TestCase):
         self.assertTrue(all(item["draft_words"] == "80" for item in split))
         self.assertGreater(len(split[0]["text"]), 40)
         self.assertTrue(all(len(item["text"]) >= 70 for item in split))
+
+    def test_split_manuscript_keeps_overlong_sentence_intact(self):
+        long_sentence = "这是一个不能被拆开的完整句子" * 80
+        source = f"开头完整句。{long_sentence}。后续完整句。"
+        split = _split_manuscript_into_target_chapters(
+            {"chapters": [{"text": source}]},
+            500,
+        )
+
+        self.assertGreaterEqual(len(split), 2)
+        self.assertTrue(all(not item["text"].startswith("。") for item in split[1:]))
+        self.assertTrue(all(not item["text"].endswith("这是一个不能被拆开的完整句子") for item in split[:-1]))
+        compact = lambda value: "".join(str(value or "").split())
+        self.assertEqual(compact(source), compact("".join(item["text"] for item in split)))
+
+    def test_split_manuscript_uses_clause_boundaries_for_long_comma_paragraphs(self):
+        source = "".join(f"第{i}个完整分句，" for i in range(180)) + "最后收束。"
+        split = _split_manuscript_into_target_chapters(
+            {"chapters": [{"text": source}]},
+            500,
+        )
+
+        self.assertGreaterEqual(len(split), 2)
+        self.assertTrue(all(not item["text"].startswith("，") for item in split[1:]))
+        compact = lambda value: "".join(str(value or "").split())
+        self.assertEqual(compact(source), compact("".join(item["text"] for item in split)))
 
     def test_local_split_chapter_title_uses_middle_sentence_without_ai(self):
         text = (
@@ -7409,7 +7436,9 @@ class NovelWritingStateTests(unittest.TestCase):
         self.assertIn("收束升级阶段", context)
         self.assertIn("用户原始框架具体章段 > 全书分卷/阶段目标 > 通用宏观节奏", context)
         self.assertIn("主副叙事发动机", context)
-        self.assertIn("快节奏、高爽感、低说明性叙事和情绪共鸣", context)
+        self.assertIn("按当前项目已经确认的题材与风格形成阅读感", context)
+        self.assertIn("outline负责用当前小说自己的口吻讲述这一章", context)
+        self.assertIn("不要像编辑解释本章功能", context)
         self.assertIn("宏观节奏不得覆盖原框架阶段", context)
         self.assertIn("imported_chapter_plan_reference", context)
         self.assertIn("导入原始章纲总览", context)
@@ -7678,6 +7707,47 @@ class NovelWritingStateTests(unittest.TestCase):
         natural_rewrite[0]["outline"] = "主角从昏迷中恢复，随即遇见女主。"
         self.assertEqual(tab._chapter_plan_event_assignment_error([], natural_rewrite), "")
 
+    def test_chapter_plan_event_assignment_accepts_stage_event_id_aliases(self):
+        tab = NovelWritingTab.__new__(NovelWritingTab)
+        stage = {
+            "id": "S01",
+            "name": "开局",
+            "start_chapter": 1,
+            "end_chapter": 3,
+            "events": [
+                {"id": "S01-E01", "order": 1, "text": "主角苏醒。"},
+                {"id": "S01-E02", "order": 2, "text": "女主登场。"},
+                {"id": "S01-E03", "order": 3, "text": "首次救人。"},
+            ],
+        }
+        stage_chapters = [
+            {"index": 1, "source_event_ids": ["STAGE_01-E01"]},
+            {"index": 2, "source_event_ids": ["STAGE_01-E02"]},
+            {"index": 3, "source_event_ids": ["STAGE_01-E03"]},
+        ]
+
+        tab.current_project = {"imported_chapter_plan_reference": {"stages": [stage]}}
+        self.assertEqual(tab._chapter_plan_event_assignment_error([], stage_chapters), "")
+
+        stage_alias_reference = deepcopy(stage)
+        stage_alias_reference["events"] = [
+            dict(event, id=f"STAGE_{event['id'][1:]}") for event in stage["events"]
+        ]
+        canonical_chapters = [
+            {
+                "index": chapter["index"],
+                "source_event_ids": [chapter["source_event_ids"][0].replace("STAGE_", "S")],
+            }
+            for chapter in stage_chapters
+        ]
+        tab.current_project = {
+            "imported_chapter_plan_reference": {"stages": [stage_alias_reference]}
+        }
+        self.assertEqual(
+            tab._chapter_plan_event_assignment_error([], canonical_chapters),
+            "",
+        )
+
     def test_opening_event_mapping_does_not_repeat_events_already_grouped_into_first_ten_chapters(self):
         tab = NovelWritingTab.__new__(NovelWritingTab)
         events = [
@@ -7739,6 +7809,7 @@ class NovelWritingStateTests(unittest.TestCase):
                 "total_chapter_count": 35,
                 "existing_chapter_count": 0,
                 "requested_chapter_count": 35,
+                "batch_size": 30,
                 "master_plan": {"summary": "总规划", "arcs": []},
                 "chapters": [],
             },
@@ -7785,7 +7856,7 @@ class NovelWritingStateTests(unittest.TestCase):
         self.assertEqual(len(tab._pending_chapter_plan["chapters"]), 35)
         self.assertTrue(tab.chapter_plan_apply_btn.visible)
 
-    def test_chapter_plan_250_chapter_pressure_simulation_merges_nine_batches(self):
+    def test_chapter_plan_250_chapter_pressure_simulation_merges_five_batches(self):
         tab = NovelWritingTab.__new__(NovelWritingTab)
         tab.current_project = {
             "chapters": [],
@@ -7941,7 +8012,7 @@ class NovelWritingStateTests(unittest.TestCase):
         batch_state["profile_confirmed"] = True
         batch_state["chapters"] = [
             {"index": index, "title": f"章节{index}", "outline": f"提纲{index}"}
-            for index in range(1, 31)
+            for index in range(1, 51)
         ]
         tab._chapter_plan_auto_active = True
         with patch("gpt_desktop.novel_writing_tab.NovelChapterPlanWorker", FakePlanWorker):
@@ -7949,16 +8020,16 @@ class NovelWritingStateTests(unittest.TestCase):
 
         worker = FakePlanWorker.instances[-1]
         self.assertEqual(tab._chapter_plan_request_kind, "batch")
-        self.assertEqual(worker.args[6], 30)
-        self.assertEqual(worker.args[8], 30)
+        self.assertEqual(worker.args[6], 50)
+        self.assertEqual(worker.args[8], 50)
         self.assertEqual(worker.kwargs["batch_number"], 2)
-        self.assertEqual(worker.kwargs["total_batches"], 9)
+        self.assertEqual(worker.kwargs["total_batches"], 5)
         batch_event = diagnostic_events[-1]
         self.assertEqual(batch_event[0], "chapter_plan_request_started")
         self.assertEqual(batch_event[1]["request_kind"], "batch")
         self.assertEqual(batch_event[1]["batch_number"], 2)
-        self.assertEqual(batch_event[1]["absolute_start"], 31)
-        self.assertEqual(batch_event[1]["absolute_end"], 60)
+        self.assertEqual(batch_event[1]["absolute_start"], 51)
+        self.assertEqual(batch_event[1]["absolute_end"], 100)
 
     def test_short_chapter_plan_also_generates_master_profile_first(self):
         class FakePlanWorker:

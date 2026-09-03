@@ -1526,6 +1526,11 @@ def _normalize_project(data):
     for key in ("bible", "world_rules", "timeline", "foreshadows", "summary"):
         base[key] = _dedupe_text_lines(base.get(key, ""))
     base["long_form_memory"] = _normalize_long_form_memory(data.get("long_form_memory", {}))
+    # Some projects created by the newer writer keep continuity under
+    # ``long_form``.  Keep that value in the in-memory normalized project so
+    # the legacy writer can read either shape without changing disk format.
+    if isinstance(data.get("long_form"), dict):
+        base["long_form"] = deepcopy(data.get("long_form"))
     base["series_continuation"] = _normalize_series_continuation(
         data.get("series_continuation", {})
     )
@@ -3830,8 +3835,11 @@ def _record_aliases(item, name_key="name"):
     if name:
         aliases.append(name)
         aliases.extend(_normalize_name_list(name))
-    alias_fields = ("description",) if "description" in item else ("notes",)
-    alias_source = "\n".join(str(item.get(key, "") or "") for key in alias_fields)
+    alias_source = "\n".join(
+        str(item.get(key, "") or "")
+        for key in ("description", "story_known", "notes")
+        if key in item
+    )
     alias_labels = (
         "别称", "别名", "又名", "化名", "称呼", "代称", "简称",
         "绰号", "外号", "代号", "真名", "本名", "原名", "曾用名",
@@ -3841,6 +3849,14 @@ def _record_aliases(item, name_key="name"):
     alias_pattern = "|".join(re.escape(label) for label in alias_labels)
     for match in re.findall(rf"(?:{alias_pattern})[：:]\s*([^\n。；;]+)", alias_source):
         aliases.extend(_normalize_name_list(match))
+    for match in re.findall(
+        r"(?:也称|称作|称为|通称|叫做)[：:\s]*[“\"「『]?([^”\"」』；;。\n]{1,24})",
+        alias_source,
+    ):
+        aliases.extend(_normalize_name_list(match))
+    for prefix in ("老", "当年", "年轻", "灰衣", "灰袍"):
+        if name.startswith(prefix) and len(name) > len(prefix) + 1:
+            aliases.append(name[len(prefix):])
     out = []
     seen = set()
     for alias in aliases:
@@ -5164,14 +5180,21 @@ def _split_paragraph_to_units(paragraph, unit_limit):
         return [paragraph]
     units = []
     current = ""
-    sentence_parts = re.split(r"([。！？!?；;：:]\s*)", paragraph)
+    sentence_parts = re.split(r"([。！？!?；;：:，,]\s*)", paragraph)
     for piece in sentence_parts:
         if not piece:
             continue
         candidate = current + piece
         if current and len(candidate) > unit_limit:
-            units.append(current.strip())
-            current = piece
+            # Keep sentence/clause punctuation with the text before it.  If
+            # it were carried into the next unit, an exported chapter could
+            # start with a dangling "。"/"！" even without content loss.
+            if re.fullmatch(r"[。！？!?；;：:，,]\s*", piece):
+                units.append(candidate.strip())
+                current = ""
+            else:
+                units.append(current.strip())
+                current = piece
         else:
             current = candidate
     if current.strip():
@@ -5181,11 +5204,11 @@ def _split_paragraph_to_units(paragraph, unit_limit):
         unit = unit.strip()
         if not unit:
             continue
-        while len(unit) > unit_limit:
-            refined.append(unit[:unit_limit].strip())
-            unit = unit[unit_limit:].strip()
-        if unit:
-            refined.append(unit)
+        # Keep an overlong sentence/semantic unit intact.  The limit is only
+        # a grouping hint; slicing here makes the next exported chapter start
+        # in the middle of a sentence and moves its punctuation to the next
+        # chapter.
+        refined.append(unit)
     return refined or [paragraph]
 
 
@@ -6510,6 +6533,239 @@ def _chapter_reference_score(value, chapter_index, chapter_title):
         if marker and marker in text:
             return score
     return 0
+
+
+_CONTINUITY_KEYWORDS = (
+    "老杂役", "杂役", "密室", "铜盘", "石台", "乱葬岗", "守山木屋",
+    "封脉针", "止血散", "灰衣执事", "中品骨",
+)
+
+
+def _continuity_memory(project):
+    """Read either long-form memory shape without migrating project data."""
+    project = project if isinstance(project, dict) else {}
+    legacy = project.get("long_form_memory")
+    primary = project.get("long_form")
+    if isinstance(primary, dict) and isinstance(legacy, dict):
+        merged = deepcopy(legacy)
+        for key, value in primary.items():
+            if value not in (None, "", [], {}):
+                merged[key] = deepcopy(value)
+        return merged
+    if isinstance(primary, dict):
+        return deepcopy(primary)
+    if isinstance(legacy, dict):
+        return deepcopy(legacy)
+    return {}
+
+
+def _build_targeted_continuity_context(project, chapter_index, chapter_match_text):
+    """Expose a few confirmed, scene-relevant facts to the legacy writer."""
+    memory = _continuity_memory(project)
+    if not memory:
+        return ""
+    query = _compact_text(chapter_match_text)
+    triggers = [term for term in _CONTINUITY_KEYWORDS if term in query]
+    if not triggers:
+        return ""
+    try:
+        current_chapter = max(0, int(chapter_index or 0))
+    except Exception:
+        current_chapter = 0
+
+    lines = []
+    facts = memory.get("active_facts", [])
+    for item in facts if isinstance(facts, list) else []:
+        if not isinstance(item, dict):
+            continue
+        base_fact = str(item.get("fact", "") or "").strip()
+        if "老杂役" in base_fact and "铜盘" in base_fact and any(
+            word in base_fact for word in ("目睹", "亲眼", "现场")
+        ):
+            continue
+        try:
+            base_source = int(item.get("source_chapter_index", 0) or 0)
+        except Exception:
+            base_source = 0
+        try:
+            base_evidence = int(item.get("evidence_chapter_index", 0) or 0)
+        except Exception:
+            base_evidence = 0
+        # Source chapter indexes are one-based while chapter_index is zero-based;
+        # later review/evidence updates must not leak into the current draft.
+        candidates = [
+            (base_source, base_fact)
+        ] if (
+            base_fact and base_source <= current_chapter
+            and (not base_evidence or base_evidence <= current_chapter)
+        ) else []
+        for detail in item.get("continuity_details", []) if isinstance(item.get("continuity_details"), list) else []:
+            if not isinstance(detail, dict):
+                continue
+            fact = str(detail.get("fact", "") or "").strip()
+            try:
+                source = int(detail.get("source_chapter_index", 0) or 0)
+            except Exception:
+                source = 0
+            if fact and source <= current_chapter:
+                candidates.append((source, fact))
+        if not candidates:
+            continue
+        source, fact = max(candidates, key=lambda value: (value[0], len(value[1])))
+        # A fact may have been revised later with a sentence about the chapter
+        # currently being drafted (or a later chapter).  Do not let that
+        # retrospective sentence leak into the draft as if it were prior
+        # evidence.
+        future_numbers = []
+        for raw in re.findall(
+            r"第\s*([一二两三四五六七八九十百千万零〇\d]+)\s*章", fact
+        ):
+            number = _chinese_numeral_to_int(raw)
+            if number is not None:
+                future_numbers.append(number)
+        if any(value >= current_chapter + 1 for value in future_numbers):
+            continue
+        haystack = _compact_text("\n".join(str(item.get(key, "") or "") for key in ("fact", "evidence")))
+        if not any(term in haystack for term in triggers):
+            continue
+        # A rescue worker must not be given an invented viewpoint over the
+        # separate bone-removal scene.
+        if "老杂役" in fact and "铜盘" in fact and any(word in fact for word in ("目睹", "亲眼", "现场")):
+            continue
+        lines.append((source, fact))
+    # Keep the block deliberately small and deterministic.
+    unique = []
+    seen = set()
+    for source, fact in sorted(lines, key=lambda value: (value[0], len(value[1])), reverse=True):
+        key = _compact_text(fact)
+        if key and key not in seen:
+            seen.add(key)
+            unique.append((source, fact))
+        if len(unique) >= 8:
+            break
+
+    snapshot = memory.get("state_snapshot", {})
+    if isinstance(snapshot, dict):
+        try:
+            snapshot_index = int(snapshot.get("as_of_chapter_index", 0) or 0)
+        except Exception:
+            snapshot_index = 0
+        if snapshot_index <= current_chapter:
+            for group in ("character_states", "object_states"):
+                for item in snapshot.get(group, []) if isinstance(snapshot.get(group), list) else []:
+                    if not isinstance(item, dict):
+                        continue
+                    name = str(item.get("name", "") or "").strip()
+                    state = str(item.get("state", "") or "").strip()
+                    if name and state and any(term in _compact_text(name + state) for term in triggers):
+                        unique.append((0, f"当前状态（{name}）：{_clip_complete_text(state, 420)}"))
+    if not unique:
+        return ""
+    rendered = []
+    for source, fact in unique[:10]:
+        source_label = f"第{source}章已确认" if source else "已确认"
+        rendered.append(
+            f"- {source_label}：{_clip_complete_text(fact, 620, keep_tail=False)}"
+        )
+    return (
+        "以下是与本章场景相关的已确认连续性依据，用于保持时间顺序、人物视角和物件状态。\n"
+        "章节提纲只是创作计划；如与已确认正文事实冲突，保留本章剧情目标，并按已确认依据调整细节。\n"
+        + "\n".join(rendered)
+    )
+
+
+def _chapter_memory_view(project, chapter_index):
+    """Return a read-only memory view with facts/state not yet known removed."""
+    view = deepcopy(project if isinstance(project, dict) else {})
+    memory = _continuity_memory(view)
+    if not memory:
+        return view
+    try:
+        current = max(0, int(chapter_index or 0))
+    except Exception:
+        current = 0
+    facts = []
+    for item in memory.get("active_facts", []) if isinstance(memory.get("active_facts"), list) else []:
+        if not isinstance(item, dict):
+            continue
+        try:
+            source = int(item.get("source_chapter_index", 0) or 0)
+        except Exception:
+            source = 0
+        try:
+            evidence = int(item.get("evidence_chapter_index", 0) or 0)
+        except Exception:
+            evidence = 0
+        if source > current or (evidence and evidence > current):
+            continue
+        copied = deepcopy(item)
+        if "老杂役" in str(copied.get("fact", "") or "") and "铜盘" in str(copied.get("fact", "") or "") and any(
+            word in str(copied.get("fact", "") or "") for word in ("目睹", "亲眼", "现场")
+        ):
+            continue
+        details = []
+        for detail in copied.get("continuity_details", []) if isinstance(copied.get("continuity_details"), list) else []:
+            if not isinstance(detail, dict):
+                continue
+            try:
+                detail_source = int(detail.get("source_chapter_index", 0) or 0)
+            except Exception:
+                detail_source = 0
+            if detail_source <= current:
+                details.append(detail)
+        if details:
+            copied["continuity_details"] = details
+        facts.append(copied)
+    memory["active_facts"] = facts
+    snapshot = memory.get("state_snapshot")
+    if isinstance(snapshot, dict):
+        try:
+            snapshot_index = int(snapshot.get("as_of_chapter_index", 0) or 0)
+        except Exception:
+            snapshot_index = 0
+        if snapshot_index > current:
+            memory["state_snapshot"] = {}
+    archives = []
+    for archive in memory.get("stage_archives", []) if isinstance(memory.get("stage_archives"), list) else []:
+        if not isinstance(archive, dict):
+            continue
+        try:
+            end_index = int(archive.get("end_chapter_index", 0) or 0)
+        except Exception:
+            end_index = 0
+        if not end_index or end_index <= current:
+            archives.append(archive)
+    memory["stage_archives"] = archives
+    runtime = memory.get("record_runtime")
+    if isinstance(runtime, dict):
+        for records in runtime.values():
+            if not isinstance(records, dict):
+                continue
+            for key, entry in list(records.items()):
+                if not isinstance(entry, dict):
+                    continue
+                developments = entry.get("developments")
+                if not isinstance(developments, list):
+                    continue
+                kept = []
+                latest_index = 0
+                for development in developments:
+                    if not isinstance(development, dict):
+                        continue
+                    try:
+                        development_index = int(development.get("chapter_index", 0) or 0)
+                    except Exception:
+                        development_index = 0
+                    if development_index <= current:
+                        kept.append(development)
+                    latest_index = max(latest_index, development_index)
+                entry["developments"] = kept
+                if latest_index > current:
+                    entry["state"] = ""
+    # _long_form_memory_sections consumes the legacy key; provide the merged
+    # view there without writing it back to the project.
+    view["long_form_memory"] = memory
+    return view
 
 
 def _style_percentile(values, ratio):
@@ -8993,6 +9249,11 @@ def _natural_expression_guidance():
         "视线、判断和动作如何改变。"
         "描写要服从当前人物、关系和现场，不把这些例子当固定动作模板。幽默、吐槽、夸张和比喻可以自由使用；"
         "根据当前人物、关系和现场自由选择描写落点。"
+        "例如‘他意识到危险’，可以写成‘眼神停了一下，身体向后撤，右手扣紧桌沿’，再让这个动作带出对白、选择或结果。"
+        "先依据当前项目的定位形成故事阅读感：题材类型与读者定位（如男频、女频、搞笑、悬疑等）、叙事人称、故事卖点和节奏，"
+        "决定本章呈现什么样的冲突、情绪和推进方式。再依据样本文风进行仿写：以文风档案中的习惯用词、口语、句式松紧、"
+        "对白接法、叙述节奏和情绪落点为仿写目标，尽量复刻它的写法，让当前故事以相近的作者表达方式呈现；"
+        "项目资料负责故事定位、人物事实和剧情方向，样本文风负责表达层的落笔方式。示例动作只作参考，具体落点交给人物和现场。"
     )
 
 
@@ -19029,6 +19290,7 @@ def _build_chapter_ai_context(project, chapter_index, action):
         str(chap.get("title", "") or ""),
         chapter_outline_for_context,
     ])
+    runtime_project = _chapter_memory_view(project, chapter_index)
 
     if selected_character_ids:
         selected_characters = [
@@ -19042,6 +19304,31 @@ def _build_chapter_ai_context(project, chapter_index, action):
             linked_names=inherited_linked_characters,
             limit=36,
         )
+    # Older chapter links may contain a title/alias (for example “当年杂役”)
+    # instead of the canonical record ID.  Add only records that match the
+    # chapter text or an explicitly linked alias.
+    selected_character_ids_found = {
+        str(item.get("id", "") or "").strip()
+        for item in selected_characters if isinstance(item, dict)
+    }
+    linked_keys = {_compact_text(name) for name in inherited_linked_characters}
+    for item in project.get("characters", []) if isinstance(project.get("characters"), list) else []:
+        if not isinstance(item, dict):
+            continue
+        aliases = _record_aliases(item)
+        matched = any(
+            _name_in_text(alias, chapter_match_text)
+            or any(
+                _compact_text(alias) in linked_name or linked_name in _compact_text(alias)
+                for linked_name in linked_keys if len(linked_name) >= 2 and len(_compact_text(alias)) >= 2
+            )
+            for alias in aliases
+        )
+        item_id = str(item.get("id", "") or "").strip()
+        if matched and item_id and item_id not in selected_character_ids_found:
+            selected_characters.append(item)
+            selected_character_ids_found.add(item_id)
+    selected_characters = selected_characters[:36]
     character_recent_map = _record_recent_context_map(project, selected_characters, chapter_index)
     character_lines = []
     for char in selected_characters:
@@ -19069,7 +19356,7 @@ def _build_chapter_ai_context(project, chapter_index, action):
         if recent_state:
             recent_state = "最近状态：" + clean_context_text(recent_state, 520)
             detail = f"{detail}｜{recent_state}" if detail else recent_state
-        runtime_state = _record_runtime_context(project, "characters", char.get("id", ""), 700)
+        runtime_state = _record_runtime_context(runtime_project, "characters", char.get("id", ""), 700)
         if runtime_state:
             detail = f"{detail}｜{runtime_state}" if detail else runtime_state
         character_lines.append(f"- {name}｜{detail}" if detail else f"- {name}")
@@ -19086,6 +19373,30 @@ def _build_chapter_ai_context(project, chapter_index, action):
             name_key="name",
             limit=45,
         )
+    # Imported settings often keep their evidence in story_known.  Pull in a
+    # matching setting by name or concrete scene keyword without loading the
+    # entire setting catalogue.
+    selected_lore_ids_found = {
+        str(item.get("id", "") or "").strip()
+        for item in selected_lore if isinstance(item, dict)
+    }
+    for item in project.get("lore", []) if isinstance(project.get("lore"), list) else []:
+        if not isinstance(item, dict):
+            continue
+        source_text = "\n".join(
+            str(item.get(key, "") or "") for key in ("name", "description", "story_known")
+        )
+        aliases = _record_aliases(item, name_key="name")
+        matched = any(_name_in_text(alias, chapter_match_text) for alias in aliases)
+        matched = matched or any(
+            term in chapter_match_text and term in source_text
+            for term in _CONTINUITY_KEYWORDS
+        )
+        item_id = str(item.get("id", "") or "").strip()
+        if matched and item_id and item_id not in selected_lore_ids_found:
+            selected_lore.insert(0, item)
+            selected_lore_ids_found.add(item_id)
+    selected_lore = selected_lore[:45]
     lore_recent_map = _record_recent_context_map(project, selected_lore, chapter_index, name_key="name")
     lore_lines = []
     for item in selected_lore:
@@ -19100,7 +19411,7 @@ def _build_chapter_ai_context(project, chapter_index, action):
             desc_source = item.get("description", "") if expose_author_secrets else story_known
             desc = clean_context_text(_stable_lore_description_context(desc_source), 300)
             desc_tail = f"｜{desc}" if desc else ""
-            runtime_state = _record_runtime_context(project, "lore", item.get("id", ""), 520)
+            runtime_state = _record_runtime_context(runtime_project, "lore", item.get("id", ""), 520)
             runtime_tail = f"｜{runtime_state}" if runtime_state else ""
             lore_lines.append(f"- {name}｜{item.get('type','其他')}{desc_tail}{recent_tail}{runtime_tail}")
 
@@ -19168,7 +19479,7 @@ def _build_chapter_ai_context(project, chapter_index, action):
             f"｜仍未揭示边界：{clean_context_text(remaining_secret, 180)}"
             if expose_author_secrets and remaining_secret else ""
         )
-        runtime_state = _record_runtime_context(project, "foreshadows", item.get("id", ""), 520)
+        runtime_state = _record_runtime_context(runtime_project, "foreshadows", item.get("id", ""), 520)
         runtime_tail = f"｜{runtime_state}" if runtime_state else ""
         foreshadow_lines.append(
             f"- {head}｜{item.get('status','')}｜埋设：{item.get('setup_chapter','')}｜回收：{item.get('payoff_chapter','')}"
@@ -19320,6 +19631,7 @@ def _build_chapter_ai_context(project, chapter_index, action):
     inheritance_rule_lines = [
         "写长篇时请把资料当成连续故事档案。",
         "继承优先级：本章需继承的关键事实 > 当前状态快照/活跃连续性事实 > 前文继承摘要 > 人物卡 > 小说圣经/世界规则 > 设定库。",
+        "章节提纲是创作计划，不等同于已经发生的事实；如与已确认正文事实冲突，保留本章剧情目标，并按已确认时间顺序、人物视角和物件状态自然调整细节。",
         "不得改写已发生事实；如果资料冲突，优先保留更具体、更新、更接近当前章节的记录。",
         "续写时要继承人物公开目标、故事内已知动机、称呼和语言风格，以及伤势、物品、地点、关系和情绪变化。",
         "跨章开头必须继承上一章结尾状态：时间、天气、地点、人物位置、人物手中物品、身体状态和未完成动作不能凭空回退。",
@@ -19436,7 +19748,9 @@ def _build_chapter_ai_context(project, chapter_index, action):
             3,
             (
                 "剧情连续性参考",
-                _build_chapter_execution_hard_constraints(project, chapter_index),
+                _build_chapter_execution_hard_constraints(
+                    runtime_project, chapter_index
+                ),
                 4200,
                 False,
             ),
@@ -19470,7 +19784,11 @@ def _build_chapter_ai_context(project, chapter_index, action):
             900,
             False,
         ))
-    memory_sections = _long_form_memory_sections(project, memory_selection)
+    memory_view = runtime_project
+    memory_sections = _long_form_memory_sections(memory_view, memory_selection)
+    continuity_context = _build_targeted_continuity_context(
+        project, chapter_index, chapter_match_text
+    )
     if reverse_from_body:
         knowledge_sections = [
             ("小说圣经", _dedupe_text_lines(project.get("bible", "")) or "暂无", 2400, True),
@@ -19481,6 +19799,7 @@ def _build_chapter_ai_context(project, chapter_index, action):
             ("近期阶段档案", memory_sections["近期阶段档案"], 12000, True),
             ("前文继承摘要", previous_summary, 5000, True),
             ("近几章连续性", recent_context_section, 2600, True),
+            ("历史连续性依据", continuity_context, 2600, False),
             ("本章相关人物", "\n".join(character_lines) or "暂无", 4200, False),
             ("本章相关设定", "\n".join(lore_lines) or "暂无", 2800, False),
         ]
@@ -19495,6 +19814,7 @@ def _build_chapter_ai_context(project, chapter_index, action):
             ("续写承接点", continuation_text or "暂无", 6000, True),
             ("前文继承摘要", previous_summary, 5000 if action == "draft" else 15000, True),
             ("近几章连续性", recent_context_section, 5000, True),
+            ("历史连续性依据", continuity_context, 2600, False),
             ("本章相关人物", "\n".join(character_lines) or "暂无", 10000, False),
             ("本章相关设定", "\n".join(lore_lines) or "暂无", 8000, False),
             ("本章相关伏笔", foreshadow_context, 7000, True),

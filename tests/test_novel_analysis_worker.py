@@ -1751,6 +1751,10 @@ class NovelAnalysisWorkerTests(unittest.TestCase):
         self.assertIn("无需回收", prompt)
         self.assertIn("review_reason", prompt)
         self.assertIn("evidence", prompt)
+        self.assertIn("人物身份字段必须逐项独立判断", prompt)
+        self.assertIn("直接对白时，voice 必须提炼", prompt)
+        self.assertIn("goal 必须写成当前正文可证实的行动目标", prompt)
+        self.assertIn("secret 只有正文直接揭示", prompt)
 
     def test_candidate_postprocess_prompt_keeps_major_chapter_characters(self):
         worker = NovelCandidatePostprocessWorker("http://example.test", "key", "model", {"characters": [{"name": "王六"}]}, "dossier")
@@ -1767,6 +1771,10 @@ class NovelAnalysisWorkerTests(unittest.TestCase):
         self.assertIn("最终输出前逐条检查 characters.name", prompt)
         self.assertIn("删除人物候选时不能丢失剧情作用", prompt)
         self.assertIn("删除只围观、传话、无姓名、无独立行动、无后续影响的路人", prompt)
+        self.assertIn("人物字段必须逐项复核后再合并", prompt)
+        self.assertIn("有稳定直接对白的候选必须保留 voice", prompt)
+        self.assertIn("有明确争夺对象、行动方向、职责或利益诉求的候选必须保留 goal", prompt)
+        self.assertIn("不能因为 secret 不明确而清空同一人物已有的 goal 或 voice", prompt)
 
     def test_draft_prompt_distinguishes_relevant_and_open_foreshadows(self):
         worker = NovelWritingWorker("http://example.test", "key", "model", "draft", "context")

@@ -11343,6 +11343,80 @@ def _long_form_memory_sections(project, selection=None):
     }
 
 
+def _long_form_character_identity_gaps_text(project, chapter_index):
+    """Build a small, chapter-scoped checklist for empty character identity fields."""
+    project = project if isinstance(project, dict) else {}
+    chapters = project.get("chapters", []) if isinstance(project.get("chapters"), list) else []
+    chapter = (
+        chapters[chapter_index]
+        if 0 <= chapter_index < len(chapters) and isinstance(chapters[chapter_index], dict)
+        else {}
+    )
+    records = project.get("characters", []) if isinstance(project.get("characters"), list) else []
+    records_by_id = {
+        str(item.get("id", "") or "").strip(): item
+        for item in records
+        if isinstance(item, dict) and str(item.get("id", "") or "").strip()
+    }
+    records_by_name = {
+        _compact_text(item.get("name", "")).casefold(): item
+        for item in records
+        if isinstance(item, dict) and str(item.get("name", "") or "").strip()
+    }
+    reference_maps = _long_form_record_reference_maps(project).get("characters", {})
+    alias_to_id = reference_maps.get("alias_to_id", {})
+    selected_ids = []
+
+    def append_id(value):
+        raw = str(value or "").strip()
+        if not raw:
+            return
+        resolved = alias_to_id.get(raw, raw)
+        if resolved not in records_by_id:
+            resolved = records_by_name.get(_compact_text(raw).casefold(), {}).get("id", "")
+        if resolved and resolved in records_by_id and resolved not in selected_ids:
+            selected_ids.append(resolved)
+
+    for value in chapter.get("actual_linked_character_ids", []) if isinstance(
+        chapter.get("actual_linked_character_ids"), list
+    ) else []:
+        append_id(value)
+    selection = chapter.get("memory_selection", {})
+    selection = selection if isinstance(selection, dict) else {}
+    for value in selection.get("character_ids", []) if isinstance(
+        selection.get("character_ids"), list
+    ) else []:
+        append_id(value)
+    for value in chapter.get("linked_characters", []) if isinstance(
+        chapter.get("linked_characters"), list
+    ) else []:
+        append_id(value)
+
+    gaps = []
+    id_to_alias = reference_maps.get("id_to_alias", {})
+    for item_id in selected_ids:
+        record = records_by_id.get(item_id, {})
+        missing = [
+            field for field in ("goal", "secret", "voice")
+            if not str(record.get(field, "") or "").strip()
+        ]
+        if not missing:
+            continue
+        name = str(record.get("name", "") or "").strip() or item_id
+        alias = id_to_alias.get(item_id, "")
+        label = f"{alias}/{name}" if alias else name
+        gaps.append(f"{label}：{','.join(missing)}")
+    if not gaps:
+        return ""
+    return (
+        "\n【本章空缺人物字段定向检查】"
+        "以下是根据本章已关联人物生成的定向清单；最终正文中若人物实际行动、说话或提供关键信息，"
+        "必须逐项检查所列空字段并在有证据时使用identity_patch补齐："
+        + "；".join(gaps)
+        + "。只补正文直接支持的内容；没有直接证据的字段保持空，不要为了填满而猜测。"
+    )
+
+
 def _long_form_record_reference_maps(project):
     project = project if isinstance(project, dict) else {}
     result = {}
@@ -12227,6 +12301,7 @@ def _long_form_compact_update_contract_instructions(project, chapter_index):
         "conflict_refs": required_conflicts,
         "task_refs": required_tasks,
     }, ensure_ascii=False, separators=(",", ":"))
+    identity_gap_text = _long_form_character_identity_gaps_text(project, chapter_index)
     return (
         "只输出版本2长篇记忆增量的紧凑语义格式。这是严格增量，不是全量总结。"
         "AI仍负责判断发生了什么、哪些旧状态改变或退出、证据是什么、"
@@ -12249,7 +12324,7 @@ def _long_form_compact_update_contract_instructions(project, chapter_index):
         "不能因为新增了一条更宽泛的概括而退役精确旧事实；仍有效的精确旧事实必须继续保留。"
         "本章选择索引中未发生变化的已有事实由程序自动保留并生成复核索引，不得为它们输出keep；"
         "fact_updates只提交正文明确新增、更新、退出或取代的事实。"
-        "record_updates只写人物或设定的动态变化。新人物create使用NC/NL临时key并填写稳定名称和canon；人物canon的role、goal、secret、voice、notes逐项只填写最终正文能够支持的内容，不能为了填满字段猜测。"
+        "record_updates只写人物或设定的动态变化。新人物create使用NC/NL临时key并填写稳定名称和canon；人物canon的role、goal、secret、voice、notes逐项只填写最终正文能够支持的内容，不能为了填满字段猜测。人物字段必须独立判断：直接对白足够辨识时必须提取voice；明确争夺资源/机缘、控制或进入地点、保护/排除/追杀/阻止对象、职责或利益诉求时必须提取goal；只有正文明确揭示的隐情才提取secret。不能因为secret无证据而连带留空goal或voice。"
         "已有人物若正文补出了此前空缺的身份、目标、秘密或语言风格，使用identity_patch逐项补齐；程序保留已有内容，并只追加正文有证据的新补充，不覆盖或替换旧资料。已有姓名未明或临时称谓人物正式命名时，继续沿用原人物ref并用name升级同一ID。"
         "如果正文把已有的姓名未明或临时称谓人物正式命名，必须沿用原人物ref并用update填写name为正式姓名，"
         "不得新建第二张人物卡；只有正文没有对应旧人物时才create。"
@@ -12263,6 +12338,7 @@ def _long_form_compact_update_contract_instructions(project, chapter_index):
         "所有event及动态更新只能依据最终正文已经公开或明确发生的内容。疑似、可能、比喻、感官相似、来源不明和人物猜测"
         "不得改成确定机制；原数量、范围、伤势程度、权限和未知边界必须保留。"
         "不得只因提纲或项目资料出现该名称，就声称正文已经使用、确认或公开它。"
+        + identity_gap_text
         + _LONG_TERM_RECORD_CLASSIFICATION_RULES
         + "current_chapter_character_refs必须列出本章实际行动、说话、来电或提供关键信息的已有/本次新增命名人物。"
         "verification.checked及六项coverage_checks只能在逐段核对正文后写true。"
@@ -12362,6 +12438,7 @@ def _long_form_update_contract_instructions(project, chapter_index, compact=Fals
         ensure_ascii=False,
         separators=(",", ":"),
     )
+    identity_gap_text = _long_form_character_identity_gaps_text(project, chapter_index)
     return (
         "只输出以下版本2长篇记忆增量，不得返回完整旧事实清单，也不得改写导入的人物卡、设定定义或伏笔计划。"
         "未出现在增量里的旧资料默认保留；只有fact_updates中的retire/supersede和state_retirements可以让旧状态退出。"
@@ -12404,7 +12481,7 @@ def _long_form_update_contract_instructions(project, chapter_index, compact=Fals
             if stage_boundary else
             "state_lifecycle_review.scope必须为current_chapter；复核本章已选及本章触及的物件、冲突和任务。"
         )
-        + "record_updates只记录动态状态和本章变化；新人物使用canon逐项填写正文有证据的身份、目标、秘密、语言风格和备注，不能猜测。已有角色只在正文补出原卡空缺信息时使用identity_patch逐项补齐，程序保留已有内容并追加明确的新补充，不覆盖或替换旧资料。已有临时人物正式命名时也使用原ref和identity_patch完成同一ID升级。"
+        + "record_updates只记录动态状态和本章变化；新人物使用canon逐项填写正文有证据的身份、目标、秘密、语言风格和备注，不能猜测。人物字段必须独立判断：直接对白足够辨识时必须提取voice；明确争夺资源/机缘、控制或进入地点、保护/排除/追杀/阻止对象、职责或利益诉求时必须提取goal；只有正文明确揭示的隐情才提取secret。不能因为secret无证据而连带留空goal或voice。已有角色只在正文补出原卡空缺信息时使用identity_patch逐项补齐，程序保留已有内容并追加明确的新补充，不覆盖或替换旧资料。已有临时人物正式命名时也使用原ref和identity_patch完成同一ID升级。"
         "已有临时人物在正文中获得正式姓名时，必须用原ref加name完成同一ID升级；不能把正式姓名另建为新人物。"
         "所有fact_updates、record_updates和foreshadow_updates必须附带最终正文中连续逐字出现的8-60字evidence_quote。"
         "keep不改写事实，可不填evidence_quote；其余事实操作必须有逐字证据。"
@@ -12451,6 +12528,7 @@ def _long_form_update_contract_instructions(project, chapter_index, compact=Fals
         "标为已回收时必须同步payoff_chapter、revealed和remaining_secret。"
         "同一人物或永久设定实体才允许update旧卡；新一轮直播、新文件、新样品、新证据批次或新物件必须create新卡，"
         "使用能区分批次的名称和临时key，绝不能覆盖旧批次当前状态。"
+        + identity_gap_text
         + _LONG_TERM_RECORD_CLASSIFICATION_RULES
         + "同一状态包内create的人物NC临时key可用于state_patch人物/关系状态、current_chapter_character_refs和下一章选择；"
         "create的设定NL临时key可用于state_patch物品状态的lore_ref和下一章选择，程序会统一分配真实ID。"

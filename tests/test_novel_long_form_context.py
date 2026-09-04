@@ -73,6 +73,8 @@ from gpt_desktop.novel_utils import (
     _chapter_logic_audit_validation_errors,
     _normalize_long_form_state_aliases,
     _long_form_memory_sections,
+    _long_form_character_identity_gaps_text,
+    _long_form_update_contract_instructions,
     _normalize_long_form_event_storage_refs,
     _normalize_long_form_update_payload,
     _normalize_long_form_structural_refs,
@@ -9079,6 +9081,42 @@ class NovelLongFormContextTests(unittest.TestCase):
         self.assertEqual(saved["goal"], "保住儿子的外门位置；想继续维持外门月例的控制权")
         self.assertEqual(saved["secret"], "曾私下替儿子从新人月例中扣取好处")
         self.assertEqual(saved["voice"], "先客气施压，受阻后转为冷硬")
+
+    def test_long_form_contract_lists_empty_identity_fields_for_current_characters(self):
+        chapter = _new_chapter(0)
+        chapter["actual_linked_character_ids"] = ["character-one", "character-two"]
+        project = self._project_with_current_chapter(chapter)
+        project["characters"] = [
+            {
+                "id": "character-one",
+                "name": "甲",
+                "role": "修士",
+                "goal": "",
+                "secret": "",
+                "voice": "",
+            },
+            {
+                "id": "character-two",
+                "name": "乙",
+                "role": "护卫",
+                "goal": "守住城门",
+                "secret": "",
+                "voice": "命令式",
+            },
+        ]
+
+        gaps = _long_form_character_identity_gaps_text(project, 0)
+        self.assertIn("C001/甲：goal,secret,voice", gaps)
+        self.assertIn("C002/乙：secret", gaps)
+        self.assertIn("identity_patch", gaps)
+        self.assertIn("没有直接证据的字段保持空", gaps)
+
+        compact_contract = _long_form_update_contract_instructions(project, 0, compact=True)
+        full_contract = _long_form_update_contract_instructions(project, 0, compact=False)
+        for contract in (compact_contract, full_contract):
+            self.assertIn("本章空缺人物字段定向检查", contract)
+            self.assertIn("C001/甲：goal,secret,voice", contract)
+            self.assertIn("人物字段必须独立判断", contract)
 
     def test_character_create_maps_top_level_identity_fields_into_card(self):
         chapter = _new_chapter(0)

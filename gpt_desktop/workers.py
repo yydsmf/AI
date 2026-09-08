@@ -5388,7 +5388,7 @@ class NovelWritingWorker(QThread):
                         "style_runtime_voice_pack", "style_plot_extract", "style_rewrite", "memory_finalize",
                         "memory_reconcile", "memory_repair", "logic_repair",
                     )
-                    else 0.55 if self.action in ("draft", "script_to_novel")
+                    else 1.5 if self.action in ("draft", "script_to_novel")
                     else 0.35
                 ),
                 "stream": True,

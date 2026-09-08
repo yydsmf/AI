@@ -66,6 +66,7 @@ from gpt_desktop.novel_utils import (
     _merge_long_form_memory_repair_full,
     _merge_long_form_memory_reconciliation_patch,
     _normalize_long_form_reconciliation_patch,
+    _normalize_foreshadow_code,
     _merge_long_form_state_patch,
     _memory_repair_patch_targets,
     _literalize_long_form_memory_evidence,
@@ -9363,6 +9364,101 @@ class NovelLongFormContextTests(unittest.TestCase):
         self.assertEqual(merged["state_patch"]["location"], "华京")
         self.assertEqual(merged["state_patch"]["story_time"], "当夜")
         self.assertEqual(merged["stage_archive"]["summary"], "保留原阶段档案")
+
+    def test_foreshadow_code_does_not_extract_uuid_fragment(self):
+        self.assertEqual(_normalize_foreshadow_code("F003"), "F0003")
+        self.assertEqual(_normalize_foreshadow_code("F003｜旧线索"), "F0003")
+        self.assertEqual(
+            _normalize_foreshadow_code("7b4cbaee-f7b1-4c2a-9d10-628de15cf000"),
+            "",
+        )
+        self.assertEqual(_normalize_foreshadow_code("abcF003"), "")
+
+    def test_reconciliation_patch_merges_long_term_event_storage(self):
+        original = {
+            "long_term_events": [{
+                "event_key": "LTE-0060-02",
+                "event": "完整玉佩对应中央地域线索与非王朝旧印",
+                "category": "other",
+                "evidence_quote": "物件已经损坏",
+                "storage": {
+                    "fact_refs": ["AF-0001"],
+                    "object_keys": ["NO002"],
+                },
+            }],
+        }
+        patch = {
+            "long_term_events": [{
+                "event_key": "LTE-0060-02",
+                "storage": {"object_keys": ["OBJ-002"]},
+            }],
+        }
+
+        merged = _merge_long_form_memory_reconciliation_patch(original, patch)
+        self.assertEqual(len(merged["long_term_events"]), 1)
+        self.assertEqual(
+            merged["long_term_events"][0]["storage"]["object_keys"],
+            ["OBJ-002"],
+        )
+        self.assertEqual(
+            merged["long_term_events"][0]["storage"]["fact_refs"],
+            ["AF-0001"],
+        )
+        self.assertEqual(
+            _merge_long_form_memory_reconciliation_patch(merged, patch),
+            merged,
+        )
+
+    def test_reconciliation_patch_matches_lte_ordinal_to_existing_event_key(self):
+        original = {
+            "long_term_events": [
+                {"event_key": "EV-CH60-ARCHIVE-ROUTE", "event": "路线证据", "storage": {}},
+                {"event_key": "EV-CH60-SEAL-SOUL", "event": "青黑旧印", "storage": {"object_keys": ["NO002"]}},
+                {"event_key": "EV-CH60-FORGET", "event": "忘天机坐标", "storage": {}},
+            ],
+        }
+        patch = {
+            "long_term_events": [{
+                "event_key": "LTE-0060-02",
+                "storage": {"object_keys": ["OBJ-002"]},
+            }],
+        }
+
+        merged = _merge_long_form_memory_reconciliation_patch(original, patch)
+        self.assertEqual(len(merged["long_term_events"]), 3)
+        self.assertEqual(
+            merged["long_term_events"][1]["event_key"],
+            "EV-CH60-SEAL-SOUL",
+        )
+        self.assertEqual(
+            merged["long_term_events"][1]["storage"]["object_keys"],
+            ["OBJ-002"],
+        )
+
+    def test_reconciliation_patch_preserves_new_fact_lifecycle(self):
+        original = {
+            "fact_updates": [{
+                "operation": "add",
+                "key": "NF-0060-03",
+                "scope": "chapter:60",
+                "fact": "旧档案存在缺页",
+                "evidence_quote": "档案缺了一页",
+            }],
+        }
+        patch = {
+            "fact_updates": [{
+                "operation": "update",
+                "key": "NF-0060-03",
+                "fact": "旧档案确认存在缺页",
+                "evidence_quote": "确认缺了一页",
+            }],
+        }
+
+        merged = _merge_long_form_memory_reconciliation_patch(original, patch)
+        self.assertEqual(len(merged["fact_updates"]), 1)
+        self.assertEqual(merged["fact_updates"][0]["operation"], "add")
+        self.assertEqual(merged["fact_updates"][0]["key"], "NF-0060-03")
+        self.assertEqual(merged["fact_updates"][0]["fact"], "旧档案确认存在缺页")
 
     def test_reconciliation_normalizes_missing_operations_and_short_refs_before_merge(self):
         chapter = _new_chapter(0)

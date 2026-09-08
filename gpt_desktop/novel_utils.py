@@ -250,7 +250,13 @@ def _normalize_foreshadow_code(value):
     if not text:
         return ""
     text = re.sub(r"\s+", "", text)
-    match = re.search(r"F0*(\d{1,7})", text)
+    # A code is a complete token (or a code-prefixed label). Searching inside
+    # arbitrary text misreads hexadecimal UUID fragments such as ``...F7...``
+    # as a real foreshadow code.
+    match = re.fullmatch(
+        r"F0*(\d{1,7})(?:[|｜:：·.、_\-—].*)?",
+        text,
+    )
     if not match and re.fullmatch(r"\d{1,7}", text):
         match = re.match(r"0*(\d{1,7})", text)
     if not match:
@@ -17734,9 +17740,121 @@ def _merge_long_form_memory_reconciliation_patch(memory_update, patch, project=N
             existing.append(deepcopy(item))
         target[key] = existing
 
-    merge_list(("fact_updates",), corrections.get("fact_updates", []), lambda item: str(
-        item.get("id", "") or item.get("key", "") or ""
-    ).strip())
+    def fact_identity(item):
+        operation = str(item.get("operation", "") or "").strip().lower()
+        key = str(item.get("key", "") or "").strip()
+        item_id = str(item.get("id", "") or "").strip()
+        # Temporary NF facts are identified by their key even when a repair
+        # response incorrectly puts that key in ``id`` and calls it update.
+        if operation == "add" or key.upper().startswith("NF-") or item_id.upper().startswith("NF-"):
+            return key or item_id
+        return item_id or key
+
+    def merge_fact_updates(incoming):
+        if not isinstance(incoming, list):
+            return
+        existing = merged.get("fact_updates", [])
+        existing = existing if isinstance(existing, list) else []
+        for item in incoming:
+            if not isinstance(item, dict):
+                continue
+            identity = fact_identity(item)
+            replaced = False
+            if identity:
+                for index, old in enumerate(existing):
+                    if not isinstance(old, dict) or fact_identity(old) != identity:
+                        continue
+                    old_operation = str(old.get("operation", "") or "").strip().lower()
+                    new_operation = str(item.get("operation", "") or "").strip().lower()
+                    if old_operation == "add" and new_operation == "update":
+                        # Reconciliation may refine a newly added fact, but it
+                        # must not turn the temporary NF record into an AF update.
+                        preserved = deepcopy(old)
+                        for field, value in item.items():
+                            if field in {"operation", "id", "key"}:
+                                continue
+                            if isinstance(value, str) and not value.strip():
+                                continue
+                            preserved[field] = deepcopy(value)
+                        preserved["operation"] = "add"
+                        preserved["key"] = str(old.get("key", "") or item.get("key", "")).strip()
+                        existing[index] = preserved
+                    else:
+                        existing[index] = deepcopy(item)
+                    replaced = True
+                    break
+            if not replaced:
+                existing.append(deepcopy(item))
+        merged["fact_updates"] = existing
+
+    merge_fact_updates(corrections.get("fact_updates", []))
+
+    def event_identity(item):
+        event_id = str(
+            item.get("event_key", "")
+            or item.get("event_id", "")
+            or item.get("id", "")
+            or ""
+        ).strip()
+        if event_id:
+            return f"id:{event_id}"
+        event_text = _compact_text(item.get("event", ""))
+        if not event_text:
+            return ""
+        return f"text:{event_text}"
+
+    def merge_long_term_events(incoming):
+        if not isinstance(incoming, list):
+            return
+        existing = merged.get("long_term_events", [])
+        existing = existing if isinstance(existing, list) else []
+        for item in incoming:
+            if not isinstance(item, dict):
+                continue
+            identity = event_identity(item)
+            replaced = False
+            fallback_index = None
+            # Boundary reconciliation responses may assign a local LTE-NN key
+            # instead of echoing the original event key. These corrections only
+            # carry storage/lifecycle fields, so the ordinal is an unambiguous
+            # fallback while preserving the original stable event key.
+            event_key = str(item.get("event_key", "") or "").strip().upper()
+            metadata_only = not any(
+                str(item.get(field, "") or "").strip()
+                for field in ("event", "title", "summary", "category")
+            )
+            ordinal_match = re.fullmatch(r"LTE-\d+-0*(\d+)", event_key)
+            if metadata_only and ordinal_match:
+                ordinal = int(ordinal_match.group(1))
+                if 1 <= ordinal <= len(existing):
+                    fallback_index = ordinal - 1
+            if identity:
+                for index, old in enumerate(existing):
+                    if not isinstance(old, dict) or event_identity(old) != identity:
+                        continue
+                    fallback_index = index
+                    break
+            if fallback_index is not None:
+                old = existing[fallback_index]
+                combined = deepcopy(old) if isinstance(old, dict) else {}
+                for field, value in item.items():
+                    if field == "event_key" and str(old.get("event_key", "") or "").strip():
+                        continue
+                    if field == "storage" and isinstance(value, dict):
+                        storage = combined.get("storage", {})
+                        storage = storage if isinstance(storage, dict) else {}
+                        for storage_key, storage_value in value.items():
+                            storage[storage_key] = deepcopy(storage_value)
+                        combined["storage"] = storage
+                    else:
+                        combined[field] = deepcopy(value)
+                existing[fallback_index] = combined
+                replaced = True
+            if not replaced:
+                existing.append(deepcopy(item))
+        merged["long_term_events"] = existing
+
+    merge_long_term_events(corrections.get("long_term_events", []))
     merge_list(("foreshadow_updates",), corrections.get("foreshadow_updates", []), lambda item: str(
         item.get("ref", "") or item.get("id", "") or item.get("key", "") or item.get("name", "")
     ).strip())

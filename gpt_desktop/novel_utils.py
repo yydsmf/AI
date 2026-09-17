@@ -5310,7 +5310,7 @@ def _split_manuscript_into_target_chapters(project, target_words):
 
 
 def _local_split_chapter_title(text, middle_chars=500, min_chars=5, max_chars=20):
-    """Use a short sentence from the middle of the text as a fast export-only title."""
+    """Use a complete sentence near the middle as a fast export-only title."""
     text = str(text or "").strip()
     if not text:
         return ""
@@ -5350,21 +5350,27 @@ def _local_split_chapter_title(text, middle_chars=500, min_chars=5, max_chars=20
                 return heading
         return value
 
+    # Do not slice a window and then treat its leading fragment as a sentence.
+    # The window can begin in the middle of a real sentence, which previously
+    # produced titles missing their first half. Extract sentence spans from the
+    # full body first, then prefer complete spans nearest the middle.
     window_chars = min(len(text), middle_chars)
     middle_start = max(0, (len(text) - window_chars) // 2)
-    middle_text = text[middle_start:middle_start + window_chars]
-    candidates = []
-    source_headings = []
-    for sentence in re.split(r"[。！？!?；;\n]+", middle_text):
-        if source_chapter_re.match(sentence):
-            heading = clean(sentence)
-            if 2 <= len(heading) <= max_chars:
-                source_headings.append(heading)
-        sentence = clean(sentence)
-        if sentence:
-            candidates.append(sentence)
+    middle_end = middle_start + window_chars
+    middle_point = len(text) / 2
+    sentence_items = []
+    for match in re.finditer(r"[^。！？!?；;\n]+(?:[。！？!?；;]+|(?=\n|$))", text):
+        raw_sentence = match.group(0)
+        sentence = clean(raw_sentence)
+        if not sentence:
+            continue
+        start, end = match.span()
+        overlaps_middle_window = start < middle_end and end > middle_start
+        distance = abs(((start + end) / 2) - middle_point)
+        sentence_items.append((not overlaps_middle_window, distance, start, sentence))
 
-    for candidate in candidates:
+    sentence_items.sort(key=lambda item: (item[0], item[1], item[2]))
+    for _outside_window, _distance, _start, candidate in sentence_items:
         if min_chars <= len(candidate) <= max_chars:
             return candidate
         if len(candidate) > max_chars:
@@ -5372,11 +5378,13 @@ def _local_split_chapter_title(text, middle_chars=500, min_chars=5, max_chars=20
                 fragment = clean(fragment)
                 if min_chars <= len(fragment) <= max_chars:
                     return fragment
-    if source_headings:
-        return source_headings[0]
-    if candidates:
-        return clean(candidates[0][:max_chars])
-    return clean(middle_text[:max_chars])
+
+    if sentence_items:
+        # A manuscript with no usable short sentence still gets a local title,
+        # but the fallback is based on a complete source sentence rather than
+        # an arbitrary slice beginning in its middle.
+        return clean(sentence_items[0][3][:max_chars])
+    return clean(text[:max_chars])
 
 
 def _chapter_analysis_hash_text(chap, include_linked=True):

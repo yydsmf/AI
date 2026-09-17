@@ -1932,7 +1932,10 @@ class NovelAnalysisWorker(QThread):
         return "候选分析"
 
     def _reasoning_effort_for_request(self):
-        return reasoning_effort_for_model(self.model, self.base_url, self._analysis_progress_label())
+        # V2 structured writing tasks expose their action directly; legacy
+        # analysis workers use the progress label (for example 框架分类).
+        action = str(getattr(self, "action", "") or "").strip() or self._analysis_progress_label()
+        return reasoning_effort_for_model(self.model, self.base_url, action)
 
     def _reasoning_effort_error(self, error):
         match = re.search(r"接口错误\s+(\d+)", str(error or ""))
@@ -4888,7 +4891,7 @@ class NovelWritingWorker(QThread):
         if configured_effort:
             return configured_effort
         if self.action in {"memory_finalize", "memory_reconcile", "memory_repair", "logic_repair"}:
-            return "low"
+            return "high"
         return ""
 
     def _json_transport_fallback_key(self):

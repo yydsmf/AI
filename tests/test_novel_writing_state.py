@@ -2402,6 +2402,16 @@ class NovelWritingStateTests(unittest.TestCase):
         title = _local_split_chapter_title(fallback)
         self.assertEqual(len(title), 20)
 
+    def test_local_split_chapter_title_never_uses_middle_window_fragment(self):
+        complete_title = "完整章节标题绝不能从中间位置被截断"
+        prefix = "甲" * 284 + "。"
+        middle_start = len(prefix) + 8
+        total_chars = 500 + middle_start * 2
+        suffix_chars = total_chars - len(prefix) - len(complete_title) - 1
+        text = prefix + complete_title + "。" + "乙" * suffix_chars
+
+        self.assertEqual(_local_split_chapter_title(text), complete_title)
+
     def test_split_docx_export_centers_chapter_headings(self):
         if DocxDocument is None:
             self.skipTest("python-docx unavailable")

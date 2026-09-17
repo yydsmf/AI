@@ -23,6 +23,47 @@ from gpt_desktop.workers import (
 
 
 class NovelAnalysisWorkerTests(unittest.TestCase):
+    def test_novel_writing_reasoning_is_high_for_all_requested_actions(self):
+        actions = (
+            "draft",
+            "outline",
+            "summary",
+            "execution_outline",
+            "outline_repair",
+            "audit",
+            "pov_audit",
+            "targeted_repair",
+            "length_repair",
+            "length_repair_segment",
+            "postwrite",
+            "completion_audit",
+            "style_profile",
+            "style_baseline",
+            "style_sheet",
+            "style_sheet_merge",
+            "style_cards",
+            "style_semantic_vocabulary",
+            "style_voice_cards",
+            "style_technique_cards",
+            "style_runtime_voice_pack",
+            "style_persona",
+            "style_rules",
+            "style_finalize",
+            "style_audit",
+            "style_rewrite",
+            "style_plot_extract",
+            "memory_finalize",
+            "memory_reconcile",
+            "memory_repair",
+            "logic_repair",
+        )
+        for action in actions:
+            with self.subTest(action=action):
+                self.assertEqual(
+                    reasoning_effort_for_model("unknown-model", "", action),
+                    "high",
+                )
+
     def test_framework_and_chapter_planning_reasoning_is_fixed_at_high(self):
         for action in ("框架分类", "全书阶段规划", "章节规划"):
             with self.subTest(action=action):
@@ -1059,12 +1100,12 @@ class NovelAnalysisWorkerTests(unittest.TestCase):
 
         self.assertEqual(results, [("memory_finalize", "{}")])
         self.assertEqual(session.last_payload["response_format"], {"type": "json_object"})
-        self.assertEqual(session.last_payload["reasoning_effort"], "low")
+        self.assertEqual(session.last_payload["reasoning_effort"], "high")
         self.assertTrue(worker.diagnostics["json_response_format_requested"])
-        self.assertEqual(worker.diagnostics["reasoning_effort_requested"], "low")
+        self.assertEqual(worker.diagnostics["reasoning_effort_requested"], "high")
         self.assertIn("不能漏掉字符串末尾", worker._action_prompt())
 
-    def test_writing_worker_uses_task_tiered_reasoning_effort_by_provider(self):
+    def test_writing_worker_uses_high_reasoning_for_known_providers(self):
         cases = (
             ("https://api.dxmcs.xin", "gpt-5.6-luna", "high"),
             ("https://api.dxmcs.xin", "gpt-5.6-sol", "high"),
@@ -1084,11 +1125,16 @@ class NovelAnalysisWorkerTests(unittest.TestCase):
 
                 self.assertEqual(session.last_payload["reasoning_effort"], expected)
 
-    def test_writing_worker_keeps_maximum_reasoning_for_prose_and_style_imitation(self):
+    def test_writing_worker_uses_high_reasoning_for_novel_writing_tasks(self):
         cases = (
-            ("draft", "max"),
-            ("style_finalize", "max"),
-            ("style_rewrite", "max"),
+            ("draft", "high"),
+            ("style_finalize", "high"),
+            ("style_rewrite", "high"),
+            ("audit", "high"),
+            ("postwrite", "high"),
+            ("memory_reconcile", "high"),
+            ("memory_repair", "high"),
+            ("logic_repair", "high"),
         )
         for action, expected in cases:
             with self.subTest(action=action):
@@ -1104,7 +1150,7 @@ class NovelAnalysisWorkerTests(unittest.TestCase):
 
                 self.assertEqual(session.last_payload["reasoning_effort"], expected)
 
-    def test_writing_worker_lowers_state_tasks_to_high(self):
+    def test_writing_worker_uses_high_reasoning_for_state_tasks(self):
         worker = NovelWritingWorker(
             "https://api.dxmcs.xin", "key", "gpt-5.6-sol", "memory_finalize", "context"
         )

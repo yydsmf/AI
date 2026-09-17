@@ -574,38 +574,72 @@ def api_url(base_url, path):
     return base_url + path
 
 
-# Only models whose reasoning levels were verified through the configured
-# OpenAI-compatible providers are included here. Unknown models keep the old
-# behavior and do not receive an extra request parameter.
+# Only models whose reasoning parameter support was verified through the
+# configured OpenAI-compatible providers are included here. The writing
+# pipeline below explicitly requests High; these mappings remain the
+# allow-list for other model-specific requests.
 _DEFAULT_REASONING_EFFORTS = {
-    "gpt-5.6-luna": "max",
-    "gpt-5.6-sol": "max",
-    "gpt-5.6-terra": "max",
-    "gpt-5.5": "xhigh",
+    "gpt-5.6-luna": "high",
+    "gpt-5.6-sol": "high",
+    "gpt-5.6-terra": "high",
+    "gpt-5.5": "high",
 }
 
 _PROVIDER_REASONING_EFFORTS = {
     "api.dxmcs.xin": {
-        "gpt-5.6-luna": "max",
-        "gpt-5.6-sol": "max",
-        "gpt-5.6-terra": "max",
-        "gpt-5.5": "xhigh",
+        "gpt-5.6-luna": "high",
+        "gpt-5.6-sol": "high",
+        "gpt-5.6-terra": "high",
+        "gpt-5.5": "high",
     },
     "hubway.cc": {
-        "gpt-5.6-luna": "max",
-        "gpt-5.6-sol": "max",
-        "gpt-5.6-terra": "max",
-        "gpt-5.5": "xhigh",
+        "gpt-5.6-luna": "high",
+        "gpt-5.6-sol": "high",
+        "gpt-5.6-terra": "high",
+        "gpt-5.5": "high",
     },
 }
 
-# Only direct prose generation and style imitation keep the provider's
-# highest verified setting. Planning, extraction, summaries and state
-# maintenance use the faster high setting.
-_HIGH_REASONING_ACTIONS = {"draft", "style_finalize", "style_rewrite"}
+# Novel writing requests that should always use the stable High reasoning tier.
+# This covers normal and automatic expansion, chapter checks, post-write
+# organization, state repair, and the ten-chapter boundary reconciliation.
+# Keeping this list at the shared resolver also covers both legacy and V2 tabs.
+_NOVEL_WRITING_HIGH_REASONING_ACTIONS = {
+    "draft",
+    "outline",
+    "summary",
+    "execution_outline",
+    "outline_repair",
+    "audit",
+    "pov_audit",
+    "targeted_repair",
+    "length_repair",
+    "length_repair_segment",
+    "postwrite",
+    "completion_audit",
+    "style_profile",
+    "style_baseline",
+    "style_sheet",
+    "style_sheet_merge",
+    "style_cards",
+    "style_semantic_vocabulary",
+    "style_voice_cards",
+    "style_technique_cards",
+    "style_runtime_voice_pack",
+    "style_persona",
+    "style_rules",
+    "style_finalize",
+    "style_audit",
+    "style_rewrite",
+    "style_plot_extract",
+    "memory_finalize",
+    "memory_reconcile",
+    "memory_repair",
+    "logic_repair",
+}
 
 # Keep import classification and both chapter-planning passes at the stable
-# high tier even when a provider advertises a higher model-specific setting.
+# High tier as well.
 _FIXED_HIGH_REASONING_ACTIONS = {"框架分类", "全书阶段规划", "章节规划"}
 
 
@@ -622,20 +656,21 @@ def _reasoning_model_key(model):
 
 
 def reasoning_effort_for_model(model, base_url="", action=""):
-    """Return the task-appropriate verified reasoning level."""
+    """Return the task-appropriate reasoning level for an API request."""
     model_key = _reasoning_model_key(model)
     try:
         host = (urlsplit(str(base_url or "").strip()).hostname or "").lower()
     except Exception:
         host = ""
+    action_key = str(action or "").strip()
+    if action_key in _NOVEL_WRITING_HIGH_REASONING_ACTIONS:
+        return "high"
     provider_levels = _PROVIDER_REASONING_EFFORTS.get(host, {})
     verified_level = provider_levels.get(model_key) or _DEFAULT_REASONING_EFFORTS.get(model_key, "")
     if not verified_level:
         return ""
-    if str(action or "").strip() in _FIXED_HIGH_REASONING_ACTIONS:
+    if action_key in _FIXED_HIGH_REASONING_ACTIONS:
         return "high"
-    if str(action or "").strip() in _HIGH_REASONING_ACTIONS:
-        return verified_level
     return "high"
 
 

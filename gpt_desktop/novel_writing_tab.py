@@ -23,7 +23,7 @@ from PySide6.QtWidgets import (
     QFrame,
     QGridLayout,
     QHBoxLayout,
-    QInputDialog,
+    QInputDialog as _QtInputDialog,
     QLabel,
     QLineEdit,
     QListWidget,
@@ -218,7 +218,7 @@ from .novel_utils import (
     _target_words,
     FRAMEWORK_IMPORT_TYPE,
 )
-from .widgets import ProviderModelBar, WideComboBox
+from .widgets import ProviderModelBar, WideComboBox, install_combo_arrow_overlay
 from .workers import EdgeTTSWorker, NovelAnalysisWorker, NovelCandidatePostprocessWorker, NovelChapterPlanMasterWorker, NovelChapterPlanWorker, NovelContextBuildWorker, NovelForeshadowReviewPostprocessWorker, NovelForeshadowReviewWorker, NovelFrameworkImportWorker, NovelVolumeFrameworkAlignmentWorker, NovelVolumeFrameworkWorker, NovelVolumeHandoffWorker, NovelVolumeIntentWorker, NovelWritingWorker
 
 NOVEL_PERF_LOG_ENABLED = str(os.environ.get("GPT_NOVEL_PERF_LOG", "") or "").strip().lower() in {
@@ -227,6 +227,39 @@ NOVEL_PERF_LOG_ENABLED = str(os.environ.get("GPT_NOVEL_PERF_LOG", "") or "").str
     "yes",
     "on",
 }
+
+
+class QInputDialog(_QtInputDialog):
+    """保留 Qt 输入对话框 API，并让选项列表显示统一的上下箭头。"""
+
+    @staticmethod
+    def getItem(
+        parent,
+        title,
+        label,
+        items,
+        current=0,
+        editable=True,
+        flags=Qt.WindowFlags(),
+        inputMethodHints=Qt.InputMethodHints(),
+    ):
+        dialog = _QtInputDialog(parent)
+        dialog.setWindowTitle(title)
+        dialog.setLabelText(label)
+        dialog.setComboBoxItems([str(item) for item in (items or [])])
+        dialog.setComboBoxEditable(bool(editable))
+        dialog.setInputMethodHints(inputMethodHints)
+        if flags:
+            dialog.setWindowFlags(flags)
+
+        combo = dialog.findChild(QComboBox)
+        if combo is not None:
+            if combo.count():
+                combo.setCurrentIndex(max(0, min(int(current), combo.count() - 1)))
+            install_combo_arrow_overlay(combo)
+
+        accepted = dialog.exec() == QDialog.Accepted
+        return dialog.textValue(), accepted
 
 _SORT_MISSING_ORDER = 10 ** 9
 _CHAPTER_PLAN_BATCH_SIZE = 50
@@ -4799,7 +4832,7 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
             QMessageBox.information(self, "拆分提示", "当前没有可导出的章节正文。")
             return
         average_words = body_words // max(1, len(body_chapters))
-        default_words = max(100, min(5000, average_words or 2000))
+        default_words = max(100, min(3000, average_words or 2000))
         target_words, ok = QInputDialog.getInt(
             self,
             "按字数拆分并导出",

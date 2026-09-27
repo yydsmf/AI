@@ -4,8 +4,8 @@ import shutil
 import subprocess
 import sys
 
-from PySide6.QtCore import Qt, QTimer, Signal
-from PySide6.QtGui import QColor, QGuiApplication, QPainter, QPixmap
+from PySide6.QtCore import QEvent, QPoint, Qt, QTimer, Signal
+from PySide6.QtGui import QColor, QGuiApplication, QPainter, QPixmap, QPolygon
 from PySide6.QtWidgets import (
     QComboBox,
     QDialog,
@@ -30,6 +30,68 @@ from .core import (
     save_config,
 )
 
+
+def _paint_combo_arrows(painter, width, height, enabled=True):
+    """绘制程序统一的上下三角列表提示。"""
+    painter.setRenderHint(QPainter.Antialiasing)
+    color = QColor("#c8ccd6" if enabled else "#6a6c72")
+    painter.setPen(color)
+    painter.setBrush(color)
+
+    x = width - 18
+    cy = height // 2
+    up = [
+        (x, cy - 6),
+        (x - 4, cy - 1),
+        (x + 4, cy - 1),
+    ]
+    down = [
+        (x, cy + 6),
+        (x - 4, cy + 1),
+        (x + 4, cy + 1),
+    ]
+    painter.drawPolygon(QPolygon([QPoint(a, b) for a, b in up]))
+    painter.drawPolygon(QPolygon([QPoint(a, b) for a, b in down]))
+
+
+class _ComboArrowOverlay(QWidget):
+    """在无法替换内部 QComboBox 子类的对话框中补充统一箭头。"""
+
+    def __init__(self, combo):
+        super().__init__(combo)
+        self._combo = combo
+        self.setAttribute(Qt.WA_TransparentForMouseEvents)
+        self.setAttribute(Qt.WA_TranslucentBackground)
+        combo.installEventFilter(self)
+        self._sync_geometry()
+        self.show()
+        self.raise_()
+
+    def _sync_geometry(self):
+        self.setGeometry(max(0, self._combo.width() - 26), 0, 26, self._combo.height())
+
+    def eventFilter(self, watched, event):
+        if watched is self._combo:
+            if event.type() == QEvent.Resize:
+                self._sync_geometry()
+                self.raise_()
+            elif event.type() == QEvent.EnabledChange:
+                self.update()
+        return super().eventFilter(watched, event)
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        _paint_combo_arrows(painter, self.width(), self.height(), self._combo.isEnabled())
+        painter.end()
+
+
+def install_combo_arrow_overlay(combo):
+    """给原生 QComboBox 添加与 WideComboBox 一致的上下箭头。"""
+    overlay = _ComboArrowOverlay(combo)
+    combo._combo_arrow_overlay = overlay
+    return overlay
+
+
 class WideComboBox(QComboBox):
     """弹出菜单宽度按内容自动撑开，并在右侧显示上下小箭头。"""
 
@@ -51,31 +113,7 @@ class WideComboBox(QComboBox):
 
         # 右侧画一个清晰的上下箭头，提示这里是可选择列表
         painter = QPainter(self)
-        painter.setRenderHint(QPainter.Antialiasing)
-        painter.setPen(QColor("#c8ccd6" if self.isEnabled() else "#6a6c72"))
-
-        x = self.width() - 18
-        cy = self.height() // 2
-
-        # 上三角
-        up = [
-            (x, cy - 6),
-            (x - 4, cy - 1),
-            (x + 4, cy - 1),
-        ]
-        # 下三角
-        down = [
-            (x, cy + 6),
-            (x - 4, cy + 1),
-            (x + 4, cy + 1),
-        ]
-
-        from PySide6.QtGui import QPolygon
-        from PySide6.QtCore import QPoint
-
-        painter.setBrush(QColor("#c8ccd6" if self.isEnabled() else "#6a6c72"))
-        painter.drawPolygon(QPolygon([QPoint(a, b) for a, b in up]))
-        painter.drawPolygon(QPolygon([QPoint(a, b) for a, b in down]))
+        _paint_combo_arrows(painter, self.width(), self.height(), self.isEnabled())
         painter.end()
 
 

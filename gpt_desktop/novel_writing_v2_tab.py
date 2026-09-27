@@ -2575,7 +2575,7 @@ class NovelWritingV2Tab(SimpleModelBarMixin, QWidget):
             QMessageBox.information(self, "拆分提示", "当前没有可导出的章节正文。")
             return
         average_words = body_words // max(1, len(body_chapters))
-        default_words = max(100, min(5000, average_words or 2000))
+        default_words = max(100, min(3000, average_words or 2000))
         target_words, ok = QInputDialog.getInt(
             self,
             "按字数拆分并导出",

@@ -4426,6 +4426,162 @@ class NovelWritingStateTests(unittest.TestCase):
         self.assertEqual(tab._chapter_ai_model, "gpt-5.5")
         self.assertEqual(tab.current_project["chapters"][0]["memory_sync_status"], "pending")
 
+    def test_chapter_sequence_resumes_memory_repair_checkpoint_directly(self):
+        chapter = _new_chapter(0)
+        chapter["outline"] = "原规划提纲"
+        chapter["memory_sync_status"] = "failed"
+        final_text = "已经完成审校的正文终稿。"
+        bundle = {
+            "outline": "实际提纲",
+            "summary": "本章摘要",
+            "key_facts": "关键事实",
+            "memory_update": {"state_reconciliation": {"checked": False}},
+        }
+        tab = NovelWritingTab.__new__(NovelWritingTab)
+        tab.current_project = {
+            "chapters": [chapter],
+            "long_form_memory": {"schema_version": "2", "revision": 107},
+        }
+        tab.current_chapter_index = 0
+        tab.current_project_path = "/tmp/repair-resume.json"
+        tab.chapter_outline = _FakePlainTextEdit(chapter["outline"])
+        tab.chapter_summary = _FakePlainTextEdit(chapter.get("summary", ""))
+        tab.chapter_key_facts = _FakePlainTextEdit(chapter.get("key_facts", ""))
+        tab.chapter_linked = _FakeLineEdit("")
+        tab.chapter_ai_preview = _FakePlainTextEdit("")
+        tab.chapter_ai_stream_text = ""
+        tab._chapter_ai_buttons_by_action = {}
+        tab._auto_expand_all_active = False
+        tab._flush_current_editors = lambda: None
+        tab._current_novel_ai_selection = lambda: ({"name": "hubway.cc"}, "gpt-5.5", "")
+        tab._note_project_dirty = lambda: None
+        tab._set_partial_chapter_ai_preview_state = lambda *_args: None
+        tab._chapter_ai_memory_pending = {}
+        tab._store_memory_repair_checkpoint(
+            "memory_repair",
+            final_text,
+            bundle,
+            validation_errors=["state_reconciliation.checked必须为true"],
+            mode="style",
+            repair_attempt=1,
+            status="failed",
+        )
+        started = []
+        tab._start_memory_repair = lambda *args: started.append(args)
+        tab._start_memory_finalize = lambda *_args, **_kwargs: self.fail(
+            "修复检查点不应重新进入状态整理"
+        )
+
+        tab._start_chapter_ai_sequence()
+
+        self.assertEqual(len(started), 1)
+        self.assertEqual(started[0][0], final_text)
+        self.assertEqual(started[0][1], bundle)
+        self.assertEqual(started[0][2], ["state_reconciliation.checked必须为true"])
+        self.assertEqual(tab.current_project["chapters"][0]["ai_generation_checkpoint"]["stage"], "memory_repair")
+
+    def test_chapter_sequence_resumes_logic_repair_checkpoint_directly(self):
+        chapter = _new_chapter(0)
+        chapter["outline"] = "原规划提纲"
+        chapter["memory_sync_status"] = "failed"
+        final_text = "已经完成审校的正文终稿。"
+        bundle = {
+            "outline": "实际提纲",
+            "summary": "本章摘要",
+            "key_facts": "关键事实",
+            "memory_update": {},
+        }
+        issue = {
+            "severity": "major",
+            "category": "object_state",
+            "earlier_quote": "物件已经撤走",
+            "later_quote": "人物再次拿起物件",
+            "explanation": "前后状态冲突",
+        }
+        tab = NovelWritingTab.__new__(NovelWritingTab)
+        tab.current_project = {
+            "chapters": [chapter],
+            "long_form_memory": {"schema_version": "2", "revision": 107},
+        }
+        tab.current_chapter_index = 0
+        tab.current_project_path = "/tmp/logic-repair-resume.json"
+        tab.chapter_outline = _FakePlainTextEdit(chapter["outline"])
+        tab.chapter_summary = _FakePlainTextEdit(chapter.get("summary", ""))
+        tab.chapter_key_facts = _FakePlainTextEdit(chapter.get("key_facts", ""))
+        tab.chapter_linked = _FakeLineEdit("")
+        tab.chapter_ai_preview = _FakePlainTextEdit("")
+        tab.chapter_ai_stream_text = ""
+        tab._chapter_ai_buttons_by_action = {}
+        tab._auto_expand_all_active = False
+        tab._flush_current_editors = lambda: None
+        tab._current_novel_ai_selection = lambda: ({"name": "hubway.cc"}, "gpt-5.5", "")
+        tab._note_project_dirty = lambda: None
+        tab._set_partial_chapter_ai_preview_state = lambda *_args: None
+        tab._chapter_ai_memory_pending = {}
+        tab._store_memory_repair_checkpoint(
+            "logic_repair",
+            final_text,
+            bundle,
+            logic_issues=[issue],
+            repair_attempt=1,
+            status="failed",
+        )
+        started = []
+        tab._start_chapter_logic_repair = lambda *args: started.append(args)
+        tab._start_memory_finalize = lambda *_args, **_kwargs: self.fail(
+            "逻辑修复检查点不应重新进入状态整理"
+        )
+
+        tab._start_chapter_ai_sequence()
+
+        self.assertEqual(len(started), 1)
+        self.assertEqual(started[0][0], final_text)
+        self.assertEqual(started[0][1], bundle)
+        self.assertEqual(started[0][2], [issue])
+        self.assertEqual(tab.current_project["chapters"][0]["ai_generation_checkpoint"]["stage"], "logic_repair")
+
+    def test_stale_repair_checkpoint_restarts_state_finalize_for_existing_body(self):
+        chapter = _new_chapter(0)
+        chapter["outline"] = "原规划提纲"
+        chapter["text"] = "当前已经保存的正文。"
+        chapter["memory_sync_status"] = "failed"
+        tab = NovelWritingTab.__new__(NovelWritingTab)
+        tab.current_project = {
+            "chapters": [chapter],
+            "long_form_memory": {"schema_version": "2", "revision": 107},
+        }
+        tab.current_chapter_index = 0
+        tab.current_project_path = "/tmp/stale-repair-resume.json"
+        tab.chapter_outline = _FakePlainTextEdit(chapter["outline"])
+        tab.chapter_summary = _FakePlainTextEdit("")
+        tab.chapter_key_facts = _FakePlainTextEdit("")
+        tab.chapter_linked = _FakeLineEdit("")
+        tab.chapter_ai_preview = _FakePlainTextEdit("")
+        tab._chapter_ai_buttons_by_action = {}
+        tab._auto_expand_all_active = False
+        tab._flush_current_editors = lambda: None
+        tab._current_novel_ai_selection = lambda: ({"name": "hubway.cc"}, "gpt-5.5", "")
+        tab._note_project_dirty = lambda: None
+        tab._set_partial_chapter_ai_preview_state = lambda *_args: None
+        tab._chapter_ai_memory_pending = {}
+        tab._store_memory_repair_checkpoint(
+            "memory_repair",
+            "旧修复终稿。",
+            {"summary": "旧摘要", "memory_update": {}},
+            validation_errors=["摘要缺失"],
+            repair_attempt=1,
+            status="failed",
+        )
+        chapter["outline"] = "用户已经修改的提纲"
+        tab.chapter_outline.setPlainText(chapter["outline"])
+        resumed_calls = []
+        tab._start_memory_finalize = lambda text, resumed=False: resumed_calls.append((text, resumed))
+
+        tab._start_chapter_ai_sequence()
+
+        self.assertEqual(resumed_calls, [(chapter["text"], False)])
+        self.assertEqual(tab.current_project["chapters"][0]["ai_generation_checkpoint"], {})
+
     def test_internal_memory_stream_stays_out_of_body_preview(self):
         tab = NovelWritingTab.__new__(NovelWritingTab)
         tab._chapter_ai_running_action = "memory_finalize"

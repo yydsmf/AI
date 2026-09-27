@@ -9803,6 +9803,13 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
         title = str(chapter.get("title", "") or f"第{index + 1}章").strip()
         has_body = bool(str(chapter.get("text", "") or "").strip())
         has_checkpoint = bool(self._memory_finalize_checkpoint_text(chapter))
+        if not has_checkpoint:
+            checkpoint = chapter.get("ai_generation_checkpoint", {})
+            has_checkpoint = bool(
+                isinstance(checkpoint, dict)
+                and str(checkpoint.get("stage", "") or "") in {"memory_repair", "logic_repair"}
+                and str(checkpoint.get("final_text", "") or "").strip()
+            )
         if not str(chapter.get("outline", "") or "").strip() and not has_body and not has_checkpoint:
             self._stop_auto_expand_all(f"自动扩写已停止：第{index + 1}章《{title}》没有章节提纲。")
             self._set_chapter_ai_actions_enabled(True)
@@ -9824,7 +9831,13 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
             chapter_id=str(chapter.get("id", "") or ""),
             queue_position=completed + 1,
             queue_total=total,
-            recovery_mode=("checkpoint" if has_checkpoint else "existing_body" if has_body else "new_draft"),
+            recovery_mode=(
+                str(chapter.get("ai_generation_checkpoint", {}).get("stage", "") or "")
+                if isinstance(chapter.get("ai_generation_checkpoint"), dict)
+                and str(chapter.get("ai_generation_checkpoint", {}).get("stage", "") or "")
+                in {"memory_finalize", "memory_repair", "logic_repair", "memory_reconcile"}
+                else "existing_body" if has_body else "new_draft"
+            ),
         )
         rewrite_notice = "（已丢弃半成品，重新生成）" if getattr(
             self, "_auto_expand_restart_rewrite_notice", False
@@ -10770,6 +10783,209 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
         )
         return True
 
+    def _store_memory_repair_checkpoint(
+        self,
+        stage,
+        final_text,
+        bundle,
+        validation_errors=None,
+        logic_issues=None,
+        mode="style",
+        repair_attempt=0,
+        status="failed",
+        error="",
+    ):
+        """Persist the exact structured inputs needed to resume a failed repair."""
+        stage = str(stage or "").strip()
+        if stage not in {"memory_repair", "logic_repair"}:
+            return False
+        chapters = self.current_project.get("chapters", []) if isinstance(self.current_project, dict) else []
+        if not (0 <= self.current_chapter_index < len(chapters)):
+            return False
+        chapter = chapters[self.current_chapter_index]
+        if not isinstance(chapter, dict):
+            return False
+        text = str(final_text or "").strip()
+        if not text or not isinstance(bundle, dict):
+            return False
+        memory = self.current_project.get("long_form_memory", {})
+        memory = memory if isinstance(memory, dict) else {}
+        previous = chapter.get("ai_generation_checkpoint", {})
+        previous = previous if isinstance(previous, dict) else {}
+        pending = getattr(self, "_chapter_ai_memory_pending", {})
+        pending = pending if isinstance(pending, dict) else {}
+        task = self._current_chapter_ai_task_context()
+        try:
+            attempt = int(repair_attempt or 0)
+        except (TypeError, ValueError):
+            attempt = 0
+        linked_characters = chapter.get("linked_characters", [])
+        try:
+            linked_characters_hash = self._chapter_ai_checkpoint_hash(
+                json.dumps(linked_characters, ensure_ascii=False, sort_keys=True, default=str)
+            )
+        except Exception:
+            linked_characters_hash = self._chapter_ai_checkpoint_hash(linked_characters)
+        checkpoint = {
+            "version": 4,
+            "stage": stage,
+            "status": str(status or "failed"),
+            "project_path": str(
+                pending.get("project_path", "")
+                or task.get("project_path", "")
+                or getattr(self, "current_project_path", "")
+                or ""
+            ),
+            "chapter_id": str(chapter.get("id", "") or ""),
+            "chapter_index": int(
+                pending.get("chapter_index", self.current_chapter_index)
+                or self.current_chapter_index
+            ),
+            "request_id": str(
+                pending.get("request_id", "")
+                or task.get("request_id", "")
+                or ""
+            ),
+            "task_generation": int(
+                pending.get("task_generation", 0)
+                or task.get("task_generation", 0)
+                or 0
+            ),
+            "mode": str(mode or pending.get("mode", "style") or "style"),
+            "final_text": text,
+            "final_text_sha256": self._chapter_ai_checkpoint_hash(text),
+            "source_text_sha256": self._chapter_ai_checkpoint_hash(chapter.get("text", "")),
+            "outline_sha256": self._chapter_ai_checkpoint_hash(chapter.get("outline", "")),
+            "summary_sha256": self._chapter_ai_checkpoint_hash(chapter.get("summary", "")),
+            "key_facts_sha256": self._chapter_ai_checkpoint_hash(chapter.get("key_facts", "")),
+            "linked_characters_sha256": linked_characters_hash,
+            "base_memory_revision": int(memory.get("revision", 0) or 0),
+            "provider": str(
+                (getattr(self, "_chapter_ai_provider", {}) or {}).get("name", "")
+                if isinstance(getattr(self, "_chapter_ai_provider", {}), dict) else ""
+            ),
+            "model": str(getattr(self, "_chapter_ai_model", "") or ""),
+            "transaction_id": str(
+                pending.get("transaction_id", "")
+                or getattr(self, "_chapter_ai_memory_transaction_id", "")
+                or previous.get("transaction_id", "")
+                or ""
+            ),
+            "bundle": deepcopy(bundle),
+            "validation_errors": [
+                str(item) for item in validation_errors or [] if str(item or "").strip()
+            ],
+            "logic_issues": [
+                deepcopy(item) for item in logic_issues or [] if isinstance(item, dict)
+            ],
+            "logic_audit_required": bool(
+                pending.get("logic_audit_required", stage == "logic_repair")
+            ),
+            "repair_attempt": attempt,
+            "created_at": str(
+                previous.get("created_at", "")
+                if previous.get("stage") == stage else now_str()
+            ),
+            "updated_at": now_str(),
+        }
+        if error:
+            checkpoint["error"] = str(error)[:1000]
+        chapter["ai_generation_checkpoint"] = checkpoint
+        chapter["auto_expand_resume_required"] = True
+        if hasattr(self, "_note_project_dirty"):
+            self._note_project_dirty()
+        self._persist_ai_generation_state()
+        self._log_novel_diagnostic(
+            "memory_repair_checkpoint_saved",
+            level="warning",
+            action=stage,
+            status=str(status or "failed"),
+            error=clean_error_text(error),
+            repair_attempt=attempt,
+            final_text_chars=len(text),
+            final_text_sha256=self._chapter_ai_checkpoint_hash(text),
+            validation_error_count=len(checkpoint["validation_errors"]),
+            logic_issue_count=len(checkpoint["logic_issues"]),
+            resume_required=True,
+        )
+        return True
+
+    def _validated_memory_repair_checkpoint(self):
+        chapters = self.current_project.get("chapters", []) if isinstance(self.current_project, dict) else []
+        if not (0 <= self.current_chapter_index < len(chapters)):
+            return None
+        chapter = chapters[self.current_chapter_index]
+        if not isinstance(chapter, dict):
+            return None
+        checkpoint = chapter.get("ai_generation_checkpoint", {})
+        if not isinstance(checkpoint, dict):
+            return None
+        stage = str(checkpoint.get("stage", "") or "")
+        if stage not in {"memory_repair", "logic_repair"}:
+            return None
+        text = str(checkpoint.get("final_text", "") or "").strip()
+        bundle = checkpoint.get("bundle")
+        memory = self.current_project.get("long_form_memory", {})
+        memory = memory if isinstance(memory, dict) else {}
+        try:
+            checkpoint_revision = int(checkpoint.get("base_memory_revision", -1) or 0)
+            memory_revision = int(memory.get("revision", 0) or 0)
+            raw_checkpoint_index = checkpoint.get("chapter_index", -1)
+            checkpoint_index = int(
+                raw_checkpoint_index if raw_checkpoint_index is not None else -1
+            )
+        except (TypeError, ValueError):
+            return None
+        checkpoint_project_path = self._canonical_project_path(checkpoint.get("project_path", ""))
+        current_project_path = self._canonical_project_path(getattr(self, "current_project_path", ""))
+        project_matches = (
+            not checkpoint_project_path
+            or not current_project_path
+            or checkpoint_project_path == current_project_path
+        )
+        linked_characters = chapter.get("linked_characters", [])
+        try:
+            linked_characters_hash = self._chapter_ai_checkpoint_hash(
+                json.dumps(linked_characters, ensure_ascii=False, sort_keys=True, default=str)
+            )
+        except Exception:
+            linked_characters_hash = self._chapter_ai_checkpoint_hash(linked_characters)
+        source_hash = str(checkpoint.get("source_text_sha256", "") or "")
+        current_text_hash = self._chapter_ai_checkpoint_hash(chapter.get("text", ""))
+        final_text_hash = self._chapter_ai_checkpoint_hash(text)
+        source_matches = source_hash == current_text_hash or current_text_hash == final_text_hash
+        common_valid = bool(
+            int(checkpoint.get("version", 0) or 0) == 4
+            and str(checkpoint.get("chapter_id", "") or "") == str(chapter.get("id", "") or "")
+            and checkpoint_index == int(self.current_chapter_index)
+            and project_matches
+            and text
+            and str(checkpoint.get("final_text_sha256", "") or "") == final_text_hash
+            and source_matches
+            and str(checkpoint.get("outline_sha256", "") or "")
+            == self._chapter_ai_checkpoint_hash(chapter.get("outline", ""))
+            and str(checkpoint.get("summary_sha256", "") or "")
+            == self._chapter_ai_checkpoint_hash(chapter.get("summary", ""))
+            and str(checkpoint.get("key_facts_sha256", "") or "")
+            == self._chapter_ai_checkpoint_hash(chapter.get("key_facts", ""))
+            and str(checkpoint.get("linked_characters_sha256", "") or "") == linked_characters_hash
+            and checkpoint_revision == memory_revision
+            and isinstance(bundle, dict)
+            and str(chapter.get("memory_sync_status", "") or "") in {"pending", "failed"}
+        )
+        if stage == "memory_repair":
+            valid = common_valid and bool(
+                isinstance(checkpoint.get("validation_errors"), list)
+                and checkpoint.get("validation_errors")
+            )
+        else:
+            valid = common_valid and bool(
+                isinstance(checkpoint.get("logic_issues"), list)
+                and checkpoint.get("logic_issues")
+                and all(isinstance(item, dict) for item in checkpoint.get("logic_issues", []))
+            )
+        return deepcopy(checkpoint) if valid else None
+
     def _validated_memory_reconciliation_checkpoint(self):
         chapters = self.current_project.get("chapters", []) if isinstance(self.current_project, dict) else []
         if not (0 <= self.current_chapter_index < len(chapters)):
@@ -11349,6 +11565,15 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
             "mode": str(mode or "style"),
             "logic_audit_required": logic_audit_required,
         }
+        self._store_memory_repair_checkpoint(
+            "memory_repair",
+            final_text,
+            self._chapter_ai_memory_pending["bundle"],
+            validation_errors=validation_errors,
+            mode=self._chapter_ai_memory_pending["mode"],
+            repair_attempt=attempts,
+            status="pending",
+        )
         context = _build_long_form_memory_repair_context(
             self._ai_project_snapshot(),
             self.current_chapter_index,
@@ -11370,14 +11595,37 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
         )
 
     def _start_chapter_logic_repair(self, final_text, bundle, logic_issues):
+        previous_pending = getattr(self, "_chapter_ai_memory_pending", {})
+        previous_pending = previous_pending if isinstance(previous_pending, dict) else {}
         attempts = int(getattr(self, "_chapter_ai_logic_repair_attempts", 0) or 0) + 1
         self._chapter_ai_logic_repair_attempts = attempts
         issues = [deepcopy(item) for item in logic_issues if isinstance(item, dict)][:3]
+        self._chapter_ai_memory_pending = {
+            "chapter_id": self._current_chapter_id(),
+            "transaction_id": str(
+                previous_pending.get("transaction_id", "")
+            ) or self._next_novel_diagnostic_request_id("memory-sync"),
+            "final_text": str(final_text or "").strip(),
+            "bundle": deepcopy(bundle) if isinstance(bundle, dict) else {},
+            "errors": [],
+            "mode": "style",
+            "logic_audit_required": True,
+            "logic_issues": issues,
+        }
         if attempts > 2 or not issues:
             self._fail_memory_sync(
                 "终稿逻辑审查仍发现明确矛盾，已停止自动写入，正文保留在恢复检查点中"
             )
             return
+        self._store_memory_repair_checkpoint(
+            "logic_repair",
+            final_text,
+            self._chapter_ai_memory_pending["bundle"],
+            logic_issues=issues,
+            mode="style",
+            repair_attempt=attempts,
+            status="pending",
+        )
         self._log_novel_diagnostic(
             "chapter_logic_repair_started",
             level="warning",
@@ -11388,19 +11636,6 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
             final_text_chars=len(str(final_text or "").strip()),
             final_text_sha256=self._chapter_ai_checkpoint_hash(final_text),
         )
-        self._chapter_ai_memory_pending = {
-            "chapter_id": self._current_chapter_id(),
-            "transaction_id": str(
-                getattr(self, "_chapter_ai_memory_pending", {}).get("transaction_id", "")
-                if isinstance(getattr(self, "_chapter_ai_memory_pending", {}), dict) else ""
-            ) or self._next_novel_diagnostic_request_id("memory-sync"),
-            "final_text": str(final_text or "").strip(),
-            "bundle": deepcopy(bundle) if isinstance(bundle, dict) else {},
-            "errors": [],
-            "mode": "style",
-            "logic_audit_required": True,
-            "logic_issues": issues,
-        }
         context = _build_chapter_logic_repair_context(
             self._ai_project_snapshot(),
             self.current_chapter_index,
@@ -11498,13 +11733,36 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
             pending.get("transaction_id", "")
             if isinstance(pending, dict) else ""
         )
+        failure_action = str(getattr(self, "_chapter_ai_running_action", "") or "")
+        repair_stage = ""
+        if failure_action == "logic_repair" or pending.get("logic_issues"):
+            repair_stage = "logic_repair"
+        elif failure_action == "memory_repair":
+            repair_stage = "memory_repair"
         if final_text:
             self.chapter_ai_preview.setPlainText(final_text)
-            self._store_memory_finalize_checkpoint(
-                final_text,
-                status="failed",
-                error=str(message or ""),
-            )
+            if repair_stage:
+                self._store_memory_repair_checkpoint(
+                    repair_stage,
+                    final_text,
+                    pending.get("bundle", {}) if isinstance(pending, dict) else {},
+                    validation_errors=pending.get("errors", []) if isinstance(pending, dict) else [],
+                    logic_issues=pending.get("logic_issues", []) if isinstance(pending, dict) else [],
+                    mode=pending.get("mode", "style") if isinstance(pending, dict) else "style",
+                    repair_attempt=(
+                        getattr(self, "_chapter_ai_logic_repair_attempts", 0)
+                        if repair_stage == "logic_repair" else
+                        getattr(self, "_chapter_ai_memory_repair_attempts", 0)
+                    ),
+                    status="failed",
+                    error=str(message or ""),
+                )
+            else:
+                self._store_memory_finalize_checkpoint(
+                    final_text,
+                    status="failed",
+                    error=str(message or ""),
+                )
         request_id = str(getattr(self, "_chapter_ai_diagnostic_request_id", "") or "")
         validation_payload = ""
         try:
@@ -11560,10 +11818,14 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
             self._stop_auto_expand_all(
                 f"自动扩写已停止：第{self.current_chapter_index + 1}章正文完成，但状态同步失败。"
             )
+        resume_action_text = {
+            "memory_repair": "重新启动时会继续状态修复。",
+            "logic_repair": "重新启动时会继续正文逻辑修复。",
+        }.get(repair_stage, "重新启动时会继续整理状态。")
         self.set_status_tip(
             "正文终稿未写入章节：状态同步失败，已保留后台恢复检查点；"
-            "重新启动自动扩写时会继续整理状态。"
-            f"{str(message or '')[:120]}"
+            + resume_action_text
+            + f"{str(message or '')[:120]}"
         )
 
     def _handle_memory_repair_ready(self, content):
@@ -12271,6 +12533,76 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
             self.chapter_ai_preview.setPlainText(final_text)
             self._start_memory_reconciliation(final_text, bundle, resumed=True)
             return
+        repair_checkpoint = self._validated_memory_repair_checkpoint()
+        if repair_checkpoint:
+            self._chapter_ai_provider = provider
+            self._chapter_ai_model = model
+            self._reset_chapter_ai_sequence()
+            self._reset_chapter_ai_style_retry()
+            self._chapter_ai_sequence_active = True
+            self._chapter_ai_sequence_chapter_id = self._current_chapter_id()
+            self._chapter_ai_sequence_started_outline = self.chapter_outline.toPlainText().strip()
+            self._set_partial_chapter_ai_preview_state(False)
+            self._chapter_ai_resume_prefix = ""
+            self.chapter_ai_stream_text = ""
+            final_text = str(repair_checkpoint.get("final_text", "") or "").strip()
+            bundle = deepcopy(repair_checkpoint.get("bundle", {}))
+            stage = str(repair_checkpoint.get("stage", "") or "")
+            self._chapter_ai_memory_transaction_id = str(
+                repair_checkpoint.get("transaction_id", "")
+                or self._next_novel_diagnostic_request_id("memory-sync")
+            )
+            self._chapter_ai_memory_pending = {
+                "chapter_id": self._current_chapter_id(),
+                "transaction_id": self._chapter_ai_memory_transaction_id,
+                "final_text": final_text,
+                "bundle": bundle,
+                "errors": [
+                    str(item) for item in repair_checkpoint.get("validation_errors", [])
+                    if str(item or "").strip()
+                ],
+                "mode": str(repair_checkpoint.get("mode", "style") or "style"),
+                "logic_audit_required": bool(
+                    repair_checkpoint.get("logic_audit_required", stage == "logic_repair")
+                ),
+                "logic_issues": [
+                    deepcopy(item) for item in repair_checkpoint.get("logic_issues", [])
+                    if isinstance(item, dict)
+                ],
+                "resumed_repair": True,
+            }
+            self._mark_current_chapter_ai_sync_pending(chapter)
+            self._chapter_ai_style_workflow_active = bool(
+                stage == "logic_repair"
+                or str(self._chapter_ai_memory_pending.get("mode", "style") or "style") == "style"
+            )
+            self.chapter_ai_preview.setPlainText(final_text)
+            try:
+                stored_attempt = int(repair_checkpoint.get("repair_attempt", 0) or 0)
+            except (TypeError, ValueError):
+                stored_attempt = 0
+            if stage == "memory_repair":
+                # Retry the failed request in the same logical repair slot; do
+                # not reset the validation budget or create an automatic loop.
+                resume_attempt = stored_attempt if 0 < stored_attempt <= 2 else 0
+                self._chapter_ai_memory_repair_attempts = max(0, resume_attempt - 1)
+                self._start_memory_repair(
+                    final_text,
+                    bundle,
+                    self._chapter_ai_memory_pending["errors"],
+                    self._chapter_ai_memory_pending["mode"],
+                )
+            else:
+                # A terminal third-attempt checkpoint is only retried after
+                # this explicit user action, with a fresh two-attempt budget.
+                resume_attempt = stored_attempt if 0 < stored_attempt <= 2 else 0
+                self._chapter_ai_logic_repair_attempts = max(0, resume_attempt - 1)
+                self._start_chapter_logic_repair(
+                    final_text,
+                    bundle,
+                    self._chapter_ai_memory_pending["logic_issues"],
+                )
+            return
         has_committed_marker = self._chapter_has_committed_memory_marker(chapter)
         if has_committed_marker:
             if self._auto_expand_chapter_has_committed_memory(chapter):
@@ -12292,11 +12624,19 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
                 self._set_chapter_ai_actions_enabled(True)
             return
         had_memory_checkpoint = bool(chapter.get("ai_generation_checkpoint"))
+        checkpoint_stage = (
+            str(chapter.get("ai_generation_checkpoint", {}).get("stage", "") or "")
+            if isinstance(chapter.get("ai_generation_checkpoint"), dict) else ""
+        )
         checkpoint_text = self._validated_memory_finalize_checkpoint()
         existing_body = str(chapter.get("text", "") or "").strip()
         rewrite_on_ready = False
         if had_memory_checkpoint and not checkpoint_text:
             self._clear_memory_finalize_checkpoint(persist=True)
+            if checkpoint_stage in {"memory_repair", "logic_repair"}:
+                # A stale repair package must not force a prose rewrite. The
+                # current body is still usable; rebuild only its state data.
+                had_memory_checkpoint = False
         # A validated memory checkpoint contains a complete, style-finalized
         # body. Resume only its state transaction. A body without a checkpoint
         # is user-authored (or already delivered) content and must go straight

@@ -19,6 +19,29 @@ CHAPTER_ANALYSIS_STATUS_PENDING = "pending"
 CHAPTER_ANALYSIS_STATUS_UNWRITTEN = "unwritten"
 CHAPTER_ANALYSIS_QUICK_SIMILARITY_LOCAL_RATIO_LIMIT = 0.50
 NOVEL_AI_CONTEXT_LIMIT = 120000
+
+
+def _canonical_chapter_plan_stage_id(value, fallback=""):
+    """Normalize legacy/current source-framework stage identifiers."""
+    normalized = re.sub(r"\s+", "", str(value or "").strip().upper())
+    match = re.fullmatch(r"(?:STAGE[_-]?|S[_-]?)(\d{1,4})", normalized)
+    if match:
+        return f"S{int(match.group(1)):02d}"
+    return str(fallback or "").strip().upper()
+
+
+def _canonical_chapter_plan_event_id(value):
+    """Normalize source-framework event IDs across legacy naming variants."""
+    normalized = re.sub(r"\s+", "", str(value or "").strip().upper())
+    match = re.fullmatch(
+        r"(?:STAGE[_-]?|S[_-]?)(\d{1,4})[_-]?E[_-]?(\d{1,4})",
+        normalized,
+    )
+    if match:
+        return f"S{int(match.group(1)):02d}-E{int(match.group(2)):02d}"
+    return normalized
+
+
 # Continuation data is kept separate from ordinary writing state so a new
 # volume can inherit continuity without importing the previous manuscript.
 VOLUME_CONTINUATION_SCHEMA_VERSION = "1"
@@ -1327,6 +1350,10 @@ def _new_chapter(index):
         "unit_type": "chapter",
         "status": "大纲",
         "outline": "",
+        "narrative_stage": "",
+        "source_stage": "",
+        "dominant_line": "",
+        "ending_hook": "",
         "draft_words": "",
         "text": "",
         "summary": "",
@@ -1703,7 +1730,10 @@ def _normalize_project(data):
                 "outline": _as_text(item.get("outline", "")),
                 "characters": _normalize_name_list(item.get("characters", [])),
                 "ending_hook": _as_text(item.get("ending_hook", "")),
-                "source_event_ids": _normalize_name_list(item.get("source_event_ids", [])),
+                "source_event_ids": [
+                    _canonical_chapter_plan_event_id(value)
+                    for value in _normalize_name_list(item.get("source_event_ids", []))
+                ],
             }
             if any(str(value or "").strip() for value in chapter.values() if not isinstance(value, list)) or chapter["characters"]:
                 chapters.append(chapter)
@@ -1722,7 +1752,7 @@ def _normalize_project(data):
                 continue
             if start_chapter <= 0 or end_chapter < start_chapter:
                 continue
-            stage_id = str(item.get("id", "") or f"S{stage_index:02d}").strip().upper()
+            stage_id = _canonical_chapter_plan_stage_id(item.get("id", ""), f"S{stage_index:02d}")
             if not re.fullmatch(r"S\d{2,4}", stage_id):
                 stage_id = f"S{stage_index:02d}"
             events = []
@@ -1736,7 +1766,9 @@ def _normalize_project(data):
                     order = max(1, int(event.get("order", event_index) or event_index))
                 except Exception:
                     order = event_index
-                event_id = str(event.get("id", "") or f"{stage_id}-E{order:02d}").strip().upper()
+                event_id = _canonical_chapter_plan_event_id(
+                    event.get("id", "") or f"{stage_id}-E{order:02d}"
+                )
                 if not re.fullmatch(r"S\d{2,4}-E\d{2,4}", event_id):
                     event_id = f"{stage_id}-E{order:02d}"
                 text = _as_text(event.get("text", "")).strip()
@@ -1799,6 +1831,11 @@ def _normalize_project(data):
             for item in generation_state.get("chapters", [])
             if isinstance(item, dict)
         ] if isinstance(generation_state.get("chapters"), list) else []
+        for chapter in chapters:
+            chapter["source_event_ids"] = [
+                _canonical_chapter_plan_event_id(value)
+                for value in _normalize_name_list(chapter.get("source_event_ids", []))
+            ]
         master_plan = deepcopy(generation_state.get("master_plan", {}))
         if not isinstance(master_plan, dict):
             master_plan = {}
@@ -1865,6 +1902,10 @@ def _normalize_project(data):
                     "unit_type",
                     "status",
                     "outline",
+                    "narrative_stage",
+                    "source_stage",
+                    "dominant_line",
+                    "ending_hook",
                     "draft_words",
                     "text",
                     "summary",
@@ -1884,7 +1925,10 @@ def _normalize_project(data):
                 ):
                     chap[key] = _as_text(chap.get(key, ""))
                 chap["linked_characters"] = _normalize_name_list(chap.get("linked_characters", []))
-                chap["source_event_ids"] = _normalize_name_list(chap.get("source_event_ids", []))
+                chap["source_event_ids"] = [
+                    _canonical_chapter_plan_event_id(value)
+                    for value in _normalize_name_list(chap.get("source_event_ids", []))
+                ]
                 chap["actual_linked_character_ids"] = _normalize_name_list(chap.get("actual_linked_character_ids", []))
                 chap["state_delta"] = deepcopy(chap.get("state_delta", {})) if isinstance(chap.get("state_delta"), dict) else {}
                 chap["long_term_events"] = [
@@ -4248,20 +4292,20 @@ def _long_form_progress_text(project, chapter_index):
     chapter_pos = (chapter_index + 1) / max(1, chapter_count)
     stage_ratio = max(progress, chapter_pos * 0.75)
     if stage_ratio < 0.18:
-        stage = "开篇建立"
-        advice = "建立主角目标、核心矛盾和主要关系；埋钩子但不要过早解释全部真相。"
+        stage = "故事刚开始"
+        advice = "让读者先看见主角眼前想要什么、谁在阻拦，以及这一章发生的具体事情；重要秘密不要一次说尽。"
     elif stage_ratio < 0.45:
-        stage = "前中段推进"
-        advice = "推进主线调查/行动，持续制造选择压力；让人物关系和阶段目标发生可继承变化。"
+        stage = "故事展开中"
+        advice = "让人物在具体场面里做选择并承担后果，关系和局面随着事件往前走，不要只解释局势。"
     elif stage_ratio < 0.72:
-        stage = "中段深化"
-        advice = "兑现部分线索并制造更高代价；避免原地反复，重点写转折、代价、关系变化。"
+        stage = "矛盾加深"
+        advice = "让已经出现的线索带来新的麻烦或选择，写清人物付出的代价和关系变化，避免同一冲突原地重演。"
     elif stage_ratio < 0.9:
-        stage = "后段收束"
-        advice = "减少新增大型设定，集中回收伏笔、压紧冲突，把人物推向最终选择。"
+        stage = "故事接近收束"
+        advice = "少开需要长篇展开的新线，集中处理正在发酵的冲突，让人物被逼到必须选择的位置。"
     else:
-        stage = "结局收束"
-        advice = "优先解决核心矛盾和情感归宿，回收关键伏笔；不要再开启需要长篇展开的新主线。"
+        stage = "故事收尾"
+        advice = "把核心冲突和人物归宿写出结果，收回能自然落地的线索，不要临时再开一条大线。"
     target_label = _target_words_label(meta.get("target_words", "")) or f"{target}字"
     return "\n".join([
         f"项目总目标规模：{target_label}",
@@ -5847,7 +5891,11 @@ def _chapter_reference_line(
     if key_facts:
         parts.append("关键事实：" + key_facts)
     if not parts and include_outline_fallback:
-        outline = _clip_complete_text(_strip_static_foreshadow_outline_fields(chap.get("outline", "")), 260)
+        outline = _clip_complete_text(
+            _strip_volume_handoff_outline_metadata(
+                _strip_static_foreshadow_outline_fields(chap.get("outline", ""))
+            ), 420,
+        )
         if outline:
             parts.append("提纲：" + outline)
     if not (summary or key_facts) and text_fallback_limit:
@@ -19437,8 +19485,9 @@ def _build_chapter_ai_context(project, chapter_index, action):
     chap = chapters[chapter_index]
     raw_chapter_outline = str(chap.get("outline", "") or "")
     chapter_outline_for_context = (
-        _strip_static_foreshadow_outline_fields(raw_chapter_outline)
-        if action == "draft" else raw_chapter_outline
+        _strip_volume_handoff_outline_metadata(
+            _strip_static_foreshadow_outline_fields(raw_chapter_outline)
+        ) if action in {"draft", "outline", "script_to_novel"} else raw_chapter_outline
     )
     linked_characters = chap.get("linked_characters", [])
     if not isinstance(linked_characters, list):

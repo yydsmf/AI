@@ -224,6 +224,9 @@ class VideoGeneratorTab(SimpleModelBarMixin, QWidget):
     }
     FRAME_OPTIONS = ["81", "121", "161", "241", "441"]
     FPS_OPTIONS = ["24", "30"]
+    H3_DURATION_OPTIONS = [str(value) for value in range(1, 16)]
+    H3_ASPECT_RATIO_OPTIONS = ["16:9", "9:16", "1:1", "4:3", "3:4"]
+    H3_RESOLUTION_OPTIONS = ["480p", "720p", "1080p"]
 
     def __init__(self, config):
         super().__init__()
@@ -269,12 +272,16 @@ class VideoGeneratorTab(SimpleModelBarMixin, QWidget):
         param_layout = QHBoxLayout(param_card)
         param_layout.setContentsMargins(14, 12, 14, 12)
         param_layout.setSpacing(10)
+        self._legacy_param_widgets = []
+        self._h3_param_widgets = []
 
-        def add_param(label_text, widget):
+        def add_param(label_text, widget, group=None):
             lbl = QLabel(label_text)
             lbl.setObjectName("field_label")
             param_layout.addWidget(lbl)
             param_layout.addWidget(widget)
+            if group is not None:
+                group.extend((lbl, widget))
 
         self.mode_combo = WideComboBox()
         self.mode_combo.addItems(["文生视频", "图生视频"])
@@ -284,20 +291,38 @@ class VideoGeneratorTab(SimpleModelBarMixin, QWidget):
         self.size_combo = WideComboBox()
         self.size_combo.addItems(self.SIZE_OPTIONS)
         self.size_combo.setMinimumWidth(160)
-        add_param("画幅", self.size_combo)
+        add_param("画幅", self.size_combo, self._legacy_param_widgets)
 
         self.frames_combo = WideComboBox()
         self.frames_combo.addItems(self.FRAME_OPTIONS)
         self.frames_combo.setMinimumWidth(90)
-        add_param("帧数", self.frames_combo)
+        add_param("帧数", self.frames_combo, self._legacy_param_widgets)
 
         self.fps_combo = WideComboBox()
         self.fps_combo.addItems(self.FPS_OPTIONS)
         self.fps_combo.setMinimumWidth(80)
-        add_param("FPS", self.fps_combo)
+        add_param("FPS", self.fps_combo, self._legacy_param_widgets)
 
         param_layout.addStretch()
         root.addWidget(param_card)
+
+        # 保留这个属性作为兼容别名，但 H3 参数现在与旧参数共用同一行。
+        self.h3_param_card = param_card
+
+        self.duration_combo = WideComboBox()
+        self.duration_combo.addItems(self.H3_DURATION_OPTIONS)
+        self.duration_combo.setMinimumWidth(70)
+        add_param("时长(秒)", self.duration_combo, self._h3_param_widgets)
+
+        self.aspect_ratio_combo = WideComboBox()
+        self.aspect_ratio_combo.addItems(self.H3_ASPECT_RATIO_OPTIONS)
+        self.aspect_ratio_combo.setMinimumWidth(80)
+        add_param("H3画幅", self.aspect_ratio_combo, self._h3_param_widgets)
+
+        self.resolution_combo = WideComboBox()
+        self.resolution_combo.addItems(self.H3_RESOLUTION_OPTIONS)
+        self.resolution_combo.setMinimumWidth(80)
+        add_param("分辨率", self.resolution_combo, self._h3_param_widgets)
 
         body = QHBoxLayout()
         body.setSpacing(14)
@@ -325,6 +350,45 @@ class VideoGeneratorTab(SimpleModelBarMixin, QWidget):
         self.image_url_input = QLineEdit()
         self.image_url_input.setPlaceholderText("可选：参考图 URL。也可以直接拖入本地图片。")
         left.addWidget(self.image_url_input)
+
+        self.h3_advanced_toggle = QPushButton("H3 高级参数（尾帧 / 多图 / 音色）")
+        self.h3_advanced_toggle.setObjectName("ghost")
+        self.h3_advanced_toggle.setCheckable(True)
+        self.h3_advanced_toggle.setChecked(False)
+        self.h3_advanced_toggle.setToolTip("展开或收起 H3 的尾帧、多图参考和音色参数")
+        left.addWidget(self.h3_advanced_toggle)
+
+        self.h3_advanced_widget = QWidget()
+        h3_advanced_layout = QVBoxLayout(self.h3_advanced_widget)
+        h3_advanced_layout.setContentsMargins(0, 0, 0, 0)
+        h3_advanced_layout.setSpacing(6)
+
+        self.last_frame_label = QLabel("H3 尾帧 URL（可选，需公网 HTTPS 地址）")
+        self.last_frame_label.setObjectName("field_label")
+        h3_advanced_layout.addWidget(self.last_frame_label)
+
+        self.last_frame_url_input = QLineEdit()
+        self.last_frame_url_input.setPlaceholderText("H3 last_frame，例如 https://.../last.png")
+        h3_advanced_layout.addWidget(self.last_frame_url_input)
+
+        self.h3_reference_label = QLabel("H3 多图参考 URL（可选，逗号或换行分隔，最多 7 张）")
+        self.h3_reference_label.setObjectName("field_label")
+        h3_advanced_layout.addWidget(self.h3_reference_label)
+
+        self.h3_reference_images_input = QTextEdit()
+        self.h3_reference_images_input.setAcceptRichText(False)
+        self.h3_reference_images_input.setPlaceholderText("每行一个公网 HTTPS 图片 URL；用于 reference_images")
+        self.h3_reference_images_input.setFixedHeight(58)
+        h3_advanced_layout.addWidget(self.h3_reference_images_input)
+
+        self.h3_voice_label = QLabel("H3 预设音色（可选，逗号或换行分隔，最多 3 个）")
+        self.h3_voice_label.setObjectName("field_label")
+        h3_advanced_layout.addWidget(self.h3_voice_label)
+
+        self.h3_voice_ids_input = QLineEdit()
+        self.h3_voice_ids_input.setPlaceholderText("例如 eve, leo；用于 reference_audios")
+        h3_advanced_layout.addWidget(self.h3_voice_ids_input)
+        left.addWidget(self.h3_advanced_widget)
 
         self.ref_area = ReferenceDropArea()
         left.addWidget(self.ref_area)
@@ -398,8 +462,15 @@ class VideoGeneratorTab(SimpleModelBarMixin, QWidget):
         self.size_combo.currentTextChanged.connect(self.save_video_params)
         self.frames_combo.currentTextChanged.connect(self.save_video_params)
         self.fps_combo.currentTextChanged.connect(self.save_video_params)
+        self.duration_combo.currentTextChanged.connect(self.save_video_params)
+        self.aspect_ratio_combo.currentTextChanged.connect(self.save_video_params)
+        self.resolution_combo.currentTextChanged.connect(self.save_video_params)
         self.prompt_input.textChanged.connect(self.save_video_draft)
         self.image_url_input.textChanged.connect(self.save_video_draft)
+        self.last_frame_url_input.textChanged.connect(self.save_video_draft)
+        self.h3_reference_images_input.textChanged.connect(self.save_video_draft)
+        self.h3_voice_ids_input.textChanged.connect(self.save_video_draft)
+        self.h3_advanced_toggle.toggled.connect(self._on_h3_advanced_toggled)
         self.ref_area.files_added.connect(self.add_refs)
         self.clear_refs_btn.clicked.connect(self.clear_refs)
         self.ref_list.preview_requested.connect(
@@ -439,6 +510,9 @@ class VideoGeneratorTab(SimpleModelBarMixin, QWidget):
                 break
         self._set_combo_text_if_exists(self.frames_combo, cfg.get("num_frames", "81"))
         self._set_combo_text_if_exists(self.fps_combo, cfg.get("frame_rate", "24"))
+        self._set_combo_text_if_exists(self.duration_combo, cfg.get("duration", "8"))
+        self._set_combo_text_if_exists(self.aspect_ratio_combo, cfg.get("aspect_ratio", "16:9"))
+        self._set_combo_text_if_exists(self.resolution_combo, cfg.get("resolution", "480p"))
 
     def save_video_params(self, *_args):
         try:
@@ -449,6 +523,9 @@ class VideoGeneratorTab(SimpleModelBarMixin, QWidget):
                 height=height,
                 num_frames=self.frames_combo.currentText(),
                 frame_rate=self.fps_combo.currentText(),
+                duration=self.duration_combo.currentText(),
+                aspect_ratio=self.aspect_ratio_combo.currentText(),
+                resolution=self.resolution_combo.currentText(),
             )
             save_config(self.config)
         except Exception:
@@ -459,6 +536,9 @@ class VideoGeneratorTab(SimpleModelBarMixin, QWidget):
             data = load_input_drafts()
             text = data.get("video_prompt", "")
             image_url = data.get("video_image_url", "")
+            last_frame_url = data.get("video_last_frame_url", "")
+            h3_reference_images = data.get("video_h3_reference_images", "")
+            h3_voice_ids = data.get("video_h3_voice_ids", "")
             refs = data.get("video_refs", [])
             self.prompt_input.blockSignals(True)
             self.prompt_input.setPlainText(text if isinstance(text, str) else "")
@@ -466,6 +546,15 @@ class VideoGeneratorTab(SimpleModelBarMixin, QWidget):
             self.image_url_input.blockSignals(True)
             self.image_url_input.setText(image_url if isinstance(image_url, str) else "")
             self.image_url_input.blockSignals(False)
+            self.last_frame_url_input.blockSignals(True)
+            self.last_frame_url_input.setText(last_frame_url if isinstance(last_frame_url, str) else "")
+            self.last_frame_url_input.blockSignals(False)
+            self.h3_reference_images_input.blockSignals(True)
+            self.h3_reference_images_input.setPlainText(h3_reference_images if isinstance(h3_reference_images, str) else "")
+            self.h3_reference_images_input.blockSignals(False)
+            self.h3_voice_ids_input.blockSignals(True)
+            self.h3_voice_ids_input.setText(h3_voice_ids if isinstance(h3_voice_ids, str) else "")
+            self.h3_voice_ids_input.blockSignals(False)
             if isinstance(refs, list):
                 self.refs = [p for p in refs if isinstance(p, str) and os.path.exists(p)]
                 self.ref_list.set_paths(self.refs)
@@ -484,6 +573,9 @@ class VideoGeneratorTab(SimpleModelBarMixin, QWidget):
             data = load_input_drafts()
             data["video_prompt"] = self.prompt_input.toPlainText()
             data["video_image_url"] = self.image_url_input.text().strip()
+            data["video_last_frame_url"] = self.last_frame_url_input.text().strip()
+            data["video_h3_reference_images"] = self.h3_reference_images_input.toPlainText()
+            data["video_h3_voice_ids"] = self.h3_voice_ids_input.text().strip()
             data["video_refs"] = list(self.refs)
             save_input_drafts(data)
         except Exception:
@@ -502,6 +594,58 @@ class VideoGeneratorTab(SimpleModelBarMixin, QWidget):
                 widget.setVisible(is_i2v)
             except Exception:
                 pass
+        self._update_h3_fields_visibility()
+
+    def _is_h3_model(self):
+        model = str(self.bar.current_model() or "").strip().lower()
+        return model == "h3" or model.startswith("h3-")
+
+    def _update_h3_fields_visibility(self):
+        visible = self._is_h3_model()
+        for widget in self._legacy_param_widgets:
+            try:
+                widget.setVisible(not visible)
+            except Exception:
+                pass
+        for widget in self._h3_param_widgets:
+            try:
+                widget.setVisible(visible)
+            except Exception:
+                pass
+        for widget in (self.h3_advanced_toggle,):
+            try:
+                widget.setVisible(visible)
+            except Exception:
+                pass
+        self._on_h3_advanced_toggled(self.h3_advanced_toggle.isChecked() and visible)
+
+    def _on_h3_advanced_toggled(self, checked):
+        checked = bool(checked) and self._is_h3_model()
+        self.h3_advanced_widget.setVisible(checked)
+        self.h3_advanced_toggle.setText(
+            "H3 高级参数（收起）" if checked else "H3 高级参数（尾帧 / 多图 / 音色）"
+        )
+
+    def on_model_changed(self, model):
+        super().on_model_changed(model)
+        self._update_h3_fields_visibility()
+
+    def on_models_loaded(self, provider_id, request_id, models):
+        super().on_models_loaded(provider_id, request_id, models)
+        self._update_h3_fields_visibility()
+
+    def on_models_failed(self, provider_id, request_id, err):
+        super().on_models_failed(provider_id, request_id, err)
+        self._update_h3_fields_visibility()
+
+    @staticmethod
+    def _split_h3_values(text):
+        values = []
+        for line in str(text or "").replace(",", "\n").splitlines():
+            value = line.strip()
+            if value and value not in values:
+                values.append(value)
+        return values
 
     def add_refs(self, files):
         changed = False
@@ -581,9 +725,6 @@ class VideoGeneratorTab(SimpleModelBarMixin, QWidget):
 
     def generate(self):
         prompt = self.prompt_input.toPlainText().strip()
-        if not prompt:
-            QMessageBox.warning(self, "提示", "请输入视频提示词。")
-            return
         mode = self.mode_combo.currentText()
         image_url = self.image_url_input.text().strip()
         image_refs = []
@@ -591,9 +732,6 @@ class VideoGeneratorTab(SimpleModelBarMixin, QWidget):
             if image_url:
                 image_refs.append(image_url)
             image_refs.extend(self.refs)
-            if not image_refs:
-                QMessageBox.warning(self, "提示", "图生视频需要填写参考图 URL，或拖入一张本地图片。")
-                return
         provider = get_provider(self.config, self.bar.current_provider_id())
         if not provider:
             QMessageBox.warning(self, "提示", "请先在设置中添加并选择厂商。")
@@ -602,6 +740,39 @@ class VideoGeneratorTab(SimpleModelBarMixin, QWidget):
         if not model:
             QMessageBox.warning(self, "提示", "请选择模型，或点击刷新加载列表。")
             return
+        is_h3 = str(model).strip().lower() == "h3" or str(model).strip().lower().startswith("h3-")
+        last_frame_url = self.last_frame_url_input.text().strip() if is_h3 else ""
+        reference_image_urls = self._split_h3_values(
+            self.h3_reference_images_input.toPlainText()
+        ) if is_h3 else []
+        voice_ids = self._split_h3_values(self.h3_voice_ids_input.text()) if is_h3 else []
+        if mode == "图生视频" and not image_refs and not (is_h3 and last_frame_url):
+            QMessageBox.warning(
+                self,
+                "提示",
+                "图生视频需要填写首帧参考图；H3 也可以只填写尾帧 URL。",
+            )
+            return
+
+        if not prompt and not (is_h3 and (image_refs or last_frame_url or reference_image_urls or voice_ids)):
+            QMessageBox.warning(self, "提示", "请输入视频提示词。")
+            return
+        if is_h3:
+            media_urls = list(image_refs) + ([last_frame_url] if last_frame_url else []) + reference_image_urls
+            invalid_urls = [value for value in media_urls if not value.lower().startswith("https://")]
+            if invalid_urls:
+                QMessageBox.warning(
+                    self,
+                    "H3 参数不兼容",
+                    "H3 图片参数只接受无需登录即可访问的公网 HTTPS URL；不支持本地文件、局域网地址或 HTTP 地址。",
+                )
+                return
+            if len(reference_image_urls) + max(0, len(image_refs) - 1) > 7:
+                QMessageBox.warning(self, "H3 参数超限", "H3 reference_images 最多 7 张。")
+                return
+            if len(voice_ids) > 3:
+                QMessageBox.warning(self, "H3 参数超限", "H3 预设音色最多 3 个。")
+                return
 
         width, height = self.SIZE_MAP.get(self.size_combo.currentText(), (1280, 720))
         self._set_video_config(model=model, mode=mode, width=width, height=height)
@@ -619,6 +790,12 @@ class VideoGeneratorTab(SimpleModelBarMixin, QWidget):
             "height": height,
             "frames": self.frames_combo.currentText(),
             "fps": self.fps_combo.currentText(),
+            "duration": self.duration_combo.currentText(),
+            "aspect_ratio": self.aspect_ratio_combo.currentText(),
+            "resolution": self.resolution_combo.currentText(),
+            "last_frame_url": last_frame_url,
+            "reference_image_urls": reference_image_urls,
+            "voice_ids": voice_ids,
             "image_refs": list(image_refs),
             "base_url": provider.get("base_url", ""),
             "api_key": provider.get("api_key", ""),
@@ -654,6 +831,12 @@ class VideoGeneratorTab(SimpleModelBarMixin, QWidget):
             task["image_refs"],
             task["proxy_url"],
             task["proxy_mode"],
+            task["duration"],
+            task["aspect_ratio"],
+            task["resolution"],
+            task["last_frame_url"],
+            task["reference_image_urls"],
+            task["voice_ids"],
         )
         self.running_tasks[task_id] = worker
         worker.progress.connect(lambda text, tid=task_id: self.on_progress(tid, text))

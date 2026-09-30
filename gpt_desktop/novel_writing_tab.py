@@ -164,6 +164,8 @@ from .novel_utils import (
     _normalize_candidate_analysis_state,
     _clean_chapter_plan_story_boundary,
     _normalize_chapter_plan_foundation,
+    _canonical_chapter_plan_event_id,
+    _canonical_chapter_plan_stage_id,
     _normalize_foreshadow_review_observations,
     _normalize_import_candidates,
     _normalize_name_list,
@@ -179,6 +181,8 @@ from .novel_utils import (
     _volume_two_framework_template_text,
     _normalize_semantic_style_archive,
     _normalize_project,
+    _strip_static_foreshadow_outline_fields,
+    _strip_volume_handoff_outline_metadata,
     _project_without_private_notes,
     _project_list_text,
     _project_summary_record_text,
@@ -268,14 +272,6 @@ _CHAPTER_PLAN_BATCH_SIZE = 50
 # limit even for large existing projects and imported frameworks.
 _CHAPTER_PLAN_CONTEXT_CHAR_BUDGET = NOVEL_AI_CONTEXT_LIMIT - 10000
 _CHAPTER_PLAN_BATCH_STATE_VERSION = 3
-
-
-def _canonical_chapter_plan_event_id(value):
-    normalized = str(value or "").strip().upper()
-    match = re.fullmatch(r"STAGE_(\d{2}-E\d{2})", normalized)
-    if match:
-        return f"S{match.group(1)}"
-    return normalized
 
 _CREATIVE_INTENT_FIELDS = (
     ("primary_line", "本卷主线"),
@@ -4911,6 +4907,10 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
         QTimer.singleShot(0, cleanup)
 
     def _load_project_data(self, data, path="", defer_helpers=False):
+        self._invalidate_chapter_plan_generation(
+            "加载项目数据，旧章节规划预览和回调已失效",
+            clear_project_state=False,
+        )
         if not getattr(self, "_is_detached_auto_runner", False):
             foreground_worker = getattr(self, "writing_worker", None)
             has_foreground_task = bool(
@@ -6979,7 +6979,10 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
                 for event in item.get("events", []) if isinstance(item.get("events", []), list) else []:
                     if not isinstance(event, dict):
                         continue
-                    event_id = self._chapter_plan_clip_text(event.get("id", ""), 40)
+                    event_id = self._chapter_plan_clip_text(
+                        _canonical_chapter_plan_event_id(event.get("id", "")),
+                        40,
+                    )
                     event_text = self._chapter_plan_clip_text(event.get("text", ""), event_limit)
                     if event_id and event_text:
                         events.append({
@@ -7392,7 +7395,10 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
                 "outline": self._chapter_plan_clip_text(item.get("outline", ""), 1000),
                 "characters": _normalize_name_list(item.get("characters", [])),
                 "ending_hook": self._chapter_plan_clip_text(item.get("ending_hook", ""), 240),
-                "source_event_ids": _normalize_name_list(item.get("source_event_ids", [])),
+                "source_event_ids": [
+                    _canonical_chapter_plan_event_id(value)
+                    for value in _normalize_name_list(item.get("source_event_ids", []))
+                ],
             }
             if any(str(value or "").strip() for value in record.values() if not isinstance(value, list)) or record["characters"]:
                 chapters.append(record)
@@ -7434,7 +7440,7 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
                 events.append({"id": event_id, "order": event_order, "text": event_text})
             if events:
                 stages.append({
-                    "id": str(item.get("id", "") or "").strip().upper(),
+                    "id": _canonical_chapter_plan_stage_id(item.get("id", "")),
                     "name": self._chapter_plan_clip_text(item.get("name", ""), 120),
                     "start_chapter": stage_start,
                     "end_chapter": stage_end,
@@ -7446,6 +7452,8 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
         result = {
             "usage": (
                 "chapters是用户明确给出的章节级约束，必须按绝对章号继承。"
+                "其中已有outline是用户导入的原始单章细纲；模型必须先判断它是否完整可写，完整时只返回outline_mode=use_imported并由程序原样沿用，"
+                "不完整时才返回outline_mode=generate并生成新的自然章节提纲。"
                 "stages.events是阶段内按顺序排列的剧情节点，不是一条节点固定对应一章；"
                 "一章可承载多个节点，扩展章可不消耗节点，但每个节点必须在所属阶段内恰好使用一次。"
                 "规划章节可用source_event_ids标记承载的节点；节点只提供故事事实和方向，不是动作清单，"
@@ -7481,7 +7489,7 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
                 continue
             if start <= chapter_index <= end:
                 return {
-                    "id": str(item.get("id", "") or "").strip().upper(),
+                "id": _canonical_chapter_plan_stage_id(item.get("id", "")),
                     "name": str(item.get("name", "") or "").strip(),
                     "start_chapter": start,
                     "end_chapter": end,
@@ -7502,7 +7510,7 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
                 stage_end = int(item.get("end_chapter", 0) or 0)
             except Exception:
                 continue
-            stage_id = str(item.get("id", "") or "").strip().upper()
+            stage_id = _canonical_chapter_plan_stage_id(item.get("id", ""))
             events = []
             for event in item.get("events", []) if isinstance(item.get("events", []), list) else []:
                 if not isinstance(event, dict):
@@ -7875,7 +7883,9 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
                 value = str(item.get(key, "") or "").strip()
                 if value:
                     lines.append(f"{label}：{value}")
-            outline = str(item.get("outline", "") or "").strip()
+            outline = _strip_volume_handoff_outline_metadata(
+                _strip_static_foreshadow_outline_fields(item.get("outline", ""))
+            )
             if outline:
                 lines.append(outline)
             lines.extend(self._chapter_plan_optional_blocks(item, outline))
@@ -7908,23 +7918,27 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
 
     def _chapter_plan_outline_for_item(self, item):
         item = item if isinstance(item, dict) else {}
-        parts = []
-        for label, key in (
-            ("所属阶段", "narrative_stage"),
-            ("原框架阶段", "source_stage"),
-            ("本章主导线", "dominant_line"),
-        ):
-            value = str(item.get(key, "") or "").strip()
-            if value:
-                parts.append(f"{label}：{value}")
         outline = str(item.get("outline", "") or "").strip()
-        if outline:
-            parts.append(outline)
-        parts.extend(self._chapter_plan_optional_blocks(item, outline))
-        ending_hook = str(item.get("ending_hook", "") or "").strip()
-        if ending_hook:
-            parts.append(f"结尾悬念：{ending_hook}")
-        return "\n\n".join(part for part in parts if part).strip()
+        return _strip_volume_handoff_outline_metadata(
+            _strip_static_foreshadow_outline_fields(outline)
+        )
+
+    @staticmethod
+    def _chapter_plan_apply_imported_outline(chapter, explicit_item):
+        """Apply the model's same-call direct-use decision to one chapter."""
+        chapter = deepcopy(chapter) if isinstance(chapter, dict) else {}
+        explicit_item = explicit_item if isinstance(explicit_item, dict) else {}
+        explicit_title = str(explicit_item.get("title", "") or "").strip()
+        if explicit_title:
+            chapter["title"] = explicit_title
+        explicit_outline = str(explicit_item.get("outline", "") or "").strip()
+        if (
+            explicit_outline
+            and str(chapter.get("outline_mode", "") or "").strip() == "use_imported"
+        ):
+            chapter["outline"] = explicit_outline
+            chapter["outline_source"] = "imported_framework"
+        return chapter
 
     def _chapter_plan_batch_ranges(self, chapter_count, batch_size=_CHAPTER_PLAN_BATCH_SIZE):
         try:
@@ -7936,6 +7950,128 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
             (offset, min(batch_size, chapter_count - offset))
             for offset in range(0, chapter_count, batch_size)
         ]
+
+    def _chapter_plan_stage_batch_ranges(self, state):
+        """Return absolute chapter ranges that never cross an explicit source stage.
+
+        ``NovelChapterPlanMasterWorker`` always returns inferred arcs, even when
+        the source project has no stage boundaries.  Therefore stage batching is
+        enabled only when the imported/source framework contains valid stages.
+        The saved master plan remains the source of the normalized boundaries so
+        resumed jobs follow exactly the same plan as the first request.
+        """
+        state = state if isinstance(state, dict) else {}
+        master_plan = state.get("master_plan", {})
+        master_plan = master_plan if isinstance(master_plan, dict) else {}
+        arcs = master_plan.get("arcs", [])
+        arcs = arcs if isinstance(arcs, list) else []
+        reference = (
+            self.current_project.get("imported_chapter_plan_reference", {})
+            if isinstance(getattr(self, "current_project", None), dict)
+            else {}
+        )
+        reference_stages = reference.get("stages", []) if isinstance(reference, dict) else []
+        if not isinstance(reference_stages, list) or not reference_stages:
+            return None
+
+        try:
+            existing_count = max(0, int(state.get("existing_chapter_count", 0) or 0))
+            requested = max(0, int(state.get("requested_chapter_count", 0) or 0))
+            batch_size = self._chapter_plan_state_batch_size(state)
+        except Exception:
+            return None
+        first_chapter = existing_count + 1
+        last_chapter = existing_count + requested
+        if first_chapter > last_chapter:
+            return []
+
+        normalized = []
+        for arc in arcs:
+            if not isinstance(arc, dict):
+                continue
+            try:
+                start = int(arc.get("start_chapter", 0) or 0)
+                end = int(arc.get("end_chapter", 0) or 0)
+            except Exception:
+                continue
+            if start <= 0 or end < start:
+                continue
+            start = max(first_chapter, start)
+            end = min(last_chapter, end)
+            if start <= end:
+                normalized.append((start, end))
+        normalized.sort()
+        if not normalized or normalized[0][0] != first_chapter or normalized[-1][1] != last_chapter:
+            return None
+        expected = first_chapter
+        for start, end in normalized:
+            if start != expected:
+                return None
+            expected = end + 1
+        if expected != last_chapter + 1:
+            return None
+
+        # Confirm that the master plan did not silently merge/split explicit
+        # source stages.  The reference may begin before an existing chapter;
+        # clipping it to the requested absolute range is intentional.
+        source_ranges = []
+        for stage in reference_stages:
+            if not isinstance(stage, dict):
+                continue
+            try:
+                start = int(stage.get("start_chapter", 0) or 0)
+                end = int(stage.get("end_chapter", 0) or 0)
+            except Exception:
+                continue
+            start = max(first_chapter, start)
+            end = min(last_chapter, end)
+            if start <= end:
+                source_ranges.append((start, end))
+        source_ranges.sort()
+        if source_ranges:
+            if source_ranges[0][0] != first_chapter or source_ranges[-1][1] != last_chapter:
+                return None
+            expected = first_chapter
+            for start, end in source_ranges:
+                if start != expected:
+                    return None
+                expected = end + 1
+            if expected != last_chapter + 1:
+                return None
+            if source_ranges != normalized:
+                return None
+
+        ranges = []
+        for start, end in normalized:
+            cursor = start
+            while cursor <= end:
+                chunk_end = min(end, cursor + batch_size - 1)
+                ranges.append((cursor, chunk_end))
+                cursor = chunk_end + 1
+        return ranges
+
+    def _chapter_plan_next_batch_info(self, state):
+        """Return (batch_count, batch_number, total_batches, abs_start, abs_end)."""
+        state = state if isinstance(state, dict) else {}
+        generated = state.get("chapters", []) if isinstance(state.get("chapters"), list) else []
+        existing_count = int(state.get("existing_chapter_count", 0) or 0)
+        requested = int(state.get("requested_chapter_count", 0) or 0)
+        next_start = existing_count + len(generated) + 1
+        stage_ranges = self._chapter_plan_stage_batch_ranges(state)
+        if stage_ranges is not None:
+            ranges = stage_ranges
+            for batch_number, (start, end) in enumerate(ranges, 1):
+                if start <= next_start <= end:
+                    return end - next_start + 1, batch_number, len(ranges), next_start, end
+            return 0, 0, len(ranges), next_start, next_start - 1
+
+        batch_size = self._chapter_plan_state_batch_size(state)
+        remaining = max(0, requested - len(generated))
+        batch_count = min(batch_size, remaining)
+        ranges = self._chapter_plan_batch_ranges(requested, batch_size)
+        batch_number = len(generated) // batch_size + 1 if batch_count else 0
+        absolute_end = next_start + batch_count - 1
+        return batch_count, batch_number, len(ranges), next_start, absolute_end
 
     @staticmethod
     def _chapter_plan_state_batch_size(state):
@@ -8304,7 +8440,10 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
                 "source_stage": item.get("source_stage", ""),
                 "dominant_line": item.get("dominant_line", ""),
                 "ending_hook": item.get("ending_hook", ""),
-                "source_event_ids": _normalize_name_list(item.get("source_event_ids", [])),
+                "source_event_ids": [
+                    _canonical_chapter_plan_event_id(value)
+                    for value in _normalize_name_list(item.get("source_event_ids", []))
+                ],
             })
         previous_tail = []
         for item in generated[-5:]:
@@ -8441,11 +8580,16 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
             )
             status = "正在生成全书走向、叙事画像和阶段规划..."
         else:
-            batch_size = self._chapter_plan_state_batch_size(state)
-            batch_count = min(batch_size, remaining)
-            ranges = self._chapter_plan_batch_ranges(requested, batch_size)
-            batch_number = len(generated) // batch_size + 1
-            total_batches = len(ranges)
+            (
+                batch_count,
+                batch_number,
+                total_batches,
+                absolute_start,
+                absolute_end,
+            ) = self._chapter_plan_next_batch_info(state)
+            if batch_count <= 0:
+                self.on_chapter_plan_failed("章节规划批次范围计算失败，请重试。")
+                return
             self._chapter_plan_request_kind = "batch"
             context = self._chapter_plan_batch_context(state, batch_count)
             worker = NovelChapterPlanWorker(
@@ -8463,8 +8607,6 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
                 batch_number=batch_number,
                 total_batches=total_batches,
             )
-            absolute_start = int(state.get("existing_chapter_count", 0) or 0) + len(generated) + 1
-            absolute_end = absolute_start + batch_count - 1
             status = f"正在规划第{absolute_start}-{absolute_end}章，共{state.get('total_chapter_count', 0)}章..."
 
         state["status"] = "generating"
@@ -8472,6 +8614,12 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
         self._persist_chapter_plan_generation_state(state)
         self._show_chapter_plan_generation_progress(state, status)
         self.chapter_plan_worker = worker
+        worker._chapter_plan_sequence_token = int(
+            getattr(self, "_chapter_plan_sequence_token", 0) or 0
+        )
+        worker._chapter_plan_project_path = self._canonical_project_path(
+            getattr(self, "current_project_path", "")
+        )
         self._connect_novel_worker_status(worker)
         worker.result_ready.connect(self.on_chapter_plan_ready)
         worker.failed.connect(self.on_chapter_plan_failed)
@@ -8610,6 +8758,8 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
         self._start_chapter_plan_worker_for_state(state)
 
     def on_chapter_plan_ready(self, plan):
+        if not self._chapter_plan_callback_is_current():
+            return
         request_id, started_at, worker_diagnostics = self._chapter_plan_signal_diagnostics()
         elapsed_ms = float(worker_diagnostics.get("elapsed_ms", 0) or 0)
         if not elapsed_ms and started_at:
@@ -8695,10 +8845,12 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
             state["profile_confirmed"] = True
             state["profile_hash"] = self._narrative_strategy_profile_hash(confirmed_profile)
         generated = state.get("chapters", []) if isinstance(state.get("chapters"), list) else []
-        expected = min(
-            self._chapter_plan_state_batch_size(state),
-            int(state.get("requested_chapter_count", 0) or 0) - len(generated),
+        expected, _batch_number, _total_batches, _absolute_start, _absolute_end = (
+            self._chapter_plan_next_batch_info(state)
         )
+        if expected <= 0:
+            self.on_chapter_plan_failed("章节规划批次范围计算失败，请重试。")
+            return
         if len(chapters) != expected:
             self.on_chapter_plan_failed(f"章节规划数量不一致：需要{expected}章，实际{len(chapters)}章。")
             return
@@ -8712,12 +8864,16 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
             if source_stage:
                 chapter["source_stage"] = source_stage.get("name", "")
             chapter["source_event_ids"] = [
-                value.upper() for value in _normalize_name_list(chapter.get("source_event_ids", []))
+                _canonical_chapter_plan_event_id(value)
+                for value in _normalize_name_list(chapter.get("source_event_ids", []))
             ]
             explicit_item = explicit.get(chapter["index"], {})
-            explicit_title = str(explicit_item.get("title", "") or "").strip() if isinstance(explicit_item, dict) else ""
-            if explicit_title:
-                chapter["title"] = explicit_title
+            # The model makes the completeness decision in the same planning
+            # call.  Once it explicitly chooses direct reuse, preserve the
+            # imported wording byte-for-byte; otherwise its generated outline
+            # remains the planning result.  Missing source text always falls
+            # back to generation, even if the model emitted a bad flag.
+            chapter = self._chapter_plan_apply_imported_outline(chapter, explicit_item)
             incoming.append(chapter)
         assignment_error = self._chapter_plan_event_assignment_error(generated, incoming)
         if assignment_error:
@@ -8766,6 +8922,8 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
         QTimer.singleShot(100, continue_planning)
 
     def on_chapter_plan_failed(self, err):
+        if not self._chapter_plan_callback_is_current():
+            return
         request_id, started_at, worker_diagnostics = self._chapter_plan_signal_diagnostics()
         elapsed_ms = float(worker_diagnostics.get("elapsed_ms", 0) or 0)
         if not elapsed_ms and started_at:
@@ -8888,9 +9046,12 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
             if target_words:
                 chapter["draft_words"] = target_words
             chapter["outline"] = self._chapter_plan_outline_for_item(item)
+            for key in ("narrative_stage", "source_stage", "dominant_line", "ending_hook"):
+                chapter[key] = str(item.get(key, "") or "").strip()
             chapter["linked_characters"] = _normalize_name_list(item.get("characters", []))
             chapter["source_event_ids"] = [
-                value.upper() for value in _normalize_name_list(item.get("source_event_ids", []))
+                _canonical_chapter_plan_event_id(value)
+                for value in _normalize_name_list(item.get("source_event_ids", []))
             ]
             chapter["status"] = "大纲"
             chapters.append(chapter)
@@ -10172,6 +10333,97 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
             reason=str(reason or "")[:500],
             task_generation=int(self._chapter_ai_task_generation),
         )
+
+    def _invalidate_chapter_plan_generation(self, reason="", clear_project_state=True):
+        """Invalidate chapter-plan work and remove stale planning UI state.
+
+        Chapter planning is resumable after a user stop, so its interrupted
+        checkpoint is intentionally kept by ``stop_chapter_ai_action``.  That
+        checkpoint must be discarded when the project/framework context is
+        replaced; otherwise the old progress remains visible and a late worker
+        signal can write it back into the new context.
+        """
+        self._chapter_plan_sequence_token = int(
+            getattr(self, "_chapter_plan_sequence_token", 0) or 0
+        ) + 1
+        self._chapter_plan_auto_active = False
+        self._chapter_plan_continue_pending = False
+        self._chapter_plan_foundation_regenerate_pending = False
+        self._chapter_plan_request_kind = ""
+        self._chapter_plan_provider = {}
+        self._chapter_plan_model = ""
+        self._chapter_plan_diagnostic_request_id = ""
+        self._chapter_plan_diagnostic_started_at = 0.0
+        self._pending_chapter_plan = {}
+        self.chapter_ai_stream_text = ""
+
+        worker = getattr(self, "chapter_plan_worker", None)
+        # Detach it immediately.  The finished callback may still arrive after
+        # stop(), but its sender will then fail the sequence/current-worker
+        # check and cannot mutate the replacement project.
+        self.chapter_plan_worker = None
+        if worker is not None:
+            try:
+                if worker.isRunning():
+                    if hasattr(worker, "stop"):
+                        worker.stop()
+                    else:
+                        worker.requestInterruption()
+            except Exception as exc:
+                log_debug("失效旧章节规划线程失败", exc)
+
+        if clear_project_state and isinstance(getattr(self, "current_project", None), dict):
+            self.current_project.pop("chapter_plan_generation_state", None)
+            if hasattr(self, "_note_project_dirty"):
+                self._note_project_dirty()
+        if hasattr(self, "chapter_plan_apply_btn"):
+            self.chapter_plan_apply_btn.setVisible(False)
+            self.chapter_plan_apply_btn.setEnabled(False)
+        if hasattr(self, "chapter_ai_preview"):
+            self.chapter_ai_preview.clear()
+        self._set_chapter_ai_actions_enabled(True)
+        self._chapter_ai_stop_requested_by_user = False
+        self._log_novel_diagnostic(
+            "chapter_plan_generation_invalidated",
+            action="chapter_plan",
+            reason=str(reason or "")[:500],
+            sequence_token=int(self._chapter_plan_sequence_token),
+        )
+
+    def _chapter_plan_callback_is_current(self):
+        """Reject late chapter-plan worker signals after context replacement."""
+        worker = None
+        try:
+            candidate = self.sender()
+            if candidate is not None and hasattr(candidate, "_chapter_plan_sequence_token"):
+                worker = candidate
+        except Exception:
+            worker = None
+        if worker is None:
+            # Direct calls used by tests and non-Qt integrations remain
+            # compatible with the public callback methods.
+            return True
+        current_worker = getattr(self, "chapter_plan_worker", None)
+        callback_token = int(getattr(worker, "_chapter_plan_sequence_token", -1) or -1)
+        current_token = int(getattr(self, "_chapter_plan_sequence_token", 0) or 0)
+        valid = bool(
+            worker is current_worker
+            and callback_token == current_token
+            and bool(getattr(self, "_chapter_plan_auto_active", False))
+        )
+        if not valid:
+            self._log_novel_diagnostic(
+                "chapter_plan_stale_callback_discarded",
+                level="warning",
+                action="chapter_plan",
+                callback_sequence_token=callback_token,
+                current_sequence_token=current_token,
+                callback_is_current_worker=worker is current_worker,
+                chapter_plan_auto_active=bool(
+                    getattr(self, "_chapter_plan_auto_active", False)
+                ),
+            )
+        return valid
 
     def _start_style_locked_draft(self, context):
         project = self._ai_project_snapshot()
@@ -16005,6 +16257,14 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
         else:
             provider, model = None, ""
 
+        # Importing a new framework changes the planning source.  Drop the
+        # resumable checkpoint and visible preview before starting classification
+        # so an interrupted plan cannot be mistaken for the new framework's
+        # progress (including the append-to-current-project path).
+        self._invalidate_chapter_plan_generation(
+            "导入新框架，旧章节规划进度已失效",
+            clear_project_state=import_mode != "创建为新项目",
+        )
         title = self._prepare_framework_import_project(text, path, source_label, import_mode)
         if classify_mode == "AI 智能分类":
             self._start_framework_import_worker(provider, model, text, title, source_label, import_mode)
@@ -16376,7 +16636,9 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
         for fallback_index, item in enumerate(items, 1):
             if not isinstance(item, dict):
                 continue
-            outline = str(item.get("outline", "") or "").strip()
+            outline = _strip_volume_handoff_outline_metadata(
+                _strip_static_foreshadow_outline_fields(item.get("outline", ""))
+            )
             if not outline:
                 outline = self._chapter_plan_outline_for_item(item)
             title = str(item.get("title", "") or "").strip()
@@ -16392,7 +16654,10 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
                 "outline": outline,
                 "characters": _normalize_name_list(item.get("characters", [])),
                 "ending_hook": str(item.get("ending_hook", "") or "").strip(),
-                "source_event_ids": _normalize_name_list(item.get("source_event_ids", [])),
+                "source_event_ids": [
+                    _canonical_chapter_plan_event_id(value)
+                    for value in _normalize_name_list(item.get("source_event_ids", []))
+                ],
             })
         stages = []
         for stage_index, item in enumerate(
@@ -16407,14 +16672,19 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
                 continue
             if start_chapter <= 0 or end_chapter < start_chapter:
                 continue
-            stage_id = str(item.get("id", "") or f"S{stage_index:02d}").strip().upper()
+            stage_id = _canonical_chapter_plan_stage_id(
+                item.get("id", ""),
+                f"S{stage_index:02d}",
+            )
             events = []
             for event_index, event in enumerate(
                 item.get("events", []) if isinstance(item.get("events", []), list) else [], 1
             ):
                 if not isinstance(event, dict):
                     continue
-                event_id = str(event.get("id", "") or f"{stage_id}-E{event_index:02d}").strip().upper()
+                event_id = _canonical_chapter_plan_event_id(
+                    event.get("id", "") or f"{stage_id}-E{event_index:02d}"
+                )
                 event_text = str(event.get("text", "") or "").strip()
                 if not event_id or not event_text:
                     continue

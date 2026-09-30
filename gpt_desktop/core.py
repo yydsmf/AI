@@ -392,6 +392,9 @@ def default_config():
             "height": "720",
             "num_frames": "81",
             "frame_rate": "24",
+            "duration": "8",
+            "aspect_ratio": "16:9",
+            "resolution": "480p",
         },
         "agent": {"provider_id": "", "model": ""},
         "novel": {"provider_id": "", "model": ""},
@@ -472,6 +475,9 @@ def normalize_config(cfg):
     cfg["video"].setdefault("height", "720")
     cfg["video"].setdefault("num_frames", "81")
     cfg["video"].setdefault("frame_rate", "24")
+    cfg["video"].setdefault("duration", "8")
+    cfg["video"].setdefault("aspect_ratio", "16:9")
+    cfg["video"].setdefault("resolution", "480p")
     if not cfg["video"].get("provider_id") and cfg["image"].get("provider_id"):
         cfg["video"]["provider_id"] = cfg["image"].get("provider_id", "")
     cfg["agent"].setdefault("provider_id", "")

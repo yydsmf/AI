@@ -81,16 +81,17 @@ _FRAMEWORK_STAGE_HEADING_RE = re.compile(
     r"^第\s*([一二两三四五六七八九十百千万零〇\d]+)\s*(阶段|卷|篇|部)\s*[：:]\s*(.+)$"
 )
 _FRAMEWORK_CHAPTER_RANGE_RE = re.compile(
-    r"^(?:(?:章节|章数|范围)\s*[：:]\s*)?第?\s*"
+    r"^(?:(?:章节|章数|范围|字数与章节|章节范围)\s*[：:]\s*)?第?\s*"
     r"([一二两三四五六七八九十百千万零〇\d]+)\s*章?\s*"
     r"[—–~～\-至到]\s*第?\s*([一二两三四五六七八九十百千万零〇\d]+)\s*章"
-    r"(?:\s*[：:]\s*(.+))?$"
+    r"(?:\s*[：:]\s*(.+)|\s*[，,；;].*)?$"
 )
 _FRAMEWORK_NUMBERED_EVENT_RE = re.compile(r"^(\d{1,5})\s*[.．、)）]\s*(.+)$")
 _FRAMEWORK_MAJOR_HEADING_RE = re.compile(r"^[一二两三四五六七八九十百千万]+、\s*\S+")
 _FRAMEWORK_EXPLICIT_TITLE_RE = re.compile(
     r"^(?:\d{1,5}\s*[.．、)）]\s*)?第\s*"
-    r"([一二两三四五六七八九十百千万零〇\d]+)\s*章\s*[：:]\s*(.+)$"
+    r"([一二两三四五六七八九十百千万零〇\d]+)\s*章\s*"
+    r"(?:[：:]\s*.+|《[^》]+》(?:.*)?)$"
 )
 _FRAMEWORK_SCOPE_HEADING_RE = re.compile(
     r"^第\s*[一二两三四五六七八九十百千万零〇\d]+\s*(?:阶段|卷|篇|部)(?:\s*[：:].*)?$"
@@ -108,6 +109,10 @@ _FRAMEWORK_EVENT_SECTION_LABELS = {
     "女主高光",
     "最终开放式结尾",
 }
+_FRAMEWORK_STAGE_METADATA_RE = re.compile(
+    r"^(?:字数与章节|章节范围|章节字数|阶段(?:地点|境界|主题|概要|人物|人物关系|关系)|"
+    r"章节细纲|本阶段(?:地点|境界|主题|概要|人物|人物关系|关系))\s*[：:：]?"
+)
 
 
 def _is_framework_scope_title(value):
@@ -118,6 +123,84 @@ def _is_framework_scope_title(value):
         _FRAMEWORK_CHAPTER_RANGE_RE.match(text)
         or _FRAMEWORK_SCOPE_HEADING_RE.match(text)
     )
+
+
+_FRAMEWORK_EXPLICIT_CHAPTER_PREFIX_RE = re.compile(
+    r"^(?:\d{1,5}\s*[.．、)）]\s*)?第\s*"
+    r"([一二两三四五六七八九十百千万零〇\d]+)\s*章\s*"
+)
+
+
+def _parse_framework_explicit_chapter_line(value):
+    """Parse a chapter heading and any same-line outline text.
+
+    Framework documents in the wild use both ``第1章：标题`` and
+    ``第1章《标题》正文``.  The brackets provide an unambiguous boundary
+    between the title and inline outline; colon-style headings retain the
+    complete remainder as the title for backwards compatibility.
+    """
+    line = str(value or "").strip()
+    match = _FRAMEWORK_EXPLICIT_CHAPTER_PREFIX_RE.match(line)
+    if not match:
+        return None
+    chapter_index = _chinese_numeral_to_int(match.group(1))
+    if not chapter_index:
+        return None
+    remainder = line[match.end():].strip()
+    if not remainder:
+        return None
+    inline_outline = ""
+    if remainder.startswith("《"):
+        closing = remainder.find("》", 1)
+        if closing < 0:
+            return None
+        title = remainder[1:closing].strip()
+        inline_outline = remainder[closing + 1:].strip(" \t:：")
+    else:
+        remainder = remainder.lstrip("：:").strip()
+        title = remainder
+    if not title:
+        return None
+    return {
+        "index": int(chapter_index),
+        "title": title,
+        "inline_outline": inline_outline,
+    }
+
+
+def _framework_explicit_chapter_records(lines):
+    """Collect chapter headings and the prose immediately following each one."""
+    records = {}
+    current = None
+    for raw_line in lines:
+        line = str(raw_line or "").strip()
+        if not line:
+            continue
+        parsed = _parse_framework_explicit_chapter_line(line)
+        if parsed:
+            current = parsed
+            records.setdefault(parsed["index"], parsed)
+            if parsed["inline_outline"]:
+                records[parsed["index"]]["outline_lines"] = [parsed["inline_outline"]]
+            continue
+        if current is None:
+            continue
+        if (
+            _FRAMEWORK_STAGE_HEADING_RE.match(line)
+            or _FRAMEWORK_CHAPTER_RANGE_RE.match(line)
+            or re.match(r"^第\s*[一二两三四五六七八九十百千万零〇\d]+\s*阶段(?:人物|章节细纲)\s*$", line)
+            or _FRAMEWORK_MAJOR_HEADING_RE.match(line)
+        ):
+            current = None
+            continue
+        records.setdefault(current["index"], current).setdefault("outline_lines", []).append(line)
+    for record in records.values():
+        record["outline"] = "\n".join(
+            str(value or "").strip()
+            for value in record.get("outline_lines", [])
+            if str(value or "").strip()
+        ).strip()
+    return records
 
 
 def _is_framework_placeholder_chapter_title(value):
@@ -134,7 +217,9 @@ def _framework_stage_event_texts(lines):
         line = str(raw_line or "").strip()
         if not line or _FRAMEWORK_MAJOR_HEADING_RE.match(line):
             break
-        if _FRAMEWORK_EXPLICIT_TITLE_RE.match(line) or _is_framework_scope_title(line):
+        if _parse_framework_explicit_chapter_line(line) or _is_framework_scope_title(line):
+            continue
+        if _FRAMEWORK_STAGE_METADATA_RE.match(line):
             continue
         if line in _FRAMEWORK_EVENT_SECTION_LABELS:
             continue
@@ -149,17 +234,23 @@ def _framework_stage_event_texts(lines):
     return values
 
 
+def _framework_chapter_event_text(chapter_index, record):
+    record = record if isinstance(record, dict) else {}
+    outline = str(record.get("outline", "") or "").strip()
+    if outline:
+        return outline
+    title = str(record.get("title", "") or "").strip()
+    return title or f"第{int(chapter_index)}章"
+
+
 def _extract_structured_framework_chapter_plan(text):
     lines = [str(line or "").strip() for line in str(text or "").splitlines()]
-    explicit_titles = {}
-    for line in lines:
-        match = _FRAMEWORK_EXPLICIT_TITLE_RE.match(line)
-        if not match:
-            continue
-        chapter_index = _chinese_numeral_to_int(match.group(1))
-        title = str(match.group(2) or "").strip()
-        if chapter_index and title and int(chapter_index) not in explicit_titles:
-            explicit_titles[int(chapter_index)] = title
+    explicit_records = _framework_explicit_chapter_records(lines)
+    explicit_titles = {
+        index: str(record.get("title", "") or "").strip()
+        for index, record in explicit_records.items()
+        if str(record.get("title", "") or "").strip()
+    }
 
     stage_positions = [index for index, line in enumerate(lines) if _FRAMEWORK_STAGE_HEADING_RE.match(line)]
     stages = []
@@ -226,7 +317,7 @@ def _extract_structured_framework_chapter_plan(text):
         if child_ranges:
             opening_end = child_ranges[0]["start_chapter"] - 1
             opening_events = [
-                explicit_titles[index]
+                _framework_chapter_event_text(index, explicit_records.get(index, {}))
                 for index in sorted(explicit_titles)
                 if start_chapter <= index <= opening_end
             ]
@@ -240,6 +331,19 @@ def _extract_structured_framework_chapter_plan(text):
                 child_events = _framework_stage_event_texts(
                     lines[child["position"] + 1:child_block_end]
                 )
+                child_chapter_events = [
+                    _framework_chapter_event_text(index, explicit_records.get(index, {}))
+                    for index in sorted(explicit_records)
+                    if child["start_chapter"] <= index <= child["end_chapter"]
+                ]
+                if child_chapter_events:
+                    child_events = child_chapter_events
+                elif not child_events:
+                    child_events = [
+                        _framework_chapter_event_text(index, explicit_records.get(index, {}))
+                        for index in sorted(explicit_records)
+                        if child["start_chapter"] <= index <= child["end_chapter"]
+                    ]
                 child_label = f"第{child['start_chapter']}-{child['end_chapter']}章：{child['title']}"
                 append_stage(
                     child_label,
@@ -247,6 +351,15 @@ def _extract_structured_framework_chapter_plan(text):
                     child["end_chapter"],
                     child_events,
                 )
+            continue
+
+        chapter_events = [
+            _framework_chapter_event_text(index, explicit_records.get(index, {}))
+            for index in sorted(explicit_records)
+            if start_chapter <= index <= end_chapter
+        ]
+        if chapter_events:
+            append_stage(stage_label, start_chapter, end_chapter, chapter_events)
             continue
 
         numbered_events = {}
@@ -280,9 +393,12 @@ def _extract_structured_framework_chapter_plan(text):
             if int(stage["start_chapter"]) <= chapter_index <= int(stage["end_chapter"]):
                 stage_label = stage["name"]
                 break
+        record = explicit_records.get(chapter_index, {})
+        title = str(explicit_titles[chapter_index] or "").strip()
+        outline = str(record.get("outline", "") or "").strip() or title
         chapters.append({
             "index": chapter_index,
-            "title": explicit_titles[chapter_index],
+            "title": title,
             "target_words": "",
             "narrative_stage": stage_label,
             "chapter_function": "",
@@ -290,7 +406,7 @@ def _extract_structured_framework_chapter_plan(text):
             "setup_ratio": "",
             "character_task": "",
             "mainline_task": "",
-            "outline": "",
+            "outline": outline,
             "characters": [],
             "settings": [],
             "ending_hook": "",
@@ -343,6 +459,9 @@ def _merge_framework_chapter_plans(ai_plan, structured_plan):
         explicit_title = str(explicit_item.get("title", "") or "").strip() if isinstance(explicit_item, dict) else ""
         if explicit_title:
             item["title"] = explicit_title
+        explicit_outline = str(explicit_item.get("outline", "") or "").strip() if isinstance(explicit_item, dict) else ""
+        if explicit_outline:
+            item["outline"] = explicit_outline
         explicit_stage = str(explicit_item.get("narrative_stage", "") or "").strip() if isinstance(explicit_item, dict) else ""
         if explicit_stage and not str(item.get("narrative_stage", "") or "").strip():
             item["narrative_stage"] = explicit_stage

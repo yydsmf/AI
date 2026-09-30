@@ -17,6 +17,7 @@ import uuid
 from datetime import datetime
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from copy import deepcopy
+from urllib.parse import urlsplit
 
 import requests
 from PySide6.QtCore import QThread, Signal
@@ -3108,15 +3109,12 @@ class NovelFrameworkImportWorker(NovelAnalysisWorker):
         outline = str(item.get("outline", "") or item.get("提纲", "") or item.get("剧情", "") or "").strip()
         parts = []
         if not outline:
-            for key in ("mainline_task", "character_task", "relationship_task", "goal"):
+            for key in ("mainline_task", "character_task", "relationship_task", "goal", "main_event", "conflict", "turning_point"):
                 value = str(item.get(key, "") or "").strip()
                 if value and value not in parts:
                     parts.append(value)
         if outline:
             parts.append(outline)
-        ending_hook = str(item.get("ending_hook", "") or "").strip()
-        if ending_hook:
-            parts.append(f"结尾钩子：{ending_hook}")
         return "\n\n".join(part for part in parts if part).strip()
 
     def _normalize_chapter_plan(self, data):
@@ -5274,12 +5272,12 @@ class NovelWritingWorker(QThread):
         prompts = {
             "outline": (
                 "你是长篇小说章节策划助手。请基于资料为当前章节生成可直接使用的章节提纲。\n"
-                "要求：分成 6-10 个短剧情拍点，每条 1-2 句；"
-                "写清本章目标、冲突、转折、情绪变化、结尾钩子；"
+                "要求：写成约300字的自然故事提要，建议在250-380字之间浮动；"
+                "写清人物所处场景、具体事件、现实阻力、人物行动、结果，以及章末出现的具体变化或悬念；"
                 "优先继承资料中的时间线、前文继承摘要、人物目标和关键事实；"
                 "如果资料里已有正文草稿，提纲必须只概括正文已经写出来的内容，"
                 "不要根据原提纲、后续规划或常规叙事补出正文没有发生的收尾、反转、下一步计划或伏笔兑现；"
-                "总长度尽量控制在 600-1200 字，不要写正文、对白或长段场景描写。"
+                "不要把‘本章目标、主导线、关系推进、结尾钩子’等策划字段原样写进提纲，不要写正文、对白或长段场景描写。"
             ),
             "draft": (
                 "你是长篇小说正文起草助手。请基于资料扩写当前章节正文草稿。\n"
@@ -6145,22 +6143,29 @@ class NovelChapterPlanWorker(NovelAnalysisWorker):
             + _CHAPTER_PLAN_STATE_PROGRESSION_GUIDANCE
             + "提纲正文应讲述人物真正会经历的故事，不安排任何固定的工作步骤或说明流程；外部事务只在故事自然需要时出现。\n"
             "title 只写章节名，不要带“第几章”和序号；target_words 写数字字符串。\n"
-            "outline是提纲里的故事正文。先理解meta中的题材、风格和叙事人称，再像这本小说的作者在讲述下一章那样，"
-            "用不超过300个字符（含标点、不计空白）的一段自然、有题材气质的叙述，写出人物会遇到什么、在意什么以及事情会怎样变化。轻松故事可以有人物视角下的"
-            "荒诞、误会、反差和调侃；悬疑、感情、成长等故事则顺着各自的情绪与阅读感来写。"
-            "narrative_stage、source_stage、dominant_line和ending_hook负责规划边界，outline只需把这些边界化成故事，"
+            "outline是提纲里的故事正文。先理解meta中的题材、风格和叙事人称，再像这本小说的作者在讲述下一章那样，用有题材气质的叙述，"
+            "用一段约300字的自然叙述（建议250-380字，内容完整时可略有浮动，不要为了凑字数硬扩写），写清人物身处什么场景、眼前遇到什么具体事情、现实阻力是什么、"
+            "人物做了什么选择或行动、事情造成了什么结果，以及章末留下的具体变化或悬念。轻松故事可以有人物视角下的荒诞、误会、反差和调侃；悬疑、感情、成长等故事则顺着各自的情绪与阅读感来写。"
+            "narrative_stage、source_stage、dominant_line和ending_hook负责规划边界，outline只需把这些边界化成故事，不要把策划字段拼进正文叙述，"
             "不要复述字段含义，也不要沿用‘目标、关系建立、完成推进、形成新局面’一类策划说明口吻。"
             "提纲仍给正文留下场景、对白和节奏空间，不必按处境、阻力、选择、后果的固定次序组织句子。\n"
             "narrative_stage 只能从“强钩子阶段”“主线扩展阶段”“收束升级阶段”中选择。\n"
             "如果项目资料包含 imported_chapter_plan_reference：chapters是明确章节级约束，必须按绝对章号执行；"
+            "如果某章在 imported_chapter_plan_reference.chapters 中已有原始细纲，先判断它是否已经写清场景、具体事件、人物行动、冲突阻力、结果和章末变化，"
+            "并且与当前项目的时间线、人物状态、世界规则和所属阶段一致。完整、连贯、可以直接交给正文扩写的细纲，"
+            "将 outline_mode 设为 use_imported，并让程序原样沿用该细纲；不要改写、缩写、扩写或替换原文。"
+            "只有原始细纲缺失、只是标题/一句话概述、信息明显不足、互相矛盾或无法直接扩写时，才将 outline_mode 设为 generate，"
+            "为该章生成约300字的自然故事提纲。模型只做这一次判断，不要另建审核任务。"
             "stages.events是阶段内有序剧情节点，不得把事件序号当作章号。每章用source_event_ids列出承载的节点ID；"
             "一章可以承载多个连续节点，扩展章可以用空数组，但每个节点只能使用一次、必须在所属阶段内并保持顺序，"
-            "阶段结束前必须全部覆盖。凡引用节点，outline必须清楚落实对应事件的语义，可以自然改写，不要机械逐字粘贴。"
+            "阶段结束前必须全部覆盖。如果本次请求覆盖一个完整原框架阶段，该阶段的所有原始事件必须在本次返回的章节中完成"
+            "source_event_ids标记，不能留给下一批，也不能只在outline中写出事件内容而省略事件ID。"
+            "凡引用节点，outline必须清楚落实对应事件的语义，可以自然改写，不要机械逐字粘贴。"
             "阶段结局和最终关系状态应放在阶段后部兑现；扩展章只能深化当前阶段，不能提前执行下一阶段事件、结论或场景。\n"
             "characters只记录本章自然涉及的主要人物，没有则用空数组；它是索引，不是强制出场清单。\n"
             'JSON 结构：{"chapters":[{"index":1,"title":"","target_words":"3000",'
             '"narrative_stage":"","source_stage":"","dominant_line":"","source_event_ids":[],"outline":"",'
-            '"characters":[],"ending_hook":""}]}\n'
+            '"outline_mode":"generate","characters":[],"ending_hook":""}]}\n'
             "chapters 数量必须严格等于请求章节数，index 从 1 连续递增。"
         )
 
@@ -6231,21 +6236,15 @@ class NovelChapterPlanWorker(NovelAnalysisWorker):
             return outline
         parts = []
         field_labels = (
-            ("本章方向", "goal"),
-            ("本章方向", "main_event"),
-            ("本章方向", "conflict"),
-            ("主导线", "dominant_line"),
-            ("原框架阶段", "source_stage"),
-            ("结尾悬念", "ending_hook"),
+            ("", "goal"),
+            ("", "main_event"),
+            ("", "conflict"),
+            ("", "turning_point"),
         )
         for label, key in field_labels:
             value = str(item.get(key, "") or "").strip()
             if value:
-                parts.append(f"{label}：{value}")
-        for label, key in (("出场人物", "characters"),):
-            values = self._string_list(item.get(key, []))
-            if values:
-                parts.append(label + "：\n" + "\n".join(f"- {value}" for value in values))
+                parts.append(value)
         return "\n\n".join(parts).strip()
 
     def _normalize_plan(self, data):
@@ -6269,7 +6268,7 @@ class NovelChapterPlanWorker(NovelAnalysisWorker):
             title = self._clean_title(raw_title, f"章节 {index}")
             outline = self._outline_from_item(item)
             if not outline:
-                outline = f"本章目标：推进「{title}」相关剧情。\n\n结尾钩子：为下一章留下明确推进点。"
+                outline = f"围绕‘{title}’这一章，写清人物此刻身处的场景、遇到的具体麻烦，以及他们采取行动后局面出现的变化；章末留下一个能自然接住下一章的新信息或新阻力。"
             narrative_stage = self._normalize_stage_text(item.get("narrative_stage", "") or item.get("stage", "") or item.get("所属阶段", ""), index)
             normalized_item = {
                 "index": index,
@@ -6282,6 +6281,7 @@ class NovelChapterPlanWorker(NovelAnalysisWorker):
                     value.upper() for value in self._string_list(item.get("source_event_ids", []))
                 ],
                 "outline": outline,
+                "outline_mode": self._normalize_outline_mode(item.get("outline_mode", "")),
                 "characters": self._string_list(item.get("characters", [])),
                 "ending_hook": str(item.get("ending_hook", "") or "").strip(),
             }
@@ -6320,6 +6320,17 @@ class NovelChapterPlanWorker(NovelAnalysisWorker):
             "existing_chapter_count": self.existing_chapter_count,
             "chapters": normalized,
         }
+
+    @staticmethod
+    def _normalize_outline_mode(value):
+        """Normalize the model's one-shot decision about a framework outline."""
+        text = str(value or "").strip().lower().replace("-", "_").replace(" ", "_")
+        if text in {
+            "use_imported", "use_framework", "reuse_imported", "reuse_framework",
+            "direct", "keep_original", "原文直用", "直接使用", "沿用原纲",
+        }:
+            return "use_imported"
+        return "generate"
 
     def run(self):
         started = time.perf_counter()
@@ -6536,7 +6547,7 @@ class ImageWorker(QThread):
                 or "unsupported" in text
                 or "unsupportedparamserror" in text
                 or "drop_params" in text
-                or ("invalid" in text and "url" in text)
+                or ("invalid" in text and ("url" in text or "b64_json" in text))
             )
         )
 
@@ -6609,9 +6620,13 @@ class ImageWorker(QThread):
 
         retry_payload = dict(payload_or_data)
         current_format = retry_payload.get("response_format")
-        if current_format == "url":
-            retry_payload["response_format"] = "b64_json"
-            self.progress.emit("接口不支持 URL 返回，已自动改用 b64_json 重试...")
+        fallback_format = "url" if current_format == "b64_json" else "b64_json"
+        if current_format in {"url", "b64_json"}:
+            retry_payload["response_format"] = fallback_format
+            if fallback_format == "url":
+                self.progress.emit("接口不支持内嵌图片数据，已自动改用 URL 返回重试...")
+            else:
+                self.progress.emit("接口不支持 URL 返回，已自动改用 b64_json 重试...")
             second = post_func(retry_payload)
             if not self._response_format_not_supported(second):
                 return second
@@ -6623,6 +6638,14 @@ class ImageWorker(QThread):
         retry_payload.pop("response_format", None)
         self.progress.emit("接口不支持 response_format，已自动移除该参数重试...")
         return post_func(retry_payload)
+
+    def _preferred_image_response_format(self):
+        """仅对已验证支持内嵌图片数据的网关启用 b64_json。"""
+        try:
+            host = (urlsplit(str(self.base_url or "")).hostname or "").lower()
+        except Exception:
+            host = ""
+        return "b64_json" if host == "api.dxmcs.xin" else "url"
 
     def _is_toapis_gpt_image_2_official(self):
         model = str(self.model or "").strip().lower()
@@ -7010,7 +7033,7 @@ class ImageWorker(QThread):
                 "n": int(self.n),
                 "size": self.SIZE_MAP.get(self.size, "auto"),
                 "quality": self.QUALITY_MAP.get(self.quality, "auto"),
-                "response_format": "url",
+                "response_format": self._preferred_image_response_format(),
             }
             return self._post_with_response_format_fallback(
                 lambda data: self._post_json_image_request(url, headers, data),
@@ -7024,7 +7047,7 @@ class ImageWorker(QThread):
             "n": str(int(self.n)),
             "size": self.SIZE_MAP.get(self.size, "auto"),
             "quality": self.QUALITY_MAP.get(self.quality, "auto"),
-            "response_format": "url",
+            "response_format": self._preferred_image_response_format(),
         }
         return self._post_with_response_format_fallback(
             lambda form_data: self._post_multipart_image_request(url, headers, form_data),
@@ -7155,7 +7178,7 @@ class VideoWorker(QThread):
     _video_query_lock = threading.Lock()
     _last_video_query_at = 0.0
 
-    def __init__(self, base_url, api_key, model, prompt, width, height, num_frames, frame_rate, image_refs=None, proxy_url="", proxy_mode="仅下载图片"):
+    def __init__(self, base_url, api_key, model, prompt, width, height, num_frames, frame_rate, image_refs=None, proxy_url="", proxy_mode="仅下载图片", duration=8, aspect_ratio="16:9", resolution="480p", last_frame_url="", reference_image_urls=None, voice_ids=None):
         super().__init__()
         self.base_url = base_url
         self.api_key = api_key
@@ -7168,6 +7191,15 @@ class VideoWorker(QThread):
         self.image_refs = [str(x).strip() for x in (image_refs or []) if str(x).strip()]
         self.proxy_url = str(proxy_url or "").strip()
         self.proxy_mode = str(proxy_mode or "仅下载图片").strip()
+        try:
+            self.duration = int(duration)
+        except Exception:
+            self.duration = 8
+        self.aspect_ratio = str(aspect_ratio or "16:9").strip()
+        self.resolution = str(resolution or "480p").strip()
+        self.last_frame_url = str(last_frame_url or "").strip()
+        self.reference_image_urls = [str(x).strip() for x in (reference_image_urls or []) if str(x).strip()]
+        self.voice_ids = [str(x).strip() for x in (voice_ids or []) if str(x).strip()]
         self._stop_requested = False
         self._session = requests.Session()
         self._session.trust_env = False
@@ -7244,6 +7276,10 @@ class VideoWorker(QThread):
             "Content-Type": "application/json",
         }
 
+    def _is_h3(self):
+        model = str(self.model or "").strip().lower()
+        return model == "h3" or model.startswith("h3-")
+
     def _extract_dict(self, data):
         if isinstance(data, dict):
             inner = data.get("data")
@@ -7257,10 +7293,12 @@ class VideoWorker(QThread):
 
         def collect(obj):
             if isinstance(obj, dict):
-                value = obj.get("video_id")
-                if value:
-                    found.append(str(value))
-                    return
+                keys = ("video_id", "request_id", "task_id", "id") if self._is_h3() else ("video_id",)
+                for key in keys:
+                    value = obj.get(key)
+                    if value:
+                        found.append(str(value))
+                        return
                 for key in ("data", "output", "result"):
                     collect(obj.get(key))
             elif isinstance(obj, list):
@@ -7299,12 +7337,13 @@ class VideoWorker(QThread):
                     "media_url",
                     "result_url",
                     "output_video_url",
+                    "video",
                     "remixed_from_video_id",
                 ):
                     value = obj.get(key)
                     if isinstance(value, str) and value.strip():
                         candidates.append(value.strip())
-                for key in ("data", "output", "outputs", "videos", "result"):
+                for key in ("data", "output", "outputs", "videos", "video", "result"):
                     collect(obj.get(key))
             elif isinstance(obj, list):
                 for item in obj:
@@ -7318,7 +7357,84 @@ class VideoWorker(QThread):
                 return value
         return candidates[0] if candidates else ""
 
+    def _h3_image_object(self, value, field_name="图片"):
+        value = str(value or "").strip()
+        if not value:
+            return None
+        if not value.lower().startswith("https://"):
+            raise Exception(f"H3 {field_name}必须是无需登录即可访问的公网 HTTPS URL。")
+        return {"url": value}
+
+    def _create_h3_task(self):
+        if self.image_refs and any(
+            not str(value).strip().lower().startswith("https://")
+            for value in self.image_refs
+        ):
+            raise Exception("H3 首帧只支持公网 HTTPS 图片 URL，不支持本地图片。")
+        if self.reference_image_urls and any(
+            not str(value).strip().lower().startswith("https://")
+            for value in self.reference_image_urls
+        ):
+            raise Exception("H3 reference_images 只支持公网 HTTPS 图片 URL。")
+
+        payload = {
+            "model": self.model,
+            "duration": min(15, max(1, self.duration)),
+            "aspect_ratio": self.aspect_ratio or "16:9",
+            "resolution": self.resolution or "480p",
+        }
+        if self.prompt.strip():
+            payload["prompt"] = self.prompt.strip()
+        if self.image_refs:
+            payload["image"] = self._h3_image_object(self.image_refs[0], "首帧 image")
+        if self.last_frame_url:
+            payload["last_frame"] = self._h3_image_object(self.last_frame_url, "尾帧 last_frame")
+        if self.reference_image_urls:
+            if len(self.reference_image_urls) > 7:
+                raise Exception("H3 reference_images 最多支持 7 张。")
+            payload["reference_images"] = [
+                self._h3_image_object(value, f"参考图 {index}")
+                for index, value in enumerate(self.reference_image_urls, 1)
+            ]
+        if self.voice_ids:
+            if len(self.voice_ids) > 3:
+                raise Exception("H3 reference_audios 最多支持 3 个预设音色。")
+            payload["reference_audios"] = [
+                {"voice_id": value} for value in self.voice_ids
+            ]
+
+        # 文档中的纯文生视频使用基础接口；只有带首尾帧、多图或音色
+        # 等高级媒体参数时才走 generations 入口。不同中转站对这两个
+        # 路径的上游映射可能不同，不能把文生视频统一发到高级入口。
+        has_advanced_media = bool(
+            self.image_refs
+            or self.last_frame_url
+            or self.reference_image_urls
+            or self.voice_ids
+        )
+        create_path = "/v1/videos/generations" if has_advanced_media else "/v1/videos"
+
+        r = self._request(
+            "POST",
+            api_url(self.base_url, create_path),
+            headers=self._headers(),
+            json=payload,
+            timeout=(30, 120),
+            proxies=self._submit_proxies(),
+        )
+        try:
+            if r.status_code >= 400:
+                raise Exception(f"H3 接口错误 {r.status_code}：{extract_api_error(r)}")
+            return r.json()
+        finally:
+            try:
+                r.close()
+            except Exception:
+                pass
+
     def _create_task(self):
+        if self._is_h3():
+            return self._create_h3_task()
         payload = {
             "model": self.model,
             "prompt": self.prompt,
@@ -7376,6 +7492,66 @@ class VideoWorker(QThread):
             raise Exception(f"参考图不存在或格式不支持：{ref}")
 
         return values
+
+    def _query_h3_result(self, video_id):
+        url = api_url(self.base_url, f"/v1/videos/{video_id}")
+        deadline = time.monotonic() + 60 * 10
+        interval = 3
+        last_status = ""
+        last_progress = None
+        while time.monotonic() < deadline:
+            self._raise_if_stopped()
+            r = self._request(
+                "GET",
+                url,
+                headers=self._headers(),
+                timeout=(10, 60),
+                proxies=self._submit_proxies(),
+            )
+            try:
+                if r.status_code >= 400:
+                    err_text = extract_api_error(r)
+                    retry_after = 0
+                    if r.status_code == 429:
+                        try:
+                            retry_after = int(r.headers.get("Retry-After", "0") or 0)
+                        except Exception:
+                            retry_after = 0
+                    if r.status_code == 429 or "rate limit" in str(err_text).lower():
+                        interval = min(60, max(3, retry_after, interval * 2))
+                        self.progress.emit(f"H3 状态查询触发限流，等待 {interval} 秒后重试...")
+                        data = None
+                    else:
+                        raise Exception(f"H3 状态查询失败 {r.status_code}：{err_text}")
+                else:
+                    data = r.json()
+            finally:
+                try:
+                    r.close()
+                except Exception:
+                    pass
+            if data is None:
+                self._sleep_with_stop(interval)
+                continue
+
+            status = self._extract_status(data)
+            obj = self._extract_dict(data)
+            progress = obj.get("progress") if isinstance(obj, dict) else None
+            if status != last_status or progress != last_progress:
+                if progress is not None:
+                    self.progress.emit(f"H3 视频状态：{status or 'in_progress'}，进度 {progress}%")
+                elif status:
+                    self.progress.emit(f"H3 视频状态：{status}")
+                last_status = status
+                last_progress = progress
+
+            video_url = self._extract_video_url(data)
+            if status in self.FAILED_STATUSES:
+                raise Exception(self._extract_error(data) or f"H3 视频生成失败：{status}")
+            if status in self.DONE_STATUSES or (video_url and not status):
+                return data
+            self._sleep_with_stop(interval)
+        raise Exception("H3 视频结果查询超时（超过 10 分钟）。")
 
     def _query_video_result(self, video_id):
         url = api_url(self.base_url, "/agnesapi")
@@ -7497,11 +7673,42 @@ class VideoWorker(QThread):
             except Exception:
                 pass
 
+    def _download_h3_content(self, video_id):
+        self.progress.emit("正在下载 H3 视频内容...")
+        r = self._request(
+            "GET",
+            api_url(self.base_url, f"/v1/videos/{video_id}/content"),
+            headers={"Authorization": f"Bearer {self.api_key}"},
+            stream=True,
+            timeout=(10, 900),
+            proxies=self._download_proxies(),
+        )
+        try:
+            r.raise_for_status()
+            day = datetime.now().strftime("%Y-%m-%d")
+            video_dir = os.path.join(VIDEO_DIR, day)
+            os.makedirs(video_dir, exist_ok=True)
+            path = os.path.join(video_dir, f"{uuid.uuid4().hex}.mp4")
+            with open(path, "wb") as f:
+                for chunk in r.iter_content(chunk_size=1024 * 1024):
+                    self._raise_if_stopped()
+                    if chunk:
+                        f.write(chunk)
+            if not os.path.exists(path) or os.path.getsize(path) <= 0:
+                safe_remove_file(path)
+                raise ValueError("H3 视频内容为空。")
+            return path
+        finally:
+            try:
+                r.close()
+            except Exception:
+                pass
+
     def run(self):
         try:
             if not self.base_url or not self.api_key:
                 raise Exception("请先在设置中添加并选择厂商。")
-            if not self.prompt.strip():
+            if not self.prompt.strip() and not (self._is_h3() and (self.image_refs or self.last_frame_url or self.reference_image_urls or self.voice_ids)):
                 raise Exception("请输入视频提示词。")
 
             self.progress.emit("正在创建视频任务...")
@@ -7512,13 +7719,22 @@ class VideoWorker(QThread):
                 raise Exception("接口没有返回 video_id，当前已禁用旧 task_id 查询逻辑。")
 
             self.progress.emit(f"视频生成已提交：{video_id}")
-            result = self._query_video_result(video_id)
-            video_url = self._extract_video_url(result)
-
-            if not video_url:
-                raise Exception("视频生成完成，但接口没有返回 video_url。")
-
-            local_path = self._download_video(video_url)
+            if self._is_h3():
+                result = self._query_h3_result(video_id)
+                video_url = self._extract_video_url(result)
+                try:
+                    local_path = self._download_h3_content(video_id)
+                except Exception:
+                    if not video_url:
+                        raise
+                    self.progress.emit("H3 content 下载失败，正在改用结果中的视频 URL 下载...")
+                    local_path = self._download_video(video_url)
+            else:
+                result = self._query_video_result(video_id)
+                video_url = self._extract_video_url(result)
+                if not video_url:
+                    raise Exception("视频生成完成，但接口没有返回 video_url。")
+                local_path = self._download_video(video_url)
             self.result_ready.emit({
                 "time": now_str(),
                 "prompt": self.prompt,
@@ -7531,6 +7747,12 @@ class VideoWorker(QThread):
                 "video_url": video_url,
                 "video": local_path,
                 "image_refs": list(self.image_refs),
+                "duration": self.duration,
+                "aspect_ratio": self.aspect_ratio,
+                "resolution": self.resolution,
+                "last_frame_url": self.last_frame_url,
+                "reference_image_urls": list(self.reference_image_urls),
+                "voice_ids": list(self.voice_ids),
             })
         except Exception as e:
             if self._stop_requested or self.isInterruptionRequested():

@@ -54,16 +54,22 @@ from .novel_utils import (
     _clip_context_text,
     _dedupe_volume_handoff_terminal_records,
     _extract_prose_delivery_result,
+    _grounded_prose_contract,
     _infer_foreshadow_status,
     _merge_text_lines_without_duplicates,
     _merge_foreshadow_description_without_bloat,
     _merge_foreshadow_status,
     _normalize_creative_intent_contract,
+    _normalize_chapter_plan_foundation,
+    _normalize_framework_analysis,
     _normalize_volume_continuity_anchors,
     NOVEL_PROSE_END_MARKER,
     NOVEL_PROSE_START_MARKER,
 )
 from .novel_import import (
+    _extract_framework_chapter_plan_from_locations,
+    _framework_numbered_source,
+    _framework_source_span,
     _foreshadow_candidate_is_terminal_review,
     _foreshadow_terminal_review_description,
     _foreshadow_terminal_review_should_replace,
@@ -2392,8 +2398,21 @@ class NovelAnalysisWorker(QThread):
             "connection broken",
             "remote end closed connection",
             "protocolerror",
+            "upstream http/2 stream failed",
+            "http/2 stream failed",
         )
         return any(marker in msg for marker in transport_markers)
+
+    def _is_stream_http2_fallback_error(self, error):
+        """Only provider-level HTTP/2 stream failures force non-stream fallback.
+
+        Ordinary premature responses should stay on the streaming path and use
+        the normal retry budget; otherwise a transient disconnect changes the
+        request mode unnecessarily and breaks providers that only support
+        streaming for long framework calls.
+        """
+        msg = str(error or "").lower()
+        return "http/2 stream failed" in msg or "upstream http/2 stream failed" in msg
 
     def _is_stream_json_error(self, error):
         msg = str(error or "").lower()
@@ -2432,7 +2451,7 @@ class NovelAnalysisWorker(QThread):
                         self._set_analysis_stream_supported(False)
                         self.progress.emit("当前接口不支持流式候选分析，已自动退回普通分块请求...")
                         return self._post_analysis_chunk(prompt, chunk, label, total, False), False
-                    if stream_supported and self._is_stream_transport_error(e2):
+                    if stream_supported and self._is_stream_http2_fallback_error(e2):
                         if getattr(self, "_retry_stream_transport_before_nonstream", False):
                             raise
                         self._set_analysis_stream_supported(False)
@@ -2447,7 +2466,7 @@ class NovelAnalysisWorker(QThread):
                 self._set_analysis_stream_supported(False)
                 self.progress.emit("当前接口不支持流式候选分析，已自动退回普通分块请求...")
                 return self._post_analysis_chunk(prompt, chunk, label, total, use_response_format), use_response_format
-            if stream_supported and self._is_stream_transport_error(e):
+            if stream_supported and self._is_stream_http2_fallback_error(e):
                 if getattr(self, "_retry_stream_transport_before_nonstream", False):
                     raise
                 self._set_analysis_stream_supported(False)
@@ -2881,7 +2900,7 @@ class NovelCandidatePostprocessWorker(NovelAnalysisWorker):
                         self._set_analysis_stream_supported(False)
                         self.progress.emit("当前接口不支持流式候选合并，已自动退回普通请求...")
                         return self._post_analysis_chunk(prompt, chunk, label, total, False), False
-                    if stream_supported and self._is_stream_transport_error(e2):
+                    if stream_supported and self._is_stream_http2_fallback_error(e2):
                         self._set_analysis_stream_supported(False)
                         self.progress.emit("流式候选合并连接提前结束，已切换为普通请求重试...")
                         return self._post_analysis_chunk(prompt, chunk, label, total, False), False
@@ -2890,7 +2909,7 @@ class NovelCandidatePostprocessWorker(NovelAnalysisWorker):
                 self._set_analysis_stream_supported(False)
                 self.progress.emit("当前接口不支持流式候选合并，已自动退回普通请求...")
                 return self._post_analysis_chunk(prompt, chunk, label, total, use_response_format), use_response_format
-            if stream_supported and self._is_stream_transport_error(e):
+            if stream_supported and self._is_stream_http2_fallback_error(e):
                 self._set_analysis_stream_supported(False)
                 self.progress.emit("流式候选合并连接提前结束，已切换为普通请求重试...")
                 return self._post_analysis_chunk(prompt, chunk, label, total, use_response_format), use_response_format
@@ -2969,45 +2988,61 @@ class NovelFrameworkImportWorker(NovelAnalysisWorker):
             proxy_mode=proxy_mode,
             max_concurrency=1,
         )
-        self._retry_stream_transport_before_nonstream = True
+        # Framework classification is a single structured request. If the
+        # gateway closes an otherwise successful SSE response early, retry the
+        # same request in non-stream mode instead of failing the import.
+        self._retry_stream_transport_before_nonstream = False
 
     def _analysis_prompt(self):
         return (
-            "你是长篇小说框架整理编辑。请把用户导入的小说框架/大纲按正式项目分类整理。\n"
-            "必须只输出一个合法 JSON 对象，不要 Markdown，不要解释，不要注释，不要尾随逗号。\n"
-            "只根据【导入框架原文】明确写出的内容分类，不要扩写正文，不要生成新的剧情，不要补全原文没有的设定。\n"
-            "不要把整段框架原文原样塞进 bible/world_rules/summary/timeline；这些字段只写精炼、长期有效、方便人工查阅和后续写作的内容。\n"
-            "小说圣经只整理原文已经明确写出的长期内容，按核心设定、读者承诺、长期主题、主线矛盾、"
-            "长期关系底盘和结局方向等已有信息自然归类；原文没有明确依据的内容留空。"
-            "结局方向只写最终应兑现的情感基调、价值取向、关系落点或关键代价，不写终局的逐步事件经过。"
-            "全书走向、阶段规划、分卷安排、逐段未来剧情和详细结局事件不得写入小说圣经，也不得写入 timeline 或 summary；"
-            "这些内容只写入 chapter_plan.summary 或 chapter_plan.stages，供后续 AI 章节规划使用。"
-            "timeline 只保留正文已经发生的时间顺序事实；summary 只保留正文已经写出的全局阶段总结。"
-            "导入框架通常还没有正文，timeline 和 summary 默认留空。\n"
-            "人物只保留主角、重要配角、反派、长期角色和有明确后续作用的人；路人、无名群体、一次性称谓不要进入人物。\n"
-            "设定只保留地点、组织、物品、规则、术语、制度、能力限制等稳定信息；普通剧情动作不要写入设定。\n"
-            "伏笔只保留长期悬念、关键秘密、明确待回收承诺；普通冲突、短期疑问、章节钩子不要当长期伏笔。\n"
-            "章节规划只提取原文已经明确写出的单章标题和阶段资料；不要凭空生成完整章节规划。"
-            "stages 只保留原文明确给出的阶段名称、章节范围和阶段内剧情节点；原文未给明确章节范围时，"
-            "把全书走向、故事节奏以及前中后期的题材/情绪/节奏变化写入 chapter_plan.summary，不要猜测范围。\n"
-            "重要格式规则：chapters 只能放明确的单章（例如“第一章：……”）；“第4—10章：……”或“第N卷：……”"
-            "是范围、分卷或阶段标题，绝对不能作为某一章的 title 或 chapter item。范围标题及其剧情节点应放入阶段资料，"
-            "如果原文没有明确的单章标题，不要把范围标题改写成单章。\n"
-            "JSON 结构：{\n"
-            '  "meta": {"title":"","genre":"","style":"","pov":"","target_words":"","status":"","premise":""},\n'
-            '  "project_materials": {"bible_sections":{"core_setting":"","reader_promise":"","theme":"","main_conflict":"","relationship_foundation":"","ending_direction":""},"bible":"","world_rules":"","timeline":"","summary":""},\n'
-            '  "characters": [{"name":"","role":"","goal":"","secret":"","voice":"","notes":""}],\n'
-            '  "lore": [{"name":"","type":"地点/势力/物品/规则/术语/事件/其他","description":""}],\n'
-            '  "foreshadows": [{"name":"","status":"未埋/已埋/已回收/无需回收/废弃","setup_chapter":"","payoff_chapter":"","description":""}],\n'
-            '  "chapter_plan": {"summary":"","stages":[{"id":"","name":"","start_chapter":0,"end_chapter":0,"events":[{"order":1,"text":""}]}],"chapters":[{"index":1,"title":"","target_words":"","narrative_stage":"","outline":"","ending_hook":""}]}\n'
-            "}\n"
-            "空字段用空字符串，空列表用 []。"
+            "读完用户提供的小说框架，把已经写明的故事分别放进对应字段。只输出一个合法JSON对象，不要Markdown或说明。\n"
+            "先识别小说正式书名并填写meta.title；原文没有书名时才留空，不能把文件名、阶段名或章节名当书名。\n"
+            "根据实际内容识别，不要求固定标题、栏目顺序、编号或排版。没有章名也可以有完整的单章故事。"
+            "只整理原文，不新增剧情、人物、境界、阶段或结局，不重复用户要求。"
+            "所有故事内容用自然的网络小说叙述语言，写人、场景、行动和具体变化，不写策划术语、抽象评语、办案式流程或编辑总结。\n"
+            "圣经保留故事的根本设定、人物为何行动、关系、结局和不能违反的限制；世界规则保留能力、境界、地点与运行规则。"
+            "人物不只抄原文的人物栏目：凡是在章节中有姓名或稳定称谓、实际参与冲突、救援、谈判、调查、决策或造成长期结果，"
+            "并且跨两章出现或承担明显剧情作用的人，都要建立人物档案；一次性路人、无名群体和只被顺带提到的人不要加入。"
+            "人物档案各字段保持简短，只写一两句事实，不要为了补人物数量扩写；章节定位优先于人物备注。"
+            "设定留稳定的地点、组织、物品与规则；伏笔留以后需要回答的秘密。"
+            "完整的实力体系不能只埋在world_rules里：只要原文出现按顺序的修炼境界、武道等级、天赋等级、"
+            "段位或其他能力层级，必须在lore中单独返回完整条目，name要明确写成“高武境界体系”“天赋等级体系”"
+            "或贴合原文的名称，description保留完整顺序、分段规则、公开与实际实力差异和相关限制。"
+            "不要只返回“有境界划分”这种概括，也不要只列当前主角的等级。"
+            "未来故事放入chapter_plan，不放进已发生的timeline或summary；没有正文时这两项留空。\n"
+            "framework_analysis.foundation_mode由你读懂内容后判断："
+            "已有故事走向、结局方向和可继续写作的内容时用reuse；有必要内容缺失时用supplement，指出具体缺少什么；"
+            "几乎只有想法时才用generate。不要因为缺少固定栏目名、阶段或章名就要求重写。"
+            "foundation只整理原有故事的summary、core_mainline、ending_promise及narrative_strategy_profile，不新编故事。"
+            "已有阶段保留原顺序与明确章号范围；没有阶段则stages=[]，不编造阶段。"
+            "planning_parameters填写整本字数、每章字数、全书章数的整数；优先原文明确值，可按两个明确值换算第三个，不把阶段字数当全书字数。\n"
+            "原文前的L000001等仅是定位标记，不是故事内容。章节完整性只需给出整体判断和数量，不要逐章返回原文、outline_ref、章节事件或任何原文摘录；"
+            "章节标题、章节细纲和阶段内事件由程序从原始框架本地恢复，AI不要重复抄写。"
+            "chapter_locations是章节恢复的必要字段；只要chapter_outline_count大于0，就必须返回恰好相同数量的条目，"
+            "即使chapter_outline_mode是reuse也不能省略。每个条目同时填写本章实际关联的人物名characters；没有明确关联人物时用空数组。"
+            "如果常规格式无法明确定位章节，只返回chapter_locations中的章号、起止行号、极短anchor和characters；"
+            "这是定位信息，不是章节内容，不要返回原文摘录。start_line和end_line必须使用输入中的L行号。\n"
+            "stages只写原有阶段名称、范围和不超过几句的阶段概要，不要把每章细纲复制进events。"
+            "chapter_outline_mode用reuse表示现有逐章细纲完整可直接扩写，用supplement表示部分章节缺失或过短，用generate表示几乎没有可用细纲；"
+            "chapter_outline_missing只列缺失或明显不足的绝对章号，不要列完整章节。\n"
+            'JSON结构请优先按以下顺序输出，chapter_locations不能省略：{"meta":{"title":"","genre":"","style":"","pov":"","target_words":"","status":"","premise":""},'
+            '"chapter_locations":[{"index":1,"start_line":"L000001","end_line":"L000010","anchor":"","characters":["人物名"]}],'
+            '"project_materials":{"bible_sections":{"core_setting":"","reader_promise":"","theme":"","main_conflict":"","relationship_foundation":"","ending_direction":""},"bible":"","world_rules":"","timeline":"","summary":""},'
+            '"characters":[{"name":"","role":"","goal":"","secret":"","voice":"","notes":""}],'
+            '"lore":[{"name":"","type":"地点/势力/物品/规则/术语/其他","description":""}],'
+            '"progression_systems":[{"name":"","type":"规则","description":""}],'
+            '"foreshadows":[{"name":"","status":"未埋","setup_chapter":"","payoff_chapter":"","description":""}],'
+            '"framework_analysis":{"foundation_mode":"reuse/supplement/generate","chapter_outline_mode":"reuse/supplement/generate","chapter_outline_count":0,"chapter_outline_missing":[],"missing_fields":[],"reason":"",'
+            '"planning_parameters":{"target_words":0,"average_chapter_words":0,"total_chapter_count":0},'
+            '"foundation":{"summary":"","core_mainline":"","ending_promise":"","narrative_strategy_profile":{"genre_world":"","primary_story_engine":"","reader_promise":"","pacing_strategy":""}}},'
+            '"chapter_plan":{"summary":"","stages":[{"id":"S01","name":"","summary":"","start_chapter":0,"end_chapter":0,"events":[]}]}}\n'
+            "空字段用空字符串，空列表用[]。"
         )
 
     def _framework_user_text(self):
         payload = {
             "已有项目档案": self.project_context,
-            "导入框架原文": self.framework_text,
+            "导入框架原文": _framework_numbered_source(self.framework_text),
         }
         return json.dumps(payload, ensure_ascii=False, indent=2)
 
@@ -3125,19 +3160,26 @@ class NovelFrameworkImportWorker(NovelAnalysisWorker):
         plan = plan if isinstance(plan, dict) else {}
         chapters = plan.get("chapters", [])
         normalized = []
+        # Semantic classification no longer asks the model to return every
+        # source outline. The local importer restores chapter text later.
+        if not isinstance(chapters, list):
+            chapters = []
+        source_ranges = []
         for fallback_index, item in enumerate(chapters if isinstance(chapters, list) else [], 1):
             if not isinstance(item, dict):
                 continue
             raw_title = str(item.get("title", "") or item.get("章节名", "")).strip()
-            if not raw_title:
-                continue
             if _is_framework_scope_title(raw_title) or _is_framework_placeholder_chapter_title(raw_title):
                 continue
             title = self._clean_title(raw_title, "")
-            if not title:
-                continue
             outline = self._outline_from_item(item)
-            if not outline:
+            if "outline_ref" in item:
+                outline = _framework_source_span(self.framework_text, item["outline_ref"])
+                span = (int(item["outline_ref"]["start_line"]), int(item["outline_ref"]["end_line"]))
+                if any(span[0] <= old[1] and old[0] <= span[1] for old in source_ranges):
+                    raise ValueError("AI识别的单章原文范围重叠，不能重复沿用同一段故事。")
+                source_ranges.append(span)
+            if not title and not outline:
                 continue
             try:
                 index = int(item.get("index", fallback_index) or fallback_index)
@@ -3170,8 +3212,9 @@ class NovelFrameworkImportWorker(NovelAnalysisWorker):
                     normalized_item[key] = values
             normalized.append(normalized_item)
         normalized.sort(key=lambda item: item.get("index", 0))
-        for index, item in enumerate(normalized, 1):
-            item["index"] = index
+        indexes = [item["index"] for item in normalized]
+        if any(index <= 0 for index in indexes) or len(indexes) != len(set(indexes)):
+            raise ValueError("AI识别的章节编号重复或无效，不能覆盖原文。")
         stages = []
         raw_stages = plan.get("stages", [])
         for fallback_index, item in enumerate(raw_stages if isinstance(raw_stages, list) else [], 1):
@@ -3202,10 +3245,11 @@ class NovelFrameworkImportWorker(NovelAnalysisWorker):
                     "order": order,
                     "text": text,
                 })
-            if events:
+            if events or item.get("summary"):
                 stages.append({
                     "id": stage_id,
                     "name": name,
+                    "summary": str(item.get("summary", "") or "").strip(),
                     "start_chapter": start_chapter,
                     "end_chapter": end_chapter,
                     "events": events,
@@ -3216,13 +3260,191 @@ class NovelFrameworkImportWorker(NovelAnalysisWorker):
             "chapters": normalized,
         }
 
+    def _progression_lore_candidates(self, data):
+        """Preserve complete ability systems as independent stable settings.
+
+        The model is asked to classify these explicitly.  The small textual
+        fallback only promotes level systems already present in
+        ``world_rules``; it never invents a realm or fills in missing levels.
+        """
+        data = data if isinstance(data, dict) else {}
+        raw_lore = data.get("lore", [])
+        raw_lore = raw_lore if isinstance(raw_lore, list) else []
+        names = {
+            str(item.get("name", "") or "").strip()
+            for item in raw_lore
+            if isinstance(item, dict)
+        }
+        existing_lore_by_name = {
+            str(item.get("name", "") or "").strip(): item
+            for item in raw_lore
+            if isinstance(item, dict) and str(item.get("name", "") or "").strip()
+        }
+        candidates = []
+        candidate_by_name = {}
+        raw_systems = data.get("progression_systems", [])
+        if not isinstance(raw_systems, list):
+            raw_systems = [raw_systems] if raw_systems else []
+        for item in raw_systems:
+            if isinstance(item, dict):
+                name = str(
+                    item.get("name", "")
+                    or item.get("title", "")
+                    or item.get("名称", "")
+                    or ""
+                ).strip()
+                description = str(
+                    item.get("description", "")
+                    or item.get("content", "")
+                    or item.get("说明", "")
+                    or ""
+                ).strip()
+                item_type = str(item.get("type", "") or item.get("类型", "") or "规则").strip()
+            else:
+                name = ""
+                description = str(item or "").strip()
+                item_type = "规则"
+            if name and description and name not in names:
+                candidate = {
+                    "name": name,
+                    "type": item_type or "规则",
+                    "description": description,
+                }
+                candidates.append(candidate)
+                candidate_by_name[name] = candidate
+                names.add(name)
+
+        materials = self._framework_project_materials(data)
+        world_rules = str(materials.get("world_rules", "") or "").strip()
+        source_lines = [
+            str(line or "").strip()
+            for line in str(self.framework_text or "").splitlines()
+            if str(line or "").strip()
+        ]
+        sentences = [
+            part.strip()
+            for part in re.split(r"(?<=[。！？；])", world_rules)
+            if part.strip()
+        ]
+
+        def add_from_source(name, predicate, source_predicate=None):
+            matched = [part for part in sentences if predicate(part)]
+            if source_predicate is not None:
+                source_matched = [
+                    line for line in source_lines if source_predicate(line)
+                ]
+                # Prefer the original framework's fuller ordered list over a
+                # compact world_rules paraphrase when both are available.
+                if source_matched:
+                    matched = source_matched
+            matched = list(dict.fromkeys(item for item in matched if item))
+            if not matched:
+                return
+            description = "\n".join(matched).strip()
+            existing = candidate_by_name.get(name) or existing_lore_by_name.get(name)
+            if existing is not None:
+                # The original framework is authoritative when it contains a
+                # fuller ordered list than the model's compact paraphrase.
+                if len(description) > len(str(existing.get("description", "") or "")):
+                    existing["description"] = description
+                return
+            if name in names:
+                return
+            candidate = {
+                "name": name,
+                "type": "规则",
+                "description": description,
+            }
+            candidates.append(candidate)
+            candidate_by_name[name] = candidate
+            names.add(name)
+
+        add_from_source(
+            "高武境界体系",
+            lambda part: (
+                "境界" in part
+                and bool(re.search(r"(?:一阶|一境|淬骨|引气|开脉)", part))
+                and bool(re.search(r"(?:无极|十阶|十境|圆满)", part))
+            ),
+            lambda line: (
+                ("高武境界" in line or "境界分" in line)
+                and bool(re.search(r"(?:一阶|一境|淬骨|引气)", line))
+            ),
+        )
+        add_from_source(
+            "天赋等级体系",
+            lambda part: (
+                "天赋" in part
+                and bool(re.search(r"(?:凡|铜|銀|银|金|曜|王|帝|天门)", part))
+                and bool(re.search(r"(?:阶|级)", part))
+            ),
+            lambda line: (
+                "天赋" in line
+                and ("天赋分为" in line or "天赋等级" in line)
+                and bool(re.search(r"(?:凡|铜|銀|银|金|曜|王|帝|天门)", line))
+                and bool(re.search(r"(?:阶|级)", line))
+            ),
+        )
+        return candidates
+
     def _normalize_framework_result(self, data):
         data = data if isinstance(data, dict) else {}
         candidate_data = deepcopy(data)
-        candidate_data["project_materials"] = self._framework_project_materials(data)
+        progression_lore = self._progression_lore_candidates(data)
+        materials = self._framework_project_materials(data)
+        world_rules = str(materials.get("world_rules", "") or "").strip()
+        for item in progression_lore:
+            description = str(item.get("description", "") or "").strip()
+            name = str(item.get("name", "") or "").strip()
+            already_has_ordered_realm = bool(
+                re.search(r"一阶.*十阶", world_rules)
+            )
+            already_has_talent_levels = bool(
+                re.search(r"天赋分(?:为|是)?[^。；\n]{0,80}(?:天门八阶|八阶)", world_rules)
+            )
+            needs_append = (
+                name == "高武境界体系" and not already_has_ordered_realm
+            ) or (
+                name == "天赋等级体系" and not already_has_talent_levels
+            ) or (
+                name not in {"高武境界体系", "天赋等级体系"}
+                and description not in world_rules
+            )
+            if description and needs_append:
+                world_rules = f"{world_rules}\n{description}".strip() if world_rules else description
+        materials["world_rules"] = world_rules
+        candidate_data["project_materials"] = materials
+        candidate_data["lore"] = list(data.get("lore", [])) if isinstance(data.get("lore", []), list) else []
+        candidate_data["lore"].extend(progression_lore)
         candidate_data.pop("bible", None)
         candidate_data.pop("bible_sections", None)
         candidates = _normalize_ai_candidates(candidate_data)
+        # A chapter can introduce a recurring named character before the
+        # model's compact dossier pass decides that the person is important
+        # enough for a full profile.  Keep the association instead of
+        # creating orphan names in chapter records.  We do not invent facts:
+        # the placeholder explicitly records that the source needs a later
+        # profile completion.
+        known_character_names = {
+            str(item.get("name", "") or "").strip()
+            for item in candidates.get("characters", [])
+            if isinstance(item, dict) and str(item.get("name", "") or "").strip()
+        }
+        for location in data.get("chapter_locations", []):
+            if not isinstance(location, dict):
+                continue
+            for name in self._string_list(location.get("characters", [])):
+                if not name or name in known_character_names:
+                    continue
+                candidates.setdefault("characters", []).append({
+                    "name": name,
+                    "role": "",
+                    "goal": "",
+                    "secret": "",
+                    "voice": "",
+                    "notes": "章节中出现；原框架未单独提供完整人物资料。",
+                })
+                known_character_names.add(name)
         meta_source = data.get("meta") or data.get("project_info") or data.get("项目信息") or {}
         meta_source = meta_source if isinstance(meta_source, dict) else {}
         meta = {}
@@ -3231,13 +3453,76 @@ class NovelFrameworkImportWorker(NovelAnalysisWorker):
             if key == "target_words":
                 value = self._project_target_words_text(value)
             meta[key] = value
+        plan = self._normalize_chapter_plan(data)
+        location_plan = _extract_framework_chapter_plan_from_locations(
+            self.framework_text,
+            data.get("chapter_locations", []),
+        )
+        normalized_locations = []
+        for fallback_index, item in enumerate(
+            data.get("chapter_locations", [])
+            if isinstance(data.get("chapter_locations", []), list) else [],
+            1,
+        ):
+            if not isinstance(item, dict):
+                continue
+            try:
+                index = int(item.get("index", fallback_index) or fallback_index)
+            except (TypeError, ValueError):
+                index = fallback_index
+            if index <= 0:
+                continue
+            normalized_locations.append({
+                "index": index,
+                "start_line": str(item.get("start_line", "") or "").strip(),
+                "end_line": str(item.get("end_line", "") or "").strip(),
+                "characters": self._string_list(item.get("characters", [])),
+                **({
+                    "anchor": str(item.get("anchor", "") or "").strip()
+                } if str(item.get("anchor", "") or "").strip() else {}),
+            })
+        plan["chapter_locations"] = normalized_locations
+        if location_plan.get("chapters"):
+            plan["chapters"] = location_plan["chapters"]
+            plan["source"] = "ai_chapter_locator"
+            plan["source_text_preserved"] = True
+            plan["local_mapping_status"] = location_plan.get("local_mapping_status", "pending")
+            plan["unresolved_chapters"] = location_plan.get("unresolved_chapters", [])
+        elif data.get("chapter_locations"):
+            plan["source"] = "ai_chapter_locator"
+            plan["source_text_preserved"] = bool(self.framework_text.strip())
+            plan["local_mapping_status"] = "pending"
+            plan["unresolved_chapters"] = [
+                item["index"] for item in normalized_locations
+            ]
+        assessment = deepcopy(data.get("framework_analysis", {}))
+        assessment = assessment if isinstance(assessment, dict) else {}
+        if assessment:
+            assessment["source_hash"] = hashlib.sha256(self.framework_text.strip().encode("utf-8")).hexdigest()
+            # The model owns the semantic completeness decision.  The local
+            # parser is only a source locator and must never overwrite that
+            # decision when a document uses an unfamiliar heading format.
+            assessment.setdefault("chapter_outline_count", 0)
+            assessment.setdefault("chapter_outline_missing", [])
+            assessment["local_mapping_status"] = plan.get("local_mapping_status", "pending")
+            foundation = assessment.get("foundation", {})
+            foundation = deepcopy(foundation) if isinstance(foundation, dict) else {}
+            foundation["arcs"] = [{"name": stage["name"], "source_stage": stage["name"],
+                                   "start_chapter": stage["start_chapter"], "end_chapter": stage["end_chapter"],
+                                   "end_state": stage["summary"] or ""}
+                                  for stage in plan["stages"]]
+            foundation["summary"] = foundation.get("summary") or plan.get("summary", "")
+            assessment["foundation"] = foundation
+            assessment = _normalize_framework_analysis(assessment, self.framework_text)
         return {
             "meta": meta,
+            "framework_analysis": assessment,
             "project_materials": candidates.get("project_materials", {}),
             "characters": candidates.get("characters", []),
             "lore": candidates.get("lore", []),
             "foreshadows": candidates.get("foreshadows", []),
-            "chapter_plan": self._normalize_chapter_plan(data),
+            "chapter_plan": plan,
+            "chapter_locations": normalized_locations,
         }
 
     def run(self):
@@ -5035,7 +5320,7 @@ class NovelWritingWorker(QThread):
             "\n\n【统一创作与编辑标准】\n"
             "请以成熟的商业小说作者兼责任编辑标准完成本次任务，输出内容要达到可直接交付人工编辑审阅的稳定度。"
             "读起来应自然、连贯、有个人声音；不追求炫技，追求真实推进、人物行为合理、情绪有层次。"
-            "信息要通过行动、对话、环境和细节自然出现，少用直接解释。"
+            "信息要通过行动、对话、环境和细节自然出现，不用直接解释替代剧情。"
             "每个角色都要有不同的说话方式、反应节奏和关注点。"
             "允许局部留白、轻微笨拙和不完全对称的句式，但整体必须成熟。"
             "先依据当前项目的定位写作：题材类型与读者定位（如男频、女频、搞笑、悬疑等）、叙事人称、故事卖点和阅读节奏，"
@@ -5045,7 +5330,7 @@ class NovelWritingWorker(QThread):
             "并检查人物、设定、时间线、伏笔、空间关系和因果链是否一致。"
         )
         if self.action in fiction_actions:
-            return common + (
+            return common + _grounded_prose_contract() + (
                 "\n正文写作要求：让人物的欲望、阻力、选择和后果自然形成推进与情绪变化；"
                 "需要时用具体动作、环境、感官或生活细节承接场景，不设细节数量配额。"
                 "对话要保留人物各自的关注点和潜台词，避免角色互相解释已经知道的事。"
@@ -5166,6 +5451,7 @@ class NovelWritingWorker(QThread):
                 "专业流程只保留会直接改变人物选择、关系或结果的部分，避免核验、记录、交接和责任说明堆成办案式流程。"
                 "同一事实不要换词重复解释，不要替人物讲道理，不要写报告式推理或机械分镜。"
                 "只输出正文，不输出标题、前言、分区标签、审校说明、JSON或Markdown代码块。"
+                + _grounded_prose_contract()
             )
         if self.action == "style_finalize":
             return (
@@ -5180,6 +5466,7 @@ class NovelWritingWorker(QThread):
                 "必须逐段核对时间顺序、因果、代词唯一指向和人物生死、清醒、位置、权限及物件持有状态；"
                 "提纲内部互斥时以已发布正文和当前已确认状态为准，不能把两种状态同时写入终稿。"
                 "必须严格使用用户上下文指定的输出分区，不输出审校报告、评分、修改说明、Markdown代码块或额外内容。"
+                + _grounded_prose_contract()
             )
         if self.action == "style_audit":
             return (
@@ -5259,6 +5546,7 @@ class NovelWritingWorker(QThread):
                 "在后续正文验收与修复阶段处理被舍弃的冲突描述，不能把两种状态同时写入正文。"
                 "本章声纹执行表必须逐个区分实际说话人物，并明确普通段落合并与短段边界。"
                 "严格使用用户指定的三个分区标题，不输出分析、状态JSON、Markdown代码块或额外内容。"
+                + _grounded_prose_contract()
             )
         if self.action in {"draft", "style_rewrite"} and "【正文风格参考】\n" in self.context:
             return (
@@ -5268,6 +5556,7 @@ class NovelWritingWorker(QThread):
                 f"只输出小说正文，并严格使用{NOVEL_PROSE_START_MARKER}和{NOVEL_PROSE_END_MARKER}包住正文；"
                 "包络外不得输出‘我会’‘接下来’‘本章将’等规划说明、分析、提纲、执行过程或致读者文字，"
                 "包络内也只能是可直接进入小说的正文。"
+                + _grounded_prose_contract()
             )
         prompts = {
             "outline": (
@@ -5295,6 +5584,7 @@ class NovelWritingWorker(QThread):
                 "优先保证完整小场景、冲突收束和正文质量，不要为了贴字数截断或省略关键结尾；"
                 "多用动作和对话推进，不要写解释性分析。"
                 "只输出正文草稿，不输出标题、说明、分析或创作建议。"
+                + _grounded_prose_contract()
             ),
             "summary": (
                 "你是长篇小说连续性编辑。请基于当前章节正文提炼本章摘要。\n"
@@ -5786,7 +6076,13 @@ class NovelChapterPlanMasterWorker(NovelAnalysisWorker):
         first_chapter = self.existing_chapter_count + 1
         sample_end = min(self.total_chapter_count, first_chapter + 24)
         return (
-            "你是长篇小说叙事策略与全书结构规划编辑。先建立项目专属叙事策略画像，再为后续分批规划建立全书阶段地图。\n"
+            "先读已有故事。原文足够时只整理已有内容，foundation_mode返回reuse，不另写全书走向；"
+            "有必要内容缺失才返回supplement，只补framework_analysis.missing_fields所指的缺口，原有内容和阶段保留；"
+            "几乎没有故事资料才返回generate。栏目名称、顺序和排版不同不代表内容缺失。"
+            "reuse且原文没有阶段时arcs=[]，不凭空分阶段。"
+            "下面的新建要求只用于原文真正缺少的部分，不能覆盖已经写明的故事。"
+            "用自然的网络小说语言讲人物、场景、行动和具体变化，不用策划词、抽象评语或编辑总结。\n"
+            "请整理后续章节需要的已有故事内容，确实不足时才补齐。\n"
             "必须只输出一个合法JSON对象，不要Markdown、解释、注释或尾随逗号。\n"
             f"目标总字数约{self.target_words}字，单章约{self.average_chapter_words}字，"
             f"全书预计{self.total_chapter_count}章，已有{self.existing_chapter_count}章。\n"
@@ -5836,6 +6132,10 @@ class NovelChapterPlanMasterWorker(NovelAnalysisWorker):
 
     def _chunk_user_text(self, chunk_text, chunk_index, total_chunks):
         return str(chunk_text or "")
+
+    def _reasoning_effort_for_request(self):
+        effort = super()._reasoning_effort_for_request()
+        return effort or ("high" if self.model.lower().startswith(("gpt-", "o1", "o3", "o4")) else "")
 
     def _analysis_progress_label(self):
         return "全书阶段规划"
@@ -5950,7 +6250,8 @@ class NovelChapterPlanMasterWorker(NovelAnalysisWorker):
     def _normalize_master_plan(self, data):
         data = self._master_plan_payload(data)
         raw_arcs = data.get("arcs", [])
-        if not isinstance(raw_arcs, list) or not raw_arcs:
+        reuse = str(data.get("foundation_mode", "") or "").strip().lower() == "reuse"
+        if not isinstance(raw_arcs, list) or (not raw_arcs and not reuse):
             raise ValueError("AI没有返回全书阶段规划。")
         arcs = []
         for item in raw_arcs:
@@ -5998,7 +6299,7 @@ class NovelChapterPlanMasterWorker(NovelAnalysisWorker):
                     f"实际从第{arc['start_chapter']}章开始。"
                 )
             expected_start = arc["end_chapter"] + 1
-        if expected_start - 1 != self.total_chapter_count:
+        if arcs and expected_start - 1 != self.total_chapter_count:
             raise ValueError(
                 f"全书阶段规划只覆盖到第{expected_start - 1}章，"
                 f"没有覆盖到第{self.total_chapter_count}章。"
@@ -6020,6 +6321,9 @@ class NovelChapterPlanMasterWorker(NovelAnalysisWorker):
             "arcs": arcs,
             "narrative_strategy_profile": deepcopy(strategy),
         }
+        mode = str(data.get("foundation_mode", "") or "").strip().lower()
+        if mode in {"reuse", "supplement", "generate"}:
+            normalized["foundation_mode"] = mode
         # Keep an optional model-returned boundary for backward compatibility,
         # but do not create an empty field when the model did not provide one.
         boundary = _clean_chapter_plan_story_boundary(data.get("global_hard_boundaries", ""))
@@ -6143,20 +6447,23 @@ class NovelChapterPlanWorker(NovelAnalysisWorker):
             + _CHAPTER_PLAN_STATE_PROGRESSION_GUIDANCE
             + "提纲正文应讲述人物真正会经历的故事，不安排任何固定的工作步骤或说明流程；外部事务只在故事自然需要时出现。\n"
             "title 只写章节名，不要带“第几章”和序号；target_words 写数字字符串。\n"
-            "outline是提纲里的故事正文。先理解meta中的题材、风格和叙事人称，再像这本小说的作者在讲述下一章那样，用有题材气质的叙述，"
+            "outline是提纲里的故事正文；只有需要补写的章节才输出outline。先理解meta中的题材、风格和叙事人称，再像这本小说的作者在讲述下一章那样，用有题材气质的叙述，"
             "用一段约300字的自然叙述（建议250-380字，内容完整时可略有浮动，不要为了凑字数硬扩写），写清人物身处什么场景、眼前遇到什么具体事情、现实阻力是什么、"
             "人物做了什么选择或行动、事情造成了什么结果，以及章末留下的具体变化或悬念。轻松故事可以有人物视角下的荒诞、误会、反差和调侃；悬疑、感情、成长等故事则顺着各自的情绪与阅读感来写。"
             "narrative_stage、source_stage、dominant_line和ending_hook负责规划边界，outline只需把这些边界化成故事，不要把策划字段拼进正文叙述，"
             "不要复述字段含义，也不要沿用‘目标、关系建立、完成推进、形成新局面’一类策划说明口吻。"
             "提纲仍给正文留下场景、对白和节奏空间，不必按处境、阻力、选择、后果的固定次序组织句子。\n"
             "narrative_stage 只能从“强钩子阶段”“主线扩展阶段”“收束升级阶段”中选择。\n"
-            "如果项目资料包含 imported_chapter_plan_reference：chapters是明确章节级约束，必须按绝对章号执行；"
-            "如果某章在 imported_chapter_plan_reference.chapters 中已有原始细纲，先判断它是否已经写清场景、具体事件、人物行动、冲突阻力、结果和章末变化，"
-            "并且与当前项目的时间线、人物状态、世界规则和所属阶段一致。完整、连贯、可以直接交给正文扩写的细纲，"
-            "将 outline_mode 设为 use_imported，并让程序原样沿用该细纲；不要改写、缩写、扩写或替换原文。"
-            "只有原始细纲缺失、只是标题/一句话概述、信息明显不足、互相矛盾或无法直接扩写时，才将 outline_mode 设为 generate，"
-            "为该章生成约300字的自然故事提纲。模型只做这一次判断，不要另建审核任务。"
-            "stages.events是阶段内有序剧情节点，不得把事件序号当作章号。每章用source_event_ids列出承载的节点ID；"
+            "如果项目资料包含 imported_chapter_plan_reference：chapters是明确章节级约束，必须按绝对章号执行。"
+            "如果其中location_status为pending，且输入包含unresolved_framework_source，"
+            "当前批次每章都要尽量返回source_location的起止L行号和极短anchor；"
+            "只返回位置，不要抄写原文。程序会根据原始框架恢复细纲，定位失败不等于细纲缺失。"
+            "当 framework_analysis.chapter_outline_mode 已经是 reuse 且当前章节有本地原文时，直接返回 outline_mode=use_imported，outline留空；"
+            "不要重抄、改写、缩写、扩写或替换本地原文。只有被 framework_analysis.chapter_outline_missing 标记的章节，"
+            "或框架判断为 supplement/generate 且当前章节确实缺少可写内容时，才返回 outline_mode=generate 并生成约300字自然故事提纲。"
+            "模型只做缺口判断，不要另建审核任务。"
+            "stages.events是可选的阶段剧情节点，不得把事件序号当作章号。完整导入框架通常没有events，章节原文由程序本地保存；"
+            "不要生成source_event_ids，也不要复制阶段节点或章节原文；"
             "一章可以承载多个连续节点，扩展章可以用空数组，但每个节点只能使用一次、必须在所属阶段内并保持顺序，"
             "阶段结束前必须全部覆盖。如果本次请求覆盖一个完整原框架阶段，该阶段的所有原始事件必须在本次返回的章节中完成"
             "source_event_ids标记，不能留给下一批，也不能只在outline中写出事件内容而省略事件ID。"
@@ -6164,13 +6471,17 @@ class NovelChapterPlanWorker(NovelAnalysisWorker):
             "阶段结局和最终关系状态应放在阶段后部兑现；扩展章只能深化当前阶段，不能提前执行下一阶段事件、结论或场景。\n"
             "characters只记录本章自然涉及的主要人物，没有则用空数组；它是索引，不是强制出场清单。\n"
             'JSON 结构：{"chapters":[{"index":1,"title":"","target_words":"3000",'
-            '"narrative_stage":"","source_stage":"","dominant_line":"","source_event_ids":[],"outline":"",'
+            '"narrative_stage":"","source_stage":"","dominant_line":"","source_event_ids":[],"source_location":{"start_line":"","end_line":"","anchor":""},"outline":"",'
             '"outline_mode":"generate","characters":[],"ending_hook":""}]}\n'
             "chapters 数量必须严格等于请求章节数，index 从 1 连续递增。"
         )
 
     def _chunk_user_text(self, chunk_text, chunk_index, total_chunks):
         return str(chunk_text or "")
+
+    def _reasoning_effort_for_request(self):
+        effort = super()._reasoning_effort_for_request()
+        return effort or ("high" if self.model.lower().startswith(("gpt-", "o1", "o3", "o4")) else "")
 
     def _analysis_progress_label(self):
         return "章节规划"
@@ -6267,7 +6578,7 @@ class NovelChapterPlanWorker(NovelAnalysisWorker):
                 )
             title = self._clean_title(raw_title, f"章节 {index}")
             outline = self._outline_from_item(item)
-            if not outline:
+            if not outline and self._normalize_outline_mode(item.get("outline_mode", "")) != "use_imported":
                 outline = f"围绕‘{title}’这一章，写清人物此刻身处的场景、遇到的具体麻烦，以及他们采取行动后局面出现的变化；章末留下一个能自然接住下一章的新信息或新阻力。"
             narrative_stage = self._normalize_stage_text(item.get("narrative_stage", "") or item.get("stage", "") or item.get("所属阶段", ""), index)
             normalized_item = {
@@ -6280,6 +6591,17 @@ class NovelChapterPlanWorker(NovelAnalysisWorker):
                 "source_event_ids": [
                     value.upper() for value in self._string_list(item.get("source_event_ids", []))
                 ],
+                "source_location": (
+                    {
+                        "start_line": str(item.get("source_location", {}).get("start_line", "") or "").strip(),
+                        "end_line": str(item.get("source_location", {}).get("end_line", "") or "").strip(),
+                        **({
+                            "anchor": str(item.get("source_location", {}).get("anchor", "") or "").strip()
+                        } if str(item.get("source_location", {}).get("anchor", "") or "").strip() else {}),
+                    }
+                    if isinstance(item.get("source_location"), dict)
+                    else {}
+                ),
                 "outline": outline,
                 "outline_mode": self._normalize_outline_mode(item.get("outline_mode", "")),
                 "characters": self._string_list(item.get("characters", [])),

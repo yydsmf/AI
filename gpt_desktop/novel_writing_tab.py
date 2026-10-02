@@ -52,6 +52,11 @@ from .novel_import import (
     _chapter_source_label_map,
     _extract_import_candidates,
     _extract_structured_framework_chapter_plan,
+    _extract_framework_chapter_plan_from_locations,
+    _build_local_framework_chapter_plan,
+    _extract_framework_planning_parameters,
+    _framework_numbered_source,
+    _framework_story_section,
     _foreshadow_candidate_identity_keys,
     _foreshadow_candidate_is_terminal_review,
     _foreshadow_candidate_target_code_keys,
@@ -164,6 +169,7 @@ from .novel_utils import (
     _normalize_candidate_analysis_state,
     _clean_chapter_plan_story_boundary,
     _normalize_chapter_plan_foundation,
+    _normalize_framework_analysis,
     _canonical_chapter_plan_event_id,
     _canonical_chapter_plan_stage_id,
     _normalize_foreshadow_review_observations,
@@ -222,6 +228,7 @@ from .novel_utils import (
     _target_words,
     FRAMEWORK_IMPORT_TYPE,
 )
+from .novel_creation_wizard import NovelCreationWizardDialog, format_creation_text
 from .widgets import ProviderModelBar, WideComboBox, install_combo_arrow_overlay
 from .workers import EdgeTTSWorker, NovelAnalysisWorker, NovelCandidatePostprocessWorker, NovelChapterPlanMasterWorker, NovelChapterPlanWorker, NovelContextBuildWorker, NovelForeshadowReviewPostprocessWorker, NovelForeshadowReviewWorker, NovelFrameworkImportWorker, NovelVolumeFrameworkAlignmentWorker, NovelVolumeFrameworkWorker, NovelVolumeHandoffWorker, NovelVolumeIntentWorker, NovelWritingWorker
 
@@ -6837,9 +6844,185 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
             return
         self.set_chapter_ai_panel_expanded(True)
 
+    def _chapter_plan_framework_parameters(self):
+        project = self.current_project if isinstance(getattr(self, "current_project", None), dict) else {}
+        source = project.get("imported_framework_source", {})
+        source = source if isinstance(source, dict) else {}
+        analysis = self._framework_ai_analysis()
+        parameters = deepcopy(analysis.get("planning_parameters", {}))
+        if not analysis:
+            parameters = _extract_framework_planning_parameters(source.get("text", ""))
+        framework = project.get("creation_framework", {})
+        framework = framework if isinstance(framework, dict) else {}
+        for key, framework_key in (
+            ("target_words", "total_words"),
+            ("average_chapter_words", "average_chapter_words"),
+        ):
+            try:
+                value = int(framework.get(framework_key, 0) or 0)
+            except (ValueError, TypeError):
+                value = 0
+            if value > 0:
+                parameters.setdefault(key, value)
+        foundation = framework.get("chapter_plan_foundation", {})
+        if isinstance(foundation, dict):
+            try:
+                count = int(foundation.get("total_chapter_count", 0) or 0)
+            except (ValueError, TypeError):
+                count = 0
+            if count > 0:
+                parameters.setdefault("total_chapter_count", count)
+        # When the imported source already contains explicit chapter records,
+        # their actual range is authoritative. A prose header may contain an
+        # old estimate that conflicts with the detailed chapter list.
+        reference = project.get("imported_chapter_plan_reference", {})
+        if isinstance(reference, dict):
+            chapter_items = reference.get("chapters", [])
+            if isinstance(chapter_items, list):
+                indices = []
+                for item in chapter_items:
+                    if not isinstance(item, dict):
+                        continue
+                    try:
+                        index = int(item.get("index", 0) or 0)
+                    except (TypeError, ValueError):
+                        index = 0
+                    if index > 0:
+                        indices.append(index)
+                if indices:
+                    parameters["total_chapter_count"] = max(indices)
+            if not indices:
+                stage_ends = []
+                for stage in reference.get("stages", []) if isinstance(reference.get("stages"), list) else []:
+                    try:
+                        end_chapter = int(stage.get("end_chapter", 0) or 0)
+                    except (TypeError, ValueError):
+                        end_chapter = 0
+                    if end_chapter > 0:
+                        stage_ends.append(end_chapter)
+                if stage_ends:
+                    parameters["total_chapter_count"] = max(stage_ends)
+        foundation = analysis.get("foundation", {}) if isinstance(analysis, dict) else {}
+        foundation_arcs = foundation.get("arcs", []) if isinstance(foundation, dict) else []
+        arc_ends = []
+        for arc in foundation_arcs if isinstance(foundation_arcs, list) else []:
+            try:
+                end_chapter = int(arc.get("end_chapter", 0) or 0)
+            except (TypeError, ValueError):
+                end_chapter = 0
+            if end_chapter > 0:
+                arc_ends.append(end_chapter)
+        if arc_ends:
+            parameters["total_chapter_count"] = max(arc_ends)
+        # A detailed source with explicit ranges is more reliable than a
+        # contradictory prose estimate such as "250 chapters". Derive the
+        # average only when the source gives enough information to do so.
+        if parameters.get("total_chapter_count") and parameters.get("target_words"):
+            chapter_count = int(parameters["total_chapter_count"])
+            average = int(parameters.get("average_chapter_words", 0) or 0)
+            if chapter_count > 0 and average <= 0:
+                parameters["average_chapter_words"] = max(
+                    1, round(int(parameters["target_words"]) / chapter_count)
+                )
+        return parameters
+
+    def _chapter_plan_restore_imported_reference(self):
+        """Recover old imports locally, without changing a running event ledger."""
+        project = self.current_project
+        if self._framework_ai_analysis():
+            return
+        reference = project.get("imported_chapter_plan_reference", {})
+        reference = reference if isinstance(reference, dict) else {}
+        generation = project.get("chapter_plan_generation_state", {})
+        generation = generation if isinstance(generation, dict) else {}
+        if generation.get("chapters") or project.get("chapters"):
+            return
+        source = self._framework_import_source()
+        structured = _extract_structured_framework_chapter_plan(source.get("text", ""))
+        if reference.get("stages"):
+            existing_outlines = {
+                str(item.get("index", "")): str(item.get("outline", "") or "").strip()
+                for item in reference.get("chapters", []) if isinstance(item, dict)
+            }
+            recovered_outlines = [
+                item for item in structured.get("chapters", [])
+                if str(item.get("outline", "") or "").strip()
+                and not existing_outlines.get(str(item.get("index", "")))
+            ]
+            if not recovered_outlines:
+                return
+        if structured.get("stages") or structured.get("chapters"):
+            self._store_imported_chapter_plan_reference(
+                _merge_framework_chapter_plans(reference, structured),
+                source.get("source_title", ""), source.get("source_label", ""),
+            )
+
+    def _framework_ai_analysis(self):
+        project = self.current_project if isinstance(self.current_project, dict) else {}
+        source = project.get("imported_framework_source", {})
+        source = source if isinstance(source, dict) else {}
+        if not source.get("text"):
+            return {}
+        return _normalize_framework_analysis(project.get("imported_framework_analysis", {}), source.get("text", ""))
+
+    def _chapter_plan_imported_foundation(self, state):
+        """Follow the saved AI decision; never infer completeness from headings."""
+        if int(state.get("existing_chapter_count", 0) or 0):
+            return {}
+        analysis = self._framework_ai_analysis()
+        if analysis.get("foundation_mode") != "reuse":
+            return {}
+        foundation = deepcopy(analysis.get("foundation", {}))
+        if not foundation:
+            return {}
+        foundation["source"] = "imported_framework"
+        foundation["source_hash"] = analysis["source_hash"]
+        for key in ("target_words", "average_chapter_words", "total_chapter_count", "existing_chapter_count"):
+            foundation[key] = int(state.get(key, 0) or 0)
+        # Number/range validity is a program invariant, not a story judgment.
+        arcs = foundation.get("arcs", [])
+        if arcs:
+            expected = 1
+            for arc in arcs:
+                if arc["start_chapter"] != expected or arc["end_chapter"] < expected:
+                    return {}
+                expected = arc["end_chapter"] + 1
+            if expected - 1 != state.get("total_chapter_count") or self._chapter_plan_master_reference_error(foundation):
+                return {}
+        elif self.current_project.get("imported_chapter_plan_reference", {}).get("stages"):
+            return {}
+        return _normalize_chapter_plan_foundation(foundation)
+
+    def _chapter_plan_reuse_foundation(self, state, saved_state):
+        """Changing only chapter size does not discard confirmed story direction."""
+        saved_state = saved_state if isinstance(saved_state, dict) else {}
+        if not saved_state.get("master_plan") or not saved_state.get("profile_confirmed"):
+            return
+        for key in ("target_words", "total_chapter_count", "existing_chapter_count"):
+            if int(saved_state.get(key, 0) or 0) != int(state.get(key, 0) or 0):
+                return
+        master = _normalize_chapter_plan_foundation(saved_state["master_plan"])
+        master["average_chapter_words"] = state["average_chapter_words"]
+        state["master_plan"] = master
+        state["profile_confirmed"] = True
+        if saved_state.get("force_master_regeneration"):
+            state["force_master_regeneration"] = True
+        state["narrative_strategy_profile"] = deepcopy(master.get("narrative_strategy_profile", {}))
+        state["foundation_hash"] = self._chapter_plan_foundation_hash(master)
+        self.current_project["chapter_plan_foundation"] = deepcopy(master)
+
     def _chapter_plan_default_average_words(self):
+        parameters = self._chapter_plan_framework_parameters()
+        project = self.current_project if isinstance(getattr(self, "current_project", None), dict) else {}
+        saved_state = project.get("chapter_plan_generation_state", {})
+        saved_state = saved_state if isinstance(saved_state, dict) else {}
+        foundation = project.get("chapter_plan_foundation", {})
+        foundation = foundation if isinstance(foundation, dict) else {}
         try:
-            value = int(self.config.setdefault("novel", {}).get("chapter_plan_average_words", 3000) or 3000)
+            value = int(parameters.get("average_chapter_words")
+                        or saved_state.get("average_chapter_words")
+                        or foundation.get("average_chapter_words")
+                        or self.config.setdefault("novel", {}).get("chapter_plan_average_words", 3000) or 3000)
         except Exception:
             value = 3000
         return max(1000, min(20000, value))
@@ -6972,6 +7155,7 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
                 row = {
                     "id": self._chapter_plan_clip_text(item.get("id", ""), 40),
                     "name": self._chapter_plan_clip_text(item.get("name", ""), 100),
+                    "summary": self._chapter_plan_clip_text(item.get("summary", ""), 1500),
                     "start_chapter": item.get("start_chapter", 0),
                     "end_chapter": item.get("end_chapter", 0),
                 }
@@ -7392,7 +7576,9 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
                 "title": self._chapter_plan_clip_text(item.get("title", ""), 80),
                 "target_words": self._chapter_plan_clip_text(item.get("target_words", ""), 40),
                 "narrative_stage": self._chapter_plan_clip_text(item.get("narrative_stage", ""), 80),
-                "outline": self._chapter_plan_clip_text(item.get("outline", ""), 1000),
+                # Do not send imported prose back to AI during semantic reuse.
+                # The local source remains available to the application.
+                "outline": "" if str(reference.get("semantic_outline_mode", "") or "").strip().lower() == "reuse" else self._chapter_plan_clip_text(item.get("outline", ""), 1000),
                 "characters": _normalize_name_list(item.get("characters", [])),
                 "ending_hook": self._chapter_plan_clip_text(item.get("ending_hook", ""), 240),
                 "source_event_ids": [
@@ -7438,31 +7624,63 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
                 except Exception:
                     event_order = len(events) + 1
                 events.append({"id": event_id, "order": event_order, "text": event_text})
-            if events:
+            # Chapter outlines are stored once in chapters. Keep stage events
+            # only for legacy/non-chapter source material; imported detailed
+            # chapters must never be duplicated into the stage ledger.
+            if events and str(reference.get("source", "") or "") != "local_framework_parser":
                 stages.append({
                     "id": _canonical_chapter_plan_stage_id(item.get("id", "")),
                     "name": self._chapter_plan_clip_text(item.get("name", ""), 120),
+                    "summary": self._chapter_plan_clip_text(item.get("summary", ""), 1500),
                     "start_chapter": stage_start,
                     "end_chapter": stage_end,
                     "events": events,
                 })
+            elif str(reference.get("source", "") or "") == "local_framework_parser":
+                stages.append({
+                    "id": _canonical_chapter_plan_stage_id(item.get("id", "")),
+                    "name": str(item.get("name", "") or f"阶段{stage_index}").strip(),
+                    "summary": str(item.get("summary", "") or "").strip(),
+                    "start_chapter": stage_start,
+                    "end_chapter": stage_end,
+                    "events": [],
+                })
         summary = self._chapter_plan_clip_text(reference.get("summary", ""), 5000)
-        if not summary and not chapters and not stages:
-            return {}
         result = {
             "usage": (
                 "chapters是用户明确给出的章节级约束，必须按绝对章号继承。"
-                "其中已有outline是用户导入的原始单章细纲；模型必须先判断它是否完整可写，完整时只返回outline_mode=use_imported并由程序原样沿用，"
-                "不完整时才返回outline_mode=generate并生成新的自然章节提纲。"
-                "stages.events是阶段内按顺序排列的剧情节点，不是一条节点固定对应一章；"
-                "一章可承载多个节点，扩展章可不消耗节点，但每个节点必须在所属阶段内恰好使用一次。"
-                "规划章节可用source_event_ids标记承载的节点；节点只提供故事事实和方向，不是动作清单，"
+                "完整导入框架的章节原文已由程序本地保存；模型只返回use_imported或generate，不得重抄原文。"
+                "stages.events是可选的阶段剧情节点；完整导入框架通常没有events。"
+                "不要生成source_event_ids，不要复制章节原文或阶段节点；节点只提供故事事实和方向，不是动作清单，"
                 "outline只需自然落实其语义，不得展开成流程步骤。"
                 "stage_index是全书不可越界的原框架阶段边界；当前阶段的扩展章只能深化当前阶段，"
                 "不得提前执行下一阶段的事件、结论或场景。"
             ),
             "summary": summary,
         }
+        location_status = str(reference.get("local_mapping_status", "") or "").strip().lower()
+        locations = reference.get("chapter_locations", [])
+        if location_status == "pending":
+            result["location_status"] = "pending"
+            if isinstance(locations, list) and locations:
+                result["chapter_locations"] = [
+                    {
+                        "index": int(item.get("index", 0) or 0),
+                        "start_line": str(item.get("start_line", "") or "").strip(),
+                        "end_line": str(item.get("end_line", "") or "").strip(),
+                        **({"anchor": str(item.get("anchor", "") or "").strip()} if str(item.get("anchor", "") or "").strip() else {}),
+                    }
+                    for item in locations
+                    if isinstance(item, dict) and int(item.get("index", 0) or 0) > 0
+                ]
+        if (
+            not summary
+            and not chapters
+            and not stages
+            and not result.get("chapter_locations")
+            and result.get("location_status") != "pending"
+        ):
+            return {}
         if chapters:
             result["chapters"] = chapters
         if stages:
@@ -7472,14 +7690,22 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
         return result
 
     def _chapter_plan_source_stage_for_index(self, chapter_index):
-        reference = self.current_project.get("imported_chapter_plan_reference", {}) if isinstance(self.current_project, dict) else {}
-        if not isinstance(reference, dict):
-            return {}
+        project = self.current_project if isinstance(self.current_project, dict) else {}
+        reference = project.get("imported_chapter_plan_reference", {})
+        reference_stages = reference.get("stages", []) if isinstance(reference, dict) else []
+        # 新建向导生成的阶段没有“导入框架”来源，但仍然是章节规划的硬边界。
+        if not isinstance(reference_stages, list) or not reference_stages:
+            creation_framework = project.get("creation_framework", {})
+            reference_stages = (
+                creation_framework.get("stage_plan", [])
+                if isinstance(creation_framework, dict)
+                else []
+            )
         try:
             chapter_index = int(chapter_index or 0)
         except Exception:
             return {}
-        for item in reference.get("stages", []) if isinstance(reference.get("stages", []), list) else []:
+        for item in reference_stages if isinstance(reference_stages, list) else []:
             if not isinstance(item, dict):
                 continue
             try:
@@ -7604,7 +7830,10 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
     def _chapter_plan_master_reference_error(self, master_plan):
         master_plan = master_plan if isinstance(master_plan, dict) else {}
         arcs = master_plan.get("arcs", []) if isinstance(master_plan.get("arcs"), list) else []
+        reference = self.current_project.get("imported_chapter_plan_reference", {})
         if not arcs:
+            if (master_plan.get("source") == "imported_framework" or master_plan.get("foundation_mode") == "reuse") and not reference.get("stages"):
+                return ""
             return "AI没有返回阶段列表。"
         reference = self.current_project.get("imported_chapter_plan_reference", {}) if isinstance(self.current_project, dict) else {}
         stages = reference.get("stages", []) if isinstance(reference, dict) and isinstance(reference.get("stages"), list) else []
@@ -7818,6 +8047,22 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
         )
         if imported_reference:
             payload["imported_chapter_plan_reference"] = imported_reference
+        analysis = self._framework_ai_analysis()
+        if analysis:
+            payload["framework_analysis"] = analysis
+            if (
+                isinstance(imported_reference, dict)
+                and str(imported_reference.get("location_status", "") or "").strip().lower()
+                == "pending"
+            ):
+                source = project.get("imported_framework_source", {})
+                source_text = source.get("text", "") if isinstance(source, dict) else ""
+                if source_text:
+                    payload["unresolved_framework_source"] = _framework_numbered_source(source_text)
+        elif context_mode == "master":
+            source = project.get("imported_framework_source", {})
+            if isinstance(source, dict) and source.get("text"):
+                payload["original_framework_text"] = source["text"]
         if isinstance(extra_payload, dict) and extra_payload:
             payload.update(deepcopy(extra_payload))
         instruction_prefix = (
@@ -7827,6 +8072,9 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
             "再用 target.macro_pacing_rules 判断宏观节奏。宏观节奏不得覆盖原框架阶段。\n\n"
             "若存在 imported_chapter_plan_reference，chapters是按绝对章号执行的明确章节约束；"
             "stages.events是阶段有序剧情节点，不得把事件序号直接当作章号。"
+            "如果imported_chapter_plan_reference.location_status为pending，"
+            "请根据unresolved_framework_source为当前批次补充每章source_location的起止L行号和极短anchor；"
+            "只返回位置，不要抄写原文。程序会用原始框架恢复细纲，定位失败不能改判为内容缺失。\n"
             "每章用source_event_ids列出本章承载的节点ID；一章可承载多个连续节点，扩展章可用空数组。"
             "每个节点只能使用一次、必须位于所属阶段章号范围内并保持原顺序；阶段结束前必须全部覆盖。"
             "凡引用节点，outline必须清楚落实其语义，可以自然改写，不要机械逐字粘贴。"
@@ -7932,12 +8180,36 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
         if explicit_title:
             chapter["title"] = explicit_title
         explicit_outline = str(explicit_item.get("outline", "") or "").strip()
-        if (
-            explicit_outline
-            and str(chapter.get("outline_mode", "") or "").strip() == "use_imported"
-        ):
-            chapter["outline"] = explicit_outline
-            chapter["outline_source"] = "imported_framework"
+        if not explicit_outline:
+            source_location = chapter.get("source_location", {})
+            # The caller injects restored source text before this method when
+            # chapter planning is handling an unresolved imported mapping.
+            source_text = str(chapter.pop("_framework_source_text", "") or "").strip()
+            if source_text and isinstance(source_location, dict):
+                try:
+                    restored = _extract_framework_chapter_plan_from_locations(
+                        source_text,
+                        [{
+                            "index": chapter.get("index", 0),
+                            **source_location,
+                        }],
+                    ).get("chapters", [])
+                except Exception:
+                    restored = []
+                if restored:
+                    explicit_outline = str(restored[0].get("outline", "") or "").strip()
+                    if not explicit_title:
+                        explicit_title = str(restored[0].get("title", "") or "").strip()
+        if str(chapter.get("outline_mode", "") or "").strip() == "use_imported":
+            if explicit_title:
+                chapter["title"] = explicit_title
+            if explicit_outline:
+                chapter["outline"] = explicit_outline
+                chapter["outline_source"] = "imported_framework"
+            # The AI selected this exact original chapter. Its source event IDs
+            # are already established, so reuse them without inventing a ledger.
+            if explicit_item.get("source_event_ids"):
+                chapter["source_event_ids"] = deepcopy(explicit_item["source_event_ids"])
         return chapter
 
     def _chapter_plan_batch_ranges(self, chapter_count, batch_size=_CHAPTER_PLAN_BATCH_SIZE):
@@ -7971,6 +8243,17 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
             else {}
         )
         reference_stages = reference.get("stages", []) if isinstance(reference, dict) else []
+        if not isinstance(reference_stages, list) or not reference_stages:
+            creation_framework = (
+                self.current_project.get("creation_framework", {})
+                if isinstance(getattr(self, "current_project", None), dict)
+                else {}
+            )
+            reference_stages = (
+                creation_framework.get("stage_plan", [])
+                if isinstance(creation_framework, dict)
+                else []
+            )
         if not isinstance(reference_stages, list) or not reference_stages:
             return None
 
@@ -8257,6 +8540,7 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
             if str(existing_contract.get("source", "") or "").strip() != "user_confirmed":
                 state["creative_intent_contract"] = {}
             state["profile_confirmed"] = False
+            state["force_master_regeneration"] = True
             state.pop("profile_hash", None)
             state.pop("foundation_hash", None)
             state["status"] = "pending"
@@ -8511,7 +8795,9 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
             f"已完成：{generated}/{requested}章",
         ]
         if state.get("master_plan"):
-            if bool(state.get("profile_confirmed", False)):
+            if state.get("master_plan", {}).get("source") == "imported_framework":
+                lines.append("规划基础：沿用导入框架和原有阶段，不重新生成全书走向")
+            elif bool(state.get("profile_confirmed", False)):
                 lines.append("规划基础：全书走向、叙事策略和阶段规划已确认")
             else:
                 lines.append("规划基础：已生成，等待用户确认")
@@ -8524,6 +8810,22 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
     def _start_chapter_plan_worker_for_state(self, state):
         if not getattr(self, "_chapter_plan_auto_active", False):
             return
+        if (not state.get("chapters") and not int(state.get("existing_chapter_count", 0) or 0)
+                and not state.get("force_master_regeneration")):
+            self._chapter_plan_restore_imported_reference()
+            foundation = self._chapter_plan_imported_foundation(state)
+            if foundation:
+                state = deepcopy(state)
+                state["master_plan"] = foundation
+                state["profile_confirmed"] = True
+                state["narrative_strategy_profile"] = deepcopy(foundation.get("narrative_strategy_profile", {}))
+                state["foundation_hash"] = self._chapter_plan_foundation_hash(foundation)
+                self.current_project["chapter_plan_foundation"] = deepcopy(foundation)
+                # The imported author framework is already the user's direction.
+                # No extra confirmation/API task is needed for a local projection.
+                if foundation.get("narrative_strategy_profile"):
+                    self._save_narrative_strategy_profile(foundation["narrative_strategy_profile"])
+                self._persist_chapter_plan_generation_state(state)
         if state.get("master_plan") and not bool(state.get("profile_confirmed", False)):
             if not self._confirm_chapter_plan_strategy_profile(state):
                 if getattr(self, "_chapter_plan_foundation_regenerate_pending", False):
@@ -8578,7 +8880,7 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
                 provider.get("proxy_url", ""),
                 self._provider_proxy_mode(provider),
             )
-            status = "正在生成全书走向、叙事画像和阶段规划..."
+            status = "正在读取已有故事，补齐继续写作所缺的内容..."
         else:
             (
                 batch_count,
@@ -8608,6 +8910,8 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
                 total_batches=total_batches,
             )
             status = f"正在规划第{absolute_start}-{absolute_end}章，共{state.get('total_chapter_count', 0)}章..."
+            if state.get("master_plan", {}).get("source") == "imported_framework":
+                status = "已读取原框架，" + status
 
         state["status"] = "generating"
         state.pop("error", None)
@@ -8675,7 +8979,8 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
             return
         self._flush_current_editors()
         meta = self.current_project.get("meta", {}) if isinstance(self.current_project, dict) else {}
-        target_words = _target_words(meta)
+        framework_parameters = self._chapter_plan_framework_parameters()
+        target_words = framework_parameters.get("target_words", 0) or _target_words(meta)
         if target_words <= 0:
             target_words, ok = QInputDialog.getInt(
                 self,
@@ -8688,22 +8993,24 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
             )
             if not ok:
                 return
-        average_chapter_words, ok = QInputDialog.getInt(
-            self,
-            "AI 生成章节规划",
-            "单章目标字数：",
-            self._chapter_plan_default_average_words(),
-            1000,
-            20000,
-            500,
-        )
-        if not ok:
-            return
-        self.config.setdefault("novel", {})["chapter_plan_average_words"] = int(average_chapter_words)
-        try:
-            save_config(self.config)
-        except Exception as e:
-            log_debug("章节规划单章字数设置保存失败", e)
+        average_chapter_words = framework_parameters.get("average_chapter_words", 0)
+        if not average_chapter_words:
+            average_chapter_words, ok = QInputDialog.getInt(
+                self,
+                "AI 生成章节规划",
+                "单章目标字数：",
+                self._chapter_plan_default_average_words(),
+                1000,
+                20000,
+                500,
+            )
+            if not ok:
+                return
+            self.config.setdefault("novel", {})["chapter_plan_average_words"] = int(average_chapter_words)
+            try:
+                save_config(self.config)
+            except Exception as e:
+                log_debug("章节规划单章字数设置保存失败", e)
         chapters = self.current_project.get("chapters", []) if isinstance(self.current_project, dict) else []
         existing_count = len(chapters if isinstance(chapters, list) else [])
         total_chapter_count, requested_chapter_count = self._chapter_plan_counts(
@@ -8711,6 +9018,12 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
             average_chapter_words,
             existing_count,
         )
+        if framework_parameters.get("total_chapter_count"):
+            total_chapter_count = framework_parameters["total_chapter_count"]
+            requested_chapter_count = max(0, total_chapter_count - existing_count)
+        if requested_chapter_count <= 0:
+            self.set_status_tip("已有章节已覆盖框架规定的全部章节，不再追加规划。")
+            return
         self.set_chapter_ai_panel_expanded(True)
         if hasattr(self, "chapter_plan_apply_btn"):
             self.chapter_plan_apply_btn.setVisible(False)
@@ -8738,6 +9051,7 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
                 "profile_confirmed": False,
                 "started_at": now_str(),
             }
+            self._chapter_plan_reuse_foundation(state, saved_state)
         if str(state.get("status", "") or "") == "complete":
             self._chapter_plan_auto_active = False
             self._pending_chapter_plan = self._chapter_plan_from_generation_state(state)
@@ -8819,6 +9133,20 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
             state["narrative_strategy_profile"] = deepcopy(strategy_profile)
             state["profile_confirmed"] = False
             state["profile_hash"] = self._narrative_strategy_profile_hash(strategy_profile)
+            if plan.get("foundation_mode") == "reuse":
+                plan["source"] = "imported_framework"
+                plan["source_hash"] = self._framework_import_source().get("sha256", "")
+                state["master_plan"] = plan
+                state["profile_confirmed"] = True
+                state["status"] = "pending"
+                state["narrative_strategy_profile"] = deepcopy(plan.get("narrative_strategy_profile", {}))
+                self.current_project["chapter_plan_foundation"] = deepcopy(plan)
+                if plan.get("narrative_strategy_profile"):
+                    self._save_narrative_strategy_profile(plan["narrative_strategy_profile"])
+                self._persist_chapter_plan_generation_state(state)
+                self._show_chapter_plan_generation_progress(state, "已读取原有故事，接下来逐章判断细纲是否可以沿用。")
+                self._queue_chapter_plan_continuation()
+                return
             state["master_plan"] = plan
             state["status"] = "awaiting_profile_confirmation"
             self._persist_chapter_plan_generation_state(state)
@@ -8868,6 +9196,18 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
                 for value in _normalize_name_list(chapter.get("source_event_ids", []))
             ]
             explicit_item = explicit.get(chapter["index"], {})
+            reference = self.current_project.get("imported_chapter_plan_reference", {})
+            reference = reference if isinstance(reference, dict) else {}
+            if (
+                str(chapter.get("outline_mode", "") or "").strip() == "use_imported"
+                and not str(explicit_item.get("outline", "") or "").strip()
+                and isinstance(chapter.get("source_location"), dict)
+                and str(reference.get("local_mapping_status", "") or "").strip().lower() == "pending"
+            ):
+                source = self.current_project.get("imported_framework_source", {})
+                source_text = source.get("text", "") if isinstance(source, dict) else ""
+                if source_text:
+                    chapter["_framework_source_text"] = source_text
             # The model makes the completeness decision in the same planning
             # call.  Once it explicitly chooses direct reuse, preserve the
             # imported wording byte-for-byte; otherwise its generated outline
@@ -9048,6 +9388,8 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
             chapter["outline"] = self._chapter_plan_outline_for_item(item)
             for key in ("narrative_stage", "source_stage", "dominant_line", "ending_hook"):
                 chapter[key] = str(item.get(key, "") or "").strip()
+            if not chapter["source_stage"]:
+                chapter["source_stage"] = chapter["narrative_stage"]
             chapter["linked_characters"] = _normalize_name_list(item.get("characters", []))
             chapter["source_event_ids"] = [
                 _canonical_chapter_plan_event_id(value)
@@ -14995,14 +15337,152 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
         finally:
             self._opening_project = False
 
+    def _apply_creation_wizard_payload(self, data, payload):
+        """把新建向导确认的框架写入现有项目字段。
+
+        这里只做新项目初始化，不触碰已有项目的导入、章节规划和正文流程。
+        结构化原稿保存在 creation_framework，旧页面继续读取已有兼容字段。
+        """
+        payload = payload if isinstance(payload, dict) else {}
+        framework = payload.get("creation_framework", {})
+        framework = deepcopy(framework) if isinstance(framework, dict) else {}
+        premise = framework.get("premise", {}) if isinstance(framework.get("premise", {}), dict) else {}
+        bible = framework.get("bible", {})
+        world_rules = framework.get("world_rules", {})
+        characters = framework.get("characters", []) if isinstance(framework.get("characters", []), list) else []
+        lore = framework.get("lore", []) if isinstance(framework.get("lore", []), list) else []
+        foreshadows = framework.get("foreshadows", []) if isinstance(framework.get("foreshadows", []), list) else []
+        stage_plan = framework.get("stage_plan", []) if isinstance(framework.get("stage_plan", []), list) else []
+
+        meta = data.setdefault("meta", {})
+        title = _safe_name(
+            framework.get("novel_name", "") or premise.get("title", "")
+        ) or "未命名小说"
+        meta.update({
+            "title": title,
+            "genre": str(premise.get("genre", "") or "").strip(),
+            "style": str(premise.get("style", "") or "").strip(),
+            "pov": "第三人称",
+            "target_words": str(framework.get("total_words", 500000) or 500000),
+            "status": "草稿",
+            "premise": str(premise.get("synopsis", "") or "").strip(),
+        })
+        data["bible"] = format_creation_text(bible, "小说圣经")
+        data["world_rules"] = format_creation_text(world_rules, "世界规则")
+        data["summary"] = str(premise.get("synopsis", "") or "").strip()
+        data["timeline"] = format_creation_text({
+            "全书走向": framework.get("global_direction", ""),
+            "阶段规划": stage_plan,
+            "章节规划提示": framework.get("chapter_plan_note", ""),
+        }, "阶段规划")
+        data["foreshadows"] = format_creation_text(foreshadows, "长期伏笔")
+
+        normalized_characters = []
+        for index, item in enumerate(characters):
+            if not isinstance(item, dict):
+                continue
+            record = _new_character(index)
+            record["name"] = str(item.get("name", "") or "").strip() or record["name"]
+            record["role"] = str(item.get("role", "") or item.get("identity", "") or "").strip()
+            record["goal"] = str(item.get("goal", "") or item.get("目标", "") or "").strip()
+            record["secret"] = str(item.get("secret", "") or item.get("秘密", "") or "").strip()
+            record["voice"] = str(item.get("voice", "") or item.get("language_style", "") or "").strip()
+            notes = str(item.get("notes", "") or "").strip()
+            relationship = str(item.get("relationship_to_protagonist", "") or "").strip()
+            long_term = str(item.get("long_term_change", "") or "").strip()
+            record["notes"] = "\n".join(
+                part for part in (notes, f"与主角关系：{relationship}" if relationship else "", f"长期变化：{long_term}" if long_term else "") if part
+            )
+            normalized_characters.append(record)
+        data["characters"] = normalized_characters
+
+        normalized_lore = []
+        for index, item in enumerate(lore):
+            if not isinstance(item, dict):
+                continue
+            record = _new_lore(index)
+            record["name"] = str(item.get("name", "") or "").strip() or record["name"]
+            record["type"] = str(item.get("type", "") or "设定").strip()
+            record["description"] = str(item.get("description", "") or "").strip()
+            record["story_known"] = str(item.get("story_known", "") or "").strip()
+            effect = str(item.get("relationship_effect", "") or "").strip()
+            if effect:
+                record["description"] = f"{record['description']}\n关系影响：{effect}".strip()
+            normalized_lore.append(record)
+        data["lore"] = normalized_lore
+
+        normalized_foreshadows = []
+        for index, item in enumerate(foreshadows):
+            if not isinstance(item, dict):
+                continue
+            record = _new_foreshadow(index)
+            record["name"] = str(item.get("name", "") or "").strip() or record["name"]
+            record["status"] = str(item.get("status", "未埋") or "未埋").strip()
+            record["setup_chapter"] = str(item.get("setup_stage", "") or "").strip()
+            record["payoff_chapter"] = str(item.get("payoff_stage", "") or "").strip()
+            record["description"] = str(item.get("description", "") or "").strip()
+            record["revealed"] = str(item.get("revealed", "") or "").strip()
+            record["remaining_secret"] = str(item.get("remaining_secret", "") or "").strip()
+            record["notes"] = "\n".join(
+                part for part in (
+                    str(item.get("relationship_effect", "") or "").strip(),
+                    str(item.get("notes", "") or "").strip(),
+                ) if part
+            )
+            normalized_foreshadows.append(record)
+        data["foreshadow_items"] = normalized_foreshadows
+
+        data["creation_framework"] = framework
+        data["creation_wizard_state"] = deepcopy(payload.get("creation_wizard_state", {}))
+        foundation = framework.get("chapter_plan_foundation", {})
+        if isinstance(foundation, dict):
+            foundation = _normalize_chapter_plan_foundation(foundation)
+            data["chapter_plan_foundation"] = deepcopy(foundation)
+            profile = _normalize_narrative_strategy_profile(
+                foundation.get("narrative_strategy_profile", {})
+            )
+            contract = _normalize_creative_intent_contract(
+                foundation.get("creative_intent_contract", {})
+            )
+            data["narrative_strategy_profile"] = deepcopy(profile)
+            data["creative_intent_contract"] = deepcopy(contract)
+
+            # 向导已经完成全书走向、叙事策略和十万字阶段边界。
+            # 这里只预置“待用户点击章节规划”的确认状态，不发起任何章节 API 调用，
+            # 这样现有“AI生成章节规划”按钮会直接进入具体章节提纲生成，避免重复生成同一层规划。
+            try:
+                target_words = max(1, int(foundation.get("target_words", 0) or 0))
+                average_words = max(1, int(foundation.get("average_chapter_words", 0) or 0))
+                total_chapters = max(1, int(foundation.get("total_chapter_count", 0) or 0))
+            except Exception:
+                target_words = average_words = total_chapters = 0
+            if target_words and average_words and total_chapters and foundation.get("arcs") and profile:
+                data["chapter_plan_generation_state"] = {
+                    "version": _CHAPTER_PLAN_BATCH_STATE_VERSION,
+                    "status": "pending",
+                    "target_words": target_words,
+                    "average_chapter_words": average_words,
+                    "total_chapter_count": total_chapters,
+                    "existing_chapter_count": 0,
+                    "requested_chapter_count": total_chapters,
+                    "batch_size": _CHAPTER_PLAN_BATCH_SIZE,
+                    "master_plan": deepcopy(foundation),
+                    "chapters": [],
+                    "creative_intent_contract": deepcopy(contract),
+                    "profile_confirmed": True,
+                    "started_at": now_str(),
+                }
+        return data
+
     def new_project(self):
-        name, ok = QInputDialog.getText(self, "新建小说项目", "名称：", text="未命名小说")
-        if not ok:
+        dialog = NovelCreationWizardDialog(
+            self._current_novel_ai_selection,
+            parent=self,
+        )
+        if dialog.exec() != QDialog.Accepted:
             return
-        name = _safe_name(name) or "未命名小说"
         self._save_current_work("新建前保存")
-        data = _default_project()
-        data["meta"]["title"] = name
+        data = self._apply_creation_wizard_payload(_default_project(), dialog.result_payload())
         self._load_project_data(data, "")
         self._save_draft_snapshot()
         try:
@@ -15010,7 +15490,7 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
         except Exception as e:
             log_debug("小说最近项目记录清理失败", e)
         self._update_stats_label()
-        self.set_status_tip("已新建为自动草稿，编辑内容会自动保存。")
+        self.set_status_tip("已完成创作框架向导，当前为自动草稿。请到“章节”页面手动点击“AI生成章节规划”。")
 
     def _set_volume_two_running(self, running):
         button = getattr(self, "create_volume_two_btn", None)
@@ -16244,18 +16724,12 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
         import_mode, ok = self._get_combo_choice("选择导入方式", "请选择导入方式：", ["创建为新项目", "追加到当前项目"], 0)
         if not ok:
             return
-        classify_mode, ok = self._get_combo_choice("选择框架处理方式", "请选择框架导入处理方式：", ["直接导入", "AI 智能分类"], 0)
-        if not ok:
+        provider, model, error = self._current_novel_ai_selection()
+        if error:
+            self.set_ai_settings_expanded(True)
+            self.set_status_tip(f"框架导入失败：{error}")
+            QMessageBox.warning(self, "框架导入失败", error)
             return
-        if classify_mode == "AI 智能分类":
-            provider, model, error = self._current_novel_ai_selection()
-            if error:
-                self.set_ai_settings_expanded(True)
-                self.set_status_tip(f"框架导入失败：{error}")
-                QMessageBox.warning(self, "框架导入失败", error)
-                return
-        else:
-            provider, model = None, ""
 
         # Importing a new framework changes the planning source.  Drop the
         # resumable checkpoint and visible preview before starting classification
@@ -16266,10 +16740,7 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
             clear_project_state=import_mode != "创建为新项目",
         )
         title = self._prepare_framework_import_project(text, path, source_label, import_mode)
-        if classify_mode == "AI 智能分类":
-            self._start_framework_import_worker(provider, model, text, title, source_label, import_mode)
-        else:
-            self._apply_direct_framework_import(text, title, source_label)
+        self._start_framework_import_worker(provider, model, text, title, source_label, import_mode)
 
     def _prepare_framework_import_project(self, text, path, source_label, import_mode):
         self.last_import_text = text
@@ -16337,19 +16808,6 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
         self.current_project["bible"] = f"{old}\n\n{block}".strip() if old else block
         return True
 
-    def _apply_direct_framework_import(self, text, title, source_label):
-        changed = self._append_framework_reference_to_bible(text, title, source_label)
-        self._refresh_project_material_editors()
-        self._update_stats_label()
-        if hasattr(self, "nav_list") and hasattr(self, "page_indexes"):
-            self.nav_list.setCurrentRow(self.page_indexes.get("圣经", 0))
-        self._note_project_dirty()
-        save_message = self._save_after_import()
-        status = "框架已直接导入到小说圣经。"
-        if not changed:
-            status = "框架原文已存在，未重复写入。"
-        self.set_status_tip(f"{status}{save_message}")
-
     def _framework_ai_materials_for_project(self, data):
         materials = deepcopy(data.get("project_materials", {})) if isinstance(data, dict) else {}
         materials = materials if isinstance(materials, dict) else {}
@@ -16373,6 +16831,13 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
             additions = "\n\n".join(moved_parts)
             if additions not in summary:
                 plan["summary"] = f"{summary}\n\n{additions}".strip() if summary else additions
+        if isinstance(data.get("chapter_locations"), list):
+            plan["chapter_locations"] = deepcopy(data.get("chapter_locations"))
+        analysis = data.get("framework_analysis", {})
+        if isinstance(analysis, dict):
+            plan["local_mapping_status"] = str(
+                analysis.get("local_mapping_status", "") or ""
+            ).strip()
         return plan
 
     def _refresh_after_framework_import(self):
@@ -16642,9 +17107,9 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
             if not outline:
                 outline = self._chapter_plan_outline_for_item(item)
             title = str(item.get("title", "") or "").strip()
-            if not title or _is_framework_scope_title(title) or _is_framework_placeholder_chapter_title(title):
+            if _is_framework_scope_title(title) or _is_framework_placeholder_chapter_title(title):
                 continue
-            if not outline:
+            if not title and not outline:
                 continue
             chapters.append({
                 "index": str(item.get("index", fallback_index) or fallback_index),
@@ -16659,6 +17124,14 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
                     for value in _normalize_name_list(item.get("source_event_ids", []))
                 ],
             })
+            if isinstance(item.get("source_location"), dict):
+                chapters[-1]["source_location"] = {
+                    "start_line": str(item["source_location"].get("start_line", "") or "").strip(),
+                    "end_line": str(item["source_location"].get("end_line", "") or "").strip(),
+                    **({
+                        "anchor": str(item["source_location"].get("anchor", "") or "").strip()
+                    } if str(item["source_location"].get("anchor", "") or "").strip() else {}),
+                }
         stages = []
         for stage_index, item in enumerate(
             plan.get("stages", []) if isinstance(plan.get("stages", []), list) else [], 1
@@ -16693,25 +17166,55 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
                 except Exception:
                     order = event_index
                 events.append({"id": event_id, "order": order, "text": event_text})
-            if events:
+            if events or str(plan.get("source", "") or "") == "local_framework_parser":
                 stages.append({
                     "id": stage_id,
                     "name": str(item.get("name", "") or f"阶段{stage_index}").strip(),
+                    "summary": str(item.get("summary", "") or "").strip(),
                     "start_chapter": start_chapter,
                     "end_chapter": end_chapter,
-                    "events": events,
+                    "events": [] if str(plan.get("source", "") or "") == "local_framework_parser" else events,
                 })
         summary = str(plan.get("summary", "") or "").strip()
         if not summary and not chapters and not stages:
             return {}
         reference = {
             "summary": summary,
+            "source": str(plan.get("source", "") or "").strip(),
+            "semantic_outline_mode": str(plan.get("semantic_outline_mode", "") or "").strip(),
+            "semantic_outline_missing": _normalize_name_list(plan.get("semantic_outline_missing", [])),
+            "source_text_preserved": bool(plan.get("source_text_preserved")),
+            "local_mapping_status": str(plan.get("local_mapping_status", "") or "").strip(),
+            "unresolved_chapters": _normalize_name_list(plan.get("unresolved_chapters", [])),
             "source_title": str(source_title or "").strip(),
             "source_label": str(source_label or "").strip(),
             "imported_at": now_str(),
         }
         if chapters:
             reference["chapters"] = chapters
+        locations = plan.get("chapter_locations", [])
+        if isinstance(locations, list) and locations:
+            normalized_locations = []
+            for fallback_index, item in enumerate(locations, 1):
+                if not isinstance(item, dict):
+                    continue
+                try:
+                    index = int(item.get("index", fallback_index) or fallback_index)
+                except (TypeError, ValueError):
+                    index = fallback_index
+                if index <= 0:
+                    continue
+                normalized_locations.append({
+                    "index": index,
+                    "start_line": str(item.get("start_line", "") or "").strip(),
+                    "end_line": str(item.get("end_line", "") or "").strip(),
+                    "characters": _normalize_name_list(item.get("characters", [])),
+                    **({
+                        "anchor": str(item.get("anchor", "") or "").strip()
+                    } if str(item.get("anchor", "") or "").strip() else {}),
+                })
+            if normalized_locations:
+                reference["chapter_locations"] = normalized_locations
         if stages:
             reference["stages"] = stages
         return reference
@@ -16723,6 +17226,75 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
             return 0
         self.current_project["imported_chapter_plan_reference"] = reference
         return len(reference.get("chapters", []) if isinstance(reference.get("chapters", []), list) else [])
+
+    def _apply_complete_imported_chapter_plan(self, plan, analysis):
+        """Write a verified complete imported outline directly as chapters."""
+        self._last_framework_direct_import_count = 0
+        plan = plan if isinstance(plan, dict) else {}
+        analysis = analysis if isinstance(analysis, dict) else {}
+        chapters_plan = [
+            item for item in plan.get("chapters", [])
+            if isinstance(item, dict)
+        ]
+        outline_mode = str(analysis.get("chapter_outline_mode", "") or "").strip().lower()
+        foundation_mode = str(analysis.get("foundation_mode", "") or "").strip().lower()
+        mapping_status = str(plan.get("local_mapping_status", "") or "").strip().lower()
+        unresolved = _normalize_name_list(plan.get("unresolved_chapters", []))
+        expected_count = int(analysis.get("chapter_outline_count", 0) or 0)
+        indexes = []
+        for item in chapters_plan:
+            try:
+                indexes.append(int(item.get("index", 0) or 0))
+            except (TypeError, ValueError):
+                indexes.append(0)
+        complete = (
+            not self.current_project.get("chapters")
+            and foundation_mode == "reuse"
+            and outline_mode == "reuse"
+            and mapping_status in {"mapped", "mapped_by_ai"}
+            and not unresolved
+            and bool(chapters_plan)
+            and len(indexes) == len(set(indexes))
+            and all(index > 0 for index in indexes)
+            and indexes == list(range(1, len(indexes) + 1))
+            and (not expected_count or expected_count == len(chapters_plan))
+            and all(str(item.get("outline", "") or "").strip() for item in chapters_plan)
+        )
+        if not complete:
+            return 0
+        chapters = self.current_project.setdefault("chapters", [])
+        parameters = analysis.get("planning_parameters", {})
+        parameters = parameters if isinstance(parameters, dict) else {}
+        try:
+            default_target_words = int(parameters.get("average_chapter_words", 0) or 0)
+        except (TypeError, ValueError):
+            default_target_words = 0
+        for item in chapters_plan:
+            chapter = _new_chapter(len(chapters))
+            title = str(item.get("title", "") or "").strip()
+            if title:
+                chapter["title"] = title
+            target_words = str(item.get("target_words", "") or "").strip()
+            if not target_words and default_target_words > 0:
+                target_words = str(default_target_words)
+            if target_words:
+                chapter["draft_words"] = target_words
+            chapter["outline"] = self._chapter_plan_outline_for_item(item)
+            for key in ("narrative_stage", "source_stage", "dominant_line", "ending_hook"):
+                chapter[key] = str(item.get(key, "") or "").strip()
+            if not chapter["source_stage"]:
+                chapter["source_stage"] = chapter["narrative_stage"]
+            chapter["linked_characters"] = _normalize_name_list(item.get("characters", []))
+            chapter["source_event_ids"] = [
+                _canonical_chapter_plan_event_id(value)
+                for value in _normalize_name_list(item.get("source_event_ids", []))
+            ]
+            chapter["status"] = "大纲"
+            chapters.append(chapter)
+        self.current_project.pop("chapter_plan_generation_state", None)
+        self.current_project.pop("chapter_plan_foundation", None)
+        self._last_framework_direct_import_count = len(chapters_plan)
+        return len(chapters_plan)
 
     def _apply_framework_import_result(self, data):
         data = data if isinstance(data, dict) else {}
@@ -16753,13 +17325,36 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
                 self.current_project.get("imported_framework_source", {}).get("text", "")
                 if isinstance(self.current_project.get("imported_framework_source"), dict) else ""
             ).strip()
-        structured_plan = _extract_structured_framework_chapter_plan(source_text)
-        merged_plan = _merge_framework_chapter_plans(framework_plan, structured_plan)
+        analysis = _normalize_framework_analysis(data.get("framework_analysis", {}), source_text)
+        if analysis:
+            self.current_project["imported_framework_analysis"] = analysis
+            # AI decides semantic completeness; local code restores the
+            # original chapter text without asking the model to echo it.
+            chapter_locations = framework_plan.get("chapter_locations", [])
+            local_plan = _build_local_framework_chapter_plan(
+                source_text,
+                analysis,
+                chapter_locations,
+            )
+            merged_plan = _merge_framework_chapter_plans(framework_plan, local_plan)
+            # Persist the final local mapping result, not the worker's
+            # pre-localization placeholder status. Otherwise a successful
+            # direct import would still look pending on the next launch.
+            analysis["local_mapping_status"] = str(
+                merged_plan.get("local_mapping_status", "") or "pending"
+            ).strip().lower()
+            self.current_project["imported_framework_analysis"] = analysis
+        else:
+            # Old saved/API payloads can still be read, but do not establish
+            # a semantic reuse decision merely because a regex recognized them.
+            structured_plan = _build_local_framework_chapter_plan(source_text, {})
+            merged_plan = _merge_framework_chapter_plans(framework_plan, structured_plan)
         plan_added = self._store_imported_chapter_plan_reference(
             merged_plan,
             context.get("source_title", ""),
             context.get("source_label", ""),
         )
+        self._apply_complete_imported_chapter_plan(merged_plan, analysis)
         self._refresh_after_framework_import()
         self._note_project_dirty()
         save_message = self._save_after_import()
@@ -16768,6 +17363,9 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
     def on_framework_import_ready(self, data):
         try:
             result, meta_changed, plan_added, save_message = self._apply_framework_import_result(data)
+            direct_import_count = int(
+                getattr(self, "_last_framework_direct_import_count", 0) or 0
+            )
             previous_state = self.current_project.get("framework_import_state", {})
             previous_state = previous_state if isinstance(previous_state, dict) else {}
             self._persist_framework_import_state(
@@ -16786,13 +17384,25 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
                 for item in reference.get("stages", [])
                 if isinstance(item, dict) and isinstance(item.get("events", []), list)
             ) if isinstance(reference, dict) else 0
+            analysis = self._framework_ai_analysis()
+            mode = str(analysis.get("foundation_mode", "") or "").strip().lower()
+            mode_text = {
+                "reuse": "AI判断为完整框架，章节细纲直接沿用原文",
+                "supplement": "AI判断为部分完整，后续只补缺失章节内容",
+                "generate": "AI判断为资料不足，后续才生成缺失规划",
+            }.get(mode, "已完成语义分类")
+            direct_text = (
+                f"已直接写入 {direct_import_count} 章章节规划，可直接开始正文扩写"
+                if direct_import_count
+                else "仍需进入“章节”补充或确认章节规划"
+            )
             self.set_status_tip(
                 "框架 AI 分类完成："
                 f"项目信息 {meta_changed} 项，"
                 f"新增 人物 {added.get('characters', 0)} / 设定 {added.get('lore', 0)} / 伏笔 {added.get('foreshadows', 0)}，"
                 f"补充 人物 {merged.get('characters', 0)} / 设定 {merged.get('lore', 0)} / 伏笔 {merged.get('foreshadows', 0)}，"
-                f"资料分类 {material_count} 项，明确章节约束 {plan_added} 章，阶段剧情节点 {stage_event_count} 个。{save_message}"
-                " 下一步请进入“章节”并点击“AI生成章节规划”；全书走向、叙事策略和阶段规划生成后会自动弹出确认窗口，确认前不会生成详细章节。"
+                f"资料分类 {material_count} 项，明确章节约束 {plan_added} 章，阶段剧情节点 {stage_event_count} 个。"
+                f"{mode_text}。{direct_text}。{save_message}"
             )
         except Exception as e:
             self.on_framework_import_failed(str(e))

@@ -829,6 +829,10 @@ def _default_project():
             "status": "草稿",
             "premise": "",
         },
+        # 新建向导的原始结构化结果和恢复状态。它们只在创建项目时写入，
+        # 不参与已有正文、导入和长期记忆流程。
+        "creation_framework": {},
+        "creation_wizard_state": {},
         "bible": "",
         "world_rules": "",
         "characters": [],
@@ -923,6 +927,7 @@ def _normalize_chapter_plan_foundation(value):
     result = {}
     for key in (
         "summary", "core_mainline", "ending_promise", "global_hard_boundaries",
+        "source", "source_hash", "foundation_mode",
     ):
         field_value = str(value.get(key, "") or "").strip()
         if key == "global_hard_boundaries":
@@ -1125,6 +1130,7 @@ def _fact_with_memory_history_context(item, memory, detail_limit=500):
 
 
 _PRIVATE_PROJECT_NOTE_KEYS = {
+    "imported_framework_analysis",
     "draft_note",
     "imported_chapter_plan_reference",
     "imported_framework_source",
@@ -1137,6 +1143,53 @@ _PRIVATE_PROJECT_NOTE_KEYS = {
     "series_continuation",
     "auto_expand_resume_required",
 }
+
+
+def _normalize_framework_analysis(value, source_text=""):
+    """Persist an AI decision; code checks schema/provenance, not story adequacy."""
+    if not isinstance(value, dict) or not value:
+        return {}
+    source_hash = str(value.get("source_hash", "") or "").strip()
+    if source_text and source_hash != hashlib.sha256(str(source_text).strip().encode("utf-8")).hexdigest():
+        return {}
+    mode = str(value.get("foundation_mode", "") or "").strip().lower()
+    if mode not in {"reuse", "supplement", "generate"}:
+        mode = "generate"
+    parameters = {}
+    raw = value.get("planning_parameters", {})
+    for key in ("target_words", "average_chapter_words", "total_chapter_count"):
+        try:
+            number = int(raw.get(key, 0) or 0) if isinstance(raw, dict) else 0
+        except (TypeError, ValueError):
+            number = 0
+        if number > 0:
+            parameters[key] = number
+    foundation = _normalize_chapter_plan_foundation(value.get("foundation", {}))
+    # The compact import classifier is allowed to omit repeated numeric
+    # fields because ``planning_parameters`` is the canonical small payload.
+    # Keep the persisted foundation internally consistent so later UI/state
+    # code cannot see a successful 100-chapter import as a zero-sized plan.
+    for key in ("target_words", "average_chapter_words", "total_chapter_count"):
+        if not foundation.get(key) and parameters.get(key):
+            foundation[key] = parameters[key]
+    if not foundation.get("total_chapter_count") and value.get("chapter_outline_count"):
+        try:
+            foundation["total_chapter_count"] = max(
+                0, int(value.get("chapter_outline_count", 0) or 0)
+            )
+        except (TypeError, ValueError):
+            pass
+    return {
+        "version": 1, "source_hash": source_hash, "foundation_mode": mode,
+        "chapter_outline_mode": str(value.get("chapter_outline_mode", "") or "").strip().lower(),
+        "chapter_outline_count": max(0, int(value.get("chapter_outline_count", 0) or 0)),
+        "chapter_outline_missing": _normalize_name_list(value.get("chapter_outline_missing", [])),
+        "local_mapping_status": str(value.get("local_mapping_status", "") or "").strip().lower(),
+        "planning_parameters": parameters,
+        "missing_fields": _normalize_name_list(value.get("missing_fields", [])),
+        "reason": str(value.get("reason", "") or "").strip(),
+        "foundation": foundation,
+    }
 
 
 def _project_without_private_notes(project):
@@ -1550,6 +1603,12 @@ def _normalize_project(data):
     if not isinstance(meta, dict):
         meta = {}
     base["meta"].update({k: str(meta.get(k, base["meta"].get(k, ""))) for k in base["meta"]})
+    creation_framework = data.get("creation_framework", {})
+    if isinstance(creation_framework, dict):
+        base["creation_framework"] = deepcopy(creation_framework)
+    creation_wizard_state = data.get("creation_wizard_state", {})
+    if isinstance(creation_wizard_state, dict):
+        base["creation_wizard_state"] = deepcopy(creation_wizard_state)
     for key in ("bible", "world_rules", "timeline", "foreshadows", "summary", "style_reference", "draft_note"):
         value = data.get(key, "")
         base[key] = value if isinstance(value, str) else str(value or "")
@@ -1782,6 +1841,7 @@ def _normalize_project(data):
             stages.append({
                 "id": stage_id,
                 "name": _as_text(item.get("name", "")).strip() or f"阶段{stage_index}",
+                "summary": _as_text(item.get("summary", "")).strip(),
                 "start_chapter": start_chapter,
                 "end_chapter": end_chapter,
                 "events": events,
@@ -1789,6 +1849,16 @@ def _normalize_project(data):
         stages.sort(key=lambda stage: (stage["start_chapter"], stage["end_chapter"], stage["id"]))
         if stages:
             normalized_reference["stages"] = stages
+        if plan_reference.get("source"):
+            normalized_reference["source"] = _as_text(plan_reference.get("source"))
+        if plan_reference.get("semantic_outline_mode"):
+            normalized_reference["semantic_outline_mode"] = _as_text(
+                plan_reference.get("semantic_outline_mode")
+            )
+        if plan_reference.get("semantic_outline_missing"):
+            normalized_reference["semantic_outline_missing"] = _normalize_name_list(
+                plan_reference.get("semantic_outline_missing", [])
+            )
         if normalized_reference.get("summary") or normalized_reference.get("chapters") or normalized_reference.get("stages"):
             base["imported_chapter_plan_reference"] = normalized_reference
     framework_source = data.get("imported_framework_source", {})
@@ -1864,11 +1934,17 @@ def _normalize_project(data):
                 ),
                 "profile_confirmed": bool(generation_state.get("profile_confirmed", False)),
             }
+            if generation_state.get("force_master_regeneration"):
+                normalized_state["force_master_regeneration"] = True
             for key in ("started_at", "updated_at", "error", "profile_hash", "foundation_hash"):
                 value = str(generation_state.get(key, "") or "").strip()
                 if value:
                     normalized_state[key] = value
             base["chapter_plan_generation_state"] = normalized_state
+    source_text = base.get("imported_framework_source", {}).get("text", "")
+    framework_analysis = _normalize_framework_analysis(data.get("imported_framework_analysis", {}), source_text)
+    if source_text and framework_analysis:
+        base["imported_framework_analysis"] = framework_analysis
     chars = data.get("characters", [])
     if isinstance(chars, list):
         base["characters"] = [c for c in chars if isinstance(c, dict)]
@@ -9214,7 +9290,8 @@ def _build_legacy_style_execution_context(
         )
         + "文风合同只控制表达，不得把连续性资料改写成正文里的合规说明；证据、权限和未知状态只在它们确实改变人物行动或判断时自然出现，"
         "不得为每个判断都补一遍‘目前只能确认、不能说明、仍待核对’。"
-        "声纹表开头必须严格写‘主叙事模式：六种模式之一’，再用一句话说明本章靠什么吸引读者。"
+        + _grounded_prose_contract()
+        + "声纹表开头必须严格写‘主叙事模式：六种模式之一’，再用一句话说明本章靠什么吸引读者。"
         f"如果提供了功能型原文片段卡，只能按本章实际场景选择0至{optional_card_high}张，只填写真实卡号SCxx。"
         "选择前必须同时核对卡片的适用和禁用边界；任何禁用条件命中时都不得选择，即使卡片语言很像样本。"
         "片段卡是条件性写法证据，不是每章覆盖清单；没有真正匹配的卡时写‘无’，不能为了证明文风而凑卡。"
@@ -9300,22 +9377,22 @@ def _build_legacy_style_execution_context(
     )[:int(limit or NOVEL_AI_CONTEXT_LIMIT)]
 
 
-def _natural_expression_guidance():
-    """Keep prose grounded in the scene instead of abstract verdicts."""
+def _grounded_prose_contract():
+    """Keep generated prose direct, concrete, and story-focused."""
     return (
-        "人物、外貌、情绪、关系、物件或场面，不要用生硬或抽象的判断语句直接下结论。"
-        "需要让读者感到好看、难过、尴尬、紧张或某件东西显眼时，"
-        "优先从当前场景写出可见、可听、可感的线索：动作、停顿、目光、语气、感官、选择、他人看见或听见后的"
-        "心理和行为变化，以及这些变化带来的后果。"
-        "不要写“他很难过”，可以让他用袖子擦眼睛、话停在半句或避开某个名字；不要写“她很漂亮”，可以写旁人看见她时"
-        "视线、判断和动作如何改变。"
-        "描写要服从当前人物、关系和现场，不把这些例子当固定动作模板。幽默、吐槽、夸张和比喻可以自由使用；"
-        "根据当前人物、关系和现场自由选择描写落点。"
-        "例如‘他意识到危险’，可以写成‘眼神停了一下，身体向后撤，右手扣紧桌沿’，再让这个动作带出对白、选择或结果。"
-        "先依据当前项目的定位形成故事阅读感：题材类型与读者定位（如男频、女频、搞笑、悬疑等）、叙事人称、故事卖点和节奏，"
-        "决定本章呈现什么样的冲突、情绪和推进方式。再依据样本文风进行仿写：以文风档案中的习惯用词、口语、句式松紧、"
-        "对白接法、叙述节奏和情绪落点为仿写目标，尽量复刻它的写法，让当前故事以相近的作者表达方式呈现；"
-        "项目资料负责故事定位、人物事实和剧情方向，样本文风负责表达层的落笔方式。示例动作只作参考，具体落点交给人物和现场。"
+        "【正文语言要求】\n"
+        "正文必须使用自然的网络小说叙述语言，直接写人物、场景、动作、对白和具体变化；"
+        "不得出现策划术语、抽象形容、文学化意象、空泛比喻、办案式表达、编辑式说明或编辑式总结。"
+        "情绪和气氛必须通过人物当下的动作、对白、反应和具体结果表现，不要用漂亮形容替代剧情。\n"
+    )
+
+
+def _natural_expression_guidance():
+    """Keep prose direct while separating story facts from style imitation."""
+    return (
+        _grounded_prose_contract()
+        + "项目资料决定故事事实、人物和剧情；文风参考只决定表达方式，"
+        "不得把参考原文的人物、剧情、物件或句子带入当前正文。"
     )
 
 
@@ -9391,7 +9468,8 @@ def _build_style_execution_context(
         "正文从当前章节的状态自然展开。"
         f"输出必须严格使用{NOVEL_PROSE_START_MARKER}和{NOVEL_PROSE_END_MARKER}包住正文；"
         "包络外不输出任何说明，包络内不写‘我会’‘接下来’‘本章将’等规划、分析或执行稿内容，"
-        "只写可以直接进入小说的正文。"
+        "只写可以直接进入小说的正文。\n"
+        + _grounded_prose_contract()
     )
     budget = max(0, effective_limit - len(instruction) - 2)
     if len(original) > budget:
@@ -19773,15 +19851,15 @@ def _build_chapter_ai_context(project, chapter_index, action):
         "优先参考本章需继承的关键事实，其次参考本章摘要、前文摘要、人物目标、语言风格和世界规则。"
         "正文风格：口语化、自然、有网文阅读感，不要太工整、太书面、太像范文。"
         "句子长短混用，允许短句、停顿、反问和不完全对称的表达。"
-        "少用排比、四字词堆叠、抽象情绪词和模板化反应。"
+        "不得使用抽象情绪判断、四字词堆叠和模板化反应。"
         "人物情绪优先通过对白、具体动作和选择体现。保持剧情高密度推进，但不要写成流水账。"
-        "去 AI 味要求：少写段尾总结、抽象情绪判断和万能反应动作；"
-        "不要频繁使用“沉默、皱眉、冷意、压迫感、空气安静、所有人愣住、下一秒”等模板化表达。"
+        "不得写段尾总结、抽象情绪判断和万能反应动作；"
+        "不得用“沉默、皱眉、冷意、压迫感、空气安静、所有人愣住、下一秒”等模板化表达替代具体剧情。"
         "对白要有真人说话的不完整感，可以短句、停顿、反问、打断。"
         "场景描写优先用具体物件、动作和细节承载情绪，不要总用氛围词概括。"
         "人物心理不要解释过满，能让读者从动作和对白看懂的，就不要再总结一遍。"
-        "少用解释型旁白，不要频繁替人物总结动机、立场和成长。"
-        "少写金句式、总结式、标语式句子，不要刻意拔高主题；章节结尾优先用具体动作、对白、信息变化或悬念收住。"
+        "不得用解释型旁白替代人物行动，不得替人物总结动机、立场和成长。"
+        "不得用金句式、总结式、标语式句子替代剧情，不得刻意拔高主题；章节结尾优先用具体动作、对白、信息变化或悬念收住。"
         "段落结构要有变化，不要连续使用“动作描写 + 心理解释 + 氛围总结”的固定结构。"
         "对白不要每句都完整、漂亮、逻辑闭合；不同人物说话要有信息差、情绪偏差和表达习惯，可以含糊、逃避、反问或只说半句。"
         "场景细节要克制：只在能强化冲突、人物状态或信息变化时，少量加入具体物件、声音、动作痕迹和环境反馈。"
@@ -19803,15 +19881,15 @@ def _build_chapter_ai_context(project, chapter_index, action):
         "优先参考本章需继承的关键事实，其次参考本章摘要、前文摘要、人物目标、语言风格和世界规则。"
         "正文风格：口语化、自然、有网文阅读感，不要太工整、太书面、太像范文。"
         "句子长短混用，允许短句、停顿、反问和不完全对称的表达。"
-        "少用排比、四字词堆叠、抽象情绪词和模板化反应。"
+        "不得使用抽象情绪判断、四字词堆叠和模板化反应。"
         "人物情绪优先通过对白、具体动作和选择体现。保持剧情高密度推进，但不要写成流水账。"
-        "去 AI 味要求：少写段尾总结、抽象情绪判断和万能反应动作；"
-        "不要频繁使用“沉默、皱眉、冷意、压迫感、空气安静、所有人愣住、下一秒”等模板化表达。"
+        "不得写段尾总结、抽象情绪判断和万能反应动作；"
+        "不得用“沉默、皱眉、冷意、压迫感、空气安静、所有人愣住、下一秒”等模板化表达替代具体剧情。"
         "对白要有真人说话的不完整感，可以短句、停顿、反问、打断。"
         "场景描写优先用具体物件、动作和细节承载情绪，不要总用氛围词概括。"
         "人物心理不要解释过满，能让读者从动作和对白看懂的，就不要再总结一遍。"
-        "少用解释型旁白，不要频繁替人物总结动机、立场和成长。"
-        "少写金句式、总结式、标语式句子，不要刻意拔高主题；章节结尾优先用具体动作、对白、信息变化或悬念收住。"
+        "不得用解释型旁白替代人物行动，不得替人物总结动机、立场和成长。"
+        "不得用金句式、总结式、标语式句子替代剧情，不得刻意拔高主题；章节结尾优先用具体动作、对白、信息变化或悬念收住。"
         "段落结构要有变化，不要连续使用“动作描写 + 心理解释 + 氛围总结”的固定结构。"
         "对白不要每句都完整、漂亮、逻辑闭合；不同人物说话要有信息差、情绪偏差和表达习惯，可以含糊、逃避、反问或只说半句。"
         "场景细节要克制：只在能强化冲突、人物状态或信息变化时，少量加入具体物件、声音、动作痕迹和环境反馈。"
@@ -19833,6 +19911,7 @@ def _build_chapter_ai_context(project, chapter_index, action):
             "参考【本章写作长度】安排内容总量，输出可直接进入小说的正文。"
         )
     draft_task += no_text_count_rule
+    draft_task += _grounded_prose_contract()
     task_map = {
         "outline": (
             "请为当前章节生成章节提纲。当前章节已有正文草稿时，必须以正文草稿为唯一事实来源，"

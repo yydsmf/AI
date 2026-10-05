@@ -233,6 +233,7 @@ from .novel_creation_wizard import (
     NovelCreationWizardDialog,
     build_chapter_plan_foundation,
     create_creation_wizard_draft,
+    creation_meta_display_values,
     creation_wizard_payload_from_project_draft,
     format_creation_preview,
     format_creation_text,
@@ -4924,6 +4925,37 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
                 log_debug("拆分章节标题线程清理失败", e)
         QTimer.singleShot(0, cleanup)
 
+    def _reconcile_creation_wizard_meta(self):
+        """补齐向导选择在主程序顶部的可读摘要，不改动结构化原稿。"""
+        project = self.current_project if isinstance(self.current_project, dict) else {}
+        framework = project.get("creation_framework", {})
+        if not isinstance(framework, dict):
+            return False
+        premise = framework.get("premise", {})
+        if not isinstance(premise, dict) or not premise:
+            return False
+        state = project.get("creation_wizard_state", {})
+        source = str(framework.get("source", "") or "").strip()
+        state_status = (
+            str(state.get("status", "") or "").strip().lower()
+            if isinstance(state, dict) else ""
+        )
+        if source != "creation_wizard" and state_status not in {"complete", "confirmed"}:
+            return False
+        meta = project.setdefault("meta", {})
+        display = creation_meta_display_values(
+            premise,
+            existing_genre=meta.get("genre", ""),
+            existing_style=meta.get("style", ""),
+        )
+        changed = False
+        for key in ("genre", "style"):
+            value = str(display.get(key, "") or "").strip()
+            if value and value != str(meta.get(key, "") or "").strip():
+                meta[key] = value
+                changed = True
+        return changed
+
     def _load_project_data(self, data, path="", defer_helpers=False):
         self._invalidate_chapter_plan_generation(
             "加载项目数据，旧章节规划预览和回调已失效",
@@ -4976,6 +5008,7 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
                 threshold_ms=80,
                 path=source_name,
             )
+            creation_meta_reconciled = self._reconcile_creation_wizard_meta()
             self.current_project_path = path
             self._record_current_project_file_signature(path)
             analysis_state = _normalize_candidate_analysis_state(self.current_project.get("analysis_state", {}))
@@ -5017,7 +5050,11 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
                 path=source_name,
                 **self._novel_perf_summary(),
             )
-            self._dirty = any(status_changes.values()) or bool(framework_reconciled)
+            self._dirty = (
+                any(status_changes.values())
+                or bool(framework_reconciled)
+                or bool(creation_meta_reconciled)
+            )
             self._project_file_dirty = self._dirty
         finally:
             self._loading = False
@@ -9723,8 +9760,11 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
         compact_master_plan.pop("creative_intent_contract", None)
         if compact_master_plan.get("source") == "creation_wizard":
             # The current stage's events are sent through wizard_framework;
-            # do not send the same structured stage tree again in the ledger.
+            # do not send the same structured stage tree or its narrative arc
+            # summaries again in the batch continuity envelope.  Keep the
+            # stage index in wizard_framework as the only stage map.
             compact_master_plan.pop("structured_stages", None)
+            compact_master_plan.pop("arcs", None)
         continuity = {
             "required_absolute_range": [batch_start, batch_end],
             "master_plan": compact_master_plan,
@@ -16598,10 +16638,11 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
         title = _safe_name(
             framework.get("novel_name", "") or premise.get("title", "")
         ) or "未命名小说"
+        display_meta = creation_meta_display_values(premise)
         meta.update({
             "title": title,
-            "genre": str(premise.get("genre", "") or "").strip(),
-            "style": str(premise.get("style", "") or "").strip(),
+            "genre": display_meta["genre"],
+            "style": display_meta["style"],
             "pov": "第三人称",
             "target_words": str(framework.get("total_words", 500000) or 500000),
             "status": "草稿",

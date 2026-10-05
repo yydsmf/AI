@@ -326,6 +326,60 @@ def _as_text(value):
     return str(value or "").strip()
 
 
+def _creation_merge_display_parts(*values):
+    """Merge visible labels while keeping the longer, more informative part."""
+    parts = []
+    for value in values:
+        for item in re.split(r"[，,、；;|/]+", _as_text(value)):
+            item = item.strip()
+            if not item:
+                continue
+            replaced = False
+            for index, existing in enumerate(parts):
+                if item == existing or item in existing:
+                    replaced = True
+                    break
+                if existing in item:
+                    parts[index] = item
+                    replaced = True
+                    break
+            if not replaced:
+                parts.append(item)
+    return "，".join(parts)
+
+
+def _creation_audience_label(value):
+    text = _as_text(value)
+    if "女频" in text and "男频" in text:
+        return "男女皆宜"
+    if "女频" in text:
+        return "女频"
+    if "男频" in text:
+        return "男频"
+    return text
+
+
+def creation_meta_display_values(premise, existing_genre="", existing_style=""):
+    """Project wizard choices into the two compact metadata fields in the main UI.
+
+    The complete choices remain in ``creation_framework.premise``.  These two
+    values are only the readable summary shown in the project header.
+    """
+    premise = premise if isinstance(premise, dict) else {}
+    genre = _creation_merge_display_parts(
+        _creation_audience_label(premise.get("audience")),
+        premise.get("genre"),
+        premise.get("theme"),
+        existing_genre,
+    )
+    style = _creation_merge_display_parts(
+        premise.get("style"),
+        premise.get("story_engine"),
+        existing_style,
+    )
+    return {"genre": genre, "style": style}
+
+
 def _creation_name_key(value):
     """Normalize a name only for de-duplication; keep the displayed name intact."""
     return re.sub(r"[\s·•．.\-—_]+", "", _as_text(value)).lower()
@@ -4462,7 +4516,7 @@ class NovelCreationWorker(NovelAnalysisWorker):
                 )
             prompt = f"""{COMMON_CREATION_RULES}
 
-读取作者选定的故事、完整故事底盘、全书阶段骨架和已经完成的前面阶段，只生成当前第{stage_number}/{total_stages or '?'}阶段，范围为第{start_chapter}章到第{end_chapter}章。全书阶段骨架是阶段方向锚点，当前阶段要落实它的主线变化和结束状态；前面阶段的结束状态、带入内容和仍在推动人物的问题是连续性依据。当前阶段沿着这些事实继续发生新的场景，前后阶段各自保持清晰的重点。阶段规划使用结构化表达，写清人物、局势、事件顺序、前置条件、直接结果和状态变化，让每个字段都服务于后续章节执行。
+读取作者选定的故事、完整故事底盘、全书阶段骨架和已经完成的前面阶段，只生成当前第{stage_number}/{total_stages or '?'}阶段，范围为第{start_chapter}章到第{end_chapter}章。全书阶段骨架只负责提供本阶段的方向和结束状态，不要把骨架中的摘要和转折原样重复成另一份总规划；当前阶段的具体内容以本次事件和人物处境为准。前面阶段的结束状态、带入内容和仍在推动人物的问题是连续性依据。当前阶段沿着这些事实继续发生新的场景，前后阶段各自保持清晰的重点。阶段规划使用结构化表达，写清人物、局势、事件顺序、前置条件、直接结果和状态变化，让每个字段都服务于后续章节执行。
 
 输入资料中的 current_foreshadow_endpoints 是本阶段自然发生的暗线端点清单。每一项落到一个当前事件中；kind=setup 写线索怎样进入人物生活，kind=payoff 写线索怎样在现场改变人物选择、关系或局势。清单为空时，场景仍然沿着人物和主线自然推进。承载端点的事件 references 加入“F编号/setup”或“F编号/payoff”，让程序可以把端点和事件稳定对应起来。
 

@@ -228,9 +228,19 @@ from .novel_utils import (
     _target_words,
     FRAMEWORK_IMPORT_TYPE,
 )
-from .novel_creation_wizard import NovelCreationWizardDialog, format_creation_text
+from .novel_creation_wizard import (
+    NovelCreationWorkspaceDialog,
+    NovelCreationWizardDialog,
+    build_chapter_plan_foundation,
+    create_creation_wizard_draft,
+    creation_wizard_payload_from_project_draft,
+    format_creation_preview,
+    format_creation_text,
+    normalize_creation_result,
+    story_requires_explicit_power_levels,
+)
 from .widgets import ProviderModelBar, WideComboBox, install_combo_arrow_overlay
-from .workers import EdgeTTSWorker, NovelAnalysisWorker, NovelCandidatePostprocessWorker, NovelChapterPlanMasterWorker, NovelChapterPlanWorker, NovelContextBuildWorker, NovelForeshadowReviewPostprocessWorker, NovelForeshadowReviewWorker, NovelFrameworkImportWorker, NovelVolumeFrameworkAlignmentWorker, NovelVolumeFrameworkWorker, NovelVolumeHandoffWorker, NovelVolumeIntentWorker, NovelWritingWorker
+from .workers import EdgeTTSWorker, NovelAnalysisWorker, NovelCandidatePostprocessWorker, NovelChapterEventPlacementWorker, NovelChapterPlanWorker, NovelContextBuildWorker, NovelForeshadowReviewPostprocessWorker, NovelForeshadowReviewWorker, NovelFrameworkImportWorker, NovelVolumeFrameworkAlignmentWorker, NovelVolumeFrameworkWorker, NovelVolumeHandoffWorker, NovelVolumeIntentWorker, NovelWritingWorker
 
 NOVEL_PERF_LOG_ENABLED = str(os.environ.get("GPT_NOVEL_PERF_LOG", "") or "").strip().lower() in {
     "1",
@@ -307,13 +317,13 @@ _NARRATIVE_STRATEGY_DIALOG_FIELDS = (
     ("pacing_strategy", "节奏策略"),
     ("low_exposition_strategy", "低说明性叙事"),
     ("chapter_variation_pool", "章节变化池"),
-    ("forbidden_drift", "禁止偏移"),
+    ("story_direction", "故事方向"),
 )
 _CHAPTER_PLAN_FOUNDATION_FIELDS = (
-    ("summary", "全书走向总览"),
-    ("core_mainline", "贯穿全书主线"),
-    ("ending_promise", "最终结局与兑现"),
-    ("global_hard_boundaries", "全书硬边界"),
+    ("summary", "故事简介"),
+    ("core_mainline", "核心主线"),
+    ("ending_promise", "结尾承诺"),
+    ("global_hard_boundaries", "写作硬边界"),
 )
 _CHAPTER_PLAN_ARC_FIELDS = (
     ("name", "阶段名称"),
@@ -345,14 +355,13 @@ _CHAPTER_PLAN_OPTIONAL_TEXT_FIELDS = (
     ("planning_method", "规划方式"),
     ("start_state", "开始状态"),
     ("must_happen", "必须发生"),
-    ("forbidden_reveal", "暂缓揭示"),
     ("satisfaction_payoff", "爽点兑现"),
     ("emotional_resonance", "情绪共鸣"),
     ("relationship_change", "关系变化"),
     ("exposition_compression", "说明处理"),
     ("variation_pattern", "变化方式"),
     ("foreshadow_task", "伏笔任务"),
-    ("forbidden", "禁止/边界"),
+    ("story_direction", "故事方向"),
     ("goal", "本章目标"),
     ("main_event", "核心事件"),
     ("conflict", "核心冲突"),
@@ -837,7 +846,7 @@ class VolumeTwoFrameworkDialog(QDialog):
             row = index // 3
             form.addWidget(QLabel(label), row, column)
             form.addWidget(editor, row, column + 1)
-        form.addWidget(QLabel("故事核心"), 2, 0)
+        form.addWidget(QLabel("故事简介"), 2, 0)
         form.addWidget(self.premise_edit, 2, 1, 1, 5)
         root.addLayout(form)
 
@@ -1186,7 +1195,7 @@ class ChapterPlanFoundationDialog(QDialog):
         buttons.setContentsMargins(0, 0, 0, 0)
         regenerate_btn = QPushButton("重新生成")
         regenerate_btn.setObjectName("ghost")
-        regenerate_btn.setToolTip("放弃当前结果，重新生成全书方向和阶段安排")
+        regenerate_btn.setToolTip("放弃当前结果，重新生成章节规划基础和阶段安排")
         regenerate_btn.clicked.connect(lambda: self.done(self.RegenerateResult))
         buttons.addWidget(regenerate_btn)
         buttons.addStretch()
@@ -1213,7 +1222,7 @@ class ChapterPlanFoundationDialog(QDialog):
         title.setObjectName("foundation_title")
         title_row.addWidget(title)
         title_row.addStretch()
-        subtitle = QLabel("确认方向无误后，才开始生成详细章节")
+        subtitle = QLabel("确认规划基础无误后，才开始生成详细章节")
         subtitle.setObjectName("foundation_subtitle")
         title_row.addWidget(subtitle)
         layout.addLayout(title_row)
@@ -1291,17 +1300,17 @@ class ChapterPlanFoundationDialog(QDialog):
 
         heading = QHBoxLayout()
         heading.setContentsMargins(0, 0, 0, 0)
-        title = QLabel("全书方向")
+        title = QLabel("章节规划基础")
         title.setObjectName("foundation_section_title")
         heading.addWidget(title)
         hint = QLabel("只确认有没有明显跑偏，不必逐句审核")
         hint.setObjectName("foundation_section_hint")
         heading.addWidget(hint)
         heading.addStretch()
-        direction_edit_btn = QPushButton("编辑全书方向")
+        direction_edit_btn = QPushButton("编辑章节规划基础")
         direction_edit_btn.setObjectName("ghost")
-        direction_edit_btn.setToolTip("主线、结局或全书禁区有明显偏差时再修改")
-        direction_edit_btn.clicked.connect(self._edit_direction_details)
+        direction_edit_btn.setToolTip("主线、结局或写作边界有明显偏差时再修改")
+        direction_edit_btn.clicked.connect(self._edit_chapter_plan_basics)
         heading.addWidget(direction_edit_btn)
         layout.addLayout(heading)
 
@@ -1367,7 +1376,7 @@ class ChapterPlanFoundationDialog(QDialog):
         )
         primary = str(contract.get("primary_line", "") or "").strip()
         supporting = "、".join(contract.get("supporting_lines", []))
-        text = f"主线：{primary}" if primary else "尚未形成独立创作意图；以全书方向和题材判断为准。"
+        text = f"主线：{primary}" if primary else "尚未形成独立创作意图；请先确认章节规划基础和题材判断。"
         if supporting:
             text += f"  ·  辅助线：{supporting}"
         label.setText(text)
@@ -1384,7 +1393,7 @@ class ChapterPlanFoundationDialog(QDialog):
                 "primary_line": profile.get("primary_story_engine", ""),
                 "supporting_lines": [profile.get("secondary_story_engine", "")],
                 "reading_experience": profile.get("core_reader_promise", ""),
-                "ending_boundaries": profile.get("forbidden_drift", ""),
+                "ending_boundaries": profile.get("story_direction", ""),
                 "source": "chapter_plan_inference",
             })
         dialog = VolumeCreativeIntentDialog(contract, self, volume_mode=False)
@@ -1398,14 +1407,14 @@ class ChapterPlanFoundationDialog(QDialog):
         for key, label in self._quick_value_labels.items():
             label.setText(self._review_text(self._plan.get(key, "")))
 
-    def _edit_direction_details(self):
+    def _edit_chapter_plan_basics(self):
         dialog = QDialog(self)
-        dialog.setWindowTitle("调整全书方向")
+        dialog.setWindowTitle("调整章节规划基础")
         dialog.setMinimumSize(700, 460)
         root = QVBoxLayout(dialog)
         root.setContentsMargins(16, 14, 16, 14)
         root.setSpacing(10)
-        hint = QLabel("只在全书方向有明显偏差时修改。这里的内容会作为后续章节规划的参考。")
+        hint = QLabel("只在章节规划基础有明显偏差时修改。这里的内容会作为后续章节规划的参考。")
         hint.setObjectName("hint")
         hint.setWordWrap(True)
         root.addWidget(hint)
@@ -1450,13 +1459,13 @@ class ChapterPlanFoundationDialog(QDialog):
             ("题材", profile.get("genre_world", "")),
             ("读者期待", profile.get("core_reader_promise", "")),
             ("故事发动机", profile.get("primary_story_engine", "")),
-            ("避免跑偏", profile.get("forbidden_drift", "")),
+            ("故事方向", profile.get("story_direction", "")),
         )
         lines = [
             f"{label}：{self._review_text(value, 48)}"
             for label, value in values if str(value or "").strip()
         ]
-        return "  ·  ".join(lines) or "AI 未给出额外题材判断；以全书方向为准。"
+        return "  ·  ".join(lines) or "AI 未给出额外题材判断；以章节规划基础为准。"
 
     def _refresh_profile_summary(self):
         label = getattr(self, "_profile_summary_label", None)
@@ -1806,6 +1815,8 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
         self._novel_diagnostics_enabled = True
         self._pending_chapter_plan = {}
         self._pending_split_export = {}
+        self._creation_wizard_workspace = None
+        self._creation_wizard_dialogs = {}
         self.current_character_index = -1
         self.current_lore_index = -1
         self.current_foreshadow_index = -1
@@ -1941,7 +1952,7 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
         self.style_profile_combo.setToolTip("选择扩写正文时调用的永久文风档案")
         self.premise_edit = PlainTextEdit()
         self.premise_edit.setFixedHeight(42)
-        self.premise_edit.setPlaceholderText("一句话说明主角、目标、冲突和故事承诺。")
+        self.premise_edit.setPlaceholderText("用几句话说清主角是谁、现在遇到什么事，以及故事会怎样展开。")
 
         for w in (self.title_edit, self.genre_edit, self.style_edit, self.target_words_edit):
             w.textChanged.connect(self._mark_dirty)
@@ -1980,7 +1991,7 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
         premise_layout = QGridLayout()
         premise_layout.setContentsMargins(0, 0, 0, 0)
         premise_layout.setHorizontalSpacing(10)
-        premise_layout.addWidget(QLabel("故事核心"), 0, 0)
+        premise_layout.addWidget(QLabel("故事简介"), 0, 0)
         premise_layout.addWidget(self.premise_edit, 0, 1)
         self.narrative_strategy_btn = self._ghost_button(
             "叙事策略",
@@ -6993,8 +7004,62 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
             return {}
         return _normalize_chapter_plan_foundation(foundation)
 
+    def _chapter_plan_creation_wizard_foundation(self, state):
+        """Reuse the wizard's confirmed stage plan without another planning call."""
+        project = self.current_project if isinstance(getattr(self, "current_project", None), dict) else {}
+        framework = project.get("creation_framework", {})
+        if not isinstance(framework, dict) or framework.get("source") != "creation_wizard":
+            return {}
+        foundation = framework.get("chapter_plan_foundation", {})
+        if not isinstance(foundation, dict) or not foundation:
+            try:
+                foundation = build_chapter_plan_foundation(framework)
+            except Exception as exc:
+                log_debug("恢复向导章节规划基础失败", exc)
+                return {}
+        foundation = _normalize_chapter_plan_foundation(foundation)
+        if not foundation.get("arcs") or not foundation.get("narrative_strategy_profile"):
+            return {}
+
+        for key in ("target_words", "average_chapter_words", "total_chapter_count"):
+            try:
+                value = int(state.get(key, 0) or 0)
+            except (TypeError, ValueError):
+                value = 0
+            if value > 0:
+                foundation[key] = value
+        try:
+            existing_count = max(0, int(state.get("existing_chapter_count", 0) or 0))
+        except (TypeError, ValueError):
+            existing_count = 0
+        foundation["existing_chapter_count"] = existing_count
+        foundation["source"] = "creation_wizard"
+
+        try:
+            total_chapters = int(foundation.get("total_chapter_count", 0) or 0)
+        except (TypeError, ValueError):
+            total_chapters = 0
+        arcs = foundation.get("arcs", [])
+        if total_chapters <= 0 or not isinstance(arcs, list):
+            return {}
+        expected_start = 1
+        for arc in arcs:
+            if not isinstance(arc, dict):
+                return {}
+            try:
+                start = int(arc.get("start_chapter", 0) or 0)
+                end = int(arc.get("end_chapter", 0) or 0)
+            except (TypeError, ValueError):
+                return {}
+            if start != expected_start or end < start:
+                return {}
+            expected_start = end + 1
+        if expected_start - 1 != total_chapters:
+            return {}
+        return foundation
+
     def _chapter_plan_reuse_foundation(self, state, saved_state):
-        """Changing only chapter size does not discard confirmed story direction."""
+        """Changing only chapter size does not discard the confirmed planning foundation."""
         saved_state = saved_state if isinstance(saved_state, dict) else {}
         if not saved_state.get("master_plan") or not saved_state.get("profile_confirmed"):
             return
@@ -7100,7 +7165,7 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
         total_limit = max(6000, int(total_limit or 0))
 
         def size():
-            return len(json.dumps(reference, ensure_ascii=False, indent=2))
+            return len(json.dumps(reference, ensure_ascii=False, separators=(",", ":")))
 
         if size() <= total_limit:
             return reference
@@ -7186,8 +7251,9 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
                 if size() <= total_limit:
                     return reference
             if master:
-                # The master call only needs stage borders and broad direction.
-                # Each batch later receives its own full scoped event range.
+                # The planning-foundation context only needs stage borders and
+                # broad constraints here. Each batch later receives its own
+                # fully scoped event range.
                 reference.pop("stages", None)
             else:
                 reference["stages"] = compact_stages(60)
@@ -7229,6 +7295,28 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
             if isinstance(absolute_range, list) and len(absolute_range) >= 2:
                 result["required_absolute_range"] = deepcopy(absolute_range[:2])
 
+            locked_schedule = source.get("locked_node_schedule", {})
+            if isinstance(locked_schedule, dict):
+                nodes = []
+                for item in locked_schedule.get("nodes", []):
+                    if not isinstance(item, dict):
+                        continue
+                    try:
+                        node_index = int(item.get("n", 0) or 0)
+                        node_range = item.get("range", [])
+                        start = int(node_range[0])
+                        end = int(node_range[1])
+                    except (TypeError, ValueError, IndexError):
+                        continue
+                    if node_index > 0 and start > 0 and end >= start:
+                        nodes.append({"n": node_index, "r": [start, end]})
+                if nodes:
+                    result["locked_node_schedule"] = {
+                        "stage_id": str(locked_schedule.get("stage_id", "") or "").strip(),
+                        "range": deepcopy(locked_schedule.get("range", [])[:2]),
+                        "nodes": nodes,
+                    }
+
             master = source.get("master_plan", {})
             if isinstance(master, dict):
                 compact_master = {}
@@ -7241,16 +7329,25 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
                     text = self._chapter_plan_clip_text(master.get(key, ""), max(120, int(limit * scale)))
                     if text:
                         compact_master[key] = text
-                arcs = _compact_volume_handoff_records(
-                    master.get("arcs", []),
-                    (
+                master_fields = (
+                    ("name", "start_chapter", "end_chapter", "source_stage",
+                     "dominant_line")
+                    if str(master.get("source", "") or "").strip() == "creation_wizard"
+                    else (
                         "name", "start_chapter", "end_chapter", "macro_phase", "source_stage",
                         "dominant_line", "relationship_goal", "end_state", "supporting_lines",
                         "goal", "main_conflict", "turning_points", "reader_payoff",
                         "emotional_arc", "pacing_pattern", "exposition_compression",
                         "variation_plan", "investigation_scope", "forbidden",
-                    ),
+                    )
+                )
+                master_limits = (
                     {
+                        "name": 80, "start_chapter": 20, "end_chapter": 20,
+                        "source_stage": 80, "dominant_line": max(50, int(180 * scale)),
+                    }
+                    if str(master.get("source", "") or "").strip() == "creation_wizard"
+                    else {
                         "name": 80, "start_chapter": 20, "end_chapter": 20, "macro_phase": 60,
                         "source_stage": 80, "dominant_line": max(50, int(180 * scale)),
                         "relationship_goal": max(40, int(140 * scale)), "end_state": max(40, int(140 * scale)),
@@ -7260,9 +7357,14 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
                         "emotional_arc": max(40, int(100 * scale)), "pacing_pattern": max(40, int(100 * scale)),
                         "exposition_compression": max(40, int(100 * scale)), "variation_plan": max(40, int(100 * scale)),
                         "investigation_scope": max(40, int(100 * scale)), "forbidden": max(40, int(100 * scale)),
-                    },
+                    }
+                )
+                arcs = _compact_volume_handoff_records(
+                    master.get("arcs", []),
+                    master_fields,
+                    master_limits,
                     max(1200, int(total_limit * 0.34)),
-                    minimal_fields=("name", "start_chapter", "end_chapter", "dominant_line"),
+                    minimal_fields=("name", "start_chapter", "end_chapter"),
                 )
                 if arcs:
                     compact_master["arcs"] = arcs
@@ -7272,18 +7374,16 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
             ledger = _compact_volume_handoff_records(
                 source.get("planned_chapter_ledger", []),
                 (
-                    "index", "title", "narrative_stage", "source_stage", "dominant_line",
-                    "ending_hook", "source_event_ids",
+                    "index", "title", "characters", "stage_id", "source_event_ids",
                 ),
                 {
-                    "index": 20, "title": 70, "narrative_stage": 60, "source_stage": 70,
-                    "dominant_line": max(40, int(110 * scale)), "ending_hook": max(32, int(80 * scale)),
+                    "index": 20, "title": 70,
                 },
                 # Chapter number + title are the cross-batch identity index.
                 # Keep a floor for that pair so a later compression tier does
                 # not silently turn a 250-chapter ledger into title-only rows.
                 max(12000, int(total_limit * 0.31)),
-                minimal_fields=("index", "title", "source_stage", "source_event_ids"),
+                minimal_fields=("index", "title"),
             )
             if ledger:
                 result["planned_chapter_ledger"] = ledger
@@ -7291,16 +7391,13 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
             tail = _compact_volume_handoff_records(
                 source.get("previous_batch_tail", []),
                 (
-                    "index", "title", "narrative_stage", "source_stage", "dominant_line",
-                    "outline", "characters", "ending_hook", "source_event_ids",
+                    "index", "title", "outline", "characters", "stage_id", "source_event_ids",
                 ),
                 {
-                    "index": 20, "title": 80, "narrative_stage": 70, "source_stage": 80,
-                    "dominant_line": max(50, int(150 * scale)), "outline": max(120, int(600 * scale)),
-                    "ending_hook": max(50, int(160 * scale)),
+                    "index": 20, "title": 80, "outline": max(120, int(650 * scale)),
                 },
                 max(1200, int(total_limit * 0.24)),
-                minimal_fields=("index", "title", "outline", "ending_hook"),
+                minimal_fields=("index", "title", "outline"),
             )
             if tail:
                 result["previous_batch_tail"] = tail
@@ -7312,7 +7409,7 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
 
         for scale in (1.0, 0.7, 0.45, 0.25):
             result = build(scale)
-            if len(json.dumps(result, ensure_ascii=False, indent=2)) <= total_limit:
+            if len(json.dumps(result, ensure_ascii=False, separators=(",", ":"))) <= total_limit:
                 return result
 
         # This final tier is only for damaged or unusually verbose saved state.
@@ -7321,15 +7418,15 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
         result = build(0.16)
         result["planned_chapter_ledger"] = _compact_volume_handoff_records(
             result.get("planned_chapter_ledger", []),
-            ("index", "title", "source_stage", "source_event_ids"),
-            {"index": 20, "title": 48, "source_stage": 48},
+            ("index", "title", "characters", "stage_id", "source_event_ids"),
+            {"index": 20, "title": 48},
             max(1000, int(total_limit * 0.30)),
             minimal_fields=("index", "title"),
         )
         result["previous_batch_tail"] = _compact_volume_handoff_records(
             result.get("previous_batch_tail", []),
-            ("index", "title", "outline", "ending_hook"),
-            {"index": 20, "title": 55, "outline": 180, "ending_hook": 70},
+            ("index", "title", "outline", "characters", "stage_id", "source_event_ids"),
+            {"index": 20, "title": 55, "outline": 180},
             max(1000, int(total_limit * 0.25)),
             minimal_fields=("index", "title", "outline"),
         )
@@ -7341,7 +7438,11 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
         budget = _CHAPTER_PLAN_CONTEXT_CHAR_BUDGET
 
         def render():
-            return str(instruction_prefix or "") + json.dumps(payload, ensure_ascii=False, indent=2)
+            return str(instruction_prefix or "") + json.dumps(
+                payload,
+                ensure_ascii=False,
+                separators=(",", ": "),
+            )
 
         batch_mode = context_mode == "batch"
         if batch_mode and isinstance(payload.get("batch_continuity"), dict):
@@ -7360,6 +7461,11 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
         for key in ("bible", "world_rules", "timeline", "summary"):
             materials[key] = self._chapter_plan_clip_text(materials.get(key, ""), material_limit, keep_tail=key in {"timeline", "summary"})
         payload["project_materials"] = materials
+        if isinstance(payload.get("wizard_framework"), dict):
+            payload["wizard_framework"] = self._chapter_plan_compact_creation_framework_context(
+                payload["wizard_framework"],
+                12000 if batch_mode else 18000,
+            )
         payload["characters"] = _compact_volume_handoff_records(
             payload.get("characters", []),
             ("name", "role", "goal", "secret", "voice", "notes"),
@@ -7373,6 +7479,20 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
             {"name": 90, "type": 40, "description": 160},
             12000 if batch_mode else 16000,
             minimal_fields=("name", "type"),
+        )
+        payload["foreshadows"] = _compact_volume_handoff_records(
+            payload.get("foreshadows", []),
+            (
+                "name", "type", "status", "setup_chapter", "payoff_chapter",
+                "description", "revealed", "remaining_secret",
+            ),
+            {
+                "name": 90, "type": 40, "status": 30,
+                "setup_chapter": 40, "payoff_chapter": 40,
+                "description": 220, "revealed": 160, "remaining_secret": 160,
+            },
+            9000 if batch_mode else 12000,
+            minimal_fields=("name", "type", "description"),
         )
         if isinstance(payload.get("imported_chapter_plan_reference"), dict):
             payload["imported_chapter_plan_reference"] = self._chapter_plan_compact_reference_context(
@@ -7421,6 +7541,11 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
                 1600,
                 keep_tail=key in {"timeline", "summary"},
             )
+        if isinstance(payload.get("wizard_framework"), dict):
+            payload["wizard_framework"] = self._chapter_plan_compact_creation_framework_context(
+                payload["wizard_framework"],
+                7000 if batch_mode else 11000,
+            )
         payload["characters"] = _compact_volume_handoff_records(
             payload.get("characters", []),
             ("name", "role", "goal"),
@@ -7434,6 +7559,13 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
             {"name": 70, "type": 30, "description": 80},
             8000,
             minimal_fields=("name", "type"),
+        )
+        payload["foreshadows"] = _compact_volume_handoff_records(
+            payload.get("foreshadows", []),
+            ("name", "type", "status", "description", "revealed", "remaining_secret"),
+            {"name": 70, "type": 30, "status": 24, "description": 110, "revealed": 80, "remaining_secret": 80},
+            5000 if batch_mode else 7000,
+            minimal_fields=("name", "description"),
         )
         if isinstance(payload.get("imported_chapter_plan_reference"), dict):
             payload["imported_chapter_plan_reference"] = self._chapter_plan_compact_reference_context(
@@ -7462,6 +7594,11 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
             )
             for key in ("bible", "world_rules", "timeline", "summary")
         }
+        if isinstance(payload.get("wizard_framework"), dict):
+            payload["wizard_framework"] = self._chapter_plan_compact_creation_framework_context(
+                payload["wizard_framework"],
+                4000,
+            )
         payload["characters"] = _compact_volume_handoff_records(
             payload.get("characters", []),
             ("name", "role", "goal"),
@@ -7475,6 +7612,13 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
             {"name": 60, "type": 30, "description": 60},
             4000,
             minimal_fields=("name", "type"),
+        )
+        payload["foreshadows"] = _compact_volume_handoff_records(
+            payload.get("foreshadows", []),
+            ("name", "type", "description"),
+            {"name": 60, "type": 24, "description": 80},
+            2600,
+            minimal_fields=("name",),
         )
         payload.pop("existing_chapter_index", None)
         if isinstance(payload.get("existing_chapters"), list):
@@ -7517,6 +7661,11 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
             )
             for key in ("bible", "world_rules", "timeline", "summary")
         }
+        if isinstance(payload.get("wizard_framework"), dict):
+            payload["wizard_framework"] = self._chapter_plan_compact_creation_framework_context(
+                payload["wizard_framework"],
+                2400,
+            )
         payload["characters"] = _compact_volume_handoff_records(
             payload.get("characters", []),
             ("name", "role"),
@@ -7529,6 +7678,13 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
             ("name", "type"),
             {"name": 50, "type": 24},
             2000,
+            minimal_fields=("name",),
+        )
+        payload["foreshadows"] = _compact_volume_handoff_records(
+            payload.get("foreshadows", []),
+            ("name", "type"),
+            {"name": 50, "type": 24},
+            1200,
             minimal_fields=("name",),
         )
         payload.pop("existing_chapter_index", None)
@@ -7557,6 +7713,24 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
         reference = self.current_project.get("imported_chapter_plan_reference", {}) if isinstance(self.current_project, dict) else {}
         if not isinstance(reference, dict):
             return {}
+        semantic_outline_mode = str(
+            reference.get("semantic_outline_mode", "") or ""
+        ).strip().lower()
+        if not semantic_outline_mode:
+            # A complete imported framework keeps the original outline in the
+            # local project.  The planner only needs chapter identity and the
+            # one-shot reuse decision; sending every local outline again is a
+            # large duplicate and does not improve that decision.
+            framework_analysis = self._framework_ai_analysis()
+            if isinstance(framework_analysis, dict):
+                outline_mode = str(
+                    framework_analysis.get("chapter_outline_mode", "") or ""
+                ).strip().lower()
+                mapping_status = str(
+                    framework_analysis.get("local_mapping_status", "") or ""
+                ).strip().lower()
+                if outline_mode == "reuse" and mapping_status in {"mapped", "mapped_by_ai"}:
+                    semantic_outline_mode = "reuse"
         chapters = []
         items = reference.get("chapters", [])
         items = items if isinstance(items, list) else []
@@ -7578,7 +7752,7 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
                 "narrative_stage": self._chapter_plan_clip_text(item.get("narrative_stage", ""), 80),
                 # Do not send imported prose back to AI during semantic reuse.
                 # The local source remains available to the application.
-                "outline": "" if str(reference.get("semantic_outline_mode", "") or "").strip().lower() == "reuse" else self._chapter_plan_clip_text(item.get("outline", ""), 1000),
+                "outline": "" if semantic_outline_mode == "reuse" else self._chapter_plan_clip_text(item.get("outline", ""), 1000),
                 "characters": _normalize_name_list(item.get("characters", [])),
                 "ending_hook": self._chapter_plan_clip_text(item.get("ending_hook", ""), 240),
                 "source_event_ids": [
@@ -7653,8 +7827,8 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
                 "stages.events是可选的阶段剧情节点；完整导入框架通常没有events。"
                 "不要生成source_event_ids，不要复制章节原文或阶段节点；节点只提供故事事实和方向，不是动作清单，"
                 "outline只需自然落实其语义，不得展开成流程步骤。"
-                "stage_index是全书不可越界的原框架阶段边界；当前阶段的扩展章只能深化当前阶段，"
-                "不得提前执行下一阶段的事件、结论或场景。"
+                "stage_index是全书原框架的阶段边界；当前阶段的扩展章先把本阶段的人物、关系和现场后果写完整，"
+                "下一阶段从当前阶段留下的新变化自然接续。"
             ),
             "summary": summary,
         }
@@ -7862,6 +8036,336 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
                 return f"{name}必须保持第{expected_start}-{expected_end}章边界，不能合并、拆分或提前。"
         return ""
 
+    def _chapter_plan_creation_framework_context(self, project):
+        """Expose the wizard's confirmed story facts without sending private state."""
+        framework = project.get("creation_framework", {}) if isinstance(project, dict) else {}
+        if not isinstance(framework, dict) or framework.get("source") != "creation_wizard":
+            return {}
+        premise = framework.get("premise", {})
+        premise = premise if isinstance(premise, dict) else {}
+        premise_context = {}
+        for key, value in premise.items():
+            if isinstance(value, (str, int, float, bool)):
+                text = self._chapter_plan_clip_text(value, 1800)
+                if text:
+                    premise_context[str(key)] = text
+            elif isinstance(value, list):
+                values = [
+                    self._chapter_plan_clip_text(item, 800)
+                    for item in value
+                    if str(item or "").strip()
+                ]
+                if values:
+                    premise_context[str(key)] = values[:40]
+
+        def compact_records(items, fields, item_limit=900, total_limit=10000):
+            rows = []
+            used = 0
+            for item in items if isinstance(items, list) else []:
+                if not isinstance(item, dict):
+                    continue
+                row = {}
+                for key in fields:
+                    value = item.get(key, "")
+                    if isinstance(value, list):
+                        value = [
+                            self._chapter_plan_clip_text(entry, 320)
+                            for entry in value if str(entry or "").strip()
+                        ][:24]
+                    elif isinstance(value, dict):
+                        value = self._chapter_plan_clip_text(
+                            json.dumps(value, ensure_ascii=False, separators=(",", ":")),
+                            item_limit,
+                        )
+                    else:
+                        value = self._chapter_plan_clip_text(value, item_limit)
+                    if value not in (None, "", [], {}):
+                        row[key] = value
+                if not row:
+                    continue
+                row_cost = len(json.dumps(row, ensure_ascii=False))
+                if rows and used + row_cost > total_limit:
+                    break
+                rows.append(row)
+                used += row_cost
+            return rows
+
+        stage_fields = (
+            "id", "name", "start_chapter", "end_chapter", "summary", "main_conflict",
+            "relationship_changes", "world_reveals", "turning_points",
+            "end_state", "entry_state", "exit_state", "carry_over", "ordered_events",
+        )
+        stage_plan = []
+        for item in framework.get("stage_plan", []) if isinstance(framework.get("stage_plan"), list) else []:
+            if not isinstance(item, dict):
+                continue
+            row = {}
+            for key in stage_fields:
+                value = item.get(key, "")
+                if key == "ordered_events":
+                    events = []
+                    for event_index, event in enumerate(
+                        value if isinstance(value, list) else [], 1
+                    ):
+                        if not isinstance(event, dict):
+                            continue
+                        event_row = {
+                            "n": event_index,
+                            "allowed_chapters": event.get("allowed_chapters", []),
+                            "references": event.get("references", []),
+                            "preconditions": event.get("preconditions", []),
+                            "event": self._chapter_plan_clip_text(event.get("event", ""), 900),
+                            "result": self._chapter_plan_clip_text(event.get("result", ""), 700),
+                            "state_delta": event.get("state_delta", {}),
+                        }
+                        events.append(event_row)
+                    if events:
+                        row[key] = events
+                    continue
+                if isinstance(value, list):
+                    values = [
+                        self._chapter_plan_clip_text(entry, 700)
+                        for entry in value
+                        if str(entry or "").strip()
+                    ]
+                    if values:
+                        row[key] = values
+                else:
+                    text = self._chapter_plan_clip_text(value, 1600)
+                    if text:
+                        row[key] = text
+            if row:
+                stage_plan.append(row)
+
+        result = {
+            "source": "creation_wizard",
+            "novel_name": self._chapter_plan_clip_text(framework.get("novel_name", ""), 300),
+            "premise": premise_context,
+            "bible": self._chapter_plan_clip_text(
+                json.dumps(framework.get("bible", {}), ensure_ascii=False, separators=(",", ":")), 6500
+            ),
+            "world_rules": self._chapter_plan_clip_text(
+                json.dumps(framework.get("world_rules", {}), ensure_ascii=False, separators=(",", ":")), 6500
+            ),
+            "characters": compact_records(
+                framework.get("characters", []),
+                ("name", "role", "goal", "secret", "voice", "notes"),
+                item_limit=700,
+                total_limit=9000,
+            ),
+            "lore": compact_records(
+                framework.get("lore", []),
+                ("name", "type", "description", "story_known"),
+                item_limit=750,
+                total_limit=11000,
+            ),
+            "foreshadows": compact_records(
+                framework.get("foreshadows", []),
+                ("code", "name", "status", "setup_chapter", "payoff_chapter", "description", "revealed", "remaining_secret"),
+                item_limit=700,
+                total_limit=9000,
+            ),
+            "book_contract": deepcopy(framework.get("book_contract", {})),
+            "chapter_plan_note": self._chapter_plan_clip_text(
+                framework.get("chapter_plan_note", ""), 2400
+            ),
+            "stage_plan": stage_plan,
+            "total_words": framework.get("total_words", 0),
+            "average_chapter_words": framework.get("average_chapter_words", 0),
+        }
+        if not (
+            result["novel_name"]
+            or result["premise"]
+            or result["chapter_plan_note"]
+            or result["stage_plan"]
+        ):
+            return {}
+        return result
+
+    def _chapter_plan_scope_creation_framework_context(
+        self,
+        value,
+        reference_start_index=None,
+        reference_end_index=None,
+    ):
+        """只给章节规划发送当前阶段的完整事件，其他阶段只保留边界索引。"""
+        source = deepcopy(value if isinstance(value, dict) else {})
+        stages = source.get("stage_plan", [])
+        stages = stages if isinstance(stages, list) else []
+        try:
+            start_index = int(reference_start_index or 0)
+            end_index = int(reference_end_index or 0)
+        except (TypeError, ValueError):
+            start_index, end_index = 0, 0
+        if start_index <= 0 or end_index < start_index:
+            return source
+
+        stage_index = []
+        scoped_stages = []
+        for item in stages:
+            if not isinstance(item, dict):
+                continue
+            try:
+                stage_start = int(item.get("start_chapter", 0) or 0)
+                stage_end = int(item.get("end_chapter", 0) or 0)
+            except (TypeError, ValueError):
+                stage_start, stage_end = 0, 0
+            stage_id = _canonical_chapter_plan_stage_id(item.get("id", ""))
+            stage_index.append({
+                "id": stage_id,
+                "name": self._chapter_plan_clip_text(item.get("name", ""), 120),
+                "start_chapter": stage_start,
+                "end_chapter": stage_end,
+            })
+            if stage_start <= end_index and stage_end >= start_index:
+                scoped_stages.append(deepcopy(item))
+        source["stage_index"] = stage_index
+        source["stage_plan"] = scoped_stages
+        return source
+
+    def _chapter_plan_creation_transport_framework(
+        self,
+        value,
+        reference_start_index=None,
+        reference_end_index=None,
+    ):
+        """去掉向导框架中会在请求顶层再次发送的重复资料。"""
+        source = self._chapter_plan_scope_creation_framework_context(
+            value,
+            reference_start_index,
+            reference_end_index,
+        )
+        if str(source.get("source", "") or "").strip() == "creation_wizard":
+            # 最新的项目资料会在请求顶层发送；阶段规划只需要保留向导
+            # 框架中的阶段边界和当前阶段事件，避免同一资料发送两遍。
+            for key in (
+                "bible", "world_rules", "characters", "lore", "foreshadows",
+                "book_contract",
+            ):
+                source.pop(key, None)
+        return source
+
+    def _chapter_plan_compact_creation_framework_context(self, value, total_limit):
+        source = deepcopy(value if isinstance(value, dict) else {})
+        total_limit = max(1200, int(total_limit or 1200))
+
+        def compact_stage(item, field_limit):
+            if not isinstance(item, dict):
+                return {}
+            row = {}
+            for key in (
+                "name", "start_chapter", "end_chapter", "summary",
+                "main_conflict", "relationship_changes", "world_reveals",
+                "turning_points", "end_state", "entry_state", "exit_state", "carry_over",
+                "ordered_events",
+            ):
+                value = item.get(key, "")
+                if key == "ordered_events":
+                    events = []
+                    for event_index, event in enumerate(value if isinstance(value, list) else [], 1):
+                        if not isinstance(event, dict):
+                            continue
+                        events.append({
+                            "n": event_index,
+                            "allowed_chapters": event.get("allowed_chapters", []),
+                            "references": event.get("references", []),
+                            "event": self._chapter_plan_clip_text(event.get("event", ""), field_limit),
+                            "result": self._chapter_plan_clip_text(event.get("result", ""), field_limit),
+                            "state_delta": event.get("state_delta", {}),
+                        })
+                    if events:
+                        row[key] = events
+                    continue
+                if isinstance(value, list):
+                    values = [
+                        self._chapter_plan_clip_text(entry, field_limit)
+                        for entry in value
+                        if str(entry or "").strip()
+                    ]
+                    if values:
+                        row[key] = values
+                else:
+                    text = self._chapter_plan_clip_text(value, field_limit)
+                    if text:
+                        row[key] = text
+            return row
+
+        stages = source.get("stage_plan", [])
+        stages = stages if isinstance(stages, list) else []
+        stage_limit = max(80, min(1400, total_limit // max(1, len(stages) * 4)))
+        source["stage_plan"] = [
+            row for row in (compact_stage(item, stage_limit) for item in stages) if row
+        ]
+        source["chapter_plan_note"] = self._chapter_plan_clip_text(
+            source.get("chapter_plan_note", ""),
+            max(240, min(2400, total_limit // 8)),
+        )
+        for key, limit in (
+            ("story_synopsis", 2600),
+            ("bible", 3200),
+            ("world_rules", 3200),
+        ):
+            source[key] = self._chapter_plan_clip_text(source.get(key, ""), limit)
+        if isinstance(source.get("book_contract"), dict):
+            source["book_contract"] = {
+                key: [self._chapter_plan_clip_text(item, 280) for item in value[:24]]
+                for key, value in source["book_contract"].items()
+                if isinstance(value, list) and value
+            }
+        premise = source.get("premise", {})
+        if isinstance(premise, dict):
+            source["premise"] = {
+                key: (
+                    [
+                        self._chapter_plan_clip_text(item, max(80, stage_limit))
+                        for item in value
+                        if str(item or "").strip()
+                    ][:20]
+                    if isinstance(value, list)
+                    else self._chapter_plan_clip_text(value, max(120, stage_limit))
+                )
+                for key, value in premise.items()
+                if value not in (None, "", [], {})
+            }
+        rendered = json.dumps(source, ensure_ascii=False, indent=2)
+        if len(rendered) <= total_limit:
+            return source
+
+        source["premise"] = {
+            key: self._chapter_plan_clip_text(value, 180)
+            for key, value in source.get("premise", {}).items()
+            if not isinstance(value, list)
+        }
+        compacted_stages = []
+        for row in source.get("stage_plan", []):
+            if not isinstance(row, dict):
+                continue
+            compacted = {
+                key: row.get(key, "")
+                for key in ("name", "start_chapter", "end_chapter", "summary", "main_conflict", "end_state")
+                if row.get(key, "") not in (None, "")
+            }
+            events = []
+            for event_index, event in enumerate(row.get("ordered_events", []), 1):
+                if not isinstance(event, dict):
+                    continue
+                event_text = self._chapter_plan_clip_text(event.get("event", ""), 420)
+                result_text = self._chapter_plan_clip_text(event.get("result", ""), 280)
+                if not event_text and not result_text:
+                    continue
+                events.append({
+                    "n": event.get("n", event_index),
+                    "allowed_chapters": event.get("allowed_chapters", []),
+                    "event": event_text,
+                    "result": result_text,
+                })
+            if events:
+                compacted["ordered_events"] = events
+            if compacted:
+                compacted_stages.append(compacted)
+        source["stage_plan"] = compacted_stages
+        return source
+
     def _chapter_plan_project_context(
         self,
         target_words,
@@ -7918,13 +8422,22 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
         materials_limit = 3200 if batch_mode else 5000
         character_total_limit = 10000 if batch_mode else 14000
         setting_total_limit = 12000 if batch_mode else 16000
+        foreshadow_total_limit = 10000 if batch_mode else 14000
+        wizard_framework = self._chapter_plan_creation_framework_context(project)
+        creation_wizard_source = bool(wizard_framework)
+        if creation_wizard_source:
+            wizard_framework = self._chapter_plan_creation_transport_framework(
+                wizard_framework,
+                reference_start_index=reference_start_index,
+                reference_end_index=reference_end_index,
+            )
         raw_profile = project.get("narrative_strategy_profile", {})
         raw_profile = raw_profile if isinstance(raw_profile, dict) else {}
         planning_profile = {
             key: deepcopy(raw_profile.get(key))
             for key in (
                 "version", "audience_direction", "genre_world", "core_reader_promise",
-                "primary_story_engine", "secondary_story_engine", "forbidden_drift",
+                "primary_story_engine", "secondary_story_engine", "story_direction",
             )
             if raw_profile.get(key) not in (None, "", [], {})
         }
@@ -7939,20 +8452,8 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
                     "原框架阶段决定内容方向，必须持续到其绝对结束章号；"
                     "通用前10%/中70%/后20%只控制节奏，不能触发题材切换。"
                 ),
-                "strategy_rule": (
-                    "先依据meta中的题材、风格、叙事人称，以及项目自己的读者承诺和故事发动机理解这本小说。"
-                    "规划事实保持准确，outline的讲述口吻也必须属于当前项目，不能换成通用策划说明或统一网文腔。"
-                    "项目资料中的专业、商业、制度和案件内容只是事实参考，只有直接改变人物选择或关系结果时才取用最少部分。"
-                ),
-                "reader_experience_rule": (
-                    "按当前项目已经确认的题材与风格形成阅读感。轻松故事可以从人物偏见、误会、反差和荒诞后果中生出趣味；"
-                    "其他题材顺着自身的悬念、情感、成长或生活质感来讲，不要求不同小说共享同一种节奏和爽点。"
-                    "设定和专业信息只是连续性参考，不要求每章主动使用或解释。"
-                ),
-                "stage_boundary_rule": (
-                    "当前阶段的稀疏节点之间只能深化当前阶段的人物、关系、对抗和后果；"
-                    "不得提前执行下一阶段事件、结论或场景，阶段结束状态放在阶段后部兑现。"
-                ),
+                "stage_boundary_rule": "当前阶段的事件、人物、关系和后果在本阶段自然展开，下一阶段承接上一阶段留下的变化继续发展。",
+                "material_rule": "项目资料是只读事实底稿，不重新生成，不把背景资料自动变成章节任务。",
             },
             "target": {
                 "target_words": int(target_words or 0),
@@ -7985,14 +8486,25 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
                 "pov": meta.get("pov", ""),
                 "target_words": meta.get("target_words", ""),
                 "status": meta.get("status", ""),
-                "premise": self._chapter_plan_clip_text(meta.get("premise", ""), 3000),
+                # The wizard framework already carries the selected premise;
+                # sending meta.premise as well repeats the public synopsis.
+                "premise": (
+                    ""
+                    if creation_wizard_source
+                    else self._chapter_plan_clip_text(meta.get("premise", ""), 3000)
+                ),
             },
             "narrative_strategy_profile": planning_profile,
             "creative_intent_contract": deepcopy(creative_intent_contract),
+            "wizard_framework": wizard_framework,
             "project_materials": {
                 "bible": self._chapter_plan_clip_text(project.get("bible", ""), materials_limit),
                 "world_rules": self._chapter_plan_clip_text(project.get("world_rules", ""), max(2600, materials_limit - 400)),
-                "timeline": self._chapter_plan_clip_text(project.get("timeline", ""), materials_limit, keep_tail=True),
+                "timeline": (
+                    ""
+                    if creation_wizard_source
+                    else self._chapter_plan_clip_text(project.get("timeline", ""), materials_limit, keep_tail=True)
+                ),
                 "summary": self._chapter_plan_clip_text(project.get("summary", ""), materials_limit, keep_tail=True),
             },
             "characters": self._chapter_plan_records(
@@ -8012,6 +8524,18 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
                 keep_tail_fields={"description"},
                 total_limit=setting_total_limit,
                 minimal_fields=("name", "type"),
+            ),
+            "foreshadows": self._chapter_plan_records(
+                project.get("foreshadow_items", []),
+                (
+                    "name", "type", "status", "setup_chapter", "payoff_chapter",
+                    "description", "revealed", "remaining_secret",
+                ),
+                160,
+                800,
+                keep_tail_fields={"description", "revealed", "remaining_secret"},
+                total_limit=foreshadow_total_limit,
+                minimal_fields=("name", "type", "description"),
             ),
             "existing_chapters": existing_chapters,
         }
@@ -8069,7 +8593,7 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
             "请根据以下 JSON 项目档案生成章节规划。只规划 requested_new_chapters 指定数量的新章节；"
             "不要重写已有章节，不要输出正文。"
             "必须先按 creative_intent_contract、planning_contract 和 imported_chapter_plan_reference 决定内容方向；"
-            "再用 target.macro_pacing_rules 判断宏观节奏。宏观节奏不得覆盖原框架阶段。\n\n"
+            "再参考 target.macro_pacing_rules 安排宏观节奏。宏观节奏不得覆盖原框架阶段。\n\n"
             "若存在 imported_chapter_plan_reference，chapters是按绝对章号执行的明确章节约束；"
             "stages.events是阶段有序剧情节点，不得把事件序号直接当作章号。"
             "如果imported_chapter_plan_reference.location_status为pending，"
@@ -8078,14 +8602,26 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
             "每章用source_event_ids列出本章承载的节点ID；一章可承载多个连续节点，扩展章可用空数组。"
             "每个节点只能使用一次、必须位于所属阶段章号范围内并保持原顺序；阶段结束前必须全部覆盖。"
             "凡引用节点，outline必须清楚落实其语义，可以自然改写，不要机械逐字粘贴。"
-            "source_stage必须填写stage_index中当前绝对章号对应的阶段名。\n\n"
+            "当前绝对章号对应的阶段和章节字数由程序根据输入资料确定，不要在返回 JSON 中重复输出source_stage、narrative_stage或target_words。\n\n"
             "若narrative_strategy_profile为空，先从项目资料推导受众方向、题材世界、主副叙事发动机、读者承诺、"
-            "情绪方向和节奏原则；后续规划只能使用这些原则，不得把它们展开成固定场景轮换表或逐章任务。\n\n"
+            "情绪方向和节奏原则；按当前项目已经确认的题材与风格形成阅读感，后续规划只能使用这些原则，"
+            "不得把它们展开成固定场景轮换表或逐章任务。\n\n"
             "若creative_intent_contract非空，它是用户已确认的最高优先级创作方向：主线和结局边界不得被交接资料、"
             "圣经中的旧剧情权重、原框架辅助线或AI重新推断的narrative_strategy_profile替换；辅助线只能推动主线发生变化。\n\n"
-            "注意：结构字段负责守住本章主线、阶段、事件和结尾边界；outline负责用当前小说自己的口吻讲述这一章。"
-            "把meta.genre、meta.style和人物气质真正体现在outline的用词、观察角度和叙述温度里，像作者在讲下一章故事，"
-            "不要像编辑解释本章功能。不要把正文细拆成必须完成的动作、对白、程序或固定拍点；"
+            "如果存在wizard_framework，它与故事简介、小说圣经、世界规则、人物、设定和伏笔共同组成向导已经确认的完整底稿；"
+            "故事底盘和十万字阶段规划已经在向导中完成，这里不要再次生成新的总规划，只写当前批次的具体章节。\n\n"
+            "注意：结构字段负责守住本章主线、阶段、事件和结尾边界；outline负责用当前小说自己的口吻讲述这一章，"
+            "这里只表示事实必须贴合当前题材和人物，不要求生成另一份自然语言版规划；outline同时保留本章给正文扩写使用的具体故事事实。"
+            "章节规划可以使用清楚、稳定、便于执行的结构化表达，不需要像发布简介，也不需要单独生成另一份自然语言版规划。"
+            "outline必须写清人物在哪里、眼前发生了什么、现实阻力是什么、人物做了什么选择或行动、事情造成了什么结果，"
+            "以及章末出现的具体新信息、新决定、新关系变化或新麻烦。不得出现字段名、内部编号、JSON、代码字符、规划过程或工作流程。"
+            "不要像编辑解释本章功能，不要写‘推动剧情、关系推进、制造悬念、完成任务、阶段作用’等空泛任务词，"
+            "不要解释本章意义、主题、节奏、主线、人物弧线或读者效果。"
+            "除非当前题材明确就是办案、破案或调查推理，否则不得把章节写成案卷、办案报告、审查流程或资料处理；不得让抽象说明、流程往来或结论宣告代替人物在现场的行动和冲突。"
+            "输入资料里的抽象总结只作为事实参考，要改写成具体人物、地点、动作、阻力、结果和状态变化；"
+            "人物认知变化必须落到看见、听见、当场反应、决定和现实后果。不要写‘章末留下悬念’或‘读者会继续追问’，直接写章末发生的具体事情。"
+            "每章都要让人物在具体场景中遇到阻力并采取行动；随着章节推进，优先安排人物对抗、关系变化、利益争夺、环境压力、能力试探或突发后果，让读者看到事情正在发生，而不是看到一份事情说明。"
+            "不要把正文细拆成必须完成的动作、对白、程序或固定拍点；结构字段只负责守住事实和顺序，正文扩写时再转换为自然的网络小说叙述语言。"
             "本章相关资料若自然出现在返回内容中，保留其原有语义，不要把它们改写成固定动作清单；"
             "伏笔由扩写正文时根据当时的开放伏笔动态调度。\n\n"
             "如果存在cross_volume_continuity，其中的anchors只是上一卷事实参考：用于避免人物关系、生活分工和既有习惯被写反，"
@@ -8112,7 +8648,7 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
         ]
         summary = str(plan.get("summary", "") or "").strip()
         if summary:
-            lines.extend(["", "全书/阶段规划：", summary])
+            lines.extend(["", "阶段规划摘要：", summary])
         for fallback_index, item in enumerate(chapters, 1):
             if not isinstance(item, dict):
                 continue
@@ -8136,6 +8672,7 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
             )
             if outline:
                 lines.append(outline)
+            lines.extend(self._chapter_plan_structured_blocks(item))
             lines.extend(self._chapter_plan_optional_blocks(item, outline))
             for label, key in (("相关人物", "characters"),):
                 values = _normalize_name_list(item.get(key, []))
@@ -8147,12 +8684,122 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
         return "\n".join(lines).strip()
 
     @staticmethod
+    def _chapter_plan_structured_blocks(item):
+        """Render structured planning facts without exposing Python/JSON syntax."""
+        item = item if isinstance(item, dict) else {}
+        blocks = []
+
+        def text_list(value):
+            return [
+                str(child or "").strip()
+                for child in (value if isinstance(value, list) else [])
+                if str(child or "").strip()
+            ]
+
+        def state_text(value):
+            if not isinstance(value, dict):
+                return ""
+            parts = []
+            location = str(value.get("location", "") or "").strip()
+            characters = text_list(value.get("characters", []))
+            known_facts = text_list(value.get("known_facts", []))
+            if location:
+                parts.append(f"地点：{location}")
+            if characters:
+                parts.append("人物：" + "、".join(characters))
+            if known_facts:
+                parts.append("已知事实：" + "；".join(known_facts))
+            return "；".join(parts)
+
+        start_state = state_text(item.get("start_state", {}))
+        if start_state:
+            blocks.append(f"开始状态：{start_state}")
+
+        scene_lines = []
+        for scene in item.get("scene_chain", []) if isinstance(item.get("scene_chain"), list) else []:
+            if not isinstance(scene, dict):
+                continue
+            parts = []
+            location = str(scene.get("location", "") or "").strip()
+            characters = text_list(scene.get("characters", []))
+            trigger = str(scene.get("trigger", "") or "").strip()
+            action = str(scene.get("action", "") or "").strip()
+            result = str(scene.get("result", "") or "").strip()
+            if location:
+                parts.append(f"地点：{location}")
+            if characters:
+                parts.append("人物：" + "、".join(characters))
+            if trigger:
+                parts.append(f"触发：{trigger}")
+            if action:
+                parts.append(f"行动：{action}")
+            if result:
+                parts.append(f"结果：{result}")
+            if parts:
+                scene_lines.append(f"{len(scene_lines) + 1}. " + "；".join(parts))
+        if scene_lines:
+            blocks.append("场景推进：\n" + "\n".join(scene_lines))
+
+        conflict = item.get("conflict", {})
+        if isinstance(conflict, dict):
+            parts = []
+            source = str(conflict.get("source", "") or "").strip()
+            pressure = str(conflict.get("pressure", "") or "").strip()
+            result = str(conflict.get("result", "") or "").strip()
+            if source:
+                parts.append(f"冲突来源：{source}")
+            if pressure:
+                parts.append(f"现实压力：{pressure}")
+            if result:
+                parts.append(f"冲突结果：{result}")
+            if parts:
+                blocks.append("冲突：" + "；".join(parts))
+
+        required_facts = text_list(item.get("required_facts", []))
+        if required_facts:
+            blocks.append("必须保留的事实：" + "；".join(required_facts))
+        delta = item.get("continuity_delta", {})
+        if isinstance(delta, dict):
+            labels = (
+                ("time_advance", "时间变化"),
+                ("location_changes", "地点变化"),
+                ("knowledge_changes", "认知变化"),
+                ("relationship_changes", "关系变化"),
+                ("object_changes", "物件变化"),
+                ("new_open_threads", "新增问题"),
+                ("closed_threads", "解决问题"),
+            )
+            changes = []
+            for key, label in labels:
+                value = delta.get(key)
+                values = text_list(value) if isinstance(value, list) else []
+                text = "；".join(values) if values else str(value or "").strip()
+                if text:
+                    changes.append(f"{label}：{text}")
+            if changes:
+                blocks.append("状态变化：" + "；".join(changes))
+
+        ending_change = item.get("ending_change", {})
+        if isinstance(ending_change, dict):
+            change_type = str(ending_change.get("type", "") or "").strip()
+            fact = str(ending_change.get("fact", "") or "").strip()
+            if change_type or fact:
+                text = "；".join(
+                    part for part in (f"变化类型：{change_type}" if change_type else "", fact) if part
+                )
+                blocks.append(f"章末变化：{text}")
+        return blocks
+
+    @staticmethod
     def _chapter_plan_optional_blocks(item, existing_text=""):
         item = item if isinstance(item, dict) else {}
         existing_text = str(existing_text or "")
         blocks = []
         for key, label in _CHAPTER_PLAN_OPTIONAL_TEXT_FIELDS:
-            value = str(item.get(key, "") or "").strip()
+            raw_value = item.get(key, "")
+            if isinstance(raw_value, (dict, list, tuple)):
+                continue
+            value = str(raw_value or "").strip()
             if value and value not in existing_text:
                 blocks.append(f"{label}：{value}")
         for key, label in _CHAPTER_PLAN_OPTIONAL_LIST_FIELDS:
@@ -8226,11 +8873,9 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
     def _chapter_plan_stage_batch_ranges(self, state):
         """Return absolute chapter ranges that never cross an explicit source stage.
 
-        ``NovelChapterPlanMasterWorker`` always returns inferred arcs, even when
-        the source project has no stage boundaries.  Therefore stage batching is
-        enabled only when the imported/source framework contains valid stages.
-        The saved master plan remains the source of the normalized boundaries so
-        resumed jobs follow exactly the same plan as the first request.
+        Stage batching is enabled only when the imported/source framework
+        contains valid stages. The saved foundation remains the source of the
+        normalized boundaries so resumed jobs follow the same plan.
         """
         state = state if isinstance(state, dict) else {}
         master_plan = state.get("master_plan", {})
@@ -8356,6 +9001,165 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
         absolute_end = next_start + batch_count - 1
         return batch_count, batch_number, len(ranges), next_start, absolute_end
 
+    def _sanitize_creation_chapter_event_refs(self, chapters, absolute_start):
+        """保留可确认的事件索引，避免辅助字段让整批提纲失败。
+
+        向导阶段事件已经作为完整事实放在章节规划上下文中。模型返回的
+        source_event_ids 只是索引，不能因为模型把索引放偏一章就丢弃已经
+        生成的 outline；越界、重复或未知索引直接移除，正文事实不变。
+        """
+        project = self.current_project if isinstance(getattr(self, "current_project", None), dict) else {}
+        framework = project.get("creation_framework", {})
+        if not isinstance(framework, dict) or framework.get("source") != "creation_wizard":
+            return
+        stages = framework.get("structured_stages", framework.get("stage_plan", []))
+        if not isinstance(stages, list) or not stages:
+            return
+
+        event_by_id = {}
+        event_aliases = {}
+        for stage_index, stage in enumerate(stages, 1):
+            if not isinstance(stage, dict):
+                continue
+            stage_id = _canonical_chapter_plan_stage_id(
+                stage.get("id", ""), f"S{stage_index:02d}"
+            )
+            if not stage_id:
+                continue
+            for event_index, event in enumerate(
+                stage.get("ordered_events", [])
+                if isinstance(stage.get("ordered_events"), list)
+                else [],
+                1,
+            ):
+                if not isinstance(event, dict):
+                    continue
+                raw_event_id = _canonical_chapter_plan_event_id(event.get("id", ""))
+                event_id = raw_event_id
+                if not re.fullmatch(rf"{re.escape(stage_id)}-E\d{{2,4}}", event_id):
+                    event_id = f"{stage_id}-E{event_index:02d}"
+                event_by_id[event_id] = (stage_id, event)
+                event_aliases[event_id] = event_id
+                event_aliases[f"{stage_id}-E{event_index:02d}"] = event_id
+                if raw_event_id:
+                    event_aliases[raw_event_id] = event_id
+
+        seen = set()
+        for offset, chapter in enumerate(chapters if isinstance(chapters, list) else []):
+            if not isinstance(chapter, dict):
+                continue
+            try:
+                chapter_index = int(absolute_start or 1) + offset
+            except (TypeError, ValueError):
+                chapter_index = offset + 1
+            stage_id = _canonical_chapter_plan_stage_id(chapter.get("stage_id", ""))
+            cleaned = []
+            for raw_ref in _normalize_name_list(
+                chapter.get("source_event_ids", chapter.get("event_refs", []))
+            ):
+                event_id = event_aliases.get(
+                    _canonical_chapter_plan_event_id(raw_ref),
+                    _canonical_chapter_plan_event_id(raw_ref),
+                )
+                info = event_by_id.get(event_id)
+                if info is None:
+                    continue
+                event_stage_id, event = info
+                if stage_id and event_stage_id != stage_id:
+                    continue
+                allowed = event.get("allowed_chapters", [])
+                if isinstance(allowed, list) and len(allowed) >= 2:
+                    try:
+                        if not (int(allowed[0]) <= chapter_index <= int(allowed[1])):
+                            continue
+                    except (TypeError, ValueError):
+                        pass
+                if event_id in seen:
+                    continue
+                seen.add(event_id)
+                cleaned.append(event_id)
+            chapter["source_event_ids"] = cleaned
+
+    def _validate_creation_chapter_plan_batch(self, chapters, absolute_start):
+        """Validate wizard event references before a batch is persisted."""
+        project = self.current_project if isinstance(getattr(self, "current_project", None), dict) else {}
+        framework = project.get("creation_framework", {})
+        if not isinstance(framework, dict) or framework.get("source") != "creation_wizard":
+            return ""
+        stages = framework.get("structured_stages", framework.get("stage_plan", []))
+        if not isinstance(stages, list) or not stages:
+            return ""
+        stage_by_id = {}
+        event_by_id = {}
+        event_aliases = {}
+        for stage_index, stage in enumerate(stages, 1):
+            if not isinstance(stage, dict):
+                continue
+            stage_id = _canonical_chapter_plan_stage_id(
+                stage.get("id", ""), f"S{stage_index:02d}"
+            )
+            if not stage_id:
+                continue
+            stage_by_id[stage_id] = stage
+            for event_index, event in enumerate(
+                stage.get("ordered_events", [])
+                if isinstance(stage.get("ordered_events"), list)
+                else [],
+                1,
+            ):
+                if not isinstance(event, dict):
+                    continue
+                raw_event_id = _canonical_chapter_plan_event_id(event.get("id", ""))
+                expected_event_id = f"{stage_id}-E{event_index:02d}"
+                event_id = raw_event_id
+                if not re.fullmatch(
+                    rf"{re.escape(stage_id)}-E\d{{2,4}}", event_id
+                ):
+                    event_id = expected_event_id
+                event_by_id[event_id] = (stage_id, event)
+                event_aliases[expected_event_id] = event_id
+                if raw_event_id:
+                    event_aliases[raw_event_id] = event_id
+        seen_events = set()
+        for offset, chapter in enumerate(chapters if isinstance(chapters, list) else []):
+            if not isinstance(chapter, dict):
+                continue
+            chapter_index = int(absolute_start or 1) + offset
+            stage_id = _canonical_chapter_plan_stage_id(
+                chapter.get("stage_id", "")
+            )
+            if stage_id and stage_id in stage_by_id:
+                stage = stage_by_id[stage_id]
+                try:
+                    start = int(stage.get("start_chapter", 0) or 0)
+                    end = int(stage.get("end_chapter", 0) or 0)
+                except (TypeError, ValueError):
+                    start, end = 0, 0
+                if start and end and not (start <= chapter_index <= end):
+                    return f"第{chapter_index}章引用了不属于当前章节的阶段 {stage_id}。"
+            refs = chapter.get("source_event_ids", chapter.get("event_refs", []))
+            for raw_ref in _normalize_name_list(refs):
+                event_id = event_aliases.get(
+                    _canonical_chapter_plan_event_id(raw_ref),
+                    _canonical_chapter_plan_event_id(raw_ref),
+                )
+                if event_id not in event_by_id:
+                    return f"第{chapter_index}章引用了不存在的阶段事件 {event_id}。"
+                event_stage_id, event = event_by_id[event_id]
+                if stage_id and event_stage_id != stage_id:
+                    return f"第{chapter_index}章把 {event_id} 放到了错误的阶段。"
+                allowed = event.get("allowed_chapters", [])
+                if isinstance(allowed, list) and len(allowed) >= 2:
+                    try:
+                        if not (int(allowed[0]) <= chapter_index <= int(allowed[1])):
+                            return f"第{chapter_index}章超出了 {event_id} 允许的章节范围。"
+                    except (TypeError, ValueError):
+                        pass
+                if event_id in seen_events:
+                    return f"阶段事件 {event_id} 被重复安排。"
+                seen_events.add(event_id)
+        return ""
+
     @staticmethod
     def _chapter_plan_state_batch_size(state):
         state = state if isinstance(state, dict) else {}
@@ -8411,7 +9215,7 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
             "primary_line": profile.get("primary_story_engine", ""),
             "supporting_lines": [supporting] if supporting else [],
             "reading_experience": "；".join(part for part in reading_parts if part),
-            "ending_boundaries": profile.get("forbidden_drift", ""),
+            "ending_boundaries": profile.get("story_direction", ""),
             "source": "chapter_plan_inference",
             "version": "1",
         })
@@ -8440,7 +9244,7 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
     def _validate_chapter_plan_foundation(self, plan):
         plan = plan if isinstance(plan, dict) else {}
         if not str(plan.get("summary", "") or "").strip():
-            return "请先填写全书走向总览。"
+            return "故事简介不能为空。"
         profile = _normalize_narrative_strategy_profile(
             plan.get("narrative_strategy_profile", {})
         )
@@ -8551,7 +9355,7 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
                 state,
                 "已放弃当前规划基础，正在准备重新生成。",
             )
-            self.set_status_tip("正在重新生成全书走向、叙事画像和阶段规划...")
+            self.set_status_tip("正在重新整理章节规划基础和叙事策略...")
             return False
         if action != "confirmed":
             pending_profile = self._save_narrative_strategy_profile(profile, "pending")
@@ -8582,7 +9386,7 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
                 state,
                 "章节规划基础尚未确认。再次点击AI生成章节规划即可继续核对，不会重复调用规划基础API。",
             )
-            self.set_status_tip("已暂停章节规划：等待确认全书走向、叙事画像和阶段规划。")
+            self.set_status_tip("已暂停章节规划：等待确认章节规划基础和叙事策略。")
             return False
 
         master_plan = deepcopy(edited_master_plan)
@@ -8708,8 +9512,173 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
                     lines.append(f"{label}：{value}")
         return "\n".join(line for line in lines if line).strip()
 
+    def _creation_wizard_stage_nodes_for_range(self, batch_start, batch_end):
+        """Return only the current wizard stage nodes needed for placement.
+
+        The placement request must not carry the full novel dossier.  The
+        wizard already produced ordered nodes with chapter windows, so this
+        helper exposes only the current stage's small, actionable slice.
+        """
+        project = self.current_project if isinstance(self.current_project, dict) else {}
+        framework = project.get("creation_framework", {})
+        if not isinstance(framework, dict) or framework.get("source") != "creation_wizard":
+            return {}
+        try:
+            batch_start = int(batch_start or 0)
+            batch_end = int(batch_end or 0)
+        except (TypeError, ValueError):
+            return {}
+        if batch_start <= 0 or batch_end < batch_start:
+            return {}
+
+        def compact_stage_value(value, limit):
+            if isinstance(value, (dict, list)):
+                value = json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+            return self._chapter_plan_clip_text(value, limit)
+
+        stages = framework.get("stage_plan", [])
+        if not isinstance(stages, list):
+            return {}
+        for stage_index, stage in enumerate(stages, 1):
+            if not isinstance(stage, dict):
+                continue
+            try:
+                stage_start = int(stage.get("start_chapter", 0) or 0)
+                stage_end = int(stage.get("end_chapter", 0) or 0)
+            except (TypeError, ValueError):
+                continue
+            if stage_start > batch_start or stage_end < batch_end:
+                continue
+            stage_id = _canonical_chapter_plan_stage_id(
+                stage.get("id", ""), f"S{stage_index:02d}"
+            )
+            raw_events = stage.get("ordered_events", [])
+            raw_events = raw_events if isinstance(raw_events, list) else []
+            nodes = []
+            for event_index, event in enumerate(raw_events, 1):
+                if not isinstance(event, dict):
+                    continue
+                allowed = event.get("allowed_chapters", [])
+                if not isinstance(allowed, (list, tuple)) or len(allowed) < 2:
+                    allowed = [stage_start, stage_end]
+                try:
+                    allowed_start = int(allowed[0] or stage_start)
+                    allowed_end = int(allowed[1] or stage_end)
+                except (TypeError, ValueError):
+                    allowed_start, allowed_end = stage_start, stage_end
+                if allowed_end < batch_start or allowed_start > batch_end:
+                    continue
+                nodes.append({
+                    "n": event_index,
+                    "id": _canonical_chapter_plan_event_id(event.get("id", "")),
+                    "allowed": [max(batch_start, allowed_start), min(batch_end, allowed_end)],
+                    "event": self._chapter_plan_clip_text(event.get("event", ""), 700),
+                    "result": self._chapter_plan_clip_text(event.get("result", ""), 500),
+                })
+            if not nodes:
+                return {}
+            return {
+                "stage_id": stage_id,
+                "stage_name": self._chapter_plan_clip_text(stage.get("name", ""), 120),
+                "stage_summary": compact_stage_value(stage.get("summary", ""), 900),
+                "entry_state": compact_stage_value(stage.get("entry_state", ""), 500),
+                "exit_state": compact_stage_value(stage.get("exit_state", ""), 500),
+                "batch_start": batch_start,
+                "batch_end": batch_end,
+                "nodes": nodes,
+            }
+        return {}
+
+    @staticmethod
+    def _chapter_plan_event_schedule_key(batch_start, batch_end):
+        return f"{int(batch_start or 0)}-{int(batch_end or 0)}"
+
+    def _chapter_plan_saved_event_schedule(self, state, batch_start, batch_end):
+        schedules = state.get("event_schedules", {}) if isinstance(state, dict) else {}
+        if not isinstance(schedules, dict):
+            return {}
+        value = schedules.get(self._chapter_plan_event_schedule_key(batch_start, batch_end), {})
+        return deepcopy(value) if isinstance(value, dict) else {}
+
+    def _chapter_plan_locked_node_schedule(self, state, batch_start, batch_end):
+        source = self._creation_wizard_stage_nodes_for_range(batch_start, batch_end)
+        if not source:
+            return {}
+        saved = self._chapter_plan_saved_event_schedule(state, batch_start, batch_end)
+        placements = saved.get("placements", []) if isinstance(saved, dict) else []
+        placement_map = {}
+        for item in placements if isinstance(placements, list) else []:
+            if not isinstance(item, dict):
+                continue
+            try:
+                placement_map[int(item.get("n", 0) or 0)] = [
+                    int(item.get("a", 0) or 0), int(item.get("b", 0) or 0)
+                ]
+            except (TypeError, ValueError):
+                continue
+        return {
+            "stage_id": source.get("stage_id", ""),
+            "range": [int(batch_start), int(batch_end)],
+            "nodes": [
+                {
+                    "n": int(node.get("n", 0) or 0),
+                    "range": placement_map.get(
+                        int(node.get("n", 0) or 0),
+                        list(node.get("allowed", [batch_start, batch_end]))[:2],
+                    ),
+                }
+                for node in source.get("nodes", [])
+                if isinstance(node, dict)
+            ],
+        }
+
+    def _chapter_plan_event_placement_context(self, stage_data):
+        """Build a small placement-only request envelope."""
+        if not isinstance(stage_data, dict):
+            return ""
+        premise = {}
+        framework = self.current_project.get("creation_framework", {})
+        if isinstance(framework, dict):
+            raw_premise = framework.get("premise", {})
+            if isinstance(raw_premise, dict):
+                for key in ("synopsis", "one_sentence", "main_line", "story_synopsis", "summary", "core_mainline"):
+                    value = self._chapter_plan_clip_text(raw_premise.get(key, ""), 700)
+                    if value:
+                        premise[key] = value
+        payload = {
+            "stage": {
+                "id": stage_data.get("stage_id", ""),
+                "name": stage_data.get("stage_name", ""),
+                "summary": stage_data.get("stage_summary", ""),
+                "entry_state": stage_data.get("entry_state", ""),
+                "exit_state": stage_data.get("exit_state", ""),
+            },
+            "batch": [stage_data.get("batch_start", 0), stage_data.get("batch_end", 0)],
+            "nodes": [
+                {
+                    "n": node.get("n", 0),
+                    "allowed": node.get("allowed", []),
+                    "event": node.get("event", ""),
+                    "result": node.get("result", ""),
+                }
+                for node in stage_data.get("nodes", [])
+                if isinstance(node, dict)
+            ],
+        }
+        if premise:
+            payload["story_anchor"] = premise
+        return (
+            "请根据以下当前阶段资料安排剧情节点的章节范围。只处理节点位置，不重新创作故事。\n"
+            + json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+        )
+
     def _chapter_plan_batch_context(self, state, batch_count):
         generated = state.get("chapters", []) if isinstance(state.get("chapters"), list) else []
+        creation_wizard_project = bool(
+            isinstance(self.current_project, dict)
+            and isinstance(self.current_project.get("creation_framework"), dict)
+            and self.current_project.get("creation_framework", {}).get("source") == "creation_wizard"
+        )
         existing_count = int(state.get("existing_chapter_count", 0) or 0)
         batch_start = existing_count + len(generated) + 1
         batch_end = batch_start + int(batch_count or 0) - 1
@@ -8717,42 +9686,52 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
         for item in generated:
             if not isinstance(item, dict):
                 continue
-            ledger.append({
+            row = {
                 "index": item.get("index", ""),
                 "title": item.get("title", ""),
-                "narrative_stage": item.get("narrative_stage", ""),
-                "source_stage": item.get("source_stage", ""),
-                "dominant_line": item.get("dominant_line", ""),
-                "ending_hook": item.get("ending_hook", ""),
-                "source_event_ids": [
+                "outline": item.get("outline", ""),
+                "characters": item.get("characters", []),
+                "stage_id": item.get("stage_id", ""),
+            }
+            if not creation_wizard_project:
+                row["source_event_ids"] = [
                     _canonical_chapter_plan_event_id(value)
                     for value in _normalize_name_list(item.get("source_event_ids", []))
-                ],
-            })
+                ]
+            ledger.append(row)
         previous_tail = []
         for item in generated[-5:]:
             if not isinstance(item, dict):
                 continue
-            previous_tail.append({
+            row = {
                 key: deepcopy(item.get(key, ""))
                 for key in (
-                    "index", "title", "narrative_stage", "source_stage", "dominant_line",
-                    "outline", "characters", "ending_hook", "source_event_ids",
+                    "index", "title", "outline", "characters", "stage_id",
                 )
-            })
+            }
+            if not creation_wizard_project:
+                row["source_event_ids"] = [
+                    _canonical_chapter_plan_event_id(value)
+                    for value in _normalize_name_list(item.get("source_event_ids", []))
+                ]
+            previous_tail.append(row)
         compact_master_plan = _normalize_chapter_plan_foundation(state.get("master_plan", {}))
         # These are already supplied once at the top level. Keeping only the
-        # confirmed direction and stage map prevents legacy planning fields or
-        # duplicated strategy prose from turning into per-chapter checklists.
+        # confirmed planning foundation and stage map prevents duplicated
+        # strategy prose from turning into per-chapter checklists.
         compact_master_plan.pop("narrative_strategy_profile", None)
         compact_master_plan.pop("creative_intent_contract", None)
+        if compact_master_plan.get("source") == "creation_wizard":
+            # The current stage's events are sent through wizard_framework;
+            # do not send the same structured stage tree again in the ledger.
+            compact_master_plan.pop("structured_stages", None)
         continuity = {
             "required_absolute_range": [batch_start, batch_end],
             "master_plan": compact_master_plan,
             "planned_chapter_ledger": ledger,
             "previous_batch_tail": previous_tail,
             "rules": [
-                "本批必须服从全书阶段总规划，不得把批次结尾写成全书结局。",
+                "本批必须服从已确认的阶段规划，不得把批次结尾写成全书结局。",
                 "第1章的相对index对应required_absolute_range起点，章节数量必须精确。",
                 "承接上一批末章状态，避免重复开局、重复冲突或提前进入后续阶段。",
                 "原框架阶段高于宏观节奏；不得在前10%/中70%边界处切换题材。",
@@ -8761,6 +9740,11 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
                 "上一批末章结尾已经是已发布触发点，下一批第一章必须从新反应、新结果或新阻力开始，不能复播末句、声音、动作落点或结论。",
             ],
         }
+        locked_node_schedule = self._chapter_plan_locked_node_schedule(
+            state, batch_start, batch_end
+        )
+        if locked_node_schedule:
+            continuity["locked_node_schedule"] = locked_node_schedule
         return self._chapter_plan_project_context(
             state.get("target_words", 0),
             state.get("average_chapter_words", 0),
@@ -8796,9 +9780,11 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
         ]
         if state.get("master_plan"):
             if state.get("master_plan", {}).get("source") == "imported_framework":
-                lines.append("规划基础：沿用导入框架和原有阶段，不重新生成全书走向")
+                lines.append("规划基础：沿用导入框架和原有阶段")
+            elif state.get("master_plan", {}).get("source") == "creation_wizard":
+                lines.append("规划基础：沿用向导阶段规划")
             elif bool(state.get("profile_confirmed", False)):
-                lines.append("规划基础：全书走向、叙事策略和阶段规划已确认")
+                lines.append("规划基础：章节规划基础和叙事策略已确认")
             else:
                 lines.append("规划基础：已生成，等待用户确认")
         else:
@@ -8807,35 +9793,244 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
             lines.extend(["", str(message)])
         self.chapter_ai_preview.setPlainText("\n".join(lines))
 
+    def _stop_chapter_plan_without_foundation(self, state):
+        message = (
+            "当前项目没有可用的章节规划基础。请先完成新建向导或导入框架，"
+            "再点击AI章节规划。"
+        )
+        state = deepcopy(state) if isinstance(state, dict) else {}
+        state["status"] = "failed"
+        state["error"] = message
+        state.pop("force_master_regeneration", None)
+        self._chapter_plan_auto_active = False
+        self._chapter_plan_continue_pending = False
+        self._chapter_plan_request_kind = ""
+        self._persist_chapter_plan_generation_state(state)
+        self._show_chapter_plan_generation_progress(state, message)
+        self._set_chapter_ai_actions_enabled(True)
+        self.set_status_tip(message)
+
+    def _start_chapter_plan_event_placement_worker(self, state, stage_data):
+        """Run the small, validated node-placement request for one stage batch."""
+        provider = self._chapter_plan_provider
+        model = self._chapter_plan_model
+        batch_start = int(stage_data.get("batch_start", 0) or 0)
+        batch_end = int(stage_data.get("batch_end", 0) or 0)
+        context = self._chapter_plan_event_placement_context(stage_data)
+        worker = NovelChapterEventPlacementWorker(
+            provider.get("base_url", ""),
+            provider.get("api_key", ""),
+            model,
+            context,
+            stage_data.get("nodes", []),
+            stage_data.get("stage_id", ""),
+            batch_start,
+            batch_end,
+            provider.get("proxy_url", ""),
+            self._provider_proxy_mode(provider),
+        )
+        self._chapter_plan_request_kind = "event_placement"
+        state = deepcopy(state) if isinstance(state, dict) else {}
+        state["status"] = "placing"
+        state.pop("error", None)
+        self._persist_chapter_plan_generation_state(state)
+        self._show_chapter_plan_generation_progress(
+            state,
+            f"正在安排第{batch_start}-{batch_end}章的阶段剧情节点...",
+        )
+        self.chapter_plan_worker = worker
+        worker._chapter_plan_sequence_token = int(
+            getattr(self, "_chapter_plan_sequence_token", 0) or 0
+        )
+        worker._chapter_plan_project_path = self._canonical_project_path(
+            getattr(self, "current_project_path", "")
+        )
+        worker.diagnostic_project_path = worker._chapter_plan_project_path
+        worker.diagnostic_project_title = str(
+            (
+                self.current_project.get("meta", {})
+                if isinstance(self.current_project.get("meta", {}), dict)
+                else {}
+            ).get("title", "")
+            or ""
+        ).strip()
+        self._connect_novel_worker_status(worker)
+        worker.result_ready.connect(self.on_chapter_plan_event_placement_ready)
+        worker.failed.connect(self.on_chapter_plan_failed)
+        worker.finished.connect(self._cleanup_chapter_plan_worker)
+        request_id = self._next_novel_diagnostic_request_id("chapter-plan-placement")
+        diagnostic_started_at = time.perf_counter()
+        self._chapter_plan_diagnostic_request_id = request_id
+        self._chapter_plan_diagnostic_started_at = diagnostic_started_at
+        worker.diagnostic_request_id = request_id
+        worker.diagnostic_started_at = diagnostic_started_at
+        worker.capture_raw_model_output = True
+        worker.diagnostic_stage = "chapter_plan_event_placement"
+        worker.raw_model_output_metadata = {
+            "request_kind": "event_placement",
+            "stage_id": str(stage_data.get("stage_id", "") or ""),
+            "batch_start": batch_start,
+            "batch_end": batch_end,
+            "node_count": len(stage_data.get("nodes", [])),
+        }
+        try:
+            system_prompt_chars = len(str(worker._analysis_prompt() or ""))
+        except Exception:
+            system_prompt_chars = 0
+        self._log_novel_diagnostic(
+            "chapter_plan_request_started",
+            action="chapter_plan_event_placement",
+            request_id=request_id,
+            provider=provider,
+            model=model,
+            request_kind="event_placement",
+            batch_start=batch_start,
+            batch_end=batch_end,
+            node_count=len(stage_data.get("nodes", [])),
+            input_chars=len(str(context or "")),
+            input_utf8_bytes=len(str(context or "").encode("utf-8", errors="replace")),
+            system_prompt_chars=system_prompt_chars,
+        )
+        self._chapter_ai_stop_requested_by_user = False
+        self._set_chapter_ai_actions_enabled(False)
+        self.set_status_tip(f"正在安排第{batch_start}-{batch_end}章的阶段剧情节点...")
+        worker.start()
+
+    def _chapter_plan_event_placement_error(self, state, placement, stage_data):
+        if not isinstance(placement, dict) or not isinstance(stage_data, dict):
+            return "节点安排结果为空。"
+        expected_nodes = stage_data.get("nodes", [])
+        placements = placement.get("placements", [])
+        if not isinstance(expected_nodes, list) or not expected_nodes:
+            return "当前阶段没有可安排的剧情节点。"
+        if not isinstance(placements, list) or len(placements) != len(expected_nodes):
+            return f"节点安排数量不一致：需要{len(expected_nodes)}项，实际{len(placements) if isinstance(placements, list) else 0}项。"
+        by_number = {}
+        for item in placements:
+            if not isinstance(item, dict):
+                return "节点安排中存在无效项目。"
+            try:
+                number = int(item.get("n", 0) or 0)
+                start = int(item.get("a", 0) or 0)
+                end = int(item.get("b", 0) or 0)
+            except (TypeError, ValueError):
+                return "节点安排缺少有效的节点序号或章节范围。"
+            if number != len(by_number) + 1:
+                return "节点序号必须按输入顺序返回。"
+            if number in by_number or not (1 <= number <= len(expected_nodes)):
+                return "节点序号必须从1连续递增且不能重复。"
+            if start < int(stage_data.get("batch_start", 0) or 0) or end > int(stage_data.get("batch_end", 0) or 0) or start > end:
+                return f"节点{number}超出了当前批次章节范围。"
+            node = expected_nodes[number - 1] if number <= len(expected_nodes) else {}
+            allowed = node.get("allowed", []) if isinstance(node, dict) else []
+            if isinstance(allowed, list) and len(allowed) >= 2:
+                try:
+                    if start < int(allowed[0]) or end > int(allowed[1]):
+                        return f"节点{number}超出了原定范围第{allowed[0]}-{allowed[1]}章。"
+                except (TypeError, ValueError):
+                    pass
+            by_number[number] = (start, end)
+        if set(by_number) != set(range(1, len(expected_nodes) + 1)):
+            return "节点安排没有覆盖全部节点。"
+        previous_start = int(stage_data.get("batch_start", 0) or 0)
+        for number in range(1, len(expected_nodes) + 1):
+            start, _end = by_number[number]
+            if start < previous_start:
+                return "节点安排顺序被打乱。"
+            previous_start = start
+        return ""
+
+    def on_chapter_plan_event_placement_ready(self, placement):
+        if not self._chapter_plan_callback_is_current():
+            return
+        stage_data = self._creation_wizard_stage_nodes_for_range(
+            placement.get("batch_start", 0) if isinstance(placement, dict) else 0,
+            placement.get("batch_end", 0) if isinstance(placement, dict) else 0,
+        )
+        error = self._chapter_plan_event_placement_error(
+            self.current_project.get("chapter_plan_generation_state", {}),
+            placement,
+            stage_data,
+        )
+        if error:
+            self.on_chapter_plan_failed(f"阶段剧情节点安排校验失败：{error}")
+            return
+        state = deepcopy(self.current_project.get("chapter_plan_generation_state", {}))
+        if not isinstance(state, dict) or not state:
+            self.on_chapter_plan_failed("章节规划进度状态丢失，无法保存节点安排。")
+            return
+        schedules = state.get("event_schedules", {})
+        schedules = deepcopy(schedules) if isinstance(schedules, dict) else {}
+        key = self._chapter_plan_event_schedule_key(
+            placement.get("batch_start", 0), placement.get("batch_end", 0)
+        )
+        schedules[key] = deepcopy(placement)
+        state["event_schedules"] = schedules
+        state["status"] = "generating"
+        state.pop("error", None)
+        self._persist_chapter_plan_generation_state(state)
+        self._show_chapter_plan_generation_progress(
+            state,
+            f"第{placement.get('batch_start', 0)}-{placement.get('batch_end', 0)}章节点已锁定，正在生成章节提纲...",
+        )
+        self._queue_chapter_plan_continuation()
+
     def _start_chapter_plan_worker_for_state(self, state):
         if not getattr(self, "_chapter_plan_auto_active", False):
             return
-        if (not state.get("chapters") and not int(state.get("existing_chapter_count", 0) or 0)
-                and not state.get("force_master_regeneration")):
-            self._chapter_plan_restore_imported_reference()
-            foundation = self._chapter_plan_imported_foundation(state)
-            if foundation:
+        if not state.get("chapters") and not int(state.get("existing_chapter_count", 0) or 0):
+            creation_foundation = self._chapter_plan_creation_wizard_foundation(state)
+            if creation_foundation:
                 state = deepcopy(state)
-                state["master_plan"] = foundation
+                state["master_plan"] = creation_foundation
                 state["profile_confirmed"] = True
-                state["narrative_strategy_profile"] = deepcopy(foundation.get("narrative_strategy_profile", {}))
-                state["foundation_hash"] = self._chapter_plan_foundation_hash(foundation)
-                self.current_project["chapter_plan_foundation"] = deepcopy(foundation)
-                # The imported author framework is already the user's direction.
-                # No extra confirmation/API task is needed for a local projection.
-                if foundation.get("narrative_strategy_profile"):
-                    self._save_narrative_strategy_profile(foundation["narrative_strategy_profile"])
+                state["narrative_strategy_profile"] = deepcopy(
+                    creation_foundation.get("narrative_strategy_profile", {})
+                )
+                state["creative_intent_contract"] = deepcopy(
+                    creation_foundation.get("creative_intent_contract", {})
+                )
+                state["foundation_hash"] = self._chapter_plan_foundation_hash(creation_foundation)
+                state.pop("force_master_regeneration", None)
+                self.current_project["chapter_plan_foundation"] = deepcopy(creation_foundation)
+                if creation_foundation.get("narrative_strategy_profile"):
+                    self._save_narrative_strategy_profile(
+                        creation_foundation["narrative_strategy_profile"]
+                    )
                 self._persist_chapter_plan_generation_state(state)
+            elif not state.get("force_master_regeneration"):
+                self._chapter_plan_restore_imported_reference()
+                foundation = self._chapter_plan_imported_foundation(state)
+                if foundation:
+                    state = deepcopy(state)
+                    state["master_plan"] = foundation
+                    state["profile_confirmed"] = True
+                    state["narrative_strategy_profile"] = deepcopy(foundation.get("narrative_strategy_profile", {}))
+                    state["foundation_hash"] = self._chapter_plan_foundation_hash(foundation)
+                    self.current_project["chapter_plan_foundation"] = deepcopy(foundation)
+                    # The imported author framework is already the user's
+                    # confirmed planning foundation.
+                    # No extra confirmation/API task is needed for a local projection.
+                    if foundation.get("narrative_strategy_profile"):
+                        self._save_narrative_strategy_profile(foundation["narrative_strategy_profile"])
+                    self._persist_chapter_plan_generation_state(state)
         if state.get("master_plan") and not bool(state.get("profile_confirmed", False)):
-            if not self._confirm_chapter_plan_strategy_profile(state):
-                if getattr(self, "_chapter_plan_foundation_regenerate_pending", False):
-                    self._chapter_plan_foundation_regenerate_pending = False
-                    state = deepcopy(self.current_project.get("chapter_plan_generation_state", {}))
-                else:
-                    self._set_chapter_ai_actions_enabled(True)
-                    return
+            source = str(state.get("master_plan", {}).get("source", "") or "").strip()
+            if source in {"creation_wizard", "imported_framework"}:
+                state = deepcopy(state)
+                state["profile_confirmed"] = True
+                state["status"] = "pending"
+                self._persist_chapter_plan_generation_state(state)
             else:
-                state = deepcopy(self.current_project.get("chapter_plan_generation_state", {}))
+                state = deepcopy(state)
+                state["master_plan"] = {}
+                state["profile_confirmed"] = False
+                self.current_project["chapter_plan_foundation"] = {}
+                self._stop_chapter_plan_without_foundation(state)
+                return
+        if not state.get("master_plan"):
+            self._stop_chapter_plan_without_foundation(state)
+            return
         generated = state.get("chapters", []) if isinstance(state.get("chapters"), list) else []
         requested = int(state.get("requested_chapter_count", 0) or 0)
         remaining = max(0, requested - len(generated))
@@ -8860,58 +10055,66 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
         total_batches = 0
         absolute_start = 0
         absolute_end = 0
-        if not state.get("master_plan"):
-            self._chapter_plan_request_kind = "master"
-            context = self._chapter_plan_project_context(
-                state.get("target_words", 0),
-                state.get("average_chapter_words", 0),
-                state.get("total_chapter_count", 0),
-                requested,
+        (
+            batch_count,
+            batch_number,
+            total_batches,
+            absolute_start,
+            absolute_end,
+        ) = self._chapter_plan_next_batch_info(state)
+        if batch_count <= 0:
+            self.on_chapter_plan_failed("章节规划批次范围计算失败，请重试。")
+            return
+        stage_data = self._creation_wizard_stage_nodes_for_range(
+            absolute_start, absolute_end
+        )
+        if stage_data:
+            saved_schedule = self._chapter_plan_saved_event_schedule(
+                state, absolute_start, absolute_end
             )
-            worker = NovelChapterPlanMasterWorker(
-                provider.get("base_url", ""),
-                provider.get("api_key", ""),
-                model,
-                context,
-                state.get("target_words", 0),
-                state.get("average_chapter_words", 0),
-                state.get("total_chapter_count", 0),
-                state.get("existing_chapter_count", 0),
-                provider.get("proxy_url", ""),
-                self._provider_proxy_mode(provider),
+            schedule_error = (
+                self._chapter_plan_event_placement_error(state, saved_schedule, stage_data)
+                if saved_schedule else ""
             )
-            status = "正在读取已有故事，补齐继续写作所缺的内容..."
-        else:
-            (
-                batch_count,
-                batch_number,
-                total_batches,
-                absolute_start,
-                absolute_end,
-            ) = self._chapter_plan_next_batch_info(state)
-            if batch_count <= 0:
-                self.on_chapter_plan_failed("章节规划批次范围计算失败，请重试。")
+            if schedule_error:
+                state = deepcopy(state)
+                schedules = state.get("event_schedules", {})
+                schedules = deepcopy(schedules) if isinstance(schedules, dict) else {}
+                schedules.pop(
+                    self._chapter_plan_event_schedule_key(absolute_start, absolute_end),
+                    None,
+                )
+                state["event_schedules"] = schedules
+                self._persist_chapter_plan_generation_state(state)
+                saved_schedule = {}
+            if not saved_schedule:
+                self._start_chapter_plan_event_placement_worker(state, stage_data)
                 return
-            self._chapter_plan_request_kind = "batch"
-            context = self._chapter_plan_batch_context(state, batch_count)
-            worker = NovelChapterPlanWorker(
-                provider.get("base_url", ""),
-                provider.get("api_key", ""),
-                model,
-                context,
-                state.get("target_words", 0),
-                state.get("average_chapter_words", 0),
-                batch_count,
-                state.get("total_chapter_count", 0),
-                int(state.get("existing_chapter_count", 0) or 0) + len(generated),
-                provider.get("proxy_url", ""),
-                self._provider_proxy_mode(provider),
-                batch_number=batch_number,
-                total_batches=total_batches,
-            )
-            status = f"正在规划第{absolute_start}-{absolute_end}章，共{state.get('total_chapter_count', 0)}章..."
-            if state.get("master_plan", {}).get("source") == "imported_framework":
-                status = "已读取原框架，" + status
+        self._chapter_plan_request_kind = "batch"
+        context = self._chapter_plan_batch_context(state, batch_count)
+        worker = NovelChapterPlanWorker(
+            provider.get("base_url", ""),
+            provider.get("api_key", ""),
+            model,
+            context,
+            state.get("target_words", 0),
+            state.get("average_chapter_words", 0),
+            batch_count,
+            state.get("total_chapter_count", 0),
+            int(state.get("existing_chapter_count", 0) or 0) + len(generated),
+            provider.get("proxy_url", ""),
+            self._provider_proxy_mode(provider),
+            batch_number=batch_number,
+            total_batches=total_batches,
+            creation_wizard_mode=bool(stage_data),
+            locked_node_schedule=(
+                self._chapter_plan_locked_node_schedule(state, absolute_start, absolute_end)
+                if stage_data else {}
+            ),
+        )
+        status = f"正在规划第{absolute_start}-{absolute_end}章，共{state.get('total_chapter_count', 0)}章..."
+        if state.get("master_plan", {}).get("source") == "imported_framework":
+            status = "已读取原框架，" + status
 
         state["status"] = "generating"
         state.pop("error", None)
@@ -8924,6 +10127,15 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
         worker._chapter_plan_project_path = self._canonical_project_path(
             getattr(self, "current_project_path", "")
         )
+        worker.diagnostic_project_path = worker._chapter_plan_project_path
+        worker.diagnostic_project_title = str(
+            (
+                self.current_project.get("meta", {})
+                if isinstance(self.current_project.get("meta", {}), dict)
+                else {}
+            ).get("title", "")
+            or ""
+        ).strip()
         self._connect_novel_worker_status(worker)
         worker.result_ready.connect(self.on_chapter_plan_ready)
         worker.failed.connect(self.on_chapter_plan_failed)
@@ -8934,6 +10146,16 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
         self._chapter_plan_diagnostic_started_at = diagnostic_started_at
         worker.diagnostic_request_id = request_id
         worker.diagnostic_started_at = diagnostic_started_at
+        worker.capture_raw_model_output = True
+        worker.diagnostic_stage = "chapter_plan"
+        worker.raw_model_output_metadata = {
+            "request_kind": str(self._chapter_plan_request_kind or "batch"),
+            "batch_number": int(batch_number or 0),
+            "total_batches": int(total_batches or 0),
+            "absolute_start": int(absolute_start or 0),
+            "absolute_end": int(absolute_end or 0),
+            "batch_count": int(batch_count or 0),
+        }
         try:
             system_prompt_chars = len(str(worker._analysis_prompt() or ""))
         except Exception:
@@ -9093,75 +10315,6 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
         if not isinstance(state, dict) or not state:
             self.on_chapter_plan_failed("章节规划进度状态丢失。")
             return
-        kind = str(getattr(self, "_chapter_plan_request_kind", "") or "")
-        if kind == "master":
-            if not isinstance(plan, dict) or not plan.get("arcs"):
-                self.on_chapter_plan_failed("AI 没有返回可用全书阶段规划。")
-                return
-            plan = deepcopy(plan)
-            for arc in plan.get("arcs", []):
-                if not isinstance(arc, dict):
-                    continue
-                source_stage = self._chapter_plan_source_stage_for_index(arc.get("start_chapter", 0))
-                if source_stage and int(source_stage.get("end_chapter", 0) or 0) == int(arc.get("end_chapter", 0) or 0):
-                    arc["source_stage"] = source_stage.get("name", "")
-                    if not str(arc.get("name", "") or "").strip():
-                        arc["name"] = source_stage.get("name", "")
-            reference_error = self._chapter_plan_master_reference_error(plan)
-            if reference_error:
-                self.on_chapter_plan_failed(f"原始框架阶段边界校验失败：{reference_error}")
-                return
-            strategy_profile = plan.get("narrative_strategy_profile", {})
-            strategy_profile = _normalize_narrative_strategy_profile(strategy_profile)
-            if not strategy_profile:
-                self.on_chapter_plan_failed("AI 没有返回可供确认的叙事策略画像。")
-                return
-            contract = _normalize_creative_intent_contract(
-                self.current_project.get("creative_intent_contract", {})
-                if isinstance(getattr(self, "current_project", None), dict) else {}
-            )
-            if not contract:
-                contract = self._creative_intent_contract_from_profile(strategy_profile)
-                if contract:
-                    contract["source"] = "chapter_plan_inference"
-            if contract:
-                plan["creative_intent_contract"] = deepcopy(contract)
-                state["creative_intent_contract"] = deepcopy(contract)
-                self.current_project["creative_intent_contract"] = deepcopy(contract)
-            strategy_profile = self._save_narrative_strategy_profile(strategy_profile, "pending")
-            plan["narrative_strategy_profile"] = deepcopy(strategy_profile)
-            state["narrative_strategy_profile"] = deepcopy(strategy_profile)
-            state["profile_confirmed"] = False
-            state["profile_hash"] = self._narrative_strategy_profile_hash(strategy_profile)
-            if plan.get("foundation_mode") == "reuse":
-                plan["source"] = "imported_framework"
-                plan["source_hash"] = self._framework_import_source().get("sha256", "")
-                state["master_plan"] = plan
-                state["profile_confirmed"] = True
-                state["status"] = "pending"
-                state["narrative_strategy_profile"] = deepcopy(plan.get("narrative_strategy_profile", {}))
-                self.current_project["chapter_plan_foundation"] = deepcopy(plan)
-                if plan.get("narrative_strategy_profile"):
-                    self._save_narrative_strategy_profile(plan["narrative_strategy_profile"])
-                self._persist_chapter_plan_generation_state(state)
-                self._show_chapter_plan_generation_progress(state, "已读取原有故事，接下来逐章判断细纲是否可以沿用。")
-                self._queue_chapter_plan_continuation()
-                return
-            state["master_plan"] = plan
-            state["status"] = "awaiting_profile_confirmation"
-            self._persist_chapter_plan_generation_state(state)
-            self._show_chapter_plan_generation_progress(state, "章节规划基础已生成，请核对全书走向、叙事策略和阶段规划。")
-            if self._confirm_chapter_plan_strategy_profile(state):
-                confirmed_state = deepcopy(self.current_project.get("chapter_plan_generation_state", {}))
-                self._show_chapter_plan_generation_progress(
-                    confirmed_state,
-                    "章节规划基础已确认，正在准备第一批详细章节。",
-                )
-                self._queue_chapter_plan_continuation()
-            elif getattr(self, "_chapter_plan_foundation_regenerate_pending", False):
-                self._chapter_plan_foundation_regenerate_pending = False
-                self._queue_chapter_plan_continuation()
-            return
         chapters = (plan or {}).get("chapters", []) if isinstance(plan, dict) else []
         if not chapters:
             self.on_chapter_plan_failed("AI 没有返回可用章节规划。")
@@ -9183,6 +10336,12 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
             self.on_chapter_plan_failed(f"章节规划数量不一致：需要{expected}章，实际{len(chapters)}章。")
             return
         absolute_start = int(state.get("existing_chapter_count", 0) or 0) + len(generated) + 1
+        creation_wizard_batch = bool(
+            self._creation_wizard_stage_nodes_for_range(
+                absolute_start,
+                absolute_start + expected - 1,
+            )
+        )
         _catalog, _stages, explicit = self._chapter_plan_event_reference()
         incoming = []
         for offset, item in enumerate(chapters):
@@ -9191,10 +10350,17 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
             source_stage = self._chapter_plan_source_stage_for_index(chapter["index"])
             if source_stage:
                 chapter["source_stage"] = source_stage.get("name", "")
-            chapter["source_event_ids"] = [
-                _canonical_chapter_plan_event_id(value)
-                for value in _normalize_name_list(chapter.get("source_event_ids", []))
-            ]
+                chapter["stage_id"] = source_stage.get("id", "")
+            if creation_wizard_batch:
+                # The wizard schedule is validated in its own request.  The
+                # outline request must not invent a second per-chapter event
+                # index; chapter order and stage are assigned locally.
+                chapter["source_event_ids"] = []
+            else:
+                chapter["source_event_ids"] = [
+                    _canonical_chapter_plan_event_id(value)
+                    for value in _normalize_name_list(chapter.get("source_event_ids", []))
+                ]
             explicit_item = explicit.get(chapter["index"], {})
             reference = self.current_project.get("imported_chapter_plan_reference", {})
             reference = reference if isinstance(reference, dict) else {}
@@ -9215,10 +10381,15 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
             # back to generation, even if the model emitted a bad flag.
             chapter = self._chapter_plan_apply_imported_outline(chapter, explicit_item)
             incoming.append(chapter)
-        assignment_error = self._chapter_plan_event_assignment_error(generated, incoming)
-        if assignment_error:
-            self.on_chapter_plan_failed(f"原始框架事件覆盖校验失败：{assignment_error}")
-            return
+        if not creation_wizard_batch:
+            structured_error = self._validate_creation_chapter_plan_batch(incoming, absolute_start)
+            if structured_error:
+                self.on_chapter_plan_failed(f"向导阶段事件校验失败：{structured_error}")
+                return
+            assignment_error = self._chapter_plan_event_assignment_error(generated, incoming)
+            if assignment_error:
+                self.on_chapter_plan_failed(f"原始框架事件覆盖校验失败：{assignment_error}")
+                return
         generated.extend(incoming)
         state["chapters"] = generated
         state["status"] = "complete" if len(generated) >= int(state.get("requested_chapter_count", 0) or 0) else "generating"
@@ -9247,7 +10418,7 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
         self._log_novel_diagnostic(
             "chapter_plan_continuation_scheduled",
             action="chapter_plan_continue",
-            request_kind="batch" if state.get("master_plan") else "master",
+            request_kind="batch",
             generated_before=generated,
             requested_chapter_count=int(state.get("requested_chapter_count", 0) or 0),
         )
@@ -9395,11 +10566,20 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
                 _canonical_chapter_plan_event_id(value)
                 for value in _normalize_name_list(item.get("source_event_ids", []))
             ]
+            chapter["chapter_plan_structured"] = {
+                "stage_id": str(item.get("stage_id", "") or "").strip().upper(),
+                "start_state": deepcopy(item.get("start_state", {})) if isinstance(item.get("start_state"), dict) else {},
+                "scene_chain": deepcopy(item.get("scene_chain", [])) if isinstance(item.get("scene_chain"), list) else [],
+                "conflict": deepcopy(item.get("conflict", {})) if isinstance(item.get("conflict"), dict) else {},
+                "required_facts": _normalize_name_list(item.get("required_facts", [])),
+                "continuity_delta": deepcopy(item.get("continuity_delta", {})) if isinstance(item.get("continuity_delta"), dict) else {},
+                "ending_change": deepcopy(item.get("ending_change", {})) if isinstance(item.get("ending_change"), dict) else {},
+            }
             chapter["status"] = "大纲"
             chapters.append(chapter)
         plan_summary = str(plan.get("summary", "") or "").strip()
         if plan_summary:
-            note_block = f"全书/阶段规划：\n{plan_summary}"
+            note_block = f"阶段规划摘要：\n{plan_summary}"
             current_note = str(self.current_project.get("draft_note", "") or "").strip()
             if plan_summary not in current_note:
                 self.current_project["draft_note"] = f"{current_note}\n\n{note_block}".strip() if current_note else note_block
@@ -15083,9 +16263,52 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
             f"资料草案 {material_text}；已清理候选 {removed_candidates}；已标记分析 {analyzed_count} 章{status_tail}{failed_tail}"
         )
 
+    def _recover_creation_wizard_project_from_draft(self, data, path):
+        """把完成但尚未落盘为正式项目的向导草稿恢复出来。"""
+        if path and os.path.abspath(str(path)) != os.path.abspath(str(NOVEL_DRAFT_FILE)):
+            return data, path, False
+        payload = creation_wizard_payload_from_project_draft(data)
+        if not payload:
+            return data, path, False
+        framework = payload.get("creation_framework", {})
+        premise = framework.get("premise", {}) if isinstance(framework, dict) else {}
+        title = _safe_name(
+            framework.get("novel_name", "") if isinstance(framework, dict) else ""
+        ) or _safe_name(
+            premise.get("title", "") if isinstance(premise, dict) else ""
+        ) or "未命名小说"
+
+        # 如果正式项目已经存在，直接打开它，避免启动时重复生成同名项目。
+        for record in list_project_summaries():
+            if _safe_name(record.get("title", "")) != title:
+                continue
+            existing_path = str(record.get("path", "") or "").strip()
+            existing_data = load_json_file(existing_path, {})
+            if isinstance(existing_data, dict):
+                remember_project_path(existing_path)
+                save_draft_project(existing_data)
+                return existing_data, existing_path, True
+
+        try:
+            recovered_data = self._apply_creation_wizard_payload(
+                _default_project(),
+                payload,
+            )
+            project_path = unique_project_path(title)
+            save_project_file(project_path, recovered_data)
+            remember_project_path(project_path)
+            save_draft_project(recovered_data)
+            return recovered_data, project_path, True
+        except Exception as exc:
+            log_debug("恢复新建向导项目失败", exc)
+            return data, path, False
+
     def _load_initial_project(self):
         data, path = load_initial_project_data()
+        data, path, recovered = self._recover_creation_wizard_project_from_draft(data, path)
         self._load_project_data(data, path)
+        if recovered:
+            self.set_status_tip("已从自动草稿恢复新建向导资料，并保存到项目列表。")
         self.refresh_project_list()
 
     def _autosave_draft(self):
@@ -15347,6 +16570,23 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
         framework = payload.get("creation_framework", {})
         framework = deepcopy(framework) if isinstance(framework, dict) else {}
         premise = framework.get("premise", {}) if isinstance(framework.get("premise", {}), dict) else {}
+        normalized_framework = normalize_creation_result(
+            "bible",
+            framework,
+            allow_power_levels=story_requires_explicit_power_levels(
+                premise,
+                framework.get("world_rules", {}),
+                framework.get("lore", []),
+            ),
+            total_words=framework.get("total_words", 500000),
+            average_chapter_words=framework.get("average_chapter_words", 3000),
+        )
+        for key in ("bible", "world_rules", "characters", "lore", "foreshadows"):
+            framework[key] = deepcopy(normalized_framework.get(key, {} if key in {"bible", "world_rules"} else []))
+        # 旧版本把势力、场景和能力体系放在独立字段；标准化后它们已经
+        # 进入 lore，项目里不再保留第二套同义数据。
+        for key in ("ability_system", "factions", "relationship_map", "key_scenes"):
+            framework.pop(key, None)
         bible = framework.get("bible", {})
         world_rules = framework.get("world_rules", {})
         characters = framework.get("characters", []) if isinstance(framework.get("characters", []), list) else []
@@ -15370,11 +16610,15 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
         data["bible"] = format_creation_text(bible, "小说圣经")
         data["world_rules"] = format_creation_text(world_rules, "世界规则")
         data["summary"] = str(premise.get("synopsis", "") or "").strip()
-        data["timeline"] = format_creation_text({
-            "全书走向": framework.get("global_direction", ""),
-            "阶段规划": stage_plan,
-            "章节规划提示": framework.get("chapter_plan_note", ""),
-        }, "阶段规划")
+        data["timeline"] = format_creation_preview(
+            "stage_plan",
+            {
+                "stage_skeleton": framework.get("stage_skeleton", []),
+                "book_contract": framework.get("book_contract", {}),
+                "stage_plan": stage_plan,
+                "chapter_plan_note": framework.get("chapter_plan_note", ""),
+            },
+        )
         data["foreshadows"] = format_creation_text(foreshadows, "长期伏笔")
 
         normalized_characters = []
@@ -15383,15 +16627,51 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
                 continue
             record = _new_character(index)
             record["name"] = str(item.get("name", "") or "").strip() or record["name"]
-            record["role"] = str(item.get("role", "") or item.get("identity", "") or "").strip()
-            record["goal"] = str(item.get("goal", "") or item.get("目标", "") or "").strip()
-            record["secret"] = str(item.get("secret", "") or item.get("秘密", "") or "").strip()
-            record["voice"] = str(item.get("voice", "") or item.get("language_style", "") or "").strip()
+            record["role"] = str(
+                item.get("role", "")
+                or item.get("identity", "")
+                or item.get("身份", "")
+                or item.get("人物身份", "")
+            ).strip()
+            record["goal"] = str(
+                item.get("goal", "")
+                or item.get("目标", "")
+                or item.get("人物目标", "")
+            ).strip()
+            record["secret"] = str(
+                item.get("secret", "")
+                or item.get("秘密", "")
+                or item.get("隐藏秘密", "")
+            ).strip()
+            record["voice"] = str(
+                item.get("voice", "")
+                or item.get("language_style", "")
+                or item.get("语言风格", "")
+                or item.get("说话风格", "")
+            ).strip()
             notes = str(item.get("notes", "") or "").strip()
-            relationship = str(item.get("relationship_to_protagonist", "") or "").strip()
-            long_term = str(item.get("long_term_change", "") or "").strip()
+            relationship = str(
+                item.get("relationship_to_protagonist", "")
+                or item.get("relationship", "")
+                or item.get("与主角关系", "")
+            ).strip()
+            long_term = str(
+                item.get("long_term_change", "")
+                or item.get("character_arc", "")
+                or item.get("长期变化", "")
+            ).strip()
+            fear = str(
+                item.get("fear", "")
+                or item.get("fears", "")
+                or item.get("害怕失去", "")
+            ).strip()
             record["notes"] = "\n".join(
-                part for part in (notes, f"与主角关系：{relationship}" if relationship else "", f"长期变化：{long_term}" if long_term else "") if part
+                part for part in (
+                    notes,
+                    f"害怕失去：{fear}" if fear else "",
+                    f"与主角关系：{relationship}" if relationship else "",
+                    f"长期变化：{long_term}" if long_term else "",
+                ) if part
             )
             normalized_characters.append(record)
         data["characters"] = normalized_characters
@@ -15405,9 +16685,6 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
             record["type"] = str(item.get("type", "") or "设定").strip()
             record["description"] = str(item.get("description", "") or "").strip()
             record["story_known"] = str(item.get("story_known", "") or "").strip()
-            effect = str(item.get("relationship_effect", "") or "").strip()
-            if effect:
-                record["description"] = f"{record['description']}\n关系影响：{effect}".strip()
             normalized_lore.append(record)
         data["lore"] = normalized_lore
 
@@ -15417,18 +16694,28 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
                 continue
             record = _new_foreshadow(index)
             record["name"] = str(item.get("name", "") or "").strip() or record["name"]
-            record["status"] = str(item.get("status", "未埋") or "未埋").strip()
-            record["setup_chapter"] = str(item.get("setup_stage", "") or "").strip()
-            record["payoff_chapter"] = str(item.get("payoff_stage", "") or "").strip()
-            record["description"] = str(item.get("description", "") or "").strip()
+            # 向导只负责建立伏笔资料，初始生命周期状态始终从“未埋”开始。
+            record["status"] = "未埋"
+            record["setup_chapter"] = str(
+                item.get("setup_chapter", "") or item.get("setup_stage", "")
+            ).strip()
+            record["payoff_chapter"] = str(
+                item.get("payoff_chapter", "") or item.get("payoff_stage", "")
+            ).strip()
+            description = str(item.get("description", "") or "").strip()
+            for extra in (
+                str(item.get("relationship_effect", "") or "").strip(),
+                str(item.get("notes", "") or "").strip(),
+            ):
+                if extra and extra not in description:
+                    description = "\n".join(
+                        part for part in (description, extra) if part
+                    ).strip()
+            record["description"] = description
             record["revealed"] = str(item.get("revealed", "") or "").strip()
             record["remaining_secret"] = str(item.get("remaining_secret", "") or "").strip()
-            record["notes"] = "\n".join(
-                part for part in (
-                    str(item.get("relationship_effect", "") or "").strip(),
-                    str(item.get("notes", "") or "").strip(),
-                ) if part
-            )
+            # 向导生成的正式内容已经归入说明；备注只保留给用户手动记录。
+            record["notes"] = ""
             normalized_foreshadows.append(record)
         data["foreshadow_items"] = normalized_foreshadows
 
@@ -15447,7 +16734,7 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
             data["narrative_strategy_profile"] = deepcopy(profile)
             data["creative_intent_contract"] = deepcopy(contract)
 
-            # 向导已经完成全书走向、叙事策略和十万字阶段边界。
+            # 向导已经完成叙事策略和十万字阶段边界。
             # 这里只预置“待用户点击章节规划”的确认状态，不发起任何章节 API 调用，
             # 这样现有“AI生成章节规划”按钮会直接进入具体章节提纲生成，避免重复生成同一层规划。
             try:
@@ -15474,23 +16761,106 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
                 }
         return data
 
-    def new_project(self):
+    def _ensure_creation_wizard_workspace(self):
+        workspace = self._creation_wizard_workspace
+        if workspace is None:
+            workspace = NovelCreationWorkspaceDialog(
+                open_draft_ids=lambda: set(self._creation_wizard_dialogs),
+                parent=self,
+            )
+            workspace.new_draft_requested.connect(self._create_creation_wizard_draft)
+            workspace.draft_open_requested.connect(self._open_creation_wizard_draft)
+            self._creation_wizard_workspace = workspace
+        return workspace
+
+    def _create_creation_wizard_draft(self):
+        draft_id = create_creation_wizard_draft()
+        workspace = self._ensure_creation_wizard_workspace()
+        workspace.refresh()
+        workspace.show()
+        workspace.raise_()
+        workspace.activateWindow()
+        self.set_status_tip("已创建创作项目，请在项目管理界面中选中它并打开向导。")
+
+    def _open_creation_wizard_draft(self, draft_id):
+        draft_id = str(draft_id or "").strip()
+        if not draft_id:
+            return
+        workspace = self._ensure_creation_wizard_workspace()
+        workspace.hide()
+        existing = self._creation_wizard_dialogs.get(draft_id)
+        if existing is not None:
+            existing.showNormal()
+            existing.raise_()
+            existing.activateWindow()
+            return
         dialog = NovelCreationWizardDialog(
             self._current_novel_ai_selection,
             parent=self,
+            draft_id=draft_id,
         )
-        if dialog.exec() != QDialog.Accepted:
+        self._creation_wizard_dialogs[draft_id] = dialog
+        dialog.draft_saved.connect(
+            lambda _draft_id: self._ensure_creation_wizard_workspace().refresh()
+        )
+        dialog.finished.connect(
+            lambda result, wizard=dialog: self._on_creation_wizard_finished(wizard, result)
+        )
+        dialog.show()
+        dialog.raise_()
+        dialog.activateWindow()
+        workspace.refresh()
+
+    def _on_creation_wizard_finished(self, dialog, result):
+        draft_id = str(getattr(dialog, "draft_id", "") or "").strip()
+        if draft_id:
+            self._creation_wizard_dialogs.pop(draft_id, None)
+        if result != QDialog.Accepted:
+            workspace = self._ensure_creation_wizard_workspace()
+            workspace.refresh()
+            if not self._creation_wizard_dialogs:
+                workspace.show()
+                workspace.raise_()
+                workspace.activateWindow()
+            dialog.deleteLater()
             return
-        self._save_current_work("新建前保存")
-        data = self._apply_creation_wizard_payload(_default_project(), dialog.result_payload())
-        self._load_project_data(data, "")
-        self._save_draft_snapshot()
         try:
-            clear_last_project_path()
-        except Exception as e:
-            log_debug("小说最近项目记录清理失败", e)
+            self._save_current_work("新建前保存")
+            data = self._apply_creation_wizard_payload(_default_project(), dialog.result_payload())
+            project_title = (
+                data.get("meta", {}).get("title", "")
+                if isinstance(data.get("meta"), dict)
+                else ""
+            )
+            project_path = unique_project_path(project_title or "未命名小说")
+            save_project_file(project_path, data)
+            self._load_project_data(data, project_path)
+            self._remember_project_path(project_path)
+            self._save_draft_snapshot()
+            self._notify_project_store_changed()
+        except Exception as exc:
+            log_debug("新建向导项目保存失败", exc)
+            QMessageBox.warning(self, "新建项目失败", f"项目保存失败：{exc}\n向导草稿仍然保留，可以稍后继续。")
+            workspace = self._ensure_creation_wizard_workspace()
+            workspace.refresh()
+            workspace.show()
+            workspace.raise_()
+            workspace.activateWindow()
+            dialog.deleteLater()
+            return
+        # 只有正式项目已经写入成功，才删除当前向导草稿。
+        dialog.clear_draft()
+        self._ensure_creation_wizard_workspace().refresh()
+        dialog.deleteLater()
         self._update_stats_label()
-        self.set_status_tip("已完成创作框架向导，当前为自动草稿。请到“章节”页面手动点击“AI生成章节规划”。")
+        self.set_status_tip("已完成创作框架向导并保存到项目列表。请到“章节”页面手动点击“AI生成章节规划”。")
+
+    def new_project(self):
+        workspace = self._ensure_creation_wizard_workspace()
+        workspace.refresh()
+        workspace.show()
+        workspace.raise_()
+        workspace.activateWindow()
 
     def _set_volume_two_running(self, running):
         button = getattr(self, "create_volume_two_btn", None)
@@ -16822,7 +18192,7 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
         materials = data.get("project_materials", {})
         materials = materials if isinstance(materials, dict) else {}
         moved_parts = []
-        for key, label in (("timeline", "框架时间线 / 阶段走向"), ("summary", "框架摘要 / 全书走向")):
+        for key, label in (("timeline", "框架时间线 / 阶段规划"), ("summary", "框架摘要")):
             value = str(materials.get(key, "") or "").strip()
             if value:
                 moved_parts.append(f"{label}：\n{value}")

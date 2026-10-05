@@ -43,6 +43,8 @@ NOVEL_DIAGNOSTIC_LATEST_SNAPSHOT_FILE = os.path.join(
 NOVEL_DIAGNOSTIC_LATEST_EXCHANGE_FILE = os.path.join(
     NOVEL_DIAGNOSTIC_DIR, "latest_model_exchange.json"
 )
+NOVEL_RAW_OUTPUT_DIR = os.path.join(NOVEL_DIAGNOSTIC_DIR, "raw_outputs")
+NOVEL_RAW_OUTPUT_MAX_FILES = 240
 NOVEL_MEMORY_DIAGNOSTIC_LOG_FILE = os.path.join(
     NOVEL_DIAGNOSTIC_DIR, "memory_sync_failures.jsonl"
 )
@@ -354,6 +356,183 @@ def save_novel_diagnostic_latest_exchange(request_id, payload):
             _write_novel_diagnostic_json(request_path, snapshot)
             _write_novel_diagnostic_json(NOVEL_DIAGNOSTIC_LATEST_EXCHANGE_FILE, snapshot)
         return request_path
+    except Exception:
+        return ""
+
+
+def _novel_raw_output_slot_key(request_id, metadata):
+    """Return the logical slot whose latest raw response should be kept."""
+    metadata = metadata if isinstance(metadata, dict) else {}
+    nested = metadata.get("metadata", {})
+    nested = nested if isinstance(nested, dict) else {}
+
+    stage = str(
+        metadata.get("stage")
+        or nested.get("stage")
+        or nested.get("creation_step")
+        or ""
+    ).strip()
+    if not stage:
+        stage = str(request_id or "raw-output").strip() or "raw-output"
+
+    # The wizard may split one visible step into several API batches.  Those
+    # batches are implementation details, so they share one latest-response
+    # slot.  Chapter planning keeps event placement separate from the actual
+    # outline request because they are two different generation stages.
+    for prefix in ("premise:", "bible:", "stage_plan:"):
+        if stage.startswith(prefix):
+            stage = prefix[:-1]
+            break
+
+    project = str(
+        metadata.get("project_path")
+        or nested.get("project_path")
+        or metadata.get("project_title")
+        or nested.get("project_title")
+        or "current-project"
+    ).strip()
+    return f"{project}|{stage}"
+
+
+def _novel_raw_output_slot_id(slot_key):
+    digest = hashlib.sha256(str(slot_key or "raw-output").encode("utf-8")).hexdigest()
+    return f"slot-{digest[:24]}"
+
+
+def _novel_raw_output_record_slot(record):
+    if not isinstance(record, dict):
+        return ""
+    saved_slot = str(record.get("slot_key", "") or "").strip()
+    if saved_slot:
+        return saved_slot
+    return _novel_raw_output_slot_key(
+        record.get("request_id", ""),
+        record,
+    )
+
+
+def _prune_novel_raw_output_slots():
+    """Keep only the newest text/metadata pair for each logical stage."""
+    try:
+        names = os.listdir(NOVEL_RAW_OUTPUT_DIR)
+    except OSError:
+        return
+
+    records = []
+    referenced_text_paths = set()
+    for name in names:
+        if not name.endswith(".json"):
+            continue
+        metadata_path = os.path.join(NOVEL_RAW_OUTPUT_DIR, name)
+        if not os.path.isfile(metadata_path):
+            continue
+        try:
+            with open(metadata_path, "r", encoding="utf-8") as handle:
+                record = json.load(handle)
+        except (OSError, ValueError, TypeError):
+            continue
+        if not isinstance(record, dict):
+            continue
+        raw_path = str(record.get("raw_output_path", "") or "").strip()
+        if raw_path:
+            referenced_text_paths.add(os.path.abspath(raw_path))
+        try:
+            mtime = os.path.getmtime(metadata_path)
+        except OSError:
+            mtime = 0
+        records.append((
+            _novel_raw_output_record_slot(record),
+            mtime,
+            metadata_path,
+            raw_path,
+        ))
+
+    newest_by_slot = {}
+    for slot, mtime, metadata_path, raw_path in records:
+        previous = newest_by_slot.get(slot)
+        if previous is None or mtime >= previous[0]:
+            newest_by_slot[slot] = (mtime, metadata_path, raw_path)
+
+    keep_metadata = {item[1] for item in newest_by_slot.values()}
+    keep_text = {
+        os.path.abspath(item[2])
+        for item in newest_by_slot.values()
+        if item[2]
+    }
+    for _slot, _mtime, metadata_path, raw_path in records:
+        if metadata_path in keep_metadata:
+            continue
+        try:
+            os.remove(metadata_path)
+        except OSError:
+            pass
+        if raw_path and os.path.abspath(raw_path) not in keep_text:
+            try:
+                os.remove(raw_path)
+            except OSError:
+                pass
+
+    # Old versions could leave text files without a metadata pair.  They are
+    # diagnostic leftovers, not project data, and are safe to remove here.
+    try:
+        for name in os.listdir(NOVEL_RAW_OUTPUT_DIR):
+            if not name.endswith(".txt"):
+                continue
+            path = os.path.abspath(os.path.join(NOVEL_RAW_OUTPUT_DIR, name))
+            if path not in keep_text:
+                try:
+                    os.remove(path)
+                except OSError:
+                    pass
+    except OSError:
+        pass
+
+
+def save_novel_raw_model_output(request_id, attempt_index, raw_text, metadata=None):
+    """Persist the latest exact response for one logical generation stage."""
+    safe_request_id = re.sub(
+        r"[^A-Za-z0-9_.-]+", "_", str(request_id or "raw-output")
+    ).strip("._")[:120] or "raw-output"
+    try:
+        attempt_index = max(1, int(attempt_index or 1))
+    except (TypeError, ValueError):
+        attempt_index = 1
+    text = str(raw_text or "")
+    raw_metadata = metadata if isinstance(metadata, dict) else {}
+    slot_key = _novel_raw_output_slot_key(request_id, raw_metadata)
+    slot_id = _novel_raw_output_slot_id(slot_key)
+    stem = f"{slot_id}--latest"
+    text_path = os.path.join(NOVEL_RAW_OUTPUT_DIR, f"{stem}.txt")
+    metadata_path = os.path.join(NOVEL_RAW_OUTPUT_DIR, f"{stem}.json")
+    record = {
+        "schema_version": 2,
+        "record_type": "novel_raw_model_output",
+        "request_id": safe_request_id,
+        "attempt_index": attempt_index,
+        "slot_key": slot_key,
+        "saved_at": now_str(),
+        "output_chars": len(text),
+        "output_utf8_bytes": len(text.encode("utf-8", errors="replace")),
+        "output_sha256": hashlib.sha256(text.encode("utf-8", errors="replace")).hexdigest(),
+    }
+    if isinstance(metadata, dict):
+        record.update(_sanitize_novel_diagnostic_value(metadata))
+    record["raw_output_path"] = text_path
+    try:
+        with _NOVEL_DIAGNOSTIC_LOCK:
+            os.makedirs(NOVEL_RAW_OUTPUT_DIR, exist_ok=True)
+            temp_text_path = f"{text_path}.{os.getpid()}.{threading.get_ident()}.tmp"
+            try:
+                with open(temp_text_path, "w", encoding="utf-8") as handle:
+                    handle.write(text)
+                    handle.flush()
+                os.replace(temp_text_path, text_path)
+            finally:
+                if os.path.exists(temp_text_path):
+                    os.remove(temp_text_path)
+            _write_novel_diagnostic_json(metadata_path, record)
+            _prune_novel_raw_output_slots()
+        return text_path
     except Exception:
         return ""
 

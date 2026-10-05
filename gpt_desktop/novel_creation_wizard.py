@@ -1,177 +1,789 @@
 """向导式小说框架创作。
 
 这个模块只负责“新建小说项目”时的创作框架向导，不参与已有项目的导入、章节正文
-生成或长期记忆处理。向导把用户提供的网文创作要求分成四步，每一步都接着前面已经确认的故事继续写，
+生成或长期记忆处理。向导把用户提供的网文创作要求分成三步，每一步都接着前面已经确认的故事继续写，
 每一步都由用户确认后才进入下一步。
 """
 
 from __future__ import annotations
 
+import ast
 import json
 import math
+import os
+import re
 import time
 import uuid
 from copy import deepcopy
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, QTimer, Signal
 from PySide6.QtWidgets import (
-    QAbstractItemView, QComboBox, QDialog, QDialogButtonBox, QFormLayout, QHBoxLayout,
-    QLabel, QListWidget, QListWidgetItem, QLineEdit, QMessageBox, QPlainTextEdit,
-    QPushButton, QSpinBox, QStackedWidget, QVBoxLayout, QWidget,
+    QAbstractItemView, QApplication, QDialog, QDialogButtonBox, QFrame,
+    QGridLayout, QHBoxLayout, QLabel, QListWidget, QListWidgetItem, QLineEdit,
+    QMessageBox, QPlainTextEdit, QPushButton, QScrollArea, QSizePolicy, QSpinBox,
+    QStackedWidget, QToolButton, QVBoxLayout, QWidget,
 )
 
-from .core import now_str
+from .core import HISTORY_DIR, load_json_file, now_str, safe_remove_file, save_json_file
 from .workers import NovelAnalysisWorker
+
+
+CREATION_WIZARD_DRAFT_FILE = os.path.join(
+    HISTORY_DIR,
+    "novel_creation_wizard_draft.json",
+)
+CREATION_WIZARD_DRAFT_DIR = os.path.join(
+    HISTORY_DIR,
+    "novel_creation_wizard_drafts",
+)
+CREATION_WIZARD_DRAFT_INDEX_FILE = os.path.join(
+    CREATION_WIZARD_DRAFT_DIR,
+    "index.json",
+)
+CREATION_WIZARD_NAME_HISTORY_FILE = os.path.join(
+    HISTORY_DIR,
+    "novel_creation_wizard_name_history.json",
+)
+CREATION_WIZARD_NAME_HISTORY_LIMIT = 160
+CREATION_WIZARD_NAME_REFERENCE_LIMIT = 36
+NOVEL_AUTOSAVE_DRAFT_FILE = os.path.join(
+    HISTORY_DIR,
+    "novel_draft.json",
+)
+
+
+def _screen_available_geometry(widget):
+    screen = widget.screen() if widget is not None else None
+    if screen is None and widget is not None:
+        parent = widget.parentWidget()
+        screen = parent.screen() if parent is not None else None
+    if screen is None:
+        app = QApplication.instance()
+        screen = app.primaryScreen() if app is not None else None
+    if screen is None:
+        return None
+    geometry = screen.availableGeometry()
+    return geometry if geometry.isValid() else None
+
+
+def _fit_dialog_to_screen(
+    dialog,
+    width_ratio=0.86,
+    height_ratio=0.84,
+    minimum_width=720,
+    minimum_height=520,
+    maximum_width=1440,
+    maximum_height=980,
+):
+    """按当前屏幕工作区给对话框一个可调整的初始尺寸。"""
+    geometry = _screen_available_geometry(dialog)
+    if geometry is None:
+        dialog.setMinimumSize(minimum_width, minimum_height)
+        return
+
+    # Reserve space for the native title bar and the macOS Dock/menu area.
+    # ``availableGeometry`` is not equally precise on every platform, so keep
+    # a little extra room instead of letting the bottom edge touch the screen.
+    safe_width = max(320, geometry.width() - 32)
+    safe_height = max(260, geometry.height() - 48)
+    minimum_width = min(int(minimum_width), safe_width)
+    minimum_height = min(int(minimum_height), safe_height)
+    width = min(
+        safe_width,
+        int(geometry.width() * float(width_ratio)),
+        int(maximum_width),
+    )
+    height = min(
+        safe_height,
+        int(geometry.height() * float(height_ratio)),
+        int(maximum_height),
+    )
+    width = max(minimum_width, width)
+    height = max(minimum_height, height)
+    dialog.setMinimumSize(minimum_width, minimum_height)
+    dialog.setMaximumSize(safe_width, safe_height)
+    dialog.resize(width, height)
+    dialog.move(
+        geometry.left() + max(0, (geometry.width() - dialog.width()) // 2),
+        geometry.top() + max(0, (geometry.height() - dialog.height()) // 2),
+    )
 
 
 CREATION_WIZARD_STEPS = (
     ("premise", "故事定位"),
-    ("bible", "小说圣经与世界规则"),
-    ("story_assets", "人物、设定与伏笔"),
+    ("bible", "故事底盘"),
     ("stage_plan", "十万字阶段规划"),
 )
 
+CREATION_CHOICE_GROUPS = {
+    "audience": {
+        "读者方向": ("男频", "女频", "男女皆宜"),
+    },
+    "genre": {
+        "奇幻仙侠": (
+            "西方奇幻", "东方仙侠", "传统玄幻", "玄幻脑洞", "都市修真",
+        ),
+        "都市题材": (
+            "都市高武", "都市种田", "都市脑洞", "都市日常", "战神赘婿",
+        ),
+        "历史与军事": (
+            "抗战谍战", "历史古代", "历史脑洞",
+        ),
+        "悬疑灵异": (
+            "悬疑灵异", "悬疑脑洞",
+        ),
+        "科幻末世": (
+            "科幻末世",
+        ),
+        "衍生与其他": (
+            "男频衍生", "动漫衍生", "游戏体育",
+        ),
+    },
+    "theme": {
+        "题材方向": (
+            "衍生", "影视", "天灾", "第四天灾", "规则怪谈", "克苏鲁",
+            "都市异能", "末日求生", "灵气复苏", "高武世界", "异世大陆",
+            "东方玄幻", "综漫", "奇幻仙侠",
+        ),
+        "时代与背景": (
+            "古代", "清朝", "宋朝", "架空", "都市", "玄幻", "历史", "武侠",
+        ),
+        "叙事与氛围": (
+            "仕途", "第一人称", "赛博朋克", "搞笑轻松", "悬疑", "谍战",
+            "断层", "武将", "国运", "开局", "体育",
+        ),
+    },
+    "protagonist_route": {
+        "开局状态": (
+            "开局无敌", "从底层崛起", "重生归来",
+            "觉醒金手指", "被迫入局", "身份反转",
+        ),
+        "故事走法": (
+            "升级变强", "经营势力", "解谜破局",
+            "感情牵引", "群像共行", "幕后布局",
+        ),
+    },
+    "style": {
+        "故事驱动": (
+            "复仇逆袭", "权谋博弈", "冒险探索", "经营建设",
+            "探案追凶", "成长治愈", "末日求生", "身份揭秘",
+        ),
+        "爽感节奏": (
+            "热血升级", "轻松爽文", "逆袭翻盘",
+            "无敌流", "高燃冒险",
+        ),
+        "氛围情绪": (
+            "温暖治愈", "轻喜剧", "细腻情感",
+            "诡异压迫", "暗黑悬疑", "史诗厚重", "现实克制",
+        ),
+        "叙事节奏": (
+            "快节奏连载", "慢热沉浸", "群像推进",
+            "日常铺陈", "多线交织",
+        ),
+    },
+    "length": {
+        "作品长度": ("30万字", "50万字", "100万字+"),
+    },
+    "chapter_words": {
+        "单章字数": ("1000字", "2000字", "3000字", "5000字", "8000字", "10000字"),
+    },
+}
+
+CREATION_CHOICE_DEFAULTS = {
+    "audience": "男频",
+    "genre": "都市脑洞",
+    "theme": "",
+    "protagonist_route": "觉醒金手指",
+    "style": "热血升级",
+    "length": "50万字",
+    "chapter_words": "3000字",
+}
+
+CREATION_CHOICE_TITLES = {
+    "audience": "读者方向",
+    "genre": "主分类",
+    "theme": "主题（最多选2项）",
+    "protagonist_route": "主角起点",
+    "style": "风格与节奏",
+    "length": "预计篇幅",
+    "chapter_words": "单章字数",
+}
+
+CREATION_CHOICE_HINTS = {
+    "audience": "先选读者方向，AI会据此调整人物关系和推进节奏。",
+    "genre": "主分类只能选择一项，分类详情会在弹窗内滚动查看。",
+    "theme": "主题最多选择两项，用来补充世界背景、叙事视角或阅读感觉。",
+    "protagonist_route": "主角从什么状态开始，会决定第一章的抓力。",
+    "style": "分类很多，选一个最想保留的主感觉即可。",
+    "length": "只是规划参考，后续可以继续调整。",
+    "chapter_words": "章节总数和阶段边界会按这个字数计算，后面仍可调整。",
+}
+
 COMMON_CREATION_RULES = """
-你正在和作者一起搭建一部长篇网络小说。每次回答都要像作者正在讲这本书里的故事，而不是在讲写作方法。
-1. 只写看得见、听得见、能让人物做出选择的内容：人物在哪里，眼前发生了什么，谁在说话，谁在犹豫，谁先出手，事情因此怎样改变。
-2. 语言要自然、具体、有画面感，像成熟网文作者在讲下一段故事。少用空泛的大词，少用概念堆叠，不要把一大段剧情压成一句空话。
-3. 写人物时，要让人物有自己的想法、脾气、欲望和顾虑。人物之间的态度要随着见闻、利益、误会、选择和结果而变化，不能一开始就把最后的关系说死。
-4. 保留爽点、反差、悬念和人物反应。主角被轻视后，要靠具体行动让别人改变态度；但每次碰撞都要有当时的原因、场面和后果，不能复制同一套打脸场面。
-5. 后面写到逐章故事时，平均两章左右可以安排一次新的碰撞：可能是路人、配角或对手误判主角、主动挑衅、争夺利益，也可能是旧关系重新靠近或彻底翻脸。每次都要换原因、换场景、换结果。
-6. 默认不写受伤、重伤和养伤。遇到危险时，优先用躲避、交换、失去资源、暴露身份、关系破裂或局势变化来制造代价。
-7. 结尾保持开放和带有余波，不把所有秘密、关系和世界问题一次说尽，也不要把结局写成人人满意。
-8. 高武、玄幻、仙侠等题材，要从低到高写清完整的实力层次、能做到的事、做不到的事和自然变强的条件；前后不能突然越过已经写明的边界。
-9. 人名要有特点、好读、好记，不用生僻字和笔画过多的字。
-10. 不要复述作者的要求，不要解释你正在怎样写。除了约定的 JSON 内容，不要在前后添加其它文字。
+你正在和作者一起搭建一部长篇网络小说。外层 JSON 只是程序读取用的容器，不能在 JSON 之外添加解释、Markdown 或注释。
+1. 沿着作者已经说过和已经确认的故事继续写，稳住题材、主角、核心悬念、人物关系和结尾方向。作者灵感中的题材组合、人物身份、关系状态、具体情节、场景、爽点和节奏要求都要进入故事；第一步的主分类、主题、读者方向、主角起点和风格选择是创作底色。
+2. 资料具体而有根，人物、地点、物件、选择、结果和长期成立的事实彼此照应。每个剧情节点都优先落到时间、地点、在场人物、当下动作、正在发生的变化和人物反应上。
+3. 人物的愿望、顾虑、秘密和关系变化都由事情推动。让人物在现场遇到压力、做出选择、付出代价，关系和情绪随结果发生变化，答案随着故事经历逐步靠近。
+4. 小说圣经、世界规则、人物、设定和伏笔各自承担不同作用：圣经托住整本书，世界规则说明长期运转方式，人物承载选择和关系，设定提供反复使用的生活落点，伏笔保留线索和后续变化。
+5. 危险和代价优先落到躲避、交换、资源变化、身份暴露、关系破裂、空间变化和局势改变上；身体伤势随题材和现场需要自然出现。
+6. 实力体系跟随题材本身生长：明确需要修炼、境界或能力层次的故事，在设定库里展开来源、层次、边界和成长条件；普通都市、言情、悬疑、灵异、现实和没有明确力量体系的科幻，把重点放在人物处境、规则边界和具体事件上。
+7. 人名好读、好记、有辨识度；人物的说话方式、动作习惯和情绪反应要能在场景中被读者感受到。
+8. 除非作者明确选择办案、破案或调查推理题材，否则不得采用案卷化、办案式、流程审查式的剧情推进。剧情要由人物当下想得到什么、现场遇到什么压力、做了什么动作、遭遇什么阻力、怎样选择、关系和情绪怎样变化，以及选择带来的具体后果向前推动；世界规则和故事资料只在人物正在争取、对抗、逃避或付出代价的场景中自然出现。
+9. 字段值直接写具体内容，保持清楚、稳定、方便后续执行；内容呈现为作者自己的故事底稿，各资料类别各自承担作用，同一段剧情只放在最合适的位置。
+10. JSON 只作为程序读取的容器：保持紧凑，不用 Markdown、缩进、空行或多余空格；压缩外壳，不压缩事实、人物数量、设定数量、伏笔数量或故事内容。
 """.strip()
 
 
 STEP_PROMPTS = {
     "premise": f"""{COMMON_CREATION_RULES}
 
-现在先从作者给出的灵感出发，写出 5 个彼此完全不同的故事开头和长线走向。每个版本都要像一本真正能开始连载的网文：有好记的书名，有完整简介，有主角眼下的处境，有会一直逼着人物往前走的矛盾，有让人想知道下一步会怎样的人物关系，还有一个不会把所有事情说死的结尾方向。不要只写宣传口号，也不要只是换人名、换地点而沿用同一个故事。
+现在先从作者给出的灵感出发，写出 5 个彼此完全不同的故事开头和长线走向。每个版本都要像一本真正能开始连载的网文：有好记的书名，有完整简介，有主角眼下的处境，有会一直逼着人物往前走的矛盾，有让人想知道下一步会怎样的人物关系，还有一个不会把所有事情说死的结尾方向。synopsis 是可直接用于发布小说的自然网络小说简介，写清主角、处境、主要矛盾和会把人物带向下一步的具体变化，内容直接进入故事。
 
-只输出：{{
-  "candidates": [
-    {{
-      "title": "书名",
-      "genre": "类型",
-      "audience": "男频或女频",
-      "style": "风格",
-      "one_sentence": "一句话故事钩子",
-      "synopsis": "自然的完整故事简介",
-      "protagonist": "主角初始处境、性格和最想得到的东西",
-      "main_line": "贯穿全书、会越闹越大的矛盾",
-      "relationship_engine": "人物之间的态度会怎样从轻视变成改观、靠近或仰望",
-      "ending_direction": "开放式、非圆满的结局方向"
-    }}
-  ],
-  "selected_index": 0
-}}""",
+先完整吸收作者灵感和全部选择，再开始写。五个方向都使用灵感中的核心内容，区别放在人物选择、冲突安排和长线走向上；简介把灵感里的关键人物关系、主要冲突和爽点自然写进故事，而不是只把它们放在分类字段里。
+
+五个方向要像五本真正不同的小说来命名和写人：每个方向的主角都要有明确姓名，主角姓名不能重复，也不能只是换一个字；重要配角的姓名也尽量错开。不要连续使用同一个姓氏、相同的姓名节奏或同一套常见网文姓名模板，要让姓名随着题材、时代、人物身份、男频或女频方向和故事气质自然变化。名字要好读、好记、有辨识度，不为了变化硬塞生僻字；简介、主角字段和人物关系里使用同一个姓名，不能前后改名。
+命名参考中的姓名和姓氏来自本地已经创建过的其它项目，只用来帮助这次换一套自然的命名方式：不要直接复用其中的姓名，不要只改一个字，也不要连续沿用同一批姓氏和姓名节奏。参考为空时，也要主动避开最常见的固定网文姓名模板；仍然以符合题材、时代、人物身份和故事气质为先，不要为了不同而使用生硬或生僻的名字。
+
+下面示例中的空对象只是为了避免重复占篇幅，实际返回时 1、2、3、4、5 五个槽位都必须各自完整填写十个字段，不能返回空对象，也不能把多个故事合并到一个槽位。
+
+只输出一个合法 JSON 对象。不要使用可变长度的候选数组，改用固定的五个编号对象：{{"c":{{"1":{{"t":"书名","g":"类型","a":"读者方向","y":"风格","h":"一句话故事引子","d":"可直接公开发布的自然网络小说故事简介","p":"主角初始处境、性格和最想得到的东西","m":"贯穿全书的矛盾","r":"人物关系长线变化","e":"开放式结尾方向"}},"2":{{}},"3":{{}},"4":{{}},"5":{{}}}},"s":0}}。c 只能有 1、2、3、4、5 五个键，不能增加第6个方向，也不能漏掉任何一个方向；每个方向都必须完整填写，不要输出 Markdown、解释或其它键。""",
     "bible": f"""{COMMON_CREATION_RULES}
 
-接着已经选定的故事，把这个世界里真正会让人物做出选择的规矩写清楚。要写出故事想讲的东西、人物一直在争什么、主角和重要人物会怎样改变；也要写清力量、身份、资源、势力和日常生活的边界，以及打破规矩要付出的代价。高武、玄幻、仙侠等题材要从低到高列出完整实力层次，说明每一层能做到什么、做不到什么、怎样自然变强，后面不能突然冒出没有来由的新境界。不要堆只在名词表里好看的设定。
+现在和作者一起把已经选定的故事底盘搭好。下面的“已经选定的故事”是唯一的故事来源：稳住它的主角、处境、地点、核心悬念、主要关系和结尾方向，再补足长篇故事继续生长所需要的事实。新增人物、新势力和新秘密都要服务于原来的主线，并在后续事件中拥有具体作用。
 
-只输出：{{
-  "bible": {{
-    "core_setting": "核心设定",
-    "reader_promise": "读者会一直想知道的事，以及让人愿意追下去的反差和悬念",
-    "theme": "长期主题",
-    "main_conflict": "主线矛盾",
-    "relationship_foundation": "重要人物从怎样的关系开始，以后可能怎样改变",
-    "ending_direction": "开放式、非圆满的结尾会留下什么",
-    "hard_boundaries": "不能违背的写法、人物行为和结尾边界"
-  }},
-  "world_rules": {{
-    "setting_overview": "世界的基本样貌",
-    "power_system": "力量从哪里来、能做到什么；没有等级的题材写清能力边界",
-    "levels": [{{"name": "境界或层级", "capability": "能做到什么", "limit": "不能做到什么", "promotion": "如何自然提升"}}],
-    "rules": ["故事中不能随便改掉、会逼人物做选择的规矩"],
-    "costs_and_limits": ["使用力量、获得资源或改变身份要付出的代价"],
-    "factions": [{{"name": "势力", "position": "立场", "relationship_to_protagonist": "与主角的关系变化空间"}}],
-    "geography_and_life": "重要地点、日常生活和人们习以为常的规矩"
-  }}
-}}""",
+这一次要把小说圣经、世界规则、人物、设定和伏笔一起写出来，但五部分各自回答不同的问题：
+这一步只根据已经选定的故事和作者偏好搭建底盘，后面的阶段规划会读取这里的完整资料。这里写整本书的骨架和长期事实，让后面的场景自然长出来；剧情细节留到阶段和章节中由人物经历展开。
+小说圣经回答“这整本书最核心的东西是什么”。它写主角为什么非走下去、全书一直悬着的矛盾、整本书会反复逼近的问题、重要关系的底子、故事想留下的东西和结尾方向。这里的长期问题要写成随着人物一次次选择不断变深的具体事情，不写“读者会……”或编辑式的阅读说明，也不承担章节剧情复述。
+
+世界规则回答“这个世界怎样运转”。它写日常生活、空间和社会关系、异常或力量从哪里来、什么条件会让它发生、人物要为触碰它付出什么，以及不同人物会怎样应对。它只写长期成立的运行方式；没有明确力量体系的题材，世界规则就围绕空间、社会、异常和代价展开；明确有修炼或境界的题材，再写力量来源和总边界，详细层次统一放进设定库里的“规则”条目。
+
+人物回答“这些人各自想得到或守住什么”。人物的欲望、顾虑、秘密、说话习惯和与主角的关系，都要在原故事里找到根，并能在具体场景中推动选择。设定库统一收录后面会反复用到的地点、物件、制度、势力、能力边界和日常场景。伏笔写成现在能看见的线索、人物当下的理解，以及它在后续阶段会怎样改变判断、关系和行动；把正式故事内容写进 description、revealed 和 remaining_secret，notes 留空。
+
+选定故事尚未确定的部分，保留为人物正在面对的问题、线索和可能解释；从故事自然延伸出来、后面反复会用到的人物、地点、势力、物件、制度和暗线，都补足为可落地的故事资料。字段值以清楚、稳定、方便后续执行为先，简介字段保持可公开发布的自然网络小说语言，其余内容像作者自己的故事底稿一样具体易读。
+
+只输出一个合法 JSON 对象，使用短键和固定顺序数组：{{"b":["核心设定","读者承诺","主题","主线矛盾","人物关系底子","结尾方向","硬边界"],"w":["世界概况","力量或能力体系","长期规则数组","代价限制数组","地理与生活"],"c":[["姓名","身份和故事位置","当前目标","秘密","说话方式","害怕失去什么、怎样牵制主角以及长期变化"]],"l":[["名称","类型","具体内容","人物当前知道多少"]],"f":[["编号","名称","埋设阶段","回收阶段","读者能看到的线索及后续变化","揭开后会改变什么","仍未揭开的部分"]]}}。实际输出时：b固定7项，w固定5项，c每项固定6项，l每项固定4项，f每项固定7项；空内容保留空字符串占位，资料数量和文字事实完整保留。""",
     "story_assets": f"""{COMMON_CREATION_RULES}
 
-接着前面已经确定的故事，把会反复出现在后续情节里的角色、地方、势力、物件、规矩和暗线一起写出来。三部分要彼此牵连：人物的欲望、秘密和态度要受世界规矩与现实利益影响；地点、势力、物件和能力边界要能逼人物做选择；暗线要从人物藏着的事或读者看得见的细节中自然出现。不要把它们写成互不相干的名词堆，也不要提前把最后答案说出来。
+接着前面已经确定的故事，把后面真的会反复出现的人物、地方、势力、物件、规矩和暗线写出来。每一项都要落到人物看得见、摸得着的生活里，并且在某一次选择中起作用；线索的意义随着人物行动、关系变化和局势变化逐步显现。
 
-每个重要人物都要有自己想得到或守住的东西，有现实阻力，有不愿让别人知道的部分，有能听出来的说话习惯，还要写清他和主角从哪里开始、以后可能怎样靠近或翻脸。主角弱小时可以被轻视或利用，但对方的态度变化必须有看得见的原因。
+每个重要人物都要有自己想得到或守住的东西，有现实阻力，有不愿让别人知道的部分，有能听出来的说话习惯。请把人物害怕失去什么、与主角怎样牵制、以后怎样改变，写进人物的 notes。人物和主角怎样靠近、利用、误会或翻脸，要通过具体事情表现出来。
 
-只补充后面真的会用到的地点、势力、组织、物品、能力规矩、制度和日常场景。实力层次要和前面说过的边界一致；不写必须靠受伤才能成立的安排。
+只补充后面真的会用到的地点、势力、组织、物品、能力规矩、制度、日常生活和反复出现的场景落点，统一写入 lore。身体代价随题材和现场需要自然出现。明确需要修炼、境界或能力层次的题材，在 lore 中建立“能力体系/规则”设定，并把详细层次、能做到什么、做不到什么和提升条件写进 description；悬疑、灵异、言情、现实和普通都市故事把设定落在空间、生活、社会关系和异常边界上。
 
-每条暗线都要能落到一个具体细节上：它在哪里出现，人物当时怎样理解，后面会在哪一段故事里变得重要，最后会改变谁的判断或关系。可以留下没有完全揭开的余波，但不要只写一个空泛的神秘称呼。
+每条暗线都要落到一个具体细节上：它第一次怎样出现，人物当时怎样理解，后来会怎样改变某个人的判断或关系。线索可以保留余波和多种可能解释，正式故事内容全部写进 description、revealed 和 remaining_secret；notes 留空。
 
-只输出：{{
-  "characters": [
-    {{
-      "name": "易读且有特点的名字",
-      "role": "身份和故事位置",
-      "goal": "当前真正想得到或守住的东西",
-      "secret": "确实会影响后续的秘密；没有就留空",
-      "voice": "稳定的说话语气、句式或措辞",
-      "relationship_to_protagonist": "与主角的初始关系和可能的变化",
-      "long_term_change": "这个人物后来会变成什么样",
-      "notes": "后面写故事时不能忘记的事实"
-    }}
-  ],
-  "relationship_map": [{{"from": "人物", "to": "人物", "initial_state": "初始关系", "turning_pressure": "什么会迫使关系改变", "possible_state": "可能走向"}}],
-  "lore": [
-    {{
-      "name": "设定名称",
-      "type": "地点、势力、物品、规则、制度、能力或其它",
-      "description": "后面故事里会真正起作用的具体内容",
-      "story_known": "人物当前知道到什么程度，未知部分不要提前写成答案",
-      "relationship_effect": "它会怎样改变人物的选择和关系"
-    }}
-  ],
-  "key_scenes": [{{"name": "场景", "atmosphere": "现场让人感到什么", "conflict_use": "适合发生的具体冲突"}}],
-  "foreshadows": [
-    {{
-      "name": "伏笔名称",
-      "status": "未埋",
-      "setup_stage": "在哪一段故事里、通过什么细节出现",
-      "payoff_stage": "在哪一段故事里发生变化，或继续藏下去",
-      "description": "读者能看见的线索、人物当时的误解，以及后来会带来的变化",
-      "revealed": "以后揭开时会改变什么；现在不要提前说破",
-      "remaining_secret": "仍然可以留到后期的未知部分",
-      "relationship_effect": "它会怎样让人物靠近、反目、低头或重新选择",
-      "notes": "现在不能提前说破的部分"
-    }}
-  ]
-}}""",
-    "stage_plan": f"""{COMMON_CREATION_RULES}
-
-现在把全书分成每段约 10 万字的连续故事。总字数和单章字数由作者输入决定；默认约 50 万字、每章约 3000 字，最后一段可以收下剩余字数。每一段都要写清人物身在什么地方、遇到了什么事、冲突怎样加深、人物关系怎样翻转、世界中哪些事实在故事里自然露出来、段尾留下什么具体变化。前后要接得上，不能把后面才该发生的事提前，也不能过早揭开后面的暗线。这里先写每段故事的大致走向，不写具体章节标题和逐章内容；逐章故事会由作者之后手动点击“AI生成章节规划”。
-
-请确保 start_chapter/end_chapter 从第 1 章开始连续覆盖全书；按 target_words / average_chapter_words 推算章节范围，最后一段吸收余数。只输出：{{
-  "stage_plan": [
-    {{
-      "id": "S01",
-      "name": "阶段名",
-      "start_chapter": 1,
-      "end_chapter": 34,
-      "target_words": 100000,
-      "summary": "直接写这一段会发生的故事",
-      "main_conflict": "真正逼人物做选择的矛盾",
-      "relationship_changes": ["人物怎样从轻视、利用、平视到改变态度"],
-      "character_changes": ["人物在这一段里具体变成什么样"],
-      "world_reveals": ["故事进行中自然露出的世界事实"],
-      "turning_points": ["关键转折"],
-      "foreshadow_actions": ["这一段里暗线怎样出现、变化或暂时藏住"],
-      "end_state": "这一段结束时人物、关系和局势变成什么样",
-      "next_stage_hook": "接下来从什么新变化开始",
-      "forbidden_reveals": "这一段不能提前说破的事"
-    }}
-  ],
-  "global_direction": "全书从开头走到开放式结尾会发生什么变化",
-  "chapter_plan_note": "后面逐章写故事时要守住的实力、关系和边界"
-}}""",
+只输出一个合法 JSON 对象，使用短键和固定顺序数组：{{"c":[["姓名","身份和故事位置","当前目标","秘密","说话方式","害怕失去什么、怎样牵制主角以及长期变化"]],"l":[["名称","类型","具体内容","人物当前知道多少"]],"f":[["编号","名称","埋设阶段","回收阶段","读者能看到的线索及后续变化","揭开后会改变什么","仍未揭开的部分"]]}}。c每项固定6项，l每项固定4项，f每项固定7项；资料数量和文字事实完整保留。""",
 }
+
+
+STAGE_PLAN_OBJECT_OUTPUT_RULES = """
+这次使用对象协议，阶段和事件按字段名归位；只返回一个合法 JSON 对象。
+短键含义如下：k=全书底盘契约，s=当前阶段对象，f=当前阶段实际发生的伏笔端点。阶段对象中 i=阶段编号，n=阶段名称，r=章节范围，b=开始状态，e=按顺序发生的场景事件对象数组，x=结束状态，y=带入下一阶段的事实。状态对象中 t=时间，l=地点，c=人物状态，k=已经发生并被人物掌握的事实，q=仍会推动人物行动的问题。事件对象中 i=事件编号，r=允许章节范围，a=关联资料，p=前置条件，h=可直接扩写的场景事件，o=直接结果，d=实际状态变化。伏笔端点对象中 i=伏笔编号，k=setup或payoff，e=承载这个端点的事件编号，d=这一次在场景中发生的具体变化；一次只写一个端点。
+每个 h 都要像一段可以直接扩写的剧情节点：交代时间地点和在场人物，让人物在可感知的压力中采取动作、遭遇阻力、做出选择，并让选择带来具体结果、情绪变化或关系变化。相邻事件主动更换场景机制和人物对抗方式，让声音、空间、物件、现实压力、人物误解、关系裂缝和突发行动轮流推动故事。资料只有在人物正在做事、被迫应对或关系发生变化时进入场景。
+当前阶段发生的伏笔端点，都在承载事件的 a 中加入“F编号/setup”或“F编号/payoff”，并在 f 中用同一事件编号 e 关联。setup写线索第一次进入人物生活，payoff写线索在场景中产生的实际变化；同一条伏笔可以在不同阶段继续生长，程序会依据事件 r 的章节范围落下具体章号。
+实际返回的 f 使用单端点格式，例如 {"i":"F06","k":"payoff","e":"E04","d":"人物在现场做出选择后，线索改变了什么"}。全书契约保留长期事实、世界运行方式、人物底色和结尾方向；伏笔通过 setup 与 payoff 表达它在场景中的进入、变化和意义显现。
+
+返回结构示例（示例中的空数组和空字段实际可以省略）：{"v":"4","k":{"f":["不能改变的长期事实"],"w":["长期世界运行方式"],"c":["人物底色"],"e":["结尾方向"]},"s":{"i":"S05","n":"阶段名称","r":[137,167],"b":{"t":"时间","l":"地点","c":["人物处境"],"k":["已经发生并被人物掌握的事实"],"q":["仍会推动人物行动的问题"]},"e":[{"i":"E01","r":[137,140],"a":["F01/setup","关联资料"],"p":["前置条件"],"h":"时间、地点、人物、压力、动作、阻力、选择和现场结果组成的场景事件","o":"直接结果","d":["人物、关系、情绪或局势发生的实际变化"]}],"x":{"t":"结束时间","l":"结束地点","c":["结束时人物处境"],"k":["结束时已经发生的事实"],"q":["带入下一阶段的问题"]},"y":["带入下一阶段的事实"]},"f":[{"i":"F01","k":"setup","e":"E01","d":"线索在现场第一次出现并改变人物选择"}]}}。本次只生成当前阶段一个 s 对象，不要返回其它阶段；有意义的事实不能省略。
+""".strip()
+
+STEP_PROMPTS["stage_plan"] = f"""{COMMON_CREATION_RULES}
+
+现在根据已经选定的故事和完整故事底盘，制作唯一的十万字阶段规划。这里的内容是给后续章节规划和正文扩写读取的执行资料，不是发布简介，也不需要写成文学化段落。总字数和单章字数完全按照作者输入；章节总数按 total_words / average_chapter_words 向上取整，最后一章吸收余数。每约十万字为一个阶段，阶段从第1章连续覆盖到最后一章，事件范围按顺序衔接。
+
+阶段规划固定事实、顺序、状态和阶段推进，但剧情推进以场景为单位。每个事件都要写出具体时间地点、在场人物、当下压力、人物动作、对方或环境形成的阻力、人物选择、情绪或关系变化和直接后果；事件之间通过人物正在做的事和刚刚付出的代价自然衔接。对都市灵异、惊悚、悬疑、情感等题材，声音、空间、物件、生活压力、人物之间的隐瞒和现场失控持续进入剧情；对其它题材，使用该题材自己的场景压力和人物对抗。除非作者明确选择办案、破案或调查推理题材，否则不得把案卷化、程序化的材料往来当成主要剧情，不得让人物靠解释性结论推动故事。连续两个事件不能都停留在说明、谈话、安排或口头结论；如果前一个事件主要是信息揭露或人物谈话，后一个事件必须转入现场行动、直接碰撞、利益变化、关系变化、能力试探、空间压力或突发后果。人物必须在具体场面中行动、碰撞、选择并承担结果；相邻事件主动更换场景目标、冲突关系和压力来源，让人物、关系、空间和局势持续变化。
+
+伏笔端点使用底盘已有编号或名称，关联到本阶段实际发生的事件；setup写线索第一次进入人物生活，payoff写线索在场景中造成的变化，阶段之间允许继续铺开同一条暗线。程序会依据事件的允许章节范围落下具体章号，模型只负责事件顺序和端点归属，不写具体章号。
+
+{STAGE_PLAN_OBJECT_OUTPUT_RULES}
+"""
+
+
+def _compact_stage_plan_prompt(prompt):
+    """让阶段事件只返回实际变化，避免每个事件重复六类空结构。"""
+    text = str(prompt or "")
+    text = text.replace(
+        '["时间变化","地点变化数组","认知变化数组","关系变化数组","物件变化数组","新增问题数组"]',
+        '"实际发生的状态变化"',
+    )
+    text = text.replace(
+        '["时间变化数组","地点变化数组","认知变化数组","关系变化数组","物件变化数组","新增问题数组"]',
+        '"实际发生的状态变化"',
+    )
+    text = text.replace(
+        "状态变化固定6项",
+        "状态变化只保留真正发生的事实，没有变化不写",
+    )
+    text = text.replace(
+        "事件固定8项",
+        "事件保留必要事实，状态变化只写实际变化",
+    )
+    if "实际发生的状态变化" in text and "没有变化不写" not in text:
+        text += "\n状态变化只写真正发生的变化；没有变化的类别不要补空数组，也不要重复上一事件。"
+    return text
 
 
 def _as_text(value):
     return str(value or "").strip()
+
+
+def _creation_name_key(value):
+    """Normalize a name only for de-duplication; keep the displayed name intact."""
+    return re.sub(r"[\s·•．.\-—_]+", "", _as_text(value)).lower()
+
+
+def _creation_clean_name(value):
+    value = _as_text(value).strip(" \t\r\n\"'“”‘’「」『』：:，,。；;、()（）[]【】")
+    if not value or len(value) > 16:
+        return ""
+    if value in {"主角", "男主", "女主", "人物", "主角姓名", "姓名"}:
+        return ""
+    return value
+
+
+def _creation_premise_name(value):
+    """Extract only the likely protagonist name from a premise field.
+
+    The first-step schema intentionally keeps protagonist as a natural sentence,
+    so this is a small history hint rather than a rewrite of the model result.
+    """
+    text = _as_text(value)
+    if not text:
+        return ""
+    patterns = (
+        r"(?:主角|男主|女主)(?:的名字|姓名|叫作|叫做|叫|是)?[：:\s]*([\u4e00-\u9fff]{2,4})",
+        r"(?:名字|姓名)[：:\s]*([\u4e00-\u9fff]{2,4})",
+    )
+    for pattern in patterns:
+        match = re.search(pattern, text)
+        if match:
+            return _creation_clean_name(match.group(1))
+    match = re.match(r"[\"“‘「『]?([\u4e00-\u9fff]{2,4})(?=是|为|叫|，|。|；|：|,|:|;|、|\s|$)", text)
+    if match:
+        return _creation_clean_name(match.group(1))
+    age_pattern = r"(?:\d{1,3}|[零一二三四五六七八九十百千万]{1,5})岁"
+    for length in range(2, 5):
+        prefix = text[:length]
+        suffix = text[length:].lstrip()
+        if re.match(age_pattern, suffix):
+            return _creation_clean_name(prefix)
+    match = re.match(r"[\"“‘「『]?([\u4e00-\u9fff]{2,4})(?=[，。；：,:;、\s\d岁]|$)", text)
+    return _creation_clean_name(match.group(1)) if match else ""
+
+
+def _creation_character_names(records):
+    if not isinstance(records, list):
+        return []
+    marked = []
+    fallback = []
+    for item in records:
+        if not isinstance(item, dict):
+            continue
+        name = _creation_clean_name(item.get("name"))
+        if not name:
+            continue
+        fallback.append(name)
+        role = _as_text(item.get("role"))
+        if any(marker in role for marker in ("主角", "男主", "女主")):
+            marked.append(name)
+    return marked or fallback[:1]
+
+
+def _creation_project_protagonist_names(payload):
+    if not isinstance(payload, dict):
+        return []
+    names = _creation_character_names(payload.get("characters"))
+    if names:
+        return names
+    framework = payload.get("creation_framework")
+    if isinstance(framework, dict):
+        names = _creation_character_names(framework.get("characters"))
+    return names
+
+
+def _creation_history_records(payload):
+    if not isinstance(payload, dict):
+        return []
+    records = payload.get("records", [])
+    if not isinstance(records, list):
+        return []
+    result = []
+    for item in records:
+        if isinstance(item, dict):
+            name = _creation_clean_name(item.get("name"))
+        else:
+            name = _creation_clean_name(item)
+        if name:
+            result.append({
+                "name": name,
+                "created_at_ns": int(item.get("created_at_ns", 0) or 0)
+                if isinstance(item, dict)
+                else 0,
+            })
+    return result
+
+
+def _bootstrap_creation_name_history():
+    """Index existing projects once, without loading their story text into AI context."""
+    data = load_json_file(CREATION_WIZARD_NAME_HISTORY_FILE, {})
+    if not isinstance(data, dict):
+        data = {}
+    records = _creation_history_records(data)
+    if data.get("project_scan_complete"):
+        return records
+
+    project_dir = os.path.join(HISTORY_DIR, "novel_projects")
+    try:
+        paths = [
+            os.path.join(project_dir, name)
+            for name in os.listdir(project_dir)
+            if name.endswith(".json") and not name.startswith(".")
+        ]
+    except OSError:
+        paths = []
+    paths.sort(
+        key=lambda path: os.path.getmtime(path) if os.path.exists(path) else 0,
+        reverse=True,
+    )
+    for path in paths:
+        payload = load_json_file(path, {})
+        for name in _creation_project_protagonist_names(payload):
+            records.append({"name": name, "created_at_ns": 0})
+
+    draft_dir = CREATION_WIZARD_DRAFT_DIR
+    try:
+        draft_paths = [
+            os.path.join(draft_dir, name)
+            for name in os.listdir(draft_dir)
+            if name.startswith("draft-") and name.endswith(".json")
+        ]
+    except OSError:
+        draft_paths = []
+    for path in draft_paths:
+        payload = load_json_file(path, {})
+        candidates = payload.get("premise_candidates", []) if isinstance(payload, dict) else []
+        for candidate in candidates if isinstance(candidates, list) else []:
+            if isinstance(candidate, dict):
+                name = _creation_premise_name(candidate.get("protagonist"))
+                if name:
+                    records.append({"name": name, "created_at_ns": 0})
+        step_results = payload.get("step_results", {}) if isinstance(payload, dict) else {}
+        bible = step_results.get("bible", {}) if isinstance(step_results, dict) else {}
+        for name in _creation_character_names(bible.get("characters") if isinstance(bible, dict) else []):
+            records.append({"name": name, "created_at_ns": 0})
+
+    data["schema_version"] = 1
+    data["project_scan_complete"] = True
+    data["records"] = records[-CREATION_WIZARD_NAME_HISTORY_LIMIT:]
+    save_json_file(CREATION_WIZARD_NAME_HISTORY_FILE, data)
+    return _creation_history_records(data)
+
+
+def _creation_name_references(current_names=None):
+    records = _bootstrap_creation_name_history()
+    data = load_json_file(CREATION_WIZARD_NAME_HISTORY_FILE, {})
+    records.extend(_creation_history_records(data))
+    ordered = []
+    seen = set()
+    for item in list(current_names or []) + list(reversed(records)):
+        name = _creation_clean_name(item.get("name") if isinstance(item, dict) else item)
+        key = _creation_name_key(name)
+        if not name or not key or key in seen:
+            continue
+        seen.add(key)
+        ordered.append(name)
+        if len(ordered) >= CREATION_WIZARD_NAME_REFERENCE_LIMIT:
+            break
+    surnames = []
+    surname_seen = set()
+    for name in ordered:
+        surname = name[0] if len(name) >= 2 and re.match(r"[\u4e00-\u9fff]", name[0]) else ""
+        if surname and surname not in surname_seen:
+            surname_seen.add(surname)
+            surnames.append(surname)
+    result = {}
+    if ordered:
+        result["recent_protagonist_names"] = ordered
+    if surnames:
+        result["recent_surnames"] = surnames[:18]
+    return result
+
+
+def remember_creation_wizard_names(names, source="premise"):
+    values = []
+    seen = set()
+    for value in names if isinstance(names, (list, tuple, set)) else [names]:
+        name = _creation_clean_name(value)
+        key = _creation_name_key(name)
+        if name and key and key not in seen:
+            seen.add(key)
+            values.append(name)
+    if not values:
+        return
+    data = load_json_file(CREATION_WIZARD_NAME_HISTORY_FILE, {})
+    if not isinstance(data, dict):
+        data = {}
+    records = _creation_history_records(data)
+    created_at_ns = time.time_ns()
+    existing = {_creation_name_key(item.get("name")): item for item in records}
+    for name in values:
+        existing[_creation_name_key(name)] = {
+            "name": name,
+            "source": _as_text(source) or "premise",
+            "created_at_ns": created_at_ns,
+        }
+    data["schema_version"] = 1
+    data["project_scan_complete"] = bool(data.get("project_scan_complete"))
+    data["records"] = list(existing.values())[-CREATION_WIZARD_NAME_HISTORY_LIMIT:]
+    save_json_file(CREATION_WIZARD_NAME_HISTORY_FILE, data)
+
+
+def _creation_wizard_draft_path(draft_id):
+    safe_id = re.sub(r"[^A-Za-z0-9_.-]+", "_", _as_text(draft_id)).strip("._")
+    if not safe_id:
+        return ""
+    return os.path.join(CREATION_WIZARD_DRAFT_DIR, f"draft-{safe_id}.json")
+
+
+def _new_creation_wizard_draft_id():
+    # Creation time is the visible identity rule; the short suffix only
+    # prevents collisions when two projects are created in one clock tick.
+    return f"{time.time_ns()}-{uuid.uuid4().hex[:8]}"
+
+
+def _creation_wizard_index():
+    data = load_json_file(CREATION_WIZARD_DRAFT_INDEX_FILE, {})
+    if not isinstance(data, dict):
+        data = {}
+    drafts = data.get("drafts", [])
+    data["drafts"] = [item for item in drafts if isinstance(item, dict)] if isinstance(drafts, list) else []
+    data.setdefault("schema_version", 1)
+    data.setdefault("legacy_migrated", False)
+    return data
+
+
+def _creation_wizard_step_summary(payload):
+    try:
+        step_index = max(
+            0,
+            min(
+                int(payload.get("current_step_index", 0) or 0),
+                len(CREATION_WIZARD_STEPS) - 1,
+            ),
+        )
+    except (TypeError, ValueError):
+        step_index = 0
+    step, title = CREATION_WIZARD_STEPS[step_index]
+    results = payload.get("step_results", {})
+    result = results.get(step, {}) if isinstance(results, dict) else {}
+    state = result.get("_generation_state", {}) if isinstance(result, dict) else {}
+    status = _as_text(state.get("status")).lower() if isinstance(state, dict) else ""
+    if step == "bible" and status == "partial":
+        completed = state.get("completed_batches", []) if isinstance(state, dict) else []
+        return "故事底盘 · 第二批" if "bible_core" in completed else "故事底盘 · 第一批"
+    if step == "stage_plan":
+        stage_plan = result.get("stage_plan", []) if isinstance(result, dict) else []
+        first_missing, _stage_by_index = _stage_plan_progress(
+            stage_plan,
+            _expected_stage_count(payload.get("target_words", 500000)),
+        )
+        if first_missing is not None:
+            return f"十万字阶段规划 · 第{first_missing + 1}阶段"
+        if status == "partial":
+            # Keep the old fallback for malformed/legacy drafts whose stage
+            # records cannot be inspected, but never prefer a stale complete
+            # counter when actual stage content says otherwise.
+            try:
+                next_stage = int(state.get("next_stage_index", 0) or 0) + 1
+            except (TypeError, ValueError):
+                next_stage = 1
+            return f"十万字阶段规划 · 第{next_stage}阶段"
+    if isinstance(result, dict) and result:
+        return f"{title} · 已保存"
+    return title
+
+
+def _creation_wizard_summary(payload):
+    payload = payload if isinstance(payload, dict) else {}
+    try:
+        step_index = max(
+            0,
+            min(
+                int(payload.get("current_step_index", 0) or 0),
+                len(CREATION_WIZARD_STEPS) - 1,
+            ),
+        )
+    except (TypeError, ValueError):
+        step_index = 0
+    premise_result = payload.get("step_results", {}).get("premise", {})
+    candidates = premise_result.get("candidates", []) if isinstance(premise_result, dict) else []
+    try:
+        selected_index = int(premise_result.get("selected_index", 0) or 0)
+    except (TypeError, ValueError):
+        selected_index = 0
+    selected = (
+        candidates[selected_index]
+        if isinstance(candidates, list) and 0 <= selected_index < len(candidates)
+        and isinstance(candidates[selected_index], dict)
+        else {}
+    )
+    title = (
+        _as_text(selected.get("title"))
+        or _as_text(payload.get("project_name_hint"))
+        or "未命名项目"
+    )
+    created_at = _as_text(payload.get("created_at")) or "创建时间未知"
+    try:
+        created_at_ns = int(payload.get("created_at_ns", 0) or 0)
+    except (TypeError, ValueError):
+        created_at_ns = 0
+    return {
+        "draft_id": _as_text(payload.get("draft_id")),
+        "title": title,
+        "created_at": created_at,
+        "created_at_ns": created_at_ns,
+        "updated_at": _as_text(payload.get("updated_at")),
+        "step": _creation_wizard_step_summary(payload),
+        "current_step_index": step_index,
+    }
+
+
+def _save_creation_wizard_index(index):
+    index = index if isinstance(index, dict) else {"schema_version": 1, "drafts": []}
+    index["schema_version"] = 1
+    index["drafts"] = [item for item in index.get("drafts", []) if isinstance(item, dict)]
+    save_json_file(CREATION_WIZARD_DRAFT_INDEX_FILE, index)
+
+
+def _migrate_legacy_creation_wizard_draft():
+    """Move the former single draft into the multi-draft store once."""
+    index = _creation_wizard_index()
+    if index.get("legacy_migrated"):
+        return index
+    index["legacy_migrated"] = True
+    legacy = load_json_file(CREATION_WIZARD_DRAFT_FILE, {})
+    if isinstance(legacy, dict) and (
+        legacy.get("premise_candidates")
+        or legacy.get("step_results")
+        or _as_text(legacy.get("inspiration"))
+    ):
+        try:
+            created_ns = int(os.stat(CREATION_WIZARD_DRAFT_FILE).st_mtime_ns)
+        except (OSError, AttributeError):
+            created_ns = time.time_ns()
+        draft_id = f"{created_ns}-{uuid.uuid4().hex[:8]}"
+        migrated = deepcopy(legacy)
+        migrated["draft_id"] = draft_id
+        migrated["created_at"] = _as_text(migrated.get("created_at")) or now_str()
+        migrated["created_at_ns"] = int(migrated.get("created_at_ns", created_ns) or created_ns)
+        migrated["updated_at"] = now_str()
+        path = _creation_wizard_draft_path(draft_id)
+        save_json_file(path, migrated)
+        index["drafts"] = [
+            item for item in index.get("drafts", [])
+            if _as_text(item.get("draft_id")) != draft_id
+        ]
+        index["drafts"].append(_creation_wizard_summary(migrated))
+    _save_creation_wizard_index(index)
+    return index
+
+
+def list_creation_wizard_drafts():
+    """Return unfinished wizard projects ordered by creation time."""
+    _migrate_legacy_creation_wizard_draft()
+    index = _creation_wizard_index()
+    records = {}
+    for item in index.get("drafts", []):
+        draft_id = _as_text(item.get("draft_id"))
+        if draft_id:
+            records[draft_id] = deepcopy(item)
+    try:
+        names = os.listdir(CREATION_WIZARD_DRAFT_DIR)
+    except OSError:
+        names = []
+    for name in names:
+        if not name.startswith("draft-") or not name.endswith(".json"):
+            continue
+        payload = load_json_file(os.path.join(CREATION_WIZARD_DRAFT_DIR, name), {})
+        if not isinstance(payload, dict):
+            continue
+        summary = _creation_wizard_summary(payload)
+        draft_id = _as_text(summary.get("draft_id"))
+        if draft_id:
+            records[draft_id] = summary
+    return sorted(
+        records.values(),
+        key=lambda item: (
+            int(item.get("created_at_ns", 0) or 0),
+            _as_text(item.get("draft_id")),
+        ),
+        reverse=True,
+    )
+
+
+def create_creation_wizard_draft(project_name_hint=""):
+    created_at_ns = time.time_ns()
+    draft_id = f"{created_at_ns}-{uuid.uuid4().hex[:8]}"
+    payload = {
+        "schema_version": 3,
+        "draft_id": draft_id,
+        "created_at": now_str(),
+        "created_at_ns": created_at_ns,
+        "updated_at": now_str(),
+        "project_name_hint": _as_text(project_name_hint),
+        "current_step_index": 0,
+        "choice_values": {},
+        "inspiration": "",
+        "target_words": 500000,
+        "average_words": 3000,
+        "premise_candidates": [],
+        "premise_selected_index": 0,
+        "step_results": {},
+    }
+    save_creation_wizard_draft(payload)
+    return draft_id
+
+
+def load_creation_wizard_draft(draft_id):
+    _migrate_legacy_creation_wizard_draft()
+    path = _creation_wizard_draft_path(draft_id)
+    data = load_json_file(path, {}) if path else {}
+    return data if isinstance(data, dict) else {}
+
+
+def save_creation_wizard_draft(payload):
+    _migrate_legacy_creation_wizard_draft()
+    payload = deepcopy(payload) if isinstance(payload, dict) else {}
+    draft_id = _as_text(payload.get("draft_id")) or _new_creation_wizard_draft_id()
+    payload["draft_id"] = draft_id
+    payload.setdefault("created_at", now_str())
+    payload.setdefault("created_at_ns", time.time_ns())
+    payload["updated_at"] = now_str()
+    path = _creation_wizard_draft_path(draft_id)
+    if not path:
+        return ""
+    save_json_file(path, payload)
+    index = _creation_wizard_index()
+    index["legacy_migrated"] = True
+    summaries = [
+        item for item in index.get("drafts", [])
+        if _as_text(item.get("draft_id")) != draft_id
+    ]
+    summaries.append(_creation_wizard_summary(payload))
+    index["drafts"] = summaries
+    _save_creation_wizard_index(index)
+    return path
+
+
+def delete_creation_wizard_draft(draft_id):
+    path = _creation_wizard_draft_path(draft_id)
+    if path:
+        safe_remove_file(path)
+    index = _creation_wizard_index()
+    index["drafts"] = [
+        item for item in index.get("drafts", [])
+        if _as_text(item.get("draft_id")) != _as_text(draft_id)
+    ]
+    _save_creation_wizard_index(index)
 
 
 def _first_value(mapping, keys, default=""):
@@ -188,15 +800,1462 @@ def _as_list(value):
     return value if isinstance(value, list) else []
 
 
-def normalize_creation_result(step, payload):
-    """Normalize common model aliases without adding another AI call."""
-    payload = deepcopy(payload) if isinstance(payload, dict) else {}
+def _strip_leading_field_label(value, labels):
+    """去掉模型把字段提示词重复写进正文的情况。"""
+    text = _as_text(value)
+    if not text:
+        return ""
+    for label in labels:
+        label = _as_text(label).rstrip("：:")
+        if not label:
+            continue
+        prefix = label + "："
+        if text.startswith(prefix):
+            return text[len(prefix):].lstrip()
+        prefix = label + ":"
+        if text.startswith(prefix):
+            return text[len(prefix):].lstrip()
+    return text
+
+
+def _clean_character_notes(value):
+    text = _as_text(value)
+    if not text:
+        return ""
+    empty_labels = {"害怕失去：", "害怕失去:", "与主角关系：", "与主角关系:", "长期变化：", "长期变化:"}
+    lines = [
+        line.strip()
+        for line in text.splitlines()
+        if line.strip() and line.strip() not in empty_labels
+    ]
+    return "\n".join(lines).strip()
+
+
+def _has_creation_content(value):
+    if isinstance(value, dict):
+        return any(_has_creation_content(child) for child in value.values())
+    if isinstance(value, (list, tuple, set)):
+        return any(_has_creation_content(child) for child in value)
+    return bool(_as_text(value))
+
+
+def _creation_stage_index(value):
+    """Return the zero-based stage index encoded by an id such as ``S03``."""
+    match = re.fullmatch(r"S[_-]?(\d{1,4})", _as_text(value).upper())
+    if not match:
+        return -1
+    try:
+        return max(0, int(match.group(1)) - 1)
+    except (TypeError, ValueError):
+        return -1
+
+
+def _stage_has_meaningful_content(stage):
+    """A stage is complete only when every saved event is executable."""
+    if not isinstance(stage, dict) or not _as_text(stage.get("name")):
+        return False
+    events = stage.get("ordered_events", [])
+    if not isinstance(events, list) or not events:
+        return False
+    for event_index, event in enumerate(events, 1):
+        if not (
+            isinstance(event, dict)
+            and _as_text(event.get("event"))
+            and _as_text(event.get("result"))
+        ):
+            return False
+        event_id = _as_text(event.get("id")).upper()
+        match = re.search(r"E[_-]?(\d+)$", event_id)
+        if match is None or int(match.group(1)) != event_index:
+            return False
+    return True
+
+
+def _validate_stage_batch_events(stage, stage_index, spec):
+    """Reject a structurally incomplete stage before it can replace saved data."""
+    if not isinstance(stage, dict):
+        raise ValueError(f"第{stage_index + 1}阶段没有返回有效的阶段结构，本次未保存。")
+    events = stage.get("ordered_events", [])
+    if not isinstance(events, list) or not events:
+        raise ValueError(
+            f"第{stage_index + 1}阶段没有返回完整的剧情事件，本次未保存；请重新生成。"
+        )
+
+    start_chapter = int(spec.get("start_chapter", 0) or 0)
+    end_chapter = int(spec.get("end_chapter", 0) or 0)
+    problems = []
+    # ``allowed_chapters`` is an anchor window, not an exclusive slice.  The
+    # next event may begin inside the previous window (for example [1, 2]
+    # followed by [2, 4]); only a backwards range or an uncovered chapter
+    # should make the stage invalid.
+    previous_start = start_chapter
+    previous_end = start_chapter - 1
+    for event_index, event in enumerate(events, 1):
+        label = f"第{event_index}个事件"
+        if not isinstance(event, dict):
+            problems.append(f"{label}不是有效事件结构")
+            continue
+        if not _as_text(event.get("event")):
+            problems.append(f"{label}缺少具体事件")
+        if not _as_text(event.get("result")):
+            problems.append(f"{label}缺少直接结果")
+        event_id = _as_text(event.get("id")).upper()
+        event_match = re.search(r"E[_-]?(\d+)$", event_id)
+        if event_match is None or int(event_match.group(1)) != event_index:
+            problems.append(f"{label}的编号不连续，应为E{event_index:02d}")
+        allowed = event.get("allowed_chapters", [])
+        if not isinstance(allowed, (list, tuple)) or len(allowed) < 2:
+            problems.append(f"{label}缺少允许章节范围")
+            continue
+        try:
+            allowed_start = int(allowed[0])
+            allowed_end = int(allowed[1])
+        except (TypeError, ValueError):
+            problems.append(f"{label}的章节范围不是有效整数")
+            continue
+        if (
+            allowed_start < start_chapter
+            or allowed_end > end_chapter
+            or allowed_start > allowed_end
+        ):
+            problems.append(
+                f"{label}超出本阶段第{start_chapter}—{end_chapter}章范围"
+            )
+        else:
+            if event_index == 1 and allowed_start != start_chapter:
+                problems.append(
+                    f"{label}没有从本阶段第{start_chapter}章开始"
+                )
+            elif event_index > 1 and allowed_start < previous_start:
+                problems.append(
+                    f"{label}的起始章节早于前一个事件，事件顺序倒退"
+                )
+            elif event_index > 1 and allowed_start > previous_end + 1:
+                problems.append(
+                    f"{label}与前一个事件之间存在未覆盖章节"
+                )
+            if event_index > 1 and allowed_end < previous_end:
+                problems.append(
+                    f"{label}的结束章节早于前一个事件，事件范围倒退"
+                )
+            previous_start = allowed_start
+            previous_end = max(previous_end, allowed_end)
+
+    if previous_end != end_chapter:
+        problems.append(
+            f"事件范围没有完整覆盖本阶段第{start_chapter}—{end_chapter}章"
+        )
+
+    if problems:
+        detail = "；".join(problems[:4])
+        if len(problems) > 4:
+            detail += f"；另有{len(problems) - 4}处问题"
+        raise ValueError(
+            f"第{stage_index + 1}阶段返回内容不完整：{detail}。"
+            "本次未保存当前阶段，请重新生成。"
+        )
+
+
+def _stage_plan_progress(stage_plan, stage_count):
+    """Return the first missing stage without trusting list position or state."""
+    try:
+        stage_count = max(0, int(stage_count))
+    except (TypeError, ValueError):
+        stage_count = 0
+    by_index = {}
+    positional = []
+    for item in stage_plan if isinstance(stage_plan, list) else []:
+        if not isinstance(item, dict):
+            continue
+        index = _creation_stage_index(item.get("id"))
+        if 0 <= index < stage_count:
+            previous = by_index.get(index)
+            if previous is None or (
+                _stage_has_meaningful_content(item)
+                and not _stage_has_meaningful_content(previous)
+            ):
+                by_index[index] = item
+        else:
+            positional.append(item)
+
+    # Only use positional fallback for records with no usable stage id.  A
+    # record explicitly marked S04 must never be moved into the S02 slot.
+    free_indexes = [index for index in range(stage_count) if index not in by_index]
+    for item, index in zip(positional, free_indexes):
+        by_index[index] = item
+
+    first_missing = next(
+        (
+            index
+            for index in range(stage_count)
+            if not _stage_has_meaningful_content(by_index.get(index))
+        ),
+        None,
+    )
+    return first_missing, by_index
+
+
+_EXPLICIT_POWER_GENRE_MARKERS = (
+    "玄幻", "仙侠", "修真", "高武", "武侠", "武道", "魔法",
+    "异世界", "西幻", "奇幻", "灵气", "修炼", "境界",
+)
+
+
+def story_requires_explicit_power_levels(*values):
+    """只对明确存在修炼/境界体系的题材保留详细能力层次。"""
+    text_parts = []
+    for value in values:
+        if isinstance(value, dict):
+            text_parts.extend(str(item) for item in value.values())
+        elif isinstance(value, (list, tuple, set)):
+            text_parts.extend(str(item) for item in value)
+        elif value not in (None, ""):
+            text_parts.append(str(value))
+    text = " ".join(text_parts).lower()
+    return any(marker.lower() in text for marker in _EXPLICIT_POWER_GENRE_MARKERS)
+
+
+def _normalize_ability_system(value, allow_power_levels):
+    if not isinstance(value, dict) or not allow_power_levels:
+        return {
+            "enabled": False,
+            "name": "",
+            "description": "",
+            "levels": [],
+            "limits": [],
+        }
+    levels = []
+    for item in _as_list(value.get("levels")):
+        if not isinstance(item, dict):
+            continue
+        levels.append({
+            "name": _as_text(_first_value(item, ("name", "level", "境界", "层次"))),
+            "capability": _as_text(_first_value(item, ("capability", "能做到", "能力"))),
+            "limit": _as_text(_first_value(item, ("limit", "不能做到", "边界"))),
+            "promotion": _as_text(_first_value(item, ("promotion", "提升", "如何变强"))),
+        })
+    return {
+        "enabled": bool(value.get("enabled", bool(levels))),
+        "name": _as_text(_first_value(value, ("name", "title", "名称", "体系名称"))),
+        "description": _as_text(_first_value(value, ("description", "summary", "说明"))),
+        "levels": levels,
+        "limits": [
+            _as_text(item)
+            for item in _as_list(value.get("limits"))
+            if _as_text(item)
+        ],
+    }
+
+
+_BIBLE_FIELDS = (
+    "core_setting",
+    "reader_promise",
+    "theme",
+    "main_conflict",
+    "relationship_foundation",
+    "ending_direction",
+    "hard_boundaries",
+)
+
+_BIBLE_FIELD_ALIASES = {
+    "core_setting": (
+        "core_setting", "story_core", "core", "核心设定", "故事核心",
+        "小说核心", "核心内容", "故事真正要讲的东西",
+    ),
+    "reader_promise": (
+        "reader_promise", "core_reader_promise", "读者承诺", "读者期待",
+        "读者追问", "读者会一直追问", "读者会一直想知道的事",
+        "读者关心的问题",
+    ),
+    "theme": ("theme", "主题", "故事主题", "故事想留下的东西", "故事想说的话"),
+    "main_conflict": (
+        "main_conflict", "core_conflict", "主线矛盾", "核心冲突",
+        "主要矛盾", "最重要的矛盾",
+    ),
+    "relationship_foundation": (
+        "relationship_foundation", "relationship_base", "关系基础", "人物关系",
+        "人物关系底子", "重要人物关系的起点",
+    ),
+    "ending_direction": (
+        "ending_direction", "ending", "结尾方向", "结局方向",
+        "结尾留下的方向",
+    ),
+    "hard_boundaries": (
+        "hard_boundaries", "boundaries", "硬边界", "必须守住的边界",
+        "不能改变的事实", "不能违背的写法",
+    ),
+}
+
+_WORLD_RULE_FIELD_ALIASES = {
+    "setting_overview": (
+        "setting_overview", "overview", "世界概况", "世界样貌",
+        "这个世界的样子", "世界的基本样貌", "世界规则概况", "时代背景",
+    ),
+    "power_system": (
+        "power_system", "ability_rules", "力量体系", "能力规则",
+        "能力边界", "力量和能力的边界", "力量和能力的规矩",
+    ),
+    "geography_and_life": (
+        "geography_and_life", "geography", "daily_life", "地理与生活",
+        "地点和生活", "重要地点和日常生活", "空间和日常生活",
+    ),
+}
+
+_CHARACTER_FIELD_ALIASES = {
+    "name": ("name", "character_name", "姓名", "人物"),
+    "role": (
+        "role", "identity", "身份", "人物身份", "角色", "角色定位",
+    ),
+    "goal": (
+        "goal", "desire", "want", "目标", "人物目标", "想要",
+    ),
+    "secret": (
+        "secret", "hidden_secret", "秘密", "隐藏秘密", "隐瞒",
+    ),
+    "voice": (
+        "voice", "speech", "language_style", "speaking_style", "tone",
+        "语言风格", "说话风格", "说话方式", "口吻", "语气",
+    ),
+    "notes": ("notes", "备注", "人物备注", "后续注意"),
+}
+
+_LORE_FIELD_ALIASES = {
+    "name": ("name", "title", "名称", "设定名"),
+    "type": ("type", "category", "类别", "类型"),
+    "description": ("description", "detail", "具体内容", "具体情况", "说明"),
+    "story_known": (
+        "story_known", "known", "已知情况", "人物已知", "人物现在知道多少",
+    ),
+}
+
+_FORESHADOW_FIELD_ALIASES = {
+    "code": ("code", "id", "编号", "伏笔编号"),
+    "name": ("name", "title", "名称", "伏笔"),
+    "status": ("status", "状态"),
+    "setup_stage": (
+        "setup_stage", "埋设阶段", "埋下阶段", "出现阶段",
+        "暗线出现的位置",
+    ),
+    "payoff_stage": (
+        "payoff_stage", "回收阶段", "变化阶段", "暗线发生变化的位置",
+    ),
+    "setup_chapter": (
+        "setup_chapter", "setup", "埋设章节", "埋下章节",
+    ),
+    "payoff_chapter": (
+        "payoff_chapter", "payoff", "回收章节", "揭示章节",
+    ),
+    "description": ("description", "detail", "具体内容", "线索", "暗线"),
+    "revealed": ("revealed", "reveal", "揭示结果", "揭开后", "以后揭开的事实"),
+    "remaining_secret": (
+        "remaining_secret", "unknown", "剩余秘密", "仍未揭开", "还藏着的部分",
+    ),
+    "notes": ("notes", "备注", "后续注意"),
+}
+
+
+def _normalize_text_list(value):
+    return [
+        _as_text(item)
+        for item in _as_list(value)
+        if _as_text(item)
+    ]
+
+
+def _normalize_text_record(value, fields, aliases):
+    if isinstance(value, str):
+        return {
+            fields[0]: _strip_leading_field_label(
+                value,
+                aliases.get(fields[0], (fields[0],)),
+            )
+        } if fields else {}
+    if not isinstance(value, dict):
+        return {}
+    return {
+        field: _strip_leading_field_label(
+            _first_value(value, aliases.get(field, (field,))),
+            aliases.get(field, (field,)),
+        )
+        for field in fields
+    }
+
+
+def _normalize_record_list(value, fields, aliases):
+    records = []
+    for item in _as_list(value):
+        if isinstance(item, dict):
+            records.append(_normalize_text_record(item, fields, aliases))
+    return records
+
+
+def _append_note(notes, value):
+    notes = _as_text(notes)
+    value = _as_text(value)
+    if not value or value in notes:
+        return notes
+    return "\n".join(part for part in (notes, value) if part).strip()
+
+
+def _clean_chapter_plan_note(value):
+    """Keep only a human-readable planning note, never transport metadata."""
+    text = _as_text(value)
+    if not text:
+        return ""
+    if text.startswith(("{", "[")):
+        return ""
+    if any(token in text for token in ("'range'", "'stage'", "'cadence'", "'boundary'", '"range"')):
+        return ""
+    return text
+
+
+def _normalize_character_record(value):
+    if not isinstance(value, dict):
+        return {}
+    record = _normalize_text_record(
+        value,
+        ("name", "role", "goal", "secret", "voice", "notes"),
+        _CHARACTER_FIELD_ALIASES,
+    )
+    record["notes"] = _clean_character_notes(record.get("notes"))
+    optional_notes = (
+        ("害怕失去：", ("fear", "fears", "害怕", "害怕失去")),
+        (
+            "与主角关系：",
+            ("relationship_to_protagonist", "relationship", "与主角关系"),
+        ),
+        ("长期变化：", ("long_term_change", "arc", "character_arc", "长期变化")),
+    )
+    for label, aliases in optional_notes:
+        detail = _as_text(_first_value(value, aliases))
+        if detail:
+            record["notes"] = _append_note(record.get("notes"), label + detail)
+    return record
+
+
+def _normalize_lore_record(value):
+    if not isinstance(value, dict):
+        return {}
+    raw_description = _first_value(
+        value,
+        _LORE_FIELD_ALIASES["description"],
+    )
+    if isinstance(raw_description, (list, tuple, dict)):
+        if isinstance(raw_description, dict):
+            raw_description = [
+                child
+                for child in raw_description.values()
+                if child not in (None, "", [], {})
+            ]
+        detail_parts = []
+        for child in raw_description if isinstance(raw_description, (list, tuple)) else (raw_description,):
+            if isinstance(child, dict):
+                child_text = "；".join(
+                    _as_text(item)
+                    for item in child.values()
+                    if _as_text(item)
+                )
+            elif isinstance(child, (list, tuple)):
+                child_text = "；".join(_as_text(item) for item in child if _as_text(item))
+            else:
+                child_text = _as_text(child)
+            if child_text:
+                detail_parts.append(child_text)
+        value = deepcopy(value)
+        value["description"] = "；".join(detail_parts)
+    record = _normalize_text_record(
+        value,
+        ("name", "type", "description", "story_known"),
+        _LORE_FIELD_ALIASES,
+    )
+    relationship_effect = _as_text(
+        _first_value(value, ("relationship_effect", "effect", "关系影响"))
+    )
+    if relationship_effect:
+        record["description"] = _append_note(
+            record.get("description"),
+            relationship_effect,
+        )
+    # Some providers understand the requested realm list more reliably when
+    # it is returned as a small nested list.  Keep the formal project schema
+    # unchanged, but fold that list into the ordinary lore description before
+    # it reaches the rest of the application.
+    levels = _first_value(value, ("levels", "power_levels", "实力层次", "境界", "等级"), [])
+    if isinstance(levels, list) and levels:
+        level_lines = []
+        for item in levels:
+            if isinstance(item, dict):
+                name = _as_text(_first_value(item, ("name", "level", "境界", "层次")))
+                detail = "；".join(
+                    part for part in (
+                        _as_text(_first_value(item, ("description", "capability", "说明", "能做到"))),
+                        _as_text(_first_value(item, ("limit", "不能做到", "边界"))),
+                        _as_text(_first_value(item, ("promotion", "提升", "突破"))),
+                    ) if part
+                )
+                if name:
+                    level_lines.append(f"{name}：{detail}" if detail else name)
+            elif _as_text(item):
+                level_lines.append(_as_text(item))
+        if level_lines:
+            record["description"] = _append_note(
+                record.get("description"),
+                "实力层次：" + "；".join(level_lines),
+            )
+    return record
+
+
+def _normalize_foreshadow_record(value, stage_count=None):
+    if not isinstance(value, dict):
+        return {}
+    record = _normalize_text_record(
+        value,
+        (
+            "code", "name", "status", "setup_stage", "payoff_stage",
+            "setup_chapter", "payoff_chapter",
+            "description", "revealed", "remaining_secret", "notes",
+        ),
+        _FORESHADOW_FIELD_ALIASES,
+    )
+    # 第二步只确定阶段，不应把“第八阶段”这样的文本放进主程序的
+    # 具体章节字段。旧草稿如果曾经把阶段写进 setup_chapter/payoff_chapter，
+    # 这里也一并搬回独立的阶段字段，避免后续再把数字 8 当成第 8 章。
+    for stage_key, chapter_key in (
+        ("setup_stage", "setup_chapter"),
+        ("payoff_stage", "payoff_chapter"),
+    ):
+        stage_value = _as_text(record.get(stage_key))
+        chapter_value = _as_text(record.get(chapter_key))
+        if not stage_value and "阶段" in chapter_value:
+            stage_value = chapter_value
+            record[chapter_key] = ""
+        record[stage_key] = _normalize_creation_stage_ref(
+            stage_value,
+            stage_count,
+        )
+
+    # 伏笔的故事性内容属于“说明”。notes 是主程序给用户留下的
+    # 体检/合并备注，不能让向导把正式内容写到那里。
+    generated_notes = _as_text(record.get("notes"))
+    if generated_notes:
+        record["description"] = _append_note(
+            record.get("description"),
+            generated_notes,
+        )
+    relationship_effect = _as_text(
+        _first_value(value, ("relationship_effect", "effect", "关系影响"))
+    )
+    if relationship_effect:
+        record["description"] = _append_note(
+            record.get("description"),
+            relationship_effect,
+        )
+    record["notes"] = ""
+    # 向导只是在搭建后续故事材料，正文尚未写到任何一条伏笔。
+    # 模型返回的状态不能覆盖主程序按正文事实维护的状态。
+    record["status"] = "未埋"
+    return record
+
+
+def _legacy_relationship_notes(value):
+    notes_by_character = {}
+    relationships = _first_value(
+        value,
+        ("relationship_map", "relationships", "关系图", "关系地图"),
+        [],
+    )
+    for item in _as_list(relationships):
+        if not isinstance(item, dict):
+            continue
+        source = _as_text(_first_value(item, ("from", "source", "人物一")))
+        target = _as_text(_first_value(item, ("to", "target", "人物二")))
+        if not source or not target:
+            continue
+        details = "；".join(
+            part for part in (
+                _as_text(_first_value(item, ("initial_state", "initial", "初始关系"))),
+                _as_text(_first_value(item, ("turning_pressure", "pressure", "转折压力"))),
+                _as_text(_first_value(item, ("possible_state", "future_state", "可能变化"))),
+            ) if part
+        )
+        text = f"与{target}的关系"
+        if details:
+            text += "：" + details
+        notes_by_character[source] = _append_note(notes_by_character.get(source, ""), text)
+    return notes_by_character
+
+
+def _legacy_scene_lore(value):
+    records = []
+    scenes = _first_value(value, ("key_scenes", "scenes", "关键场景"), [])
+    for item in _as_list(scenes):
+        if not isinstance(item, dict):
+            continue
+        name = _as_text(_first_value(item, ("name", "title", "名称", "场景")))
+        if not name:
+            continue
+        description = "；".join(
+            part for part in (
+                _as_text(_first_value(item, ("atmosphere", "mood", "氛围", "现场感觉"))),
+                _as_text(_first_value(item, ("conflict_use", "use", "冲突用途", "适合发生的冲突"))),
+            ) if part
+        )
+        records.append({
+            "name": name,
+            "type": "地点",
+            "description": description,
+            "story_known": "",
+        })
+    return records
+
+
+def _ability_system_lore(value, allow_power_levels):
+    ability_system = _normalize_ability_system(value, allow_power_levels)
+    levels = ability_system.get("levels", [])
+    if not ability_system.get("enabled") or not levels:
+        return None
+    description_parts = [_as_text(ability_system.get("description"))]
+    for item in levels:
+        if not isinstance(item, dict):
+            continue
+        level_name = _as_text(item.get("name"))
+        details = "；".join(
+            part for part in (
+                _as_text(item.get("capability")),
+                _as_text(item.get("limit")),
+                _as_text(item.get("promotion")),
+            ) if part
+        )
+        if level_name:
+            description_parts.append(f"{level_name}：{details}" if details else level_name)
+    limits = [
+        _as_text(item)
+        for item in ability_system.get("limits", [])
+        if _as_text(item)
+    ]
+    if limits:
+        description_parts.append("不能越过的边界：" + "；".join(limits))
+    return {
+        "name": _as_text(ability_system.get("name")) or "能力体系",
+        "type": "规则",
+        "description": "\n".join(part for part in description_parts if part).strip(),
+        "story_known": "",
+    }
+
+
+def _has_ordered_power_lore(lore):
+    """判断设定库中是否已有可供后续章节执行的实力层次记录。"""
+    if not isinstance(lore, list):
+        return False
+    text = " ".join(
+        _as_text(item.get("name")) + " " + _as_text(item.get("description"))
+        for item in lore
+        if isinstance(item, dict)
+    )
+    if not text:
+        return False
+    has_system_word = any(
+        word in text
+        for word in ("境界", "武道等级", "实力体系", "实力层次", "能力层次", "修炼层次")
+    )
+    ordered_names = re.findall(
+        r"(?<![一二三四五六七八九十])([\u4e00-\u9fff]{1,10}(?:境|阶|级))(?!界)",
+        text,
+    )
+    ordered_names = {
+        item for item in ordered_names
+        if item not in {"境界", "阶段", "等级", "层次"}
+    }
+    named_levels = {
+        item for item in re.findall(
+            r"(?:武者|武师|宗师|大宗师|武王|武皇|武帝|天人|圣人|神境)",
+            text,
+        )
+    }
+    has_order = len(ordered_names) >= 2 or bool(
+        re.search(r"(?:一|二|三|四|五|六|七|八|九|十)[阶境级段层]", text)
+        or re.search(r"\d+\s*[阶境级段层]", text)
+        or re.search(r"从低到高|境界依次|境界分为|层次依次", text)
+        or len(named_levels) >= 2
+    )
+    return has_system_word and has_order
+
+
+def _normalize_bible(value):
+    return _normalize_text_record(value, _BIBLE_FIELDS, _BIBLE_FIELD_ALIASES)
+
+
+def _legacy_faction_lore(value):
+    """把旧版世界规则里的势力迁移到主程序的设定库。"""
+    records = []
+    for item in _as_list(value):
+        if not isinstance(item, dict):
+            continue
+        name = _as_text(_first_value(item, ("name", "名称", "势力", "组织")))
+        if not name:
+            continue
+        position = _as_text(
+            _first_value(item, ("position", "stance", "立场", "想守住或争夺"))
+        )
+        relation = _as_text(
+            _first_value(
+                item,
+                (
+                    "relationship_to_protagonist",
+                    "relationship",
+                    "与主角关系",
+                    "对主角的态度",
+                ),
+            )
+        )
+        description = "\n".join(
+            part for part in (
+                position,
+                f"与主角的关系：{relation}" if relation else "",
+            ) if part
+        ).strip()
+        records.append({
+            "name": name,
+            "type": "势力",
+            "description": description,
+            "story_known": _as_text(
+                _first_value(item, ("story_known", "known", "人物已知"))
+            ),
+        })
+    return records
+
+
+def _normalize_world_rules(value):
+    if isinstance(value, str):
+        return {
+            "setting_overview": _strip_leading_field_label(
+                value,
+                _WORLD_RULE_FIELD_ALIASES["setting_overview"],
+            ),
+            "power_system": "",
+            "geography_and_life": "",
+            "rules": [],
+            "costs_and_limits": [],
+        }
+    if not isinstance(value, dict):
+        return {}
+    return {
+        **_normalize_text_record(value, tuple(_WORLD_RULE_FIELD_ALIASES), _WORLD_RULE_FIELD_ALIASES),
+        "rules": _normalize_text_list(_first_value(value, ("rules", "规矩", "规则"), [])),
+        "costs_and_limits": _normalize_text_list(
+            _first_value(value, ("costs_and_limits", "costs", "代价和限制"), [])
+        ),
+    }
+
+
+def _normalize_story_assets_fields(
+    payload,
+    allow_power_levels,
+    foreshadow_stage_count=None,
+):
+    payload = payload if isinstance(payload, dict) else {}
+    characters = _first_value(payload, ("characters", "people", "人物"), [])
+    lore = _first_value(payload, ("lore", "settings", "设定"), [])
+    foreshadows = _first_value(
+        payload,
+        ("foreshadows", "foreshadow_items", "clues", "伏笔"),
+        [],
+    )
+    ability_system = _first_value(
+        payload,
+        ("ability_system", "能力体系", "力量体系"),
+        {},
+    )
+    world_rules = payload.get("world_rules", {})
+    if allow_power_levels and isinstance(world_rules, dict):
+        legacy_levels = _first_value(
+            world_rules,
+            ("levels", "实力层次", "境界", "等级"),
+            [],
+        )
+        if (
+            isinstance(legacy_levels, list)
+            and legacy_levels
+            and (
+                not isinstance(ability_system, dict)
+                or not _as_list(ability_system.get("levels"))
+            )
+        ):
+            ability_system = {
+                "enabled": True,
+                "name": "能力体系",
+                "description": _as_text(
+                    _first_value(world_rules, ("power_system", "力量体系", "能力规则"))
+                ),
+                "levels": legacy_levels,
+                "limits": _first_value(
+                    world_rules,
+                    ("costs_and_limits", "代价和限制", "limits", "边界"),
+                    [],
+                ),
+            }
+    legacy_factions = _first_value(payload, ("factions", "势力"), [])
+    if not legacy_factions and isinstance(world_rules, dict):
+        legacy_factions = _first_value(world_rules, ("factions", "势力"), [])
+    relationship_notes = _legacy_relationship_notes(payload)
+    normalized_characters = []
+    for item in _as_list(characters):
+        record = _normalize_character_record(item)
+        if not record:
+            continue
+        name = _as_text(record.get("name"))
+        if name in relationship_notes:
+            record["notes"] = _append_note(record.get("notes"), relationship_notes[name])
+        normalized_characters.append(record)
+
+    normalized_lore = [
+        _normalize_lore_record(item)
+        for item in _as_list(lore)
+        if isinstance(item, dict)
+    ]
+    existing_lore_names = {
+        _as_text(item.get("name"))
+        for item in normalized_lore
+        if isinstance(item, dict)
+    }
+    for item in _legacy_scene_lore(payload):
+        if item["name"] not in existing_lore_names:
+            normalized_lore.append(item)
+            existing_lore_names.add(item["name"])
+    for item in _legacy_faction_lore(legacy_factions):
+        name = _as_text(item.get("name"))
+        if not name:
+            continue
+        if name not in existing_lore_names:
+            normalized_lore.append(item)
+            existing_lore_names.add(name)
+        else:
+            for existing in normalized_lore:
+                if _as_text(existing.get("name")) == name:
+                    existing["type"] = "势力"
+                    existing["description"] = _append_note(
+                        existing.get("description"),
+                        item.get("description"),
+                    )
+                    existing["story_known"] = (
+                        _as_text(existing.get("story_known"))
+                        or _as_text(item.get("story_known"))
+                    )
+                    break
+    ability_lore = _ability_system_lore(ability_system, allow_power_levels)
+    if ability_lore and ability_lore["name"] not in existing_lore_names:
+        normalized_lore.append(ability_lore)
+
+    normalized_foreshadows = []
+    for index, item in enumerate(_as_list(foreshadows), 1):
+        if not isinstance(item, dict):
+            continue
+        record = _normalize_foreshadow_record(
+            item,
+            stage_count=foreshadow_stage_count,
+        )
+        if not _as_text(record.get("code")):
+            record["code"] = f"F{index:04d}"
+        normalized_foreshadows.append(record)
+
+    return {
+        "characters": normalized_characters,
+        "lore": normalized_lore,
+        "foreshadows": normalized_foreshadows,
+    }
+
+
+def _normalize_stage_text_list(value):
+    if isinstance(value, str):
+        values = value.replace("；", "\n").replace(";", "\n").splitlines()
+    else:
+        values = _as_list(value)
+    return [_as_text(item) for item in values if _as_text(item)]
+
+
+_STAGE_EVENT_TRANSPORT_FIELDS = (
+    "id", "allowed_chapters", "references", "preconditions",
+    "event", "result", "state_delta",
+)
+
+
+def _parse_compact_stage_event(value):
+    """Read one short-protocol event array without evaluating arbitrary text."""
+    candidate = value
+    if isinstance(candidate, str):
+        text = candidate.strip()
+        if not (text.startswith("[") and text.endswith("]")):
+            return None
+        try:
+            candidate = ast.literal_eval(text)
+        except (SyntaxError, ValueError):
+            return None
+    if not isinstance(candidate, (list, tuple)) or len(candidate) < 5:
+        return None
+    event_id = _as_text(candidate[0]).upper()
+    if not re.fullmatch(r"(?:(?:S|STAGE)[_-]?\d{1,4}[_-]?)?E[_-]?\d{1,4}", event_id):
+        return None
+    return list(candidate)
+
+
+def _normalize_transport_stage_event(value, fallback_id=""):
+    """Normalize a dict or compact event array into the regular event schema."""
+    if isinstance(value, dict):
+        return _normalize_stage_event(value, fallback_id)
+    compact = _parse_compact_stage_event(value)
+    if compact is None:
+        return {}
+    return _normalize_stage_event(
+        _compact_record(compact, _STAGE_EVENT_TRANSPORT_FIELDS),
+        fallback_id,
+    )
+
+
+def _stage_event_content_score(event):
+    if not isinstance(event, dict):
+        return 0
+    return sum(
+        1
+        for key, value in event.items()
+        if key != "id" and value not in (None, "", [], {})
+    )
+
+
+def _restore_stage_events_from_carry_over(value, stage_index):
+    """Recover event arrays that were accidentally placed in carry_over.
+
+    Some short-protocol responses put the ordered event arrays in the next
+    positional slot.  Keep ordinary carry-over text untouched, but recover
+    only values that have an unambiguous event id such as ``E01``.
+    """
+    compact_outer = _parse_compact_stage_event(value)
+    if compact_outer is not None:
+        values = [compact_outer]
+    elif isinstance(value, str):
+        values = _normalize_stage_text_list(value)
+    else:
+        values = _as_list(value)
+
+    recovered = []
+    carry = []
+    for event_index, raw in enumerate(values, 1):
+        event = _normalize_transport_stage_event(
+            raw,
+            f"S{stage_index + 1:02d}-E{event_index:02d}",
+        )
+        if event:
+            recovered.append(event)
+            continue
+        text = _as_text(raw)
+        if text:
+            carry.append(text)
+    return recovered, carry
+
+
+def _normalize_stage_state(value):
+    """Normalize a stage entry/exit state without exposing implementation keys to users."""
+    if not isinstance(value, dict):
+        return {}
+    aliases = {
+        "time": ("time", "t", "时间"),
+        "location": ("location", "l", "地点", "当前位置"),
+        "character_states": ("character_states", "c", "人物状态", "人物处境"),
+        "known_facts": ("known_facts", "k", "已知事实", "人物知道"),
+        "open_threads": ("open_threads", "q", "未解决问题", "开放问题"),
+    }
+    result = {}
+    for key, names in aliases.items():
+        raw = _first_value(value, names, [])
+        if key in {"character_states", "known_facts", "open_threads"}:
+            items = _normalize_stage_text_list(raw)
+            if items:
+                result[key] = items
+        else:
+            text = _as_text(raw)
+            if text:
+                result[key] = text
+    return result
+
+
+def _normalize_stage_event(value, fallback_id=""):
+    if not isinstance(value, dict):
+        return {}
+    allowed = _first_value(
+        value,
+        ("allowed_chapters", "chapter_range", "r", "允许章节"),
+        [],
+    )
+    if isinstance(allowed, str):
+        numbers = [int(item) for item in re.findall(r"\d+", allowed)]
+        allowed = numbers[:2]
+    elif isinstance(allowed, (tuple, list)):
+        parsed = []
+        for item in allowed[:2]:
+            try:
+                parsed.append(int(item))
+            except (TypeError, ValueError):
+                continue
+        allowed = parsed
+    else:
+        allowed = []
+    state_delta = _first_value(
+        value,
+        ("state_delta", "状态变化", "changes", "变化", "d"),
+        {},
+    )
+    if isinstance(state_delta, str):
+        state_delta = {"summary": _as_text(state_delta)}
+    elif isinstance(state_delta, list):
+        # New transport format: one short list/string of actual changes. The
+        # normalized project format still keeps a dict so existing readers
+        # can consume it without carrying six empty categories per event.
+        if len(state_delta) == 6 and any(isinstance(item, (list, dict)) for item in state_delta):
+            state_delta = _compact_record(
+                state_delta,
+                (
+                    "time_advance", "location_changes", "knowledge_changes",
+                    "relationship_changes", "object_changes", "new_open_threads",
+                ),
+            )
+        else:
+            state_delta = {
+                "summary": "；".join(_as_text(item) for item in state_delta if _as_text(item)),
+            }
+    if not isinstance(state_delta, dict):
+        state_delta = {}
+    delta = {
+        "summary": _as_text(_first_value(state_delta, ("summary", "变化事实", "实际变化"))),
+        "time_advance": _as_text(_first_value(state_delta, ("time_advance", "时间变化"))),
+        "location_changes": _normalize_stage_text_list(
+            _first_value(state_delta, ("location_changes", "地点变化"), [])
+        ),
+        "knowledge_changes": _normalize_stage_text_list(
+            _first_value(state_delta, ("knowledge_changes", "认知变化"), [])
+        ),
+        "relationship_changes": _normalize_stage_text_list(
+            _first_value(state_delta, ("relationship_changes", "关系变化"), [])
+        ),
+        "object_changes": _normalize_stage_text_list(
+            _first_value(state_delta, ("object_changes", "物件变化"), [])
+        ),
+        "new_open_threads": _normalize_stage_text_list(
+            _first_value(state_delta, ("new_open_threads", "新增问题"), [])
+        ),
+    }
+    delta = {key: value for key, value in delta.items() if value not in ("", [], {})}
+    raw_event_id = _as_text(_first_value(value, ("id", "event_id", "i", "事件编号")))
+    compact_event_id = re.sub(r"\s+", "", raw_event_id.upper())
+    event_match = re.fullmatch(
+        r"(?:STAGE[_-]?|S[_-]?)(\d{1,4})[_-]?E[_-]?(\d{1,4})",
+        compact_event_id,
+    )
+    if event_match:
+        event_id = (
+            f"S{int(event_match.group(1)):02d}-E"
+            f"{int(event_match.group(2)):02d}"
+        )
+    else:
+        bare_event_match = re.fullmatch(r"E[_-]?(\d{1,4})", compact_event_id)
+        if bare_event_match:
+            event_id = f"E{int(bare_event_match.group(1)):02d}"
+        else:
+            # Stage events are internal planning anchors.  Older responses
+            # often used a bare number such as "1", which is ambiguous across
+            # stages.  The normalized fallback is the stable identifier used
+            # everywhere else.
+            event_id = str(fallback_id or "").strip().upper()
+    result = {
+        "id": event_id,
+        "allowed_chapters": allowed,
+        "references": _normalize_stage_text_list(
+            _first_value(value, ("references", "refs", "a", "关联资料"), [])
+        ),
+        "preconditions": _normalize_stage_text_list(
+            _first_value(value, ("preconditions", "p", "前置条件"), [])
+        ),
+        "event": _as_text(_first_value(value, ("event", "h", "事件", "发生什么"))),
+        "result": _as_text(_first_value(value, ("result", "o", "结果", "事件结果"))),
+        "state_delta": delta,
+    }
+    return {key: child for key, child in result.items() if child not in ("", [], {})}
+
+
+def _normalize_stage_book_contract(value):
+    if not isinstance(value, dict):
+        return {}
+    result = {}
+    for key, aliases in {
+        "hard_facts": ("hard_facts", "硬事实", "不能改变的事实"),
+        "world_invariants": ("world_invariants", "长期规则", "世界不变量"),
+        "character_boundaries": ("character_boundaries", "人物边界"),
+        "ending_boundaries": ("ending_boundaries", "结尾边界"),
+    }.items():
+        items = _normalize_stage_text_list(_first_value(value, aliases, []))
+        if items:
+            result[key] = items
+    return result
+
+
+def _compact_record(value, fields):
+    """把固定顺序数组还原为主程序继续使用的字段对象。"""
+    if isinstance(value, dict):
+        return deepcopy(value)
+    if not isinstance(value, list):
+        return {}
+    return {
+        field: deepcopy(value[index])
+        for index, field in enumerate(fields)
+        if index < len(value)
+    }
+
+
+def _expand_transport_aliases(value, aliases):
+    """Expand short transport keys without changing already named fields."""
+    if not isinstance(value, dict):
+        return deepcopy(value)
+    result = deepcopy(value)
+    for short_key, field_name in aliases.items():
+        if field_name not in result and short_key in value:
+            result[field_name] = deepcopy(value[short_key])
+    return result
+
+
+def _expand_stage_state_transport(value):
+    if isinstance(value, dict):
+        return _expand_transport_aliases(
+            value,
+            {
+                "t": "time",
+                "l": "location",
+                "c": "character_states",
+                "k": "known_facts",
+                "q": "open_threads",
+            },
+        )
+    if isinstance(value, list):
+        return _compact_record(
+            value,
+            ("time", "location", "character_states", "known_facts", "open_threads"),
+        )
+    return deepcopy(value)
+
+
+def _expand_stage_event_transport(value):
+    if isinstance(value, dict):
+        return _expand_transport_aliases(
+            value,
+            {
+                "i": "id",
+                "r": "allowed_chapters",
+                "a": "references",
+                "p": "preconditions",
+                "h": "event",
+                "o": "result",
+                "d": "state_delta",
+            },
+        )
+    if isinstance(value, list):
+        return _compact_record(value, _STAGE_EVENT_TRANSPORT_FIELDS)
+    return deepcopy(value)
+
+
+def _expand_stage_object_transport(value):
+    """Expand the named-field single-stage protocol into project fields."""
+    if isinstance(value, list):
+        value = _compact_record(
+            value,
+            (
+                "id", "name", "start_chapter", "end_chapter", "target_words",
+                "entry_state", "ordered_events", "exit_state", "carry_over",
+            ),
+        )
+    if not isinstance(value, dict):
+        return {}
+
+    stage = _expand_transport_aliases(
+        value,
+        {
+            "i": "id",
+            "n": "name",
+            "b": "entry_state",
+            "e": "ordered_events",
+            "x": "exit_state",
+            "y": "carry_over",
+        },
+    )
+    chapter_range = value.get("r", stage.get("chapter_range"))
+    if isinstance(chapter_range, dict):
+        chapter_range = [
+            chapter_range.get("a", chapter_range.get("start")),
+            chapter_range.get("b", chapter_range.get("end")),
+        ]
+    if isinstance(chapter_range, (list, tuple)):
+        if "start_chapter" not in stage and len(chapter_range) >= 1:
+            stage["start_chapter"] = deepcopy(chapter_range[0])
+        if "end_chapter" not in stage and len(chapter_range) >= 2:
+            stage["end_chapter"] = deepcopy(chapter_range[1])
+    stage["entry_state"] = _expand_stage_state_transport(
+        stage.get("entry_state", {})
+    )
+    stage["exit_state"] = _expand_stage_state_transport(
+        stage.get("exit_state", {})
+    )
+    raw_events = stage.get("ordered_events", [])
+    if isinstance(raw_events, list):
+        stage["ordered_events"] = [
+            _expand_stage_event_transport(item)
+            for item in raw_events
+            if isinstance(item, (dict, list))
+        ]
+    stage["carry_over"] = deepcopy(stage.get("carry_over", []))
+    return stage
+
+
+def _expand_stage_contract_transport(value):
+    if isinstance(value, list):
+        return _compact_record(
+            value,
+            (
+                "hard_facts", "world_invariants", "character_boundaries",
+                "ending_boundaries",
+            ),
+        )
+    if isinstance(value, dict):
+        return _expand_transport_aliases(
+            value,
+            {
+                "f": "hard_facts",
+                "w": "world_invariants",
+                "c": "character_boundaries",
+                "e": "ending_boundaries",
+            },
+        )
+    return {}
+
+
+def _expand_foreshadow_transport(value):
+    if isinstance(value, list):
+        return _compact_record(
+            value,
+            (
+                "code", "name", "endpoint_kind", "endpoint_chapter",
+                "endpoint_event", "setup_chapter", "payoff_chapter",
+                "setup_event", "payoff_event", "endpoint_event_id",
+            ),
+        )
+    if isinstance(value, dict):
+        result = _expand_transport_aliases(
+            value,
+            {
+                "i": "code",
+                "n": "name",
+                "k": "endpoint_kind",
+                "e": "endpoint_event_id",
+                "c": "endpoint_chapter",
+                "d": "endpoint_event",
+                "a": "setup_chapter",
+                "b": "payoff_chapter",
+                "u": "setup_event",
+                "v": "payoff_event",
+            },
+        )
+        # The old protocol used a/b/u/v for both endpoints.  Keep those
+        # fields readable while allowing new responses to carry one endpoint
+        # at a time through k/c/d.
+        return result
+    return {}
+
+
+_PREMISE_SLOT_KEYS = ("1", "2", "3", "4", "5")
+_PREMISE_CANDIDATE_ALIASES = {
+    "t": "title",
+    "g": "genre",
+    "a": "audience",
+    "y": "style",
+    "h": "one_sentence",
+    "d": "synopsis",
+    "p": "protagonist",
+    "m": "main_line",
+    "r": "relationship_engine",
+    "e": "ending_direction",
+}
+
+
+def _expand_premise_candidate_transport(value):
+    if isinstance(value, dict):
+        return _expand_transport_aliases(value, _PREMISE_CANDIDATE_ALIASES)
+    if isinstance(value, list):
+        return _compact_record(
+            value,
+            (
+                "title", "genre", "audience", "style", "one_sentence", "synopsis",
+                "protagonist", "main_line", "relationship_engine", "ending_direction",
+            ),
+        )
+    return {}
+
+
+def _premise_transport_items(value):
+    """Read the new five-slot contract and report structural violations."""
+    if isinstance(value, dict):
+        extra_keys = [key for key in value if str(key) not in _PREMISE_SLOT_KEYS]
+        missing_keys = [key for key in _PREMISE_SLOT_KEYS if key not in value]
+        items = [value[key] for key in _PREMISE_SLOT_KEYS if key in value]
+        error = ""
+        if extra_keys or missing_keys:
+            parts = []
+            if missing_keys:
+                parts.append("缺少方向 " + ",".join(missing_keys))
+            if extra_keys:
+                parts.append("出现未定义方向 " + ",".join(str(key) for key in extra_keys))
+            error = "；".join(parts)
+        return items, error
+    if isinstance(value, list):
+        return value, "" if len(value) == 5 else f"返回了 {len(value)} 个方向，应为 5 个"
+    return [], "没有返回五个固定故事方向"
+
+
+def _expand_creation_transport(step, payload):
+    """展开向导专用的短键/定长数组协议，不改变正式保存字段。"""
+    data = deepcopy(payload) if isinstance(payload, dict) else {}
+    if step == "premise" and "candidates" not in data and isinstance(data.get("c"), (dict, list)):
+        raw_items, protocol_error = _premise_transport_items(data.get("c"))
+        data["candidates"] = [
+            _expand_premise_candidate_transport(item)
+            for item in raw_items
+            if isinstance(item, (list, dict))
+        ]
+        if protocol_error:
+            data["_candidate_protocol_error"] = protocol_error
+        if "s" in data and "selected_index" not in data:
+            data["selected_index"] = data.get("s", 0)
+        return data
+
+    if step == "bible":
+        if "bible" not in data and isinstance(data.get("b"), list):
+            data["bible"] = _compact_record(data["b"], _BIBLE_FIELDS)
+        if "world_rules" not in data and isinstance(data.get("w"), list):
+            data["world_rules"] = _compact_record(
+                data["w"],
+                (
+                    "setting_overview", "power_system", "rules",
+                    "costs_and_limits", "geography_and_life",
+                ),
+            )
+        if "characters" not in data and isinstance(data.get("c"), list):
+            data["characters"] = [
+                _compact_record(item, ("name", "role", "goal", "secret", "voice", "notes"))
+                for item in data.get("c", [])
+                if isinstance(item, (list, dict))
+            ]
+        if "lore" not in data and isinstance(data.get("l"), list):
+            data["lore"] = [
+                _compact_record(item, ("name", "type", "description", "story_known"))
+                for item in data.get("l", [])
+                if isinstance(item, (list, dict))
+            ]
+        if "foreshadows" not in data and isinstance(data.get("f"), list):
+            data["foreshadows"] = [
+                _compact_record(
+                    item,
+                    (
+                        "code", "name", "setup_stage", "payoff_stage",
+                        "description", "revealed", "remaining_secret",
+                    ),
+                )
+                for item in data.get("f", [])
+                if isinstance(item, (list, dict))
+            ]
+        return data
+
+    if step == "stage_plan":
+        if "planning_schema_version" not in data and "v" in data:
+            data["planning_schema_version"] = data.get("v", "2")
+        if "stage_skeleton" not in data and isinstance(data.get("g"), list):
+            data["stage_skeleton"] = data.get("g", [])
+        if "book_contract" not in data and isinstance(data.get("k"), (dict, list)):
+            data["book_contract"] = _expand_stage_contract_transport(data["k"])
+        if "chapter_plan_note" not in data and "n" in data:
+            data["chapter_plan_note"] = _clean_chapter_plan_note(data.get("n", ""))
+        if "foreshadow_schedule" not in data and isinstance(data.get("f"), list):
+            data["foreshadow_schedule"] = [
+                _expand_foreshadow_transport(item)
+                for item in data.get("f", [])
+                if isinstance(item, (list, dict))
+            ]
+        if "stage_plan" not in data and isinstance(data.get("s"), dict):
+            data["stage_plan"] = [_expand_stage_object_transport(data["s"])]
+        elif "stage_plan" not in data and isinstance(data.get("s"), list):
+            state_fields = ("time", "location", "character_states", "known_facts", "open_threads")
+            delta_fields = (
+                "time_advance", "location_changes", "knowledge_changes",
+                "relationship_changes", "object_changes", "new_open_threads",
+            )
+            event_fields = (
+                "id", "allowed_chapters", "references", "preconditions",
+                "event", "result", "state_delta",
+            )
+            stage_fields = (
+                "id", "name", "start_chapter", "end_chapter", "target_words",
+                "entry_state", "ordered_events", "exit_state", "carry_over",
+            )
+            stages = []
+            for raw_stage in data.get("s", []):
+                stage = _compact_record(raw_stage, stage_fields)
+                for state_key in ("entry_state", "exit_state"):
+                    if isinstance(stage.get(state_key), list):
+                        stage[state_key] = _compact_record(stage[state_key], state_fields)
+                events = []
+                for raw_event in stage.get("ordered_events", []) if isinstance(stage.get("ordered_events"), list) else []:
+                    event = _compact_record(raw_event, event_fields)
+                    if isinstance(event.get("state_delta"), list):
+                        if len(event["state_delta"]) == 6 and any(
+                            isinstance(item, (list, dict)) for item in event["state_delta"]
+                        ):
+                            event["state_delta"] = _compact_record(
+                                event["state_delta"], delta_fields
+                            )
+                        else:
+                            event["state_delta"] = {
+                                "summary": "；".join(
+                                    _as_text(item)
+                                    for item in event["state_delta"]
+                                    if _as_text(item)
+                                )
+                            }
+                    elif isinstance(event.get("state_delta"), str):
+                        event["state_delta"] = {"summary": _as_text(event["state_delta"])}
+                    events.append(event)
+                stage["ordered_events"] = events
+                stages.append(stage)
+            data["stage_plan"] = stages
+        return data
+
+    return data
+
+
+def normalize_creation_result(
+    step,
+    payload,
+    allow_power_levels=False,
+    pad_stage_plan=True,
+    foreshadow_stage_count=None,
+    total_words=500000,
+    average_chapter_words=3000,
+):
+    """Normalize model aliases into the fixed wizard schema."""
+    payload = _expand_creation_transport(step, payload)
     if step == "premise":
         raw = _first_value(payload, ("candidates", "stories", "options", "简介候选"), [])
+        raw_items, inferred_protocol_error = _premise_transport_items(raw)
+        protocol_error = _as_text(
+            payload.get("_candidate_protocol_error")
+        ) or inferred_protocol_error
         candidates = []
-        for item in _as_list(raw):
+        for item in raw_items:
             if not isinstance(item, dict):
                 continue
+            item = _expand_premise_candidate_transport(item)
             candidate = {
                 "title": _as_text(_first_value(item, ("title", "name", "book_title", "书名"))),
                 "genre": _as_text(_first_value(item, ("genre", "类型"))),
@@ -211,49 +2270,244 @@ def normalize_creation_result(step, payload):
             }
             if candidate["title"] or candidate["synopsis"]:
                 candidates.append(candidate)
-        payload["candidates"] = candidates[:8]
         try:
-            payload["selected_index"] = max(0, min(int(payload.get("selected_index", 0) or 0), max(0, len(candidates) - 1)))
+            selected_index = int(payload.get("selected_index", 0) or 0)
         except Exception:
-            payload["selected_index"] = 0
-        return payload
-    if step == "bible":
-        bible = _first_value(payload, ("bible", "novel_bible", "小说圣经"), {})
-        world_rules = _first_value(payload, ("world_rules", "world", "世界规则"), {})
-        payload["bible"] = bible if isinstance(bible, (dict, str)) else str(bible)
-        payload["world_rules"] = world_rules if isinstance(world_rules, (dict, str)) else str(world_rules)
-        return payload
-    if step == "story_assets":
-        aliases = {
-            "characters": ("characters", "people", "人物"),
-            "lore": ("lore", "settings", "设定"),
-            "foreshadows": ("foreshadows", "foreshadow_items", "clues", "伏笔"),
+            selected_index = 0
+        result = {
+            "candidates": candidates,
+            "selected_index": max(0, min(selected_index, max(0, len(candidates) - 1))),
         }
-        for key, keys in aliases.items():
-            raw = _first_value(payload, keys, [])
-            payload[key] = [deepcopy(item) for item in _as_list(raw) if isinstance(item, dict)]
-        relationship_map = _first_value(
-            payload,
-            ("relationship_map", "relationships", "关系图", "关系地图"),
-            [],
+        if protocol_error:
+            result["_candidate_protocol_error"] = protocol_error
+        return result
+    if step == "bible":
+        result = {
+            "bible": _normalize_bible(
+                _first_value(payload, ("bible", "novel_bible", "小说圣经"), {})
+            ),
+            "world_rules": _normalize_world_rules(
+                _first_value(payload, ("world_rules", "world", "世界规则"), {})
+            ),
+        }
+        result.update(
+            _normalize_story_assets_fields(
+                payload,
+                allow_power_levels,
+                foreshadow_stage_count=foreshadow_stage_count,
+            )
         )
-        key_scenes = _first_value(
+        return result
+    if step == "story_assets":
+        return _normalize_story_assets_fields(
             payload,
-            ("key_scenes", "scenes", "关键场景"),
-            [],
+            allow_power_levels,
+            foreshadow_stage_count=foreshadow_stage_count,
         )
-        payload["relationship_map"] = [
-            deepcopy(item) for item in _as_list(relationship_map) if isinstance(item, dict)
-        ]
-        payload["key_scenes"] = [
-            deepcopy(item) for item in _as_list(key_scenes) if isinstance(item, dict)
-        ]
-        return payload
     if step == "stage_plan":
         raw = _first_value(payload, ("stage_plan", "stages", "arcs", "阶段规划"), [])
-        payload["stage_plan"] = [deepcopy(item) for item in _as_list(raw) if isinstance(item, dict)]
-        return payload
-    return payload
+        normalized = (
+            normalize_stage_plan_ranges(
+                raw,
+                total_words,
+                average_chapter_words,
+                expected_count=(None if pad_stage_plan else len(raw)),
+                pad_missing=pad_stage_plan,
+            )
+            if _as_list(raw) else []
+        )
+        contract = _normalize_stage_book_contract(
+            _first_value(payload, ("book_contract", "planning_contract", "全书契约"), {})
+        )
+        return {
+            "planning_schema_version": _as_text(
+                _first_value(payload, ("planning_schema_version", "schema_version"), "2")
+            ) or "2",
+            "stage_skeleton": _normalize_stage_skeleton(
+                _first_value(
+                    payload,
+                    ("stage_skeleton", "skeleton", "full_book_skeleton", "全书阶段骨架"),
+                    [],
+                ),
+                total_words,
+                average_chapter_words,
+            ),
+            "book_contract": contract,
+            "stage_plan": normalized,
+            "foreshadow_schedule": _normalize_foreshadow_schedule(
+                _first_value(
+                    payload,
+                    ("foreshadow_schedule", "foreshadow_plan", "伏笔安排", "伏笔章位"),
+                    [],
+                )
+            ),
+            "chapter_plan_note": _clean_chapter_plan_note(
+                _first_value(payload, ("chapter_plan_note", "章节规划提示"))
+            ),
+        }
+    return deepcopy(payload)
+
+
+def creation_wizard_payload_from_project_draft(project):
+    """从尚未写入正式项目的自动草稿中恢复已完成的向导结果。
+
+    向导完成后，旧流程可能先把结构化框架写入 ``novel_draft.json``，
+    但还没来得及补齐项目元信息就被重启。这里仅在元信息仍是空白时恢复，
+    不会把已有正式项目重新当成一次新建。
+    """
+    if not isinstance(project, dict):
+        return {}
+    meta = project.get("meta", {})
+    if not isinstance(meta, dict):
+        meta = {}
+    if (
+        _as_text(meta.get("title")) not in {"", "未命名小说"}
+        or _as_text(meta.get("genre"))
+        or _as_text(meta.get("style"))
+        or _as_text(meta.get("premise"))
+    ):
+        return {}
+
+    framework = project.get("creation_framework", {})
+    if not isinstance(framework, dict):
+        return {}
+    state = project.get("creation_wizard_state", {})
+    if isinstance(state, dict):
+        status = _as_text(state.get("status")).lower()
+        if status and status not in {"complete", "confirmed"}:
+            return {}
+    candidates = [
+        deepcopy(item)
+        for item in framework.get("premise_candidates", [])
+        if isinstance(item, dict)
+    ]
+    if not candidates:
+        return {}
+
+    selected = framework.get("premise", {})
+    if not isinstance(selected, dict):
+        selected = {}
+    selected = deepcopy(selected)
+    if not _as_text(selected.get("title")) or not _as_text(selected.get("synopsis")):
+        selected = deepcopy(candidates[0])
+    if not _as_text(selected.get("title")) or not _as_text(selected.get("synopsis")):
+        return {}
+
+    recovered_framework = deepcopy(framework)
+    recovered_framework["premise"] = selected
+    recovered_framework["premise_candidates"] = candidates
+    recovered_framework["novel_name"] = (
+        _as_text(recovered_framework.get("novel_name"))
+        or _as_text(selected.get("title"))
+    )
+    try:
+        recovered_framework["total_words"] = max(
+            10000,
+            int(recovered_framework.get("total_words", meta.get("target_words", 500000)) or 500000),
+        )
+    except (TypeError, ValueError):
+        recovered_framework["total_words"] = 500000
+    try:
+        recovered_framework["average_chapter_words"] = max(
+            1000,
+            int(recovered_framework.get("average_chapter_words", 3000) or 3000),
+        )
+    except (TypeError, ValueError):
+        recovered_framework["average_chapter_words"] = 3000
+
+    recovered_state = deepcopy(state) if isinstance(state, dict) else {}
+    if not recovered_state:
+        recovered_state = {
+            "schema_version": 1,
+            "status": "complete",
+            "current_step": "complete",
+        }
+    return {
+        "creation_framework": recovered_framework,
+        "creation_wizard_state": recovered_state,
+    }
+
+
+def creation_wizard_draft_from_project_draft(project):
+    """把自动草稿中的完整框架还原为向导可继续编辑的草稿。"""
+    payload = creation_wizard_payload_from_project_draft(project)
+    if not payload:
+        return {}
+    framework = payload["creation_framework"]
+    candidates = deepcopy(framework.get("premise_candidates", []))
+    selected = deepcopy(framework.get("premise", {}))
+    try:
+        selected_index = max(
+            0,
+            min(candidates.index(selected), max(0, len(candidates) - 1)),
+        )
+    except ValueError:
+        selected_index = 0
+    try:
+        total_words = int(framework.get("total_words", 500000) or 500000)
+    except (TypeError, ValueError):
+        total_words = 500000
+    try:
+        average_words = int(framework.get("average_chapter_words", 3000) or 3000)
+    except (TypeError, ValueError):
+        average_words = 3000
+
+    def length_choice(value):
+        if value >= 1000000:
+            return "100万字+"
+        if value >= 500000:
+            return "50万字"
+        return "30万字"
+
+    chapter_choice = f"{average_words}字"
+    if chapter_choice not in CREATION_CHOICE_GROUPS["chapter_words"]["单章字数"]:
+        chapter_choice = CREATION_CHOICE_DEFAULTS["chapter_words"]
+    step_results = {
+        "premise": {
+            "candidates": deepcopy(candidates),
+            "selected_index": selected_index,
+            "selected": deepcopy(selected),
+        },
+        "stage_plan": {
+            "stage_skeleton": deepcopy(framework.get("stage_skeleton", [])),
+            "stage_plan": deepcopy(framework.get("stage_plan", [])),
+            "foreshadow_schedule": deepcopy(framework.get("foreshadow_schedule", [])),
+            "chapter_plan_note": _as_text(framework.get("chapter_plan_note")),
+        },
+        "bible": {
+            "bible": deepcopy(framework.get("bible", {})),
+            "world_rules": deepcopy(framework.get("world_rules", {})),
+            "characters": deepcopy(framework.get("characters", [])),
+            "lore": deepcopy(framework.get("lore", [])),
+            "foreshadows": deepcopy(framework.get("foreshadows", [])),
+        },
+    }
+    return {
+        "schema_version": 2,
+        "project_name_hint": _as_text(selected.get("title")),
+        "current_step_index": len(CREATION_WIZARD_STEPS) - 1,
+        "choice_values": {
+            "audience": _as_text(selected.get("audience")) or CREATION_CHOICE_DEFAULTS["audience"],
+            "genre": _as_text(selected.get("genre")) or CREATION_CHOICE_DEFAULTS["genre"],
+            "theme": _as_text(selected.get("theme")),
+            "protagonist_route": (
+                _as_text(selected.get("protagonist_route"))
+                or CREATION_CHOICE_DEFAULTS["protagonist_route"]
+            ),
+            "style": _as_text(selected.get("style")) or CREATION_CHOICE_DEFAULTS["style"],
+            "length": length_choice(total_words),
+            "chapter_words": chapter_choice,
+        },
+        # The selected synopsis is generated story material, not the author's
+        # original inspiration.  Do not put it back into the editable input.
+        "inspiration": "",
+        "target_words": total_words,
+        "average_words": average_words,
+        "premise_candidates": candidates,
+        "premise_selected_index": selected_index,
+        "step_results": step_results,
+        "updated_at": now_str(),
+    }
 
 
 def pretty_json(value):
@@ -265,7 +2519,7 @@ def _format_value(value, indent=0):
     if isinstance(value, dict):
         lines = []
         for key, child in value.items():
-            label = str(key)
+            label = _context_label(key)
             if isinstance(child, (dict, list)):
                 lines.append(f"{prefix}{label}：")
                 lines.extend(_format_value(child, indent + 1))
@@ -292,22 +2546,391 @@ def format_creation_text(value, title=""):
     return "\n".join(line for line in lines if line).strip()
 
 
-def normalize_stage_plan_ranges(stage_plan, total_words, average_chapter_words):
+def _flatten_preview_text(value):
+    if isinstance(value, dict):
+        parts = []
+        for child in value.values():
+            parts.extend(_flatten_preview_text(child))
+        return parts
+    if isinstance(value, (list, tuple)):
+        parts = []
+        for child in value:
+            parts.extend(_flatten_preview_text(child))
+        return parts
+    text = _as_text(value)
+    return [text] if text else []
+
+
+def _preview_field(mapping, key):
+    if not isinstance(mapping, dict):
+        return ""
+    return " ".join(_flatten_preview_text(mapping.get(key))).strip()
+
+
+def _format_bible_section_body(result):
+    result = result if isinstance(result, dict) else {}
+    bible = result.get("bible", {})
+    bible_lines = []
+    bible_labels = {
+        "core_setting": "核心设定",
+        "main_conflict": "主线矛盾",
+        "relationship_foundation": "人物关系底子",
+        "reader_promise": "持续悬念",
+        "theme": "故事想留下的东西",
+        "ending_direction": "结尾方向",
+        "hard_boundaries": "必须守住的边界",
+    }
+    if not isinstance(bible, dict):
+        text = _as_text(bible)
+        if text:
+            bible_lines.append(text)
+    else:
+        for key in (
+            "core_setting", "main_conflict", "relationship_foundation",
+            "reader_promise", "theme", "ending_direction", "hard_boundaries",
+        ):
+            text = _preview_field(bible, key)
+            if text:
+                bible_lines.append(f"{bible_labels.get(key, key)}：\n{text}")
+    return "\n\n".join(bible_lines).strip() or "这部分还没有生成有效内容。"
+
+
+def _format_world_rules_section_body(result):
+    result = result if isinstance(result, dict) else {}
+    world_rules = result.get("world_rules", {})
+    world_lines = []
+    if not isinstance(world_rules, dict):
+        text = _as_text(world_rules)
+        if text:
+            world_lines.append(text)
+    else:
+        setting = _preview_field(world_rules, "setting_overview")
+        geography = _preview_field(world_rules, "geography_and_life")
+        power = _preview_field(world_rules, "power_system")
+        if setting:
+            world_lines.append(f"世界概况：\n{setting}")
+        if geography:
+            world_lines.append(f"地点和日常生活：\n{geography}")
+        if power:
+            world_lines.append(f"能力边界：\n{power}")
+
+        rules = [
+            _as_text(item)
+            for item in world_rules.get("rules", [])
+            if _as_text(item)
+        ]
+        if rules:
+            world_lines.append("长期规则：")
+            world_lines.extend(f"・{item}" for item in rules)
+
+        costs = [
+            _as_text(item)
+            for item in world_rules.get("costs_and_limits", [])
+            if _as_text(item)
+        ]
+        if costs:
+            world_lines.append("代价和限制：")
+            world_lines.extend(f"・{item}" for item in costs)
+    return "\n\n".join(world_lines).strip() or "这部分还没有生成有效内容。"
+
+
+def _format_characters_section_body(result):
+    result = result if isinstance(result, dict) else {}
+    characters = result.get("characters", [])
+    if not characters:
+        return "这部分还没有生成有效内容。"
+    lines = [f"共 {len(characters)} 名主要人物"]
+    for item in characters:
+        if not isinstance(item, dict):
+            continue
+        name = _as_text(item.get("name")) or "未命名人物"
+        lines.append(f"・{name}")
+        for label, key in (
+            ("身份", "role"),
+            ("人物目标", "goal"),
+            ("隐藏秘密", "secret"),
+            ("语言风格", "voice"),
+            ("备注", "notes"),
+        ):
+            value = _as_text(item.get(key))
+            if value:
+                lines.append(f"  {label}：{value}")
+    return "\n".join(lines).strip()
+
+
+def _format_lore_section_body(result):
+    result = result if isinstance(result, dict) else {}
+    lore = result.get("lore", [])
+    if not lore:
+        return "这部分还没有生成有效内容。"
+    lines = [f"共 {len(lore)} 项设定"]
+    for item in lore:
+        if not isinstance(item, dict):
+            continue
+        name = _as_text(item.get("name")) or "未命名设定"
+        kind = _as_text(item.get("type"))
+        description = _as_text(item.get("description"))
+        known = _as_text(item.get("story_known"))
+        detail = "；".join(part for part in (kind, description) if part)
+        lines.append(f"・{name}" + (f"：{detail}" if detail else ""))
+        if known:
+            lines.append(f"  人物已知：{known}")
+    return "\n".join(lines).strip()
+
+
+def _format_foreshadows_section_body(result):
+    result = result if isinstance(result, dict) else {}
+    foreshadows = result.get("foreshadows", [])
+    if not foreshadows:
+        return "这部分还没有生成有效内容。"
+    lines = [f"共 {len(foreshadows)} 条伏笔"]
+    for item in foreshadows:
+        if not isinstance(item, dict):
+            continue
+        code = _as_text(item.get("code"))
+        name = _as_text(item.get("name")) or "未命名伏笔"
+        description = _as_text(item.get("description"))
+        title = " ".join(part for part in (code, name) if part)
+        lines.append(f"・{title}" + (f"：{description}" if description else ""))
+        status = _as_text(item.get("status"))
+        if status:
+            lines.append(f"  状态：{status}")
+        setup_chapter = _as_text(item.get("setup_chapter"))
+        setup_stage = _as_text(item.get("setup_stage"))
+        if setup_chapter:
+            lines.append(f"  埋设章节：{setup_chapter}")
+        elif setup_stage:
+            lines.append(f"  埋设阶段：{setup_stage}")
+        payoff_chapter = _as_text(item.get("payoff_chapter"))
+        payoff_stage = _as_text(item.get("payoff_stage"))
+        if payoff_chapter:
+            lines.append(f"  回收章节：{payoff_chapter}")
+        elif payoff_stage:
+            lines.append(f"  回收阶段：{payoff_stage}")
+        for label, key in (
+            ("揭示结果", "revealed"),
+            ("仍未揭开", "remaining_secret"),
+            ("备注", "notes"),
+        ):
+            value = _as_text(item.get(key))
+            if value:
+                lines.append(f"  {label}：{value}")
+    return "\n".join(lines).strip()
+
+
+def _format_bible_sections(result):
+    result = result if isinstance(result, dict) else {}
+    return {
+        "bible": ("小说圣经", _format_bible_section_body(result)),
+        "world_rules": ("世界规则", _format_world_rules_section_body(result)),
+        "characters": ("人物", _format_characters_section_body(result)),
+        "lore": ("设定库", _format_lore_section_body(result)),
+        "foreshadows": ("伏笔", _format_foreshadows_section_body(result)),
+    }
+
+
+def _format_story_assets_preview(result):
+    sections = _format_bible_sections(result)
+    return "\n\n".join(
+        f"{title}\n\n{body}"
+        for key in ("characters", "lore", "foreshadows")
+        for title, body in (sections[key],)
+    ).strip()
+
+
+def _format_bible_preview(result):
+    sections = _format_bible_sections(result)
+    return "\n\n".join(
+        f"{title}\n\n{body}"
+        for key in ("bible", "world_rules", "characters", "lore", "foreshadows")
+        for title, body in (sections[key],)
+    ).strip()
+
+
+def _format_stage_state_preview(value):
+    if not isinstance(value, dict):
+        return ""
+    labels = {
+        "time": "时间",
+        "location": "地点",
+        "character_states": "人物处境",
+        "known_facts": "已经知道",
+        "open_threads": "尚未解决",
+    }
+    lines = []
+    summary = _as_text(value.get("summary"))
+    if summary:
+        lines.append(summary)
+    for key, label in labels.items():
+        child = value.get(key)
+        if isinstance(child, list):
+            text = "；".join(_as_text(item) for item in child if _as_text(item))
+        else:
+            text = _as_text(child)
+        if text:
+            lines.append(f"{label}：{text}")
+    return "；".join(lines)
+
+
+def _format_stage_plan_preview(result):
+    lines = []
+    skeleton = result.get("stage_skeleton", [])
+    if isinstance(skeleton, list) and skeleton:
+        skeleton_lines = ["全书阶段骨架："]
+        for index, item in enumerate(skeleton, 1):
+            if not isinstance(item, dict):
+                continue
+            stage_id = _as_text(item.get("id")) or f"S{index:02d}"
+            name = _as_text(item.get("name")) or f"阶段{index}"
+            start = _as_text(item.get("start_chapter"))
+            end = _as_text(item.get("end_chapter"))
+            range_text = f"（第{start}—{end}章）" if start and end else ""
+            skeleton_lines.append(f"{stage_id} · {name}{range_text}")
+            summary = _as_text(item.get("summary"))
+            if summary:
+                skeleton_lines.append(f"  主线变化：{summary}")
+            turns = _normalize_stage_text_list(item.get("turning_points", []))
+            if turns:
+                skeleton_lines.append("  关键转折：" + "；".join(turns))
+            end_state = _as_text(item.get("end_state"))
+            if end_state:
+                skeleton_lines.append(f"  阶段结束：{end_state}")
+        if len(skeleton_lines) > 1:
+            lines.append("\n".join(skeleton_lines))
+    contract = result.get("book_contract", {})
+    contract_labels = (
+        ("hard_facts", "全书固定事实"),
+        ("world_invariants", "长期成立的规则"),
+        ("character_boundaries", "人物不能随意改变的边界"),
+        ("ending_boundaries", "结尾必须守住的边界"),
+    )
+    if isinstance(contract, dict):
+        for key, label in contract_labels:
+            values = _normalize_stage_text_list(contract.get(key, []))
+            if values:
+                lines.append(f"{label}：\n" + "\n".join(f"・{item}" for item in values))
+    for index, item in enumerate(result.get("stage_plan", []), 1):
+        if not isinstance(item, dict):
+            continue
+        if not _stage_has_meaningful_content(item):
+            continue
+        name = _as_text(item.get("name")) or f"阶段{index}"
+        start = _as_text(item.get("start_chapter"))
+        end = _as_text(item.get("end_chapter"))
+        header = f"第 {start}-{end} 章 · {name}" if start and end else name
+        block = [header]
+        entry = _format_stage_state_preview(item.get("entry_state", {}))
+        if entry:
+            block.append(f"开始时：{entry}")
+        conflict = _as_text(item.get("main_conflict"))
+        if conflict:
+            block.append(f"主要矛盾：{conflict}")
+        events = item.get("ordered_events", [])
+        if isinstance(events, list) and events:
+            block.append("按顺序发生：")
+            for event_index, event in enumerate(events, 1):
+                if not isinstance(event, dict):
+                    continue
+                event_text = _as_text(event.get("event"))
+                result_text = _as_text(event.get("result"))
+                allowed = event.get("allowed_chapters", [])
+                allowed_text = ""
+                if isinstance(allowed, list) and len(allowed) >= 2:
+                    allowed_text = f"（第{allowed[0]}—{allowed[1]}章之间）"
+                if event_text:
+                    block.append(f"{event_index}. {event_text}{allowed_text}")
+                if result_text:
+                    block.append(f"   结果：{result_text}")
+                delta = event.get("state_delta", {})
+                delta_text = _format_stage_state_preview(delta)
+                if delta_text:
+                    block.append(f"   变化：{delta_text}")
+        summary = _as_text(item.get("summary"))
+        if summary and not events:
+            block.append(f"阶段内容：{summary}")
+        exit_state = _format_stage_state_preview(item.get("exit_state", {}))
+        if exit_state:
+            block.append(f"结束时：{exit_state}")
+        carry = _normalize_stage_text_list(item.get("carry_over", []))
+        if carry:
+            block.append("带入下一阶段：" + "；".join(carry))
+        lines.append("\n".join(block))
+    note = _clean_chapter_plan_note(result.get("chapter_plan_note"))
+    if note:
+        lines.append(f"章节规划要守住：\n{note}")
+    return "\n\n".join(lines).strip()
+
+
+def format_creation_preview(step, result):
+    """给向导展示可读的完整摘要，完整结构仍保存在 step_results。"""
+    result = result if isinstance(result, dict) else {}
+    if step == "bible":
+        return _format_bible_preview(result)
+    if step == "story_assets":
+        return _format_story_assets_preview(result) or "AI 已生成故事人物、设定和暗线。"
+    if step == "stage_plan":
+        return _format_stage_plan_preview(result) or "AI 还没有生成有效的阶段规划。"
+    return format_creation_text(result)
+
+
+def _expected_stage_count(total_words):
+    try:
+        return max(1, int(math.ceil(max(1, int(total_words or 500000)) / 100000)))
+    except (TypeError, ValueError):
+        return 5
+
+
+def normalize_stage_plan_ranges(
+    stage_plan,
+    total_words,
+    average_chapter_words,
+    expected_count=None,
+    pad_missing=True,
+):
     """把阶段范围校正为连续覆盖全书的章节范围。"""
     source = [deepcopy(item) for item in stage_plan if isinstance(item, dict)]
-    expected_count = max(1, int(math.ceil(max(1, int(total_words or 500000)) / 100000)))
-    while len(source) < expected_count:
-        index = len(source) + 1
-        source.append({
-            "name": f"阶段{index}",
-            "summary": "承接上一阶段留下的新变化，继续让人物选择和关系变化把故事推向下一处未知。",
-            "main_conflict": "上一阶段留下的后果继续逼近，人物必须作出新的选择。",
-            "end_state": "局势出现新的变化，仍保留未完全解释的余波。",
-        })
-    source = source[:expected_count]
-    bounds, _total_chapters = _stage_chapter_bounds(source, total_words, average_chapter_words)
+    if expected_count is None:
+        expected_count = _expected_stage_count(total_words)
+    else:
+        try:
+            expected_count = max(0, int(expected_count))
+        except (TypeError, ValueError):
+            expected_count = len(source)
+    # A partial response may contain only S04.  The old implementation used
+    # list position as the stage identity, so a later retry could silently
+    # turn S04 into S02.  Keep explicit ids in their original slots and use
+    # the full book stage count for chapter bounds even when placeholders are
+    # not returned to the caller.
+    explicit_slots = {}
+    unassigned = []
+    for item in source:
+        slot = _creation_stage_index(item.get("id"))
+        if 0 <= slot < max(expected_count, _expected_stage_count(total_words)):
+            if slot not in explicit_slots:
+                explicit_slots[slot] = item
+            else:
+                unassigned.append(item)
+        else:
+            unassigned.append(item)
+    logical_count = max(
+        expected_count,
+        _expected_stage_count(total_words),
+        (max(explicit_slots) + 1) if explicit_slots else 0,
+    )
+    free_slots = [index for index in range(logical_count) if index not in explicit_slots]
+    for item, slot in zip(unassigned, free_slots):
+        explicit_slots[slot] = item
+    if pad_missing:
+        for index in range(logical_count):
+            explicit_slots.setdefault(index, {"id": f"S{index + 1:02d}"})
+    bounds, _total_chapters = _stage_chapter_bounds(
+        [{} for _ in range(logical_count)],
+        total_words,
+        average_chapter_words,
+    )
     normalized = []
-    for index, item in enumerate(source):
+    for index in sorted(explicit_slots):
+        item = explicit_slots[index]
         if index >= len(bounds):
             break
         start, end = bounds[index]
@@ -318,6 +2941,63 @@ def normalize_stage_plan_ranges(stage_plan, total_words, average_chapter_words):
         if index == len(bounds) - 1:
             target = max(1, int(total_words or 500000) - 100000 * index)
         item["target_words"] = target
+        item["entry_state"] = _normalize_stage_state(
+            _first_value(item, ("entry_state", "start_state", "进入状态"), {})
+        )
+        item["exit_state"] = _normalize_stage_state(
+            _first_value(item, ("exit_state", "end_state_detail", "离开状态"), {})
+        )
+        raw_events = _first_value(
+            item,
+            ("ordered_events", "events", "event_nodes", "事件节点"),
+            [],
+        )
+        events = []
+        for event_index, event in enumerate(_as_list(raw_events), 1):
+            normalized_event = _normalize_transport_stage_event(
+                event,
+                f"S{index + 1:02d}-E{event_index:02d}",
+            )
+            if normalized_event:
+                event_id = _canonical_stage_event_id(
+                    normalized_event.get("id"),
+                    index,
+                )
+                if event_id:
+                    normalized_event["id"] = event_id
+                events.append(normalized_event)
+        recovered_events, carry_over = _restore_stage_events_from_carry_over(
+            _first_value(item, ("carry_over", "carryover", "带入下一阶段"), []),
+            index,
+        )
+        event_indexes = {
+            _as_text(event.get("id")).upper(): event_index
+            for event_index, event in enumerate(events)
+            if _as_text(event.get("id"))
+        }
+        for recovered in recovered_events:
+            event_id = _as_text(recovered.get("id")).upper()
+            if event_id and event_id in event_indexes:
+                existing_index = event_indexes[event_id]
+                existing = events[existing_index]
+                if _stage_event_content_score(recovered) > _stage_event_content_score(existing):
+                    events[existing_index] = recovered
+            elif recovered:
+                event_indexes[event_id] = len(events)
+                events.append(recovered)
+        item["ordered_events"] = events
+        item["carry_over"] = carry_over
+        # Legacy fields remain available to old project readers, but all new
+        # planning requests use the structured fields above as the source of truth.
+        for key in (
+            "name", "summary", "main_conflict", "relationship_changes",
+            "character_changes", "world_reveals", "turning_points",
+            "foreshadow_actions", "end_state", "next_stage_hook",
+        ):
+            if isinstance(item.get(key), list):
+                item[key] = _normalize_stage_text_list(item.get(key))
+            elif key in item:
+                item[key] = _as_text(item.get(key))
         normalized.append(item)
     return normalized
 
@@ -348,6 +3028,155 @@ def _stage_chapter_bounds(stage_plan, total_words, average_chapter_words):
     return bounds, total_chapters
 
 
+def _creation_stage_batch_specs(total_words, average_chapter_words):
+    """Return deterministic ten-thousand-word stage batches for the wizard."""
+    stage_count = _expected_stage_count(total_words)
+    bounds, total_chapters = _stage_chapter_bounds(
+        [{} for _ in range(stage_count)],
+        total_words,
+        average_chapter_words,
+    )
+    specs = []
+    for index, (start_chapter, end_chapter) in enumerate(bounds):
+        target_words = 100000
+        if index == stage_count - 1:
+            target_words = max(
+                1,
+                int(total_words or 500000) - 100000 * index,
+            )
+        specs.append({
+            "number": index + 1,
+            "id": f"S{index + 1:02d}",
+            "total_stages": stage_count,
+            "start_chapter": start_chapter,
+            "end_chapter": end_chapter,
+            "target_words": target_words,
+            "total_chapters": total_chapters,
+        })
+    return specs
+
+
+def _normalize_stage_skeleton(value, total_words=500000, average_chapter_words=3000):
+    """Normalize the compact whole-book stage anchor without changing stage data."""
+    if isinstance(value, dict):
+        value = _first_value(value, ("stages", "items", "g", "阶段"), [])
+    raw_items = _as_list(value)
+    if not raw_items:
+        return []
+    specs = _creation_stage_batch_specs(total_words, average_chapter_words)
+    by_index = {}
+    for position, raw in enumerate(raw_items):
+        if isinstance(raw, (list, tuple)):
+            raw = _compact_record(
+                raw,
+                ("id", "name", "summary", "turning_points", "end_state"),
+            )
+        if not isinstance(raw, dict):
+            continue
+        raw_id = _as_text(_first_value(raw, ("id", "stage_id", "阶段编号", "i")))
+        stage_index = _creation_stage_index(raw_id)
+        if stage_index < 0:
+            stage_index = position if position < len(specs) else -1
+        if not 0 <= stage_index < len(specs) or stage_index in by_index:
+            continue
+        turning_points = _normalize_stage_text_list(
+            _first_value(raw, ("turning_points", "turns", "关键转折", "转折"), [])
+        )
+        row = {
+            "id": specs[stage_index]["id"],
+            "name": _as_text(_first_value(raw, ("name", "title", "阶段名称"))),
+            "start_chapter": specs[stage_index]["start_chapter"],
+            "end_chapter": specs[stage_index]["end_chapter"],
+            "target_words": specs[stage_index]["target_words"],
+            "summary": _as_text(
+                _first_value(raw, ("summary", "core_conflict", "main_line", "阶段主线"))
+            ),
+            "turning_points": turning_points,
+            "end_state": _as_text(
+                _first_value(raw, ("end_state", "ending_state", "阶段结束", "结束状态"))
+            ),
+        }
+        if row["name"] or row["summary"] or row["turning_points"] or row["end_state"]:
+            by_index[stage_index] = row
+    return [by_index[index] for index in sorted(by_index)]
+
+
+def _compact_stage_plan_handoff(stage_plan):
+    """给下一阶段保留连续性事实，去掉重复的空分类和展示字段。"""
+    compacted = []
+    for stage in stage_plan if isinstance(stage_plan, list) else []:
+        if not isinstance(stage, dict):
+            continue
+        row = {}
+        for key in ("id", "name", "start_chapter", "end_chapter"):
+            value = stage.get(key)
+            if value not in (None, "", [], {}):
+                row[key] = deepcopy(value)
+        for key in ("entry_state", "exit_state", "carry_over"):
+            value = stage.get(key)
+            if value not in (None, "", [], {}):
+                row[key] = deepcopy(value)
+        events = []
+        for event in stage.get("ordered_events", []) if isinstance(stage.get("ordered_events"), list) else []:
+            if not isinstance(event, dict):
+                continue
+            event_row = {}
+            for key in (
+                "id", "allowed_chapters", "references", "preconditions",
+                "event", "result", "state_delta",
+            ):
+                value = event.get(key)
+                if key == "state_delta" and isinstance(value, dict):
+                    value = {
+                        child_key: deepcopy(child_value)
+                        for child_key, child_value in value.items()
+                        if child_value not in (None, "", [], {})
+                    }
+                if value not in (None, "", [], {}):
+                    event_row[key] = value
+            if event_row:
+                events.append(event_row)
+        if events:
+            row["ordered_events"] = events
+        if row:
+            compacted.append(row)
+    return compacted
+
+
+def _merge_foreshadow_schedule_rows(existing, incoming, total_chapters=0):
+    """Merge stage-local setup/payoff rows without losing earlier endpoints."""
+    rows = _normalize_foreshadow_schedule(existing, total_chapters)
+    incoming_rows = _normalize_foreshadow_schedule(incoming, total_chapters)
+    indexes = {}
+    for index, row in enumerate(rows):
+        key = _as_text(row.get("code")).upper() or _as_text(row.get("name"))
+        if key:
+            indexes[key] = index
+    for row in incoming_rows:
+        key = _as_text(row.get("code")).upper() or _as_text(row.get("name"))
+        if not key:
+            continue
+        if key not in indexes:
+            indexes[key] = len(rows)
+            rows.append(deepcopy(row))
+            continue
+        target = rows[indexes[key]]
+        for field in (
+            "code", "name", "setup_chapter", "payoff_chapter",
+            "setup_event_id", "payoff_event_id", "setup_event", "payoff_event",
+        ):
+            value = _as_text(row.get(field))
+            if value:
+                if (
+                    field == "payoff_chapter"
+                    and _as_text(target.get(field)) == "结尾保留"
+                    and value != "结尾保留"
+                ):
+                    continue
+                target[field] = value
+    return rows
+
+
 def build_chapter_plan_foundation(framework):
     """将向导确认内容投影到已有章节规划可识别的基础字段。"""
     framework = framework if isinstance(framework, dict) else {}
@@ -355,23 +3184,27 @@ def build_chapter_plan_foundation(framework):
     bible = framework.get("bible", {}) if isinstance(framework.get("bible"), dict) else {}
     world_rules = framework.get("world_rules", {}) if isinstance(framework.get("world_rules"), dict) else {}
     stages = framework.get("stage_plan", []) if isinstance(framework.get("stage_plan"), list) else []
+    book_contract = _normalize_stage_book_contract(framework.get("book_contract", {}))
     total_words = int(framework.get("total_words", 500000) or 500000)
     average_words = int(framework.get("average_chapter_words", 3000) or 3000)
     bounds, total_chapters = _stage_chapter_bounds(stages, total_words, average_words)
+    core_mainline = _as_text(premise.get("main_line", "")) or _as_text(bible.get("main_conflict", ""))
+    relationship_engine = _as_text(premise.get("relationship_engine", ""))
+    reading_experience = _as_text(premise.get("one_sentence", "")) or _as_text(bible.get("reader_promise", ""))
     profile = {
         "version": "creation_wizard_v1",
         "audience_direction": _as_text(premise.get("audience", "")),
         "genre_world": _as_text(premise.get("genre", "")),
-        "core_reader_promise": _as_text(premise.get("one_sentence", "")) or _as_text(bible.get("reader_promise", "")),
-        "primary_story_engine": "通过人物处境、利益和认知变化推动关系从俯视、平视到仰望，再由新的选择打破既有关系。",
-        "secondary_story_engine": _as_text(premise.get("relationship_engine", "")),
-        "planning_grammar": "每一段都要有具体场景、人物选择、关系变化和阶段末的新状态；不把后续资料写成当前人物的任务清单。",
-        "pacing_strategy": "以关系反转、具体冲突、反差和悬念形成阅读推动，避免固定句式和重复打脸。",
-        "low_exposition_strategy": "世界规则只在人物选择和冲突需要时出现，以场景和行动带出。",
-        "forbidden_drift": "不要写受伤养伤；不要提前回收后期伏笔；不要把开放式结局写成所有问题圆满解决。",
-        "satisfaction_currencies": ["关系天平翻转", "具体反差", "身份或认知揭开", "人物主动选择"],
-        "emotional_resonance_axes": ["被轻视后的反转", "靠近与反目", "仰望之后仍然留下的未知"],
-        "chapter_variation_pool": ["人物碰撞", "利益交换", "误会反转", "公开选择", "新规则显形"],
+        "core_reader_promise": reading_experience,
+        "primary_story_engine": core_mainline or "让人物在具体事情里作出选择，并承担选择带来的变化。",
+        "secondary_story_engine": relationship_engine,
+        "planning_grammar": "每一段都写人物正在经历的事情、当下的选择和事情留下的变化，不把后面的故事提前塞进当前内容。",
+        "pacing_strategy": "按照题材本身的快慢推进，让悬念、情绪、行动和结果自然交替，不套固定场面。",
+        "low_exposition_strategy": "只在人物看见、听见或需要作出选择时带出世界信息。",
+        "story_direction": "让人物在具体事情里持续作出选择，保持题材的核心读感，让伏笔随着人物行动和关系变化逐步显出意义，结尾留下有余波的问题。",
+        "satisfaction_currencies": ["具体事情带来的结果", "人物选择造成的变化", "身份或认知被揭开", "仍未说尽的余波"],
+        "emotional_resonance_axes": ["人物在现实压力下的选择", "靠近、疏远或反目", "知道一部分真相后仍然留下的未知"],
+        "chapter_variation_pool": ["现实阻力", "人物选择", "利益交换", "新信息出现", "关系发生变化"],
     }
     arcs = []
     for index, stage in enumerate(stages, 1):
@@ -396,14 +3229,20 @@ def build_chapter_plan_foundation(framework):
             "pacing_pattern": "具体冲突与关系变化交替推进，不使用固定章节模板。",
             "exposition_compression": "只在人物选择需要时带出世界信息。",
             "variation_plan": "；".join(_as_text(item) for item in stage.get("world_reveals", []) if _as_text(item)),
-            "forbidden": _as_text(stage.get("forbidden_reveals", "")),
+            "story_direction": "；".join(
+                value for value in (
+                    _as_text(stage.get("summary", "")),
+                    _as_text(stage.get("main_conflict", "")),
+                    _as_text(stage.get("end_state", "")),
+                ) if value
+            ),
         }
         arcs.append(arc)
-    summary = _as_text(framework.get("global_direction", "")) or _as_text(premise.get("synopsis", ""))
-    core_mainline = _as_text(premise.get("main_line", "")) or _as_text(bible.get("main_conflict", ""))
+    summary = _as_text(premise.get("synopsis", ""))
     ending = _as_text(premise.get("ending_direction", "")) or _as_text(bible.get("ending_direction", ""))
     boundaries = _as_text(bible.get("hard_boundaries", "")) or "不写受伤剧情；结局保持开放、非圆满。"
     return {
+        "planning_schema_version": _as_text(framework.get("planning_schema_version", "2")) or "2",
         "summary": summary,
         "core_mainline": core_mainline,
         "ending_promise": ending,
@@ -422,6 +3261,9 @@ def build_chapter_plan_foundation(framework):
             "source": "creation_wizard",
             "version": "1",
         },
+        "book_contract": book_contract,
+        "stage_skeleton": deepcopy(framework.get("stage_skeleton", [])),
+        "structured_stages": deepcopy(stages),
         "arcs": arcs,
     }
 
@@ -433,14 +3275,33 @@ _CONTEXT_LABELS = {
     "genre": "故事类型",
     "audience": "读者方向",
     "style": "希望采用的叙述味道",
+    "protagonist_route": "主角的起点",
+    "story_engine": "故事推进的感觉",
+    "length": "预计篇幅",
     "total_words": "预计总字数",
     "average_chapter_words": "每章大约字数",
+    "chapter_words": "单章字数",
     "no_injury": "必须守住的写法",
     "ending": "结尾倾向",
     "confirmed": "前面已经确认的故事资料",
+    "generation_batch": "这次生成的部分",
+    "previous_stage_plan": "前面已经完成的阶段",
+    "previous_foreshadow_schedule": "前面已经确定的暗线位置",
+    "current_foreshadow_endpoints": "本阶段会进入场景并产生变化的暗线端点",
+    "current_stage": "这一次要生成的阶段",
+    "number": "阶段编号",
+    "total_stages": "阶段总数",
+    "start_chapter": "开始章节",
+    "end_chapter": "结束章节",
+    "target_words": "这一阶段字数",
+    "total_chapters": "全书总章数",
     "premise": "已经选定的故事",
     "selected": "已经选定的版本",
     "candidates": "其它备选版本",
+    "stage_summary": "这一段故事",
+    "end_state": "这一段结束时的变化",
+    "next_hook": "下一段从什么变化开始",
+    "next_stage_hook": "下一段从什么变化开始",
     "title": "书名",
     "one_sentence": "故事钩子",
     "synopsis": "故事简介",
@@ -450,17 +3311,32 @@ _CONTEXT_LABELS = {
     "ending_direction": "结尾留下的方向",
     "bible": "故事的核心",
     "novel_bible": "故事的核心",
-    "core_setting": "故事真正要讲的东西",
-    "reader_promise": "读者会一直想知道的事",
-    "theme": "故事想说的话",
-    "main_conflict": "最重要的矛盾",
-    "relationship_foundation": "重要人物关系的起点",
+    "core_setting": "核心设定",
+    "reader_promise": "持续悬念",
+    "theme": "主题",
+    "main_conflict": "主线矛盾",
+    "relationship_foundation": "人物关系底子",
     "hard_boundaries": "必须守住的边界",
     "world_rules": "世界里的规矩",
     "world": "世界里的规矩",
-    "setting_overview": "这个世界的样子",
-    "power_system": "力量和能力的规矩",
+    "setting_overview": "世界概况",
+    "power_system": "能力边界",
+    "ability_system": "故事里的能力边界",
+    "description": "说明",
+    "limits": "不能越过的边界",
     "levels": "实力层次",
+    "narrative_strategy_profile": "这本书的写法",
+    "creative_intent_contract": "作者想写的故事",
+    "primary_story_engine": "故事怎样被往前推",
+    "secondary_story_engine": "人物关系怎样变化",
+    "core_reader_promise": "读者会一直追问的事",
+    "planning_grammar": "故事继续往前走的写法",
+    "pacing_strategy": "故事快慢的感觉",
+    "low_exposition_strategy": "世界信息怎样自然出现",
+    "story_direction": "故事方向",
+    "satisfaction_currencies": "故事里的具体回响",
+    "emotional_resonance_axes": "人物情绪的变化",
+    "chapter_variation_pool": "故事里可以出现的变化",
     "name": "名字",
     "capability": "这一层能做到的事",
     "limit": "这一层做不到的事",
@@ -470,7 +3346,7 @@ _CONTEXT_LABELS = {
     "factions": "势力",
     "position": "立场",
     "relationship_to_protagonist": "和主角的关系",
-    "geography_and_life": "重要地点和日常生活",
+    "geography_and_life": "地点和日常生活",
     "story_assets": "人物、地方和暗线",
     "characters": "人物",
     "role": "身份和故事位置",
@@ -488,13 +3364,15 @@ _CONTEXT_LABELS = {
     "lore": "会在故事里起作用的设定",
     "type": "属于哪一类",
     "description": "具体内容",
-    "story_known": "人物现在知道多少",
+    "story_known": "人物已知",
     "relationship_effect": "它会怎样改变人物关系",
     "key_scenes": "适合发生故事的地方",
     "atmosphere": "现场的感觉",
     "conflict_use": "这里适合发生的冲突",
     "foreshadows": "埋在故事里的暗线",
     "status": "现在的状态",
+    "setup_chapter": "暗线出现的位置",
+    "payoff_chapter": "暗线发生变化的位置",
     "setup_stage": "暗线从哪里出现",
     "payoff_stage": "暗线什么时候发生变化",
     "revealed": "以后揭开的事实",
@@ -514,13 +3392,14 @@ _CONTEXT_LABELS = {
     "foreshadow_actions": "暗线怎样出现或变化",
     "end_state": "这一段结束时的人物和局势",
     "next_stage_hook": "接下来从什么变化开始",
-    "forbidden_reveals": "暂时不能揭开的事",
-    "global_direction": "从开头走到结尾的变化",
+    "open_threads": "仍在发展的线索",
     "chapter_plan_note": "后面逐章写故事时要守住的边界",
 }
 
 _CONTEXT_OMIT_KEYS = {
-    "schema_version", "source", "completed_at", "selected_index", "version",
+    "schema_version", "source", "completed_at", "selected_index", "version", "enabled",
+    "_generation_state", "completed_batches", "next_batch", "next_stage_index",
+    "generation_batch",
 }
 
 
@@ -573,21 +3452,920 @@ def _render_context_value(value, indent=0, label=None):
 
 
 def format_creation_context(context):
+    """Serialize wizard input without repeating a human-readable field tree.
+
+    The model still receives the complete confirmed facts, but the transport
+    envelope no longer expands every dictionary into labels, list numbers and
+    indentation.  Only the outer, repetitive wrapper keys use short aliases;
+    story records keep their semantic field names so the model can read them
+    without a second schema table.
+    """
     context = context if isinstance(context, dict) else {}
-    lines = [
-        "下面是作者已经说过、或在前面亲自确认过的故事资料。",
-        "只沿着这些资料往下写，不替作者改掉题材、人物选择、结尾方向和必须守住的边界。",
-        "把它当成作者脑海里已经存在的故事，不要逐条复述资料；直接写出人物和事情。",
-    ]
-    lines.extend(_render_context_value(context))
-    return "\n".join(lines)
+    compact_keys = {
+        "author_input": "a",
+        "selected_premise": "p",
+        "confirmed": "c",
+        "generation_batch": "b",
+        "current_stage": "s",
+        "previous_stage_plan": "h",
+        "previous_foreshadow_schedule": "f",
+        "naming_reference": "n",
+    }
+    transport = {
+        compact_keys.get(key, key): deepcopy(value)
+        for key, value in context.items()
+        if value not in (None, "", [], {})
+    }
+    return (
+        "下面是作者已经说过、或在前面亲自确认过的故事资料。"
+        "只沿着这些资料往下写，不替作者改掉题材、人物选择、结尾方向和必须守住的边界。"
+        "输入 JSON 中 a=作者输入，p=已选故事，c=前面确认的资料，b=本次批次，"
+        "s=当前阶段，h=前面阶段，f=暗线位置，n=命名参考；其余字段按原名读取。"
+        "a.inspiration 是作者亲自写下的灵感原文，里面的具体人物、关系、情节、场景、爽点和节奏要求都要逐项吸收；"
+        "a 里的主分类、主题、读者方向、风格和主角起点是硬要求，不要只在标签里提到，也不要用相似题材替换。"
+        "不要逐条复述资料，直接写出人物和事情。\n"
+        + json.dumps(transport, ensure_ascii=False, separators=(",", ": "))
+    )
+
+
+def _creation_scale_requirements(total_words):
+    """Return the long-form material ranges used by the wizard and its checks."""
+    try:
+        total_words = max(1, int(total_words or 500000))
+    except (TypeError, ValueError):
+        total_words = 500000
+    if total_words >= 900000:
+        size_label = "100万字以上"
+        ranges = {
+            "characters": (20, 30),
+            "lore": (30, 45),
+            "foreshadows": (18, 30),
+        }
+    elif total_words >= 450000:
+        size_label = "约50万字"
+        ranges = {
+            "characters": (12, 18),
+            "lore": (20, 30),
+            "foreshadows": (12, 20),
+        }
+    else:
+        size_label = "约30万字"
+        ranges = {
+            "characters": (8, 12),
+            "lore": (12, 18),
+            "foreshadows": (8, 12),
+        }
+    return size_label, ranges
+
+
+def _creation_scale_shortfalls(result, total_words):
+    _size_label, ranges = _creation_scale_requirements(total_words)
+    result = result if isinstance(result, dict) else {}
+    labels = {
+        "characters": "主要人物",
+        "lore": "设定",
+        "foreshadows": "伏笔",
+    }
+    shortfalls = []
+    for key, (minimum, _maximum) in ranges.items():
+        value = result.get(key, [])
+        count = len(value) if isinstance(value, list) else 0
+        if count < minimum:
+            shortfalls.append(f"{labels[key]} {count}/{minimum}")
+    return shortfalls
+
+
+def _creation_scale_guidance(total_words):
+    """根据作品长度给故事底盘提供长篇资料规模参考。"""
+    size_label, ranges = _creation_scale_requirements(total_words)
+    characters = f"{ranges['characters'][0]}—{ranges['characters'][1]}"
+    lore = f"{ranges['lore'][0]}—{ranges['lore'][1]}"
+    foreshadows = f"{ranges['foreshadows'][0]}—{ranges['foreshadows'][1]}"
+    return f"""
+这不是只够写开头几章的简介，而是预计写到{size_label}的整本长篇底盘。请让资料的数量和层次足以支撑人物在不同阶段持续遇到新的事情，不要只列主角和三五个配角，也不要只列一两个地点和一个谜团。这里的资料是给后续阶段规划和章节规划使用的事实底盘，数量只是宽松参考，按故事需要浮动，不要为了凑数添加没有根的名词：
+- 主要人物约 {characters} 名：除了主角，还要有会反复出现的亲近者、同行者、对手、关键势力代表、现实生活中的牵连人物，以及会在后期改变立场的人。每个人物的 notes 都要写清害怕失去什么、与主角怎样牵制，以及后面会怎样改变。
+- 会反复起作用的设定约 {lore} 项：统一写入 lore，覆盖地点、反复出现的场景落点、物件、势力、制度、日常生活和题材本身的能力边界；不要把同一件事换名字重复填写。
+- 跨阶段伏笔约 {foreshadows} 条：每条都要有现在看得见的线索、人物当下的理解，以及以后会改变判断或关系的方向；不要把普通章末悬念当成伏笔。
+这些内容都必须从作者灵感和已经选定的故事自然长出来。人物、设定和伏笔之间要互相牵连，但不要把它们写成重复的剧情简介。故事简介仍然需要自然、可读、可以公开发布；其余字段以清楚、稳定、方便后续执行为先。
+""".strip()
+
+
+def _creation_foreshadow_stage_guidance(total_words):
+    """给故事底盘安排阶段级伏笔位置，不提前锁死具体章节。"""
+    try:
+        total_words = max(1, int(total_words or 500000))
+    except (TypeError, ValueError):
+        total_words = 500000
+    stage_count = max(1, int(math.ceil(total_words / 100000)))
+    return f"""
+本书预计按每约十万字分为 {stage_count} 个阶段。第二步先为每条伏笔安排“从哪个阶段进入故事、在哪个阶段产生明显变化”，setup_stage 和 payoff_stage 填写阶段位置，范围为“第1阶段”到“第{stage_count}阶段”；仍然留到结尾的暗线，payoff_stage 写“结尾保留”。阶段位置体现故事因果：先让线索进入人物生活，再让它在人物行动和关系变化中逐步显出意义。具体章号由第三步结合阶段边界、总字数和单章字数落下，因此第二步只保留阶段参考。
+""".strip()
+
+
+def _creation_total_chapters(total_words, average_chapter_words):
+    try:
+        total_words = max(1, int(total_words or 500000))
+    except (TypeError, ValueError):
+        total_words = 500000
+    try:
+        average_chapter_words = max(1, int(average_chapter_words or 3000))
+    except (TypeError, ValueError):
+        average_chapter_words = 3000
+    return max(1, int(math.ceil(total_words / average_chapter_words)))
+
+
+def _creation_chapter_number(value):
+    """Read one concrete chapter number from a wizard planning field."""
+    if isinstance(value, bool):
+        return 0
+    if isinstance(value, (int, float)):
+        try:
+            number = int(value)
+        except (TypeError, ValueError):
+            return 0
+        return number if number > 0 else 0
+    text = _as_text(value)
+    if not text:
+        return 0
+    match = re.search(r"(?:第\s*)?(\d{1,4})\s*(?:章|回|节)?", text)
+    if match:
+        try:
+            number = int(match.group(1))
+        except (TypeError, ValueError):
+            return 0
+        return number if number > 0 else 0
+    chinese_digits = {
+        "零": 0, "〇": 0, "一": 1, "二": 2, "两": 2, "三": 3,
+        "四": 4, "五": 5, "六": 6, "七": 7, "八": 8, "九": 9,
+    }
+    match = re.search(r"第\s*([零〇一二两三四五六七八九十百千万]+)\s*[章回节]?", text)
+    if not match:
+        return 0
+    raw = match.group(1)
+    if raw == "十":
+        return 10
+    if "十" in raw:
+        left, _, right = raw.partition("十")
+        tens = chinese_digits.get(left, 1) if left else 1
+        ones = chinese_digits.get(right, 0) if right else 0
+        return tens * 10 + ones
+    if "百" in raw or "千" in raw or "万" in raw:
+        units = {"十": 10, "百": 100, "千": 1000, "万": 10000}
+        total = 0
+        current = 0
+        for char in raw:
+            if char in chinese_digits:
+                current = chinese_digits[char]
+            elif char in units:
+                total += (current or 1) * units[char]
+                current = 0
+        return total + current
+    return chinese_digits.get(raw, 0)
+
+
+def _normalize_creation_stage_ref(value, stage_count=0):
+    """Normalize a second-step stage reference without treating it as a chapter."""
+    if isinstance(value, bool):
+        return ""
+    text = _as_text(value)
+    if not text:
+        return ""
+    if text in {"结尾保留", "结尾开放", "不回收", "暂不回收", "保留到结尾"}:
+        return "结尾保留"
+    number = _creation_chapter_number(value)
+    if number <= 0:
+        return ""
+    try:
+        stage_count = int(stage_count or 0)
+    except (TypeError, ValueError):
+        stage_count = 0
+    if stage_count and number > stage_count:
+        return ""
+    return f"第{number}阶段"
+
+
+def _foreshadow_stage_shortfalls(foreshadows, stage_count):
+    """Find missing or out-of-range stage references from the second step."""
+    missing = []
+    for record in foreshadows if isinstance(foreshadows, list) else []:
+        if not isinstance(record, dict):
+            continue
+        setup = _normalize_creation_stage_ref(
+            record.get("setup_stage"),
+            stage_count,
+        )
+        payoff = _normalize_creation_stage_ref(
+            record.get("payoff_stage"),
+            stage_count,
+        )
+        setup_number = _creation_chapter_number(setup)
+        payoff_number = _creation_chapter_number(payoff)
+        valid_payoff = payoff == "结尾保留" or (
+            setup_number > 0 and payoff_number > setup_number
+        )
+        if setup_number <= 0 or not valid_payoff:
+            missing.append(
+                _as_text(record.get("code"))
+                or _as_text(record.get("name"))
+            )
+    return missing
+
+
+def _normalize_creation_chapter_ref(value, total_chapters=0):
+    text = _as_text(value)
+    if not text:
+        return ""
+    # 阶段参考只能在 setup_stage/payoff_stage 中存在，不能被解析成同号章节。
+    if "阶段" in text:
+        return ""
+    if text in {"结尾保留", "结尾开放", "不回收", "暂不回收", "保留到结尾"}:
+        return "结尾保留"
+    # A range is not a chapter assignment. Leave it empty so validation can
+    # request one concrete chapter instead of silently choosing one endpoint.
+    if re.search(
+        r"(?:\d|[一二三四五六七八九十百千万零〇])\s*(?:至|到|[-—])\s*"
+        r"(?:\d|[一二三四五六七八九十百千万零〇])",
+        text,
+    ):
+        return ""
+    number = _creation_chapter_number(value)
+    if number <= 0:
+        return ""
+    if total_chapters:
+        number = min(number, int(total_chapters))
+    return f"第{number}章"
+
+
+def _normalize_foreshadow_endpoint_kind(value):
+    text = _as_text(value).lower()
+    if text in {"setup", "set", "埋设", "埋下", "出现", "起点"}:
+        return "setup"
+    if text in {"payoff", "resolve", "reveal", "回收", "揭示", "兑现", "终点"}:
+        return "payoff"
+    return ""
+
+
+def _foreshadow_key(value):
+    if not isinstance(value, dict):
+        return ""
+    code = _as_text(value.get("code"))
+    if code:
+        return code.upper()
+    return _as_text(value.get("name"))
+
+
+def _stage_index_from_ref(value, stage_count=0):
+    normalized = _normalize_creation_stage_ref(value, stage_count)
+    if normalized == "结尾保留":
+        return -1
+    number = _creation_chapter_number(normalized)
+    return number - 1 if number > 0 else -1
+
+
+def _foreshadow_stage_requirements(foreshadows, stage_specs):
+    """Return the exact setup/payoff endpoint required in each stage."""
+    specs = stage_specs if isinstance(stage_specs, list) else []
+    requirements = {index: [] for index in range(len(specs))}
+    stage_count = len(specs)
+    for record in foreshadows if isinstance(foreshadows, list) else []:
+        if not isinstance(record, dict):
+            continue
+        key = _foreshadow_key(record)
+        if not key:
+            continue
+        name = _as_text(record.get("name"))
+        setup_index = _stage_index_from_ref(record.get("setup_stage"), stage_count)
+        if 0 <= setup_index < stage_count:
+            requirements[setup_index].append({
+                "key": key,
+                "code": _as_text(record.get("code")),
+                "name": name,
+                "kind": "setup",
+                "stage_index": setup_index,
+            })
+        payoff_stage = _normalize_creation_stage_ref(
+            record.get("payoff_stage"),
+            stage_count,
+        )
+        payoff_index = (
+            stage_count - 1
+            if payoff_stage == "结尾保留"
+            else _stage_index_from_ref(payoff_stage, stage_count)
+        )
+        if 0 <= payoff_index < stage_count:
+            requirements[payoff_index].append({
+                "key": key,
+                "code": _as_text(record.get("code")),
+                "name": name,
+                "kind": "payoff",
+                "stage_index": payoff_index,
+                "tail_reserved": payoff_stage == "结尾保留",
+            })
+    return requirements
+
+
+def _foreshadow_endpoint_in_stage(value, kind, requirement, stage_specs, total_chapters=0):
+    text = _normalize_creation_chapter_ref(value, total_chapters)
+    if kind == "payoff" and requirement.get("tail_reserved"):
+        return "结尾保留" if text == "结尾保留" else ""
+    chapter = _creation_chapter_number(text)
+    try:
+        stage_index = int(requirement.get("stage_index", -1))
+    except (TypeError, ValueError):
+        stage_index = -1
+    if chapter <= 0 or not (0 <= stage_index < len(stage_specs)):
+        return ""
+    spec = stage_specs[stage_index]
+    start = int(spec.get("start_chapter", 0) or 0)
+    end = int(spec.get("end_chapter", 0) or 0)
+    if start <= chapter <= end:
+        return f"第{chapter}章"
+    return ""
+
+
+def _canonical_stage_event_id(value, stage_index=-1):
+    """Normalize a stage event reference without using list position as identity."""
+    text = re.sub(r"\s+", "", _as_text(value).upper())
+    if not text:
+        return ""
+    match = re.fullmatch(r"(?:STAGE[_-]?(\d{1,4})|S[_-]?(\d{1,4}))[_-]?E[_-]?(\d{1,4})", text)
+    if match:
+        stage_number = int(match.group(1) or match.group(2))
+        event_number = int(match.group(3))
+        return f"S{stage_number:02d}-E{event_number:02d}"
+    match = re.fullmatch(r"E[_-]?(\d{1,4})", text)
+    if match and int(stage_index) >= 0:
+        return f"S{int(stage_index) + 1:02d}-E{int(match.group(1)):02d}"
+    return ""
+
+
+def _stage_event_anchor_chapter(event, stage_spec, event_index=0, event_count=1):
+    """Pick one stable chapter from an event's range.
+
+    The model owns the event range.  The program only chooses the first
+    chapter in that range, so an endpoint is never re-planned independently
+    from the event that actually contains it.
+    """
+    if not isinstance(event, dict) or not isinstance(stage_spec, dict):
+        return ""
+    try:
+        stage_start = int(stage_spec.get("start_chapter", 0) or 0)
+        stage_end = int(stage_spec.get("end_chapter", 0) or 0)
+    except (TypeError, ValueError):
+        return ""
+    if stage_start <= 0 or stage_end < stage_start:
+        return ""
+    allowed = event.get("allowed_chapters", [])
+    try:
+        allowed_start = int(allowed[0])
+        allowed_end = int(allowed[1]) if len(allowed) > 1 else allowed_start
+    except (TypeError, ValueError, IndexError):
+        allowed_start = allowed_end = 0
+    if allowed_start > 0 and allowed_end >= allowed_start:
+        start = max(stage_start, allowed_start)
+        end = min(stage_end, allowed_end)
+        if start <= end:
+            return f"第{start}章"
+    try:
+        event_count = max(1, int(event_count or 1))
+        event_index = max(0, min(int(event_index or 0), event_count - 1))
+    except (TypeError, ValueError):
+        event_index, event_count = 0, 1
+    chapter = stage_start + int(
+        (stage_end - stage_start) * event_index / max(1, event_count - 1)
+    )
+    return f"第{max(stage_start, min(stage_end, chapter))}章"
+
+
+def _stage_event_endpoint_detail(event):
+    if not isinstance(event, dict):
+        return ""
+    return "；".join(
+        part for part in (
+            _as_text(event.get("event")),
+            _as_text(event.get("result")),
+        ) if part
+    )
+
+
+def _event_references_endpoint(event, requirement):
+    """Only use explicit endpoint references for automatic event association."""
+    if not isinstance(event, dict) or not isinstance(requirement, dict):
+        return False
+    code = _as_text(requirement.get("code")).upper()
+    name = _as_text(requirement.get("name"))
+    kind = _as_text(requirement.get("kind")).lower()
+    kind_token = kind.upper()
+    references = event.get("references", [])
+    references = references if isinstance(references, list) else [references]
+    for reference in references:
+        text = _as_text(reference)
+        upper = text.upper()
+        code_match = bool(
+            code
+            and re.search(
+                rf"(?<![A-Z0-9]){re.escape(code)}(?![A-Z0-9])",
+                upper,
+            )
+        )
+        if code_match:
+            if (
+                not kind_token
+                or kind_token in upper
+                or kind == "setup" and "埋" in text
+                or kind == "payoff" and "回" in text
+            ):
+                return True
+        if name and name == text:
+            return True
+    return False
+
+
+def _derive_stage_endpoint_rows(
+    result,
+    stage_index,
+    stage_specs,
+    foreshadows,
+    total_chapters=0,
+):
+    """Attach required endpoints to generated events before schedule merge.
+
+    The stage baseline decides which endpoint belongs here.  The response only
+    identifies the event that carries it; chapter placement is derived from
+    that event's allowed range.  This removes the fragile second decision in
+    which the model had to keep stage, event and exact chapter synchronized.
+    """
+    specs = stage_specs if isinstance(stage_specs, list) else []
+    if not (0 <= int(stage_index) < len(specs)):
+        return []
+    raw_stages = result.get("stage_plan", []) if isinstance(result, dict) else []
+    stages = [item for item in raw_stages if isinstance(item, dict)]
+    target_id = _as_text(specs[stage_index].get("id")).upper()
+    stage = next(
+        (
+            item for item in stages
+            if _as_text(item.get("id")).upper() == target_id
+        ),
+        stages[0] if stages else {},
+    )
+    raw_events = stage.get("ordered_events", []) if isinstance(stage, dict) else []
+    events = [item for item in raw_events if isinstance(item, dict)]
+    event_lookup = {}
+    for index, event in enumerate(events):
+        event_id = _canonical_stage_event_id(event.get("id"), stage_index)
+        if not event_id:
+            event_id = f"S{int(stage_index) + 1:02d}-E{index + 1:02d}"
+        event["id"] = event_id
+        event_lookup[event_id] = (index, event)
+        event_lookup[f"E{index + 1:02d}"] = (index, event)
+
+    incoming = _normalize_foreshadow_schedule(result.get("foreshadow_schedule", []), total_chapters)
+    requirements = _foreshadow_stage_requirements(foreshadows, specs).get(int(stage_index), [])
+    requirement_by_key = {
+        (_as_text(item.get("key")).upper() or _as_text(item.get("name"))): item
+        for item in requirements
+    }
+    resolved = []
+    resolved_keys = set()
+
+    def row_key(row):
+        return _as_text(row.get("code")).upper() or _as_text(row.get("name"))
+
+    def find_requirement(row):
+        key = row_key(row)
+        requirement = requirement_by_key.get(key)
+        if requirement:
+            return requirement
+        for candidate in requirements:
+            if (
+                _as_text(candidate.get("code")).upper() == _as_text(row.get("code")).upper()
+                and _as_text(candidate.get("kind")) == _as_text(row.get("endpoint_kind"))
+            ):
+                return candidate
+        return None
+
+    def find_event(row, requirement):
+        event_ref = _canonical_stage_event_id(
+            row.get("endpoint_event_id"),
+            stage_index,
+        )
+        if event_ref and event_ref in event_lookup:
+            event_index, event = event_lookup[event_ref]
+            # Keep the two compact transport locations synchronized.  When a
+            # response names an event in f but omits the matching Fxx/setup or
+            # Fxx/payoff marker in the event references, preserve the endpoint
+            # and add the missing marker instead of losing the association.
+            code = _as_text(requirement.get("code"))
+            kind = _as_text(requirement.get("kind")).lower()
+            marker = f"{code}/{kind}" if code and kind else ""
+            references = event.get("references", [])
+            references = list(references) if isinstance(references, list) else ([references] if references else [])
+            if marker and not any(_as_text(item).upper() == marker.upper() for item in references):
+                references.insert(0, marker)
+                event["references"] = references
+            return event_index, event
+        for index, event in enumerate(events):
+            if _event_references_endpoint(event, requirement):
+                return index, event
+        return None
+
+    for row in incoming:
+        kind = _normalize_foreshadow_endpoint_kind(row.get("endpoint_kind"))
+        requirement = find_requirement(row) if kind else None
+        if not requirement:
+            resolved.append(row)
+            continue
+        key = _as_text(requirement.get("key")).upper() or _as_text(requirement.get("name"))
+        if key in resolved_keys:
+            continue
+        event_match = find_event(row, requirement)
+        if event_match:
+            event_index, event = event_match
+            row["endpoint_event_id"] = _as_text(event.get("id"))
+            row["endpoint_chapter"] = _stage_event_anchor_chapter(
+                event,
+                specs[stage_index],
+                event_index,
+                len(events),
+            )
+            row["endpoint_event"] = row.get("endpoint_event") or _stage_event_endpoint_detail(event)
+        resolved.append(row)
+        resolved_keys.add(key)
+
+    # If f was omitted, recover it from the explicit Fxx/setup or Fxx/payoff
+    # token required in the event references.  This is reconstruction from the
+    # generated event, not a fabricated chapter or a blanket acceptance rule.
+    for requirement in requirements:
+        key = _as_text(requirement.get("key")).upper() or _as_text(requirement.get("name"))
+        if key in resolved_keys or requirement.get("tail_reserved"):
+            continue
+        for event_index, event in enumerate(events):
+            if not _event_references_endpoint(event, requirement):
+                continue
+            resolved.append({
+                "code": _as_text(requirement.get("code")),
+                "name": _as_text(requirement.get("name")),
+                "endpoint_kind": requirement.get("kind"),
+                "endpoint_event_id": _as_text(event.get("id")),
+                "endpoint_chapter": _stage_event_anchor_chapter(
+                    event,
+                    specs[stage_index],
+                    event_index,
+                    len(events),
+                ),
+                "endpoint_event": _stage_event_endpoint_detail(event),
+            })
+            resolved_keys.add(key)
+            break
+    return resolved
+
+
+def _canonicalize_foreshadow_schedule(
+    foreshadows,
+    schedule,
+    stage_specs,
+    total_chapters=0,
+    strict=False,
+):
+    """Project schedule rows onto the second-step foreshadowing baseline.
+
+    The baseline owns endpoint stage placement.  A stage response may only
+    fill the endpoint that belongs to the current stage; stale legacy fields
+    outside that stage are ignored during migration instead of becoming a
+    false chapter assignment.
+    """
+    baseline = [item for item in foreshadows if isinstance(item, dict)]
+    by_key = {_foreshadow_key(item): item for item in baseline if _foreshadow_key(item)}
+    requirements = _foreshadow_stage_requirements(baseline, stage_specs)
+    requirement_by_key = {}
+    for rows in requirements.values():
+        for requirement in rows:
+            requirement_by_key.setdefault(requirement["key"], {})[
+                requirement["kind"]
+            ] = requirement
+
+    canonical = {}
+    for item in baseline:
+        key = _foreshadow_key(item)
+        if not key:
+            continue
+        canonical[key] = {
+            "code": _as_text(item.get("code")),
+            "name": _as_text(item.get("name")),
+            "setup_chapter": "",
+            "payoff_chapter": "",
+            "setup_event_id": "",
+            "payoff_event_id": "",
+            "setup_event": "",
+            "payoff_event": "",
+        }
+
+    errors = []
+    notes = []
+    rows = _normalize_foreshadow_schedule(schedule, total_chapters)
+
+    def assign(target, kind, value, detail, event_id, requirement, explicit):
+        if not requirement:
+            if explicit and value:
+                errors.append(
+                    f"{target.get('code') or target.get('name') or '未知伏笔'}的{kind}端点不在第二步确定的阶段内"
+                )
+            elif value:
+                notes.append(
+                    f"旧伏笔章位未采用：{target.get('code') or target.get('name') or '未知伏笔'}的{kind}端点为{_as_text(value)}，与第二步阶段位置不一致"
+                )
+            return
+        normalized = _foreshadow_endpoint_in_stage(
+            value,
+            kind,
+            requirement,
+            stage_specs,
+            total_chapters,
+        )
+        if not normalized:
+            if explicit and value:
+                errors.append(
+                    f"{target.get('code') or target.get('name') or '未知伏笔'}的{kind}章位不在所属阶段范围内"
+                )
+            elif value:
+                notes.append(
+                    f"旧伏笔章位未采用：{target.get('code') or target.get('name') or '未知伏笔'}的{kind}端点为{_as_text(value)}，不在所属阶段范围内"
+                )
+            return
+        target[f"{kind}_chapter"] = normalized
+        if event_id:
+            target[f"{kind}_event_id"] = _as_text(event_id)
+        if detail:
+            target[f"{kind}_event"] = _as_text(detail)
+
+    for row in rows:
+        key = _foreshadow_key(row)
+        target = canonical.get(key)
+        explicit_kind = _normalize_foreshadow_endpoint_kind(row.get("endpoint_kind"))
+        endpoint_value = row.get("endpoint_chapter")
+        endpoint_detail = row.get("endpoint_event")
+        endpoint_event_id = row.get("endpoint_event_id")
+        has_legacy_endpoint = any(
+            _as_text(row.get(field))
+            for field in (
+                "setup_chapter", "payoff_chapter", "setup_event", "payoff_event",
+            )
+        )
+        if target is None:
+            # Old stage responses sometimes put the n-field chapter boundary
+            # into the f-array. Keep the text as a planning note, never as a
+            # made-up foreshadow. Unknown endpoint records are also retained
+            # in that note so migration cannot silently discard model output.
+            note = _as_text(row.get("code")) or _as_text(row.get("name"))
+            if has_legacy_endpoint or explicit_kind:
+                note = "未识别的伏笔章位记录：" + json.dumps(row, ensure_ascii=False, separators=(",", ":"))
+            if note:
+                notes.append(note)
+            if strict:
+                errors.append(
+                    f"{_as_text(row.get('code')) or _as_text(row.get('name')) or '未命名伏笔'}不是第二步确认的伏笔"
+                )
+            continue
+
+        requirements_for_key = requirement_by_key.get(key, {})
+        if explicit_kind:
+            assign(
+                target,
+                explicit_kind,
+                endpoint_value,
+                endpoint_detail,
+                endpoint_event_id,
+                requirements_for_key.get(explicit_kind),
+                True,
+            )
+            continue
+
+        # Legacy a/b rows are accepted only for migration.  Each endpoint is
+        # checked against its own baseline stage, so F06's stale b=47 cannot
+        # overwrite the real S04 payoff endpoint.
+        assign(
+            target,
+            "setup",
+            row.get("setup_chapter"),
+            row.get("setup_event"),
+            row.get("setup_event_id"),
+            requirements_for_key.get("setup"),
+            False,
+        )
+        assign(
+            target,
+            "payoff",
+            row.get("payoff_chapter"),
+            row.get("payoff_event"),
+            row.get("payoff_event_id"),
+            requirements_for_key.get("payoff"),
+            False,
+        )
+
+    # A tail-reserved payoff is a second-step decision, not something the
+    # model needs to rediscover in the final stage response.
+    for key, target in canonical.items():
+        payoff_requirement = requirement_by_key.get(key, {}).get("payoff")
+        if payoff_requirement and payoff_requirement.get("tail_reserved"):
+            target["payoff_chapter"] = "结尾保留"
+    return [item for item in canonical.values()], notes, errors
+
+
+def _normalize_foreshadow_schedule(value, total_chapters=0):
+    raw_items = value if isinstance(value, list) else []
+    normalized = []
+    for item in raw_items:
+        if not isinstance(item, dict):
+            continue
+        code = _as_text(
+            _first_value(
+                item,
+                ("code", "foreshadow_code", "id", "i", "编号", "伏笔编号"),
+            )
+        )
+        name = _as_text(
+            _first_value(item, ("name", "title", "n", "伏笔名称", "名称"))
+        )
+        endpoint_kind = _normalize_foreshadow_endpoint_kind(
+            _first_value(item, ("endpoint_kind", "kind", "k", "端点类型", "端点"))
+        )
+        endpoint_event_id = _as_text(
+            _first_value(
+                item,
+                (
+                    "endpoint_event_id", "event_id", "e",
+                    "关联事件", "事件编号",
+                ),
+            )
+        )
+        endpoint_chapter = _first_value(
+            item,
+            ("endpoint_chapter", "chapter", "c", "具体章节", "章节"),
+        )
+        endpoint_event = _as_text(
+            _first_value(item, ("endpoint_event", "detail", "d", "端点内容", "内容"))
+        )
+        setup_event_id = _as_text(
+            _first_value(item, ("setup_event_id", "setup_event_ref", "埋设事件编号"))
+        )
+        payoff_event_id = _as_text(
+            _first_value(item, ("payoff_event_id", "payoff_event_ref", "回收事件编号"))
+        )
+        normalized.append({
+            "code": code,
+            "name": name,
+            "endpoint_kind": endpoint_kind,
+            "endpoint_event_id": endpoint_event_id if endpoint_kind else "",
+            "endpoint_chapter": _normalize_creation_chapter_ref(
+                endpoint_chapter,
+                total_chapters,
+            ) if endpoint_kind else "",
+            "endpoint_event": endpoint_event if endpoint_kind else "",
+            "setup_chapter": _normalize_creation_chapter_ref(
+                _first_value(item, ("setup_chapter", "setup", "埋设章节", "埋下章节")),
+                total_chapters,
+            ),
+            "payoff_chapter": _normalize_creation_chapter_ref(
+                _first_value(item, ("payoff_chapter", "payoff", "回收章节", "揭示章节")),
+                total_chapters,
+            ),
+            "setup_event_id": setup_event_id,
+            "payoff_event_id": payoff_event_id,
+            "setup_event": _as_text(_first_value(item, ("setup_event", "setup_detail", "埋设内容"))),
+            "payoff_event": _as_text(_first_value(item, ("payoff_event", "payoff_detail", "回收内容"))),
+        })
+    return normalized
+
+
+def _apply_foreshadow_schedule(foreshadows, schedule, total_chapters=0):
+    records = [deepcopy(item) for item in foreshadows if isinstance(item, dict)]
+    rows = _normalize_foreshadow_schedule(schedule, total_chapters)
+    by_code = {
+        _as_text(item.get("code")).upper(): item
+        for item in rows if _as_text(item.get("code"))
+    }
+    by_name = {
+        _as_text(item.get("name")): item
+        for item in rows if _as_text(item.get("name"))
+    }
+    for record in records:
+        match = by_code.get(_as_text(record.get("code")).upper())
+        if match is None:
+            match = by_name.get(_as_text(record.get("name")))
+        if not match:
+            continue
+        setup = _as_text(match.get("setup_chapter"))
+        payoff = _as_text(match.get("payoff_chapter"))
+        setup_number = _creation_chapter_number(setup)
+        payoff_number = _creation_chapter_number(payoff)
+        valid_payoff = payoff == "结尾保留" or (
+            setup_number > 0 and payoff_number > setup_number
+        )
+        if setup_number > 0:
+            record["setup_chapter"] = setup
+        if valid_payoff:
+            record["payoff_chapter"] = payoff
+    return records
+
+
+def _stage_foreshadow_shortfalls(foreshadows, schedule, stage_specs, total_chapters=0):
+    """Return missing endpoint records grouped by the stage that owns them."""
+    specs = stage_specs if isinstance(stage_specs, list) else []
+    requirements = _foreshadow_stage_requirements(foreshadows, specs)
+    rows = _normalize_foreshadow_schedule(schedule, total_chapters)
+    by_key = {_foreshadow_key(row): row for row in rows if _foreshadow_key(row)}
+    missing = []
+    for stage_index, required_rows in requirements.items():
+        for requirement in required_rows:
+            row = by_key.get(requirement["key"])
+            chapter = row.get(f"{requirement['kind']}_chapter") if row else ""
+            normalized = _foreshadow_endpoint_in_stage(
+                chapter,
+                requirement["kind"],
+                requirement,
+                specs,
+                total_chapters,
+            )
+            if not normalized:
+                missing.append({
+                    "stage_index": stage_index,
+                    "kind": requirement["kind"],
+                    "code": requirement.get("code") or requirement.get("name"),
+                    "name": requirement.get("name", ""),
+                })
+    return missing
+
+
+def _foreshadow_schedule_shortfalls(
+    foreshadows,
+    schedule,
+    total_chapters=0,
+    stage_specs=None,
+):
+    if isinstance(stage_specs, list):
+        return [
+            item.get("code") or item.get("name")
+            for item in _stage_foreshadow_shortfalls(
+                foreshadows,
+                schedule,
+                stage_specs,
+                total_chapters,
+            )
+        ]
+    records = [item for item in foreshadows if isinstance(item, dict)]
+    rows = _normalize_foreshadow_schedule(schedule, total_chapters)
+    by_code = {
+        _as_text(item.get("code")).upper(): item
+        for item in rows if _as_text(item.get("code"))
+    }
+    by_name = {
+        _as_text(item.get("name")): item
+        for item in rows if _as_text(item.get("name"))
+    }
+    missing = []
+    for record in records:
+        match = by_code.get(_as_text(record.get("code")).upper())
+        if match is None:
+            match = by_name.get(_as_text(record.get("name")))
+        if not match:
+            missing.append(_as_text(record.get("code")) or _as_text(record.get("name")))
+            continue
+        setup_number = _creation_chapter_number(match.get("setup_chapter"))
+        payoff = _as_text(match.get("payoff_chapter"))
+        payoff_number = _creation_chapter_number(payoff)
+        if setup_number <= 0 or (payoff != "结尾保留" and payoff_number <= setup_number):
+            missing.append(_as_text(record.get("code")) or _as_text(record.get("name")))
+    return missing
+
+
+def _creation_foreshadow_chapter_guidance(total_words, average_chapter_words):
+    total_chapters = _creation_total_chapters(total_words, average_chapter_words)
+    return f"""
+本书按当前输入预计共 {total_chapters} 章。阶段规划只把每个暗线端点关联到当前阶段中的一个事件，程序会根据事件的允许章节范围稳定落下具体章号，章号覆盖第1章到第{total_chapters}章。暗线先进入人物生活，再在后续行动和关系变化中产生新的意义；需要留到结尾的线索由程序保留为“结尾保留”。
+""".strip()
 
 
 class NovelCreationWorker(NovelAnalysisWorker):
-    """复用现有结构化请求、流式回退和重试机制的单步向导 worker。"""
+    """复用现有结构化请求、流式回退和重试机制的向导批次 worker。"""
 
-    def __init__(self, base_url, api_key, model, step, context, proxy_url="", proxy_mode="不使用代理"):
+    def __init__(
+        self,
+        base_url,
+        api_key,
+        model,
+        step,
+        context,
+        proxy_url="",
+        proxy_mode="不使用代理",
+        batch_kind="",
+        stage_index=0,
+    ):
         self.creation_step = str(step or "").strip()
+        self.creation_batch = str(batch_kind or "").strip()
+        try:
+            self.stage_index = max(0, int(stage_index or 0))
+        except (TypeError, ValueError):
+            self.stage_index = 0
         self.creation_context = deepcopy(context if isinstance(context, dict) else {})
         text = format_creation_context(self.creation_context)
         super().__init__(
@@ -602,10 +4380,141 @@ class NovelCreationWorker(NovelAnalysisWorker):
         self.retry_attempts = 3
 
     def _analysis_prompt(self):
-        return STEP_PROMPTS.get(self.creation_step, COMMON_CREATION_RULES)
+        prompt = STEP_PROMPTS.get(self.creation_step, COMMON_CREATION_RULES)
+        author_input = self.creation_context.get("author_input", {})
+        total_words = author_input.get("total_words", 500000) if isinstance(author_input, dict) else 500000
+        try:
+            total_words = max(1, int(total_words or 500000))
+        except (TypeError, ValueError):
+            total_words = 500000
+        average_chapter_words = (
+            author_input.get("average_chapter_words", 3000)
+            if isinstance(author_input, dict) else 3000
+        )
+        try:
+            average_chapter_words = max(1, int(average_chapter_words or 3000))
+        except (TypeError, ValueError):
+            average_chapter_words = 3000
+        power_levels_guidance = ""
+        if story_requires_explicit_power_levels(
+            author_input,
+            self.creation_context.get("selected_premise", {}),
+        ):
+            power_levels_guidance = """
+当前题材明确属于高武、玄幻、仙侠、修真、武道或其它有力量层次的题材。设定数组 l 里必须有一条独立的实力体系条目，不能只在世界规则的力量体系里一笔带过，也不能只写主角有多强。这条条目仍然使用 l 的原有四个位置：名称、类型、具体内容、人物当前知道多少；名称可以写成“高武境界体系”或贴合本书的实力体系，类型固定写“规则”。
+具体内容按从低到高写出一套清楚、够用的境界顺序，每个境界只用一到两句话，说明这一层主要能做到什么、边界在哪里，以及通常靠什么提升。境界数量按故事需要安排，不要把同一层拆成大量重复小级别；主角当前大致处在哪一层、普通武者、武帝和更高层次与主角的差距，也要在这条条目里说清楚。每个境界的描述要成为后面阶段和正文可以反复使用的事实，不要只写“存在境界划分”或“力量来自气血真元”，不要把境界体系留给阶段规划。
+如果使用嵌套数组表达境界，也必须把最终完整内容同时写入这条 l 条目的“具体内容”，这样程序会按主程序现有 lore 字段保存。
+""".strip()
+        if self.creation_batch == "bible_core":
+            prompt = f"""{COMMON_CREATION_RULES}
+
+只根据作者已经选定的故事，生成小说圣经和世界规则。小说圣经写整本书的核心矛盾、人物关系底子、贯穿全书并会随着人物选择不断变深的问题、主题、结尾方向和长期事实，让后面的阶段和场景都有清楚的根。世界规则写世界长期怎样运转、日常生活、地点和社会关系、异常或能力的来源、触发条件、作用边界和代价；普通都市、灵异、悬疑、情感和现实题材，把规则落在空间、社会、异常与人物处境上；明确有修炼或境界的题材，再写力量来源和总边界，详细层次留给下一批的设定记录。
+
+世界规则的五个位置都要形成可执行的事实：世界概况交代长期环境，力量或能力体系交代来源与总边界，长期规则数组写会反复成立的运行方式，代价限制数组写人物触碰这些规则后会承担的现实后果，地理与生活写人物平常真正会走进的地方和生活压力。每条规则都能影响人物选择，数组写实际内容，不用空泛的分类名。
+
+“长期规则数组”和“代价限制数组”都要写出实际条目，通常各有三到六条；不要为了省字留空，也不要把它们只写进世界概况或能力边界。高武、玄幻、仙侠、修真和武道题材要写清修炼、资源、宗门秩序、越级或使用力量会遇到的现实代价；其它题材则写这个世界会反复成立的生活、空间、社会或异常规则。
+
+这是预计写到{_creation_scale_requirements(total_words)[0]}的长篇，资料要足够支撑后续人物、设定、伏笔和阶段规划，让人物在不同阶段拥有新的处境和选择。伏笔位置此时只写阶段参考，不写具体章号。小说简介保持自然网络小说语言，其余内容以清楚、稳定、方便后续执行为先。
+
+只返回一个合法 JSON 对象，不能有 Markdown 或解释：{{"b":["核心设定","读者承诺","主题","主线矛盾","人物关系底子","结尾方向","硬边界"],"w":["世界概况","力量或能力体系","长期规则数组","代价限制数组","地理与生活"]}}。b固定7项，w固定5项，不要输出人物、设定或伏笔。"""
+        elif self.creation_batch == "bible_assets":
+            prompt = f"""{COMMON_CREATION_RULES}
+
+读取作者已经选定的故事，以及前一批已经生成的小说圣经和世界规则，补齐人物、设定和伏笔。人物要写各自的身份、想得到或守住的东西、秘密、说话习惯，以及害怕失去什么、怎样牵制主角和长期变化。设定库统一收录后面反复会用到的地点、物件、势力、制度、日常场景和能力边界。明确有修炼、境界或力量层次的题材，在设定的规则条目里写详细层次；其它题材把设定落在空间、生活、社会关系和异常边界上。伏笔写现在能看到的线索、以后会改变的判断或关系、揭开后会发生什么和仍未揭开的部分，notes留空，状态统一为未埋。
+
+{power_levels_guidance}
+
+这是预计写到{_creation_scale_requirements(total_words)[0]}的长篇，按故事需要补足资料，不要把简介换个说法重复输出，也不要为了凑数量添加无根名词。伏笔位置此时只写第几阶段，不写具体章号。{_creation_foreshadow_stage_guidance(total_words)}
+
+只返回一个合法 JSON 对象，不能有 Markdown 或解释：{{"c":[["姓名","身份和故事位置","当前目标","秘密","说话方式","害怕失去什么、怎样牵制主角以及长期变化"]],"l":[["名称","类型","具体内容","人物当前知道多少"]],"f":[["编号","名称","埋设阶段","回收阶段","读者能看到的线索及后续变化","揭开后会改变什么","仍未揭开的部分"]]}}。只输出 c、l、f，不要重复输出 b 或 w。人物、设定和伏笔数量要达到长篇规模要求。{("高武、玄幻、仙侠、修真、武道题材的 l 中必须包含一条按从低到高排列的实力体系条目；它要使用 l 的四个原有位置写完整境界内容，每个境界一到两句话。" if power_levels_guidance else "")}"""
+            prompt += """
+
+补充方向：让人物、设定和伏笔都能在后续场景中落地。伏笔的阶段位置表示它如何进入人物生活、如何在行动和关系变化中逐步显出意义；先写线索和当下理解，再写后续变化，不把最终解释写成一开始就确定的结论。"""
+        elif self.creation_batch == "stage_skeleton":
+            prompt = f"""{COMMON_CREATION_RULES}
+
+读取作者选定的故事和完整故事底盘，在正式生成十万字阶段规划前，先建立一份简短的全书阶段骨架。它只负责固定每个阶段的主线变化、关键转折和阶段结束状态，不写章节细纲，不写事件数组，不安排具体伏笔章位，也不重复小说圣经、世界规则和人物设定。阶段数量和章节范围完全按照作者输入；每个阶段写一条清楚的主线变化、两到四个关键转折和一条结束状态，内容要能让后面的阶段规划沿着同一条故事发展，避免阶段之间方向漂移。
+
+只返回一个合法 JSON 对象：{{"g":[["S01","阶段名称","这一阶段的主线变化",["关键转折一","关键转折二"],"阶段结束时的人物和局势"]]}}。g 必须按 S01、S02、S03 的顺序覆盖全书所有阶段，每项固定五个位置；不要返回章节事件、伏笔内容、代码、Markdown 或其它字段。"""
+        elif self.creation_batch == "stage_plan_stage":
+            current_stage = self.creation_context.get("current_stage", {})
+            stage_number = current_stage.get("number", self.stage_index + 1) if isinstance(current_stage, dict) else self.stage_index + 1
+            start_chapter = current_stage.get("start_chapter", "") if isinstance(current_stage, dict) else ""
+            end_chapter = current_stage.get("end_chapter", "") if isinstance(current_stage, dict) else ""
+            target_stage_words = current_stage.get("target_words", 100000) if isinstance(current_stage, dict) else 100000
+            total_stages = current_stage.get("total_stages", "") if isinstance(current_stage, dict) else ""
+            first_stage = self.stage_index == 0
+            genre_text = " ".join(
+                str(value or "")
+                for value in (
+                    author_input.get("genre", "") if isinstance(author_input, dict) else "",
+                    self.creation_context.get("selected_premise", {}).get("genre", "")
+                    if isinstance(self.creation_context.get("selected_premise", {}), dict)
+                    else "",
+                )
+            )
+            subject_guidance = ""
+            if story_requires_explicit_power_levels(genre_text):
+                subject_guidance = (
+                    "本题材是高武或武道宗门故事，阶段推进优先落在宗门经营、上门挑战、战斗试探、资源争夺、修炼比试、"
+                    "人物争执和当场选择上；世界规则和制度只有在人物正在争取、对抗或付出代价时进入场景，"
+                    "连续事件要主动更换推进方式。"
+                )
+            prompt = f"""{COMMON_CREATION_RULES}
+
+读取作者选定的故事、完整故事底盘、全书阶段骨架和已经完成的前面阶段，只生成当前第{stage_number}/{total_stages or '?'}阶段，范围为第{start_chapter}章到第{end_chapter}章。全书阶段骨架是阶段方向锚点，当前阶段要落实它的主线变化和结束状态；前面阶段的结束状态、带入内容和仍在推动人物的问题是连续性依据。当前阶段沿着这些事实继续发生新的场景，前后阶段各自保持清晰的重点。阶段规划使用结构化表达，写清人物、局势、事件顺序、前置条件、直接结果和状态变化，让每个字段都服务于后续章节执行。
+
+输入资料中的 current_foreshadow_endpoints 是本阶段自然发生的暗线端点清单。每一项落到一个当前事件中；kind=setup 写线索怎样进入人物生活，kind=payoff 写线索怎样在现场改变人物选择、关系或局势。清单为空时，场景仍然沿着人物和主线自然推进。承载端点的事件 references 加入“F编号/setup”或“F编号/payoff”，让程序可以把端点和事件稳定对应起来。
+
+阶段内的事件以场景为核心：具体时间地点、在场人物、当下压力、动作、阻力、选择、情绪或关系变化和直接后果要在 h 中自然连成一段。相邻事件更换推进机制，让人物行动、空间变化、生活压力、关系碰撞、异常介入和线索变化共同推动故事。除非题材本身就是办案、破案或调查推理，不要让案卷化或程序化内容成为事件主线；连续两个事件不能都靠解释、谈话、规则说明或口头结论推进，必须让人物在场面中做出动作并承担后果。伏笔只在实际发生的阶段返回，一次只返回一个当前端点；f中的每项写 i、k、e、d，其中 k 为 setup 或 payoff，e 是承载它的事件编号，d 是这一次在场景中发生的具体变化。程序会依据事件范围落下具体章号。{("同时返回全书长期事实 k。" if first_stage else "本阶段沿用前面已经确认的长期事实。")}
+
+{subject_guidance}
+
+{STAGE_PLAN_OBJECT_OUTPUT_RULES}
+"""
+        if self.creation_step == "stage_plan":
+            prompt = _compact_stage_plan_prompt(prompt)
+        prompt += (
+            "\n\n最终只返回紧凑合法 JSON：不使用 Markdown、缩进、空行或多余空格；"
+            "可省略空字符串、空数组和没有内容的可选字段，但不得删减任何有意义的事实或资料数量。"
+        )
+        return prompt
 
     def _analysis_progress_label(self):
-        return "新建向导"
+        if self.creation_batch == "stage_skeleton":
+            return "全书阶段骨架"
+        if self.creation_batch == "stage_plan_stage":
+            return f"第{self.stage_index + 1}阶段"
+        if self.creation_batch == "bible_core":
+            return "小说圣经、世界规则"
+        if self.creation_batch == "bible_assets":
+            return "人物、设定、伏笔"
+        if self.creation_step == "premise":
+            return "5个故事方向"
+        return "当前步骤"
+
+    def _max_tokens_for_request(self):
+        if self.creation_batch == "stage_skeleton":
+            return 8000
+        if self.creation_batch == "bible_core":
+            return 16000
+        if self.creation_batch == "bible_assets":
+            return 22000
+        if self.creation_batch == "stage_plan_stage":
+            return 16000
+        return {
+            "premise": 12000,
+            "bible": 50000,
+            "story_assets": 12000,
+            "stage_plan": 36000,
+        }.get(self.creation_step, 8000)
+
+    def _analysis_retry_progress_text(self, error, label, total, wait_seconds, next_attempt, attempts):
+        if self._is_stream_read_failure(error):
+            return f"第 {label}/{total} 块流式响应中途断开，{wait_seconds} 秒后自动重试 {next_attempt}/{attempts}..."
+        return super()._analysis_retry_progress_text(
+            error, label, total, wait_seconds, next_attempt, attempts
+        )
 
     def _chunk_user_text(self, chunk_text, chunk_index, total_chunks):
         return format_creation_context(self.creation_context)
@@ -613,7 +4522,22 @@ class NovelCreationWorker(NovelAnalysisWorker):
     def _allow_retry_chunk_split(self):
         return False
 
+    def _generation_progress_text(self, total_words):
+        if self.creation_step == "premise":
+            return "正在生成：5个故事方向"
+        if self.creation_batch == "stage_skeleton":
+            return "正在生成：全书阶段骨架"
+        if self.creation_batch == "bible_core":
+            return "正在生成：小说圣经、世界规则"
+        if self.creation_batch == "bible_assets":
+            return "正在生成：人物、设定、伏笔"
+        if self.creation_batch == "stage_plan_stage":
+            total_stages = _expected_stage_count(total_words)
+            return f"正在生成：第{self.stage_index + 1}阶段（共{total_stages}个阶段）"
+        return f"正在生成：{dict(CREATION_WIZARD_STEPS).get(self.creation_step, self.creation_step)}"
+
     def run(self):
+        started = self._start_analysis_diagnostics()
         try:
             if not self.base_url:
                 raise Exception("请先选择厂商。")
@@ -623,7 +4547,19 @@ class NovelCreationWorker(NovelAnalysisWorker):
                 raise Exception("请选择模型。")
             if self.creation_step not in dict(CREATION_WIZARD_STEPS):
                 raise Exception("未知的新建向导步骤。")
-            self.progress.emit(f"正在生成：{dict(CREATION_WIZARD_STEPS).get(self.creation_step, self.creation_step)}")
+            author_input = self.creation_context.get("author_input", {})
+            try:
+                total_words = max(
+                    1,
+                    int(
+                        author_input.get("total_words", 500000)
+                        if isinstance(author_input, dict)
+                        else 500000
+                    ),
+                )
+            except (TypeError, ValueError):
+                total_words = 500000
+            self.progress.emit(self._generation_progress_text(total_words))
             parsed, _response_format = self._analyze_chunk_with_retries(
                 self._analysis_prompt(),
                 self._chunk_user_text(self.text, 1, 1),
@@ -632,33 +4568,417 @@ class NovelCreationWorker(NovelAnalysisWorker):
                 True,
             )
             if self._stop_requested or self.isInterruptionRequested():
+                self._finalize_analysis_diagnostics("stopped", started)
                 return
-            normalized = normalize_creation_result(self.creation_step, parsed)
+            normalized = normalize_creation_result(
+                self.creation_step,
+                parsed,
+                allow_power_levels=story_requires_explicit_power_levels(
+                    self.creation_context.get("author_input", {}),
+                    self.creation_context.get("selected_premise", {}),
+                ),
+                pad_stage_plan=self.creation_batch != "stage_plan_stage",
+                total_words=(
+                    author_input.get("total_words", 500000)
+                    if isinstance(author_input, dict) else 500000
+                ),
+                average_chapter_words=(
+                    author_input.get("average_chapter_words", 3000)
+                    if isinstance(author_input, dict) else 3000
+                ),
+            )
+            self._finalize_analysis_diagnostics("success", started)
             self.result_ready.emit(normalized)
         except Exception as exc:
             if not self._stop_requested and not self.isInterruptionRequested():
+                self._finalize_analysis_diagnostics("error", started, exc)
                 self.failed.emit(str(exc))
+            else:
+                self._finalize_analysis_diagnostics("stopped", started)
         finally:
             self._close_active_network_handles()
 
 
-class NovelCreationWizardDialog(QDialog):
-    """新建小说项目的四步确认向导。"""
+class CreationChoicePickerDialog(QDialog):
+    """弹出式偏好选择器，避免把大量分类长期铺在向导首屏。"""
 
-    def __init__(self, ai_selection, project_name_hint="", parent=None):
+    def __init__(self, title, groups, current_value="", max_selections=1, parent=None):
         super().__init__(parent)
+        self.setWindowTitle(f"选择{title}")
+        _fit_dialog_to_screen(
+            self,
+            width_ratio=0.56,
+            height_ratio=0.66,
+            minimum_width=460,
+            minimum_height=330,
+            maximum_width=900,
+            maximum_height=720,
+        )
+        self.max_selections = max(1, int(max_selections or 1))
+        self.selected_value = ""
+        self.selected_values = []
+        self._selection_label = None
+        self._build_ui(groups if isinstance(groups, dict) else {}, current_value)
+
+    def _build_ui(self, groups, current_value):
+        root = QVBoxLayout(self)
+        root.setContentsMargins(14, 14, 14, 14)
+        root.setSpacing(8)
+        if self.max_selections > 1:
+            hint_text = (
+                f"可选择 1—{self.max_selections} 项；选满 {self.max_selections} 项后自动确认，"
+                "只选一项时请点击“确认”。分类较多时可以在窗口内滚动查看。"
+            )
+        else:
+            hint_text = "选择一项即可返回向导；分类较多时可以在窗口内滚动查看。"
+        hint = QLabel(hint_text)
+        hint.setStyleSheet("color: #9da3ad;")
+        hint.setWordWrap(True)
+        root.addWidget(hint)
+
+        current_values = self._split_values(current_value)
+        self.selected_values = current_values[: self.max_selections]
+        if self.max_selections > 1:
+            self._selection_label = QLabel()
+            self._selection_label.setStyleSheet("color: #86b6df;")
+            root.addWidget(self._selection_label)
+            self._refresh_selection_label()
+
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.NoFrame)
+        content = QWidget()
+        layout = QVBoxLayout(content)
+        layout.setContentsMargins(2, 2, 8, 2)
+        layout.setSpacing(12)
+        seen_options = set()
+        for group_title, options in groups.items():
+            title = QLabel(str(group_title))
+            title.setStyleSheet("font-size: 13px; font-weight: 600; color: #e3e6eb;")
+            layout.addWidget(title)
+            grid = QGridLayout()
+            grid.setContentsMargins(0, 0, 0, 0)
+            grid.setHorizontalSpacing(7)
+            grid.setVerticalSpacing(7)
+            display_index = 0
+            for option in options if isinstance(options, (list, tuple)) else ():
+                option = str(option)
+                if option in seen_options:
+                    continue
+                seen_options.add(option)
+                button = QPushButton(option)
+                button.setCheckable(True)
+                button.setMinimumHeight(40)
+                button.setCursor(Qt.PointingHandCursor)
+                button.setStyleSheet(
+                    """
+                    QPushButton {
+                        color: #d9dde4;
+                        background: #22252b;
+                        border: 1px solid #3a3f49;
+                        border-radius: 5px;
+                        padding: 7px 10px;
+                        text-align: left;
+                    }
+                    QPushButton:hover {
+                        background: #2b3038;
+                        border-color: #687488;
+                    }
+                    QPushButton:checked {
+                        color: #ffffff;
+                        background: #315d86;
+                        border-color: #6da4d8;
+                    }
+                    """
+                )
+                if option in self.selected_values:
+                    button.setChecked(True)
+                if self.max_selections > 1:
+                    button.clicked.connect(
+                        lambda checked=False, value=option, choice_button=button: self._toggle(
+                            value, checked, choice_button
+                        )
+                    )
+                else:
+                    button.clicked.connect(
+                        lambda _checked=False, value=option: self._select(value)
+                    )
+                row, column = divmod(display_index, 3)
+                grid.addWidget(button, row, column)
+                display_index += 1
+            for column in range(3):
+                grid.setColumnStretch(column, 1)
+            layout.addLayout(grid)
+        layout.addStretch(1)
+        scroll.setWidget(content)
+        root.addWidget(scroll, 1)
+
+        button_flags = QDialogButtonBox.Cancel
+        if self.max_selections > 1:
+            button_flags |= QDialogButtonBox.Ok
+        buttons = QDialogButtonBox(button_flags)
+        if self.max_selections > 1:
+            buttons.button(QDialogButtonBox.Ok).setText("确认")
+            buttons.accepted.connect(self._accept_multiple)
+        buttons.rejected.connect(self.reject)
+        root.addWidget(buttons)
+
+    @staticmethod
+    def _split_values(value):
+        values = []
+        for item in re.split(r"[、,，]", str(value or "")):
+            item = item.strip()
+            if item and item not in values:
+                values.append(item)
+        return values
+
+    def _refresh_selection_label(self):
+        if self._selection_label is not None:
+            selected = "、".join(self.selected_values) or "未选择"
+            self._selection_label.setText(
+                f"已选 {len(self.selected_values)}/{self.max_selections}：{selected}"
+            )
+
+    def _toggle(self, value, checked, button):
+        value = str(value or "").strip()
+        if not value:
+            return
+        if checked:
+            if value in self.selected_values:
+                return
+            if len(self.selected_values) >= self.max_selections:
+                button.setChecked(False)
+                return
+            self.selected_values.append(value)
+        else:
+            self.selected_values = [item for item in self.selected_values if item != value]
+        self._refresh_selection_label()
+        if len(self.selected_values) >= self.max_selections:
+            self.selected_value = "、".join(self.selected_values[: self.max_selections])
+            self.accept()
+
+    def _accept_multiple(self):
+        self.selected_value = "、".join(self.selected_values)
+        self.accept()
+
+    def _select(self, value):
+        self.selected_value = str(value or "").strip()
+        self.selected_values = [self.selected_value] if self.selected_value else []
+        if self.selected_value:
+            self.accept()
+
+
+class CreationSectionedPreview(QWidget):
+    """第三步的五类资料预览，按主程序栏目分开显示。"""
+
+    _SECTION_SPECS = (
+        "bible",
+        "world_rules",
+        "characters",
+        "lore",
+        "foreshadows",
+    )
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.title_labels = {}
+        self.editors = {}
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(0, 0, 0, 0)
+        root.setSpacing(0)
+
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+
+        content = QWidget()
+        content_layout = QVBoxLayout(content)
+        content_layout.setContentsMargins(2, 2, 8, 8)
+        content_layout.setSpacing(10)
+
+        for key in self._SECTION_SPECS:
+            title = _format_bible_sections({})[key][0]
+            section = QFrame()
+            section.setObjectName("creation_preview_section")
+            section.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
+            section.setStyleSheet(
+                """
+                QFrame#creation_preview_section {
+                    background: #171a1f;
+                    border: 1px solid #363c47;
+                    border-radius: 5px;
+                }
+                QLabel#creation_preview_section_title {
+                    color: #f0f2f5;
+                    font-size: 14px;
+                    font-weight: 600;
+                }
+                QPlainTextEdit#creation_preview_section_editor {
+                    color: #d9dde4;
+                    background: #111317;
+                    border: 0;
+                    border-top: 1px solid #2b3039;
+                    padding: 8px;
+                }
+                """
+            )
+            section_layout = QVBoxLayout(section)
+            section_layout.setContentsMargins(12, 10, 12, 10)
+            section_layout.setSpacing(8)
+
+            title_label = QLabel(title)
+            title_label.setObjectName("creation_preview_section_title")
+            section_layout.addWidget(title_label)
+
+            editor = QPlainTextEdit()
+            editor.setObjectName("creation_preview_section_editor")
+            editor.setReadOnly(True)
+            editor.setLineWrapMode(QPlainTextEdit.WidgetWidth)
+            editor.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
+            editor.setMinimumHeight(96)
+            editor.setPlaceholderText("生成后会在这里显示。")
+            section_layout.addWidget(editor)
+
+            self.title_labels[key] = title_label
+            self.editors[key] = editor
+            content_layout.addWidget(section)
+
+        content_layout.addStretch(1)
+        scroll.setWidget(content)
+        root.addWidget(scroll)
+        self.clear()
+
+    def _update_editor_heights(self):
+        available_height = max(0, int(self.height()))
+        if available_height <= 0:
+            return
+        base_height = max(112, min(320, int(available_height * 0.30)))
+        compact_height = max(96, int(base_height * 0.86))
+        for key in ("bible", "world_rules"):
+            editor = self.editors.get(key)
+            if editor is not None:
+                editor.setMinimumHeight(compact_height)
+        for key in ("characters", "lore", "foreshadows"):
+            editor = self.editors.get(key)
+            if editor is not None:
+                editor.setMinimumHeight(base_height)
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._update_editor_heights()
+
+    def set_result(self, result):
+        sections = _format_bible_sections(result)
+        result = result if isinstance(result, dict) else {}
+        for key in self._SECTION_SPECS:
+            title, body = sections[key]
+            value = result.get(key)
+            if key in {"characters", "lore", "foreshadows"}:
+                count = len(value) if isinstance(value, list) else 0
+                title = f"{title}（{count}）"
+            self.title_labels[key].setText(title)
+            self.editors[key].setPlainText(body)
+
+    def clear(self):
+        empty = {
+            key: []
+            for key in self._SECTION_SPECS
+            if key in {"characters", "lore", "foreshadows"}
+        }
+        empty.update({"bible": {}, "world_rules": {}})
+        self.set_result(empty)
+
+
+class NovelCreationWizardDialog(QDialog):
+    """新建小说项目的三步确认向导。"""
+
+    draft_saved = Signal(str)
+
+    def __init__(self, ai_selection, project_name_hint="", parent=None, draft_id=""):
+        super().__init__(parent)
+        # macOS keeps the minimize control disabled for a child QDialog even
+        # when WindowMinimizeButtonHint is present. Treat the wizard as an
+        # independent top-level window so it can be minimized while its worker
+        # continues running; the QDialog API is still used for accept/reject.
+        window_flags = self.windowFlags()
+        window_flags &= ~Qt.Dialog
+        window_flags |= (
+            Qt.Window
+            | Qt.WindowTitleHint
+            | Qt.WindowSystemMenuHint
+            | Qt.WindowMinimizeButtonHint
+            | Qt.WindowCloseButtonHint
+        )
+        self.setWindowFlags(window_flags)
         self.setWindowTitle("新建小说：AI 创作框架向导")
-        self.setMinimumSize(980, 720)
-        self.resize(1120, 820)
+        _fit_dialog_to_screen(
+            self,
+            width_ratio=0.88,
+            height_ratio=0.86,
+            minimum_width=720,
+            minimum_height=520,
+            maximum_width=1600,
+            maximum_height=1080,
+        )
         self.ai_selection = ai_selection if callable(ai_selection) else (lambda: (None, "", "请选择模型。"))
         self.project_name_hint = _as_text(project_name_hint)
+        self.draft_id = _as_text(draft_id) or _new_creation_wizard_draft_id()
+        self.created_at = ""
+        self.created_at_ns = 0
         self.worker = None
+        self._active_batch_kind = ""
+        self._active_stage_index = -1
+        self._pending_batch_kind = ""
+        self._pending_stage_index = -1
+        self._generation_failed = False
         self.current_step_index = 0
         self.step_results = {}
         self.premise_candidates = []
         self.premise_selected_index = 0
         self._premise_loading_index = -1
+        self.choice_values = {}
+        self.choice_summary_buttons = {}
+        self.choice_arrow_buttons = {}
+        self.choice_widgets = []
+        self.json_editors = {}
+        self.json_generate_buttons = {}
+        self._status_text = "先输入一点灵感，再点选你喜欢的故事方向。"
+        self._received_chars = 0
+        self._last_worker_error = ""
+        self._draft_restoring = True
+        self.target_words_spin = QSpinBox()
+        self.target_words_spin.setRange(10000, 3000000)
+        self.target_words_spin.setValue(500000)
+        self.average_words_spin = QSpinBox()
+        self.average_words_spin.setRange(1000, 20000)
+        self.average_words_spin.setValue(3000)
         self._build_ui()
+        self._connect_draft_signals()
+        self._draft_restoring = False
+        self._load_draft()
+
+    def _refit_to_screen(self):
+        if not self.isVisible():
+            return
+        _fit_dialog_to_screen(
+            self,
+            width_ratio=0.88,
+            height_ratio=0.82,
+            minimum_width=720,
+            minimum_height=520,
+            maximum_width=1600,
+            maximum_height=1080,
+        )
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        # The first layout pass can increase the dialog height after the
+        # constructor has positioned it. Refit after Qt has created the native
+        # window frame, then check once more after macOS finishes its layout.
+        QTimer.singleShot(0, self._refit_to_screen)
+        QTimer.singleShot(120, self._refit_to_screen)
 
     def _build_ui(self):
         root = QVBoxLayout(self)
@@ -668,8 +4988,11 @@ class NovelCreationWizardDialog(QDialog):
         self.step_label = QLabel()
         self.step_label.setStyleSheet("font-size: 16px; font-weight: bold;")
         header.addWidget(self.step_label, 1)
-        self.status_label = QLabel("先填写故事灵感，再点击“AI生成当前步骤”。")
+        self.status_label = QLabel(self._status_text)
+        self.status_label.setObjectName("novel_status_current")
         self.status_label.setWordWrap(True)
+        self.status_label.setMinimumHeight(32)
+        self.status_label.setMaximumHeight(52)
         header.addWidget(self.status_label, 2)
         root.addLayout(header)
 
@@ -687,99 +5010,852 @@ class NovelCreationWizardDialog(QDialog):
         self.next_btn.clicked.connect(self._go_next)
         self.cancel_btn.clicked.connect(self.reject)
         root.addWidget(buttons)
+        self._update_responsive_controls()
         self._refresh_step_ui()
+
+    def _connect_draft_signals(self):
+        self.inspiration_edit.textChanged.connect(self._save_draft)
+        self.target_words_spin.valueChanged.connect(self._on_generation_scope_changed)
+        self.average_words_spin.valueChanged.connect(self._on_generation_scope_changed)
+
+    def _draft_payload(self):
+        return {
+            "schema_version": 3,
+            "draft_id": self.draft_id,
+            "created_at": self.created_at or now_str(),
+            "created_at_ns": self.created_at_ns or time.time_ns(),
+            "project_name_hint": self.project_name_hint,
+            "current_step_index": self.current_step_index,
+            "choice_values": deepcopy(self.choice_values),
+            "inspiration": self.inspiration_edit.text(),
+            "target_words": self.target_words_spin.value(),
+            "average_words": self.average_words_spin.value(),
+            "premise_candidates": deepcopy(self.premise_candidates),
+            "premise_selected_index": self.premise_selected_index,
+            "step_results": deepcopy(self.step_results),
+            "updated_at": now_str(),
+        }
+
+    def _save_draft(self, *_args):
+        if getattr(self, "_draft_restoring", False):
+            return
+        try:
+            payload = self._draft_payload()
+            payload["updated_at"] = now_str()
+            save_creation_wizard_draft(payload)
+            self.draft_saved.emit(self.draft_id)
+        except Exception as exc:
+            # 草稿保存失败不能打断向导；正式生成结果仍保留在当前窗口中。
+            print("保存新建向导草稿失败：", exc)
+
+    def _invalidate_steps_from(self, step):
+        """前置资料变化后，清掉依赖它的结果，避免不同故事版本混用。"""
+        step_names = [name for name, _title in CREATION_WIZARD_STEPS]
+        try:
+            start_index = step_names.index(step)
+        except ValueError:
+            return
+        for name in step_names[start_index:]:
+            self.step_results.pop(name, None)
+            editor = self.json_editors.get(name)
+            if editor is not None:
+                editor.clear()
+
+    def _on_generation_scope_changed(self, *_args):
+        if not getattr(self, "_draft_restoring", False) and self.premise_candidates:
+            self._invalidate_steps_from("bible")
+        self._save_draft()
+
+    def _load_draft(self):
+        draft = load_creation_wizard_draft(self.draft_id)
+        if not isinstance(draft, dict):
+            draft = {}
+        self.created_at = _as_text(draft.get("created_at")) or now_str()
+        try:
+            self.created_at_ns = int(draft.get("created_at_ns", 0) or 0)
+        except (TypeError, ValueError):
+            self.created_at_ns = 0
+        self.project_name_hint = _as_text(
+            draft.get("project_name_hint")
+        ) or self.project_name_hint
+        self._draft_restoring = True
+        try:
+            saved_choices = draft.get("choice_values", {})
+            if not isinstance(saved_choices, dict):
+                saved_choices = {}
+            for key in CREATION_CHOICE_DEFAULTS:
+                value = _as_text(saved_choices.get(key))
+                if value:
+                    self._set_choice(key, value)
+
+            if "inspiration" in draft:
+                self.inspiration_edit.setText(_as_text(draft.get("inspiration")))
+
+            try:
+                self.target_words_spin.setValue(
+                    max(self.target_words_spin.minimum(), min(
+                        self.target_words_spin.maximum(),
+                        int(draft.get("target_words", self.target_words_spin.value()) or self.target_words_spin.value()),
+                    ))
+                )
+            except (TypeError, ValueError):
+                pass
+            try:
+                self.average_words_spin.setValue(
+                    max(self.average_words_spin.minimum(), min(
+                        self.average_words_spin.maximum(),
+                        int(draft.get("average_words", self.average_words_spin.value()) or self.average_words_spin.value()),
+                    ))
+                )
+            except (TypeError, ValueError):
+                pass
+            # 旧版草稿没有单独保存“单章字数”按钮；用已保存的数值补回显示，
+            # 这样旧草稿的阶段边界不会因为界面升级而悄悄改变。
+            saved_chapter_words = _as_text(saved_choices.get("chapter_words"))
+            if not saved_chapter_words:
+                self._set_choice("chapter_words", f"{self.average_words_spin.value()}字")
+            else:
+                try:
+                    saved_value = int(saved_chapter_words.replace("字", "").replace(",", "").strip())
+                except (TypeError, ValueError):
+                    saved_value = 0
+                if saved_value != self.average_words_spin.value():
+                    self._set_choice("chapter_words", f"{self.average_words_spin.value()}字")
+
+            candidates = draft.get("premise_candidates", [])
+            self.premise_candidates = [
+                deepcopy(item) for item in candidates if isinstance(item, dict)
+            ] if isinstance(candidates, list) else []
+            try:
+                self.premise_selected_index = max(
+                    0,
+                    min(
+                        int(draft.get("premise_selected_index", 0) or 0),
+                        max(0, len(self.premise_candidates) - 1),
+                    ),
+                )
+            except (TypeError, ValueError):
+                self.premise_selected_index = 0
+
+            saved_results = draft.get("step_results", {})
+            self.step_results = {}
+            legacy_assets = {}
+            allowed_steps = {name for name, _title in CREATION_WIZARD_STEPS}
+            if isinstance(saved_results, dict):
+                for step, result in saved_results.items():
+                    if step == "story_assets":
+                        legacy_assets = normalize_creation_result(
+                            "story_assets",
+                            result,
+                            allow_power_levels=self._allow_power_levels(),
+                        )
+                        continue
+                    if step not in allowed_steps:
+                        continue
+                    self.step_results[step] = self._normalize_step_result(step, result)
+            if legacy_assets:
+                bible_result = self.step_results.get("bible", {})
+                if not isinstance(bible_result, dict):
+                    bible_result = {}
+                for key in ("characters", "lore", "foreshadows"):
+                    if not bible_result.get(key) and legacy_assets.get(key):
+                        bible_result[key] = deepcopy(legacy_assets[key])
+                self.step_results["bible"] = self._normalize_step_result("bible", bible_result)
+            if self.premise_candidates:
+                self._populate_candidate_list()
+            else:
+                self._show_empty_candidate_list()
+
+            premise_result = self.step_results.get("premise")
+            if not premise_result and self.premise_candidates:
+                self.step_results["premise"] = {
+                    "candidates": deepcopy(self.premise_candidates),
+                    "selected_index": self.premise_selected_index,
+                }
+            elif isinstance(premise_result, dict):
+                premise_result["candidates"] = deepcopy(self.premise_candidates)
+                premise_result["selected_index"] = self.premise_selected_index
+
+            selected_premise = self._current_premise()
+            if selected_premise:
+                self.step_results.setdefault("premise", {})
+                self.step_results["premise"]["selected"] = deepcopy(selected_premise)
+
+            for step, _title in CREATION_WIZARD_STEPS[1:]:
+                result = self.step_results.get(step)
+                if result:
+                    if step == "stage_plan":
+                        # A previous run may have advanced the counter after a
+                        # valid JSON shell was returned. Recalculate progress
+                        # from the actual stage events while restoring.
+                        self._sync_stage_generation_state(result)
+                    self._set_preview_result(step, result)
+
+            try:
+                saved_step_index = max(
+                    0,
+                    min(
+                        int(draft.get("current_step_index", 0) or 0),
+                        len(CREATION_WIZARD_STEPS) - 1,
+                    ),
+                )
+            except (TypeError, ValueError):
+                saved_step_index = 0
+            # 旧版向导的步骤顺序不同。恢复时以已经存在的结果为准，
+            # 避免把旧的阶段规划当成当前故事底盘。
+            if self.premise_candidates and saved_step_index > 0:
+                if "bible" not in self.step_results:
+                    saved_step_index = 1
+                elif _as_text(self._generation_state("bible").get("status")).lower() == "partial":
+                    saved_step_index = 1
+                elif "stage_plan" not in self.step_results:
+                    saved_step_index = 2
+                elif _as_text(self._generation_state("stage_plan").get("status")).lower() == "partial":
+                    saved_step_index = 2
+                else:
+                    saved_step_index = min(saved_step_index, len(CREATION_WIZARD_STEPS) - 1)
+            self.current_step_index = saved_step_index
+            self._refresh_step_ui()
+        finally:
+            self._draft_restoring = False
+
+    def _populate_candidate_list(self):
+        target_index = max(
+            0,
+            min(self.premise_selected_index, len(self.premise_candidates) - 1),
+        )
+        self.premise_selected_index = target_index
+        self.candidate_list.blockSignals(True)
+        try:
+            self.candidate_list.clear()
+            for index, item in enumerate(self.premise_candidates, 1):
+                text = _as_text(item.get("title")) or f"方向 {index}"
+                self.candidate_list.addItem(QListWidgetItem(text))
+            if self.premise_candidates:
+                self.candidate_list.setCurrentRow(target_index)
+        finally:
+            self.candidate_list.blockSignals(False)
+        if self.premise_candidates:
+            self._load_candidate(target_index)
+            self.premise_result_frame.setVisible(True)
+
+    def _clear_candidate_preview(self):
+        self.candidate_title_label.clear()
+        self.candidate_meta_label.clear()
+        self.candidate_hook_label.clear()
+        self.candidate_synopsis_preview.clear()
+
+    def _show_empty_candidate_list(self, message="故事列表"):
+        self.candidate_list.clear()
+        placeholder = QListWidgetItem(message)
+        placeholder.setFlags(Qt.NoItemFlags)
+        self.candidate_list.addItem(placeholder)
+        self._clear_candidate_preview()
+
+    def clear_draft(self):
+        delete_creation_wizard_draft(self.draft_id)
 
     def _add_page_header(self, layout, text):
         label = QLabel(text)
         label.setWordWrap(True)
-        label.setStyleSheet("color: #555; padding: 4px 0;")
+        label.setStyleSheet("color: #9da3ad; padding: 2px 0 8px;")
         layout.addWidget(label)
+
+    def _selected_choice(self, key):
+        return str(self.choice_values.get(key, "") or "").strip()
+
+    def _allow_power_levels(self):
+        premise = self._current_premise()
+        return story_requires_explicit_power_levels(
+            self._selected_choice("genre"),
+            premise.get("genre", "") if isinstance(premise, dict) else "",
+            premise.get("synopsis", "") if isinstance(premise, dict) else "",
+            premise.get("main_line", "") if isinstance(premise, dict) else "",
+        )
+
+    def _normalize_step_result(self, step, payload):
+        payload = payload if isinstance(payload, dict) else {}
+        generation_state = deepcopy(payload.get("_generation_state", {}))
+        is_partial_stage = (
+            step == "stage_plan"
+            and isinstance(generation_state, dict)
+            and _as_text(generation_state.get("status")).lower() == "partial"
+        )
+        result = normalize_creation_result(
+            step,
+            payload,
+            allow_power_levels=self._allow_power_levels() if step in {"bible", "story_assets"} else False,
+            pad_stage_plan=not is_partial_stage,
+            foreshadow_stage_count=(
+                _expected_stage_count(self.target_words_spin.value())
+                if step == "bible" else None
+            ),
+            total_words=self.target_words_spin.value(),
+            average_chapter_words=self.average_words_spin.value(),
+        )
+        # AI 返回的阶段范围可能沿用了默认篇幅；向导的用户选择才是最终边界。
+        if step == "stage_plan" and isinstance(result, dict):
+            total_chapters = _creation_total_chapters(
+                self.target_words_spin.value(),
+                self.average_words_spin.value(),
+            )
+            result["stage_plan"] = normalize_stage_plan_ranges(
+                result.get("stage_plan", []),
+                self.target_words_spin.value(),
+                self.average_words_spin.value(),
+                expected_count=(
+                    len(result.get("stage_plan", []))
+                    if is_partial_stage else None
+                ),
+                pad_missing=not is_partial_stage,
+            )
+            result["foreshadow_schedule"] = _normalize_foreshadow_schedule(
+                result.get("foreshadow_schedule", []),
+                total_chapters,
+            )
+        if generation_state:
+            result["_generation_state"] = generation_state
+        return result
+
+    def _generation_state(self, step):
+        result = self.step_results.get(step, {})
+        if not isinstance(result, dict):
+            return {}
+        state = result.get("_generation_state", {})
+        return deepcopy(state) if isinstance(state, dict) else {}
+
+    def _canonicalize_stage_schedule(self, result, strict=False):
+        """Rebuild the stage schedule from the second-step foreshadow baseline."""
+        if not isinstance(result, dict):
+            return [], []
+        bible_result = self.step_results.get("bible", {})
+        foreshadows = (
+            bible_result.get("foreshadows", [])
+            if isinstance(bible_result, dict) else []
+        )
+        if not isinstance(foreshadows, list) or not foreshadows:
+            return [], []
+        specs = self._stage_specs()
+        total_chapters = _creation_total_chapters(
+            self.target_words_spin.value(),
+            self.average_words_spin.value(),
+        )
+        derived_rows = []
+        for position, stage in enumerate(
+            result.get("stage_plan", [])
+            if isinstance(result.get("stage_plan", []), list) else []
+        ):
+            if not isinstance(stage, dict):
+                continue
+            stage_index = _creation_stage_index(stage.get("id"))
+            if stage_index < 0:
+                stage_index = position
+            derived_rows.extend(
+                _derive_stage_endpoint_rows(
+                    {
+                        "stage_plan": [stage],
+                        "foreshadow_schedule": [],
+                    },
+                    stage_index,
+                    specs,
+                    foreshadows,
+                    total_chapters,
+                )
+            )
+        schedule_input = []
+        schedule_input.extend(
+            result.get("foreshadow_schedule", [])
+            if isinstance(result.get("foreshadow_schedule", []), list) else []
+        )
+        schedule_input.extend(derived_rows)
+        schedule, notes, errors = _canonicalize_foreshadow_schedule(
+            foreshadows,
+            schedule_input,
+            specs,
+            total_chapters,
+            strict=strict,
+        )
+        result["foreshadow_schedule"] = schedule
+        for note in notes:
+            result["chapter_plan_note"] = _append_note(
+                _clean_chapter_plan_note(result.get("chapter_plan_note", "")),
+                note,
+            )
+        if errors and strict:
+            raise ValueError("阶段规划返回了不属于当前伏笔阶段的章位：" + "；".join(errors[:6]))
+        return schedule, errors
+
+    def _sync_stage_generation_state(self, result):
+        """Rebuild stage progress from saved content, never from a stale counter."""
+        if not isinstance(result, dict):
+            return None
+        specs = self._stage_specs()
+        skeleton = _normalize_stage_skeleton(
+            result.get("stage_skeleton", []),
+            self.target_words_spin.value(),
+            self.average_words_spin.value(),
+        )
+        if skeleton:
+            result["stage_skeleton"] = skeleton
+        skeleton_complete = len(skeleton) == len(specs)
+        self._canonicalize_stage_schedule(result, strict=False)
+        first_missing, _by_index = _stage_plan_progress(
+            result.get("stage_plan", []),
+            len(specs),
+        )
+        foreshadow_missing = _stage_foreshadow_shortfalls(
+            self.step_results.get("bible", {}).get("foreshadows", [])
+            if isinstance(self.step_results.get("bible", {}), dict) else [],
+            result.get("foreshadow_schedule", []),
+            specs,
+            _creation_total_chapters(
+                self.target_words_spin.value(),
+                self.average_words_spin.value(),
+            ),
+        )
+        first_missing_endpoint = min(
+            (
+                item.get("stage_index", len(specs))
+                for item in foreshadow_missing
+                if isinstance(item, dict)
+            ),
+            default=None,
+        )
+        if first_missing is None:
+            first_missing = first_missing_endpoint
+        elif first_missing_endpoint is not None:
+            first_missing = min(first_missing, first_missing_endpoint)
+        # Existing completed projects may predate the compact skeleton. Keep
+        # their already complete stage plan usable; new generation runs still
+        # request a skeleton before the first stage batch.
+        complete = first_missing is None
+        result["_generation_state"] = {
+            "schema_version": 1,
+            "status": "complete" if complete else "partial",
+            "skeleton_complete": skeleton_complete,
+            "next_stage_index": len(specs) if complete else first_missing,
+            "stage_count": len(specs),
+            "missing_foreshadow_endpoints": [
+                {
+                    "stage_index": item.get("stage_index"),
+                    "kind": item.get("kind"),
+                    "code": item.get("code"),
+                    "name": item.get("name", ""),
+                }
+                for item in foreshadow_missing
+            ],
+            "updated_at": now_str(),
+        }
+        # Endpoint warnings describe an incomplete intermediate merge.  Once
+        # every stage and every endpoint is present, a later retry or a stale
+        # legacy row must not leave an obsolete warning in the completed draft.
+        if complete:
+            result["foreshadow_endpoint_warnings"] = []
+        return first_missing
+
+    def _merge_stage_skeleton(self, result):
+        """Save the compact whole-book anchor before any stage batch runs."""
+        skeleton = _normalize_stage_skeleton(
+            result.get("stage_skeleton", []) if isinstance(result, dict) else [],
+            self.target_words_spin.value(),
+            self.average_words_spin.value(),
+        )
+        specs = self._stage_specs()
+        if len(skeleton) != len(specs):
+            raise ValueError(
+                f"全书阶段骨架没有覆盖全部阶段：收到{len(skeleton)}个，需要{len(specs)}个。"
+            )
+        current = deepcopy(self.step_results.get("stage_plan", {}))
+        if not isinstance(current, dict):
+            current = {}
+        current["stage_skeleton"] = skeleton
+        current.setdefault("stage_plan", [])
+        current["_generation_state"] = {
+            "schema_version": 1,
+            "status": "partial",
+            "skeleton_complete": True,
+            "next_stage_index": 0,
+            "stage_count": len(specs),
+            "missing_foreshadow_endpoints": [],
+            "updated_at": now_str(),
+        }
+        self.step_results["stage_plan"] = current
+
+    def _stage_specs(self):
+        return _creation_stage_batch_specs(
+            self.target_words_spin.value(),
+            self.average_words_spin.value(),
+        )
+
+    def _next_generation_batch(self, step):
+        state = self._generation_state(step)
+        if step == "premise":
+            return "premise", -1
+        if step == "bible":
+            if not state:
+                return "bible_core", -1
+            if _as_text(state.get("status")).lower() == "complete":
+                result = self.step_results.get("bible", {})
+                if isinstance(result, dict) and _creation_scale_shortfalls(
+                    result,
+                    self.target_words_spin.value(),
+                ):
+                    return "bible_assets", -1
+                return "bible_core", -1
+            completed = state.get("completed_batches", [])
+            if "bible_core" not in completed:
+                return "bible_core", -1
+            return "bible_assets", -1
+        if step == "stage_plan":
+            specs = self._stage_specs()
+            result = self.step_results.get("stage_plan", {})
+            if isinstance(result, dict):
+                self._sync_stage_generation_state(result)
+                state = self._generation_state(step)
+                if not result.get("stage_skeleton"):
+                    return "stage_skeleton", -1
+                if _as_text(state.get("status")).lower() == "partial":
+                    next_index = int(state.get("next_stage_index", 0) or 0)
+                    return "stage_plan_stage", min(next_index, max(0, len(specs) - 1))
+            first_missing, _by_index = _stage_plan_progress(
+                result.get("stage_plan", []) if isinstance(result, dict) else [],
+                len(specs),
+            )
+            if first_missing is None:
+                return "stage_plan_stage", 0
+            return "stage_plan_stage", min(first_missing, max(0, len(specs) - 1))
+        return "", -1
+
+    def _set_choice(self, key, value):
+        value = str(value or "").strip()
+        if key == "theme":
+            theme_values = []
+            for item in re.split(r"[、,，]", value):
+                item = item.strip()
+                if item and item not in theme_values:
+                    theme_values.append(item)
+            value = "、".join(theme_values[:2])
+        elif not value:
+            return
+        previous = self._selected_choice(key)
+        self.choice_values[key] = value
+        button = self.choice_summary_buttons.get(key)
+        if button is not None:
+            button.setText(value or "点击选择")
+        arrows = self.choice_arrow_buttons.get(key, ())
+        if arrows:
+            if key == "theme":
+                tooltip = f"{CREATION_CHOICE_TITLES.get(key, key)}：打开多选窗口"
+                arrows[0].setToolTip(tooltip)
+                arrows[1].setToolTip(tooltip)
+            else:
+                arrows[0].setToolTip(f"{CREATION_CHOICE_TITLES.get(key, key)}：上一个选项")
+                arrows[1].setToolTip(f"{CREATION_CHOICE_TITLES.get(key, key)}：下一个选项")
+        if previous and previous != value and self.premise_candidates:
+            self._invalidate_steps_from("stage_plan")
+        self._on_choice_changed(key)
+        self._save_draft()
+
+    @staticmethod
+    def _choice_options(key):
+        groups = CREATION_CHOICE_GROUPS.get(key, {})
+        options = []
+        seen = set()
+        for values in groups.values():
+            if isinstance(values, (list, tuple)):
+                for value in values:
+                    value = str(value)
+                    if value not in seen:
+                        seen.add(value)
+                        options.append(value)
+        return options
+
+    def _step_choice(self, key, delta):
+        if key == "theme":
+            self._open_choice_picker(key)
+            return
+        options = self._choice_options(key)
+        if not options:
+            return
+        current = self._selected_choice(key)
+        try:
+            index = options.index(current)
+        except ValueError:
+            index = 0
+        next_index = (index + int(delta)) % len(options)
+        self._set_choice(key, options[next_index])
+
+    def _add_choice_selector(self, grid, key, row_index, column_index):
+        cell = QFrame()
+        cell.setFrameShape(QFrame.StyledPanel)
+        cell.setStyleSheet(
+            "QFrame { background: #1b1d22; border: 1px solid #363b45; border-radius: 5px; }"
+        )
+        cell_layout = QHBoxLayout(cell)
+        cell_layout.setContentsMargins(8, 6, 8, 6)
+        cell_layout.setSpacing(6)
+        title = QLabel(CREATION_CHOICE_TITLES.get(key, key))
+        title.setMinimumWidth(66)
+        title.setStyleSheet("font-size: 13px; font-weight: 600; color: #e3e6eb;")
+        title.setToolTip(CREATION_CHOICE_HINTS.get(key, ""))
+        cell_layout.addWidget(title)
+
+        selector_frame = QFrame()
+        selector_frame.setObjectName(f"choice_selector_{key}")
+        selector_frame.setMinimumHeight(32)
+        selector_frame.setStyleSheet(
+            f"""
+            QFrame#choice_selector_{key} {{
+                background: #315d86;
+                border: 1px solid #6da4d8;
+                border-radius: 5px;
+            }}
+            """
+        )
+        selector_layout = QHBoxLayout(selector_frame)
+        selector_layout.setContentsMargins(0, 0, 0, 0)
+        selector_layout.setSpacing(0)
+
+        button = QPushButton()
+        button.setMinimumHeight(32)
+        button.setText("点击选择")
+        button.setCursor(Qt.PointingHandCursor)
+        button.setToolTip("点击打开完整选项")
+        button.setStyleSheet(
+            """
+            QPushButton {
+                color: #ffffff;
+                background: transparent;
+                border: 0;
+                border-radius: 0;
+                padding: 6px 8px;
+                text-align: left;
+            }
+            QPushButton:hover {
+                background: #3b6e9c;
+            }
+            """
+        )
+        self.choice_summary_buttons[key] = button
+        self.choice_widgets.append(button)
+        button.clicked.connect(lambda _checked=False, choice_key=key: self._open_choice_picker(choice_key))
+
+        arrow_layout = QVBoxLayout()
+        arrow_layout.setContentsMargins(0, 0, 0, 0)
+        arrow_layout.setSpacing(0)
+        up_button = QToolButton()
+        up_button.setArrowType(Qt.UpArrow)
+        up_button.setAutoRaise(True)
+        up_button.setFixedSize(18, 15)
+        up_button.setStyleSheet(
+            """
+            QToolButton {
+                color: #d9dde4;
+                background: transparent;
+                border: 0;
+                border-left: 1px solid #3a3f49;
+            }
+            QToolButton:hover {
+                background: #315d86;
+            }
+            """
+        )
+        up_button.clicked.connect(lambda choice_key=key: self._step_choice(choice_key, -1))
+        down_button = QToolButton()
+        down_button.setArrowType(Qt.DownArrow)
+        down_button.setAutoRaise(True)
+        down_button.setFixedSize(18, 15)
+        down_button.setStyleSheet(
+            """
+            QToolButton {
+                color: #d9dde4;
+                background: transparent;
+                border: 0;
+                border-left: 1px solid #3a3f49;
+            }
+            QToolButton:hover {
+                background: #315d86;
+            }
+            """
+        )
+        down_button.clicked.connect(lambda choice_key=key: self._step_choice(choice_key, 1))
+        arrow_layout.addWidget(up_button)
+        arrow_layout.addWidget(down_button)
+        self.choice_arrow_buttons[key] = (up_button, down_button)
+        self.choice_widgets.extend((up_button, down_button))
+        selector_layout.addWidget(button, 1)
+        selector_layout.addLayout(arrow_layout)
+        cell_layout.addWidget(selector_frame, 1)
+        default = CREATION_CHOICE_DEFAULTS.get(key)
+        self._set_choice(key, default)
+        grid.addWidget(cell, row_index, column_index)
+
+    def _open_choice_picker(self, key):
+        dialog = CreationChoicePickerDialog(
+            CREATION_CHOICE_TITLES.get(key, key),
+            CREATION_CHOICE_GROUPS.get(key, {}),
+            current_value=self._selected_choice(key),
+            max_selections=2 if key == "theme" else 1,
+            parent=self,
+        )
+        if dialog.exec() == QDialog.Accepted:
+            if key == "theme" or dialog.selected_value:
+                self._set_choice(key, dialog.selected_value)
+
+    def _on_choice_changed(self, key):
+        if key == "length":
+            values = {
+                "30万字": 300000,
+                "50万字": 500000,
+                "100万字+": 1000000,
+            }
+            self.target_words_spin.setValue(values.get(self._selected_choice(key), 500000))
+        elif key == "chapter_words":
+            raw_value = self._selected_choice(key).replace("字", "").replace(",", "").strip()
+            try:
+                chapter_words = int(raw_value)
+            except (TypeError, ValueError):
+                chapter_words = 3000
+            self.average_words_spin.setValue(
+                max(self.average_words_spin.minimum(), min(
+                    self.average_words_spin.maximum(),
+                    chapter_words,
+                ))
+            )
+        self._save_draft()
 
     def _build_premise_page(self):
         page = QWidget()
-        layout = QVBoxLayout(page)
-        layout.setSpacing(8)
-        self._add_page_header(layout, "这一页先确定故事方向。AI 会给出 5 份不同的书名和简介，你可以选择并修改其中一份，再进入小说圣经。")
-        form = QFormLayout()
-        self.inspiration_edit = QPlainTextEdit()
-        self.inspiration_edit.setPlaceholderText("输入灵感、想写的主角、场景、爽点或已有想法，可留空让 AI 自由发挥。")
-        self.inspiration_edit.setMaximumHeight(100)
+        page_layout = QVBoxLayout(page)
+        page_layout.setContentsMargins(0, 0, 0, 0)
+        layout = QVBoxLayout()
+        layout.setContentsMargins(2, 2, 2, 2)
+        layout.setSpacing(7)
+        self.inspiration_edit = QLineEdit()
+        self.inspiration_edit.setPlaceholderText(
+            "可选：一句话灵感、特殊题材、主角设想、想写的场景，或者暂定书名"
+        )
         if self.project_name_hint:
-            self.inspiration_edit.setPlainText(self.project_name_hint)
-        form.addRow("灵感/暂定名：", self.inspiration_edit)
-        self.genre_edit = QLineEdit()
-        self.genre_edit.setPlaceholderText("例如：都市异能、玄幻、古言、科幻悬疑")
-        form.addRow("类型：", self.genre_edit)
-        self.audience_combo = QComboBox()
-        self.audience_combo.addItems(["男频", "女频", "不限"])
-        form.addRow("频段：", self.audience_combo)
-        self.style_edit = QLineEdit()
-        self.style_edit.setPlaceholderText("例如：轻快爽文、克制悬疑、细腻情感")
-        form.addRow("风格：", self.style_edit)
-        numbers = QHBoxLayout()
-        self.target_words_spin = QSpinBox()
-        self.target_words_spin.setRange(10000, 3000000)
-        self.target_words_spin.setSingleStep(10000)
-        self.target_words_spin.setValue(500000)
-        self.target_words_spin.setSuffix(" 字")
-        numbers.addWidget(QLabel("总字数"))
-        numbers.addWidget(self.target_words_spin)
-        self.average_words_spin = QSpinBox()
-        self.average_words_spin.setRange(1000, 20000)
-        self.average_words_spin.setSingleStep(500)
-        self.average_words_spin.setValue(3000)
-        self.average_words_spin.setSuffix(" 字/章")
-        numbers.addWidget(QLabel("单章"))
-        numbers.addWidget(self.average_words_spin)
-        numbers.addStretch(1)
-        form.addRow("规模：", numbers)
-        layout.addLayout(form)
-        self.premise_generate_btn = QPushButton("AI生成 5 份故事简介")
+            self.inspiration_edit.setText(self.project_name_hint)
+        preferences_frame = QFrame()
+        preferences_frame.setObjectName("creation_preferences")
+        preferences_frame.setFrameShape(QFrame.NoFrame)
+        preferences_frame.setStyleSheet(
+            "QFrame#creation_preferences { background: transparent; border: none; }"
+        )
+        preferences_layout = QVBoxLayout(preferences_frame)
+        preferences_layout.setContentsMargins(8, 8, 8, 8)
+        preferences_layout.setSpacing(7)
+        preferences_title = QLabel("故事灵感")
+        preferences_title.setStyleSheet("font-size: 13px; font-weight: 600; color: #e3e6eb;")
+        preferences_layout.addWidget(preferences_title)
+        preferences_layout.addWidget(self.inspiration_edit)
+        choice_grid = QGridLayout()
+        choice_grid.setContentsMargins(0, 0, 0, 0)
+        choice_grid.setHorizontalSpacing(7)
+        choice_grid.setVerticalSpacing(7)
+        for column in range(3):
+            choice_grid.setColumnStretch(column, 1)
+        for index, key in enumerate(
+            (
+                "audience", "genre", "theme", "protagonist_route",
+                "style", "length", "chapter_words",
+            )
+        ):
+            row_index, column_index = divmod(index, 3)
+            self._add_choice_selector(choice_grid, key, row_index, column_index)
+        preferences_layout.addLayout(choice_grid)
+
+        self.premise_generate_btn = QPushButton("AI 生成 5 个故事方向")
+        self.premise_generate_btn.setMinimumHeight(38)
         self.premise_generate_btn.clicked.connect(self._generate_current)
-        layout.addWidget(self.premise_generate_btn)
+        preferences_layout.addWidget(self.premise_generate_btn)
+        layout.addWidget(preferences_frame)
+        layout.addSpacing(14)
+
+        self.premise_result_frame = QFrame()
+        self.premise_result_frame.setObjectName("creation_results")
+        self.premise_result_frame.setFrameShape(QFrame.NoFrame)
+        self.premise_result_frame.setStyleSheet(
+            "QFrame#creation_results { background: transparent; border: none; }"
+        )
+        result_layout = QVBoxLayout(self.premise_result_frame)
+        result_layout.setContentsMargins(8, 8, 8, 8)
+        result_layout.setSpacing(6)
+        result_title = QLabel("故事方向（生成后直接在这里选择）")
+        result_title.setStyleSheet("font-size: 13px; font-weight: 600; color: #e3e6eb;")
+        result_layout.addWidget(result_title)
         body = QHBoxLayout()
+        body.setSpacing(8)
         self.candidate_list = QListWidget()
-        self.candidate_list.setMinimumWidth(230)
+        self.candidate_list.setSizePolicy(
+            QSizePolicy.Preferred,
+            QSizePolicy.Expanding,
+        )
         self.candidate_list.setSelectionMode(QAbstractItemView.SingleSelection)
         self.candidate_list.currentRowChanged.connect(self._on_candidate_changed)
+        placeholder = QListWidgetItem("故事列表")
+        placeholder.setFlags(Qt.NoItemFlags)
+        self.candidate_list.addItem(placeholder)
         body.addWidget(self.candidate_list)
-        editor = QFormLayout()
-        self.title_edit = QLineEdit()
-        self.one_sentence_edit = QLineEdit()
-        self.candidate_genre_edit = QLineEdit()
-        self.candidate_style_edit = QLineEdit()
-        self.synopsis_edit = QPlainTextEdit()
-        self.synopsis_edit.setMinimumHeight(130)
-        self.protagonist_edit = QPlainTextEdit()
-        self.protagonist_edit.setMinimumHeight(80)
-        self.main_line_edit = QPlainTextEdit()
-        self.main_line_edit.setMinimumHeight(80)
-        self.relationship_edit = QPlainTextEdit()
-        self.relationship_edit.setMinimumHeight(80)
-        self.ending_edit = QPlainTextEdit()
-        self.ending_edit.setMinimumHeight(80)
-        for label, widget in (
-            ("书名：", self.title_edit), ("一句话钩子：", self.one_sentence_edit),
-            ("类型：", self.candidate_genre_edit), ("风格：", self.candidate_style_edit),
-            ("完整简介：", self.synopsis_edit), ("主角：", self.protagonist_edit),
-            ("主线：", self.main_line_edit), ("关系变化：", self.relationship_edit),
-            ("结局方向：", self.ending_edit),
-        ):
-            editor.addRow(label, widget)
-        body.addLayout(editor, 1)
-        layout.addLayout(body, 1)
-        self.stack.addWidget(page)
+        preview = QVBoxLayout()
+        preview.setSpacing(6)
+        self.candidate_title_label = QLabel()
+        self.candidate_title_label.setStyleSheet("font-size: 16px; font-weight: 600; color: #f0f2f5;")
+        self.candidate_title_label.setWordWrap(True)
+        preview.addWidget(self.candidate_title_label)
+        self.candidate_meta_label = QLabel()
+        self.candidate_meta_label.setStyleSheet("color: #86b6df;")
+        self.candidate_meta_label.setWordWrap(True)
+        preview.addWidget(self.candidate_meta_label)
+        self.candidate_hook_label = QLabel()
+        self.candidate_hook_label.setStyleSheet("color: #d9dde4; font-weight: 600;")
+        self.candidate_hook_label.setWordWrap(True)
+        preview.addWidget(self.candidate_hook_label)
+        self.candidate_synopsis_preview = QPlainTextEdit()
+        self.candidate_synopsis_preview.setReadOnly(True)
+        self.candidate_synopsis_preview.setSizePolicy(
+            QSizePolicy.Expanding,
+            QSizePolicy.Expanding,
+        )
+        self.candidate_synopsis_preview.setMinimumHeight(96)
+        self.candidate_synopsis_preview.setPlaceholderText("选择左侧故事方向后，这里会显示简介。")
+        preview.addWidget(self.candidate_synopsis_preview, 1)
+        body.addLayout(preview, 1)
+        result_layout.addLayout(body, 1)
+        layout.addWidget(self.premise_result_frame, 1)
+        page_layout.addLayout(layout)
+        page_scroll = QScrollArea()
+        page_scroll.setWidgetResizable(True)
+        page_scroll.setFrameShape(QFrame.NoFrame)
+        page_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        page_scroll.setWidget(page)
+        self.stack.addWidget(page_scroll)
 
     def _build_json_page(self, step, title):
         page = QWidget()
         layout = QVBoxLayout(page)
-        self._add_page_header(layout, f"AI 会结合前面已经确认的资料生成{title}。右侧内容是结构化结果，可以直接修改；确认后才会写入新项目。")
-        generate_btn = QPushButton(f"AI生成{title}")
+        header_text = (
+            "生成后会按小说圣经、世界规则、人物、设定库、伏笔分别显示，"
+            "每一栏都对应主程序里的资料栏目。确认后才会写入新项目。"
+            if step == "bible"
+            else f"AI 会根据前面已经确认的灵感和选择自动生成{title}。这里展示可读摘要，确认后才会写入新项目。"
+        )
+        self._add_page_header(
+            layout,
+            header_text,
+        )
+        generate_btn = QPushButton(f"AI 生成{title}")
         generate_btn.clicked.connect(self._generate_current)
         layout.addWidget(generate_btn)
-        editor = QPlainTextEdit()
-        editor.setLineWrapMode(QPlainTextEdit.WidgetWidth)
-        editor.setPlaceholderText("点击上面的按钮生成结构化内容。确认前可以直接编辑 JSON。")
+        if step == "bible":
+            editor = CreationSectionedPreview()
+        else:
+            editor = QPlainTextEdit()
+            editor.setReadOnly(True)
+            editor.setLineWrapMode(QPlainTextEdit.WidgetWidth)
+            editor.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+            editor.setPlaceholderText("点击上面的按钮生成内容。你不需要填写 JSON。")
         layout.addWidget(editor, 1)
         self.json_editors = getattr(self, "json_editors", {})
         self.json_generate_buttons = getattr(self, "json_generate_buttons", {})
@@ -787,103 +5863,289 @@ class NovelCreationWizardDialog(QDialog):
         self.json_generate_buttons[step] = generate_btn
         self.stack.addWidget(page)
 
+    def _update_responsive_controls(self):
+        candidate_list = getattr(self, "candidate_list", None)
+        if candidate_list is not None:
+            list_width = max(170, min(300, int(self.width() * 0.22)))
+            candidate_list.setMinimumWidth(list_width)
+            candidate_list.setMaximumWidth(list_width)
+        synopsis = getattr(self, "candidate_synopsis_preview", None)
+        if synopsis is not None:
+            synopsis.setMinimumHeight(max(88, min(180, int(self.height() * 0.14))))
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._update_responsive_controls()
+
+    def _set_preview_result(self, step, result):
+        editor = self.json_editors.get(step)
+        if editor is None:
+            return
+        if step == "bible" and hasattr(editor, "set_result"):
+            editor.set_result(result)
+        else:
+            editor.setPlainText(format_creation_preview(step, result))
+
     def _refresh_step_ui(self):
         step, title = CREATION_WIZARD_STEPS[self.current_step_index]
         self.step_label.setText(f"第 {self.current_step_index + 1}/{len(CREATION_WIZARD_STEPS)} 步：{title}")
         self.stack.setCurrentIndex(self.current_step_index)
         self.back_btn.setEnabled(self.current_step_index > 0 and self.worker is None)
-        self.next_btn.setEnabled(self.worker is None)
+        self.next_btn.setEnabled(self.worker is None and self._current_step_ready())
         self.next_btn.setText("确认并创建项目" if self.current_step_index == len(CREATION_WIZARD_STEPS) - 1 else "确认并下一步")
         if self.current_step_index == 0:
-            self.status_label.setText("先生成并选择一份故事方向。")
+            self._set_status_text("先输入一点灵感，再选择题材和阅读感觉。")
         elif step in self.step_results:
-            self.status_label.setText("当前步骤已有结果，可以重新生成或直接编辑后确认。")
+            state = self._generation_state(step)
+            if step == "stage_plan":
+                self._sync_stage_generation_state(self.step_results[step])
+                state = self._generation_state(step)
+                if not self.step_results[step].get("stage_skeleton"):
+                    self._set_status_text("点击生成后会先整理全书阶段骨架，再按十万字阶段依次生成。")
+                elif _as_text(state.get("status")).lower() == "partial":
+                    next_index = int(state.get("next_stage_index", 0) or 0)
+                    missing_endpoints = state.get("missing_foreshadow_endpoints", [])
+                    detail = "，其中包含未完成的伏笔章位" if missing_endpoints else ""
+                    self._set_status_text(
+                        f"当前步骤已保存部分内容，点击生成会继续第{next_index + 1}阶段{detail}。"
+                    )
+                else:
+                    self._set_status_text("当前步骤已有完整阶段规划，可以重新生成或直接确认。")
+            elif _as_text(state.get("status")).lower() == "partial":
+                if step == "bible":
+                    self._set_status_text("当前步骤已保存第一批资料，点击生成会继续第二批。")
+                else:
+                    next_index = int(state.get("next_stage_index", 0) or 0)
+                    self._set_status_text(f"当前步骤已保存前面阶段，点击生成会继续第{next_index + 1}阶段。")
+            else:
+                self._set_status_text("当前步骤已有 AI 结果，可以重新生成或直接确认。")
         else:
-            self.status_label.setText("请点击 AI 生成当前步骤。")
+            self._set_status_text("请点击 AI 生成当前步骤。")
+
+    def _current_step_ready(self):
+        step = CREATION_WIZARD_STEPS[self.current_step_index][0]
+        if step == "premise":
+            return bool(self.premise_candidates)
+        if step == "bible":
+            result = self.step_results.get("bible", {})
+            state = self._generation_state("bible")
+            return (
+                isinstance(result, dict)
+                and _as_text(state.get("status")).lower() in {"", "complete"}
+                and _has_creation_content(result.get("bible"))
+                and _has_creation_content(result.get("world_rules"))
+                and _has_creation_content(result.get("characters"))
+                and _has_creation_content(result.get("lore"))
+                and _has_creation_content(result.get("foreshadows"))
+            )
+        if step == "stage_plan":
+            result = self.step_results.get(step, {})
+            if not isinstance(result, dict):
+                return False
+            self._sync_stage_generation_state(result)
+            if _as_text(self._generation_state(step).get("status")).lower() == "partial":
+                return False
+            first_missing, _by_index = _stage_plan_progress(
+                result.get("stage_plan", []),
+                len(self._stage_specs()),
+            )
+            return first_missing is None
+        return step in self.step_results
+
+    def _set_status_text(self, text):
+        self._status_text = str(text or "")
+        suffix = ""
+        if self._received_chars > 0:
+            suffix = f"；已接收字符：{self._received_chars}"
+        display_text = self._status_text + suffix
+        self.status_label.setText(display_text)
+        self.status_label.setToolTip(display_text)
+
+    def _on_worker_progress(self, text):
+        self._set_status_text(text)
+
+    def _on_worker_output_chars(self, count):
+        try:
+            self._received_chars = max(0, int(count or 0))
+        except (TypeError, ValueError):
+            return
+        self._set_status_text(self._status_text)
 
     def _context_for_step(self, step):
+        genre = self._selected_choice("genre")
         context = {
             "author_input": {
-                "inspiration": self.inspiration_edit.toPlainText().strip(),
-                "temporary_title": self.project_name_hint,
-                "genre": self.genre_edit.text().strip(),
-                "audience": self.audience_combo.currentText().strip(),
-                "style": self.style_edit.text().strip(),
+                "inspiration": self.inspiration_edit.text().strip(),
+                "temporary_title": self.project_name_hint or self.inspiration_edit.text().strip(),
+                "genre": genre,
+                "theme": self._selected_choice("theme"),
+                "audience": self._selected_choice("audience"),
+                "style": self._selected_choice("style"),
+                "protagonist_route": self._selected_choice("protagonist_route"),
+                "length": self._selected_choice("length"),
                 "total_words": self.target_words_spin.value(),
                 "average_chapter_words": self.average_words_spin.value(),
                 "no_injury": True,
                 "ending": "开放式、非圆满",
             },
-            "confirmed": deepcopy(self.step_results),
         }
+        if step == "premise":
+            current_names = [
+                _creation_premise_name(item.get("protagonist"))
+                for item in self.premise_candidates
+                if isinstance(item, dict)
+            ]
+            context["naming_reference"] = _creation_name_references(current_names)
         premise = self._current_premise() if step != "premise" else {}
-        if premise:
-            context["confirmed_novel_name"] = _as_text(premise.get("title", ""))
         if step != "premise":
             context["selected_premise"] = premise
+        if step == "bible":
+            context["confirmed"] = {
+                # Only the selected candidate is authoritative. It is already
+                # carried once as selected_premise; do not send a second copy.
+            }
+            batch_kind, _stage_index = self._next_generation_batch("bible")
+            context["generation_batch"] = batch_kind
+            if batch_kind == "bible_assets":
+                bible_result = self.step_results.get("bible", {})
+                if isinstance(bible_result, dict):
+                    context["confirmed"]["bible"] = {
+                        "bible": deepcopy(bible_result.get("bible", {})),
+                        "world_rules": deepcopy(bible_result.get("world_rules", {})),
+                    }
+        elif step == "stage_plan":
+            batch_kind, stage_index = self._next_generation_batch("stage_plan")
+            specs = self._stage_specs()
+            current_stage = specs[stage_index] if 0 <= stage_index < len(specs) else {}
+            stage_result = self.step_results.get("stage_plan", {})
+            context["confirmed"] = {
+                "bible": deepcopy(self.step_results.get("bible", {})),
+            }
+            context["generation_batch"] = batch_kind
+            if isinstance(stage_result, dict) and stage_result.get("stage_skeleton"):
+                context["confirmed"]["stage_skeleton"] = deepcopy(
+                    stage_result.get("stage_skeleton", [])
+                )
+            context["current_stage"] = deepcopy(current_stage)
+            bible_result = self.step_results.get("bible", {})
+            bible_foreshadows = (
+                bible_result.get("foreshadows", [])
+                if isinstance(bible_result, dict) else []
+            )
+            if batch_kind == "stage_plan_stage":
+                endpoint_requirements = _foreshadow_stage_requirements(
+                    bible_foreshadows,
+                    specs,
+                )
+                context["current_foreshadow_endpoints"] = [
+                    {
+                        "code": item.get("code") or item.get("name"),
+                        "name": item.get("name", ""),
+                        "kind": item.get("kind"),
+                        "stage": item.get("stage_index", 0) + 1,
+                        "use": (
+                            "让这条线索在人物生活中第一次出现，改变当下的行动或关系"
+                            if item.get("kind") == "setup"
+                            else "让这条线索在现场产生新的事实，改变人物的行动、关系或局势"
+                        ),
+                    }
+                    for item in endpoint_requirements.get(stage_index, [])
+                ]
+            if isinstance(stage_result, dict):
+                _first_missing, stages_by_index = _stage_plan_progress(
+                    stage_result.get("stage_plan", []),
+                    len(specs),
+                )
+                previous_stages = [
+                    deepcopy(stages_by_index[index])
+                    for index in sorted(stages_by_index)
+                    if index < stage_index
+                    and _stage_has_meaningful_content(stages_by_index[index])
+                ]
+                context["confirmed"]["previous_stage_plan"] = deepcopy(
+                    _compact_stage_plan_handoff(previous_stages)
+                )
+                context["confirmed"]["previous_foreshadow_schedule"] = deepcopy(
+                    [
+                        row for row in stage_result.get("foreshadow_schedule", [])
+                        if isinstance(row, dict)
+                        and (
+                            _creation_chapter_number(row.get("setup_chapter")) > 0
+                            and _creation_chapter_number(row.get("setup_chapter"))
+                            <= int(current_stage.get("end_chapter", 0) or 0)
+                            or _creation_chapter_number(row.get("payoff_chapter")) > 0
+                            and _creation_chapter_number(row.get("payoff_chapter"))
+                            <= int(current_stage.get("end_chapter", 0) or 0)
+                            or _as_text(row.get("payoff_chapter")) == "结尾保留"
+                        )
+                    ]
+                )
         return context
 
     def _current_premise(self):
-        self._save_current_candidate()
         if not self.premise_candidates:
             return {}
         index = max(0, min(self.premise_selected_index, len(self.premise_candidates) - 1))
         return deepcopy(self.premise_candidates[index])
 
     def _save_current_candidate(self):
-        if not self.premise_candidates or self._premise_loading_index >= 0:
-            return
-        index = self.premise_selected_index
-        if index < 0 or index >= len(self.premise_candidates):
-            return
-        item = self.premise_candidates[index]
-        item.update({
-            "title": self.title_edit.text().strip(),
-            "one_sentence": self.one_sentence_edit.text().strip(),
-            "genre": self.candidate_genre_edit.text().strip(),
-            "style": self.candidate_style_edit.text().strip(),
-            "synopsis": self.synopsis_edit.toPlainText().strip(),
-            "protagonist": self.protagonist_edit.toPlainText().strip(),
-            "main_line": self.main_line_edit.toPlainText().strip(),
-            "relationship_engine": self.relationship_edit.toPlainText().strip(),
-            "ending_direction": self.ending_edit.toPlainText().strip(),
-        })
+        # 故事方向改为只读预览，避免用户在第一步重新填写一份策划案。
+        return
 
     def _load_candidate(self, index):
         if index < 0 or index >= len(self.premise_candidates):
             return
         self._premise_loading_index = index
         item = self.premise_candidates[index]
-        self.title_edit.setText(_as_text(item.get("title")))
-        self.one_sentence_edit.setText(_as_text(item.get("one_sentence")))
-        self.candidate_genre_edit.setText(_as_text(item.get("genre")))
-        self.candidate_style_edit.setText(_as_text(item.get("style")))
-        self.synopsis_edit.setPlainText(_as_text(item.get("synopsis")))
-        self.protagonist_edit.setPlainText(_as_text(item.get("protagonist")))
-        self.main_line_edit.setPlainText(_as_text(item.get("main_line")))
-        self.relationship_edit.setPlainText(_as_text(item.get("relationship_engine")))
-        self.ending_edit.setPlainText(_as_text(item.get("ending_direction")))
+        self.candidate_title_label.setText(_as_text(item.get("title")) or f"方向 {index + 1}")
+        meta = " · ".join(
+            part for part in (
+                _as_text(item.get("audience")),
+                _as_text(item.get("genre")) or self._selected_choice("genre"),
+                self._selected_choice("theme"),
+                _as_text(item.get("style")) or self._selected_choice("style"),
+            ) if part
+        )
+        self.candidate_meta_label.setText(meta)
+        self.candidate_hook_label.setText(_as_text(item.get("one_sentence")))
+        self.candidate_synopsis_preview.setPlainText(_as_text(item.get("synopsis")))
         self._premise_loading_index = -1
 
     def _on_candidate_changed(self, index):
         if self._premise_loading_index >= 0:
             return
-        self._save_current_candidate()
         if index >= 0:
+            previous = self.premise_selected_index
             self.premise_selected_index = index
             self._load_candidate(index)
+            if previous != index:
+                self._invalidate_steps_from("bible")
+            self._save_draft()
 
     def _generate_current(self):
         if self.worker is not None:
             return
         step = CREATION_WIZARD_STEPS[self.current_step_index][0]
+        batch_kind, stage_index = self._next_generation_batch(step)
+        if not batch_kind:
+            return
+        state = self._generation_state(step)
         provider, model, error = self.ai_selection()
         if error:
             QMessageBox.warning(self, "新建向导", error)
             return
+        if step == "bible" and batch_kind == "bible_core" and state.get("status") == "complete":
+            self._invalidate_steps_from("stage_plan")
+            self.step_results.pop("bible", None)
+            editor = self.json_editors.get("bible")
+            if editor is not None:
+                editor.clear()
+        elif step == "stage_plan" and state.get("status") == "complete":
+            self.step_results.pop("stage_plan", None)
+            editor = self.json_editors.get("stage_plan")
+            if editor is not None:
+                editor.clear()
         context = self._context_for_step(step)
-        if step == "premise":
-            context["author_input"]["genre"] = self.genre_edit.text().strip()
         self.worker = NovelCreationWorker(
             provider.get("base_url", ""),
             provider.get("api_key", ""),
@@ -892,54 +6154,470 @@ class NovelCreationWizardDialog(QDialog):
             context,
             provider.get("proxy_url", ""),
             provider.get("proxy_mode", "提交和下载" if provider.get("proxy_url") else "不使用代理"),
+            batch_kind=batch_kind,
+            stage_index=stage_index,
         )
+        self.worker.diagnostic_request_id = (
+            f"creation-wizard-{step}-{batch_kind or step}-{uuid.uuid4().hex[:12]}"
+        )
+        self.worker.diagnostic_stage = f"{step}:{batch_kind or step}"
+        self.worker.diagnostic_project_path = _creation_wizard_draft_path(self.draft_id)
+        self.worker.diagnostic_project_title = _as_text(
+            self._current_premise().get("title")
+        )
+        self.worker.capture_raw_model_output = True
+        self.worker.raw_model_output_metadata = {
+            "creation_step": step,
+            "creation_batch": batch_kind,
+            "stage_index": int(stage_index) if stage_index is not None else -1,
+            "draft_id": self.draft_id,
+            "draft_created_at": self.created_at,
+        }
         self.worker.result_ready.connect(self._on_ai_result)
         self.worker.failed.connect(self._on_ai_failed)
-        self.worker.progress.connect(self.status_label.setText)
+        self.worker.progress.connect(self._on_worker_progress)
+        self.worker.output_chars.connect(self._on_worker_output_chars)
         self.worker.finished.connect(self._cleanup_worker)
+        self._active_batch_kind = batch_kind
+        self._active_stage_index = stage_index
+        self._pending_batch_kind = ""
+        self._pending_stage_index = -1
+        self._generation_failed = False
+        self._last_worker_error = ""
+        self._received_chars = 0
+        self._set_status_text("AI 正在连接并准备生成，请稍候……")
+        self._save_draft()
         self._set_running(True)
         self.worker.start()
+
+    def _merge_bible_batch(self, result, batch_kind):
+        """Merge one story-base batch while keeping the other batch intact."""
+        result = result if isinstance(result, dict) else {}
+        if batch_kind == "bible_core" and not all(
+            _has_creation_content(result.get(key))
+            for key in ("bible", "world_rules")
+        ):
+            raise ValueError("第一批没有同时收到完整的小说圣经和世界规则。")
+        if batch_kind == "bible_assets" and any(
+            not isinstance(result.get(key), list) or not result.get(key)
+            for key in ("characters", "lore", "foreshadows")
+        ):
+            raise ValueError("第二批没有同时收到完整的人物、设定和伏笔。")
+        current = deepcopy(self.step_results.get("bible", {}))
+        if not isinstance(current, dict):
+            current = {}
+        if batch_kind == "bible_core":
+            for key in ("bible", "world_rules"):
+                if _has_creation_content(result.get(key)):
+                    current[key] = deepcopy(result.get(key))
+        elif batch_kind == "bible_assets":
+            for key in ("characters", "lore", "foreshadows"):
+                if isinstance(result.get(key), list):
+                    current[key] = deepcopy(result.get(key))
+
+        if batch_kind == "bible_core":
+            world_rules = current.get("world_rules", {})
+            if not isinstance(world_rules, dict):
+                raise ValueError("第一批世界规则没有形成可执行的规则资料。")
+            if not _normalize_text_list(world_rules.get("rules", [])):
+                raise ValueError("第一批世界规则缺少长期规则条目，请重新生成这一批。")
+            if not _normalize_text_list(world_rules.get("costs_and_limits", [])):
+                raise ValueError("第一批世界规则缺少代价限制条目，请重新生成这一批。")
+
+        if batch_kind == "bible_assets" and self._allow_power_levels():
+            if not _has_ordered_power_lore(current.get("lore", [])):
+                raise ValueError(
+                    "当前题材需要一条按顺序说明的实力体系，但设定库中没有形成可执行的境界记录；"
+                    "本次资料未写入，请重新生成第二批。"
+                )
+
+        completed = [
+            str(item)
+            for item in current.get("_generation_state", {}).get("completed_batches", [])
+            if str(item)
+        ] if isinstance(current.get("_generation_state"), dict) else []
+        if batch_kind and batch_kind not in completed:
+            completed.append(batch_kind)
+        complete = all(item in completed for item in ("bible_core", "bible_assets"))
+        current["_generation_state"] = {
+            "schema_version": 1,
+            "status": "complete" if complete else "partial",
+            "completed_batches": completed,
+            "next_batch": "" if complete else "bible_assets",
+            "updated_at": now_str(),
+        }
+        self.step_results["bible"] = current
+        if complete:
+            self._invalidate_steps_from("stage_plan")
+
+    def _merge_stage_batch(self, result, stage_index):
+        """Merge one stage and its local foreshadow endpoints in order."""
+        specs = self._stage_specs()
+        if stage_index < 0 or stage_index >= len(specs):
+            raise ValueError("当前阶段编号无效，无法继续保存阶段规划。")
+        spec = specs[stage_index]
+        current = deepcopy(self.step_results.get("stage_plan", {}))
+        if not isinstance(current, dict):
+            current = {}
+        incoming_stages = result.get("stage_plan", []) if isinstance(result, dict) else []
+        incoming_stages = [item for item in incoming_stages if isinstance(item, dict)]
+        if not incoming_stages:
+            raise ValueError(f"第{stage_index + 1}阶段没有收到有效内容。")
+        selected = None
+        for item in incoming_stages:
+            if _as_text(item.get("id")).upper() == spec["id"]:
+                selected = deepcopy(item)
+                break
+        if selected is None:
+            selected = deepcopy(
+                incoming_stages[stage_index]
+                if len(incoming_stages) > stage_index else incoming_stages[0]
+            )
+        # Normalize this response against the whole book, then force it into
+        # the requested slot. A compact response may carry a stale S01 id;
+        # the API batch's stage_index is authoritative here.
+        normalized_selected = normalize_stage_plan_ranges(
+            [selected],
+            self.target_words_spin.value(),
+            self.average_words_spin.value(),
+            expected_count=len(specs),
+            pad_missing=False,
+        )
+        if not normalized_selected:
+            raise ValueError(f"第{stage_index + 1}阶段没有收到有效内容，当前批次未保存。")
+        selected = normalized_selected[0]
+        selected["id"] = spec["id"]
+        selected["start_chapter"] = spec["start_chapter"]
+        selected["end_chapter"] = spec["end_chapter"]
+        selected["target_words"] = spec["target_words"]
+        events = selected.get("ordered_events", [])
+        if isinstance(events, list):
+            for event_index, event in enumerate(events, 1):
+                if not isinstance(event, dict):
+                    continue
+                raw_event_id = _as_text(event.get("id"))
+                event_match = re.search(r"E[_-]?(\d+)", raw_event_id.upper())
+                event_number = int(event_match.group(1)) if event_match else event_index
+                event["id"] = f"{spec['id']}-E{event_number:02d}"
+                allowed = event.get("allowed_chapters", [])
+                if isinstance(allowed, list) and len(allowed) >= 2:
+                    try:
+                        allowed_start, allowed_end = int(allowed[0]), int(allowed[1])
+                    except (TypeError, ValueError):
+                        allowed_start = allowed_end = 0
+                    if (
+                        allowed_start < spec["start_chapter"]
+                        or allowed_end > spec["end_chapter"]
+                        or allowed_start > allowed_end
+                    ):
+                        raise ValueError(
+                            f"第{stage_index + 1}阶段事件 {event['id']} 超出了本阶段允许的第"
+                            f"{spec['start_chapter']}—{spec['end_chapter']}章范围。"
+                        )
+        if not _stage_has_meaningful_content(selected):
+            raise ValueError(
+                f"第{stage_index + 1}阶段返回的是空结构或不完整内容，当前批次未保存；请重新生成。"
+            )
+        _validate_stage_batch_events(selected, stage_index, spec)
+
+        # Merge by stable stage id. Never normalize the combined sparse list
+        # by its length, because S04 must stay S04 when S02/S03 are missing.
+        stage_by_index = {}
+        for position, item in enumerate(current.get("stage_plan", [])):
+            if not isinstance(item, dict):
+                continue
+            item_index = _creation_stage_index(item.get("id"))
+            if not (0 <= item_index < len(specs)):
+                item_index = position if position < len(specs) else -1
+            if item_index < 0:
+                continue
+            stage_by_index[item_index] = deepcopy(item)
+        stage_by_index[stage_index] = selected
+        existing_stages = []
+        for index in sorted(stage_by_index):
+            item = stage_by_index[index]
+            item["id"] = specs[index]["id"]
+            item["start_chapter"] = specs[index]["start_chapter"]
+            item["end_chapter"] = specs[index]["end_chapter"]
+            item["target_words"] = specs[index]["target_words"]
+            existing_stages.append(item)
+        current["stage_plan"] = existing_stages
+        total_chapters = _creation_total_chapters(
+            self.target_words_spin.value(),
+            self.average_words_spin.value(),
+        )
+        bible_result = self.step_results.get("bible", {})
+        bible_foreshadows = (
+            bible_result.get("foreshadows", [])
+            if isinstance(bible_result, dict) else []
+        )
+        # Resolve the new event-anchored endpoint protocol before merging.  A
+        # model response no longer needs to guess an independent chapter; the
+        # event range and the second-step stage baseline determine it here.
+        stage_endpoint_rows = _derive_stage_endpoint_rows(
+            result,
+            stage_index,
+            specs,
+            bible_foreshadows,
+            total_chapters,
+        )
+        # Persist any endpoint marker recovered from an explicit f event id in
+        # the stage copy that is about to be saved as well.
+        endpoint_markers = {
+            (
+                _as_text(row.get("endpoint_event_id")),
+                _as_text(row.get("code")),
+                _normalize_foreshadow_endpoint_kind(row.get("endpoint_kind")),
+            )
+            for row in stage_endpoint_rows
+            if _as_text(row.get("endpoint_event_id")) and _as_text(row.get("code"))
+        }
+        for event in selected.get("ordered_events", []) if isinstance(selected.get("ordered_events"), list) else []:
+            event_id = _as_text(event.get("id"))
+            for endpoint_event_id, code, kind in endpoint_markers:
+                if endpoint_event_id != event_id or not kind:
+                    continue
+                marker = f"{code}/{kind}"
+                references = event.get("references", [])
+                references = list(references) if isinstance(references, list) else ([references] if references else [])
+                if not any(_as_text(item).upper() == marker.upper() for item in references):
+                    references.insert(0, marker)
+                    event["references"] = references
+        combined_schedule = []
+        combined_schedule.extend(
+            current.get("foreshadow_schedule", [])
+            if isinstance(current.get("foreshadow_schedule", []), list) else []
+        )
+        combined_schedule.extend(
+            stage_endpoint_rows
+        )
+        canonical_schedule, schedule_notes, schedule_errors = _canonicalize_foreshadow_schedule(
+            bible_foreshadows,
+            combined_schedule,
+            specs,
+            total_chapters,
+            strict=False,
+        )
+        current["foreshadow_schedule"] = canonical_schedule
+        current_missing = [
+            item for item in _stage_foreshadow_shortfalls(
+                bible_foreshadows,
+                current.get("foreshadow_schedule", []),
+                specs,
+                total_chapters,
+            )
+            if item.get("stage_index") == stage_index
+        ]
+        endpoint_warnings = [
+            item for item in current.get("foreshadow_endpoint_warnings", [])
+            if isinstance(item, dict) and item.get("stage_index") != stage_index
+        ]
+        if schedule_errors or current_missing:
+            endpoint_warnings.append({
+                "stage_index": stage_index,
+                "errors": list(schedule_errors[:8]),
+                "missing": [
+                    {
+                        "code": item.get("code"),
+                        "name": item.get("name"),
+                        "kind": item.get("kind"),
+                    }
+                    for item in current_missing
+                ],
+                "updated_at": now_str(),
+            })
+        current["foreshadow_endpoint_warnings"] = endpoint_warnings
+        if isinstance(result, dict):
+            if stage_index == 0:
+                contract = _normalize_stage_book_contract(result.get("book_contract", {}))
+                if contract:
+                    current["book_contract"] = contract
+                note = _clean_chapter_plan_note(result.get("chapter_plan_note"))
+                if note:
+                    current["chapter_plan_note"] = note
+            for note in schedule_notes:
+                current["chapter_plan_note"] = _append_note(
+                    _clean_chapter_plan_note(current.get("chapter_plan_note", "")),
+                    note,
+                )
+            current["planning_schema_version"] = (
+                _as_text(result.get("planning_schema_version", "2")) or "2"
+            )
+        self._sync_stage_generation_state(current)
+        self.step_results["stage_plan"] = current
+
+        if isinstance(bible_result, dict):
+            bible_result["foreshadows"] = _apply_foreshadow_schedule(
+                bible_result.get("foreshadows", []),
+                current.get("foreshadow_schedule", []),
+                total_chapters,
+            )
+            self.step_results["bible"] = bible_result
+            self._set_preview_result("bible", bible_result)
 
     def _set_running(self, running):
         running = bool(running)
         self.premise_generate_btn.setEnabled(not running)
         for button in getattr(self, "json_generate_buttons", {}).values():
             button.setEnabled(not running)
+        for button in self.choice_widgets:
+            button.setEnabled(not running)
+        self.inspiration_edit.setEnabled(not running)
         self.back_btn.setEnabled(not running and self.current_step_index > 0)
-        self.next_btn.setEnabled(not running)
+        self.next_btn.setEnabled(not running and self._current_step_ready())
         self.cancel_btn.setEnabled(not running)
         if running:
-            self.status_label.setText("AI 正在生成当前步骤，请稍候……")
+            self._set_status_text(self._active_generation_status())
+
+    def _active_generation_status(self):
+        """Return the visible label for the exact wizard batch in progress."""
+        step = CREATION_WIZARD_STEPS[self.current_step_index][0]
+        if step == "premise":
+            return "正在生成：5个故事方向"
+        if self._active_batch_kind == "bible_core":
+            return "正在生成：小说圣经、世界规则"
+        if self._active_batch_kind == "bible_assets":
+            return "正在生成：人物、设定、伏笔"
+        if self._active_batch_kind == "stage_plan_stage":
+            total_stages = len(self._stage_specs())
+            return f"正在生成：第{self._active_stage_index + 1}阶段（共{total_stages}个阶段）"
+        if self._active_batch_kind == "stage_skeleton":
+            return "正在生成：全书阶段骨架"
+        return "AI 正在生成当前步骤，请稍候……"
 
     def _on_ai_result(self, result):
         step = CREATION_WIZARD_STEPS[self.current_step_index][0]
-        result = normalize_creation_result(step, result)
-        self.step_results[step] = deepcopy(result)
-        if step == "premise":
-            self._save_current_candidate()
-            self.premise_candidates = result.get("candidates", [])
-            self.premise_selected_index = max(0, min(int(result.get("selected_index", 0) or 0), max(0, len(self.premise_candidates) - 1)))
-            self.candidate_list.clear()
-            for index, item in enumerate(self.premise_candidates, 1):
-                text = _as_text(item.get("title")) or f"方向 {index}"
-                self.candidate_list.addItem(QListWidgetItem(text))
-            if self.premise_candidates:
-                # setCurrentRow 会触发 currentRowChanged，先屏蔽旧编辑器内容的回写，
-                # 再把本次生成的候选加载到编辑器。
-                self._premise_loading_index = self.premise_selected_index
-                self.candidate_list.setCurrentRow(self.premise_selected_index)
-                self._load_candidate(self.premise_selected_index)
-            self.status_label.setText(f"已生成 {len(self.premise_candidates)} 份故事方向，请选择并编辑。")
+        batch_kind = self._active_batch_kind
+        stage_index = self._active_stage_index
+        if batch_kind == "stage_plan_stage":
+            partial_payload = deepcopy(result) if isinstance(result, dict) else {}
+            partial_payload["_generation_state"] = {"status": "partial"}
+            result = self._normalize_step_result(step, partial_payload)
         else:
-            editor = self.json_editors.get(step)
-            if editor is not None:
-                editor.setPlainText(pretty_json(result))
-            self.status_label.setText("已生成当前步骤，确认前可以编辑。")
+            result = self._normalize_step_result(step, result)
+        if step == "premise":
+            candidates = [
+                deepcopy(item)
+                for item in result.get("candidates", [])
+                if isinstance(item, dict)
+            ]
+            protocol_error = _as_text(result.get("_candidate_protocol_error"))
+            if protocol_error or len(candidates) != 5:
+                detail = protocol_error or f"这次返回了 {len(candidates)} 个方向，应为 5 个"
+                if self.premise_candidates:
+                    self._set_status_text(
+                        f"这次故事方向的返回结构不完整（{detail}），暂不替换上一组结果，请重新生成。"
+                    )
+                else:
+                    self._show_empty_candidate_list("这次没有收到符合五个固定方向的结果，请重新生成")
+                    self._set_status_text(
+                        f"这次故事方向的返回结构不完整（{detail}），请重新生成。"
+                    )
+                self._set_running(False)
+                return
+            self._invalidate_steps_from("bible")
+            self.step_results[step] = deepcopy(result)
+            self.premise_candidates = candidates
+            self.step_results[step]["candidates"] = deepcopy(self.premise_candidates)
+            self.premise_selected_index = max(
+                0,
+                min(
+                    int(result.get("selected_index", 0) or 0),
+                    len(self.premise_candidates) - 1,
+                ),
+            )
+            self.step_results[step]["selected_index"] = self.premise_selected_index
+            self._populate_candidate_list()
+            remember_creation_wizard_names(
+                [
+                    _creation_premise_name(item.get("protagonist"))
+                    for item in self.premise_candidates
+                    if isinstance(item, dict)
+                ],
+                source="premise",
+            )
+            self._set_status_text(f"已生成 {len(self.premise_candidates)} 份故事方向，请选择一份。")
+        else:
+            try:
+                if step == "bible":
+                    self._merge_bible_batch(result, batch_kind)
+                elif step == "stage_plan":
+                    if batch_kind == "stage_skeleton":
+                        self._merge_stage_skeleton(result)
+                    else:
+                        self._merge_stage_batch(result, stage_index)
+                if step == "bible" and batch_kind == "bible_assets":
+                    remember_creation_wizard_names(
+                        _creation_character_names(result.get("characters", [])),
+                        source="bible",
+                    )
+            except Exception as exc:
+                self._on_ai_failed(str(exc))
+                return
+            merged = deepcopy(self.step_results.get(step, {}))
+            self._set_preview_result(step, merged)
+
+            state = self._generation_state(step)
+            if state.get("status") == "partial":
+                if step == "bible":
+                    next_label = "第二批：人物、设定、伏笔"
+                    self._pending_batch_kind = "bible_assets"
+                    self._pending_stage_index = -1
+                else:
+                    next_index = int(state.get("next_stage_index", 0) or 0)
+                    self._pending_batch_kind = "stage_plan_stage"
+                    self._pending_stage_index = next_index
+                    next_label = (
+                        f"第{next_index + 1}阶段"
+                        if batch_kind != "stage_skeleton"
+                        else "第1阶段"
+                    )
+                self._set_status_text(f"已保存当前批次，接下来生成{next_label}。")
+            else:
+                shortfalls = (
+                    _creation_scale_shortfalls(merged, self.target_words_spin.value())
+                    if step == "bible" else []
+                )
+                if shortfalls:
+                    self._set_status_text(
+                        "已生成；资料数量低于建议参考值："
+                        + "、".join(shortfalls)
+                        + "；可以直接确认，也可以重新生成故事底盘。"
+                    )
+                else:
+                    self._set_status_text("已生成当前步骤，可以直接确认进入下一步。")
+        self._save_draft()
         self._set_running(False)
 
     def _on_ai_failed(self, error):
-        self.status_label.setText(f"生成失败：{error}")
-        QMessageBox.warning(self, "新建向导生成失败", str(error))
+        raw_error = str(error or "生成失败。")
+        raw_error_lower = raw_error.lower()
+        if "流式响应在结果完成前中断" in raw_error:
+            message = (
+                raw_error
+                + "\n这表示模型还没有返回完整结果，程序没有把这次不完整响应写入当前批次；"
+                "已经完成的前一批或前一阶段仍然保留。"
+            )
+        elif "gateway request timed out" in raw_error_lower:
+            message = (
+                "上游网关等待模型输出超时（gateway request timed out）。\n"
+                "这不是小说内容检查失败，而是本次连接在结果完成前被网关关闭；"
+                "重新生成会重新发起完整请求。"
+            )
+        else:
+            message = raw_error
+        self._last_worker_error = f"生成失败：{message}"
+        self._generation_failed = True
+        self._pending_batch_kind = ""
+        self._pending_stage_index = -1
+        state = self._generation_state(CREATION_WIZARD_STEPS[self.current_step_index][0])
+        if state.get("status") == "partial":
+            continuation = "已完成的批次已经保存，下次点击生成会从未完成批次继续。"
+            message += "\n" + continuation
+            self._last_worker_error += "；已完成批次已保存，下次生成会继续未完成批次"
+        self._set_status_text(self._last_worker_error)
+        self._save_draft()
+        QMessageBox.warning(self, "新建向导生成失败", message)
         self._set_running(False)
 
     def _cleanup_worker(self):
@@ -949,17 +6627,33 @@ class NovelCreationWizardDialog(QDialog):
             worker.deleteLater()
         self._set_running(False)
         self._refresh_step_ui()
+        pending = bool(self._pending_batch_kind) and not self._generation_failed
+        self._pending_batch_kind = ""
+        self._pending_stage_index = -1
+        if pending:
+            QTimer.singleShot(0, self._generate_current)
+            return
+        if self._last_worker_error:
+            self._set_status_text(self._last_worker_error)
 
     def _read_current_step(self):
         step = CREATION_WIZARD_STEPS[self.current_step_index][0]
         if step == "premise":
-            self._save_current_candidate()
             if not self.premise_candidates:
                 raise ValueError("请先生成至少一份故事方向。")
             candidate = self._current_premise()
-            candidate["genre"] = candidate.get("genre") or self.genre_edit.text().strip()
-            candidate["style"] = candidate.get("style") or self.style_edit.text().strip()
-            candidate["audience"] = candidate.get("audience") or self.audience_combo.currentText().strip()
+            candidate["genre"] = self._selected_choice("genre")
+            candidate["theme"] = self._selected_choice("theme")
+            candidate["style"] = candidate.get("style") or self._selected_choice("style")
+            candidate["audience"] = candidate.get("audience") or self._selected_choice("audience")
+            candidate["protagonist_route"] = (
+                candidate.get("protagonist_route")
+                or self._selected_choice("protagonist_route")
+            )
+            candidate["story_engine"] = (
+                candidate.get("story_engine")
+                or self._selected_choice("style")
+            )
             if not candidate.get("title") or not candidate.get("synopsis"):
                 raise ValueError("书名和完整简介不能为空。")
             self.premise_candidates[self.premise_selected_index] = deepcopy(candidate)
@@ -969,28 +6663,40 @@ class NovelCreationWizardDialog(QDialog):
                 "selected": candidate,
             }
             return
-        editor = self.json_editors.get(step)
-        if editor is None:
-            raise ValueError("当前步骤编辑器不存在。")
-        text = editor.toPlainText().strip()
-        if not text:
-            raise ValueError("请先生成当前步骤内容。")
-        try:
-            value = json.loads(text)
-        except json.JSONDecodeError as exc:
-            raise ValueError(f"当前步骤不是合法 JSON：第 {exc.lineno} 行，第 {exc.colno} 列。") from exc
-        normalized = normalize_creation_result(step, value)
-        if step == "story_assets":
+        if step not in self.step_results:
+            raise ValueError("请先点击 AI 生成当前步骤。")
+        generation_state = self._generation_state(step)
+        if _as_text(generation_state.get("status")).lower() == "partial":
+            if step == "bible":
+                raise ValueError("故事底盘还在生成中，请先点击 AI 生成完成第二批人物、设定和伏笔。")
+            raise ValueError("阶段规划还在生成中，请先点击 AI 生成完成剩余阶段。")
+        normalized = self._normalize_step_result(step, self.step_results.get(step, {}))
+        if step == "bible":
             missing = [
                 label for key, label in (
+                    ("bible", "小说圣经"),
+                    ("world_rules", "世界规则"),
                     ("characters", "人物"),
                     ("lore", "设定"),
                     ("foreshadows", "伏笔"),
                 )
-                if not normalized.get(key)
+                if not _has_creation_content(normalized.get(key))
             ]
             if missing:
-                raise ValueError(f"当前步骤缺少：{'、'.join(missing)}。")
+                raise ValueError(
+                    f"当前故事底盘缺少：{'、'.join(missing)}。请重新生成完整故事底盘。"
+                )
+            stage_shortfalls = _foreshadow_stage_shortfalls(
+                normalized.get("foreshadows", []),
+                _expected_stage_count(self.target_words_spin.value()),
+            )
+            if stage_shortfalls:
+                stage_count = _expected_stage_count(self.target_words_spin.value())
+                raise ValueError(
+                    "伏笔阶段位置无效或超出本书阶段范围："
+                    + "、".join(stage_shortfalls[:12])
+                    + f"。本书只有第1至第{stage_count}阶段，请重新生成故事底盘。"
+                )
         elif step == "stage_plan" and not normalized.get(step):
             raise ValueError("当前步骤至少需要一条内容。")
         if step == "stage_plan":
@@ -999,16 +6705,55 @@ class NovelCreationWizardDialog(QDialog):
                 self.target_words_spin.value(),
                 self.average_words_spin.value(),
             )
-        if step == "bible" and not normalized.get("bible"):
-            raise ValueError("小说圣经不能为空。")
-        if step == "bible" and not normalized.get("world_rules"):
-            raise ValueError("世界规则不能为空。")
+            total_chapters = _creation_total_chapters(
+                self.target_words_spin.value(),
+                self.average_words_spin.value(),
+            )
+            bible_result = self.step_results.get("bible", {})
+            bible_foreshadows = (
+                bible_result.get("foreshadows", [])
+                if isinstance(bible_result, dict) else []
+            )
+            canonical_schedule, _schedule_notes, _schedule_errors = _canonicalize_foreshadow_schedule(
+                bible_foreshadows,
+                normalized.get("foreshadow_schedule", []),
+                self._stage_specs(),
+                total_chapters,
+                strict=True,
+            )
+            if _schedule_errors:
+                raise ValueError(
+                    "阶段规划中的伏笔章位与第二步底盘不一致："
+                    + "；".join(_schedule_errors[:6])
+                    + "。请重新生成对应阶段。"
+                )
+            normalized["foreshadow_schedule"] = canonical_schedule
+            if len(normalized.get("stage_plan", [])) < len(self._stage_specs()):
+                raise ValueError("阶段规划尚未覆盖全部十万字阶段，请继续生成。")
+            missing_schedule = _stage_foreshadow_shortfalls(
+                bible_foreshadows,
+                normalized.get("foreshadow_schedule", []),
+                self._stage_specs(),
+                total_chapters,
+            )
+            if missing_schedule:
+                missing_labels = [
+                    f"{item.get('code') or item.get('name') or '未命名伏笔'}"
+                    f"（第{int(item.get('stage_index', 0)) + 1}阶段{('埋设' if item.get('kind') == 'setup' else '回收')}）"
+                    for item in missing_schedule
+                ]
+                raise ValueError(
+                    "阶段规划没有为全部伏笔确定具体章位："
+                    + "、".join(missing_labels[:12])
+                    + "。请重新生成阶段规划。"
+                )
         self.step_results[step] = normalized
 
     def _go_back(self):
         if self.worker is not None or self.current_step_index <= 0:
             return
         self.current_step_index -= 1
+        self._save_draft()
         self._refresh_step_ui()
 
     def _go_next(self):
@@ -1021,16 +6766,56 @@ class NovelCreationWizardDialog(QDialog):
             return
         if self.current_step_index < len(CREATION_WIZARD_STEPS) - 1:
             self.current_step_index += 1
+            self._save_draft()
             self._refresh_step_ui()
             return
+        self._save_draft()
         self.accept()
 
     def result_payload(self):
         self._save_current_candidate()
         premise_result = self.step_results.get("premise", {})
-        selected = premise_result.get("selected", {}) if isinstance(premise_result, dict) else {}
+        selected = (
+            deepcopy(premise_result.get("selected", {}))
+            if isinstance(premise_result, dict)
+            else {}
+        )
+        if not isinstance(selected, dict):
+            selected = {}
+        if not selected.get("title") or not selected.get("synopsis"):
+            candidates = (
+                premise_result.get("candidates", [])
+                if isinstance(premise_result, dict)
+                else []
+            )
+            if not isinstance(candidates, list) or not candidates:
+                candidates = self.premise_candidates
+            if isinstance(candidates, list) and candidates:
+                index = max(0, min(self.premise_selected_index, len(candidates) - 1))
+                candidate = candidates[index]
+                if isinstance(candidate, dict):
+                    selected = deepcopy(candidate)
+        if selected:
+            selected["genre"] = self._selected_choice("genre")
+            selected["theme"] = self._selected_choice("theme")
+            selected["style"] = selected.get("style") or self._selected_choice("style")
+            selected["audience"] = selected.get("audience") or self._selected_choice("audience")
+            selected["protagonist_route"] = (
+                selected.get("protagonist_route")
+                or self._selected_choice("protagonist_route")
+            )
+            selected["story_engine"] = (
+                selected.get("story_engine")
+                or self._selected_choice("style")
+            )
         bible_result = self.step_results.get("bible", {})
-        assets_result = deepcopy(self.step_results.get("story_assets", {}))
+        assets_result = deepcopy(bible_result) if isinstance(bible_result, dict) else {}
+        # 兼容仍停留在旧版本向导草稿中的独立 story_assets。
+        legacy_assets = self.step_results.get("story_assets", {})
+        if isinstance(legacy_assets, dict):
+            for key in ("characters", "lore", "foreshadows"):
+                if not assets_result.get(key) and legacy_assets.get(key):
+                    assets_result[key] = deepcopy(legacy_assets[key])
         stage_result = deepcopy(self.step_results.get("stage_plan", {}))
         if isinstance(stage_result, dict):
             stage_result["stage_plan"] = normalize_stage_plan_ranges(
@@ -1038,8 +6823,30 @@ class NovelCreationWizardDialog(QDialog):
                 self.target_words_spin.value(),
                 self.average_words_spin.value(),
             )
+            self._canonicalize_stage_schedule(stage_result, strict=True)
+        total_chapters = _creation_total_chapters(
+            self.target_words_spin.value(),
+            self.average_words_spin.value(),
+        )
+        foreshadow_schedule = (
+            _normalize_foreshadow_schedule(
+                stage_result.get("foreshadow_schedule", []),
+                total_chapters,
+            ) if isinstance(stage_result, dict) else []
+        )
+        bible_result = deepcopy(bible_result) if isinstance(bible_result, dict) else {}
+        bible_result["foreshadows"] = _apply_foreshadow_schedule(
+            bible_result.get("foreshadows", []),
+            foreshadow_schedule,
+            total_chapters,
+        )
+        for foreshadow in bible_result.get("foreshadows", []):
+            if isinstance(foreshadow, dict):
+                foreshadow.pop("setup_stage", None)
+                foreshadow.pop("payoff_stage", None)
+        assets_result["foreshadows"] = deepcopy(bible_result.get("foreshadows", []))
         framework = {
-            "schema_version": 1,
+            "schema_version": 2,
             "source": "creation_wizard",
             "premise": deepcopy(selected),
             "premise_candidates": deepcopy(premise_result.get("candidates", [])),
@@ -1048,11 +6855,18 @@ class NovelCreationWizardDialog(QDialog):
             "characters": deepcopy(assets_result.get("characters", [])),
             "lore": deepcopy(assets_result.get("lore", [])),
             "foreshadows": deepcopy(assets_result.get("foreshadows", [])),
-            "relationship_map": deepcopy(assets_result.get("relationship_map", [])),
-            "key_scenes": deepcopy(assets_result.get("key_scenes", [])),
+            "stage_skeleton": deepcopy(stage_result.get("stage_skeleton", [])),
             "stage_plan": deepcopy(stage_result.get("stage_plan", [])),
-            "global_direction": _as_text(stage_result.get("global_direction", "")),
-            "chapter_plan_note": _as_text(stage_result.get("chapter_plan_note", "")),
+            "foreshadow_schedule": deepcopy(foreshadow_schedule),
+            "planning_schema_version": _as_text(
+                stage_result.get("planning_schema_version", "2")
+            ) or "2",
+            "book_contract": _normalize_stage_book_contract(
+                stage_result.get("book_contract", {})
+            ),
+            "chapter_plan_note": _clean_chapter_plan_note(
+                stage_result.get("chapter_plan_note", "")
+            ),
             "total_words": self.target_words_spin.value(),
             "average_chapter_words": self.average_words_spin.value(),
             "completed_at": now_str(),
@@ -1071,8 +6885,17 @@ class NovelCreationWizardDialog(QDialog):
         }
         return {"creation_framework": framework, "creation_wizard_state": state}
 
+    def reject(self):
+        if self.worker is None:
+            self._save_draft()
+        super().reject()
+
     def closeEvent(self, event):
         if self.worker is not None:
+            self._save_draft()
+            self._generation_failed = True
+            self._pending_batch_kind = ""
+            self._pending_stage_index = -1
             try:
                 self.worker.stop()
                 self.worker.wait(2000)
@@ -1082,4 +6905,122 @@ class NovelCreationWizardDialog(QDialog):
             self.worker = None
             self._set_running(False)
             return
+        self._save_draft()
         super().closeEvent(event)
+
+
+class NovelCreationWorkspaceDialog(QDialog):
+    """管理多个尚未完成的向导项目；每个项目由独立向导窗口负责生成。"""
+
+    new_draft_requested = Signal()
+    draft_open_requested = Signal(str)
+
+    def __init__(self, open_draft_ids=None, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("新建小说：创作中的项目")
+        _fit_dialog_to_screen(
+            self,
+            width_ratio=0.52,
+            height_ratio=0.62,
+            minimum_width=520,
+            minimum_height=420,
+            maximum_width=820,
+            maximum_height=760,
+        )
+        self._open_draft_ids = open_draft_ids if callable(open_draft_ids) else (lambda: set())
+        self._build_workspace_ui()
+        self.refresh()
+
+    def _build_workspace_ui(self):
+        root = QVBoxLayout(self)
+        root.setContentsMargins(16, 16, 16, 16)
+        root.setSpacing(10)
+
+        title = QLabel("创作中的项目")
+        title.setStyleSheet("font-size: 16px; font-weight: bold;")
+        root.addWidget(title)
+
+        hint = QLabel("未完成的向导项目会按创建时间独立保存，完成后才会进入主程序项目列表。")
+        hint.setObjectName("hint")
+        hint.setWordWrap(True)
+        root.addWidget(hint)
+
+        self.draft_list = QListWidget()
+        self.draft_list.setSelectionMode(QAbstractItemView.SingleSelection)
+        self.draft_list.itemDoubleClicked.connect(self._open_selected)
+        root.addWidget(self.draft_list, 1)
+
+        actions = QHBoxLayout()
+        self.new_btn = QPushButton("新建项目")
+        self.open_btn = QPushButton("打开选中")
+        self.delete_btn = QPushButton("删除草稿")
+        self.refresh_btn = QPushButton("刷新")
+        self.new_btn.clicked.connect(self.new_draft_requested)
+        self.open_btn.clicked.connect(self._open_selected)
+        self.delete_btn.clicked.connect(self._delete_selected)
+        self.refresh_btn.clicked.connect(self.refresh)
+        actions.addWidget(self.new_btn)
+        actions.addWidget(self.open_btn)
+        actions.addWidget(self.delete_btn)
+        actions.addStretch(1)
+        actions.addWidget(self.refresh_btn)
+        root.addLayout(actions)
+
+    def _selected_draft_id(self):
+        item = self.draft_list.currentItem()
+        return _as_text(item.data(Qt.UserRole)) if item is not None else ""
+
+    def _open_selected(self, *_args):
+        draft_id = self._selected_draft_id()
+        if draft_id:
+            self.draft_open_requested.emit(draft_id)
+
+    def _delete_selected(self):
+        draft_id = self._selected_draft_id()
+        if not draft_id:
+            return
+        if draft_id in set(self._open_draft_ids() or set()):
+            QMessageBox.information(self, "无法删除", "这个项目正在打开，请先关闭它的向导窗口。")
+            return
+        item = self.draft_list.currentItem()
+        title = item.text().splitlines()[0] if item is not None else "这个项目"
+        answer = QMessageBox.question(
+            self,
+            "删除草稿",
+            f"确定删除“{title}”吗？\n删除后不能恢复。",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if answer != QMessageBox.Yes:
+            return
+        delete_creation_wizard_draft(draft_id)
+        self.refresh()
+
+    def refresh(self, *_args):
+        selected_id = self._selected_draft_id()
+        self.draft_list.blockSignals(True)
+        try:
+            self.draft_list.clear()
+            records = list_creation_wizard_drafts()
+            selected_row = -1
+            for row, record in enumerate(records):
+                title = _as_text(record.get("title")) or "未命名项目"
+                step = _as_text(record.get("step")) or "故事定位"
+                created_at = _as_text(record.get("created_at")) or "创建时间未知"
+                item = QListWidgetItem(f"{title}\n{step} · 创建于 {created_at}")
+                item.setData(Qt.UserRole, _as_text(record.get("draft_id")))
+                item.setToolTip(
+                    f"创建时间：{created_at}\n最近保存：{_as_text(record.get('updated_at'))}"
+                )
+                self.draft_list.addItem(item)
+                if _as_text(record.get("draft_id")) == selected_id:
+                    selected_row = row
+            if selected_row >= 0:
+                self.draft_list.setCurrentRow(selected_row)
+            elif self.draft_list.count():
+                self.draft_list.setCurrentRow(0)
+            has_items = self.draft_list.count() > 0
+            self.open_btn.setEnabled(has_items)
+            self.delete_btn.setEnabled(has_items)
+        finally:
+            self.draft_list.blockSignals(False)

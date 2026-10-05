@@ -372,6 +372,169 @@ def make_clickable(widget, tooltip=None):
     return widget
 
 
+# 当前视频综合分组公开目录中的能力约束。它们用于界面默认值、
+# 提交前校验和动态下拉选项；服务端仍是最终校验来源。
+VIDEO_MODEL_PROFILES = {
+    "seedance-2.0-900-特惠": {
+        "kind": "seedance",
+        "duration_min": 4,
+        "duration_max": 15,
+        "duration_default": 5,
+        "resolutions": ["480p", "720p"],
+        "resolution_default": "720p",
+        "ratios": ["16:9", "9:16", "1:1"],
+        "max_images": 9,
+        "max_audios": 3,
+        "max_videos": 3,
+    },
+    "seedance-2.5-900-特惠": {
+        "kind": "seedance",
+        "duration_min": 4,
+        "duration_max": 30,
+        "duration_default": 5,
+        "resolutions": ["480p", "720p"],
+        "resolution_default": "480p",
+        "ratios": ["16:9", "9:16", "1:1"],
+        "max_images": 9,
+        "max_audios": 3,
+        "max_videos": 3,
+    },
+    "seedance-2.0-933-特惠": {
+        "kind": "seedance",
+        "duration_min": 4,
+        "duration_max": 15,
+        "duration_default": 5,
+        "resolutions": ["480p", "720p", "1080p"],
+        "resolution_default": "720p",
+        "ratios": ["16:9", "9:16", "1:1"],
+        "max_images": 9,
+        "max_audios": 3,
+        "max_videos": 3,
+    },
+    "seedance-2.5-1010-特惠": {
+        "kind": "seedance",
+        "duration_min": 4,
+        "duration_max": 30,
+        "duration_default": 5,
+        "resolutions": ["480p", "720p"],
+        "resolution_default": "720p",
+        "ratios": ["16:9", "9:16", "1:1"],
+        "max_images": 10,
+        "max_audios": 10,
+        "max_videos": 3,
+    },
+    "seedance-2.5-3010-特惠": {
+        "kind": "seedance",
+        "duration_min": 4,
+        "duration_max": 30,
+        "duration_default": 5,
+        "resolutions": ["480p", "720p"],
+        "resolution_default": "720p",
+        "ratios": ["16:9", "9:16", "1:1"],
+        "max_images": 30,
+        "max_audios": 10,
+        "max_videos": 3,
+    },
+    "seedance2.0-mini-A": {
+        "kind": "seedance",
+        "duration_min": 5,
+        "duration_max": 15,
+        "duration_default": 5,
+        "resolutions": ["480p", "720p"],
+        "resolution_default": "720p",
+        "ratios": ["16:9", "9:16", "1:1"],
+        "duration_max_by_resolution": {"480p": 15, "720p": 12},
+        "max_images": 9,
+        "max_audios": 3,
+        "max_videos": 3,
+    },
+    "seedance2.5-pro-G1": {
+        "kind": "seedance",
+        "duration_min": 16,
+        "duration_max": 30,
+        "duration_default": 30,
+        "resolutions": ["720p"],
+        "resolution_default": "720p",
+        "ratios": ["16:9", "9:16", "1:1"],
+        "max_images": 30,
+        "max_audios": 10,
+        "max_videos": 0,
+    },
+    "grok-1.5": {
+        "kind": "mixed",
+        "duration_min": 3,
+        "duration_max": 15,
+        "duration_default": 5,
+        "resolutions": ["720p"],
+        "resolution_default": "720p",
+        "ratios": ["16:9", "9:16", "1:1"],
+        "max_images": 7,
+        "max_audios": 0,
+        "max_videos": 0,
+    },
+    "minimax-h3-933-2k-支持真人": {
+        "kind": "h3",
+        "duration_min": 4,
+        "duration_max": 15,
+        "duration_default": 15,
+        "resolutions": ["2k"],
+        "resolution_default": "2k",
+        "ratios": ["9:16", "1:1", "3:4", "4:3", "16:9"],
+        "max_images": 32,
+        "max_audios": 3,
+        "max_videos": 3,
+    },
+    "sd-2.0-933-720-fast-原生真人": {
+        "kind": "mixed",
+        "duration_min": 4,
+        "duration_max": 15,
+        "duration_default": 5,
+        "resolutions": ["720p"],
+        "resolution_default": "720p",
+        "ratios": ["16:9", "9:16", "1:1"],
+        "max_images": 9,
+        "max_audios": 3,
+        "max_videos": 3,
+    },
+}
+
+
+def video_model_profile(model):
+    """返回视频模型能力副本，未知模型按旧版兼容协议处理。"""
+    model = str(model or "").strip()
+    lower = model.lower()
+    if lower == "h3" or lower.startswith("h3-"):
+        return {
+            "kind": "h3",
+            "duration_min": 1,
+            "duration_max": 15,
+            "duration_default": 8,
+            "resolutions": ["480p", "720p", "1080p"],
+            "resolution_default": "480p",
+            "ratios": ["16:9", "9:16", "1:1", "4:3", "3:4"],
+            "max_images": 7,
+            "max_audios": 3,
+            "max_videos": 0,
+        }
+    profile = VIDEO_MODEL_PROFILES.get(model)
+    if profile is None and lower.startswith("seedance"):
+        profile = VIDEO_MODEL_PROFILES["seedance-2.0-900-特惠"]
+    if profile is None:
+        return {
+            "kind": "legacy",
+            "duration_min": 1,
+            "duration_max": 15,
+            "duration_default": 8,
+            "resolutions": ["480p", "720p", "1080p"],
+            "resolution_default": "480p",
+            "ratios": ["16:9", "9:16", "1:1"],
+            "max_images": 0,
+            "max_audios": 0,
+            "max_videos": 0,
+        }
+    return {key: (dict(value) if isinstance(value, dict) else list(value) if isinstance(value, list) else value) for key, value in profile.items()}
+
+
 def default_config():
     return {
         "providers": [],
@@ -386,15 +549,16 @@ def default_config():
         },
         "video": {
             "provider_id": "",
-            "model": "agnes-video-v2.0",
+            "model": "seedance-2.0-900-特惠",
             "mode": "文生视频",
             "width": "1280",
             "height": "720",
             "num_frames": "81",
             "frame_rate": "24",
-            "duration": "8",
+            "duration": "5",
             "aspect_ratio": "16:9",
-            "resolution": "480p",
+            "ratio": "16:9",
+            "resolution": "720p",
         },
         "agent": {"provider_id": "", "model": ""},
         "novel": {"provider_id": "", "model": ""},
@@ -469,15 +633,16 @@ def normalize_config(cfg):
     cfg["image"].setdefault("quality", "自动")
     cfg["image"].setdefault("upload_optimization", "高质量")
     cfg["video"].setdefault("provider_id", "")
-    cfg["video"].setdefault("model", "agnes-video-v2.0")
+    cfg["video"].setdefault("model", "seedance-2.0-900-特惠")
     cfg["video"].setdefault("mode", "文生视频")
     cfg["video"].setdefault("width", "1280")
     cfg["video"].setdefault("height", "720")
     cfg["video"].setdefault("num_frames", "81")
     cfg["video"].setdefault("frame_rate", "24")
-    cfg["video"].setdefault("duration", "8")
+    cfg["video"].setdefault("duration", "5")
     cfg["video"].setdefault("aspect_ratio", "16:9")
-    cfg["video"].setdefault("resolution", "480p")
+    cfg["video"].setdefault("ratio", cfg["video"].get("aspect_ratio", "16:9"))
+    cfg["video"].setdefault("resolution", "720p")
     if not cfg["video"].get("provider_id") and cfg["image"].get("provider_id"):
         cfg["video"]["provider_id"] = cfg["image"].get("provider_id", "")
     cfg["agent"].setdefault("provider_id", "")
@@ -646,7 +811,7 @@ _NOVEL_WRITING_HIGH_REASONING_ACTIONS = {
 
 # Keep import classification and both chapter-planning passes at the stable
 # High tier as well.
-_FIXED_HIGH_REASONING_ACTIONS = {"框架分类", "全书阶段规划", "章节规划"}
+_FIXED_HIGH_REASONING_ACTIONS = {"框架分类", "章节规划"}
 
 
 def _reasoning_model_key(model):

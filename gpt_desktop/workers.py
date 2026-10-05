@@ -41,6 +41,7 @@ from .core import (
     safe_remove_file,
     save_base64_to_image,
     save_bytes_to_image,
+    video_model_profile,
 )
 from .novel_utils import (
     NOVEL_AI_CONTEXT_LIMIT,
@@ -63,6 +64,7 @@ from .novel_utils import (
     _normalize_chapter_plan_foundation,
     _normalize_framework_analysis,
     _normalize_volume_continuity_anchors,
+    _story_conflict_pacing_guidance,
     NOVEL_PROSE_END_MARKER,
     NOVEL_PROSE_START_MARKER,
 )
@@ -77,6 +79,7 @@ from .novel_import import (
     _is_framework_scope_title,
     _normalize_ai_candidates,
 )
+from .novel_storage import save_novel_raw_model_output
 
 _BLENDER_PROBE_CACHE = {}
 
@@ -84,9 +87,27 @@ _BLENDER_PROBE_CACHE = {}
 _CHAPTER_PLAN_STATE_PROGRESSION_GUIDANCE = (
     "长期状态推进要求：对项目资料中已经明确的受伤、疾病、修养、长期身体限制、身份风险、持续追踪、关系僵局和未决任务，"
     "阶段与章节规划必须安排自然的变化路径：从当前影响走向继续、缓解、恶化、转化、解决或稳定。"
-    "可以暂不解决，但必须给出本阶段真实的新后果或下一推进窗口，不能让同一句状态原样跨多个章节。"
-    "恢复或解决必须有资料中已有或剧情自然建立的时间、资源、事件依据；不要凭空痊愈，"
-    "也不要把状态推进拆成固定办理流程或要求每章处理所有状态。"
+    "暂时悬而未决的状态也要在本阶段留下真实的新后果或下一推进窗口，让同一状态随着人物选择持续变化；"
+    "同一状态在连续章节中要呈现新的后果、压力或推进；不能让同一句状态原样跨多个章节。"
+    "恢复或解决必须有资料中已有或剧情自然建立的时间、资源、事件依据，状态推进融入人物正在经历的场景。"
+)
+
+
+_CHAPTER_PLAN_STORY_LANGUAGE_GUIDANCE = (
+    "【章节规划表达】\n"
+    "章节规划是给后续正文扩写使用的结构化事实底稿，不是发布简介，也不是最终小说正文。"
+    "每章先固定人物、地点、前置状态、具体行动、现实阻力、结果和章末变化；这些内容必须能直接用于后续正文扩写。"
+    "outline只写本章具体发生的故事事实，可以用清楚的短段落或分句表达，不要求文学化，也不要求单独生成一份自然语言版规划。"
+    "规划可以使用清楚的结构化表达，不套固定句式；字段内容直接写人物正在经历的事情、当下压力、选择和结果。"
+    "内容只保留故事事实和必要索引，字段名、内部编号、JSON、代码和生成过程留在外层结构中。"
+    "除非作者明确选择办案、破案或调查推理题材，否则不得采用案卷化、办案式、审查流程式的剧情推进；不得让文书往来、纸面说明、程序步骤或结论说明代替人物在现场的行动和冲突。"
+    "非办案题材要用场景压力、人物行动、关系碰撞、情绪变化和具体后果推进；人物必须在当下处境中遇到阻力、采取行动、作出选择并承担变化。"
+    "非办案题材中，连续两章不能都停在解释、谈话、安排或结论；至少让其中一章出现人物的主动行动、直接碰撞、利益变化、关系变化、环境压力、能力试探或突发后果，并让结果改变后续章节的起点。"
+    "章节规划使用清楚、具体、便于执行的故事事实和人物行动表达，不得出现策划术语、抽象形容、办案式表达、编辑式说明或编辑式总结。"
+    "人物认知、关系和局势的变化都落到具体看见、听见、决定、行动和结果；阶段事件按自然的场景长度组合，让相邻章节有变化并共同完成节点。"
+    "伏笔随着人物实际行动、关系变化和局势发展自然生长，不写固定伏笔任务；线索可以在合适的时机转化为新的选择、代价、误会、帮助或冲突。"
+    "伏笔由后续扩写正文和正文分析根据实际内容动态处理，规划阶段只提供能够支撑故事继续发展的线索和变化空间。"
+    "阶段剧情节点提供连续性依据，不能决定本章写什么题材内容；本章题材内容仍由当前人物、场景、关系和正在发生的事情自然决定。\n"
 )
 
 
@@ -1196,6 +1217,8 @@ class NovelAnalysisWorker(QThread):
         self.last_user_text = ""
         self.last_partial_output = ""
         self.last_invalid_json_output = ""
+        self.capture_raw_model_output = False
+        self.raw_model_output_metadata = {}
         input_bytes = self.text.encode("utf-8", errors="replace")
         self.diagnostics = {
             "requested_model": str(self.model or ""),
@@ -1215,6 +1238,7 @@ class NovelAnalysisWorker(QThread):
             "reasoning_chars": 0,
             "content_chars": 0,
             "partial_output_chars": 0,
+            "raw_response_chars": 0,
             "last_http_status": 0,
             "last_response_headers": {},
             "http_status": 0,
@@ -1291,6 +1315,12 @@ class NovelAnalysisWorker(QThread):
     def _begin_analysis_api_diagnostic(self, prompt, user_text, stream, use_response_format):
         prompt = str(prompt or "")
         user_text = str(user_text or "")
+        # The UI counter represents returned content, not hidden reasoning.
+        # Reset it for every real API attempt so retries do not look like one
+        # ever-growing response.
+        with self._output_chars_lock:
+            self._output_chars_total = 0
+        self.output_chars.emit(0)
         self.last_system_prompt = prompt
         self.last_user_text = user_text
         self.last_partial_output = ""
@@ -1318,6 +1348,7 @@ class NovelAnalysisWorker(QThread):
             "finish_reason": "",
             "response_headers": {},
             "response_chars": 0,
+            "raw_response_chars": 0,
             "reasoning_chars": 0,
             "content_chars": 0,
             "sse_lines": 0,
@@ -1335,6 +1366,8 @@ class NovelAnalysisWorker(QThread):
             return attempt["index"] - 1
 
     def _finish_analysis_api_diagnostic(self, index, **updates):
+        raw_output = ""
+        raw_metadata = {}
         with self._diagnostic_lock:
             attempts = self.diagnostics.setdefault("attempts", [])
             if not (0 <= int(index) < len(attempts)):
@@ -1368,6 +1401,9 @@ class NovelAnalysisWorker(QThread):
             self.diagnostics["response_chars"] = int(
                 attempt.get("response_chars", 0) or 0
             )
+            self.diagnostics["raw_response_chars"] = int(
+                attempt.get("raw_response_chars", 0) or 0
+            )
             self.diagnostics["time_to_headers_ms"] = float(
                 attempt.get("time_to_headers_ms", 0) or 0
             )
@@ -1383,6 +1419,43 @@ class NovelAnalysisWorker(QThread):
             self.diagnostics["done_received"] = bool(
                 attempt.get("received_done", False)
             )
+            if self.capture_raw_model_output:
+                raw_output = str(self.last_partial_output or "")
+                raw_metadata = {
+                    "model": str(self.model or ""),
+                    "stage": str(getattr(self, "diagnostic_stage", "") or ""),
+                    "project_path": str(
+                        getattr(self, "diagnostic_project_path", "") or ""
+                    ),
+                    "project_title": str(
+                        getattr(self, "diagnostic_project_title", "") or ""
+                    ),
+                    "outcome": str(attempt.get("outcome", "") or ""),
+                    "finish_reason": str(attempt.get("finish_reason", "") or ""),
+                    "http_status": int(attempt.get("http_status", 0) or 0),
+                    "response_chars": int(attempt.get("response_chars", 0) or 0),
+                    "content_chars": int(attempt.get("content_chars", 0) or 0),
+                    "reasoning_chars": int(attempt.get("reasoning_chars", 0) or 0),
+                    "received_done": bool(attempt.get("received_done", False)),
+                    "metadata": deepcopy(self.raw_model_output_metadata)
+                    if isinstance(self.raw_model_output_metadata, dict)
+                    else {},
+                }
+                if attempt.get("error"):
+                    raw_metadata["error"] = str(attempt.get("error") or "")[:2000]
+
+        if self.capture_raw_model_output:
+            raw_path = save_novel_raw_model_output(
+                getattr(self, "diagnostic_request_id", ""),
+                attempts[int(index)].get("index", int(index) + 1),
+                raw_output,
+                raw_metadata,
+            )
+            if raw_path:
+                with self._diagnostic_lock:
+                    attempts = self.diagnostics.setdefault("attempts", [])
+                    if 0 <= int(index) < len(attempts):
+                        attempts[int(index)]["raw_output_path"] = raw_path
 
     def _increment_analysis_diagnostic(self, key, amount=1):
         with self._diagnostic_lock:
@@ -1938,6 +2011,10 @@ class NovelAnalysisWorker(QThread):
     def _analysis_progress_label(self):
         return "候选分析"
 
+    def _max_tokens_for_request(self):
+        """Return an optional output budget for structured analysis requests."""
+        return 0
+
     def _reasoning_effort_for_request(self):
         # V2 structured writing tasks expose their action directly; legacy
         # analysis workers use the progress label (for example 框架分类).
@@ -1967,6 +2044,10 @@ class NovelAnalysisWorker(QThread):
             ],
             "temperature": 0.2,
         }
+        max_tokens = self._max_tokens_for_request()
+        if max_tokens:
+            payload["max_tokens"] = int(max_tokens)
+            self.diagnostics["max_output_tokens"] = int(max_tokens)
         reasoning_effort = self._reasoning_effort_for_request()
         if reasoning_effort:
             payload["reasoning_effort"] = reasoning_effort
@@ -2028,7 +2109,7 @@ class NovelAnalysisWorker(QThread):
                 or ""
             )
             self.last_partial_output = content or reasoning
-            self._emit_output_chars(len(content or reasoning))
+            self._emit_output_chars(len(content))
             parsed = self._parse_json_result(content)
             piece_at_ms = round((time.perf_counter() - diagnostic_started) * 1000, 1)
             self._finish_analysis_api_diagnostic(
@@ -2041,7 +2122,8 @@ class NovelAnalysisWorker(QThread):
                 time_to_first_content_ms=piece_at_ms if content else 0,
                 last_piece_at_ms=piece_at_ms if (content or reasoning) else 0,
                 response_headers=response_headers,
-                response_chars=len(content or reasoning),
+                response_chars=len(content),
+                raw_response_chars=len(content) + len(reasoning),
                 reasoning_chars=len(reasoning),
                 content_chars=len(content),
                 outcome="success",
@@ -2057,7 +2139,8 @@ class NovelAnalysisWorker(QThread):
                 response_model=response_model,
                 time_to_headers_ms=time_to_headers_ms,
                 response_headers=response_headers,
-                response_chars=len(content or reasoning),
+                response_chars=len(content),
+                raw_response_chars=len(content) + len(reasoning),
                 reasoning_chars=len(reasoning),
                 content_chars=len(content),
                 outcome="error",
@@ -2096,6 +2179,10 @@ class NovelAnalysisWorker(QThread):
             "temperature": 0.2,
             "stream": True,
         }
+        max_tokens = self._max_tokens_for_request()
+        if max_tokens:
+            payload["max_tokens"] = int(max_tokens)
+            self.diagnostics["max_output_tokens"] = int(max_tokens)
         reasoning_effort = self._reasoning_effort_for_request()
         if reasoning_effort:
             payload["reasoning_effort"] = reasoning_effort
@@ -2119,6 +2206,7 @@ class NovelAnalysisWorker(QThread):
         max_idle_gap_ms = 0.0
         reasoning_chars = 0
         content_chars = 0
+        reasoning_full = ""
         sse_lines = 0
         invalid_sse_lines = 0
         received_done = False
@@ -2174,6 +2262,7 @@ class NovelAnalysisWorker(QThread):
                         max_idle_gap_ms=max_idle_gap_ms,
                         finish_reason=finish_reason,
                         response_chars=len(full),
+                        raw_response_chars=content_chars + reasoning_chars,
                         reasoning_chars=reasoning_chars,
                         content_chars=content_chars,
                         sse_lines=sse_lines,
@@ -2251,12 +2340,28 @@ class NovelAnalysisWorker(QThread):
                         first_piece = True
                         time_to_first_piece_ms = piece_at_ms
                         self.progress.emit(f"正在接收{self._analysis_progress_label()} {chunk_index}/{total_chunks} 的流式结果...")
-                    full += piece
-                    self.last_partial_output = full
-                    self._emit_output_chars(len(piece))
+                    if reasoning_piece:
+                        reasoning_full += reasoning_piece
+                    if content_piece:
+                        full += content_piece
+                        self.last_partial_output = full
+                        self._emit_output_chars(len(content_piece))
+                    elif not full:
+                        self.last_partial_output = reasoning_full
             if not full.strip():
                 raise Exception("AI 没有返回有效候选内容。")
-            parsed = self._parse_json_result(full)
+            if finish_reason in {"length", "max_tokens", "token_limit"}:
+                raise ValueError(
+                    f"AI 返回在输出上限处被截断（finish_reason={finish_reason}）。"
+                )
+            try:
+                parsed = self._parse_json_result(full)
+            except Exception as parse_error:
+                if not received_done:
+                    raise ValueError(
+                        "流式输出未收到完整结束标记，返回内容疑似在输出上限处被截断。"
+                    ) from parse_error
+                raise
             self._finish_analysis_api_diagnostic(
                 diagnostic_index,
                 http_status=int(getattr(r, "status_code", 0) or 0),
@@ -2270,6 +2375,7 @@ class NovelAnalysisWorker(QThread):
                 finish_reason=finish_reason,
                 response_headers=response_headers,
                 response_chars=len(full),
+                raw_response_chars=content_chars + reasoning_chars,
                 reasoning_chars=reasoning_chars,
                 content_chars=content_chars,
                 sse_lines=sse_lines,
@@ -2284,6 +2390,18 @@ class NovelAnalysisWorker(QThread):
             elapsed_ms = round((time.perf_counter() - diagnostic_started) * 1000, 1)
             if last_piece_at_ms:
                 max_idle_gap_ms = max(max_idle_gap_ms, elapsed_ms - last_piece_at_ms)
+            stream_failure_text = str(exc)[:1000]
+            if self._is_stream_read_failure(exc):
+                stream_failure_text = self._analysis_stream_failure_message(
+                    exc,
+                    http_status=int(getattr(r, "status_code", 0) or 0) if r is not None else 0,
+                    content_chars=content_chars,
+                    reasoning_chars=reasoning_chars,
+                    sse_lines=sse_lines,
+                    invalid_sse_lines=invalid_sse_lines,
+                    received_done=received_done,
+                    finish_reason=finish_reason,
+                )
             self._finish_analysis_api_diagnostic(
                 diagnostic_index,
                 http_status=int(getattr(r, "status_code", 0) or 0) if r is not None else 0,
@@ -2297,6 +2415,7 @@ class NovelAnalysisWorker(QThread):
                 finish_reason=finish_reason,
                 response_headers=response_headers,
                 response_chars=len(full),
+                raw_response_chars=content_chars + reasoning_chars,
                 reasoning_chars=reasoning_chars,
                 content_chars=content_chars,
                 sse_lines=sse_lines,
@@ -2304,10 +2423,12 @@ class NovelAnalysisWorker(QThread):
                 received_done=received_done,
                 outcome="error",
                 error_type=type(exc).__name__,
-                error=str(exc)[:1000],
+                error=stream_failure_text,
                 finished_at=now_str(),
                 elapsed_ms=elapsed_ms,
             )
+            if stream_failure_text != str(exc)[:1000]:
+                raise RuntimeError(stream_failure_text) from exc
             raise
         finally:
             if r is not None:
@@ -2324,8 +2445,53 @@ class NovelAnalysisWorker(QThread):
             except Exception:
                 pass
 
+    @staticmethod
+    def _is_stream_read_failure(error):
+        msg = str(error or "").lower()
+        return any(
+            marker in msg
+            for marker in (
+                "stream_read_error",
+                "stream read error",
+                "response ended prematurely",
+                "incomplete read",
+                "chunkedencodingerror",
+                "connection broken",
+                "remote end closed connection",
+                "protocolerror",
+            )
+        )
+
+    @staticmethod
+    def _analysis_stream_failure_message(
+        error,
+        http_status=0,
+        content_chars=0,
+        reasoning_chars=0,
+        sse_lines=0,
+        invalid_sse_lines=0,
+        received_done=False,
+        finish_reason="",
+    ):
+        original = str(error or "未知流式读取错误").strip() or "未知流式读取错误"
+        status = str(int(http_status)) if http_status else "未知"
+        finish = str(finish_reason or "").strip() or "未返回"
+        return (
+            "流式响应在结果完成前中断。"
+            f"原始错误：{original[:300]}；"
+            f"HTTP状态：{status}；"
+            f"已接收正文：{int(content_chars or 0)}字符；"
+            f"已接收推理内容：{int(reasoning_chars or 0)}字符；"
+            f"流数据行数：{int(sse_lines or 0)}；"
+            f"无法解析的流数据行数：{int(invalid_sse_lines or 0)}；"
+            f"收到完整结束标记：{'是' if received_done else '否'}；"
+            f"完成原因：{finish}。"
+        )
+
     def _is_retryable_analysis_error(self, error):
         if self._is_analysis_rate_limit_error(error):
+            return True
+        if self._is_analysis_output_limit_error(error):
             return True
         if getattr(self, "_analysis_stream_only", False) and self._is_stream_json_error(error):
             return True
@@ -2352,8 +2518,38 @@ class NovelAnalysisWorker(QThread):
             "connection broken",
             "remote end closed connection",
             "protocolerror",
+            "stream_read_error",
+            "stream read error",
         )
         return any(marker in msg for marker in retry_markers)
+
+    @staticmethod
+    def _is_analysis_output_limit_error(error):
+        msg = str(error or "").lower()
+        return any(
+            marker in msg
+            for marker in (
+                "输出上限",
+                "输出长度上限",
+                "output limit",
+                "maximum output",
+                "max output",
+                "finish_reason=length",
+                "finish_reason=max_tokens",
+                "token_limit",
+                "token limit",
+            )
+        )
+
+    @staticmethod
+    def _compact_analysis_retry_prompt(prompt):
+        return (
+            str(prompt or "")
+            + "\n\n【输出长度保护】上一次响应在固定输出上限处被截断。"
+            "本次必须保留全部事实、资料数量和章节数量，不得删减人物、设定、伏笔或剧情内容；"
+            "只压缩 JSON 容器：禁止 Markdown、缩进、空行和多余空格，省略空字符串、空数组和没有内容的可选字段，"
+            "不要重复输入资料或输出解释，只返回一份紧凑且完整的合法 JSON。"
+        )
 
     def _is_analysis_rate_limit_error(self, error):
         msg = str(error or "").lower()
@@ -2513,13 +2709,14 @@ class NovelAnalysisWorker(QThread):
     def _analyze_chunk_with_retries(self, prompt, chunk, label, total, use_response_format):
         attempts = max(1, int(self.retry_attempts or 1))
         current_response_format = use_response_format
+        current_prompt = str(prompt or "")
         last_error = None
         for attempt in range(1, attempts + 1):
             if self._stop_requested or self.isInterruptionRequested():
                 return {}, current_response_format
             try:
                 return self._analyze_chunk_resilient(
-                    prompt,
+                    current_prompt,
                     chunk,
                     label,
                     total,
@@ -2531,6 +2728,9 @@ class NovelAnalysisWorker(QThread):
                 if getattr(e, "_analysis_split_failed", False) or attempt >= attempts or not self._is_retryable_analysis_error(e):
                     raise
                 self._increment_analysis_diagnostic("retry_count")
+                if self._is_analysis_output_limit_error(e):
+                    current_prompt = self._compact_analysis_retry_prompt(current_prompt)
+                    self.progress.emit("上次响应触及输出上限，本次重试将保持内容不变并压缩 JSON 外壳...")
                 wait_seconds = self._analysis_retry_wait_seconds(e, attempt)
                 self.progress.emit(
                     self._analysis_retry_progress_text(e, label, total, wait_seconds, attempt + 1, attempts)
@@ -3197,7 +3397,7 @@ class NovelFrameworkImportWorker(NovelAnalysisWorker):
             for key in (
                 "relationship_task", "investigation_scope", "chapter_function",
                 "conflict_intensity", "setup_ratio", "character_task", "mainline_task",
-                "planning_method", "start_state", "must_happen", "forbidden_reveal",
+                "planning_method", "start_state", "must_happen",
                 "satisfaction_payoff", "emotional_resonance", "relationship_change",
                 "exposition_compression", "variation_pattern", "foreshadow_task",
                 "forbidden", "goal", "main_event", "conflict", "turning_point",
@@ -6038,7 +6238,118 @@ class EdgeTTSWorker(QThread):
                 self.failed.emit(str(e))
 
 
-class NovelChapterPlanMasterWorker(NovelAnalysisWorker):
+def _compact_worker_record(value, fields):
+    if isinstance(value, dict):
+        return deepcopy(value)
+    if not isinstance(value, list):
+        return {}
+    return {
+        field: deepcopy(value[index])
+        for index, field in enumerate(fields)
+        if index < len(value)
+    }
+
+
+def _expand_compact_chapter_plan(data):
+    data = deepcopy(data) if isinstance(data, dict) else {}
+    if "chapters" in data or not isinstance(data.get("c"), list):
+        return data
+    chapters = []
+    for raw in data.get("c", []):
+        if isinstance(raw, dict):
+            item = deepcopy(raw)
+        elif isinstance(raw, list):
+            item = _compact_worker_record(
+                raw,
+                (
+                    "index", "title", "target_words", "stage_id", "narrative_stage",
+                    "source_stage", "dominant_line", "event_refs", "start_state",
+                    "scene_chain", "conflict", "required_facts",
+                    "continuity_delta", "ending_change", "source_location", "outline",
+                    "outline_mode", "characters", "ending_hook",
+                ),
+            )
+        else:
+            continue
+        aliases = {
+            "index": "i", "title": "t", "target_words": "w", "stage_id": "s",
+            "narrative_stage": "n", "source_stage": "u", "dominant_line": "d",
+            "event_refs": "e", "start_state": "b", "scene_chain": "q",
+            "conflict": "x", "required_facts": "f",
+            "continuity_delta": "z", "ending_change": "h", "source_location": "g",
+            "outline": "o", "outline_mode": "m", "characters": "p", "ending_hook": "k",
+        }
+        for canonical, short in aliases.items():
+            if canonical not in item and short in item:
+                item[canonical] = item.get(short)
+
+        if isinstance(item.get("start_state"), dict):
+            state = item["start_state"]
+            item["start_state"] = {
+                "location": state.get("l", state.get("location", "")),
+                "characters": state.get("c", state.get("characters", [])),
+                "known_facts": state.get("k", state.get("known_facts", [])),
+            }
+        scenes = []
+        for scene in item.get("scene_chain", []) if isinstance(item.get("scene_chain"), list) else []:
+            if isinstance(scene, dict):
+                scenes.append({
+                    "location": scene.get("l", scene.get("location", "")),
+                    "characters": scene.get("c", scene.get("characters", [])),
+                    "trigger": scene.get("t", scene.get("trigger", "")),
+                    "action": scene.get("a", scene.get("action", "")),
+                    "result": scene.get("r", scene.get("result", "")),
+                })
+            elif isinstance(scene, list):
+                scenes.append(_compact_worker_record(
+                    scene, ("location", "characters", "trigger", "action", "result")
+                ))
+        item["scene_chain"] = scenes
+        if isinstance(item.get("conflict"), dict):
+            conflict = item["conflict"]
+            item["conflict"] = {
+                "source": conflict.get("s", conflict.get("source", "")),
+                "pressure": conflict.get("p", conflict.get("pressure", "")),
+                "result": conflict.get("r", conflict.get("result", "")),
+            }
+        if isinstance(item.get("continuity_delta"), dict):
+            delta = item["continuity_delta"]
+            item["continuity_delta"] = {
+                "time_advance": delta.get("t", delta.get("time_advance", "")),
+                "location_changes": delta.get("l", delta.get("location_changes", [])),
+                "knowledge_changes": delta.get("k", delta.get("knowledge_changes", [])),
+                "relationship_changes": delta.get("r", delta.get("relationship_changes", [])),
+                "object_changes": delta.get("o", delta.get("object_changes", [])),
+                "new_open_threads": delta.get("n", delta.get("new_open_threads", [])),
+                "closed_threads": delta.get("c", delta.get("closed_threads", [])),
+            }
+        if isinstance(item.get("ending_change"), dict):
+            ending = item["ending_change"]
+            item["ending_change"] = {
+                "type": ending.get("t", ending.get("type", "")),
+                "fact": ending.get("f", ending.get("fact", "")),
+            }
+        if isinstance(item.get("source_location"), dict):
+            location = item["source_location"]
+            item["source_location"] = {
+                "start_line": location.get("s", location.get("start_line", "")),
+                "end_line": location.get("e", location.get("end_line", "")),
+                "anchor": location.get("a", location.get("anchor", "")),
+            }
+        chapters.append(item)
+    data["chapters"] = chapters
+    return data
+
+
+class NovelChapterEventPlacementWorker(NovelAnalysisWorker):
+    """Place the current stage's ordered nodes before chapter outlines are written.
+
+    This is deliberately a small request.  It does not receive or return the
+    novel's full material set, and it never writes chapter prose or outlines.
+    The main chapter-plan worker consumes the locked ranges and returns only
+    chapter content; the application assigns absolute chapter numbers locally.
+    """
+
     result_ready = Signal(dict)
 
     def __init__(
@@ -6047,10 +6358,10 @@ class NovelChapterPlanMasterWorker(NovelAnalysisWorker):
         api_key,
         model,
         project_context,
-        target_words,
-        average_chapter_words,
-        total_chapter_count,
-        existing_chapter_count=0,
+        nodes,
+        stage_id,
+        batch_start,
+        batch_end,
         proxy_url="",
         proxy_mode="不使用代理",
     ):
@@ -6065,271 +6376,114 @@ class NovelChapterPlanMasterWorker(NovelAnalysisWorker):
         )
         self._analysis_stream_only = True
         self._retry_stream_transport_before_nonstream = True
-        self.target_words = max(1, int(target_words or 1))
-        self.average_chapter_words = max(1, int(average_chapter_words or 3000))
-        self.total_chapter_count = max(1, int(total_chapter_count or 1))
-        self.existing_chapter_count = max(0, int(existing_chapter_count or 0))
-        remaining = max(1, self.total_chapter_count - self.existing_chapter_count)
-        self.arc_count = max(1, min(20, (remaining + 24) // 25))
+        self.nodes = [deepcopy(item) for item in nodes if isinstance(item, dict)]
+        self.stage_id = str(stage_id or "").strip().upper()
+        self.batch_start = max(1, int(batch_start or 1))
+        self.batch_end = max(self.batch_start, int(batch_end or self.batch_start))
+
+    @staticmethod
+    def _number(value):
+        if isinstance(value, bool):
+            return None
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            match = re.search(r"-?\d+", str(value or ""))
+            return int(match.group(0)) if match else None
 
     def _analysis_prompt(self):
-        first_chapter = self.existing_chapter_count + 1
-        sample_end = min(self.total_chapter_count, first_chapter + 24)
+        example_rows = []
+        for fallback_index, node in enumerate(self.nodes, 1):
+            allowed = node.get("allowed", []) if isinstance(node, dict) else []
+            if isinstance(allowed, (list, tuple)) and len(allowed) >= 2:
+                start, end = allowed[0], allowed[1]
+            else:
+                start, end = self.batch_start, self.batch_end
+            example_rows.append({"n": fallback_index, "a": start, "b": end})
+        example = json.dumps(
+            {"p": example_rows},
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
         return (
-            "先读已有故事。原文足够时只整理已有内容，foundation_mode返回reuse，不另写全书走向；"
-            "有必要内容缺失才返回supplement，只补framework_analysis.missing_fields所指的缺口，原有内容和阶段保留；"
-            "几乎没有故事资料才返回generate。栏目名称、顺序和排版不同不代表内容缺失。"
-            "reuse且原文没有阶段时arcs=[]，不凭空分阶段。"
-            "下面的新建要求只用于原文真正缺少的部分，不能覆盖已经写明的故事。"
-            "用自然的网络小说语言讲人物、场景、行动和具体变化，不用策划词、抽象评语或编辑总结。\n"
-            "请整理后续章节需要的已有故事内容，确实不足时才补齐。\n"
-            "必须只输出一个合法JSON对象，不要Markdown、解释、注释或尾随逗号。\n"
-            f"目标总字数约{self.target_words}字，单章约{self.average_chapter_words}字，"
-            f"全书预计{self.total_chapter_count}章，已有{self.existing_chapter_count}章。\n"
-            f"没有用户原始阶段时，把尚未规划的章节划分为约{self.arc_count}个连续剧情阶段。阶段必须"
-            f"首尾相接、覆盖到第{self.total_chapter_count}章，不得重叠或留空；第一个阶段必须从第"
-            f"{first_chapter}章开始。\n"
-            f"arcs必须一次性返回完整阶段数组，最后一个阶段的end_chapter必须等于{self.total_chapter_count}；"
-            "严禁只返回第一个阶段或把后续阶段留给下一次回答。如果原框架明确分卷或分阶段，每一卷/阶段都必须"
-            "在arcs中独立保留，并按目标总字数和单章字数换算连续章号。\n"
-            "规划优先级固定为：已确认creative_intent_contract（若有） > 用户原始框架的具体章段 > 全书分卷/阶段目标 > 通用开局、扩展、收束节奏。"
-            "通用节奏只控制冲突强度和收束速度，绝不能改变当前章段写感情、经商、成长、冒险或悬疑的内容方向。\n"
-            "如果输入包含creative_intent_contract，它是用户已确认的最高优先级创作意图：primary_line不得被原框架中的辅助线、"
-            "上一卷交接权重或AI重新推断的narrative_strategy_profile替换。每个阶段的dominant_line和end_state都必须让"
-            "primary_line产生新变化；supporting_lines只能制造推动主线的压力、选择或后果。不要重新生成或改写该契约。\n"
-            "先根据项目资料输出narrative_strategy_profile：受众方向和题材世界只是基础，必须判断本项目真正的主线发动机、"
-            "读者承诺、情绪方向、节奏原则和低说明性原则。planning_grammar只概括这本小说独有的故事动力：什么会让人物行动、"
-            "关系如何发生变化、读者期待怎样积累；它是内部规划依据，不是逐章照抄的句式或通用因果公式。"
-            "不得写成公开场合、会议、第三人介入等固定场景顺序；chapter_variation_pool只作可选灵感，"
-            "不得列出需要轮换的场景或冲突模块，没有必要时返回空数组。具体项目以用户原框架和已确认意图为准，不按性别套模板。\n"
-            "summary写全书走向总览；core_mainline单独写贯穿全书的核心主线；ending_promise写最终结局与"
-            "读者承诺如何兑现。全书规划以用户框架和人物关系变化为依据；"
-            "每个阶段只需写清原框架阶段、宏观节奏位置、主导剧情线、关系或人物处境的总体走向、"
-            "阶段后部才会抵达的关键局面和不能提前改变的故事事实；relationship_goal只描述人物/关系的总体走向，"
-            "不能写成申报、核验、会议、材料或其他工作流程目标。不要把阶段拆成逐章待办表，"
-            "也不要为了填字段预设每章要完成的动作。不要生成逐章提纲，不要固定安排伏笔编号。主导线必须在整个阶段持续占主位，"
-            "不能只在前两三章完成后把剩余章节改写成另一种题材。\n"
-            "阅读体验必须服从当前项目确认的题材、风格和受众承诺。轻松、悬疑、感情、成长或其他题材各自用本项目自然的方式"
-            "形成节奏、满足感和情绪，不给所有小说套同一种爽点与推进语气；每章只需产生与当前故事相称的有效变化。"
-            "项目资料中的制度、商业、专业和案件信息"
-            "只是事实参考，只有在它直接改变人物选择或关系结果时才使用，不是章节任务清单。不要把任何辅助线拆成连续办理步骤，"
-            "也不要让一章主要由说明、核对、问答或结果确认组成；保留人物行动、冲突和后果，把过程压缩到读者理解所需的最短程度。\n"
-            + _CHAPTER_PLAN_STATE_PROGRESSION_GUIDANCE
-            + "如果项目资料包含 imported_chapter_plan_reference，阶段边界和阶段顺序必须以其中的"
-            "stages及绝对章号为准；stages.events是阶段内有序剧情节点，不是一条节点固定对应一章。"
-            "不得合并阶段、调序阶段、提前执行下一阶段，或用新阶段替换用户原始阶段。阶段名称和全部事件共同"
-            "决定主导线；稀疏事件之间的扩展章只能深化当前阶段的人物、关系、对抗与结果，不能借空白转入下一阶段。\n"
-            'JSON结构：{"summary":"","core_mainline":"","ending_promise":"",'
-            '"narrative_strategy_profile":{"version":"1",'
-            '"audience_direction":"","genre_world":"","core_reader_promise":"","primary_story_engine":"",'
-            '"secondary_story_engine":"","planning_grammar":"","satisfaction_currencies":[],"emotional_resonance_axes":[],'
-            '"pacing_strategy":"","low_exposition_strategy":"","chapter_variation_pool":[]},'
-            f'"arcs":[{{"name":"","start_chapter":{first_chapter},'
-            f'"end_chapter":{sample_end},"macro_phase":"","source_stage":"","dominant_line":"",'
-            '"relationship_goal":"","end_state":""}]}。'
-            "上面arcs里的单个对象只用于展示字段结构，不代表实际只输出一个阶段；实际JSON必须展开全部阶段。"
+            "你只负责给当前阶段的既有剧情节点安排章节范围，不负责写章节提纲。\n"
+            "必须只输出一个合法 JSON 对象，不要 Markdown，不要解释，不要注释，不要额外字段。"
+            "JSON使用紧凑格式，只保留p、n、a、b四个字段。\n"
+            f"当前批次是全书第{self.batch_start}-{self.batch_end}章，共{self.batch_end - self.batch_start + 1}章。"
+            f"当前阶段编号是{self.stage_id or '当前阶段'}。"
+            "输入中的节点已经按剧情顺序排列，n只是节点序号，不是章节号。"
+            "节点原有的允许范围决定每个节点的落点，节点顺序保持输入顺序。"
+            "一个节点可以覆盖连续几章，前后节点通过人物行动、关系变化和现场后果自然衔接，"
+            "每个节点的核心事件、关键变化和直接结果在自己的范围内完成。\n"
+            f"只返回类似{example}的对象，示例中的数量必须与输入节点数量一致。"
+            "p中的项目数量必须与输入节点数量完全一致；n必须从1连续递增。"
+            "a和b是全书绝对章号，不是批次内序号。不要返回节点文字、事件ID、章节标题或任何解释。"
         )
 
-    def _chunk_user_text(self, chunk_text, chunk_index, total_chunks):
-        return str(chunk_text or "")
-
-    def _reasoning_effort_for_request(self):
-        effort = super()._reasoning_effort_for_request()
-        return effort or ("high" if self.model.lower().startswith(("gpt-", "o1", "o3", "o4")) else "")
-
     def _analysis_progress_label(self):
-        return "全书阶段规划"
+        return "章节节点安排"
 
     def _analysis_retry_progress_text(self, error, label, total, wait_seconds, next_attempt, attempts):
-        return f"全书阶段规划暂时失败，{wait_seconds} 秒后自动进行流式重试 {next_attempt}/{attempts}..."
+        return f"章节节点安排暂时失败，{wait_seconds} 秒后自动重试 {next_attempt}/{attempts}..."
 
     def _allow_retry_chunk_split(self):
         return False
 
-    @staticmethod
-    def _chapter_number(value):
-        if isinstance(value, bool):
-            raise ValueError("章号格式无效。")
-        if isinstance(value, (int, float)):
-            return int(value)
-        text = str(value or "").strip()
-        match = re.search(r"\d+", text)
-        if not match:
-            raise ValueError("章号格式无效。")
-        return int(match.group(0))
-
-    @staticmethod
-    def _first_present(mapping, keys, default=""):
-        mapping = mapping if isinstance(mapping, dict) else {}
-        for key in keys:
-            if key in mapping and mapping.get(key) not in (None, ""):
-                return mapping.get(key)
-        return default
-
-    def _master_plan_payload(self, data):
+    def _normalize_placement(self, data):
         data = data if isinstance(data, dict) else {}
-        candidates = [data]
-        for key in ("master_plan", "full_book_plan", "chapter_plan", "plan", "全书规划"):
-            nested = data.get(key)
-            if isinstance(nested, dict):
-                merged = deepcopy(data)
-                merged.update(nested)
-                candidates.append(merged)
-        for candidate in candidates:
-            for key in ("arcs", "stages", "phases", "阶段规划", "阶段"):
-                value = candidate.get(key)
-                if isinstance(value, list) and value:
-                    normalized = deepcopy(candidate)
-                    normalized["arcs"] = value
-                    return normalized
-        return data
-
-    def _arc_range_summary(self, data):
-        data = self._master_plan_payload(data)
-        ranges = []
-        for item in data.get("arcs", []) if isinstance(data.get("arcs"), list) else []:
-            if not isinstance(item, dict):
-                continue
-            try:
-                start = self._chapter_number(self._first_present(
-                    item, ("start_chapter", "startChapter", "start", "起始章节", "开始章节"), 0
-                ))
-                end = self._chapter_number(self._first_present(
-                    item, ("end_chapter", "endChapter", "end", "结束章节", "截止章节"), 0
-                ))
-            except ValueError:
-                continue
-            ranges.append(f"{start}-{end}")
-        return "、".join(ranges) or "未识别到有效阶段范围"
-
-    def _structure_repair_prompt(self):
-        return (
-            "你是长篇小说规划JSON的结构补正编辑。上一次规划已经完成内容判断，但阶段章号没有完整覆盖全书。\n"
-            "必须只输出一个合法JSON对象，不要Markdown、解释、注释或尾随逗号。\n"
-            "保留previous_plan中的全书走向、叙事策略、阶段内容和原框架分卷，不要从零改写，不要生成逐章提纲。"
-            "只补齐遗漏阶段或修正start_chapter/end_chapter，使arcs首尾相接、不重叠、不留空；第一阶段从"
-            f"第{self.existing_chapter_count + 1}章开始，最后阶段必须结束于第{self.total_chapter_count}章。\n"
-            "如果project_reference明确分卷或分阶段，必须逐项保留，不能为了修章号而合并或删除。"
-            "返回完整对象，必须包含summary、core_mainline、ending_promise、narrative_strategy_profile和完整arcs数组。"
-        )
-
-    def _structure_repair_user_text(self, parsed, error):
-        compact_reference = {}
-        text = str(self.text or "")
-        json_start = text.find("{")
-        if json_start >= 0:
-            try:
-                project = json.loads(text[json_start:])
-            except Exception:
-                project = {}
-            if isinstance(project, dict):
-                compact_reference = {
-                    "target": deepcopy(project.get("target", {})),
-                    "meta": deepcopy(project.get("meta", {})),
-                    "imported_chapter_plan_reference": deepcopy(
-                        project.get("imported_chapter_plan_reference", {})
-                    ),
-                }
-                materials = project.get("project_materials", {})
-                if isinstance(materials, dict):
-                    compact_reference["project_materials"] = {
-                        "bible": str(materials.get("bible", "") or "")[:6000],
-                        "world_rules": str(materials.get("world_rules", "") or "")[:4000],
-                    }
-        payload = {
-            "validation_error": str(error or ""),
-            "required_range": {
-                "start_chapter": self.existing_chapter_count + 1,
-                "end_chapter": self.total_chapter_count,
-            },
-            "project_reference": compact_reference,
-            "previous_plan": parsed if isinstance(parsed, dict) else {},
-        }
-        return json.dumps(payload, ensure_ascii=False, indent=2)
-
-    def _normalize_master_plan(self, data):
-        data = self._master_plan_payload(data)
-        raw_arcs = data.get("arcs", [])
-        reuse = str(data.get("foundation_mode", "") or "").strip().lower() == "reuse"
-        if not isinstance(raw_arcs, list) or (not raw_arcs and not reuse):
-            raise ValueError("AI没有返回全书阶段规划。")
-        arcs = []
-        for item in raw_arcs:
-            if not isinstance(item, dict):
-                continue
-            try:
-                start = self._chapter_number(self._first_present(
-                    item, ("start_chapter", "startChapter", "start", "起始章节", "开始章节"), 0
-                ))
-                end = self._chapter_number(self._first_present(
-                    item, ("end_chapter", "endChapter", "end", "结束章节", "截止章节"), 0
-                ))
-            except Exception:
-                continue
-            if start <= 0 or end < start:
-                continue
-            arc = {
-                "name": str(self._first_present(
-                    item, ("name", "title", "stage_name", "阶段名称", "阶段名"), f"阶段{len(arcs) + 1}"
-                )).strip(),
-                "start_chapter": start,
-                "end_chapter": end,
-                "macro_phase": str(item.get("macro_phase", "") or "").strip(),
-                "source_stage": str(item.get("source_stage", "") or item.get("name", "") or "").strip(),
-                "dominant_line": str(item.get("dominant_line", "") or "").strip(),
-                "relationship_goal": str(item.get("relationship_goal", "") or "").strip(),
-                "end_state": str(item.get("end_state", "") or "").strip(),
-            }
-            for key in (
-                "supporting_lines", "goal", "main_conflict", "turning_points",
-                "reader_payoff", "emotional_arc", "pacing_pattern",
-                "exposition_compression", "variation_plan", "investigation_scope",
-                "forbidden",
-            ):
-                value = str(item.get(key, "") or "").strip()
-                if value:
-                    arc[key] = value
-            arcs.append(arc)
-        arcs.sort(key=lambda item: item["start_chapter"])
-        expected_start = self.existing_chapter_count + 1
-        for arc in arcs:
-            if arc["start_chapter"] != expected_start:
-                raise ValueError(
-                    f"全书阶段范围不连续：应从第{expected_start}章开始，"
-                    f"实际从第{arc['start_chapter']}章开始。"
-                )
-            expected_start = arc["end_chapter"] + 1
-        if arcs and expected_start - 1 != self.total_chapter_count:
+        raw = data.get("p", data.get("placements", []))
+        if not isinstance(raw, list) or len(raw) != len(self.nodes):
             raise ValueError(
-                f"全书阶段规划只覆盖到第{expected_start - 1}章，"
-                f"没有覆盖到第{self.total_chapter_count}章。"
+                f"节点安排数量不一致：需要{len(self.nodes)}项，实际{len(raw) if isinstance(raw, list) else 0}项。"
             )
-        strategy = self._first_present(
-            data,
-            ("narrative_strategy_profile", "strategy_profile", "narrative_profile", "叙事策略画像"),
-            {},
-        )
-        strategy = strategy if isinstance(strategy, dict) else {}
-        normalized = {
-            "summary": str(data.get("summary", "") or "").strip(),
-            "core_mainline": str(data.get("core_mainline", "") or "").strip(),
-            "ending_promise": str(data.get("ending_promise", "") or "").strip(),
-            "target_words": self.target_words,
-            "average_chapter_words": self.average_chapter_words,
-            "total_chapter_count": self.total_chapter_count,
-            "existing_chapter_count": self.existing_chapter_count,
-            "arcs": arcs,
-            "narrative_strategy_profile": deepcopy(strategy),
+        normalized = []
+        seen = set()
+        for fallback_index, item in enumerate(raw, 1):
+            if not isinstance(item, dict):
+                raise ValueError("节点安排中存在无效项目。")
+            node_index = self._number(item.get("n", item.get("node", fallback_index)))
+            range_value = item.get("r", item.get("range", []))
+            if isinstance(range_value, (list, tuple)) and len(range_value) >= 2:
+                start = self._number(range_value[0])
+                end = self._number(range_value[1])
+            else:
+                start = self._number(item.get("a", item.get("start", "")))
+                end = self._number(item.get("b", item.get("end", "")))
+            if node_index is None or start is None or end is None:
+                raise ValueError("节点安排缺少节点序号或章节范围。")
+            if node_index != fallback_index:
+                raise ValueError("节点序号必须按输入顺序返回。")
+            if node_index in seen or not (1 <= node_index <= len(self.nodes)):
+                raise ValueError("节点序号必须从1连续递增且不能重复。")
+            if start < self.batch_start or end > self.batch_end or start > end:
+                raise ValueError(f"节点{node_index}超出了当前批次章节范围。")
+            node = self.nodes[node_index - 1]
+            allowed = node.get("allowed", node.get("w", []))
+            if isinstance(allowed, (list, tuple)) and len(allowed) >= 2:
+                allowed_start = self._number(allowed[0])
+                allowed_end = self._number(allowed[1])
+                if (
+                    allowed_start is not None
+                    and allowed_end is not None
+                    and (start < allowed_start or end > allowed_end)
+                ):
+                    raise ValueError(
+                        f"节点{node_index}超出了原定范围第{allowed_start}-{allowed_end}章。"
+                    )
+            seen.add(node_index)
+            normalized.append({"n": node_index, "a": start, "b": end})
+        normalized.sort(key=lambda item: item["n"])
+        previous_start = self.batch_start
+        for item in normalized:
+            if item["a"] < previous_start:
+                raise ValueError("节点安排顺序被打乱。")
+            previous_start = item["a"]
+        return {
+            "stage_id": self.stage_id,
+            "batch_start": self.batch_start,
+            "batch_end": self.batch_end,
+            "placements": normalized,
         }
-        mode = str(data.get("foundation_mode", "") or "").strip().lower()
-        if mode in {"reuse", "supplement", "generate"}:
-            normalized["foundation_mode"] = mode
-        # Keep an optional model-returned boundary for backward compatibility,
-        # but do not create an empty field when the model did not provide one.
-        boundary = _clean_chapter_plan_story_boundary(data.get("global_hard_boundaries", ""))
-        if boundary:
-            normalized["global_hard_boundaries"] = boundary
-        return normalized
 
     def run(self):
         started = time.perf_counter()
@@ -6343,27 +6497,16 @@ class NovelChapterPlanMasterWorker(NovelAnalysisWorker):
             if not self.model:
                 raise Exception("请选择模型。")
             if not self.text.strip():
-                raise Exception("没有可用于生成全书阶段规划的项目资料。")
-            self.progress.emit("正在生成全书阶段规划...")
+                raise Exception("没有可用于安排章节节点的资料。")
+            if not self.nodes:
+                raise Exception("当前阶段没有可安排的剧情节点。")
+            self.progress.emit("正在安排当前阶段剧情节点...")
             response_format_supported, _stream_supported = self._analysis_request_capabilities()
-            parsed, response_format_supported = self._analyze_chunk_with_retries(
-                self._analysis_prompt(), self.text, 1, 1, response_format_supported
-            )
-            if self._stop_requested or self.isInterruptionRequested():
-                self._finalize_analysis_diagnostics("stopped", started)
-                return
-            try:
-                normalized = self._normalize_master_plan(parsed)
-            except ValueError as first_error:
-                self._increment_analysis_diagnostic("structure_repair_count")
-                self.diagnostics["first_structure_error"] = str(first_error)[:1000]
-                ranges = self._arc_range_summary(parsed)
-                self.progress.emit(
-                    f"阶段范围需要补正（{ranges}；{first_error}），正在基于首次结果修正一次..."
-                )
+            last_error = None
+            for structure_attempt in range(2):
                 parsed, response_format_supported = self._analyze_chunk_with_retries(
-                    self._structure_repair_prompt(),
-                    self._structure_repair_user_text(parsed, first_error),
+                    self._analysis_prompt(),
+                    self.text,
                     1,
                     1,
                     response_format_supported,
@@ -6371,13 +6514,22 @@ class NovelChapterPlanMasterWorker(NovelAnalysisWorker):
                 if self._stop_requested or self.isInterruptionRequested():
                     self._finalize_analysis_diagnostics("stopped", started)
                     return
-                normalized = self._normalize_master_plan(parsed)
-            self._finalize_analysis_diagnostics("success", started)
-            self.result_ready.emit(normalized)
-        except Exception as e:
+                try:
+                    normalized = self._normalize_placement(parsed)
+                    self._finalize_analysis_diagnostics("success", started)
+                    self.result_ready.emit(normalized)
+                    return
+                except ValueError as error:
+                    last_error = error
+                    if structure_attempt == 0:
+                        self._increment_analysis_diagnostic("structure_regeneration_count")
+                        self.diagnostics["first_structure_error"] = str(error)[:1000]
+                        self.progress.emit("节点安排结构不完整，正在自动重做当前安排...")
+            raise last_error or ValueError("当前阶段节点安排格式不完整。")
+        except Exception as error:
             if not self._stop_requested and not self.isInterruptionRequested():
-                self._finalize_analysis_diagnostics("error", started, e)
-                self.failed.emit(str(e))
+                self._finalize_analysis_diagnostics("error", started, error)
+                self.failed.emit(str(error))
             else:
                 self._finalize_analysis_diagnostics("stopped", started)
 
@@ -6400,6 +6552,8 @@ class NovelChapterPlanWorker(NovelAnalysisWorker):
         proxy_mode="不使用代理",
         batch_number=1,
         total_batches=1,
+        creation_wizard_mode=False,
+        locked_node_schedule=None,
     ):
         super().__init__(
             base_url,
@@ -6419,61 +6573,108 @@ class NovelChapterPlanWorker(NovelAnalysisWorker):
         self.existing_chapter_count = max(0, int(existing_chapter_count or 0))
         self.batch_number = max(1, int(batch_number or 1))
         self.total_batches = max(1, int(total_batches or 1))
+        self.creation_wizard_mode = bool(creation_wizard_mode)
+        self.locked_node_schedule = deepcopy(
+            locked_node_schedule if isinstance(locked_node_schedule, dict) else {}
+        )
 
     def _analysis_prompt(self):
+        absolute_start = self.existing_chapter_count + 1
+        absolute_end = self.existing_chapter_count + self.chapter_count
+        if self.creation_wizard_mode:
+            chapter_order_rule = (
+                f"本批次必须返回{self.chapter_count}项，列表第1项就是全书第{absolute_start}章，"
+                f"最后一项就是第{absolute_end}章。不要返回章节编号、阶段编号、事件编号或任何定位标签，"
+                "章节号和阶段归属由程序根据列表顺序写入。"
+            )
+            event_rule = (
+                "当前阶段的剧情节点已经由程序先行安排，输入中的locked_node_schedule提供每个节点的落点范围。"
+                "节点序号不是章节号，章节提纲按节点范围展开，并通过人物行动、关系变化和现场结果完成前后衔接；"
+                "章节outline按照locked_node_schedule在对应范围内落实节点内容。"
+            )
+            output_schema = (
+                'JSON结构只保留：{"c":[{"t":"章节名","o":"本章具体故事提纲","p":[]}]}'
+                "列表顺序就是章节顺序；不要返回i、e、s、u、g、m等定位字段。"
+            )
+        else:
+            chapter_order_rule = (
+                f"对应全书第 {absolute_start}-{absolute_end} 章。返回 JSON 中的 i 是本批次内序号，"
+                f"必须从 1 连续到 {self.chapter_count}；第 i 条对应的全书绝对章号是 {self.existing_chapter_count}+i。"
+            )
+            event_rule = (
+                "stages.events是可选的阶段剧情节点，不得把事件序号当作章号。完整导入框架通常没有events，"
+                "没有events时source_event_ids必须为空，章节原文由程序本地保存；存在events时，source_event_ids只是辅助索引，不是必填字段，"
+                "不要为了凑齐事件ID重复阶段节点或章节原文。阶段事件已经在输入资料中提供，outline必须落实当前阶段真正发生的事实；"
+                "如果填写source_event_ids，一章可以承载多个连续节点，但每个节点只能使用一次、必须位于所属阶段内并保持顺序。"
+                "引用事件ID时，先把本批次内序号 i 换算成全书绝对章号；只有绝对章号落在该事件 allowed_chapters 范围内时才填写对应事件ID，"
+                "不在范围内时 e 必须为空；没有把握时直接留空。"
+                "事件ID按当前阶段的顺序和允许范围对应；凡引用节点，outline清楚落实对应事件的语义，可以自然改写，"
+                "让节点之间通过人物行动和结果衔接，不机械逐字粘贴。"
+            )
+            output_schema = (
+                'JSON结构只保留必要索引：{"c":[{"i":1,"t":"章节名","o":"本章具体故事提纲","p":[]}]}'
+                "c=chapters；i/index、t/title、o=outline、p=characters；e/source_event_ids只有模型能够确认时才返回。"
+                "w、s、n、u、d等可由当前阶段和程序上下文确定，不要返回；b、q、x、f、v、z、h、k等重复结构不要返回。"
+                "导入项目只有在确实需要时才返回m=outline_mode和g=source_location。"
+            )
         return (
-            "你是长篇小说轻量章节提纲编辑。请根据用户已确认的规划基础，只生成当前批次的逐章提纲。\n"
-            "必须只输出一个合法 JSON 对象，不要 Markdown，不要解释，不要注释，不要尾随逗号。\n"
-            "规划目标：严格执行用户已确认的全书走向、叙事策略画像和阶段规划，但给正文扩写保留场景、节奏、对白与转折的发挥空间。\n"
+            "你是这部长篇小说的作者助手。请根据用户已确认的规划基础，只生成当前批次的逐章提纲。\n"
+            "必须只输出一个合法 JSON 对象，不要 Markdown，不要解释，不要注释，不要尾随逗号。JSON必须使用单行紧凑格式，"
+            "不要换行、缩进、空行或多余空格；空字符串、空数组和没有内容的可选字段可以省略。"
+            "这只压缩JSON外壳，不得删减章节数量、outline中的故事事实或必要的连续性约束。\n"
+            "规划目标：严格执行用户已确认的故事底盘、叙事策略画像和阶段规划；提纲仍给正文留下场景、对白和节奏空间，"
+            "只固定人物正在经历的事实、选择和结果。\n"
             f"目标总字数约 {self.target_words} 字，单章目标约 {self.average_chapter_words} 字，"
             f"全书预计约 {self.total_chapter_count} 章，已有 {self.existing_chapter_count} 章，"
-            f"本次是第 {self.batch_number}/{self.total_batches} 批，必须输出接下来的 {self.chapter_count} 章。\n"
-            "每章应把人物、关系、处境或主线推进到一个读者可感知的新局面，避免重复水章节；"
-            "不要提前回收后期伏笔，不要擅自推翻小说圣经和世界规则。\n"
-            "不要按伏笔编号、旧伏笔列表或现有早期伏笔为章节固定安排埋设、推进或回收；"
-            "伏笔由后续扩写正文和正文分析根据实际内容动态处理。若需要悬念，只写自然剧情信息变化，不写固定伏笔任务。\n"
-            "规划优先级固定为：已确认creative_intent_contract（若有） > 用户原始框架的具体章段 > 全书阶段总规划 > 前 10%/中间 70%/后 20%的宏观节奏。"
-            "宏观节奏只控制冲突强度、信息释放和收束速度，不能决定本章写什么题材内容，更不能在百分比边界处"
-            "擅自从感情、日常、经商或成长切换到调查主线。\n"
-            "前 10%为强钩子期，中间 70%为扩展期，后 20%为收束期；narrative_stage只记录宏观位置，不能成为固定章法。"
-            "source_stage必须记录当前用户原始章段，dominant_line必须记录本章真正的主导剧情线。"
-            "每章的内容方向必须服从source_stage和全书阶段总规划。\n"
-            "输入中的narrative_strategy_profile和master_plan均为用户已确认的只读规划基础。不得重新生成、改写、"
-            "总结或返回它们；不得另建全书阶段、调整阶段边界或重复输出全书摘要。不同题材必须采用不同的冲突入口、"
-            "状态变化与兑现方式。"
-            "输入中的creative_intent_contract同样只读且优先级最高；每章主导线必须服务primary_line，辅助线不得连续扩张成独立主线。"
-            "让本章自然形成符合当前题材的阅读期待即可；不要把某一种网文节奏或爽点当成所有小说的统一标准。"
+            f"本次是第 {self.batch_number}/{self.total_batches} 批，必须输出接下来的 {self.chapter_count} 章，"
+            f"{chapter_order_rule}\n"
+            "每章应把人物、关系、处境或主线推进到一个读者可感知的新局面，章节之间保持场景、压力和结果的变化；"
+            "小说圣经、世界规则和阶段规划提供长期事实，伏笔随着人物实际行动、关系变化和信息出现自然生长。\n"
+            "章节规划重点写本章正在发生的事情、人物如何应对以及事情留下的变化；"
+            "悬念通过现场信息、人物反应、关系裂缝和新的选择自然形成，后续正文再根据实际发生内容处理暗线。\n"
+            "规划优先级固定为：已确认creative_intent_contract（若有） > 用户原始框架的具体章段 > 已确认的阶段规划 > 前 10%/中间 70%/后 20%的宏观节奏。"
+            "宏观节奏负责冲突强度、信息释放和收束速度；具体场景内容由用户选定的题材和人物关系决定。"
+            "故事主线跟随用户选定的题材和人物关系展开，感情、日常、经商、成长或其它题材推进方式以题材本身的现场压力为依据。\n"
+            "前 10%为强钩子期，中间 70%为扩展期，后 20%为收束期；这些只是宏观节奏参考，具体场景和冲突由当前故事自然决定。"
+            "对非办案题材，通常每两章至少要让主角和路人、配角、对手或反派发生一次有效碰撞：对方可以误判、挑衅、争夺利益、提出条件或让主角必须当场选择；每次更换原因、场景和结果，让人物关系与局势一起变化。明确的办案、破案或调查推理题材则按其题材逻辑安排现场行动。\n"
+            "source_stage、narrative_stage和dominant_line由程序根据阶段资料补齐。\n"
+            "输入中的narrative_strategy_profile和master_plan是用户已确认的只读规划基础，本次输出直接承接其中的事实、"
+            "阶段边界和题材方向；不同题材使用各自的冲突入口、状态变化与兑现方式。"
+            "小说圣经和世界规则属于已经确认的故事底盘，章节规划不要擅自推翻小说圣经和世界规则。"
+            "输入中的只读规划基础不得重新生成、改写、总结或返回；本次只沿用其中的事实和边界。"
+            "输入中的creative_intent_contract同样只读且优先级最高；每章围绕primary_line展开，其他内容只在推动人物、关系或局势变化时进入。"
+            "让本章形成符合当前题材的阅读期待，节奏和爽点随故事本身变化。"
+            "故事底盘和阶段规划已经在前面的规划基础中确认，本次直接生成当前批次的章节故事。\n"
             "项目资料是连续性事实参考，不是本章待办清单；只在当下人物选择或关系结果确实需要时取用最少内容。"
+            + _story_conflict_pacing_guidance()
             + _CHAPTER_PLAN_STATE_PROGRESSION_GUIDANCE
-            + "提纲正文应讲述人物真正会经历的故事，不安排任何固定的工作步骤或说明流程；外部事务只在故事自然需要时出现。\n"
-            "title 只写章节名，不要带“第几章”和序号；target_words 写数字字符串。\n"
-            "outline是提纲里的故事正文；只有需要补写的章节才输出outline。先理解meta中的题材、风格和叙事人称，再像这本小说的作者在讲述下一章那样，用有题材气质的叙述，"
-            "用一段约300字的自然叙述（建议250-380字，内容完整时可略有浮动，不要为了凑字数硬扩写），写清人物身处什么场景、眼前遇到什么具体事情、现实阻力是什么、"
-            "人物做了什么选择或行动、事情造成了什么结果，以及章末留下的具体变化或悬念。轻松故事可以有人物视角下的荒诞、误会、反差和调侃；悬疑、感情、成长等故事则顺着各自的情绪与阅读感来写。"
-            "narrative_stage、source_stage、dominant_line和ending_hook负责规划边界，outline只需把这些边界化成故事，不要把策划字段拼进正文叙述，"
-            "不要复述字段含义，也不要沿用‘目标、关系建立、完成推进、形成新局面’一类策划说明口吻。"
-            "提纲仍给正文留下场景、对白和节奏空间，不必按处境、阻力、选择、后果的固定次序组织句子。\n"
-            "narrative_stage 只能从“强钩子阶段”“主线扩展阶段”“收束升级阶段”中选择。\n"
+            + _CHAPTER_PLAN_STORY_LANGUAGE_GUIDANCE
+            + "提纲正文应讲述人物真正会经历的故事，外部事务融入人物当下的行动、关系和现场后果。\n"
+            "title 只写章节名，不要带“第几章”和序号；章节字数已经由程序输入，不要返回target_words。\n"
+            "章节规划返回一份本章提纲；人物、地点、具体事情、现实阻力、人物行动、结果和章末变化集中写进outline，"
+            "结构字段只保留程序确实需要的索引，避免重复表达同一内容。"
+            "outline只写本章给正文使用的具体故事事实，建议250-380字；可以是清楚的事实段落，不要求像发布简介，也不要求写成有题材气质的叙述，更不要写成代码、字段说明或工作流程。"
+            "outline是提纲里的故事正文；只有需要补写的章节才输出outline。这里的‘正文’指章节规划中的故事事实，不是最终小说正文。"
+            "资料确认后，只把具体事实写清楚；不额外生成一份自然语言版规划。"
+            "outline写清人物、地点、行动、现实阻力、结果和章末变化，直接写故事事实和人物选择；"
+            "可以按当前故事最自然的顺序组织，不必按处境、阻力、选择、后果的固定次序；不要复述字段含义。"
+            "提纲可以像这本小说的作者在讲述下一章一样清楚，但仍然保留执行所需的事实密度。"
+            "章节规划保留后续正文真正需要的故事事实和人物索引，正文扩写时转换成自然的网络小说叙述语言，"
+            "结构字段名、编号和规划过程停留在外层数据中。剧情推进落到人物正在经历的事情、行动和结果，不安排任何固定的工作步骤或说明流程。\n"
             "如果项目资料包含 imported_chapter_plan_reference：chapters是明确章节级约束，必须按绝对章号执行。"
             "如果其中location_status为pending，且输入包含unresolved_framework_source，"
             "当前批次每章都要尽量返回source_location的起止L行号和极短anchor；"
             "只返回位置，不要抄写原文。程序会根据原始框架恢复细纲，定位失败不等于细纲缺失。"
             "当 framework_analysis.chapter_outline_mode 已经是 reuse 且当前章节有本地原文时，直接返回 outline_mode=use_imported，outline留空；"
             "不要重抄、改写、缩写、扩写或替换本地原文。只有被 framework_analysis.chapter_outline_missing 标记的章节，"
-            "或框架判断为 supplement/generate 且当前章节确实缺少可写内容时，才返回 outline_mode=generate 并生成约300字自然故事提纲。"
+            "或框架判断为 supplement/generate 且当前章节确实缺少可写内容时，才返回 outline_mode=generate 并生成约300字具体故事提纲。"
             "模型只做缺口判断，不要另建审核任务。"
-            "stages.events是可选的阶段剧情节点，不得把事件序号当作章号。完整导入框架通常没有events，章节原文由程序本地保存；"
-            "不要生成source_event_ids，也不要复制阶段节点或章节原文；"
-            "一章可以承载多个连续节点，扩展章可以用空数组，但每个节点只能使用一次、必须在所属阶段内并保持顺序，"
-            "阶段结束前必须全部覆盖。如果本次请求覆盖一个完整原框架阶段，该阶段的所有原始事件必须在本次返回的章节中完成"
-            "source_event_ids标记，不能留给下一批，也不能只在outline中写出事件内容而省略事件ID。"
-            "凡引用节点，outline必须清楚落实对应事件的语义，可以自然改写，不要机械逐字粘贴。"
-            "阶段结局和最终关系状态应放在阶段后部兑现；扩展章只能深化当前阶段，不能提前执行下一阶段事件、结论或场景。\n"
-            "characters只记录本章自然涉及的主要人物，没有则用空数组；它是索引，不是强制出场清单。\n"
-            'JSON 结构：{"chapters":[{"index":1,"title":"","target_words":"3000",'
-            '"narrative_stage":"","source_stage":"","dominant_line":"","source_event_ids":[],"source_location":{"start_line":"","end_line":"","anchor":""},"outline":"",'
-            '"outline_mode":"generate","characters":[],"ending_hook":""}]}\n'
-            "chapters 数量必须严格等于请求章节数，index 从 1 连续递增。"
+            + event_rule
+            + "阶段结局和最终关系状态在阶段后部自然兑现；扩展章继续深化当前阶段的人物、关系、处境和现场后果，"
+            "下一阶段从上一阶段留下的变化继续展开。\n"
+            "characters只列出本章自然涉及的主要人物，没有则用空数组；它是索引，不是强制出场清单。\n"
+            + output_schema
+            + "章节数量必须严格等于请求章节数。"
         )
 
     def _chunk_user_text(self, chunk_text, chunk_index, total_chunks):
@@ -6559,7 +6760,7 @@ class NovelChapterPlanWorker(NovelAnalysisWorker):
         return "\n\n".join(parts).strip()
 
     def _normalize_plan(self, data):
-        data = data if isinstance(data, dict) else {}
+        data = _expand_compact_chapter_plan(data)
         chapters = data.get("chapters", [])
         if not isinstance(chapters, list) or not chapters:
             raise ValueError("AI 没有返回章节规划列表。")
@@ -6581,16 +6782,29 @@ class NovelChapterPlanWorker(NovelAnalysisWorker):
             if not outline and self._normalize_outline_mode(item.get("outline_mode", "")) != "use_imported":
                 outline = f"围绕‘{title}’这一章，写清人物此刻身处的场景、遇到的具体麻烦，以及他们采取行动后局面出现的变化；章末留下一个能自然接住下一章的新信息或新阻力。"
             narrative_stage = self._normalize_stage_text(item.get("narrative_stage", "") or item.get("stage", "") or item.get("所属阶段", ""), index)
+            target_words = self._target_words_text(item.get("target_words", "")) or str(self.average_chapter_words)
+            source_event_ids = [
+                value.upper() for value in self._string_list(
+                    item.get("source_event_ids", item.get("event_refs", []))
+                )
+            ]
+            stage_id = str(
+                item.get("stage_id", item.get("source_stage_id", "")) or ""
+            ).strip().upper()
+            if not stage_id:
+                for event_id in source_event_ids:
+                    match = re.match(r"(S\d{2,4})-E\d{2,4}", event_id)
+                    if match:
+                        stage_id = match.group(1)
+                        break
             normalized_item = {
                 "index": index,
                 "title": title,
-                "target_words": self._target_words_text(item.get("target_words", "")),
+                "target_words": target_words,
                 "narrative_stage": narrative_stage,
                 "source_stage": str(item.get("source_stage", "") or "").strip(),
                 "dominant_line": str(item.get("dominant_line", "") or "").strip(),
-                "source_event_ids": [
-                    value.upper() for value in self._string_list(item.get("source_event_ids", []))
-                ],
+                "source_event_ids": source_event_ids,
                 "source_location": (
                     {
                         "start_line": str(item.get("source_location", {}).get("start_line", "") or "").strip(),
@@ -6605,27 +6819,65 @@ class NovelChapterPlanWorker(NovelAnalysisWorker):
                 "outline": outline,
                 "outline_mode": self._normalize_outline_mode(item.get("outline_mode", "")),
                 "characters": self._string_list(item.get("characters", [])),
-                "ending_hook": str(item.get("ending_hook", "") or "").strip(),
             }
-            # These legacy fields are optional compatibility data. They are
-            # deliberately absent from the planning prompt, but must survive
-            # when a model returns them on its own or an older task resumes.
-            for key in (
-                "relationship_task", "investigation_scope", "chapter_function",
-                "conflict_intensity", "setup_ratio", "character_task", "mainline_task",
-                "planning_method", "start_state", "must_happen", "forbidden_reveal",
-                "satisfaction_payoff", "emotional_resonance", "relationship_change",
-                "exposition_compression", "variation_pattern", "foreshadow_task",
-                "forbidden", "goal", "main_event", "conflict", "turning_point",
-                "emotional_shift",
-            ):
-                value = str(item.get(key, "") or "").strip()
-                if value:
-                    normalized_item[key] = value
-            for key in ("dynamic_modules", "settings", "foreshadows", "required_events"):
-                values = self._string_list(item.get(key, []))
-                if values:
-                    normalized_item[key] = values
+            ending_hook = str(item.get("ending_hook", "") or "").strip()
+            if ending_hook:
+                normalized_item["ending_hook"] = ending_hook
+            if stage_id:
+                normalized_item["stage_id"] = stage_id
+            start_state = item.get("start_state", {})
+            if isinstance(start_state, dict) and start_state:
+                normalized_item["start_state"] = deepcopy(start_state)
+            scene_chain = []
+            for scene in item.get("scene_chain", []) if isinstance(item.get("scene_chain"), list) else []:
+                if not isinstance(scene, dict):
+                    continue
+                scene_chain.append({
+                    "location": str(scene.get("location", scene.get("location_ref", "")) or "").strip(),
+                    "characters": self._string_list(scene.get("characters", [])),
+                    "trigger": str(scene.get("trigger", "") or "").strip(),
+                    "action": str(scene.get("action", "") or "").strip(),
+                    "result": str(scene.get("result", "") or "").strip(),
+                })
+            if scene_chain:
+                normalized_item["scene_chain"] = scene_chain
+            conflict = item.get("conflict", {})
+            if isinstance(conflict, dict):
+                conflict = {
+                    "source": str(conflict.get("source", "") or "").strip(),
+                    "pressure": str(conflict.get("pressure", "") or "").strip(),
+                    "result": str(conflict.get("result", "") or "").strip(),
+                }
+                conflict = {key: value for key, value in conflict.items() if value}
+                if conflict:
+                    normalized_item["conflict"] = conflict
+            required_facts = self._string_list(item.get("required_facts", []))
+            if required_facts:
+                normalized_item["required_facts"] = required_facts
+            for key in ("continuity_delta", "ending_change"):
+                value = item.get(key, {})
+                if isinstance(value, dict) and value:
+                    normalized_item[key] = deepcopy(value)
+            if not self.creation_wizard_mode:
+                # Older imported/manual planning tasks may still return these
+                # fields. Keep them readable without exposing them in the new
+                # creation-wizard prompt or output schema.
+                for key in (
+                    "relationship_task", "investigation_scope", "chapter_function",
+                    "conflict_intensity", "setup_ratio", "character_task", "mainline_task",
+                    "planning_method", "start_state", "must_happen",
+                    "satisfaction_payoff", "emotional_resonance", "relationship_change",
+                    "exposition_compression", "variation_pattern", "foreshadow_task",
+                    "forbidden", "goal", "main_event", "conflict", "turning_point",
+                    "emotional_shift",
+                ):
+                    value = str(item.get(key, "") or "").strip()
+                    if value:
+                        normalized_item[key] = value
+                for key in ("dynamic_modules", "settings", "foreshadows", "required_events"):
+                    values = self._string_list(item.get(key, []))
+                    if values:
+                        normalized_item[key] = values
             normalized.append(normalized_item)
         normalized.sort(key=lambda item: item.get("index", 0))
         if not normalized:
@@ -7495,12 +7747,12 @@ class VideoWorker(QThread):
     failed = Signal(str)
 
     DONE_STATUSES = {"completed", "succeeded", "success", "done", "finished"}
-    FAILED_STATUSES = {"failed", "error", "cancelled", "canceled", "timeout"}
+    FAILED_STATUSES = {"failed", "error", "cancelled", "canceled", "timeout", "expired"}
     VIDEO_QUERY_MIN_INTERVAL = 8
     _video_query_lock = threading.Lock()
     _last_video_query_at = 0.0
 
-    def __init__(self, base_url, api_key, model, prompt, width, height, num_frames, frame_rate, image_refs=None, proxy_url="", proxy_mode="仅下载图片", duration=8, aspect_ratio="16:9", resolution="480p", last_frame_url="", reference_image_urls=None, voice_ids=None):
+    def __init__(self, base_url, api_key, model, prompt, width, height, num_frames, frame_rate, image_refs=None, proxy_url="", proxy_mode="仅下载图片", duration=None, aspect_ratio="16:9", resolution="", last_frame_url="", reference_image_urls=None, voice_ids=None, *, ratio="", seedance_video_urls=None, seedance_audio_urls=None, seedance_material_urls=None):
         super().__init__()
         self.base_url = base_url
         self.api_key = api_key
@@ -7513,15 +7765,25 @@ class VideoWorker(QThread):
         self.image_refs = [str(x).strip() for x in (image_refs or []) if str(x).strip()]
         self.proxy_url = str(proxy_url or "").strip()
         self.proxy_mode = str(proxy_mode or "仅下载图片").strip()
+        profile = video_model_profile(self.model)
         try:
-            self.duration = int(duration)
+            self.duration = int(
+                profile.get("duration_default", 8)
+                if duration is None or str(duration).strip() == ""
+                else duration
+            )
         except Exception:
-            self.duration = 8
+            self.duration = int(profile.get("duration_default", 8) or 8)
         self.aspect_ratio = str(aspect_ratio or "16:9").strip()
-        self.resolution = str(resolution or "480p").strip()
+        self.ratio = str(ratio or self.aspect_ratio or "16:9").strip()
+        default_resolution = video_model_profile(self.model).get("resolution_default", "480p")
+        self.resolution = str(resolution or default_resolution).strip()
         self.last_frame_url = str(last_frame_url or "").strip()
         self.reference_image_urls = [str(x).strip() for x in (reference_image_urls or []) if str(x).strip()]
         self.voice_ids = [str(x).strip() for x in (voice_ids or []) if str(x).strip()]
+        self.seedance_video_urls = [str(x).strip() for x in (seedance_video_urls or []) if str(x).strip()]
+        self.seedance_audio_urls = [str(x).strip() for x in (seedance_audio_urls or []) if str(x).strip()]
+        self.seedance_material_urls = [str(x).strip() for x in (seedance_material_urls or []) if str(x).strip()]
         self._stop_requested = False
         self._session = requests.Session()
         self._session.trust_env = False
@@ -7599,8 +7861,14 @@ class VideoWorker(QThread):
         }
 
     def _is_h3(self):
-        model = str(self.model or "").strip().lower()
-        return model == "h3" or model.startswith("h3-")
+        return video_model_profile(self.model).get("kind") == "h3"
+
+    def _video_profile(self):
+        return video_model_profile(self.model)
+
+    def _is_unified_video_model(self):
+        """Seedance/H3 以及当前厂商的综合模型都使用 /v1/videos JSON 协议。"""
+        return self._video_profile().get("kind") in {"h3", "seedance", "mixed"}
 
     def _extract_dict(self, data):
         if isinstance(data, dict):
@@ -7615,7 +7883,10 @@ class VideoWorker(QThread):
 
         def collect(obj):
             if isinstance(obj, dict):
-                keys = ("video_id", "request_id", "task_id", "id") if self._is_h3() else ("video_id",)
+                if self._is_unified_video_model():
+                    keys = ("video_id", "request_id", "task_id", "id")
+                else:
+                    keys = ("video_id",)
                 for key in keys:
                     value = obj.get(key)
                     if value:
@@ -7754,9 +8025,86 @@ class VideoWorker(QThread):
             except Exception:
                 pass
 
+    @staticmethod
+    def _is_http_url(value):
+        return str(value or "").strip().lower().startswith(("http://", "https://"))
+
+    def _seedance_duration_limit(self, profile):
+        by_resolution = profile.get("duration_max_by_resolution", {})
+        if isinstance(by_resolution, dict) and self.resolution in by_resolution:
+            try:
+                return int(by_resolution[self.resolution])
+            except Exception:
+                pass
+        try:
+            return int(profile.get("duration_max", 30) or 30)
+        except Exception:
+            return 30
+
+    def _create_seedance_task(self):
+        profile = self._video_profile()
+        minimum = int(profile.get("duration_min", 1) or 1)
+        maximum = self._seedance_duration_limit(profile)
+        if self.duration < minimum or self.duration > maximum:
+            raise Exception(
+                f"{self.model} 在 {self.resolution} 下支持 {minimum}–{maximum} 秒。"
+            )
+        resolutions = profile.get("resolutions") or []
+        if resolutions and self.resolution not in resolutions:
+            raise Exception(f"{self.model} 不支持 {self.resolution} 分辨率。")
+        ratios = profile.get("ratios") or []
+        if ratios and self.ratio not in ratios:
+            raise Exception(f"{self.model} 不支持 {self.ratio} 画幅。")
+
+        image_values = self._video_image_values()
+        payload = {
+            "model": self.model,
+            "prompt": self.prompt.strip(),
+            "duration": self.duration,
+            "ratio": self.ratio or self.aspect_ratio or "16:9",
+            "resolution": self.resolution or profile.get("resolution_default", "720p"),
+        }
+        limits = (
+            ("images", image_values, profile.get("max_images")),
+            ("videos", self.seedance_video_urls, profile.get("max_videos")),
+            ("audios", self.seedance_audio_urls, profile.get("max_audios")),
+        )
+        for field, values, maximum_count in limits:
+            if maximum_count is not None and len(values) > int(maximum_count):
+                raise Exception(f"{self.model} 最多支持 {maximum_count} 个{field}素材。")
+            if values:
+                payload[field] = list(values)
+        if self.seedance_material_urls:
+            payload["materials"] = list(self.seedance_material_urls)
+
+        for field in ("videos", "audios", "materials"):
+            for value in payload.get(field, []):
+                if not self._is_http_url(value):
+                    raise Exception(f"Seedance {field} 只支持公网 HTTP(S) URL。")
+
+        r = self._request(
+            "POST",
+            api_url(self.base_url, "/v1/videos"),
+            headers=self._headers(),
+            json=payload,
+            timeout=(30, 120),
+            proxies=self._submit_proxies(),
+        )
+        try:
+            if r.status_code >= 400:
+                raise Exception(f"视频接口错误 {r.status_code}：{extract_api_error(r)}")
+            return r.json()
+        finally:
+            try:
+                r.close()
+            except Exception:
+                pass
+
     def _create_task(self):
         if self._is_h3():
             return self._create_h3_task()
+        if self._is_unified_video_model():
+            return self._create_seedance_task()
         payload = {
             "model": self.model,
             "prompt": self.prompt,
@@ -7874,6 +8222,65 @@ class VideoWorker(QThread):
                 return data
             self._sleep_with_stop(interval)
         raise Exception("H3 视频结果查询超时（超过 10 分钟）。")
+
+    def _query_unified_result(self, video_id):
+        """查询 Seedance/综合视频任务，兼容不同中转站返回的状态字段。"""
+        url = api_url(self.base_url, f"/v1/videos/{video_id}")
+        deadline = time.monotonic() + 60 * 30
+        interval = 3
+        last_status = ""
+        last_progress = None
+        while time.monotonic() < deadline:
+            self._raise_if_stopped()
+            r = self._request(
+                "GET",
+                url,
+                headers=self._headers(),
+                timeout=(10, 60),
+                proxies=self._submit_proxies(),
+            )
+            try:
+                if r.status_code >= 400:
+                    err_text = extract_api_error(r)
+                    retry_after = 0
+                    try:
+                        retry_after = int(r.headers.get("Retry-After", "0") or 0)
+                    except Exception:
+                        retry_after = 0
+                    if r.status_code == 429 or "rate limit" in str(err_text).lower():
+                        interval = min(60, max(3, retry_after, interval * 2))
+                        self.progress.emit(f"视频状态查询触发限流，等待 {interval} 秒后重试...")
+                        data = None
+                    else:
+                        raise Exception(f"视频状态查询失败 {r.status_code}：{err_text}")
+                else:
+                    data = r.json()
+            finally:
+                try:
+                    r.close()
+                except Exception:
+                    pass
+            if data is None:
+                self._sleep_with_stop(interval)
+                continue
+
+            status = self._extract_status(data)
+            obj = self._extract_dict(data)
+            progress = obj.get("progress") if isinstance(obj, dict) else None
+            if status != last_status or progress != last_progress:
+                if progress is not None:
+                    self.progress.emit(f"视频状态：{status or 'processing'}，进度 {progress}%")
+                elif status:
+                    self.progress.emit(f"视频状态：{status}")
+                last_status = status
+                last_progress = progress
+            video_url = self._extract_video_url(data)
+            if status in self.FAILED_STATUSES:
+                raise Exception(self._extract_error(data) or f"视频生成失败：{status}")
+            if status in self.DONE_STATUSES or (video_url and not status):
+                return data
+            self._sleep_with_stop(interval)
+        raise Exception("视频结果查询超时（超过 30 分钟）。")
 
     def _query_video_result(self, video_id):
         url = api_url(self.base_url, "/agnesapi")
@@ -7995,8 +8402,8 @@ class VideoWorker(QThread):
             except Exception:
                 pass
 
-    def _download_h3_content(self, video_id):
-        self.progress.emit("正在下载 H3 视频内容...")
+    def _download_video_content(self, video_id, label="视频"):
+        self.progress.emit(f"正在下载 {label}内容...")
         r = self._request(
             "GET",
             api_url(self.base_url, f"/v1/videos/{video_id}/content"),
@@ -8018,13 +8425,17 @@ class VideoWorker(QThread):
                         f.write(chunk)
             if not os.path.exists(path) or os.path.getsize(path) <= 0:
                 safe_remove_file(path)
-                raise ValueError("H3 视频内容为空。")
+                raise ValueError(f"{label}内容为空。")
             return path
         finally:
             try:
                 r.close()
             except Exception:
                 pass
+
+    def _download_h3_content(self, video_id):
+        # 保留原方法名，既兼容旧测试，也让历史调用继续使用 H3 文案。
+        return self._download_video_content(video_id, "H3 视频")
 
     def run(self):
         try:
@@ -8051,6 +8462,16 @@ class VideoWorker(QThread):
                         raise
                     self.progress.emit("H3 content 下载失败，正在改用结果中的视频 URL 下载...")
                     local_path = self._download_video(video_url)
+            elif self._is_unified_video_model():
+                result = self._query_unified_result(video_id)
+                video_url = self._extract_video_url(result)
+                try:
+                    local_path = self._download_video_content(video_id, "视频")
+                except Exception:
+                    if not video_url:
+                        raise
+                    self.progress.emit("视频 content 下载失败，正在改用结果中的视频 URL 下载...")
+                    local_path = self._download_video(video_url)
             else:
                 result = self._query_video_result(video_id)
                 video_url = self._extract_video_url(result)
@@ -8071,10 +8492,14 @@ class VideoWorker(QThread):
                 "image_refs": list(self.image_refs),
                 "duration": self.duration,
                 "aspect_ratio": self.aspect_ratio,
+                "ratio": self.ratio,
                 "resolution": self.resolution,
                 "last_frame_url": self.last_frame_url,
                 "reference_image_urls": list(self.reference_image_urls),
                 "voice_ids": list(self.voice_ids),
+                "seedance_video_urls": list(self.seedance_video_urls),
+                "seedance_audio_urls": list(self.seedance_audio_urls),
+                "seedance_material_urls": list(self.seedance_material_urls),
             })
         except Exception as e:
             if self._stop_requested or self.isInterruptionRequested():

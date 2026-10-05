@@ -461,7 +461,7 @@ class NovelWritingV2Tab(SimpleModelBarMixin, QWidget):
         self.status_combo.addItems(["草稿", "连载中", "已完结", "修订中"])
         self.premise_edit = PlainTextEdit()
         self.premise_edit.setFixedHeight(42)
-        self.premise_edit.setPlaceholderText("一句话说明主角、目标、冲突和故事承诺。")
+        self.premise_edit.setPlaceholderText("用几句话说清主角是谁、现在遇到什么事，以及故事会怎样展开。")
 
         for w in (self.title_edit, self.genre_edit, self.style_edit, self.target_words_edit):
             w.textChanged.connect(self._mark_dirty)
@@ -484,7 +484,7 @@ class NovelWritingV2Tab(SimpleModelBarMixin, QWidget):
         add_field(1, 0, "叙事人称", self.pov_combo)
         add_field(1, 2, "项目总字数（万字）", self.target_words_edit)
         add_field(1, 4, "状态", self.status_combo)
-        header_layout.addWidget(QLabel("故事核心"), 2, 0)
+        header_layout.addWidget(QLabel("故事简介"), 2, 0)
         header_layout.addWidget(self.premise_edit, 2, 1, 1, 5)
         header_layout_outer.addWidget(self.project_info_body)
 
@@ -4801,7 +4801,7 @@ class NovelWritingV2Tab(SimpleModelBarMixin, QWidget):
         ]
         summary = str(plan.get("summary", "") or "").strip()
         if summary:
-            lines.extend(["", "全书/阶段规划：", summary])
+            lines.extend(["", "阶段规划摘要：", summary])
         maintenance = plan.get("foreshadow_maintenance", {})
         if isinstance(maintenance, dict):
             merge_groups = maintenance.get("merge_groups", [])
@@ -7984,7 +7984,7 @@ class NovelWritingV2Tab(SimpleModelBarMixin, QWidget):
         materials = deepcopy(data.get("project_materials", {})) if isinstance(data, dict) else {}
         materials = materials if isinstance(materials, dict) else {}
         moved_parts = []
-        for key, label in (("timeline", "框架时间线 / 阶段走向"), ("summary", "框架摘要 / 全书走向")):
+        for key, label in (("timeline", "框架时间线 / 阶段规划"), ("summary", "框架摘要")):
             value = str(materials.get(key, "") or "").strip()
             if value:
                 moved_parts.append(f"{label}：\n{value}")
@@ -7993,7 +7993,7 @@ class NovelWritingV2Tab(SimpleModelBarMixin, QWidget):
         plan = plan if isinstance(plan, dict) else {}
         if moved_parts:
             bible = str(materials.get("bible", "") or "").strip()
-            framework_block = "全书阶段规划 / 框架参考：\n" + "\n\n".join(moved_parts)
+            framework_block = "阶段规划 / 框架参考：\n" + "\n\n".join(moved_parts)
             materials["bible"] = f"{bible}\n\n{framework_block}".strip() if bible else framework_block
         return materials
 

@@ -628,8 +628,8 @@ def _build_local_framework_chapter_plan(text, semantic_analysis=None, ai_locatio
     plan["semantic_outline_mode"] = mode
     plan["semantic_outline_missing"] = sorted(missing)
     plan["source_text_preserved"] = bool(str(text or "").strip())
-    # For mapping completeness, use the AI's outline count, not the book's
-    # planning chapter count. A framework may state an approximate full-book
+    # For mapping completeness, use the AI's outline count, not the overall
+    # planning chapter count. A framework may state an approximate total
     # count while containing a shorter detailed outline.
     expected_count = int(analysis.get("chapter_outline_count", 0) or 0)
     resolved_indexes = {
@@ -897,7 +897,7 @@ def _extract_framework_planning_parameters(text, plan=None):
             stage_count = expected - 1
             total = result.get("target_words", 0)
             average = result.get("average_chapter_words", 0)
-            # A partial stage map must not override an explicit full-book size.
+            # A partial stage map must not override an explicit overall size.
             if not (total and average) or stage_count >= (total + average - 1) // average:
                 result.setdefault("total_chapter_count", stage_count)
     # Only derive a missing size when the other two are explicit.

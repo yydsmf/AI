@@ -701,10 +701,10 @@ def _normalize_series_continuation(value):
         record_text_fields = {
             "reusable_characters": ("notes",),
             "reusable_lore": ("description", "story_known"),
-            "reusable_foreshadows": ("description", "revealed", "remaining_secret", "notes"),
-            "deferred_foreshadows": ("description", "revealed", "remaining_secret", "notes"),
-            "resolved_foreshadows": ("description", "revealed", "remaining_secret", "notes", "result"),
-            "discarded_foreshadows": ("description", "revealed", "remaining_secret", "notes", "result"),
+            "reusable_foreshadows": ("description", "revealed", "remaining_secret"),
+            "deferred_foreshadows": ("description", "revealed", "remaining_secret"),
+            "resolved_foreshadows": ("description", "revealed", "remaining_secret", "result"),
+            "discarded_foreshadows": ("description", "revealed", "remaining_secret", "result"),
         }
         for key in (
             "character_states",
@@ -733,6 +733,8 @@ def _normalize_series_continuation(value):
                     cleaned = _strip_internal_candidate_markers(item)
                 else:
                     continue
+                if key in _PRIVATE_FORESHADOW_NOTE_COLLECTION_KEYS and isinstance(cleaned, dict):
+                    cleaned.pop("notes", None)
                 if str(cleaned or "").strip():
                     normalized_items.append(cleaned)
             if key in handoff or normalized_items:
@@ -873,7 +875,7 @@ def _normalize_narrative_strategy_profile(value):
         "planning_grammar",
         "pacing_strategy",
         "low_exposition_strategy",
-        "forbidden_drift",
+        "story_direction",
     )
     list_fields = (
         "satisfaction_currencies",
@@ -921,13 +923,82 @@ def _clean_chapter_plan_story_boundary(value):
     return cleaned
 
 
+def _normalize_structured_stage_plan(value):
+    """Keep the wizard's ordered event graph available to chapter planning."""
+    if not isinstance(value, list):
+        return []
+    stages = []
+    for stage in value:
+        if not isinstance(stage, dict):
+            continue
+        try:
+            start = int(stage.get("start_chapter", 0) or 0)
+            end = int(stage.get("end_chapter", 0) or 0)
+        except Exception:
+            continue
+        if start <= 0 or end < start:
+            continue
+        row = {
+            "id": str(stage.get("id", "") or "").strip(),
+            "name": str(stage.get("name", "") or "").strip(),
+            "start_chapter": start,
+            "end_chapter": end,
+            "target_words": max(0, int(stage.get("target_words", 0) or 0)),
+        }
+        for key in (
+            "summary", "main_conflict", "end_state", "next_stage_hook",
+        ):
+            text = str(stage.get(key, "") or "").strip()
+            if text:
+                row[key] = text
+        for key in (
+            "relationship_changes", "character_changes", "world_reveals",
+            "turning_points", "foreshadow_actions", "carry_over",
+        ):
+            values = _normalize_name_list(stage.get(key, []))
+            if values:
+                row[key] = values[:60]
+        for key in ("entry_state", "exit_state"):
+            state = stage.get(key, {})
+            if isinstance(state, dict):
+                row[key] = deepcopy(state)
+        events = []
+        for event in stage.get("ordered_events", []) if isinstance(stage.get("ordered_events"), list) else []:
+            if not isinstance(event, dict):
+                continue
+            event_row = {
+                "id": str(event.get("id", "") or "").strip(),
+                "allowed_chapters": [
+                    int(item) for item in event.get("allowed_chapters", [])[:2]
+                    if str(item).strip().isdigit()
+                ],
+                "references": _normalize_name_list(event.get("references", []))[:30],
+                "preconditions": _normalize_name_list(event.get("preconditions", []))[:30],
+                "event": str(event.get("event", "") or "").strip(),
+                "result": str(event.get("result", "") or "").strip(),
+            }
+            delta = event.get("state_delta", {})
+            if isinstance(delta, dict):
+                event_row["state_delta"] = deepcopy(delta)
+            event_row = {
+                key: child for key, child in event_row.items()
+                if child not in ("", [], {})
+            }
+            if event_row:
+                events.append(event_row)
+        if events:
+            row["ordered_events"] = events
+        stages.append(row)
+    return stages
+
+
 def _normalize_chapter_plan_foundation(value):
     if not isinstance(value, dict):
         return {}
     result = {}
     for key in (
         "summary", "core_mainline", "ending_promise", "global_hard_boundaries",
-        "source", "source_hash", "foundation_mode",
+        "source", "source_hash", "foundation_mode", "planning_schema_version",
     ):
         field_value = str(value.get(key, "") or "").strip()
         if key == "global_hard_boundaries":
@@ -947,12 +1018,34 @@ def _normalize_chapter_plan_foundation(value):
     contract = _normalize_creative_intent_contract(value.get("creative_intent_contract", {}))
     if contract:
         result["creative_intent_contract"] = contract
+    book_contract = value.get("book_contract", {})
+    if isinstance(book_contract, dict):
+        normalized_contract = {}
+        for key in (
+            "hard_facts", "world_invariants", "character_boundaries",
+            "ending_boundaries",
+        ):
+            items = _normalize_name_list(book_contract.get(key, []))
+            if items:
+                normalized_contract[key] = items[:80]
+        if normalized_contract:
+            result["book_contract"] = normalized_contract
+    structured_stages = _normalize_structured_stage_plan(
+        value.get("structured_stages", value.get("stage_plan", []))
+    )
+    if structured_stages:
+        result["structured_stages"] = structured_stages
     arc_fields = (
         "name", "macro_phase", "source_stage", "dominant_line", "supporting_lines",
         "relationship_goal", "end_state", "goal", "main_conflict", "turning_points",
         "reader_payoff", "emotional_arc", "pacing_pattern", "exposition_compression",
-        "variation_plan", "investigation_scope", "forbidden",
+        "variation_plan", "story_direction",
     )
+    # Legacy imported/manual planning records may still carry these fields.
+    # They remain readable outside the creation-wizard protocol, while new
+    # wizard foundations intentionally omit them.
+    if str(result.get("source", "") or "").strip() != "creation_wizard":
+        arc_fields += ("investigation_scope", "forbidden")
     arcs = []
     for item in value.get("arcs", []) if isinstance(value.get("arcs"), list) else []:
         if not isinstance(item, dict):
@@ -1144,6 +1237,15 @@ _PRIVATE_PROJECT_NOTE_KEYS = {
     "auto_expand_resume_required",
 }
 
+_PRIVATE_FORESHADOW_NOTE_COLLECTION_KEYS = {
+    "foreshadow_items",
+    "foreshadows",
+    "reusable_foreshadows",
+    "deferred_foreshadows",
+    "resolved_foreshadows",
+    "discarded_foreshadows",
+}
+
 
 def _normalize_framework_analysis(value, source_text=""):
     """Persist an AI decision; code checks schema/provenance, not story adequacy."""
@@ -1196,15 +1298,19 @@ def _project_without_private_notes(project):
     if not isinstance(project, dict):
         return {}
 
-    def scrub(value):
+    def scrub(value, parent_key=""):
         if isinstance(value, dict):
             return {
-                key: scrub(child)
+                key: scrub(child, str(key))
                 for key, child in value.items()
                 if str(key) not in _PRIVATE_PROJECT_NOTE_KEYS
+                and not (
+                    str(key) == "notes"
+                    and parent_key in _PRIVATE_FORESHADOW_NOTE_COLLECTION_KEYS
+                )
             }
         if isinstance(value, list):
-            return [scrub(item) for item in value]
+            return [scrub(item, parent_key) for item in value]
         return value
 
     return scrub(project)
@@ -1910,7 +2016,7 @@ def _normalize_project(data):
         if not isinstance(master_plan, dict):
             master_plan = {}
         if version > 0 and status in {
-            "pending", "awaiting_profile_confirmation", "generating", "failed", "interrupted", "complete"
+            "pending", "awaiting_profile_confirmation", "placing", "generating", "failed", "interrupted", "complete"
         }:
             def state_int(key, default=0):
                 try:
@@ -1934,6 +2040,42 @@ def _normalize_project(data):
                 ),
                 "profile_confirmed": bool(generation_state.get("profile_confirmed", False)),
             }
+            event_schedules = generation_state.get("event_schedules", {})
+            if isinstance(event_schedules, dict):
+                normalized_schedules = {}
+                for raw_key, raw_schedule in event_schedules.items():
+                    if not isinstance(raw_schedule, dict):
+                        continue
+                    placements = []
+                    for item in raw_schedule.get("placements", []) if isinstance(raw_schedule.get("placements"), list) else []:
+                        if not isinstance(item, dict):
+                            continue
+                        try:
+                            node_index = int(item.get("n", 0) or 0)
+                            start = int(item.get("a", 0) or 0)
+                            end = int(item.get("b", 0) or 0)
+                        except (TypeError, ValueError):
+                            continue
+                        if node_index > 0 and start > 0 and end >= start:
+                            placements.append({"n": node_index, "a": start, "b": end})
+                    if not placements:
+                        continue
+                    try:
+                        batch_start = int(raw_schedule.get("batch_start", 0) or 0)
+                        batch_end = int(raw_schedule.get("batch_end", 0) or 0)
+                    except (TypeError, ValueError):
+                        batch_start, batch_end = 0, 0
+                    if batch_start <= 0 or batch_end < batch_start:
+                        continue
+                    key = str(raw_key or f"{batch_start}-{batch_end}").strip()
+                    normalized_schedules[key] = {
+                        "stage_id": _as_text(raw_schedule.get("stage_id", "")),
+                        "batch_start": batch_start,
+                        "batch_end": batch_end,
+                        "placements": placements,
+                    }
+                if normalized_schedules:
+                    normalized_state["event_schedules"] = normalized_schedules
             if generation_state.get("force_master_regeneration"):
                 normalized_state["force_master_regeneration"] = True
             for key in ("started_at", "updated_at", "error", "profile_hash", "foundation_hash"):
@@ -2005,6 +2147,10 @@ def _normalize_project(data):
                     _canonical_chapter_plan_event_id(value)
                     for value in _normalize_name_list(chap.get("source_event_ids", []))
                 ]
+                structured_plan = chap.get("chapter_plan_structured", {})
+                chap["chapter_plan_structured"] = (
+                    deepcopy(structured_plan) if isinstance(structured_plan, dict) else {}
+                )
                 chap["actual_linked_character_ids"] = _normalize_name_list(chap.get("actual_linked_character_ids", []))
                 chap["state_delta"] = deepcopy(chap.get("state_delta", {})) if isinstance(chap.get("state_delta"), dict) else {}
                 chap["long_term_events"] = [
@@ -2452,12 +2598,12 @@ def _compact_volume_handoff_source_for_request(source, total_limit=VOLUME_HANDOF
             records.get("foreshadows", []),
             (
                 "code", "name", "status", "setup_chapter", "payoff_chapter",
-                "description", "revealed", "remaining_secret", "notes",
+                "description", "revealed", "remaining_secret",
             ),
             {
                 "code": 28, "name": 70, "status": 20, "setup_chapter": 36,
                 "payoff_chapter": 36, "description": 100, "revealed": 80,
-                "remaining_secret": 100, "notes": 70,
+                "remaining_secret": 100,
             },
             active_limit,
             minimal_fields=("code", "name", "status", "remaining_secret"),
@@ -2608,12 +2754,12 @@ def _compact_volume_handoff_for_framework(handoff, total_limit=VOLUME_FRAMEWORK_
         handoff.get("reusable_foreshadows", []),
         (
             "code", "name", "status", "setup_chapter", "payoff_chapter",
-            "description", "revealed", "remaining_secret", "notes",
+            "description", "revealed", "remaining_secret",
         ),
         {
             "code": 28, "name": 70, "status": 20, "setup_chapter": 36,
             "payoff_chapter": 36, "description": 100, "revealed": 80,
-            "remaining_secret": 100, "notes": 70,
+            "remaining_secret": 100,
         },
         12000,
         minimal_fields=("code", "name", "status", "remaining_secret"),
@@ -2990,7 +3136,7 @@ def _build_volume_handoff_source(project):
     discarded_foreshadows = []
     foreshadow_fields = (
         "code", "name", "status", "setup_chapter", "payoff_chapter",
-        "description", "revealed", "remaining_secret", "notes",
+        "description", "revealed", "remaining_secret",
     )
     for item in raw_foreshadows:
         if not isinstance(item, dict) or not str(item.get("name", "") or "").strip():
@@ -3061,7 +3207,7 @@ def _build_volume_handoff_source(project):
             {
                 "code": 28, "name": 70, "status": 20, "setup_chapter": 36,
                 "payoff_chapter": 36, "description": 100, "revealed": 80,
-                "remaining_secret": 100, "notes": 70,
+                "remaining_secret": 100,
             },
             12000,
             minimal_fields=("code", "name", "status", "remaining_secret"),
@@ -3160,7 +3306,7 @@ def _build_volume_handoff_record_catalog(project):
             item,
             (
                 "id", "code", "name", "status", "setup_chapter", "payoff_chapter",
-                "description", "revealed", "remaining_secret", "notes",
+                "description", "revealed", "remaining_secret",
             ),
             field_limit=1800,
         )
@@ -9375,6 +9521,18 @@ def _build_legacy_style_execution_context(
             instruction,
         ) if part
     )[:int(limit or NOVEL_AI_CONTEXT_LIMIT)]
+
+
+def _story_conflict_pacing_guidance():
+    """Keep chapter-plan rhythm lively without forcing every genre into a fight scene."""
+    return (
+        "【剧情推进要求】\n"
+        "连续章节都由正在发生的事情推动。对于爽文、逆袭、升级、都市、高武、玄幻等强调外部结果的题材，"
+        "每两章至少要让主角和路人、配角、对手或反派发生一次由具体事件触发的有效碰撞：对方可以带来质疑、阻拦、争抢、试探、竞争、对峙或对抗，"
+        "每次碰撞都留下新的结果、信息或关系变化，形式可以随题材和人物处境变化。"
+        "其他题材在两章内安排符合自身故事的具体压力、误会、对峙或选择，让主角的处境继续改变。"
+        "碰撞从人物当前目标、场景和利益关系中自然长出，随着人物、场景和结果持续变化。\n"
+    )
 
 
 def _grounded_prose_contract():
@@ -19562,6 +19720,15 @@ def _build_chapter_ai_context(project, chapter_index, action):
     meta = project.get("meta", {})
     chap = chapters[chapter_index]
     raw_chapter_outline = str(chap.get("outline", "") or "")
+    structured_chapter_plan = chap.get("chapter_plan_structured", {})
+    structured_chapter_plan = (
+        structured_chapter_plan if isinstance(structured_chapter_plan, dict) else {}
+    )
+    structured_plan_text = json.dumps(
+        structured_chapter_plan,
+        ensure_ascii=False,
+        separators=(",", ":"),
+    ) if structured_chapter_plan else ""
     chapter_outline_for_context = (
         _strip_volume_handoff_outline_metadata(
             _strip_static_foreshadow_outline_fields(raw_chapter_outline)
@@ -19589,6 +19756,7 @@ def _build_chapter_ai_context(project, chapter_index, action):
         str(chap.get("text", "") or ""),
         str(chap.get("summary", "") or ""),
         str(chap.get("key_facts", "") or ""),
+        structured_plan_text,
         recent_context_text,
         " ".join(str(name) for name in linked_names_for_context),
         " ".join(str(name) for name in recent_linked_characters),
@@ -19991,6 +20159,78 @@ def _build_chapter_ai_context(project, chapter_index, action):
         f"本章扩写字数：{draft_words_line}",
         f"本章有效关联人物：{', '.join(inherited_linked_characters)}",
     ]
+    if structured_chapter_plan:
+        structured_lines = []
+        stage_id = str(structured_chapter_plan.get("stage_id", "") or "").strip()
+        if stage_id:
+            structured_lines.append(f"所属阶段：{stage_id}")
+        start_state = structured_chapter_plan.get("start_state", {})
+        if isinstance(start_state, dict):
+            state_text = "；".join(
+                f"{key}：{value}" for key, value in (
+                    ("地点", start_state.get("location", "")),
+                    ("人物状态", "、".join(_normalize_name_list(start_state.get("characters", [])))),
+                    ("已知事实", "；".join(_normalize_name_list(start_state.get("known_facts", [])))),
+                ) if str(value or "").strip()
+            )
+            if state_text:
+                structured_lines.append(f"开始状态：{state_text}")
+        scenes = structured_chapter_plan.get("scene_chain", [])
+        if isinstance(scenes, list):
+            for index, scene in enumerate(scenes, 1):
+                if not isinstance(scene, dict):
+                    continue
+                scene_text = "；".join(
+                    f"{label}：{value}" for label, value in (
+                        ("地点", scene.get("location", "")),
+                        ("人物", "、".join(_normalize_name_list(scene.get("characters", [])))),
+                        ("触发", scene.get("trigger", "")),
+                        ("行动", scene.get("action", "")),
+                        ("结果", scene.get("result", "")),
+                    ) if str(value or "").strip()
+                )
+                if scene_text:
+                    structured_lines.append(f"场景{index}：{scene_text}")
+        conflict = structured_chapter_plan.get("conflict", {})
+        if isinstance(conflict, dict):
+            conflict_text = "；".join(
+                f"{label}：{conflict.get(key, '')}" for label, key in (
+                    ("冲突来源", "source"), ("现实压力", "pressure"), ("冲突结果", "result")
+                ) if str(conflict.get(key, "") or "").strip()
+            )
+            if conflict_text:
+                structured_lines.append(f"本章冲突：{conflict_text}")
+        for label, key in (("本章要落地的事实", "required_facts"),):
+            values = _normalize_name_list(structured_chapter_plan.get(key, []))
+            if values:
+                structured_lines.append(f"{label}：" + "；".join(values))
+        delta = structured_chapter_plan.get("continuity_delta", {})
+        if isinstance(delta, dict):
+            delta_parts = []
+            for label, key in (
+                ("时间", "time_advance"), ("地点", "location_changes"),
+                ("认知", "knowledge_changes"), ("关系", "relationship_changes"),
+                ("物件", "object_changes"), ("新增问题", "new_open_threads"),
+                ("关闭问题", "closed_threads"),
+            ):
+                value = delta.get(key, "")
+                if isinstance(value, list):
+                    value = "；".join(_normalize_name_list(value))
+                if str(value or "").strip():
+                    delta_parts.append(f"{label}：{value}")
+            if delta_parts:
+                structured_lines.append("本章连续性变化：" + "；".join(delta_parts))
+        ending = structured_chapter_plan.get("ending_change", {})
+        if isinstance(ending, dict):
+            ending_text = "；".join(
+                str(value or "").strip() for value in (
+                    ending.get("type", ""), ending.get("fact", "")
+                ) if str(value or "").strip()
+            )
+            if ending_text:
+                structured_lines.append(f"章末变化：{ending_text}")
+        if structured_lines:
+            current_lines.append("结构化章节事实（只用于确认顺序和连续性，不要把字段名或规划过程写进正文）：\n" + "\n".join(structured_lines))
     if selected_character_ids and planned_linked_characters:
         current_lines.append(
             "初始章节规划人物（仅弱参考，不要求全部出场，也不得覆盖AI按实写状态生成的本章人物清单）："

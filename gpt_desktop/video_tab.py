@@ -24,6 +24,7 @@ from .core import (
     save_config,
     save_input_drafts,
     save_json_file,
+    video_model_profile,
 )
 from .error_ui import show_generation_error
 from .model_bar_mixin import SimpleModelBarMixin
@@ -215,7 +216,7 @@ class VideoGeneratorTab(SimpleModelBarMixin, QWidget):
     request_settings = Signal()
     MODEL_CONFIG_SECTION = "video"
 
-    FALLBACK_MODELS = ["agnes-video-v2.0"]
+    FALLBACK_MODELS = ["seedance-2.0-900-特惠", "agnes-video-v2.0"]
     SIZE_OPTIONS = ["1280x720（横屏）", "720x1280（竖屏）", "1024x1024（方形）"]
     SIZE_MAP = {
         "1280x720（横屏）": (1280, 720),
@@ -224,6 +225,8 @@ class VideoGeneratorTab(SimpleModelBarMixin, QWidget):
     }
     FRAME_OPTIONS = ["81", "121", "161", "241", "441"]
     FPS_OPTIONS = ["24", "30"]
+    # 初始值只用于模型列表还没加载完成时的占位；真正的选项会根据
+    # video_model_profile() 在模型切换后动态刷新。
     H3_DURATION_OPTIONS = [str(value) for value in range(1, 16)]
     H3_ASPECT_RATIO_OPTIONS = ["16:9", "9:16", "1:1", "4:3", "3:4"]
     H3_RESOLUTION_OPTIONS = ["480p", "720p", "1080p"]
@@ -231,6 +234,8 @@ class VideoGeneratorTab(SimpleModelBarMixin, QWidget):
     def __init__(self, config):
         super().__init__()
         self.config = config
+        # 初始化期间只恢复控件状态，不应把传入的测试/默认配置写入真实配置文件。
+        self._video_params_ready = False
         self.model_worker = None
         self._pending_model_reload = False
         self.history = []
@@ -273,7 +278,11 @@ class VideoGeneratorTab(SimpleModelBarMixin, QWidget):
         param_layout.setContentsMargins(14, 12, 14, 12)
         param_layout.setSpacing(10)
         self._legacy_param_widgets = []
-        self._h3_param_widgets = []
+        self._unified_param_widgets = []
+        # 旧名称保留，避免已有外部调用或测试依赖该属性。
+        self._h3_param_widgets = self._unified_param_widgets
+        self._h3_advanced_widgets = []
+        self._seedance_advanced_widgets = []
 
         def add_param(label_text, widget, group=None):
             lbl = QLabel(label_text)
@@ -282,6 +291,7 @@ class VideoGeneratorTab(SimpleModelBarMixin, QWidget):
             param_layout.addWidget(widget)
             if group is not None:
                 group.extend((lbl, widget))
+            return lbl
 
         self.mode_combo = WideComboBox()
         self.mode_combo.addItems(["文生视频", "图生视频"])
@@ -312,17 +322,17 @@ class VideoGeneratorTab(SimpleModelBarMixin, QWidget):
         self.duration_combo = WideComboBox()
         self.duration_combo.addItems(self.H3_DURATION_OPTIONS)
         self.duration_combo.setMinimumWidth(70)
-        add_param("时长(秒)", self.duration_combo, self._h3_param_widgets)
+        self.duration_label = add_param("时长(秒)", self.duration_combo, self._unified_param_widgets)
 
         self.aspect_ratio_combo = WideComboBox()
         self.aspect_ratio_combo.addItems(self.H3_ASPECT_RATIO_OPTIONS)
         self.aspect_ratio_combo.setMinimumWidth(80)
-        add_param("H3画幅", self.aspect_ratio_combo, self._h3_param_widgets)
+        self.aspect_ratio_label = add_param("画幅", self.aspect_ratio_combo, self._unified_param_widgets)
 
         self.resolution_combo = WideComboBox()
         self.resolution_combo.addItems(self.H3_RESOLUTION_OPTIONS)
         self.resolution_combo.setMinimumWidth(80)
-        add_param("分辨率", self.resolution_combo, self._h3_param_widgets)
+        self.resolution_label = add_param("分辨率", self.resolution_combo, self._unified_param_widgets)
 
         body = QHBoxLayout()
         body.setSpacing(14)
@@ -351,11 +361,11 @@ class VideoGeneratorTab(SimpleModelBarMixin, QWidget):
         self.image_url_input.setPlaceholderText("可选：参考图 URL。也可以直接拖入本地图片。")
         left.addWidget(self.image_url_input)
 
-        self.h3_advanced_toggle = QPushButton("H3 高级参数（尾帧 / 多图 / 音色）")
+        self.h3_advanced_toggle = QPushButton("高级素材参数")
         self.h3_advanced_toggle.setObjectName("ghost")
         self.h3_advanced_toggle.setCheckable(True)
         self.h3_advanced_toggle.setChecked(False)
-        self.h3_advanced_toggle.setToolTip("展开或收起 H3 的尾帧、多图参考和音色参数")
+        self.h3_advanced_toggle.setToolTip("展开或收起当前视频模型支持的高级素材参数")
         left.addWidget(self.h3_advanced_toggle)
 
         self.h3_advanced_widget = QWidget()
@@ -366,28 +376,70 @@ class VideoGeneratorTab(SimpleModelBarMixin, QWidget):
         self.last_frame_label = QLabel("H3 尾帧 URL（可选，需公网 HTTPS 地址）")
         self.last_frame_label.setObjectName("field_label")
         h3_advanced_layout.addWidget(self.last_frame_label)
+        self._h3_advanced_widgets.append(self.last_frame_label)
 
         self.last_frame_url_input = QLineEdit()
         self.last_frame_url_input.setPlaceholderText("H3 last_frame，例如 https://.../last.png")
         h3_advanced_layout.addWidget(self.last_frame_url_input)
+        self._h3_advanced_widgets.append(self.last_frame_url_input)
 
         self.h3_reference_label = QLabel("H3 多图参考 URL（可选，逗号或换行分隔，最多 7 张）")
         self.h3_reference_label.setObjectName("field_label")
         h3_advanced_layout.addWidget(self.h3_reference_label)
+        self._h3_advanced_widgets.append(self.h3_reference_label)
 
         self.h3_reference_images_input = QTextEdit()
         self.h3_reference_images_input.setAcceptRichText(False)
         self.h3_reference_images_input.setPlaceholderText("每行一个公网 HTTPS 图片 URL；用于 reference_images")
         self.h3_reference_images_input.setFixedHeight(58)
         h3_advanced_layout.addWidget(self.h3_reference_images_input)
+        self._h3_advanced_widgets.append(self.h3_reference_images_input)
 
         self.h3_voice_label = QLabel("H3 预设音色（可选，逗号或换行分隔，最多 3 个）")
         self.h3_voice_label.setObjectName("field_label")
         h3_advanced_layout.addWidget(self.h3_voice_label)
+        self._h3_advanced_widgets.append(self.h3_voice_label)
 
         self.h3_voice_ids_input = QLineEdit()
         self.h3_voice_ids_input.setPlaceholderText("例如 eve, leo；用于 reference_audios")
         h3_advanced_layout.addWidget(self.h3_voice_ids_input)
+        self._h3_advanced_widgets.append(self.h3_voice_ids_input)
+
+        self.seedance_video_label = QLabel("参考视频 URL（可选，按当前模型上限）")
+        self.seedance_video_label.setObjectName("field_label")
+        h3_advanced_layout.addWidget(self.seedance_video_label)
+        self._seedance_advanced_widgets.append(self.seedance_video_label)
+
+        self.seedance_video_input = QTextEdit()
+        self.seedance_video_input.setAcceptRichText(False)
+        self.seedance_video_input.setPlaceholderText("每行一个公网 HTTP(S) 视频 URL；用于 videos")
+        self.seedance_video_input.setFixedHeight(50)
+        h3_advanced_layout.addWidget(self.seedance_video_input)
+        self._seedance_advanced_widgets.append(self.seedance_video_input)
+
+        self.seedance_audio_label = QLabel("参考音频 URL（可选，按当前模型上限）")
+        self.seedance_audio_label.setObjectName("field_label")
+        h3_advanced_layout.addWidget(self.seedance_audio_label)
+        self._seedance_advanced_widgets.append(self.seedance_audio_label)
+
+        self.seedance_audio_input = QTextEdit()
+        self.seedance_audio_input.setAcceptRichText(False)
+        self.seedance_audio_input.setPlaceholderText("每行一个公网 HTTP(S) 音频 URL；用于 audios")
+        self.seedance_audio_input.setFixedHeight(50)
+        h3_advanced_layout.addWidget(self.seedance_audio_input)
+        self._seedance_advanced_widgets.append(self.seedance_audio_input)
+
+        self.seedance_material_label = QLabel("其他素材 URL（可选，按当前模型接口支持）")
+        self.seedance_material_label.setObjectName("field_label")
+        h3_advanced_layout.addWidget(self.seedance_material_label)
+        self._seedance_advanced_widgets.append(self.seedance_material_label)
+
+        self.seedance_material_input = QTextEdit()
+        self.seedance_material_input.setAcceptRichText(False)
+        self.seedance_material_input.setPlaceholderText("每行一个公网 HTTP(S) 素材 URL；用于 materials")
+        self.seedance_material_input.setFixedHeight(50)
+        h3_advanced_layout.addWidget(self.seedance_material_input)
+        self._seedance_advanced_widgets.append(self.seedance_material_input)
         left.addWidget(self.h3_advanced_widget)
 
         self.ref_area = ReferenceDropArea()
@@ -465,11 +517,15 @@ class VideoGeneratorTab(SimpleModelBarMixin, QWidget):
         self.duration_combo.currentTextChanged.connect(self.save_video_params)
         self.aspect_ratio_combo.currentTextChanged.connect(self.save_video_params)
         self.resolution_combo.currentTextChanged.connect(self.save_video_params)
+        self.resolution_combo.currentTextChanged.connect(self._on_resolution_changed)
         self.prompt_input.textChanged.connect(self.save_video_draft)
         self.image_url_input.textChanged.connect(self.save_video_draft)
         self.last_frame_url_input.textChanged.connect(self.save_video_draft)
         self.h3_reference_images_input.textChanged.connect(self.save_video_draft)
         self.h3_voice_ids_input.textChanged.connect(self.save_video_draft)
+        self.seedance_video_input.textChanged.connect(self.save_video_draft)
+        self.seedance_audio_input.textChanged.connect(self.save_video_draft)
+        self.seedance_material_input.textChanged.connect(self.save_video_draft)
         self.h3_advanced_toggle.toggled.connect(self._on_h3_advanced_toggled)
         self.ref_area.files_added.connect(self.add_refs)
         self.clear_refs_btn.clicked.connect(self.clear_refs)
@@ -480,6 +536,7 @@ class VideoGeneratorTab(SimpleModelBarMixin, QWidget):
 
         self.restore_video_params()
         self.restore_video_draft()
+        self._video_params_ready = True
         self.on_video_mode_changed(self.mode_combo.currentText())
         self.refresh_providers()
         self.load_persistent_history()
@@ -501,20 +558,40 @@ class VideoGeneratorTab(SimpleModelBarMixin, QWidget):
 
     def restore_video_params(self):
         cfg = self.config.setdefault("video", {})
-        self._set_combo_text_if_exists(self.mode_combo, cfg.get("mode", "文生视频"))
-        width = cfg.get("width", "1280")
-        height = cfg.get("height", "720")
-        for label, size in self.SIZE_MAP.items():
-            if str(size[0]) == str(width) and str(size[1]) == str(height):
-                self._set_combo_text_if_exists(self.size_combo, label)
-                break
-        self._set_combo_text_if_exists(self.frames_combo, cfg.get("num_frames", "81"))
-        self._set_combo_text_if_exists(self.fps_combo, cfg.get("frame_rate", "24"))
-        self._set_combo_text_if_exists(self.duration_combo, cfg.get("duration", "8"))
-        self._set_combo_text_if_exists(self.aspect_ratio_combo, cfg.get("aspect_ratio", "16:9"))
-        self._set_combo_text_if_exists(self.resolution_combo, cfg.get("resolution", "480p"))
+        combos = (
+            self.mode_combo,
+            self.size_combo,
+            self.frames_combo,
+            self.fps_combo,
+            self.duration_combo,
+            self.aspect_ratio_combo,
+            self.resolution_combo,
+        )
+        for combo in combos:
+            combo.blockSignals(True)
+        try:
+            self._set_combo_text_if_exists(self.mode_combo, cfg.get("mode", "文生视频"))
+            width = cfg.get("width", "1280")
+            height = cfg.get("height", "720")
+            for label, size in self.SIZE_MAP.items():
+                if str(size[0]) == str(width) and str(size[1]) == str(height):
+                    self._set_combo_text_if_exists(self.size_combo, label)
+                    break
+            self._set_combo_text_if_exists(self.frames_combo, cfg.get("num_frames", "81"))
+            self._set_combo_text_if_exists(self.fps_combo, cfg.get("frame_rate", "24"))
+            self._set_combo_text_if_exists(self.duration_combo, cfg.get("duration", "5"))
+            self._set_combo_text_if_exists(
+                self.aspect_ratio_combo,
+                cfg.get("ratio", cfg.get("aspect_ratio", "16:9")),
+            )
+            self._set_combo_text_if_exists(self.resolution_combo, cfg.get("resolution", "720p"))
+        finally:
+            for combo in combos:
+                combo.blockSignals(False)
 
     def save_video_params(self, *_args):
+        if not self._video_params_ready:
+            return
         try:
             width, height = self.SIZE_MAP.get(self.size_combo.currentText(), (1280, 720))
             self._set_video_config(
@@ -525,6 +602,7 @@ class VideoGeneratorTab(SimpleModelBarMixin, QWidget):
                 frame_rate=self.fps_combo.currentText(),
                 duration=self.duration_combo.currentText(),
                 aspect_ratio=self.aspect_ratio_combo.currentText(),
+                ratio=self.aspect_ratio_combo.currentText(),
                 resolution=self.resolution_combo.currentText(),
             )
             save_config(self.config)
@@ -539,6 +617,9 @@ class VideoGeneratorTab(SimpleModelBarMixin, QWidget):
             last_frame_url = data.get("video_last_frame_url", "")
             h3_reference_images = data.get("video_h3_reference_images", "")
             h3_voice_ids = data.get("video_h3_voice_ids", "")
+            seedance_videos = data.get("video_seedance_videos", "")
+            seedance_audios = data.get("video_seedance_audios", "")
+            seedance_materials = data.get("video_seedance_materials", "")
             refs = data.get("video_refs", [])
             self.prompt_input.blockSignals(True)
             self.prompt_input.setPlainText(text if isinstance(text, str) else "")
@@ -555,6 +636,15 @@ class VideoGeneratorTab(SimpleModelBarMixin, QWidget):
             self.h3_voice_ids_input.blockSignals(True)
             self.h3_voice_ids_input.setText(h3_voice_ids if isinstance(h3_voice_ids, str) else "")
             self.h3_voice_ids_input.blockSignals(False)
+            self.seedance_video_input.blockSignals(True)
+            self.seedance_video_input.setPlainText(seedance_videos if isinstance(seedance_videos, str) else "")
+            self.seedance_video_input.blockSignals(False)
+            self.seedance_audio_input.blockSignals(True)
+            self.seedance_audio_input.setPlainText(seedance_audios if isinstance(seedance_audios, str) else "")
+            self.seedance_audio_input.blockSignals(False)
+            self.seedance_material_input.blockSignals(True)
+            self.seedance_material_input.setPlainText(seedance_materials if isinstance(seedance_materials, str) else "")
+            self.seedance_material_input.blockSignals(False)
             if isinstance(refs, list):
                 self.refs = [p for p in refs if isinstance(p, str) and os.path.exists(p)]
                 self.ref_list.set_paths(self.refs)
@@ -576,6 +666,9 @@ class VideoGeneratorTab(SimpleModelBarMixin, QWidget):
             data["video_last_frame_url"] = self.last_frame_url_input.text().strip()
             data["video_h3_reference_images"] = self.h3_reference_images_input.toPlainText()
             data["video_h3_voice_ids"] = self.h3_voice_ids_input.text().strip()
+            data["video_seedance_videos"] = self.seedance_video_input.toPlainText()
+            data["video_seedance_audios"] = self.seedance_audio_input.toPlainText()
+            data["video_seedance_materials"] = self.seedance_material_input.toPlainText()
             data["video_refs"] = list(self.refs)
             save_input_drafts(data)
         except Exception:
@@ -594,49 +687,180 @@ class VideoGeneratorTab(SimpleModelBarMixin, QWidget):
                 widget.setVisible(is_i2v)
             except Exception:
                 pass
-        self._update_h3_fields_visibility()
+        self._update_video_fields_visibility()
 
     def _is_h3_model(self):
-        model = str(self.bar.current_model() or "").strip().lower()
-        return model == "h3" or model.startswith("h3-")
+        return self._current_video_profile().get("kind") == "h3"
 
-    def _update_h3_fields_visibility(self):
-        visible = self._is_h3_model()
+    def _current_video_profile(self):
+        model = self.bar.current_model()
+        if not model:
+            model = self.config.setdefault("video", {}).get("model", "")
+        return video_model_profile(model)
+
+    def _is_unified_model(self):
+        return self._current_video_profile().get("kind") in {"h3", "seedance", "mixed"}
+
+    def _is_seedance_model(self):
+        return self._current_video_profile().get("kind") == "seedance"
+
+    @staticmethod
+    def _profile_duration_limit(profile, resolution):
+        by_resolution = profile.get("duration_max_by_resolution", {})
+        if isinstance(by_resolution, dict) and resolution in by_resolution:
+            try:
+                return int(by_resolution[resolution])
+            except Exception:
+                pass
+        try:
+            return int(profile.get("duration_max", 15))
+        except Exception:
+            return 15
+
+    def _set_combo_options(self, combo, options, preferred=None):
+        options = [str(item) for item in (options or []) if str(item).strip()]
+        if not options:
+            return
+        current = str(preferred if preferred is not None else combo.currentText())
+        combo.blockSignals(True)
+        combo.clear()
+        combo.addItems(options)
+        target = current if current in options else options[0]
+        self._set_combo_text_if_exists(combo, target)
+        combo.blockSignals(False)
+        return target
+
+    def _refresh_unified_options(self, profile):
+        resolutions = profile.get("resolutions") or self.H3_RESOLUTION_OPTIONS
+        saved_resolution = str(self.config.setdefault("video", {}).get("resolution", "") or "")
+        resolution = self._set_combo_options(
+            self.resolution_combo,
+            resolutions,
+            saved_resolution or profile.get("resolution_default", resolutions[0]),
+        )
+        ratios = profile.get("ratios") or self.H3_ASPECT_RATIO_OPTIONS
+        saved_ratio = str(
+            self.config.setdefault("video", {}).get(
+                "ratio",
+                self.config.setdefault("video", {}).get("aspect_ratio", ""),
+            )
+            or ""
+        )
+        ratio = self._set_combo_options(
+            self.aspect_ratio_combo,
+            ratios,
+            saved_ratio or profile.get("ratio_default", ratios[0]),
+        )
+        minimum = int(profile.get("duration_min", 1) or 1)
+        maximum = self._profile_duration_limit(profile, resolution)
+        options = [str(value) for value in range(minimum, maximum + 1)]
+        saved_duration = str(self.config.setdefault("video", {}).get("duration", "") or "")
+        duration = self._set_combo_options(
+            self.duration_combo,
+            options,
+            saved_duration or profile.get("duration_default", options[0]),
+        )
+        return duration, ratio, resolution
+
+    def _on_resolution_changed(self, _resolution):
+        if self._is_unified_model():
+            self._refresh_unified_options(self._current_video_profile())
+
+    def _update_advanced_field_visibility(self, visible, widgets):
+        for widget in widgets:
+            try:
+                widget.setVisible(bool(visible))
+            except Exception:
+                pass
+
+    def _update_video_fields_visibility(self):
+        profile = self._current_video_profile()
+        kind = profile.get("kind")
+        unified = kind in {"h3", "seedance", "mixed"}
         for widget in self._legacy_param_widgets:
             try:
-                widget.setVisible(not visible)
+                widget.setVisible(not unified)
             except Exception:
                 pass
-        for widget in self._h3_param_widgets:
+        for widget in self._unified_param_widgets:
             try:
-                widget.setVisible(visible)
+                widget.setVisible(unified)
             except Exception:
                 pass
+        if unified:
+            self._refresh_unified_options(profile)
+        advanced_supported = kind in {"h3", "seedance"}
         for widget in (self.h3_advanced_toggle,):
             try:
-                widget.setVisible(visible)
+                widget.setVisible(advanced_supported)
             except Exception:
                 pass
-        self._on_h3_advanced_toggled(self.h3_advanced_toggle.isChecked() and visible)
+        self._update_advanced_field_visibility(kind == "h3", self._h3_advanced_widgets)
+        self._update_advanced_field_visibility(kind == "seedance", self._seedance_advanced_widgets)
+        self._on_h3_advanced_toggled(self.h3_advanced_toggle.isChecked() and advanced_supported)
+
+    # 旧方法名保留给之前的调用点和第三方插件。
+    def _update_h3_fields_visibility(self):
+        self._update_video_fields_visibility()
 
     def _on_h3_advanced_toggled(self, checked):
-        checked = bool(checked) and self._is_h3_model()
+        checked = bool(checked) and self._is_unified_model()
         self.h3_advanced_widget.setVisible(checked)
-        self.h3_advanced_toggle.setText(
-            "H3 高级参数（收起）" if checked else "H3 高级参数（尾帧 / 多图 / 音色）"
-        )
+        if self._is_h3_model():
+            label = "H3 高级参数（尾帧 / 多图 / 音色）"
+        elif self._is_seedance_model():
+            label = "Seedance 高级素材（图片 / 视频 / 音频）"
+        else:
+            label = "高级素材参数"
+        self.h3_advanced_toggle.setText(f"{label}（收起）" if checked else label)
 
     def on_model_changed(self, model):
         super().on_model_changed(model)
-        self._update_h3_fields_visibility()
+        self._update_video_fields_visibility()
 
     def on_models_loaded(self, provider_id, request_id, models):
-        super().on_models_loaded(provider_id, request_id, models)
-        self._update_h3_fields_visibility()
+        if not self._is_current_model_request(provider_id, request_id):
+            return
+        models = [str(model).strip() for model in (models or []) if str(model).strip()]
+        if provider_id:
+            cache = self.config.setdefault("model_cache", {})
+            cache[provider_id] = list(models)
+        selected = self._saved_model_for_provider(provider_id)
+        if selected not in models:
+            selected = next(
+                (model for model in models if video_model_profile(model).get("kind") == "seedance"),
+                models[0] if models else "",
+            )
+        self.bar.set_models(models, selected)
+        self._remember_active_model(provider_id, selected)
+        save_config(self.config)
+        self.bar.set_status(f"已加载 {len(models)} 个模型")
+        self._update_video_fields_visibility()
 
     def on_models_failed(self, provider_id, request_id, err):
-        super().on_models_failed(provider_id, request_id, err)
-        self._update_h3_fields_visibility()
+        if not self._is_current_model_request(provider_id, request_id):
+            return
+        err = clean_error_text(err)
+        cached = [
+            str(model).strip()
+            for model in self.config.get("model_cache", {}).get(provider_id, [])
+            if str(model).strip()
+        ]
+        options = cached or [str(model).strip() for model in self.FALLBACK_MODELS if str(model).strip()]
+        selected = self._saved_model_for_provider(provider_id)
+        if selected and selected not in options and not cached:
+            options.insert(0, selected)
+        if selected not in options:
+            selected = next(
+                (model for model in options if video_model_profile(model).get("kind") == "seedance"),
+                options[0] if options else "",
+            )
+        self.bar.set_models(options, selected)
+        self._remember_active_model(provider_id, selected)
+        save_config(self.config)
+        prefix = "加载失败，已使用该厂商缓存" if cached else "加载失败"
+        self.bar.set_status(f"{prefix}：{err[:60]}")
+        self._update_video_fields_visibility()
 
     @staticmethod
     def _split_h3_values(text):
@@ -740,12 +964,24 @@ class VideoGeneratorTab(SimpleModelBarMixin, QWidget):
         if not model:
             QMessageBox.warning(self, "提示", "请选择模型，或点击刷新加载列表。")
             return
-        is_h3 = str(model).strip().lower() == "h3" or str(model).strip().lower().startswith("h3-")
+        profile = video_model_profile(model)
+        kind = profile.get("kind")
+        is_h3 = kind == "h3"
+        is_seedance = kind == "seedance"
         last_frame_url = self.last_frame_url_input.text().strip() if is_h3 else ""
         reference_image_urls = self._split_h3_values(
             self.h3_reference_images_input.toPlainText()
         ) if is_h3 else []
         voice_ids = self._split_h3_values(self.h3_voice_ids_input.text()) if is_h3 else []
+        seedance_video_urls = self._split_h3_values(
+            self.seedance_video_input.toPlainText()
+        ) if is_seedance else []
+        seedance_audio_urls = self._split_h3_values(
+            self.seedance_audio_input.toPlainText()
+        ) if is_seedance else []
+        seedance_material_urls = self._split_h3_values(
+            self.seedance_material_input.toPlainText()
+        ) if is_seedance else []
         if mode == "图生视频" and not image_refs and not (is_h3 and last_frame_url):
             QMessageBox.warning(
                 self,
@@ -774,6 +1010,34 @@ class VideoGeneratorTab(SimpleModelBarMixin, QWidget):
                 QMessageBox.warning(self, "H3 参数超限", "H3 预设音色最多 3 个。")
                 return
 
+        if is_seedance:
+            resolution = self.resolution_combo.currentText()
+            ratio = self.aspect_ratio_combo.currentText()
+            duration = int(self.duration_combo.currentText() or 0)
+            max_duration = self._profile_duration_limit(profile, resolution)
+            min_duration = int(profile.get("duration_min", 1) or 1)
+            if duration < min_duration or duration > max_duration:
+                QMessageBox.warning(
+                    self,
+                    "Seedance 参数超限",
+                    f"当前模型在 {resolution} 下支持 {min_duration}–{max_duration} 秒。",
+                )
+                return
+            limits = (
+                ("图片", image_refs, profile.get("max_images")),
+                ("音频", seedance_audio_urls, profile.get("max_audios")),
+                ("视频", seedance_video_urls, profile.get("max_videos")),
+            )
+            for label, values, maximum in limits:
+                if maximum is not None and len(values) > int(maximum):
+                    QMessageBox.warning(self, "Seedance 参数超限", f"当前模型最多支持 {maximum} 个{label}素材。")
+                    return
+            material_urls = seedance_material_urls
+            for value in seedance_video_urls + seedance_audio_urls + material_urls:
+                if not value.lower().startswith(("http://", "https://")):
+                    QMessageBox.warning(self, "Seedance 参数不兼容", "视频、音频和其他素材必须填写公网 HTTP(S) URL。")
+                    return
+
         width, height = self.SIZE_MAP.get(self.size_combo.currentText(), (1280, 720))
         self._set_video_config(model=model, mode=mode, width=width, height=height)
         self.save_video_params()
@@ -792,10 +1056,14 @@ class VideoGeneratorTab(SimpleModelBarMixin, QWidget):
             "fps": self.fps_combo.currentText(),
             "duration": self.duration_combo.currentText(),
             "aspect_ratio": self.aspect_ratio_combo.currentText(),
+            "ratio": self.aspect_ratio_combo.currentText(),
             "resolution": self.resolution_combo.currentText(),
             "last_frame_url": last_frame_url,
             "reference_image_urls": reference_image_urls,
             "voice_ids": voice_ids,
+            "seedance_video_urls": seedance_video_urls,
+            "seedance_audio_urls": seedance_audio_urls,
+            "seedance_material_urls": seedance_material_urls,
             "image_refs": list(image_refs),
             "base_url": provider.get("base_url", ""),
             "api_key": provider.get("api_key", ""),
@@ -837,6 +1105,10 @@ class VideoGeneratorTab(SimpleModelBarMixin, QWidget):
             task["last_frame_url"],
             task["reference_image_urls"],
             task["voice_ids"],
+            ratio=task.get("ratio", task["aspect_ratio"]),
+            seedance_video_urls=task.get("seedance_video_urls", []),
+            seedance_audio_urls=task.get("seedance_audio_urls", []),
+            seedance_material_urls=task.get("seedance_material_urls", []),
         )
         self.running_tasks[task_id] = worker
         worker.progress.connect(lambda text, tid=task_id: self.on_progress(tid, text))

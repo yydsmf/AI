@@ -93,6 +93,26 @@ _CHAPTER_PLAN_STATE_PROGRESSION_GUIDANCE = (
 )
 
 
+_OPENING_THREE_CHAPTER_GUIDANCE = (
+    "【开篇前三章强度】\n"
+    "当前批次包含全书开头时，前3章要以强冲突开局，并把冲突落到人物、场景、行为、动作、情绪和结果上。"
+    "第1章直接进入正在发生的具体冲突；第2章承接上一章的后果，让冲突升级并出现改变判断的反转；第3章让主角主动选择或反击，并承担已经发生的直接后果。"
+    "三章前后相扣，具体冲突、人物关系和表现方式结合题材自由发挥；让读者先看到人物正在怎样碰撞、怎样行动、怎样失去或得到，再逐步理解背景和规则。\n"
+)
+
+
+_FINAL_CHAPTER_PLAN_GUIDANCE = (
+    "【全书最后一章收束要求】\n"
+    "本批包含全书最后一章时，只对对应的最后一项执行以下要求，前面的章节仍按正常节奏推进。"
+    "最后一章要在具体场景里完成核心矛盾的最终选择和结果，让主要人物的关系、读者一直跟随的核心承诺、"
+    "能够自然落地的关键线索和主角最终处境都有清楚的结果。需要保留余味的内容，要写成已经成立的结局状态，"
+    "不要留下必须靠后续章节才能解决的主线任务、重大反转、重要人物或新的世界规则。"
+    "最后一章的outline末尾要写实际发生的收束动作、关系结果或生活落点，不写作者总结、概念性结论、"
+    "突然跳过过程的多年后概括、‘未完待续’或单独的‘全文完’。倒数第二章可以把冲突推到临界点，"
+    "但不要提前讲完最后一章才应发生的结果。\n"
+)
+
+
 _CHAPTER_PLAN_STORY_LANGUAGE_GUIDANCE = (
     "【章节规划表达】\n"
     "章节规划是给后续正文扩写使用的结构化事实底稿，不是发布简介，也不是最终小说正文。"
@@ -6584,6 +6604,11 @@ class NovelChapterPlanWorker(NovelAnalysisWorker):
     def _analysis_prompt(self):
         absolute_start = self.existing_chapter_count + 1
         absolute_end = self.existing_chapter_count + self.chapter_count
+        final_chapter_in_batch = absolute_end >= self.total_chapter_count
+        ending_guidance = _FINAL_CHAPTER_PLAN_GUIDANCE if final_chapter_in_batch else ""
+        opening_guidance = ""
+        if self.existing_chapter_count == 0 and absolute_start <= 3 <= absolute_end:
+            opening_guidance = _OPENING_THREE_CHAPTER_GUIDANCE
         if self.creation_wizard_mode:
             chapter_order_rule = (
                 f"本批次必须返回{self.chapter_count}项，列表第1项就是全书第{absolute_start}章，"
@@ -6650,8 +6675,10 @@ class NovelChapterPlanWorker(NovelAnalysisWorker):
             "故事底盘和阶段规划已经在前面的规划基础中确认，本次直接生成当前批次的章节故事。\n"
             "项目资料是连续性事实参考，不是本章待办清单；只在当下人物选择或关系结果确实需要时取用最少内容。"
             + _story_conflict_pacing_guidance()
+            + opening_guidance
             + _CHAPTER_PLAN_STATE_PROGRESSION_GUIDANCE
             + _CHAPTER_PLAN_STORY_LANGUAGE_GUIDANCE
+            + ending_guidance
             + "提纲正文应讲述人物真正会经历的故事，外部事务融入人物当下的行动、关系和现场后果。\n"
             "title 只写章节名，不要带“第几章”和序号。章节标题也要像读者会看到的正式网文章节名："
             "从本章最具体、最有辨识度的事情、人物动作、现场冲突、关系变化或结果中自然起名，"

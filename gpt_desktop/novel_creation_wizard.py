@@ -227,7 +227,7 @@ COMMON_CREATION_RULES = """
 4. 小说圣经、世界规则、人物、设定和伏笔各自承担不同作用：圣经托住整本书，世界规则说明长期运转方式，人物承载选择和关系，设定提供反复使用的生活落点，伏笔保留线索和后续变化。
 5. 危险和代价优先落到躲避、交换、资源变化、身份暴露、关系破裂、空间变化和局势改变上；身体伤势随题材和现场需要自然出现。
 6. 实力体系跟随题材本身生长：明确需要修炼、境界或能力层次的故事，在设定库里展开来源、层次、边界和成长条件；普通都市、言情、悬疑、灵异、现实和没有明确力量体系的科幻，把重点放在人物处境、规则边界和具体事件上。
-7. 人物的说话方式不要使用“短促直接”“温和克制”“冷淡”“命令式”等固定风格标签。
+7. 不使用“短促直接”“温和克制”“冷淡”“命令式”这几类语言风格，其它可以正常使用。
 8. 除非作者明确选择办案、破案或调查推理题材，否则不得采用案卷化、办案式、流程审查式的剧情推进。剧情要由人物当下想得到什么、现场遇到什么压力、做了什么动作、遭遇什么阻力、怎样选择、关系和情绪怎样变化，以及选择带来的具体后果向前推动；世界规则和故事资料只在人物正在争取、对抗、逃避或付出代价的场景中自然出现。
 9. 字段值直接写具体内容，保持清楚、稳定、方便后续执行；内容呈现为作者自己的故事底稿，各资料类别各自承担作用，同一段剧情只放在最合适的位置。
 10. JSON 只作为程序读取的容器：保持紧凑，不用 Markdown、缩进、空行或多余空格；压缩外壳，不压缩事实、人物数量、设定数量、伏笔数量或故事内容。
@@ -257,7 +257,7 @@ STEP_PROMPTS = {
 
 世界规则回答“这个世界怎样运转”。它写日常生活、空间和社会关系、异常或力量从哪里来、什么条件会让它发生、人物要为触碰它付出什么，以及不同人物会怎样应对。它只写长期成立的运行方式；没有明确力量体系的题材，世界规则就围绕空间、社会、异常和代价展开；明确有修炼或境界的题材，再写力量来源和总边界，详细层次统一放进设定库里的“规则”条目。
 
-人物回答“这些人各自想得到或守住什么”。人物的欲望、顾虑、秘密、说话方式和与主角的关系，都要在原故事里找到根，并能在具体场景中推动选择。人物说话方式不要使用“短促直接”“温和克制”“冷淡”“命令式”等固定风格标签。设定库统一收录后面会反复用到的地点、物件、制度、势力、能力边界和日常场景。伏笔写成现在能看见的线索、人物当下的理解，以及它在后续阶段会怎样改变判断、关系和行动；把正式故事内容写进 description、revealed 和 remaining_secret，notes 留空。
+人物回答“这些人各自想得到或守住什么”。人物的欲望、顾虑、秘密、说话方式和与主角的关系，都要在原故事里找到根，并能在具体场景中推动选择。设定库统一收录后面会反复用到的地点、物件、制度、势力、能力边界和日常场景。伏笔写成现在能看见的线索、人物当下的理解，以及它在后续阶段会怎样改变判断、关系和行动；把正式故事内容写进 description、revealed 和 remaining_secret，notes 留空。
 
 选定故事尚未确定的部分，保留为人物正在面对的问题、线索和可能解释；从故事自然延伸出来、后面反复会用到的人物、地点、势力、物件、制度和暗线，都补足为可落地的故事资料。字段值以清楚、稳定、方便后续执行为先，简介字段保持可公开发布的自然网络小说语言，其余内容像作者自己的故事底稿一样具体易读。
 
@@ -266,7 +266,7 @@ STEP_PROMPTS = {
 
 接着前面已经确定的故事，把后面真的会反复出现的人物、地方、势力、物件、规矩和暗线写出来。每一项都要落到人物看得见、摸得着的生活里，并且在某一次选择中起作用；线索的意义随着人物行动、关系变化和局势变化逐步显现。
 
-每个重要人物都要有自己想得到或守住的东西，有现实阻力，有不愿让别人知道的部分，也要有说话方式。人物说话方式不要使用“短促直接”“温和克制”“冷淡”“命令式”等固定风格标签。请把人物害怕失去什么、与主角怎样牵制、以后怎样改变，写进人物的 notes。人物和主角怎样靠近、利用、误会或翻脸，要通过具体事情表现出来。
+每个重要人物都要有自己想得到或守住的东西，有现实阻力，有不愿让别人知道的部分，也要有说话方式。请把人物害怕失去什么、与主角怎样牵制、以后怎样改变，写进人物的 notes。人物和主角怎样靠近、利用、误会或翻脸，要通过具体事情表现出来。
 
 只补充后面真的会用到的地点、势力、组织、物品、能力规矩、制度、日常生活和反复出现的场景落点，统一写入 lore。身体代价随题材和现场需要自然出现。明确需要修炼、境界或能力层次的题材，在 lore 中建立“能力体系/规则”设定，并把详细层次、能做到什么、做不到什么和提升条件写进 description；悬疑、灵异、言情、现实和普通都市故事把设定落在空间、生活、社会关系和异常边界上。
 
@@ -280,7 +280,7 @@ STAGE_PLAN_OBJECT_OUTPUT_RULES = """
 这次使用对象协议，阶段和事件按字段名归位；只返回一个合法 JSON 对象。
 短键含义如下：k=全书底盘契约，s=当前阶段对象，f=当前阶段实际发生的伏笔端点。阶段对象中 i=阶段编号，n=阶段名称，r=章节范围，b=开始状态，e=按顺序发生的场景事件对象数组，x=结束状态，y=带入下一阶段的事实。状态对象中 t=时间，l=地点，c=人物状态，k=已经发生并被人物掌握的事实，q=仍会推动人物行动的问题。事件对象中 i=事件编号，r=允许章节范围，a=关联资料，p=前置条件，h=可直接扩写的场景事件，o=直接结果，d=实际状态变化。伏笔端点对象中 i=伏笔编号，k=setup或payoff，e=承载这个端点的事件编号，d=这一次在场景中发生的具体变化；一次只写一个端点。
 每个 h 都要像一段可以直接扩写的剧情节点：交代时间地点和在场人物，让人物在可感知的压力中采取动作、遭遇阻力、做出选择，并让选择带来具体结果、情绪变化或关系变化。相邻事件主动更换场景机制和人物对抗方式，让声音、空间、物件、现实压力、人物误解、关系裂缝和突发行动轮流推动故事。资料只有在人物正在做事、被迫应对或关系发生变化时进入场景。
-当前阶段发生的伏笔端点，都在承载事件的 a 中加入“F编号/setup”或“F编号/payoff”，并在 f 中用同一事件编号 e 关联。setup写线索第一次进入人物生活，payoff写线索在场景中产生的实际变化；同一条伏笔可以在不同阶段继续生长，程序会依据事件 r 的章节范围落下具体章号。
+当前阶段发生的正式伏笔端点，都在承载事件的 a 中加入一次“F编号/setup”或“F编号/payoff”，并在 f 中用同一事件编号 e 关联。setup写线索第一次进入人物生活，payoff写线索在场景中产生决定性变化；同一条伏笔在其它事件中继续出现、深化、造成后果是正常的，这些事件只把它作为普通关联资料或写出“F编号”，不要重复标成正式 setup/payoff。程序以正式端点为准，再把后续事件中的具体变化交给章节规划继续使用；阶段之间允许继续铺开同一条暗线，程序会依据事件 r 的章节范围落下具体章号。
 实际返回的 f 使用单端点格式，例如 {"i":"F06","k":"payoff","e":"E04","d":"人物在现场做出选择后，线索改变了什么"}。全书契约保留长期事实、世界运行方式、人物底色和结尾方向；伏笔通过 setup 与 payoff 表达它在场景中的进入、变化和意义显现。
 
 返回结构示例（示例中的空数组和空字段实际可以省略）：{"v":"4","k":{"f":["不能改变的长期事实"],"w":["长期世界运行方式"],"c":["人物底色"],"e":["结尾方向"]},"s":{"i":"S05","n":"阶段名称","r":[137,167],"b":{"t":"时间","l":"地点","c":["人物处境"],"k":["已经发生并被人物掌握的事实"],"q":["仍会推动人物行动的问题"]},"e":[{"i":"E01","r":[137,140],"a":["F01/setup","关联资料"],"p":["前置条件"],"h":"时间、地点、人物、压力、动作、阻力、选择和现场结果组成的场景事件","o":"直接结果","d":["人物、关系、情绪或局势发生的实际变化"]}],"x":{"t":"结束时间","l":"结束地点","c":["结束时人物处境"],"k":["结束时已经发生的事实"],"q":["带入下一阶段的问题"]},"y":["带入下一阶段的事实"]},"f":[{"i":"F01","k":"setup","e":"E01","d":"线索在现场第一次出现并改变人物选择"}]}}。本次只生成当前阶段一个 s 对象，不要返回其它阶段；有意义的事实不能省略。
@@ -292,7 +292,7 @@ STEP_PROMPTS["stage_plan"] = f"""{COMMON_CREATION_RULES}
 
 阶段规划固定事实、顺序、状态和阶段推进，但剧情推进以场景为单位。每个事件都要写出具体时间地点、在场人物、当下压力、人物动作、对方或环境形成的阻力、人物选择、情绪或关系变化和直接后果；事件之间通过人物正在做的事和刚刚付出的代价自然衔接。对都市灵异、惊悚、悬疑、情感等题材，声音、空间、物件、生活压力、人物之间的隐瞒和现场失控持续进入剧情；对其它题材，使用该题材自己的场景压力和人物对抗。除非作者明确选择办案、破案或调查推理题材，否则不得把案卷化、程序化的材料往来当成主要剧情，不得让人物靠解释性结论推动故事。连续两个事件不能都停留在说明、谈话、安排或口头结论；如果前一个事件主要是信息揭露或人物谈话，后一个事件必须转入现场行动、直接碰撞、利益变化、关系变化、能力试探、空间压力或突发后果。人物必须在具体场面中行动、碰撞、选择并承担结果；相邻事件主动更换场景目标、冲突关系和压力来源，让人物、关系、空间和局势持续变化。
 
-伏笔端点使用底盘已有编号或名称，关联到本阶段实际发生的事件；setup写线索第一次进入人物生活，payoff写线索在场景中造成的变化，阶段之间允许继续铺开同一条暗线。程序会依据事件的允许章节范围落下具体章号，模型只负责事件顺序和端点归属，不写具体章号。
+伏笔端点使用底盘已有编号或名称，关联到本阶段实际发生的事件；setup写线索第一次进入人物生活，payoff写线索在场景中造成决定性变化。同一条伏笔可以在多个事件中继续出现、深化或影响人物选择，但正式 setup/payoff 只各自标记一次；后续事件用普通关联资料或“F编号”承接，不把每次提及都写成新的正式端点。阶段之间允许继续铺开同一条暗线，程序会依据事件的允许章节范围落下具体章号，模型只负责事件顺序和端点归属，不写具体章号。
 
 {STAGE_PLAN_OBJECT_OUTPUT_RULES}
 """
@@ -1216,6 +1216,44 @@ def _normalize_text_list(value):
     ]
 
 
+def _normalize_world_rule_list(value, labels=()):
+    """Read a world-rule list from either JSON arrays or compact text.
+
+    The wizard asks for fixed-position arrays to keep responses small. Some
+    models still put the numbered items into one string in that array slot,
+    e.g. ``"长期规则数组：1.... 2...."``. Treating that valid content as an
+    empty list made the UI report a false "missing rules" error. This helper
+    only expands that transport quirk; it does not invent or discard facts.
+    """
+    if isinstance(value, (list, tuple)):
+        return [
+            _as_text(item)
+            for item in value
+            if _as_text(item)
+        ]
+    text = _as_text(value)
+    if not text:
+        return []
+    text = _strip_leading_field_label(text, labels)
+    matches = list(
+        re.finditer(
+            r"(?:^|[\s；;。！？!?])(?:\d+)[.、)）:]\s*",
+            text,
+        )
+    )
+    if len(matches) >= 2:
+        items = []
+        for index, match in enumerate(matches):
+            start = match.end()
+            end = matches[index + 1].start() if index + 1 < len(matches) else len(text)
+            item = text[start:end].strip(" \t\r\n；;、")
+            if item:
+                items.append(item)
+        if items:
+            return items
+    return [text]
+
+
 def _normalize_text_record(value, fields, aliases):
     if isinstance(value, str):
         return {
@@ -1595,9 +1633,17 @@ def _normalize_world_rules(value):
         return {}
     return {
         **_normalize_text_record(value, tuple(_WORLD_RULE_FIELD_ALIASES), _WORLD_RULE_FIELD_ALIASES),
-        "rules": _normalize_text_list(_first_value(value, ("rules", "规矩", "规则"), [])),
-        "costs_and_limits": _normalize_text_list(
-            _first_value(value, ("costs_and_limits", "costs", "代价和限制"), [])
+        "rules": _normalize_world_rule_list(
+            _first_value(value, ("rules", "规矩", "规则", "长期规则数组"), []),
+            ("rules", "规矩", "规则", "长期规则数组"),
+        ),
+        "costs_and_limits": _normalize_world_rule_list(
+            _first_value(
+                value,
+                ("costs_and_limits", "costs", "代价和限制", "代价限制数组"),
+                [],
+            ),
+            ("costs_and_limits", "costs", "代价和限制", "代价限制数组"),
         ),
     }
 
@@ -3294,7 +3340,9 @@ def build_chapter_plan_foundation(framework):
         arcs.append(arc)
     summary = _as_text(premise.get("synopsis", ""))
     ending = _as_text(premise.get("ending_direction", "")) or _as_text(bible.get("ending_direction", ""))
-    boundaries = _as_text(bible.get("hard_boundaries", "")) or "不写受伤剧情；结局保持开放、非圆满。"
+    boundaries = _as_text(bible.get("hard_boundaries", "")) or (
+        "本部核心矛盾和主角当前目标在结尾形成明确结果；可以保留不影响本部结局的续作余味。"
+    )
     return {
         "planning_schema_version": _as_text(framework.get("planning_schema_version", "2")) or "2",
         "summary": summary,
@@ -3543,32 +3591,26 @@ def format_creation_context(context):
 
 
 def _creation_scale_requirements(total_words):
-    """Return the long-form material ranges used by the wizard and its checks."""
+    """Return the minimum long-form material counts derived from stage count."""
     try:
         total_words = max(1, int(total_words or 500000))
     except (TypeError, ValueError):
         total_words = 500000
-    if total_words >= 900000:
+    stage_count = _expected_stage_count(total_words)
+    minimum = stage_count * 5
+    if stage_count >= 10:
         size_label = "100万字以上"
-        ranges = {
-            "characters": (20, 30),
-            "lore": (30, 45),
-            "foreshadows": (18, 30),
-        }
-    elif total_words >= 450000:
+    elif stage_count == 5:
         size_label = "约50万字"
-        ranges = {
-            "characters": (12, 18),
-            "lore": (20, 30),
-            "foreshadows": (12, 20),
-        }
-    else:
+    elif stage_count == 3:
         size_label = "约30万字"
-        ranges = {
-            "characters": (8, 12),
-            "lore": (12, 18),
-            "foreshadows": (8, 12),
-        }
+    else:
+        size_label = f"约{stage_count * 10}万字"
+    ranges = {
+        "characters": (minimum, minimum),
+        "lore": (minimum, minimum),
+        "foreshadows": (minimum, minimum),
+    }
     return size_label, ranges
 
 
@@ -3590,16 +3632,18 @@ def _creation_scale_shortfalls(result, total_words):
 
 
 def _creation_scale_guidance(total_words):
-    """根据作品长度给故事底盘提供长篇资料规模参考。"""
+    """根据阶段数给故事底盘提供资料最低数量。"""
     size_label, ranges = _creation_scale_requirements(total_words)
-    characters = f"{ranges['characters'][0]}—{ranges['characters'][1]}"
-    lore = f"{ranges['lore'][0]}—{ranges['lore'][1]}"
-    foreshadows = f"{ranges['foreshadows'][0]}—{ranges['foreshadows'][1]}"
+    stage_count = _expected_stage_count(total_words)
+    characters = ranges["characters"][0]
+    lore = ranges["lore"][0]
+    foreshadows = ranges["foreshadows"][0]
     return f"""
-这不是只够写开头几章的简介，而是预计写到{size_label}的整本长篇底盘。请让资料的数量和层次足以支撑人物在不同阶段持续遇到新的事情，不要只列主角和三五个配角，也不要只列一两个地点和一个谜团。这里的资料是给后续阶段规划和章节规划使用的事实底盘，数量只是宽松参考，按故事需要浮动，不要为了凑数添加没有根的名词：
-- 主要人物约 {characters} 名：除了主角，还要有会反复出现的亲近者、同行者、对手、关键势力代表、现实生活中的牵连人物，以及会在后期改变立场的人。每个人物的 notes 都要写清害怕失去什么、与主角怎样牵制，以及后面会怎样改变。
-- 会反复起作用的设定约 {lore} 项：统一写入 lore，覆盖地点、反复出现的场景落点、物件、势力、制度、日常生活和题材本身的能力边界；不要把同一件事换名字重复填写。
-- 跨阶段伏笔约 {foreshadows} 条：每条都要有现在看得见的线索、人物当下的理解，以及以后会改变判断或关系的方向；不要把普通章末悬念当成伏笔。
+这不是只够写开头几章的简介，而是预计写到{size_label}、分为{stage_count}个十万字阶段的整本长篇底盘。数量是后续阶段规划和章节规划的最低资料规模，不要只列主角和少量配角，也不要把同一项换名字重复填写：
+- 每个阶段至少准备5名能在该阶段发挥作用的人物，全书人物最低{characters}名；人物要覆盖主角身边的人、对手、关键势力代表、现实生活中的牵连人物和后期可能改变立场的人。
+- 每个阶段至少准备5项会在该阶段反复起作用的设定，全书设定最低{lore}项；统一写入 lore，覆盖地点、场景落点、物件、势力、制度、日常生活和题材本身的能力边界。
+- 每个阶段至少准备5条会在该阶段进入、推进或产生变化的伏笔，全书伏笔最低{foreshadows}条；每条都要有现在看得见的线索、人物当下的理解，以及以后会改变判断或关系的方向。
+以上是最低数量，不是上限；所有资料都必须从作者灵感和已经选定的故事自然长出来，不要为了凑数添加没有根的名词。
 这些内容都必须从作者灵感和已经选定的故事自然长出来。人物、设定和伏笔之间要互相牵连，但不要把它们写成重复的剧情简介。故事简介仍然需要自然、可读、可以公开发布；其余字段以清楚、稳定、方便后续执行为先。
 """.strip()
 
@@ -3714,8 +3758,10 @@ def _foreshadow_stage_shortfalls(foreshadows, stage_count):
         )
         setup_number = _creation_chapter_number(setup)
         payoff_number = _creation_chapter_number(payoff)
+        # A foreshadow can be introduced and resolved within one ten-thousand-word
+        # stage. It only becomes invalid when the payoff is placed in an earlier stage.
         valid_payoff = payoff == "结尾保留" or (
-            setup_number > 0 and payoff_number > setup_number
+            setup_number > 0 and payoff_number >= setup_number
         )
         if setup_number <= 0 or not valid_payoff:
             missing.append(
@@ -3903,11 +3949,15 @@ def _stage_event_endpoint_detail(event):
 
 
 def _event_references_endpoint(event, requirement):
-    """Only use explicit endpoint references for automatic event association."""
+    """Only use explicit endpoint markers for automatic event association.
+
+    A bare foreshadow name is ordinary story material.  It may legitimately
+    appear in several events as a continuing clue or consequence, so it must
+    not be promoted to a formal setup/payoff endpoint by itself.
+    """
     if not isinstance(event, dict) or not isinstance(requirement, dict):
         return False
     code = _as_text(requirement.get("code")).upper()
-    name = _as_text(requirement.get("name"))
     kind = _as_text(requirement.get("kind")).lower()
     kind_token = kind.upper()
     references = event.get("references", [])
@@ -3930,8 +3980,6 @@ def _event_references_endpoint(event, requirement):
                 or kind == "payoff" and "回" in text
             ):
                 return True
-        if name and name == text:
-            return True
     return False
 
 
@@ -3980,6 +4028,9 @@ def _derive_stage_endpoint_rows(
         for item in requirements
     }
     resolved = []
+    # A single foreshadow may legitimately have both its setup and payoff in
+    # the same stage.  Include the endpoint kind in the deduplication key so
+    # the second endpoint is not silently discarded.
     resolved_keys = set()
 
     def row_key(row):
@@ -4030,7 +4081,8 @@ def _derive_stage_endpoint_rows(
             resolved.append(row)
             continue
         key = _as_text(requirement.get("key")).upper() or _as_text(requirement.get("name"))
-        if key in resolved_keys:
+        resolved_key = (key, kind)
+        if resolved_key in resolved_keys:
             continue
         event_match = find_event(row, requirement)
         if event_match:
@@ -4044,14 +4096,16 @@ def _derive_stage_endpoint_rows(
             )
             row["endpoint_event"] = row.get("endpoint_event") or _stage_event_endpoint_detail(event)
         resolved.append(row)
-        resolved_keys.add(key)
+        resolved_keys.add(resolved_key)
 
     # If f was omitted, recover it from the explicit Fxx/setup or Fxx/payoff
     # token required in the event references.  This is reconstruction from the
     # generated event, not a fabricated chapter or a blanket acceptance rule.
     for requirement in requirements:
         key = _as_text(requirement.get("key")).upper() or _as_text(requirement.get("name"))
-        if key in resolved_keys or requirement.get("tail_reserved"):
+        kind = _normalize_foreshadow_endpoint_kind(requirement.get("kind"))
+        resolved_key = (key, kind)
+        if resolved_key in resolved_keys or requirement.get("tail_reserved"):
             continue
         for event_index, event in enumerate(events):
             if not _event_references_endpoint(event, requirement):
@@ -4059,7 +4113,7 @@ def _derive_stage_endpoint_rows(
             resolved.append({
                 "code": _as_text(requirement.get("code")),
                 "name": _as_text(requirement.get("name")),
-                "endpoint_kind": requirement.get("kind"),
+                "endpoint_kind": kind,
                 "endpoint_event_id": _as_text(event.get("id")),
                 "endpoint_chapter": _stage_event_anchor_chapter(
                     event,
@@ -4069,7 +4123,7 @@ def _derive_stage_endpoint_rows(
                 ),
                 "endpoint_event": _stage_event_endpoint_detail(event),
             })
-            resolved_keys.add(key)
+            resolved_keys.add(resolved_key)
             break
     return resolved
 
@@ -4313,13 +4367,34 @@ def _apply_foreshadow_schedule(foreshadows, schedule, total_chapters=0):
         setup_number = _creation_chapter_number(setup)
         payoff_number = _creation_chapter_number(payoff)
         valid_payoff = payoff == "结尾保留" or (
-            setup_number > 0 and payoff_number > setup_number
+            setup_number > 0 and payoff_number >= setup_number
         )
         if setup_number > 0:
             record["setup_chapter"] = setup
         if valid_payoff:
             record["payoff_chapter"] = payoff
     return records
+
+
+def _restore_foreshadow_stage_baseline(foreshadows):
+    """Keep the second-step foreshadow records at stage granularity.
+
+    Concrete chapter placement belongs to the third-step schedule and to the
+    final project payload.  Older drafts may have received those chapter
+    fields while a stage batch was being generated, so clear them only when
+    the corresponding stage fields are present and preserve all story data.
+    """
+    restored = []
+    for item in foreshadows if isinstance(foreshadows, list) else []:
+        if not isinstance(item, dict):
+            continue
+        record = deepcopy(item)
+        if _as_text(record.get("setup_stage")):
+            record["setup_chapter"] = ""
+        if _as_text(record.get("payoff_stage")):
+            record["payoff_chapter"] = ""
+        restored.append(record)
+    return restored
 
 
 def _stage_foreshadow_shortfalls(foreshadows, schedule, stage_specs, total_chapters=0):
@@ -4431,7 +4506,33 @@ class NovelCreationWorker(NovelAnalysisWorker):
             proxy_mode=proxy_mode,
             max_concurrency=1,
         )
-        self.retry_attempts = 3
+        # One initial request plus three retries.  Wizard requests are small,
+        # independent generation tasks, so every failed attempt follows the
+        # same 10s / 20s / 30s schedule instead of using error-specific gaps.
+        self.retry_attempts = 4
+
+    def _is_retryable_analysis_error(self, error):
+        """Retry every failed API/JSON response for this wizard request.
+
+        The wizard validates the fixed schema after the worker returns. API
+        transport, provider compatibility, malformed JSON and output-limit
+        failures all deserve the same retry budget here; incomplete results
+        are still never emitted as a successful result.
+        """
+        return True
+
+    def _analysis_retry_wait_seconds(self, error, attempt):
+        try:
+            attempt = max(1, int(attempt or 1))
+        except (TypeError, ValueError):
+            attempt = 1
+        return attempt * 10
+
+    def _analysis_retry_progress_text(self, error, label, total, wait_seconds, next_attempt, attempts):
+        return (
+            f"{label}/{total} 本次生成失败，{wait_seconds}秒后自动重试 "
+            f"{next_attempt - 1}/3（共3次重试）..."
+        )
 
     def _analysis_prompt(self):
         prompt = STEP_PROMPTS.get(self.creation_step, COMMON_CREATION_RULES)
@@ -4474,9 +4575,11 @@ class NovelCreationWorker(NovelAnalysisWorker):
         elif self.creation_batch == "bible_assets":
             prompt = f"""{COMMON_CREATION_RULES}
 
-读取作者已经选定的故事，以及前一批已经生成的小说圣经和世界规则，补齐人物、设定和伏笔。人物要写各自的身份、想得到或守住的东西、秘密、说话方式，以及害怕失去什么、怎样牵制主角和长期变化。人物说话方式不要使用“短促直接”“温和克制”“冷淡”“命令式”等固定风格标签。设定库统一收录后面反复会用到的地点、物件、势力、制度、日常场景和能力边界。明确有修炼、境界或力量层次的题材，在设定的规则条目里写详细层次；其它题材把设定落在空间、生活、社会关系和异常边界上。伏笔写现在能看到的线索、以后会改变的判断或关系、揭开后会发生什么和仍未揭开的部分，notes留空，状态统一为未埋。
+读取作者已经选定的故事，以及前一批已经生成的小说圣经和世界规则，补齐人物、设定和伏笔。人物要写各自的身份、想得到或守住的东西、秘密、说话方式，以及害怕失去什么、怎样牵制主角和长期变化。设定库统一收录后面反复会用到的地点、物件、势力、制度、日常场景和能力边界。明确有修炼、境界或力量层次的题材，在设定的规则条目里写详细层次；其它题材把设定落在空间、生活、社会关系和异常边界上。伏笔写现在能看到的线索、以后会改变的判断或关系、揭开后会发生什么和仍未揭开的部分，notes留空，状态统一为未埋。
 
 {power_levels_guidance}
+
+{_creation_scale_guidance(total_words)}
 
 这是预计写到{_creation_scale_requirements(total_words)[0]}的长篇，按故事需要补足资料，不要把简介换个说法重复输出，也不要为了凑数量添加无根名词。伏笔位置此时只写第几阶段，不写具体章号。{_creation_foreshadow_stage_guidance(total_words)}
 
@@ -4485,11 +4588,50 @@ class NovelCreationWorker(NovelAnalysisWorker):
 
 补充方向：让人物、设定和伏笔都能在后续场景中落地。伏笔的阶段位置表示它如何进入人物生活、如何在行动和关系变化中逐步显出意义；先写线索和当下理解，再写后续变化，不把最终解释写成一开始就确定的结论。"""
         elif self.creation_batch == "stage_skeleton":
+            stage_specs = _creation_stage_batch_specs(
+                total_words,
+                average_chapter_words,
+            )
+            stage_count = len(stage_specs)
+            stage_ranges = "；".join(
+                f"{item['id']}（第{item['start_chapter']}—{item['end_chapter']}章）"
+                for item in stage_specs
+            )
+            skeleton_shape = ",".join(
+                f'["{item["id"]}","阶段名称","这一阶段的主线变化",["关键转折一","关键转折二"],"阶段结束时的人物和局势"]'
+                for item in stage_specs
+            )
             prompt = f"""{COMMON_CREATION_RULES}
 
 读取作者选定的故事和完整故事底盘，在正式生成十万字阶段规划前，先建立一份简短的全书阶段骨架。它只负责固定每个阶段的主线变化、关键转折和阶段结束状态，不写章节细纲，不写事件数组，不安排具体伏笔章位，也不重复小说圣经、世界规则和人物设定。阶段数量和章节范围完全按照作者输入；每个阶段写一条清楚的主线变化、两到四个关键转折和一条结束状态，内容要能让后面的阶段规划沿着同一条故事发展，避免阶段之间方向漂移。
 
-只返回一个合法 JSON 对象：{{"g":[["S01","阶段名称","这一阶段的主线变化",["关键转折一","关键转折二"],"阶段结束时的人物和局势"]]}}。g 必须按 S01、S02、S03 的顺序覆盖全书所有阶段，每项固定五个位置；不要返回章节事件、伏笔内容、代码、Markdown 或其它字段。"""
+本书总字数为{total_words}字，按每十万字划分为{stage_count}个阶段。必须恰好返回{stage_count}项，不能少一项，也不能多出额外阶段；阶段编号和章节范围固定为：{stage_ranges}。即使某一阶段的故事暂时不如其它阶段集中，也必须为该阶段写出属于它的主线变化、关键转折和结束状态，不能把相邻阶段合并，也不能提前结束全书。
+
+第一阶段的开头要有强冲突前三章，并把冲突落到人物、场景、行为、动作、情绪和结果上。第1章直接让主角进入正在发生的具体冲突；第2章承接上一章的后果，让冲突升级并出现改变判断的反转；第3章让主角主动选择或反击，并承担已经发生的直接后果，形成必须继续追读的新局面。这里写宏观走向即可，具体冲突和表现方式结合题材自由发挥；不要先铺完背景，也不要用抽象概括代替人物正在经历的现场。最后一个阶段的结束状态要让本部主线、主角当前目标和主要关系形成看得见的结果；可以留下不影响本部结局的续作余味，但不能把本部核心矛盾和主角必须完成的事情推给下一部。
+
+只返回一个合法 JSON 对象：{{"g":[{skeleton_shape}]}}。g 必须严格按上述编号顺序覆盖全部{stage_count}个阶段，每项固定五个位置；不要返回章节事件、伏笔内容、代码、Markdown 或其它字段。"""
+        elif self.creation_batch == "stage_endpoint_repair":
+            current_stage = self.creation_context.get("current_stage", {})
+            stage_number = (
+                current_stage.get("number", self.stage_index + 1)
+                if isinstance(current_stage, dict) else self.stage_index + 1
+            )
+            total_stages = (
+                current_stage.get("total_stages", "")
+                if isinstance(current_stage, dict) else ""
+            )
+            missing = self.creation_context.get("missing_foreshadow_endpoints", [])
+            missing_text = "、".join(
+                _as_text(item.get("code") or item.get("name"))
+                for item in missing if isinstance(item, dict)
+            ) or "指定伏笔"
+            prompt = f"""{COMMON_CREATION_RULES}
+
+读取已经完成的第{stage_number}/{total_stages or '?'}阶段规划和第二步确认的伏笔阶段位置，只补齐当前阶段缺失的伏笔正式端点，不重新生成阶段规划，不改写已有事件，不增加新的伏笔。当前需要补齐：{missing_text}。
+
+请根据已有事件的实际内容，为每一项选择一个真正承载这次变化的事件：setup 表示线索在场景中第一次进入人物生活，payoff 表示线索在场景中形成新的事实或决定性变化。返回的 e 必须使用已有事件编号，d 写这次在场景中发生的具体变化；只补当前缺失项目，不能把同一伏笔的普通延续重复当成正式端点。
+
+只返回一个合法 JSON 对象：{{"f":[{{"i":"F编号","k":"setup或payoff","e":"S{stage_number:02d}-E01","d":"这次在场景中发生的具体变化"}}]}}。不要返回阶段规划、章节号、Markdown、解释或其它字段。"""
         elif self.creation_batch == "stage_plan_stage":
             current_stage = self.creation_context.get("current_stage", {})
             stage_number = current_stage.get("number", self.stage_index + 1) if isinstance(current_stage, dict) else self.stage_index + 1
@@ -4498,6 +4640,21 @@ class NovelCreationWorker(NovelAnalysisWorker):
             target_stage_words = current_stage.get("target_words", 100000) if isinstance(current_stage, dict) else 100000
             total_stages = current_stage.get("total_stages", "") if isinstance(current_stage, dict) else ""
             first_stage = self.stage_index == 0
+            opening_guidance = ""
+            try:
+                opening_stage = (
+                    first_stage
+                    and int(start_chapter or 0) <= 3 <= int(end_chapter or 0)
+                )
+            except (TypeError, ValueError):
+                opening_stage = False
+            if opening_stage:
+                opening_guidance = (
+                    "\n\n这是全书第一阶段，前3章是开篇重点。请在事件数组中为第1、2、3章分别留下"
+                    "能够落地且前后相扣的现场冲突节点，允许章节范围要能让程序把它们分别安排到开头三章，而不是把三章合成一个背景事件。"
+                    "每个节点都写清人物、场景、行为、动作、情绪变化和结果。第1章直接进入强冲突，第2章承接后果并升级冲突、产生反转，第3章让主角主动选择或反击并承担直接后果；"
+                    "三章前后相扣，具体冲突和表现方式结合题材自由发挥，背景和规则随着现场行动自然出现，不用抽象概括代替人物冲突。"
+                )
             genre_text = " ".join(
                 str(value or "")
                 for value in (
@@ -4514,15 +4671,28 @@ class NovelCreationWorker(NovelAnalysisWorker):
                     "人物争执和当场选择上；世界规则和制度只有在人物正在争取、对抗或付出代价时进入场景，"
                     "连续事件要主动更换推进方式。"
                 )
+            final_stage_guidance = ""
+            try:
+                is_final_stage = int(stage_number) == int(total_stages)
+            except (TypeError, ValueError):
+                is_final_stage = False
+            if is_final_stage:
+                final_stage_guidance = (
+                    "\n\n这是全书最后一个十万字阶段。阶段后部必须沿着已经发生的冲突、人物选择和关系变化完成收束："
+                    "把核心矛盾推到最终选择并写出实际结果，让主要人物的关系、读者承诺、能够自然落地的关键线索和主角最终处境有清楚落点。"
+                    "即使作者选择开放式结尾，也要让本部的主要目标、核心冲突和人物关系在本部内得到明确结果；续作只保留不影响当前结局的余味、远景或新的选择，不把本部必须解决的事情留给下一部。"
+                    "最后几章不要再开需要后续章节解决的主线、重大反转、重要人物或新的世界规则；要把结局写成具体场景中的行动、结果和已经成立的生活状态，"
+                    "不要用突然跳过多年的概括、作者总结或一句抽象结论代替过程。倒数第二章可以把冲突推到临界点，最后一章再完成最后选择、结果和余味。"
+                )
             prompt = f"""{COMMON_CREATION_RULES}
 
 读取作者选定的故事、完整故事底盘、全书阶段骨架和已经完成的前面阶段，只生成当前第{stage_number}/{total_stages or '?'}阶段，范围为第{start_chapter}章到第{end_chapter}章。全书阶段骨架只负责提供本阶段的方向和结束状态，不要把骨架中的摘要和转折原样重复成另一份总规划；当前阶段的具体内容以本次事件和人物处境为准。前面阶段的结束状态、带入内容和仍在推动人物的问题是连续性依据。当前阶段沿着这些事实继续发生新的场景，前后阶段各自保持清晰的重点。阶段规划使用结构化表达，写清人物、局势、事件顺序、前置条件、直接结果和状态变化，让每个字段都服务于后续章节执行。
 
-输入资料中的 current_foreshadow_endpoints 是本阶段自然发生的暗线端点清单。每一项落到一个当前事件中；kind=setup 写线索怎样进入人物生活，kind=payoff 写线索怎样在现场改变人物选择、关系或局势。清单为空时，场景仍然沿着人物和主线自然推进。承载端点的事件 references 加入“F编号/setup”或“F编号/payoff”，让程序可以把端点和事件稳定对应起来。
+输入资料中的 current_foreshadow_endpoints 是本阶段自然发生的正式暗线端点清单。每一项落到一个当前事件中；kind=setup 写线索怎样第一次进入人物生活，kind=payoff 写线索怎样在现场形成决定性变化。清单为空时，场景仍然沿着人物和主线自然推进。同一条伏笔在其它事件里继续出现、深化或产生后果是正常的，但正式端点只在真正承担该变化的事件中标记一次；后续事件用普通关联资料或“F编号”继续承接，不重复写“F编号/setup”或“F编号/payoff”。承载正式端点的事件 references 加入对应标记，让程序可以把端点和事件稳定对应起来。
 
-阶段内的事件以场景为核心：具体时间地点、在场人物、当下压力、动作、阻力、选择、情绪或关系变化和直接后果要在 h 中自然连成一段。相邻事件更换推进机制，让人物行动、空间变化、生活压力、关系碰撞、异常介入和线索变化共同推动故事。除非题材本身就是办案、破案或调查推理，不要让案卷化或程序化内容成为事件主线；连续两个事件不能都靠解释、谈话、规则说明或口头结论推进，必须让人物在场面中做出动作并承担后果。伏笔只在实际发生的阶段返回，一次只返回一个当前端点；f中的每项写 i、k、e、d，其中 k 为 setup 或 payoff，e 是承载它的事件编号，d 是这一次在场景中发生的具体变化。程序会依据事件范围落下具体章号。{("同时返回全书长期事实 k。" if first_stage else "本阶段沿用前面已经确认的长期事实。")}
+阶段内的事件以场景为核心：具体时间地点、在场人物、当下压力、动作、阻力、选择、情绪或关系变化和直接后果要在 h 中自然连成一段。相邻事件更换推进机制，让人物行动、空间变化、生活压力、关系碰撞、异常介入和线索变化共同推动故事。除非题材本身就是办案、破案或调查推理，不要让案卷化或程序化内容成为事件主线；连续两个事件不能都靠解释、谈话、规则说明或口头结论推进，必须让人物在场面中做出动作并承担后果。伏笔只在实际发生的阶段返回，一次只返回一个当前正式端点；f中的每项写 i、k、e、d，其中 k 为 setup 或 payoff，e 是承载它的事件编号，d 是这一次在场景中发生的具体变化。后续事件可以继续写同一条线索的新增影响，但不重复返回同一种正式端点。程序会依据事件范围落下具体章号。{("同时返回全书长期事实 k。" if first_stage else "本阶段沿用前面已经确认的长期事实。")}
 
-{subject_guidance}
+            {opening_guidance}{subject_guidance}{final_stage_guidance}
 
 {STAGE_PLAN_OBJECT_OUTPUT_RULES}
 """
@@ -4537,6 +4707,8 @@ class NovelCreationWorker(NovelAnalysisWorker):
     def _analysis_progress_label(self):
         if self.creation_batch == "stage_skeleton":
             return "全书阶段骨架"
+        if self.creation_batch == "stage_endpoint_repair":
+            return f"第{self.stage_index + 1}阶段伏笔定位"
         if self.creation_batch == "stage_plan_stage":
             return f"第{self.stage_index + 1}阶段"
         if self.creation_batch == "bible_core":
@@ -4550,6 +4722,8 @@ class NovelCreationWorker(NovelAnalysisWorker):
     def _max_tokens_for_request(self):
         if self.creation_batch == "stage_skeleton":
             return 8000
+        if self.creation_batch == "stage_endpoint_repair":
+            return 6000
         if self.creation_batch == "bible_core":
             return 16000
         if self.creation_batch == "bible_assets":
@@ -4581,6 +4755,8 @@ class NovelCreationWorker(NovelAnalysisWorker):
             return "正在生成：5个故事方向"
         if self.creation_batch == "stage_skeleton":
             return "正在生成：全书阶段骨架"
+        if self.creation_batch == "stage_endpoint_repair":
+            return f"正在补齐：第{self.stage_index + 1}阶段伏笔定位"
         if self.creation_batch == "bible_core":
             return "正在生成：小说圣经、世界规则"
         if self.creation_batch == "bible_assets":
@@ -4631,7 +4807,10 @@ class NovelCreationWorker(NovelAnalysisWorker):
                     self.creation_context.get("author_input", {}),
                     self.creation_context.get("selected_premise", {}),
                 ),
-                pad_stage_plan=self.creation_batch != "stage_plan_stage",
+                pad_stage_plan=self.creation_batch not in {
+                    "stage_plan_stage",
+                    "stage_endpoint_repair",
+                },
                 total_words=(
                     author_input.get("total_words", 500000)
                     if isinstance(author_input, dict) else 500000
@@ -4986,6 +5165,9 @@ class NovelCreationWizardDialog(QDialog):
         self._active_stage_index = -1
         self._pending_batch_kind = ""
         self._pending_stage_index = -1
+        self._pending_retry_delay_ms = 0
+        self._retrying_same_request = False
+        self._generation_retry_count = 0
         self._generation_failed = False
         self.current_step_index = 0
         self.step_results = {}
@@ -4998,6 +5180,7 @@ class NovelCreationWizardDialog(QDialog):
         self.choice_widgets = []
         self.json_editors = {}
         self.json_generate_buttons = {}
+        self.json_clear_buttons = {}
         self._status_text = "先输入一点灵感，再点选你喜欢的故事方向。"
         self._received_chars = 0
         self._last_worker_error = ""
@@ -5109,11 +5292,57 @@ class NovelCreationWizardDialog(QDialog):
             start_index = step_names.index(step)
         except ValueError:
             return
+        if step == "stage_plan":
+            bible_result = self.step_results.get("bible")
+            if isinstance(bible_result, dict):
+                bible_result["foreshadows"] = _restore_foreshadow_stage_baseline(
+                    bible_result.get("foreshadows", [])
+                )
+                self.step_results["bible"] = bible_result
+                self._set_preview_result("bible", bible_result)
         for name in step_names[start_index:]:
             self.step_results.pop(name, None)
             editor = self.json_editors.get(name)
             if editor is not None:
                 editor.clear()
+
+    def _clear_step_content(self, step):
+        """Clear one wizard step and the results that depend on it."""
+        if self.worker is not None:
+            return
+        step_titles = dict(CREATION_WIZARD_STEPS)
+        if step not in step_titles:
+            return
+
+        has_content = bool(self.step_results.get(step))
+        if step == "premise":
+            has_content = has_content or bool(self.premise_candidates)
+        if not has_content:
+            self._refresh_step_ui()
+            return
+
+        answer = QMessageBox.question(
+            self,
+            "清空本步内容",
+            f"确定清空“{step_titles[step]}”吗？\n"
+            "这一步及后面依赖它的内容都会被清除，第一步的灵感和选择会保留。",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if answer != QMessageBox.Yes:
+            return
+
+        if step == "premise":
+            self._invalidate_steps_from("premise")
+            self.premise_candidates = []
+            self.premise_selected_index = 0
+            self._show_empty_candidate_list()
+            self.premise_result_frame.setVisible(False)
+        else:
+            self._invalidate_steps_from(step)
+
+        self._save_draft()
+        self._refresh_step_ui()
 
     def _on_generation_scope_changed(self, *_args):
         if not getattr(self, "_draft_restoring", False) and self.premise_candidates:
@@ -5206,7 +5435,16 @@ class NovelCreationWizardDialog(QDialog):
                         continue
                     if step not in allowed_steps:
                         continue
-                    self.step_results[step] = self._normalize_step_result(step, result)
+                    normalized = self._normalize_step_result(step, result)
+                    if step == "bible" and isinstance(normalized, dict):
+                        # A previous version projected third-step chapter
+                        # placement into the second-step baseline.  Restore
+                        # the intended stage-only representation when opening
+                        # such a draft.
+                        normalized["foreshadows"] = _restore_foreshadow_stage_baseline(
+                            normalized.get("foreshadows", [])
+                        )
+                    self.step_results[step] = normalized
             if legacy_assets:
                 bible_result = self.step_results.get("bible", {})
                 if not isinstance(bible_result, dict):
@@ -5215,6 +5453,9 @@ class NovelCreationWizardDialog(QDialog):
                     if not bible_result.get(key) and legacy_assets.get(key):
                         bible_result[key] = deepcopy(legacy_assets[key])
                 self.step_results["bible"] = self._normalize_step_result("bible", bible_result)
+                self.step_results["bible"]["foreshadows"] = _restore_foreshadow_stage_baseline(
+                    self.step_results["bible"].get("foreshadows", [])
+                )
             if self.premise_candidates:
                 self._populate_candidate_list()
             else:
@@ -5263,7 +5504,13 @@ class NovelCreationWizardDialog(QDialog):
                 elif _as_text(self._generation_state("bible").get("status")).lower() == "partial":
                     saved_step_index = 1
                 elif "stage_plan" not in self.step_results:
-                    saved_step_index = 2
+                    # A saved bible result is not automatically confirmable.
+                    # Re-run the same validation used by the Next button so a
+                    # malformed result cannot reopen directly on stage plans.
+                    bible_error = self._bible_validation_error(
+                        self.step_results.get("bible", {})
+                    )
+                    saved_step_index = 1 if bible_error else 2
                 elif _as_text(self._generation_state("stage_plan").get("status")).lower() == "partial":
                     saved_step_index = 2
                 else:
@@ -5453,7 +5700,7 @@ class NovelCreationWizardDialog(QDialog):
             result["stage_skeleton"] = skeleton
         skeleton_complete = len(skeleton) == len(specs)
         self._canonicalize_stage_schedule(result, strict=False)
-        first_missing, _by_index = _stage_plan_progress(
+        first_missing_stage, _by_index = _stage_plan_progress(
             result.get("stage_plan", []),
             len(specs),
         )
@@ -5475,19 +5722,23 @@ class NovelCreationWizardDialog(QDialog):
             ),
             default=None,
         )
-        if first_missing is None:
-            first_missing = first_missing_endpoint
-        elif first_missing_endpoint is not None:
-            first_missing = min(first_missing, first_missing_endpoint)
         # Existing completed projects may predate the compact skeleton. Keep
         # their already complete stage plan usable; new generation runs still
         # request a skeleton before the first stage batch.
-        complete = first_missing is None
+        complete = first_missing_stage is None and not foreshadow_missing
         result["_generation_state"] = {
             "schema_version": 1,
             "status": "complete" if complete else "partial",
             "skeleton_complete": skeleton_complete,
-            "next_stage_index": len(specs) if complete else first_missing,
+            # Stage content decides which stage is generated next. Missing
+            # foreshadow endpoints are repaired separately and must never
+            # point the whole-stage request back to an already saved stage.
+            "next_stage_index": (
+                len(specs) if first_missing_stage is None else first_missing_stage
+            ),
+            "next_endpoint_stage_index": (
+                len(specs) if first_missing_endpoint is None else first_missing_endpoint
+            ),
             "stage_count": len(specs),
             "missing_foreshadow_endpoints": [
                 {
@@ -5505,7 +5756,7 @@ class NovelCreationWizardDialog(QDialog):
         # legacy row must not leave an obsolete warning in the completed draft.
         if complete:
             result["foreshadow_endpoint_warnings"] = []
-        return first_missing
+        return first_missing_stage
 
     def _merge_stage_skeleton(self, result):
         """Save the compact whole-book anchor before any stage batch runs."""
@@ -5569,13 +5820,47 @@ class NovelCreationWizardDialog(QDialog):
                 if not result.get("stage_skeleton"):
                     return "stage_skeleton", -1
                 if _as_text(state.get("status")).lower() == "partial":
+                    first_missing, stages_by_index = _stage_plan_progress(
+                        result.get("stage_plan", []),
+                        len(specs),
+                    )
+                    missing_endpoints = state.get("missing_foreshadow_endpoints", [])
+                    # A saved stage is the only stage whose endpoint can be
+                    # repaired now.  Repair it before opening the next stage,
+                    # so later stages receive the complete continuity handoff.
+                    completed_stage_indexes = {
+                        index for index, stage in stages_by_index.items()
+                        if _stage_has_meaningful_content(stage)
+                    }
+                    completed_endpoint_indexes = [
+                        int(item.get("stage_index"))
+                        for item in missing_endpoints
+                        if isinstance(item, dict)
+                        and str(item.get("stage_index", "")).lstrip("-").isdigit()
+                        and int(item.get("stage_index")) in completed_stage_indexes
+                    ]
+                    if completed_endpoint_indexes:
+                        return "stage_endpoint_repair", min(completed_endpoint_indexes)
                     next_index = int(state.get("next_stage_index", 0) or 0)
-                    return "stage_plan_stage", min(next_index, max(0, len(specs) - 1))
+                    if next_index < len(specs):
+                        return "stage_plan_stage", next_index
+                    endpoint_index = int(
+                        state.get("next_endpoint_stage_index", len(specs))
+                        or len(specs)
+                    )
+                    if endpoint_index < len(specs):
+                        return "stage_endpoint_repair", endpoint_index
             first_missing, _by_index = _stage_plan_progress(
                 result.get("stage_plan", []) if isinstance(result, dict) else [],
                 len(specs),
             )
             if first_missing is None:
+                state = self._generation_state(step)
+                endpoint_index = int(
+                    state.get("next_endpoint_stage_index", len(specs)) or len(specs)
+                )
+                if endpoint_index < len(specs):
+                    return "stage_endpoint_repair", endpoint_index
                 return "stage_plan_stage", 0
             return "stage_plan_stage", min(first_missing, max(0, len(specs) - 1))
         return "", -1
@@ -5823,7 +6108,16 @@ class NovelCreationWizardDialog(QDialog):
         self.premise_generate_btn = QPushButton("AI 生成 5 个故事方向")
         self.premise_generate_btn.setMinimumHeight(38)
         self.premise_generate_btn.clicked.connect(self._generate_current)
-        preferences_layout.addWidget(self.premise_generate_btn)
+        premise_actions = QHBoxLayout()
+        premise_actions.setSpacing(8)
+        premise_actions.addWidget(self.premise_generate_btn, 1)
+        self.premise_clear_btn = QPushButton("清空本步内容")
+        self.premise_clear_btn.setMinimumHeight(38)
+        self.premise_clear_btn.clicked.connect(
+            lambda _checked=False: self._clear_step_content("premise")
+        )
+        premise_actions.addWidget(self.premise_clear_btn)
+        preferences_layout.addLayout(premise_actions)
         layout.addWidget(preferences_frame)
         layout.addSpacing(14)
 
@@ -5901,7 +6195,15 @@ class NovelCreationWizardDialog(QDialog):
         )
         generate_btn = QPushButton(f"AI 生成{title}")
         generate_btn.clicked.connect(self._generate_current)
-        layout.addWidget(generate_btn)
+        clear_btn = QPushButton("清空本步内容")
+        clear_btn.clicked.connect(
+            lambda _checked=False, current_step=step: self._clear_step_content(current_step)
+        )
+        action_layout = QHBoxLayout()
+        action_layout.setSpacing(8)
+        action_layout.addWidget(generate_btn, 1)
+        action_layout.addWidget(clear_btn)
+        layout.addLayout(action_layout)
         if step == "bible":
             editor = CreationSectionedPreview()
         else:
@@ -5913,8 +6215,10 @@ class NovelCreationWizardDialog(QDialog):
         layout.addWidget(editor, 1)
         self.json_editors = getattr(self, "json_editors", {})
         self.json_generate_buttons = getattr(self, "json_generate_buttons", {})
+        self.json_clear_buttons = getattr(self, "json_clear_buttons", {})
         self.json_editors[step] = editor
         self.json_generate_buttons[step] = generate_btn
+        self.json_clear_buttons[step] = clear_btn
         self.stack.addWidget(page)
 
     def _update_responsive_controls(self):
@@ -5957,12 +6261,17 @@ class NovelCreationWizardDialog(QDialog):
                 if not self.step_results[step].get("stage_skeleton"):
                     self._set_status_text("点击生成后会先整理全书阶段骨架，再按十万字阶段依次生成。")
                 elif _as_text(state.get("status")).lower() == "partial":
-                    next_index = int(state.get("next_stage_index", 0) or 0)
-                    missing_endpoints = state.get("missing_foreshadow_endpoints", [])
-                    detail = "，其中包含未完成的伏笔章位" if missing_endpoints else ""
-                    self._set_status_text(
-                        f"当前步骤已保存部分内容，点击生成会继续第{next_index + 1}阶段{detail}。"
-                    )
+                    next_batch, next_index = self._next_generation_batch("stage_plan")
+                    if next_batch == "stage_endpoint_repair":
+                        self._set_status_text(
+                            f"当前阶段正文已保存，点击生成会先补齐第{next_index + 1}阶段的伏笔定位。"
+                        )
+                    elif next_batch == "stage_plan_stage" and next_index < len(self._stage_specs()):
+                        self._set_status_text(
+                            f"当前步骤已保存部分内容，点击生成会继续第{next_index + 1}阶段。"
+                        )
+                    else:
+                        self._set_status_text("当前步骤已保存部分内容，请点击生成继续未完成批次。")
                 else:
                     self._set_status_text("当前步骤已有完整阶段规划，可以重新生成或直接确认。")
             elif _as_text(state.get("status")).lower() == "partial":
@@ -5970,9 +6279,29 @@ class NovelCreationWizardDialog(QDialog):
                     self._set_status_text("当前步骤已保存第一批资料，点击生成会继续第二批。")
                 else:
                     next_index = int(state.get("next_stage_index", 0) or 0)
-                    self._set_status_text(f"当前步骤已保存前面阶段，点击生成会继续第{next_index + 1}阶段。")
+                    if next_index < len(self._stage_specs()):
+                        self._set_status_text(
+                            f"当前步骤已保存前面阶段，点击生成会继续第{next_index + 1}阶段。"
+                        )
+                    else:
+                        endpoint_index = int(
+                            state.get("next_endpoint_stage_index", len(self._stage_specs()))
+                            or len(self._stage_specs())
+                        )
+                        self._set_status_text(
+                            f"阶段正文已生成，点击生成会补齐第{endpoint_index + 1}阶段的伏笔定位。"
+                            if endpoint_index < len(self._stage_specs())
+                            else "当前步骤已保存部分内容，请点击生成继续未完成批次。"
+                        )
             else:
-                self._set_status_text("当前步骤已有 AI 结果，可以重新生成或直接确认。")
+                if step == "bible":
+                    bible_error = self._bible_validation_error(self.step_results.get("bible", {}))
+                    if bible_error:
+                        self._set_status_text(bible_error)
+                    else:
+                        self._set_status_text("当前步骤已有 AI 结果，可以重新生成或直接确认。")
+                else:
+                    self._set_status_text("当前步骤已有 AI 结果，可以重新生成或直接确认。")
         else:
             self._set_status_text("请点击 AI 生成当前步骤。")
 
@@ -5986,11 +6315,7 @@ class NovelCreationWizardDialog(QDialog):
             return (
                 isinstance(result, dict)
                 and _as_text(state.get("status")).lower() in {"", "complete"}
-                and _has_creation_content(result.get("bible"))
-                and _has_creation_content(result.get("world_rules"))
-                and _has_creation_content(result.get("characters"))
-                and _has_creation_content(result.get("lore"))
-                and _has_creation_content(result.get("foreshadows"))
+                and not self._bible_validation_error(result)
             )
         if step == "stage_plan":
             result = self.step_results.get(step, {})
@@ -6005,6 +6330,34 @@ class NovelCreationWizardDialog(QDialog):
             )
             return first_missing is None
         return step in self.step_results
+
+    def _bible_validation_error(self, result):
+        """Return the confirmation error shared by generation, navigation and restore."""
+        normalized = self._normalize_step_result("bible", result)
+        missing = [
+            label for key, label in (
+                ("bible", "小说圣经"),
+                ("world_rules", "世界规则"),
+                ("characters", "人物"),
+                ("lore", "设定"),
+                ("foreshadows", "伏笔"),
+            )
+            if not _has_creation_content(normalized.get(key))
+        ]
+        if missing:
+            return f"当前故事底盘缺少：{'、'.join(missing)}。请重新生成完整故事底盘。"
+        stage_shortfalls = _foreshadow_stage_shortfalls(
+            normalized.get("foreshadows", []),
+            _expected_stage_count(self.target_words_spin.value()),
+        )
+        if stage_shortfalls:
+            stage_count = _expected_stage_count(self.target_words_spin.value())
+            return (
+                "伏笔阶段位置无效或超出本书阶段范围："
+                + "、".join(stage_shortfalls[:12])
+                + f"。本书只有第1至第{stage_count}阶段，请重新生成故事底盘。"
+            )
+        return ""
 
     def _set_status_text(self, text):
         self._status_text = str(text or "")
@@ -6105,6 +6458,30 @@ class NovelCreationWizardDialog(QDialog):
                     }
                     for item in endpoint_requirements.get(stage_index, [])
                 ]
+            elif batch_kind == "stage_endpoint_repair":
+                state = self._generation_state("stage_plan")
+                missing = [
+                    item for item in state.get("missing_foreshadow_endpoints", [])
+                    if isinstance(item, dict)
+                    and int(item.get("stage_index", -1) or -1) == stage_index
+                ]
+                context["missing_foreshadow_endpoints"] = [
+                    {
+                        "code": item.get("code") or item.get("name"),
+                        "name": item.get("name", ""),
+                        "kind": item.get("kind", ""),
+                    }
+                    for item in missing
+                ]
+                current_stage_plan = []
+                for item in stage_result.get("stage_plan", []) if isinstance(stage_result, dict) else []:
+                    if not isinstance(item, dict):
+                        continue
+                    item_index = _creation_stage_index(item.get("id"))
+                    if item_index == stage_index:
+                        current_stage_plan.append(deepcopy(item))
+                        break
+                context["confirmed"]["current_stage_plan"] = current_stage_plan
             if isinstance(stage_result, dict):
                 _first_missing, stages_by_index = _stage_plan_progress(
                     stage_result.get("stage_plan", []),
@@ -6179,10 +6556,36 @@ class NovelCreationWizardDialog(QDialog):
     def _generate_current(self):
         if self.worker is not None:
             return
+        retrying_same_request = bool(self._retrying_same_request)
+        self._retrying_same_request = False
+        if not retrying_same_request:
+            self._generation_retry_count = 0
         step = CREATION_WIZARD_STEPS[self.current_step_index][0]
         batch_kind, stage_index = self._next_generation_batch(step)
         if not batch_kind:
             return
+        if step == "stage_plan" and batch_kind == "stage_plan_stage":
+            # A queued continuation can carry an older stage index while the
+            # previous result has already been merged. Recompute from the
+            # saved stages immediately before opening the request so a
+            # completed S02 can never be requested again merely because a
+            # stale pending index still says 1. If the first missing stage is
+            # the current one, keep it eligible for a genuine retry caused by
+            # incomplete events or unresolved foreshadow endpoints.
+            stage_result = self.step_results.get("stage_plan", {})
+            if isinstance(stage_result, dict):
+                self._sync_stage_generation_state(stage_result)
+                specs = self._stage_specs()
+                first_missing, _stage_by_index = _stage_plan_progress(
+                    stage_result.get("stage_plan", []),
+                    len(specs),
+                )
+                if first_missing is None:
+                    self._set_status_text("阶段规划已经覆盖全部阶段，可以直接确认创建项目。")
+                    self._refresh_step_ui()
+                    return
+                if stage_index < first_missing:
+                    stage_index = first_missing
         state = self._generation_state(step)
         provider, model, error = self.ai_selection()
         if error:
@@ -6236,6 +6639,7 @@ class NovelCreationWizardDialog(QDialog):
         self._active_stage_index = stage_index
         self._pending_batch_kind = ""
         self._pending_stage_index = -1
+        self._pending_retry_delay_ms = 0
         self._generation_failed = False
         self._last_worker_error = ""
         self._received_chars = 0
@@ -6257,6 +6661,17 @@ class NovelCreationWizardDialog(QDialog):
             for key in ("characters", "lore", "foreshadows")
         ):
             raise ValueError("第二批没有同时收到完整的人物、设定和伏笔。")
+        if batch_kind == "bible_assets":
+            shortfalls = _creation_scale_shortfalls(
+                result,
+                self.target_words_spin.value(),
+            )
+            if shortfalls:
+                raise ValueError(
+                    "第二批资料数量没有达到按阶段计算的最低要求："
+                    + "、".join(shortfalls)
+                    + "。请重新生成第二批人物、设定和伏笔。"
+                )
         current = deepcopy(self.step_results.get("bible", {}))
         if not isinstance(current, dict):
             current = {}
@@ -6300,6 +6715,10 @@ class NovelCreationWizardDialog(QDialog):
             "next_batch": "" if complete else "bible_assets",
             "updated_at": now_str(),
         }
+        if complete:
+            bible_error = self._bible_validation_error(current)
+            if bible_error:
+                raise ValueError(bible_error)
         self.step_results["bible"] = current
         if complete:
             self._invalidate_steps_from("stage_plan")
@@ -6500,19 +6919,161 @@ class NovelCreationWizardDialog(QDialog):
         self._sync_stage_generation_state(current)
         self.step_results["stage_plan"] = current
 
-        if isinstance(bible_result, dict):
-            bible_result["foreshadows"] = _apply_foreshadow_schedule(
-                bible_result.get("foreshadows", []),
+        # Keep the second-step baseline stage-only.  Concrete chapter numbers
+        # remain in the third-step foreshadow_schedule and are projected into
+        # the final project only after the whole wizard is confirmed.
+
+    def _merge_stage_endpoint_repair(self, result, stage_index):
+        """Merge only missing foreshadow endpoints into an existing stage.
+
+        A completed stage must never be regenerated just because one of its
+        setup/payoff markers was absent.  This request only identifies the
+        existing event that carries the missing endpoint; the stage text and
+        the second-step foreshadow baseline remain unchanged.
+        """
+        specs = self._stage_specs()
+        if stage_index < 0 or stage_index >= len(specs):
+            raise ValueError("当前伏笔定位阶段编号无效，本次未保存。")
+
+        current = deepcopy(self.step_results.get("stage_plan", {}))
+        if not isinstance(current, dict):
+            current = {}
+        stage_by_index = {}
+        for position, item in enumerate(current.get("stage_plan", [])):
+            if not isinstance(item, dict):
+                continue
+            item_index = _creation_stage_index(item.get("id"))
+            if not (0 <= item_index < len(specs)):
+                item_index = position if position < len(specs) else -1
+            if item_index >= 0:
+                stage_by_index[item_index] = deepcopy(item)
+
+        existing_stage = stage_by_index.get(stage_index)
+        if not _stage_has_meaningful_content(existing_stage):
+            raise ValueError(
+                f"第{stage_index + 1}阶段正文尚未保存，不能单独补齐伏笔定位；请先生成该阶段。"
+            )
+
+        bible_result = self.step_results.get("bible", {})
+        bible_foreshadows = (
+            bible_result.get("foreshadows", [])
+            if isinstance(bible_result, dict) else []
+        )
+        total_chapters = _creation_total_chapters(
+            self.target_words_spin.value(),
+            self.average_words_spin.value(),
+        )
+        missing_before = [
+            item for item in _stage_foreshadow_shortfalls(
+                bible_foreshadows,
                 current.get("foreshadow_schedule", []),
+                specs,
                 total_chapters,
             )
-            self.step_results["bible"] = bible_result
-            self._set_preview_result("bible", bible_result)
+            if isinstance(item, dict) and item.get("stage_index") == stage_index
+        ]
+        if not missing_before:
+            # The response may have arrived after another state refresh already
+            # completed the endpoint.  Do not issue a second repair merge.
+            self._sync_stage_generation_state(current)
+            self.step_results["stage_plan"] = current
+            return
+
+        incoming_schedule = (
+            result.get("foreshadow_schedule", [])
+            if isinstance(result, dict) else []
+        )
+        if not isinstance(incoming_schedule, list) or not incoming_schedule:
+            raise ValueError("伏笔定位补充请求没有返回有效端点，本次未保存。")
+
+        # Resolve the compact i/k/e/d response against the already saved
+        # events.  _derive_stage_endpoint_rows also adds the stable endpoint
+        # marker to the matching event reference when the model omitted it.
+        stage_copy = deepcopy(existing_stage)
+        derived_rows = _derive_stage_endpoint_rows(
+            {
+                "stage_plan": [stage_copy],
+                "foreshadow_schedule": incoming_schedule,
+            },
+            stage_index,
+            specs,
+            bible_foreshadows,
+            total_chapters,
+        )
+        if not derived_rows:
+            raise ValueError("伏笔定位补充请求没有找到可关联的现有事件，本次未保存。")
+
+        combined_schedule = []
+        combined_schedule.extend(
+            current.get("foreshadow_schedule", [])
+            if isinstance(current.get("foreshadow_schedule", []), list) else []
+        )
+        combined_schedule.extend(derived_rows)
+        canonical_schedule, schedule_notes, schedule_errors = _canonicalize_foreshadow_schedule(
+            bible_foreshadows,
+            combined_schedule,
+            specs,
+            total_chapters,
+            strict=True,
+        )
+        if schedule_errors:
+            raise ValueError(
+                "伏笔定位补充结果与第二步阶段位置不一致："
+                + "；".join(schedule_errors[:6])
+                + "。本次未保存。"
+            )
+
+        # Check the result before mutating the saved state.  A partial repair
+        # must be retried as a repair request, never accepted as a complete
+        # stage and never used to trigger a full-stage regeneration.
+        repaired_missing = [
+            item for item in _stage_foreshadow_shortfalls(
+                bible_foreshadows,
+                canonical_schedule,
+                specs,
+                total_chapters,
+            )
+            if isinstance(item, dict) and item.get("stage_index") == stage_index
+        ]
+        if repaired_missing:
+            labels = "、".join(
+                f"{item.get('code') or item.get('name') or '未命名伏笔'}"
+                f"/{'埋设' if item.get('kind') == 'setup' else '回收'}"
+                for item in repaired_missing
+            )
+            raise ValueError(
+                f"第{stage_index + 1}阶段伏笔定位仍不完整（{labels}），本次未保存阶段内容；请重新补齐。"
+            )
+
+        stage_by_index[stage_index] = stage_copy
+        current["stage_plan"] = [
+            stage_by_index[index]
+            for index in sorted(stage_by_index)
+            if 0 <= index < len(specs)
+        ]
+        current["foreshadow_schedule"] = canonical_schedule
+        current["foreshadow_endpoint_warnings"] = [
+            item for item in current.get("foreshadow_endpoint_warnings", [])
+            if not (
+                isinstance(item, dict)
+                and item.get("stage_index") == stage_index
+            )
+        ]
+        for note in schedule_notes:
+            current["chapter_plan_note"] = _append_note(
+                _clean_chapter_plan_note(current.get("chapter_plan_note", "")),
+                note,
+            )
+        self._sync_stage_generation_state(current)
+        self.step_results["stage_plan"] = current
 
     def _set_running(self, running):
         running = bool(running)
         self.premise_generate_btn.setEnabled(not running)
+        self.premise_clear_btn.setEnabled(not running)
         for button in getattr(self, "json_generate_buttons", {}).values():
+            button.setEnabled(not running)
+        for button in getattr(self, "json_clear_buttons", {}).values():
             button.setEnabled(not running)
         for button in self.choice_widgets:
             button.setEnabled(not running)
@@ -6535,20 +7096,60 @@ class NovelCreationWizardDialog(QDialog):
         if self._active_batch_kind == "stage_plan_stage":
             total_stages = len(self._stage_specs())
             return f"正在生成：第{self._active_stage_index + 1}阶段（共{total_stages}个阶段）"
+        if self._active_batch_kind == "stage_endpoint_repair":
+            return f"正在补齐：第{self._active_stage_index + 1}阶段伏笔定位"
         if self._active_batch_kind == "stage_skeleton":
             return "正在生成：全书阶段骨架"
         return "AI 正在生成当前步骤，请稍候……"
+
+    def _schedule_generation_retry(self, error, batch_kind="", stage_index=-1):
+        """Retry a failed post-response validation without saving bad content."""
+        retry_number = int(self._generation_retry_count or 0) + 1
+        detail = str(error or "返回内容未通过当前步骤校验。").strip()
+        if retry_number <= 3:
+            self._generation_retry_count = retry_number
+            self._pending_batch_kind = batch_kind or self._active_batch_kind
+            self._pending_stage_index = (
+                stage_index if stage_index is not None and stage_index >= 0
+                else self._active_stage_index
+            )
+            self._pending_retry_delay_ms = retry_number * 10 * 1000
+            self._retrying_same_request = True
+            self._generation_failed = False
+            self._last_worker_error = (
+                f"本次生成失败：{detail}；{retry_number * 10}秒后自动重试 "
+                f"{retry_number}/3。"
+            )
+            self._set_status_text(self._last_worker_error)
+            self._set_running(False)
+            return True
+
+        self._generation_failed = True
+        self._pending_batch_kind = ""
+        self._pending_stage_index = -1
+        self._pending_retry_delay_ms = 0
+        self._retrying_same_request = False
+        self._last_worker_error = (
+            f"生成失败：{detail}；已自动重试3次，请点击 AI 生成重试。"
+        )
+        self._set_status_text(self._last_worker_error)
+        self._set_running(False)
+        return False
 
     def _on_ai_result(self, result):
         step = CREATION_WIZARD_STEPS[self.current_step_index][0]
         batch_kind = self._active_batch_kind
         stage_index = self._active_stage_index
-        if batch_kind == "stage_plan_stage":
-            partial_payload = deepcopy(result) if isinstance(result, dict) else {}
-            partial_payload["_generation_state"] = {"status": "partial"}
-            result = self._normalize_step_result(step, partial_payload)
-        else:
-            result = self._normalize_step_result(step, result)
+        try:
+            if batch_kind in {"stage_plan_stage", "stage_endpoint_repair"}:
+                partial_payload = deepcopy(result) if isinstance(result, dict) else {}
+                partial_payload["_generation_state"] = {"status": "partial"}
+                result = self._normalize_step_result(step, partial_payload)
+            else:
+                result = self._normalize_step_result(step, result)
+        except Exception as exc:
+            self._schedule_generation_retry(str(exc), batch_kind, stage_index)
+            return
         if step == "premise":
             candidates = [
                 deepcopy(item)
@@ -6567,7 +7168,7 @@ class NovelCreationWizardDialog(QDialog):
                     self._set_status_text(
                         f"这次故事方向的返回结构不完整（{detail}），请重新生成。"
                     )
-                self._set_running(False)
+                self._schedule_generation_retry(detail, batch_kind, stage_index)
                 return
             self._invalidate_steps_from("bible")
             self.step_results[step] = deepcopy(result)
@@ -6598,6 +7199,8 @@ class NovelCreationWizardDialog(QDialog):
                 elif step == "stage_plan":
                     if batch_kind == "stage_skeleton":
                         self._merge_stage_skeleton(result)
+                    elif batch_kind == "stage_endpoint_repair":
+                        self._merge_stage_endpoint_repair(result, stage_index)
                     else:
                         self._merge_stage_batch(result, stage_index)
                 if step == "bible" and batch_kind == "bible_assets":
@@ -6606,7 +7209,7 @@ class NovelCreationWizardDialog(QDialog):
                         source="bible",
                     )
             except Exception as exc:
-                self._on_ai_failed(str(exc))
+                self._schedule_generation_retry(str(exc), batch_kind, stage_index)
                 return
             merged = deepcopy(self.step_results.get(step, {}))
             self._set_preview_result(step, merged)
@@ -6618,14 +7221,19 @@ class NovelCreationWizardDialog(QDialog):
                     self._pending_batch_kind = "bible_assets"
                     self._pending_stage_index = -1
                 else:
-                    next_index = int(state.get("next_stage_index", 0) or 0)
-                    self._pending_batch_kind = "stage_plan_stage"
+                    next_batch, next_index = self._next_generation_batch(step)
+                    self._pending_batch_kind = next_batch
                     self._pending_stage_index = next_index
-                    next_label = (
-                        f"第{next_index + 1}阶段"
-                        if batch_kind != "stage_skeleton"
-                        else "第1阶段"
-                    )
+                    if next_batch == "stage_endpoint_repair":
+                        next_label = f"补齐第{next_index + 1}阶段的伏笔定位"
+                    elif next_batch == "stage_plan_stage":
+                        next_label = (
+                            f"第{next_index + 1}阶段"
+                            if batch_kind != "stage_skeleton"
+                            else "第1阶段"
+                        )
+                    else:
+                        next_label = "未完成的阶段"
                 self._set_status_text(f"已保存当前批次，接下来生成{next_label}。")
             else:
                 shortfalls = (
@@ -6660,10 +7268,15 @@ class NovelCreationWizardDialog(QDialog):
             )
         else:
             message = raw_error
-        self._last_worker_error = f"生成失败：{message}"
+        self._last_worker_error = (
+            f"生成失败：{message}\n已自动重试3次，请点击 AI 生成重试。"
+        )
         self._generation_failed = True
         self._pending_batch_kind = ""
         self._pending_stage_index = -1
+        self._pending_retry_delay_ms = 0
+        self._retrying_same_request = False
+        self._generation_retry_count = 0
         state = self._generation_state(CREATION_WIZARD_STEPS[self.current_step_index][0])
         if state.get("status") == "partial":
             continuation = "已完成的批次已经保存，下次点击生成会从未完成批次继续。"
@@ -6671,7 +7284,6 @@ class NovelCreationWizardDialog(QDialog):
             self._last_worker_error += "；已完成批次已保存，下次生成会继续未完成批次"
         self._set_status_text(self._last_worker_error)
         self._save_draft()
-        QMessageBox.warning(self, "新建向导生成失败", message)
         self._set_running(False)
 
     def _cleanup_worker(self):
@@ -6682,10 +7294,12 @@ class NovelCreationWizardDialog(QDialog):
         self._set_running(False)
         self._refresh_step_ui()
         pending = bool(self._pending_batch_kind) and not self._generation_failed
+        pending_delay_ms = max(0, int(self._pending_retry_delay_ms or 0))
         self._pending_batch_kind = ""
         self._pending_stage_index = -1
+        self._pending_retry_delay_ms = 0
         if pending:
-            QTimer.singleShot(0, self._generate_current)
+            QTimer.singleShot(pending_delay_ms, self._generate_current)
             return
         if self._last_worker_error:
             self._set_status_text(self._last_worker_error)
@@ -6726,31 +7340,9 @@ class NovelCreationWizardDialog(QDialog):
             raise ValueError("阶段规划还在生成中，请先点击 AI 生成完成剩余阶段。")
         normalized = self._normalize_step_result(step, self.step_results.get(step, {}))
         if step == "bible":
-            missing = [
-                label for key, label in (
-                    ("bible", "小说圣经"),
-                    ("world_rules", "世界规则"),
-                    ("characters", "人物"),
-                    ("lore", "设定"),
-                    ("foreshadows", "伏笔"),
-                )
-                if not _has_creation_content(normalized.get(key))
-            ]
-            if missing:
-                raise ValueError(
-                    f"当前故事底盘缺少：{'、'.join(missing)}。请重新生成完整故事底盘。"
-                )
-            stage_shortfalls = _foreshadow_stage_shortfalls(
-                normalized.get("foreshadows", []),
-                _expected_stage_count(self.target_words_spin.value()),
-            )
-            if stage_shortfalls:
-                stage_count = _expected_stage_count(self.target_words_spin.value())
-                raise ValueError(
-                    "伏笔阶段位置无效或超出本书阶段范围："
-                    + "、".join(stage_shortfalls[:12])
-                    + f"。本书只有第1至第{stage_count}阶段，请重新生成故事底盘。"
-                )
+            bible_error = self._bible_validation_error(normalized)
+            if bible_error:
+                raise ValueError(bible_error)
         elif step == "stage_plan" and not normalized.get(step):
             raise ValueError("当前步骤至少需要一条内容。")
         if step == "stage_plan":

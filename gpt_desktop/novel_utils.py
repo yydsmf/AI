@@ -4538,6 +4538,62 @@ def _long_form_progress_text(project, chapter_index):
     ])
 
 
+def _project_planned_chapter_count(project):
+    """Return a trusted whole-book chapter count when planning has recorded one."""
+    project = project if isinstance(project, dict) else {}
+    candidates = []
+    for container in (
+        project.get("meta", {}),
+        project.get("generation_state", {}),
+        project.get("chapter_plan_foundation", {}),
+        project.get("framework_analysis", {}),
+    ):
+        if not isinstance(container, dict):
+            continue
+        for key in ("total_chapter_count", "total_chapters"):
+            try:
+                value = int(container.get(key, 0) or 0)
+            except (TypeError, ValueError):
+                value = 0
+            if value > 0:
+                candidates.append(value)
+        parameters = container.get("planning_parameters", {})
+        if isinstance(parameters, dict):
+            try:
+                value = int(parameters.get("total_chapter_count", 0) or 0)
+            except (TypeError, ValueError):
+                value = 0
+            if value > 0:
+                candidates.append(value)
+    return max(candidates) if candidates else 0
+
+
+def _is_project_final_chapter(project, chapter_index):
+    project = project if isinstance(project, dict) else {}
+    chapters = project.get("chapters", [])
+    if not isinstance(chapters, list) or not chapters:
+        return False
+    try:
+        chapter_index = int(chapter_index)
+    except (TypeError, ValueError):
+        return False
+    if chapter_index != len(chapters) - 1:
+        return False
+    planned_count = _project_planned_chapter_count(project)
+    return planned_count <= 0 or planned_count == len(chapters)
+
+
+def _final_chapter_ending_guidance():
+    return (
+        "【全书最后一章收束要求】\n"
+        "当前章节是全书最后一章，也要让读者把这一部当成一个完整结局来读。正文要在具体场景里完成核心矛盾的最终选择和结果，"
+        "让主要人物的关系、读者一直跟随的核心承诺、能够自然落地的关键线索和主角本部目标都有清楚结果。"
+        "即使故事保留续作可能，也只能留下不影响本部结局的余味、远景或新的选择；不能留下必须依靠后续章节解决的主线任务、重大反转、重要人物或新的世界规则。"
+        "最后的收束落在人物的动作、对白、关系结果或生活状态上，不用突然跳过多年的概括、作者总结、抽象结论、‘未完待续’或单独的‘全文完’代替结尾。"
+        "不要为了回收而硬塞与本章无关的伏笔；只处理能从当前冲突和人物选择自然落地的线索，其余已经不再影响主线的内容，用清楚的结果或状态自然关上。"
+    )
+
+
 def _project_list_text(data, fallback_title="未命名小说"):
     data = data if isinstance(data, dict) else {}
     meta = data.get("meta", {}) if isinstance(data.get("meta"), dict) else {}
@@ -20004,6 +20060,8 @@ def _build_chapter_ai_context(project, chapter_index, action):
     draft_words_remaining_label = f"{draft_words_remaining}字" if draft_words_remaining else ""
     style_reference = str(project.get("style_reference", "") or "").strip()
     stage_boundary = (chapter_index + 1) % 10 == 0
+    is_final_chapter = _is_project_final_chapter(project, chapter_index)
+    final_chapter_guidance = _final_chapter_ending_guidance() if is_final_chapter else ""
     no_text_count_rule = (
         "能不用“几个字/几个词/几个音节”就不用；真要写字数，标点符号、引号和空格都不计入字数。"
     )
@@ -20127,6 +20185,8 @@ def _build_chapter_ai_context(project, chapter_index, action):
         ),
     }
     task_text = task_map.get(action, str(action or "").strip() or "请根据当前资料完成本章写作任务。")
+    if final_chapter_guidance and action in {"draft", "outline", "script_to_novel"}:
+        task_text = f"{task_text}\n{final_chapter_guidance}"
 
     inheritance_rule_lines = [
         "写长篇时请把资料当成连续故事档案。",
@@ -20148,6 +20208,11 @@ def _build_chapter_ai_context(project, chapter_index, action):
         inheritance_rule_lines.append(
             "后续章节提纲和人物名单来自初始框架规划，只是可调整的方向与边界，不是已发生事实或强制出场名单；"
             "当前章可以自然铺垫下一章，但不要提前兑现后续章节安排的真相、转折或结局。"
+        )
+    if final_chapter_guidance and action in {"draft", "outline", "script_to_novel"}:
+        inheritance_rule_lines.append(
+            "当前是全书最后一章：本章不再给后续章节开主线；核心矛盾、主要关系和主角最终处境必须在本章形成真实结果，"
+            "结尾落到具体场景、动作、对白或已经成立的生活状态。"
         )
     inheritance_rules = "\n".join(inheritance_rule_lines)
 
@@ -20315,6 +20380,11 @@ def _build_chapter_ai_context(project, chapter_index, action):
             f"项目总目标字数：{_target_words_label(meta.get('target_words', ''))}",
         ]), 500, False),
     ]
+    if final_chapter_guidance and action in {"draft", "outline", "script_to_novel"}:
+        common_sections.insert(
+            2,
+            ("终章收束要求", final_chapter_guidance, 1800, False),
+        )
     if action == "draft":
         common_sections.insert(
             3,

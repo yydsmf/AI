@@ -177,6 +177,7 @@ from .novel_utils import (
     _normalize_name_list,
     _normalize_narrative_strategy_profile,
     _normalize_creative_intent_contract,
+    _procedural_plot_guard_guidance,
     _build_volume_handoff_source,
     _build_volume_handoff_record_catalog,
     _compact_volume_continuity_anchors,
@@ -225,6 +226,7 @@ from .novel_utils import (
     _style_candidate_needs_rescue,
     _style_candidate_rank,
     _style_output_target_from_context,
+    _story_conflict_pacing_guidance,
     _target_words,
     FRAMEWORK_IMPORT_TYPE,
 )
@@ -7196,6 +7198,52 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
             )
         return records
 
+    @staticmethod
+    def _chapter_plan_foreshadow_chapter(value):
+        text = str(value or "").strip()
+        if not text:
+            return 0
+        match = re.search(r"第\s*(\d+)\s*章", text)
+        if not match:
+            match = re.search(r"(?<!\d)(\d+)(?!\d)", text)
+        try:
+            return int(match.group(1)) if match else 0
+        except (AttributeError, TypeError, ValueError):
+            return 0
+
+    def _chapter_plan_scoped_foreshadows(self, items, start_index, end_index):
+        """只把当前章节范围内已出现的伏笔送入向导章节规划。
+
+        向导保存的伏笔资料覆盖全书，并且可能带有后续阶段的具体埋设章号。
+        如果整份资料直接进入当前批次，模型会把后续章位当成本批任务，导致
+        当前阶段被提前写穿。这里仅裁剪请求上下文，不改变项目里的原始伏笔。
+        """
+        try:
+            start_index = int(start_index or 0)
+            end_index = int(end_index or 0)
+        except (TypeError, ValueError):
+            return items if isinstance(items, list) else []
+        if start_index <= 0 or end_index < start_index:
+            return items if isinstance(items, list) else []
+
+        scoped = []
+        for item in items if isinstance(items, list) else []:
+            if not isinstance(item, dict):
+                continue
+            setup_chapter = self._chapter_plan_foreshadow_chapter(
+                item.get("setup_chapter", "")
+            )
+            if setup_chapter and setup_chapter > end_index:
+                continue
+            row = deepcopy(item)
+            payoff_chapter = self._chapter_plan_foreshadow_chapter(
+                row.get("payoff_chapter", "")
+            )
+            if payoff_chapter and payoff_chapter > end_index:
+                row.pop("payoff_chapter", None)
+            scoped.append(row)
+        return scoped
+
     def _chapter_plan_compact_reference_context(self, reference, total_limit, master=False):
         """Keep source-framework constraints structured when a plan is large."""
         reference = deepcopy(reference if isinstance(reference, dict) else {})
@@ -8127,6 +8175,16 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
                 used += row_cost
             return rows
 
+        stage_skeletons = framework.get("stage_skeleton", [])
+        stage_skeletons = stage_skeletons if isinstance(stage_skeletons, list) else []
+        skeleton_by_id = {}
+        for skeleton in stage_skeletons:
+            if not isinstance(skeleton, dict):
+                continue
+            skeleton_id = _canonical_chapter_plan_stage_id(skeleton.get("id", ""))
+            if skeleton_id:
+                skeleton_by_id[skeleton_id] = skeleton
+
         stage_fields = (
             "id", "name", "start_chapter", "end_chapter", "summary", "main_conflict",
             "relationship_changes", "world_reveals", "turning_points",
@@ -8137,8 +8195,12 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
             if not isinstance(item, dict):
                 continue
             row = {}
+            stage_id = _canonical_chapter_plan_stage_id(item.get("id", ""))
+            skeleton = skeleton_by_id.get(stage_id, {})
             for key in stage_fields:
                 value = item.get(key, "")
+                if value in (None, "", [], {}) and isinstance(skeleton, dict):
+                    value = skeleton.get(key, "")
                 if key == "ordered_events":
                     events = []
                     for event_index, event in enumerate(
@@ -8266,20 +8328,100 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
         reference_start_index=None,
         reference_end_index=None,
     ):
-        """去掉向导框架中会在请求顶层再次发送的重复资料。"""
+        """构造向导章节规划专用的单份阶段事实包。"""
         source = self._chapter_plan_scope_creation_framework_context(
             value,
             reference_start_index,
             reference_end_index,
         )
         if str(source.get("source", "") or "").strip() == "creation_wizard":
-            # 最新的项目资料会在请求顶层发送；阶段规划只需要保留向导
-            # 框架中的阶段边界和当前阶段事件，避免同一资料发送两遍。
+            # 最新的人物、设定和伏笔会在请求顶层发送。这里仅保留当前阶段
+            # 的故事事实；引用、前置条件和状态差分不是章节请求的执行字段，
+            # 再次发送只会让章节规划同时面对两套节点协议。
             for key in (
                 "bible", "world_rules", "characters", "lore", "foreshadows",
                 "book_contract",
             ):
                 source.pop(key, None)
+            compact_stages = []
+            for stage in source.get("stage_plan", []) if isinstance(source.get("stage_plan"), list) else []:
+                if not isinstance(stage, dict):
+                    continue
+                compact_stage = {}
+                for key in (
+                    "id", "name", "start_chapter", "end_chapter", "summary",
+                    "end_state", "entry_state", "exit_state",
+                ):
+                    value = stage.get(key, "")
+                    if value not in (None, "", [], {}):
+                        compact_stage[key] = value
+                events = []
+                for event_index, event in enumerate(
+                    stage.get("ordered_events", [])
+                    if isinstance(stage.get("ordered_events"), list) else [],
+                    1,
+                ):
+                    if not isinstance(event, dict):
+                        continue
+                    event_text = self._chapter_plan_clip_text(event.get("event", ""), 760)
+                    result_text = self._chapter_plan_clip_text(event.get("result", ""), 520)
+                    if not event_text and not result_text:
+                        continue
+                    event_row = {
+                        "n": event_index,
+                        "event": event_text,
+                        "result": result_text,
+                    }
+                    # Keep the event's original chapter window beside its
+                    # text. The batch schedule is authoritative, but carrying
+                    # this small range here avoids making the model join two
+                    # separate structures by event order.
+                    allowed = event.get("allowed_chapters", [])
+                    if isinstance(allowed, (list, tuple)) and len(allowed) >= 2:
+                        try:
+                            allowed_start = int(allowed[0])
+                            allowed_end = int(allowed[1])
+                        except (TypeError, ValueError):
+                            allowed_start = allowed_end = 0
+                        if allowed_start > 0 and allowed_end >= allowed_start:
+                            if reference_start_index is not None:
+                                allowed_start = max(
+                                    allowed_start, int(reference_start_index or 0)
+                                )
+                            if reference_end_index is not None:
+                                allowed_end = min(
+                                    allowed_end, int(reference_end_index or 0)
+                                )
+                            if allowed_end >= allowed_start:
+                                event_row["allowed_chapters"] = [
+                                    allowed_start, allowed_end
+                                ]
+                    events.append(event_row)
+                if events:
+                    compact_stage["ordered_events"] = events
+                if compact_stage:
+                    compact_stages.append(compact_stage)
+            source["stage_plan"] = compact_stages
+            # A batch request only needs the active stage. Future stage
+            # boundaries are already known by the application and tend to
+            # invite the model to continue past the requested endpoint.
+            active_stage_ids = {
+                _canonical_chapter_plan_stage_id(stage.get("id", ""))
+                for stage in compact_stages
+                if isinstance(stage, dict)
+            }
+            if active_stage_ids and isinstance(source.get("stage_index"), list):
+                source["stage_index"] = [
+                    item
+                    for item in source["stage_index"]
+                    if isinstance(item, dict)
+                    and _canonical_chapter_plan_stage_id(item.get("id", ""))
+                    in active_stage_ids
+                ]
+            source.pop("total_words", None)
+            source.pop("average_chapter_words", None)
+            if not str(source.get("chapter_plan_note", "") or "").strip():
+                source.pop("chapter_plan_note", None)
         return source
 
     def _chapter_plan_compact_creation_framework_context(self, value, total_limit):
@@ -8293,7 +8435,7 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
             for key in (
                 "name", "start_chapter", "end_chapter", "summary",
                 "main_conflict", "relationship_changes", "world_reveals",
-                "turning_points", "end_state", "entry_state", "exit_state", "carry_over",
+                "turning_points", "end_state", "entry_state", "exit_state",
                 "ordered_events",
             ):
                 value = item.get(key, "")
@@ -8443,6 +8585,20 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
             if existing_count_override is not None else len(chapters)
         )
         batch_mode = context_mode == "batch"
+        try:
+            batch_is_final = bool(
+                batch_mode
+                and reference_end_index is not None
+                and int(reference_end_index or 0) >= int(total_chapter_count or 0)
+            )
+        except (TypeError, ValueError):
+            batch_is_final = False
+        batch_creative_intent_contract = deepcopy(creative_intent_contract)
+        if batch_mode and not batch_is_final:
+            # The concrete ending belongs to the final stage. Sending it to
+            # an earlier batch makes a model close the whole novel as soon as
+            # the current stage reaches its local climax.
+            batch_creative_intent_contract.pop("ending_boundaries", None)
         detailed_existing_count = 10 if batch_mode else 16
         if len(existing_chapter_records) > detailed_existing_count:
             existing_chapters = existing_chapter_records[-detailed_existing_count:]
@@ -8467,6 +8623,13 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
                 wizard_framework,
                 reference_start_index=reference_start_index,
                 reference_end_index=reference_end_index,
+            )
+        foreshadow_items = project.get("foreshadow_items", [])
+        if creation_wizard_source:
+            foreshadow_items = self._chapter_plan_scoped_foreshadows(
+                foreshadow_items,
+                reference_start_index,
+                reference_end_index,
             )
         raw_profile = project.get("narrative_strategy_profile", {})
         raw_profile = raw_profile if isinstance(raw_profile, dict) else {}
@@ -8532,7 +8695,7 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
                 ),
             },
             "narrative_strategy_profile": planning_profile,
-            "creative_intent_contract": deepcopy(creative_intent_contract),
+            "creative_intent_contract": batch_creative_intent_contract,
             "wizard_framework": wizard_framework,
             "project_materials": {
                 "bible": self._chapter_plan_clip_text(project.get("bible", ""), materials_limit),
@@ -8563,7 +8726,7 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
                 minimal_fields=("name", "type"),
             ),
             "foreshadows": self._chapter_plan_records(
-                project.get("foreshadow_items", []),
+                foreshadow_items,
                 (
                     "name", "type", "status", "setup_chapter", "payoff_chapter",
                     "description", "revealed", "remaining_secret",
@@ -8599,16 +8762,24 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
             }
         if existing_chapter_index:
             payload["existing_chapter_index"] = existing_chapter_index
-        imported_reference = self._chapter_plan_reference_context(
-            reference_start_index,
-            reference_end_index,
-            target_words=target_words,
-            average_chapter_words=average_chapter_words,
-            total_chapter_count=total_chapter_count,
+        # A creation-wizard project already has its own confirmed stage plan.
+        # Never let an old imported-framework reference leak into this request:
+        # it uses a different chapter/event protocol and can make the model
+        # plan the same range twice.
+        imported_reference = (
+            {}
+            if creation_wizard_source
+            else self._chapter_plan_reference_context(
+                reference_start_index,
+                reference_end_index,
+                target_words=target_words,
+                average_chapter_words=average_chapter_words,
+                total_chapter_count=total_chapter_count,
+            )
         )
         if imported_reference:
             payload["imported_chapter_plan_reference"] = imported_reference
-        analysis = self._framework_ai_analysis()
+        analysis = {} if creation_wizard_source else self._framework_ai_analysis()
         if analysis:
             payload["framework_analysis"] = analysis
             if (
@@ -8650,11 +8821,12 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
             "注意：结构字段负责守住本章主线、阶段、事件和结尾边界；outline负责用当前小说自己的口吻讲述这一章，"
             "这里只表示事实必须贴合当前题材和人物，不要求生成另一份自然语言版规划；outline同时保留本章给正文扩写使用的具体故事事实。"
             "章节规划可以使用清楚、稳定、便于执行的结构化表达，不需要像发布简介，也不需要单独生成另一份自然语言版规划。"
-            "outline必须写清人物在哪里、眼前发生了什么、现实阻力是什么、人物做了什么选择或行动、事情造成了什么结果，"
-            "以及章末出现的具体新信息、新决定、新关系变化或新麻烦。不得出现字段名、内部编号、JSON、代码字符、规划过程或工作流程。"
+            "outline直接写本章真正需要给正文继承的具体故事事实；人物、地点、行动、阻力、结果或章末变化按本章需要自然取用，"
+            "不要求每章按同一顺序全部出现，也不要为了凑齐项目补写没有发生的内容。不得出现字段名、内部编号、JSON、代码字符、规划过程或工作流程。"
             "不要像编辑解释本章功能，不要写‘推动剧情、关系推进、制造悬念、完成任务、阶段作用’等空泛任务词，"
             "不要解释本章意义、主题、节奏、主线、人物弧线或读者效果。"
-            "除非当前题材明确就是办案、破案或调查推理，否则不得把章节写成案卷、办案报告、审查流程或资料处理；不得让抽象说明、流程往来或结论宣告代替人物在现场的行动和冲突。"
+            + _procedural_plot_guard_guidance()
+            + "章节不能写成案卷、办案报告、审查流程或资料处理；不得让抽象说明、流程往来或结论宣告代替人物在现场的行动和冲突。"
             "输入资料里的抽象总结只作为事实参考，要改写成具体人物、地点、动作、阻力、结果和状态变化；"
             "人物认知变化必须落到看见、听见、当场反应、决定和现实后果。不要写‘章末留下悬念’或‘读者会继续追问’，直接写章末发生的具体事情。"
             "每章都要让人物在具体场景中遇到阻力并采取行动；随着章节推进，优先安排人物对抗、关系变化、利益争夺、环境压力、能力试探或突发后果，让读者看到事情正在发生，而不是看到一份事情说明。"
@@ -8667,6 +8839,38 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
             "不得把同一句对白、同一声响、同一动作落点或同一结论同时写进前章结尾钩子和后章开头。"
             "前章ending_hook负责留下已发布的触发，后章outline只需写触发后可能出现的新增变量，不要重复前章落点。\n\n"
         )
+        if creation_wizard_source:
+            # 向导项目使用自己的章节协议。导入项目的通用提示会要求模型
+            # 逐章维护事件索引，这与向导工作线程的紧凑输出协议相冲突；
+            # 这里直接替换整段请求说明，而不是在末尾继续追加另一套规则。
+            instruction_prefix = (
+                "请根据以下 JSON 项目档案生成向导已经确认的当前阶段章节规划。"
+                "只生成 requested_new_chapters 指定数量的新章节，不重写已有章节，不输出正文。"
+                "故事简介、小说圣经、世界规则、人物、设定、伏笔和当前阶段资料共同构成只读底稿；"
+                "它们提供事实和边界，本次只把当前阶段继续落实到具体章节。\n\n"
+                "wizard_framework.stage_plan 只包含当前阶段的阶段事实和有序剧情节点；"
+                "batch_continuity.locked_node_schedule 已由程序锁定节点可以落入的章节范围。"
+                "按节点的既定顺序安排故事，不改变当前阶段边界，不把下一阶段内容提前写入当前阶段。"
+                "节点编号和落点只供你理解，不要把它们写进返回内容，也不要为节点另造章节。"
+                "同一节点第一次发生时完成它的核心转折；如果一个节点覆盖数章，后续章节只写由它造成的新反应、新选择、新代价、新关系变化或新阻力，尽量不用固定清单式要求逐章重复节点。\n\n"
+                "伏笔资料只列当前章节范围内已经出现或即将出现的线索；后续阶段的伏笔等到对应阶段再自然展开。\n\n"
+                "本批次必须返回准确数量的章节，列表顺序就是章节顺序；不要返回章节号、阶段号、节点号或其它定位标签。"
+                "章节名和 outline 是读者与正文作者会看到的内容：章节名从本章具体发生的事情、人物行动、现场冲突、关系变化或结果中自然命名，且不超过15个汉字；"
+                "outline 直接写本章真正需要给正文继承的具体故事事实；人物、地点、行动、阻力、结果或章末变化按本章需要自然取用，"
+                "不要求每章按同一顺序全部出现，也不要为了凑齐项目补写没有发生的内容。"
+                "outline 建议 250—380 字，保持事实密度，但不要写成字段说明、工作流程、编辑分析或另一份规划表。"
+                "不要把阶段资料逐条复述成清单；让人物在具体场景里行动、碰撞、改变关系或承担后果。"
+                "当前题材和人物关系决定冲突的形状，不能用固定场景轮换或固定拍点替代故事发展。\n\n"
+                "创作意图、阶段边界、人物关系和结尾方向已经确认，优先沿用它们；"
+                "宏观节奏只作参考，不新增全书总规划，不提前解释后续阶段。"
+                "每章都要留下可承接的具体结果，下一章从新反应、新结果或新阻力继续。\n"
+                + _story_conflict_pacing_guidance()
+                + _procedural_plot_guard_guidance()
+                + "状态变化要落到人物正在经历的场景、行动和后果，不把同一句状态连续复制到多章。"
+                "章节标题和提纲都使用具体、好读、能看见人物与现场的表达；不写策划术语、抽象形容、办案式说明或编辑式总结。\n"
+                + "只输出一个合法 JSON 对象，结构为 {\"c\":[{\"t\":\"章节名\",\"o\":\"本章具体故事提纲\",\"p\":[]}]}；"
+                "列表数量必须严格等于本批次要求，p 只列本章自然涉及的主要人物，没有则为空数组。"
+            )
         return self._chapter_plan_bounded_context(
             instruction_prefix,
             payload,
@@ -9759,12 +9963,25 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
         compact_master_plan.pop("narrative_strategy_profile", None)
         compact_master_plan.pop("creative_intent_contract", None)
         if compact_master_plan.get("source") == "creation_wizard":
-            # The current stage's events are sent through wizard_framework;
-            # do not send the same structured stage tree or its narrative arc
-            # summaries again in the batch continuity envelope.  Keep the
-            # stage index in wizard_framework as the only stage map.
-            compact_master_plan.pop("structured_stages", None)
-            compact_master_plan.pop("arcs", None)
+            # The current stage and all stage boundaries are already sent once
+            # through wizard_framework.  The batch envelope only needs the
+            # confirmed story-level anchors; sending the foundation object
+            # again makes the model reconcile two copies of the same plan.
+            master_keys = (
+                "source", "summary", "core_mainline", "ending_promise",
+                "global_hard_boundaries",
+            )
+            try:
+                batch_is_final = batch_end >= int(state.get("total_chapter_count", 0) or 0)
+            except (TypeError, ValueError):
+                batch_is_final = False
+            if not batch_is_final:
+                master_keys = tuple(key for key in master_keys if key != "ending_promise")
+            compact_master_plan = {
+                key: deepcopy(compact_master_plan.get(key))
+                for key in master_keys
+                if compact_master_plan.get(key) not in (None, "", [], {})
+            }
         continuity = {
             "required_absolute_range": [batch_start, batch_end],
             "master_plan": compact_master_plan,
@@ -10108,6 +10325,12 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
         stage_data = self._creation_wizard_stage_nodes_for_range(
             absolute_start, absolute_end
         )
+        creation_wizard_project = bool(
+            isinstance(self.current_project, dict)
+            and isinstance(self.current_project.get("creation_framework"), dict)
+            and self.current_project.get("creation_framework", {}).get("source")
+            == "creation_wizard"
+        )
         if stage_data:
             saved_schedule = self._chapter_plan_saved_event_schedule(
                 state, absolute_start, absolute_end
@@ -10146,7 +10369,7 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
             self._provider_proxy_mode(provider),
             batch_number=batch_number,
             total_batches=total_batches,
-            creation_wizard_mode=bool(stage_data),
+            creation_wizard_mode=creation_wizard_project,
             locked_node_schedule=(
                 self._chapter_plan_locked_node_schedule(state, absolute_start, absolute_end)
                 if stage_data else {}
@@ -10377,12 +10600,26 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
             return
         absolute_start = int(state.get("existing_chapter_count", 0) or 0) + len(generated) + 1
         creation_wizard_batch = bool(
-            self._creation_wizard_stage_nodes_for_range(
-                absolute_start,
-                absolute_start + expected - 1,
-            )
+            isinstance(self.current_project, dict)
+            and isinstance(self.current_project.get("creation_framework"), dict)
+            and self.current_project.get("creation_framework", {}).get("source")
+            == "creation_wizard"
         )
-        _catalog, _stages, explicit = self._chapter_plan_event_reference()
+        if creation_wizard_batch and not self._creation_wizard_stage_nodes_for_range(
+            absolute_start,
+            absolute_start + expected - 1,
+        ):
+            self.on_chapter_plan_failed(
+                "向导当前阶段资料与返回批次范围不一致，未保存本批章节。"
+            )
+            return
+        if creation_wizard_batch:
+            # A wizard batch has no imported chapter-level source to reuse.
+            # Ignore stale imported references that may remain on an older
+            # project instead of letting them alter the new outline.
+            explicit = {}
+        else:
+            _catalog, _stages, explicit = self._chapter_plan_event_reference()
         incoming = []
         for offset, item in enumerate(chapters):
             chapter = deepcopy(item)

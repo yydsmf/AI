@@ -25,6 +25,7 @@ from PySide6.QtWidgets import (
 )
 
 from .core import HISTORY_DIR, load_json_file, now_str, safe_remove_file, save_json_file
+from .novel_utils import _procedural_plot_guard_guidance
 from .workers import NovelAnalysisWorker
 
 
@@ -219,16 +220,19 @@ CREATION_CHOICE_HINTS = {
     "chapter_words": "章节总数和阶段边界会按这个字数计算，后面仍可调整。",
 }
 
-COMMON_CREATION_RULES = """
+CREATION_PROCEDURAL_PLOT_GUARD = _procedural_plot_guard_guidance().strip()
+
+
+COMMON_CREATION_RULES = f"""
 你正在和作者一起搭建一部长篇网络小说。外层 JSON 只是程序读取用的容器，不能在 JSON 之外添加解释、Markdown 或注释。
 1. 沿着作者已经说过和已经确认的故事继续写，稳住题材、主角、核心悬念、人物关系和结尾方向。作者灵感中的题材组合、人物身份、关系状态、具体情节、场景、爽点和节奏要求都要进入故事；第一步的主分类、主题、读者方向、主角起点和风格选择是创作底色。
-2. 资料具体而有根，人物、地点、物件、选择、结果和长期成立的事实彼此照应。每个剧情节点都优先落到时间、地点、在场人物、当下动作、正在发生的变化和人物反应上。
-3. 人物的愿望、顾虑、秘密和关系变化都由事情推动。让人物在现场遇到压力、做出选择、付出代价，关系和情绪随结果发生变化，答案随着故事经历逐步靠近。
+2. 资料具体而有根，人物、地点、物件、选择、结果和长期成立的事实彼此照应；剧情节点只写当前故事真正需要的细节，让重要变化能够被看见、听见或感受到。
+3. 人物的愿望、顾虑、秘密和关系变化随着事情自然显现；故事可以由人物、关系、环境、事件、欲望、秘密或题材规则推动，不要求所有题材使用同一套冲突顺序。
 4. 小说圣经、世界规则、人物、设定和伏笔各自承担不同作用：圣经托住整本书，世界规则说明长期运转方式，人物承载选择和关系，设定提供反复使用的生活落点，伏笔保留线索和后续变化。
 5. 危险和代价优先落到躲避、交换、资源变化、身份暴露、关系破裂、空间变化和局势改变上；身体伤势随题材和现场需要自然出现。
 6. 实力体系跟随题材本身生长：明确需要修炼、境界或能力层次的故事，在设定库里展开来源、层次、边界和成长条件；普通都市、言情、悬疑、灵异、现实和没有明确力量体系的科幻，把重点放在人物处境、规则边界和具体事件上。
 7. 不使用“短促直接”“温和克制”“冷淡”“命令式”这几类语言风格，其它可以正常使用。
-8. 除非作者明确选择办案、破案或调查推理题材，否则不得采用案卷化、办案式、流程审查式的剧情推进。剧情要由人物当下想得到什么、现场遇到什么压力、做了什么动作、遭遇什么阻力、怎样选择、关系和情绪怎样变化，以及选择带来的具体后果向前推动；世界规则和故事资料只在人物正在争取、对抗、逃避或付出代价的场景中自然出现。
+8. {CREATION_PROCEDURAL_PLOT_GUARD}
 9. 字段值直接写具体内容，保持清楚、稳定、方便后续执行；内容呈现为作者自己的故事底稿，各资料类别各自承担作用，同一段剧情只放在最合适的位置。
 10. JSON 只作为程序读取的容器：保持紧凑，不用 Markdown、缩进、空行或多余空格；压缩外壳，不压缩事实、人物数量、设定数量、伏笔数量或故事内容。
 """.strip()
@@ -237,16 +241,16 @@ COMMON_CREATION_RULES = """
 STEP_PROMPTS = {
     "premise": f"""{COMMON_CREATION_RULES}
 
-现在先从作者给出的灵感出发，写出 5 个彼此完全不同的故事开头和长线走向。每个版本都要像一本真正能开始连载的网文：有好记的书名，有完整简介，有主角眼下的处境，有会一直逼着人物往前走的矛盾，有让人想知道下一步会怎样的人物关系，还有一个不会把所有事情说死的结尾方向。synopsis 是可直接用于发布小说的自然网络小说简介，写清主角、处境、主要矛盾和会把人物带向下一步的具体变化，内容直接进入故事。
+现在先从作者给出的灵感出发，写出 5 个彼此真正不同、可以直接开始连载的故事方向。每个方向的简介都从一个正在发生的强冲突切入：让主角在具体场面里立刻遇到会改变处境的压力、对抗、失控或突发事件，并让这次冲突留下清楚的现实后果，把故事推向后面。冲突的形状由题材、灵感、人物关系和风格自然决定，不套固定顺序，不把简介写成资料清单或策划说明。简介要求用自然的网络小说叙述语言风格，不要出现策划术语、抽象形容、办案式风格、编辑式说明、编辑式总结之类的词。简介字数软要求为 300 字左右。
 
-先完整吸收作者灵感和全部选择，再开始写。五个方向都使用灵感中的核心内容，区别放在人物选择、冲突安排和长线走向上；简介把灵感里的关键人物关系、主要冲突和爽点自然写进故事，而不是只把它们放在分类字段里。
+先完整吸收作者灵感和全部选择，再开始写。五个方向都使用灵感中的核心内容，但各自从不同的人物选择、现实压力、关系变化或题材机制长出自己的故事；差异要来自故事本身，不靠只换名字、地点或几句设定。五个方向可以采用完全不同的剧情发动方式，不要求统一的冲突顺序、固定的网文结构或相同的推进节奏。
 
 五个方向要像五本真正不同的小说来命名和写人：每个方向的主角都要有明确姓名，主角姓名不能重复，也不能只是换一个字；重要配角的姓名也尽量错开。不要连续使用同一个姓氏、相同的姓名节奏或同一套常见网文姓名模板，要让姓名随着题材、时代、人物身份、男频或女频方向和故事气质自然变化。名字要好读、好记、有辨识度，不为了变化硬塞生僻字；简介、主角字段和人物关系里使用同一个姓名，不能前后改名。
 命名参考中的姓名和姓氏来自本地已经创建过的其它项目，只用来帮助这次换一套自然的命名方式：不要直接复用其中的姓名，不要只改一个字，也不要连续沿用同一批姓氏和姓名节奏。参考为空时，也要主动避开最常见的固定网文姓名模板；仍然以符合题材、时代、人物身份和故事气质为先，不要为了不同而使用生硬或生僻的名字。
 
 下面示例中的空对象只是为了避免重复占篇幅，实际返回时 1、2、3、4、5 五个槽位都必须各自完整填写十个字段，不能返回空对象，也不能把多个故事合并到一个槽位。
 
-只输出一个合法 JSON 对象。不要使用可变长度的候选数组，改用固定的五个编号对象：{{"c":{{"1":{{"t":"书名","g":"类型","a":"读者方向","y":"风格","h":"一句话故事引子","d":"可直接公开发布的自然网络小说故事简介","p":"主角初始处境、性格和最想得到的东西","m":"贯穿全书的矛盾","r":"人物关系长线变化","e":"开放式结尾方向"}},"2":{{}},"3":{{}},"4":{{}},"5":{{}}}},"s":0}}。c 只能有 1、2、3、4、5 五个键，不能增加第6个方向，也不能漏掉任何一个方向；每个方向都必须完整填写，不要输出 Markdown、解释或其它键。""",
+只输出一个合法 JSON 对象。不要使用可变长度的候选数组，改用固定的五个编号对象：{{"c":{{"1":{{"t":"书名","g":"类型","a":"读者方向","y":"风格","h":"一句话故事引子","d":"故事简介，约300字","p":"主角初始处境、性格和最想得到的东西","m":"贯穿全书的矛盾","r":"人物关系长线变化","e":"开放式结尾方向"}},"2":{{}},"3":{{}},"4":{{}},"5":{{}}}},"s":0}}。c 只能有 1、2、3、4、5 五个键，不能增加第6个方向，也不能漏掉任何一个方向；每个方向都必须完整填写，不要输出 Markdown、解释或其它键。""",
     "bible": f"""{COMMON_CREATION_RULES}
 
 现在和作者一起把已经选定的故事底盘搭好。下面的“已经选定的故事”是唯一的故事来源：稳住它的主角、处境、地点、核心悬念、主要关系和结尾方向，再补足长篇故事继续生长所需要的事实。新增人物、新势力和新秘密都要服务于原来的主线，并在后续事件中拥有具体作用。
@@ -279,7 +283,7 @@ STEP_PROMPTS = {
 STAGE_PLAN_OBJECT_OUTPUT_RULES = """
 这次使用对象协议，阶段和事件按字段名归位；只返回一个合法 JSON 对象。
 短键含义如下：k=全书底盘契约，s=当前阶段对象，f=当前阶段实际发生的伏笔端点。阶段对象中 i=阶段编号，n=阶段名称，r=章节范围，b=开始状态，e=按顺序发生的场景事件对象数组，x=结束状态，y=带入下一阶段的事实。状态对象中 t=时间，l=地点，c=人物状态，k=已经发生并被人物掌握的事实，q=仍会推动人物行动的问题。事件对象中 i=事件编号，r=允许章节范围，a=关联资料，p=前置条件，h=可直接扩写的场景事件，o=直接结果，d=实际状态变化。伏笔端点对象中 i=伏笔编号，k=setup或payoff，e=承载这个端点的事件编号，d=这一次在场景中发生的具体变化；一次只写一个端点。
-每个 h 都要像一段可以直接扩写的剧情节点：交代时间地点和在场人物，让人物在可感知的压力中采取动作、遭遇阻力、做出选择，并让选择带来具体结果、情绪变化或关系变化。相邻事件主动更换场景机制和人物对抗方式，让声音、空间、物件、现实压力、人物误解、关系裂缝和突发行动轮流推动故事。资料只有在人物正在做事、被迫应对或关系发生变化时进入场景。
+每个 h 都要像一段可以直接扩写的剧情节点：只写这件事真正需要的故事事实，必要时交代人物、场景、动作、阻力、选择或结果，尽量不用固定清单式要求，不为凑齐项目硬塞字段。剧情发动机由题材和人物处境决定，可以是正面碰撞、追逐逃避、关系变化、欲望争夺、环境失控、能力试探、秘密暴露或其它自然发生的压力；相邻事件要让人物处境产生新的变化，不把这些方式排成固定轮换。资料只有在人物正在做事、被迫应对或关系发生变化时进入场景。
 当前阶段发生的正式伏笔端点，都在承载事件的 a 中加入一次“F编号/setup”或“F编号/payoff”，并在 f 中用同一事件编号 e 关联。setup写线索第一次进入人物生活，payoff写线索在场景中产生决定性变化；同一条伏笔在其它事件中继续出现、深化、造成后果是正常的，这些事件只把它作为普通关联资料或写出“F编号”，不要重复标成正式 setup/payoff。程序以正式端点为准，再把后续事件中的具体变化交给章节规划继续使用；阶段之间允许继续铺开同一条暗线，程序会依据事件 r 的章节范围落下具体章号。
 实际返回的 f 使用单端点格式，例如 {"i":"F06","k":"payoff","e":"E04","d":"人物在现场做出选择后，线索改变了什么"}。全书契约保留长期事实、世界运行方式、人物底色和结尾方向；伏笔通过 setup 与 payoff 表达它在场景中的进入、变化和意义显现。
 
@@ -290,7 +294,8 @@ STEP_PROMPTS["stage_plan"] = f"""{COMMON_CREATION_RULES}
 
 现在根据已经选定的故事和完整故事底盘，制作唯一的十万字阶段规划。这里的内容是给后续章节规划和正文扩写读取的执行资料，不是发布简介，也不需要写成文学化段落。总字数和单章字数完全按照作者输入；章节总数按 total_words / average_chapter_words 向上取整，最后一章吸收余数。每约十万字为一个阶段，阶段从第1章连续覆盖到最后一章，事件范围按顺序衔接。
 
-阶段规划固定事实、顺序、状态和阶段推进，但剧情推进以场景为单位。每个事件都要写出具体时间地点、在场人物、当下压力、人物动作、对方或环境形成的阻力、人物选择、情绪或关系变化和直接后果；事件之间通过人物正在做的事和刚刚付出的代价自然衔接。对都市灵异、惊悚、悬疑、情感等题材，声音、空间、物件、生活压力、人物之间的隐瞒和现场失控持续进入剧情；对其它题材，使用该题材自己的场景压力和人物对抗。除非作者明确选择办案、破案或调查推理题材，否则不得把案卷化、程序化的材料往来当成主要剧情，不得让人物靠解释性结论推动故事。连续两个事件不能都停留在说明、谈话、安排或口头结论；如果前一个事件主要是信息揭露或人物谈话，后一个事件必须转入现场行动、直接碰撞、利益变化、关系变化、能力试探、空间压力或突发后果。人物必须在具体场面中行动、碰撞、选择并承担结果；相邻事件主动更换场景目标、冲突关系和压力来源，让人物、关系、空间和局势持续变化。
+阶段规划固定事实、顺序、状态和阶段推进，但剧情推进以场景为单位。每个事件写清本次真正发生、会影响后续的故事事实；时间、地点、人物、动作、阻力、选择、关系变化和结果等内容，只在当前事件确实需要时补充。事件之间通过人物正在做的事和已经发生的变化自然衔接。先判断这一事件真正由什么推动，再选择最适合题材的场景：人物对抗、关系变化、现场危机、公开行动、利益争夺、环境压力或信息出现都可以成为主发动机。相邻事件主动更换主发动机、场景目标和压力来源，让人物、关系、空间和局势持续变化。
+同一事件如果覆盖数章，只承担一次明确的转折；前面的章节让事情发生，后面的章节写它造成的新反应、新选择、新损失、新关系变化或新阻力，不要把同一场谈话、同一份材料或同一个结论反复当成新的剧情。对都市灵异、惊悚、悬疑、情感等题材，声音、空间、物件、生活压力、人物之间的隐瞒和现场失控持续进入剧情；对其它题材，使用该题材自己的场景压力和人物对抗。故事的关键变化要发生在人物正在经历的场面里，而不是停在解释性结论上。
 
 伏笔端点使用底盘已有编号或名称，关联到本阶段实际发生的事件；setup写线索第一次进入人物生活，payoff写线索在场景中造成决定性变化。同一条伏笔可以在多个事件中继续出现、深化或影响人物选择，但正式 setup/payoff 只各自标记一次；后续事件用普通关联资料或“F编号”承接，不把每次提及都写成新的正式端点。阶段之间允许继续铺开同一条暗线，程序会依据事件的允许章节范围落下具体章号，模型只负责事件顺序和端点归属，不写具体章号。
 
@@ -2108,6 +2113,11 @@ def _expand_stage_object_transport(value):
             if isinstance(item, (dict, list))
         ]
     stage["carry_over"] = deepcopy(stage.get("carry_over", []))
+    # The short keys are transport-only.  Leaving them beside the expanded
+    # fields duplicates every stage in the next continuity handoff and lets
+    # later normalizers read two versions of the same fact.
+    for key in ("i", "n", "b", "e", "x", "y", "r"):
+        stage.pop(key, None)
     return stage
 
 
@@ -2234,6 +2244,19 @@ def _expand_creation_transport(step, payload):
     if step == "bible":
         if "bible" not in data and isinstance(data.get("b"), list):
             data["bible"] = _compact_record(data["b"], _BIBLE_FIELDS)
+        elif "bible" not in data and isinstance(data.get("b"), dict):
+            data["bible"] = _expand_transport_aliases(
+                data["b"],
+                {
+                    "c": "core_setting",
+                    "r": "reader_promise",
+                    "t": "theme",
+                    "m": "main_conflict",
+                    "p": "relationship_foundation",
+                    "e": "ending_direction",
+                    "h": "hard_boundaries",
+                },
+            )
         if "world_rules" not in data and isinstance(data.get("w"), list):
             data["world_rules"] = _compact_record(
                 data["w"],
@@ -2242,26 +2265,72 @@ def _expand_creation_transport(step, payload):
                     "costs_and_limits", "geography_and_life",
                 ),
             )
+        elif "world_rules" not in data and isinstance(data.get("w"), dict):
+            data["world_rules"] = _expand_transport_aliases(
+                data["w"],
+                {
+                    "s": "setting_overview",
+                    "p": "power_system",
+                    "r": "rules",
+                    "c": "costs_and_limits",
+                    "g": "geography_and_life",
+                },
+            )
         if "characters" not in data and isinstance(data.get("c"), list):
             data["characters"] = [
-                _compact_record(item, ("name", "role", "goal", "secret", "voice", "notes"))
+                _expand_transport_aliases(
+                    _compact_record(
+                        item,
+                        ("name", "role", "goal", "secret", "voice", "notes"),
+                    ),
+                    {
+                        "n": "name",
+                        "r": "role",
+                        "g": "goal",
+                        "s": "secret",
+                        "v": "voice",
+                        "q": "notes",
+                    },
+                )
                 for item in data.get("c", [])
                 if isinstance(item, (list, dict))
             ]
         if "lore" not in data and isinstance(data.get("l"), list):
             data["lore"] = [
-                _compact_record(item, ("name", "type", "description", "story_known"))
+                _expand_transport_aliases(
+                    _compact_record(
+                        item,
+                        ("name", "type", "description", "story_known"),
+                    ),
+                    {
+                        "n": "name",
+                        "t": "type",
+                        "d": "description",
+                        "k": "story_known",
+                    },
+                )
                 for item in data.get("l", [])
                 if isinstance(item, (list, dict))
             ]
         if "foreshadows" not in data and isinstance(data.get("f"), list):
             data["foreshadows"] = [
-                _compact_record(
-                    item,
-                    (
-                        "code", "name", "setup_stage", "payoff_stage",
-                        "description", "revealed", "remaining_secret",
+                _expand_transport_aliases(
+                    _compact_record(
+                        item,
+                        (
+                            "code", "name", "setup_stage", "payoff_stage",
+                            "description", "revealed", "remaining_secret",
+                        ),
                     ),
+                    {
+                        "i": "code",
+                        "n": "name",
+                        "a": "setup_stage",
+                        "b": "payoff_stage",
+                        "d": "description",
+                        "r": "revealed",
+                        "u": "remaining_secret",
+                    },
                 )
                 for item in data.get("f", [])
                 if isinstance(item, (list, dict))
@@ -4569,9 +4638,11 @@ class NovelCreationWorker(NovelAnalysisWorker):
 
 “长期规则数组”和“代价限制数组”都要写出实际条目，通常各有三到六条；不要为了省字留空，也不要把它们只写进世界概况或能力边界。高武、玄幻、仙侠、修真和武道题材要写清修炼、资源、宗门秩序、越级或使用力量会遇到的现实代价；其它题材则写这个世界会反复成立的生活、空间、社会或异常规则。
 
-这是预计写到{_creation_scale_requirements(total_words)[0]}的长篇，资料要足够支撑后续人物、设定、伏笔和阶段规划，让人物在不同阶段拥有新的处境和选择。伏笔位置此时只写阶段参考，不写具体章号。小说简介保持自然网络小说语言，其余内容以清楚、稳定、方便后续执行为先。
+这是预计写到{_creation_scale_requirements(total_words)[0]}的长篇，资料要足够支撑后续人物、设定、伏笔和阶段规划，让人物在不同阶段拥有新的处境和选择。伏笔位置此时只写阶段参考，不写具体章号。小说简介保持自然网络小说语言；reader_promise 也直接写故事会持续制造的悬念、压力和选择，不对读者说“读者会”“读者将”或“本书将”，不写编辑式说明。其余内容以清楚、稳定、方便后续执行为先。
 
-只返回一个合法 JSON 对象，不能有 Markdown 或解释：{{"b":["核心设定","读者承诺","主题","主线矛盾","人物关系底子","结尾方向","硬边界"],"w":["世界概况","力量或能力体系","长期规则数组","代价限制数组","地理与生活"]}}。b固定7项，w固定5项，不要输出人物、设定或伏笔。"""
+只返回一个合法 JSON 对象，不能有 Markdown 或解释。为了避免字段名称混进正文，b 和 w 使用短键对象，不使用定长内容数组：
+{{"b":{{"c":"小说圣经的核心内容","r":"读者承诺","t":"主题","m":"主线矛盾","p":"人物关系底子","e":"结尾方向","h":"必须守住的边界"}},"w":{{"s":"世界概况","p":"力量或能力体系的来源与总边界","r":["长期规则一","长期规则二"],"c":["代价限制一","代价限制二"],"g":"地理与生活"}}}}
+b 只能使用 c、r、t、m、p、e、h；w 只能使用 s、p、r、c、g。键名只是程序标记，不能把“小说圣经的核心内容”“世界概况”等示例文字原样返回；每个值必须直接写这本小说的实际内容。不要输出人物、设定或伏笔。"""
         elif self.creation_batch == "bible_assets":
             prompt = f"""{COMMON_CREATION_RULES}
 
@@ -4583,7 +4654,9 @@ class NovelCreationWorker(NovelAnalysisWorker):
 
 这是预计写到{_creation_scale_requirements(total_words)[0]}的长篇，按故事需要补足资料，不要把简介换个说法重复输出，也不要为了凑数量添加无根名词。伏笔位置此时只写第几阶段，不写具体章号。{_creation_foreshadow_stage_guidance(total_words)}
 
-只返回一个合法 JSON 对象，不能有 Markdown 或解释：{{"c":[["姓名","身份和故事位置","当前目标","秘密","说话方式","害怕失去什么、怎样牵制主角以及长期变化"]],"l":[["名称","类型","具体内容","人物当前知道多少"]],"f":[["编号","名称","埋设阶段","回收阶段","读者能看到的线索及后续变化","揭开后会改变什么","仍未揭开的部分"]]}}。只输出 c、l、f，不要重复输出 b 或 w。人物、设定和伏笔数量要达到长篇规模要求。{("高武、玄幻、仙侠、修真、武道题材的 l 中必须包含一条按从低到高排列的实力体系条目；它要使用 l 的四个原有位置写完整境界内容，每个境界一到两句话。" if power_levels_guidance else "")}"""
+只返回一个合法 JSON 对象，不能有 Markdown 或解释。为了避免字段名称混进内容，c、l、f 都使用短键对象，不使用定长内容数组：
+{{"c":[{{"n":"姓名","r":"身份和故事位置","g":"当前目标","s":"秘密","v":"说话方式","q":"害怕失去什么、怎样牵制主角以及长期变化"}}],"l":[{{"n":"名称","t":"类型","d":"具体内容","k":"人物当前知道多少"}}],"f":[{{"i":"编号","n":"名称","a":"埋设阶段","b":"回收阶段","d":"读者能看到的线索及后续变化","r":"揭开后会改变什么","u":"仍未揭开的部分"}}]}}
+c 中每项只能使用 n、r、g、s、v、q；l 中每项只能使用 n、t、d、k；f 中每项只能使用 i、n、a、b、d、r、u。键名只是程序标记，不能把“姓名”“身份和故事位置”等示例文字原样返回；每个值必须直接写这本小说的实际内容。只输出 c、l、f，不要重复输出 b 或 w。人物、设定和伏笔数量要达到长篇规模要求。{("高武、玄幻、仙侠、修真、武道题材的 l 中必须包含一条按从低到高排列的实力体系条目；它要使用 l 的四个字段写完整境界内容，每个境界一到两句话。" if power_levels_guidance else "")}"""
             prompt += """
 
 补充方向：让人物、设定和伏笔都能在后续场景中落地。伏笔的阶段位置表示它如何进入人物生活、如何在行动和关系变化中逐步显出意义；先写线索和当下理解，再写后续变化，不把最终解释写成一开始就确定的结论。"""
@@ -4603,7 +4676,7 @@ class NovelCreationWorker(NovelAnalysisWorker):
             )
             prompt = f"""{COMMON_CREATION_RULES}
 
-读取作者选定的故事和完整故事底盘，在正式生成十万字阶段规划前，先建立一份简短的全书阶段骨架。它只负责固定每个阶段的主线变化、关键转折和阶段结束状态，不写章节细纲，不写事件数组，不安排具体伏笔章位，也不重复小说圣经、世界规则和人物设定。阶段数量和章节范围完全按照作者输入；每个阶段写一条清楚的主线变化、两到四个关键转折和一条结束状态，内容要能让后面的阶段规划沿着同一条故事发展，避免阶段之间方向漂移。
+读取作者选定的故事和完整故事底盘，在正式生成十万字阶段规划前，先建立一份简短的全书阶段骨架。它只负责固定每个阶段的主线变化、关键转折和阶段结束状态，不写章节细纲，不写事件数组，不安排具体伏笔章位，也不重复小说圣经、世界规则和人物设定。先从本阶段故事真正会发生的变化出发，再确定阶段转折；转折方式由题材、人物关系、环境和事件自然决定，不要求各阶段使用同一种推进顺序。阶段数量和章节范围完全按照作者输入；每个阶段写一条清楚的主线变化、两到四个关键转折和一条结束状态，内容要能让后面的阶段规划沿着同一条故事发展，避免阶段之间方向漂移，尽量不用固定清单式要求。
 
 本书总字数为{total_words}字，按每十万字划分为{stage_count}个阶段。必须恰好返回{stage_count}项，不能少一项，也不能多出额外阶段；阶段编号和章节范围固定为：{stage_ranges}。即使某一阶段的故事暂时不如其它阶段集中，也必须为该阶段写出属于它的主线变化、关键转折和结束状态，不能把相邻阶段合并，也不能提前结束全书。
 
@@ -4651,7 +4724,7 @@ class NovelCreationWorker(NovelAnalysisWorker):
             if opening_stage:
                 opening_guidance = (
                     "\n\n这是全书第一阶段，前3章是开篇重点。请在事件数组中为第1、2、3章分别留下"
-                    "能够落地且前后相扣的现场冲突节点，允许章节范围要能让程序把它们分别安排到开头三章，而不是把三章合成一个背景事件。"
+                    "能够落地且前后相扣的现场冲突节点；第一个事件的 allowed_chapters 必须是 [1,1]，第二个事件必须是 [2,2]，第三个事件必须是 [3,3]，不能使用重叠范围，也不能把三章合成一个背景事件。"
                     "每个节点都写清人物、场景、行为、动作、情绪变化和结果。第1章直接进入强冲突，第2章承接后果并升级冲突、产生反转，第3章让主角主动选择或反击并承担直接后果；"
                     "三章前后相扣，具体冲突和表现方式结合题材自由发挥，背景和规则随着现场行动自然出现，不用抽象概括代替人物冲突。"
                 )
@@ -4686,11 +4759,11 @@ class NovelCreationWorker(NovelAnalysisWorker):
                 )
             prompt = f"""{COMMON_CREATION_RULES}
 
-读取作者选定的故事、完整故事底盘、全书阶段骨架和已经完成的前面阶段，只生成当前第{stage_number}/{total_stages or '?'}阶段，范围为第{start_chapter}章到第{end_chapter}章。全书阶段骨架只负责提供本阶段的方向和结束状态，不要把骨架中的摘要和转折原样重复成另一份总规划；当前阶段的具体内容以本次事件和人物处境为准。前面阶段的结束状态、带入内容和仍在推动人物的问题是连续性依据。当前阶段沿着这些事实继续发生新的场景，前后阶段各自保持清晰的重点。阶段规划使用结构化表达，写清人物、局势、事件顺序、前置条件、直接结果和状态变化，让每个字段都服务于后续章节执行。
+读取作者选定的故事、完整故事底盘、全书阶段骨架和已经完成的前面阶段，只生成当前第{stage_number}/{total_stages or '?'}阶段，范围为第{start_chapter}章到第{end_chapter}章。全书阶段骨架只负责提供本阶段的方向和结束状态，不要把骨架中的摘要和转折原样重复成另一份总规划；当前阶段的具体内容以本次事件和人物处境为准。前面阶段的结束状态、带入内容和仍在推动人物的问题是连续性依据。当前阶段沿着这些事实继续发生新的场景，前后阶段各自保持清晰的重点。阶段规划使用结构化表达，写清人物真正正在经历的事情、事件顺序、直接结果和状态变化；字段服务于故事事实，尽量不用固定清单式要求，不把每个事件套成同一张检查表。
 
 输入资料中的 current_foreshadow_endpoints 是本阶段自然发生的正式暗线端点清单。每一项落到一个当前事件中；kind=setup 写线索怎样第一次进入人物生活，kind=payoff 写线索怎样在现场形成决定性变化。清单为空时，场景仍然沿着人物和主线自然推进。同一条伏笔在其它事件里继续出现、深化或产生后果是正常的，但正式端点只在真正承担该变化的事件中标记一次；后续事件用普通关联资料或“F编号”继续承接，不重复写“F编号/setup”或“F编号/payoff”。承载正式端点的事件 references 加入对应标记，让程序可以把端点和事件稳定对应起来。
 
-阶段内的事件以场景为核心：具体时间地点、在场人物、当下压力、动作、阻力、选择、情绪或关系变化和直接后果要在 h 中自然连成一段。相邻事件更换推进机制，让人物行动、空间变化、生活压力、关系碰撞、异常介入和线索变化共同推动故事。除非题材本身就是办案、破案或调查推理，不要让案卷化或程序化内容成为事件主线；连续两个事件不能都靠解释、谈话、规则说明或口头结论推进，必须让人物在场面中做出动作并承担后果。伏笔只在实际发生的阶段返回，一次只返回一个当前正式端点；f中的每项写 i、k、e、d，其中 k 为 setup 或 payoff，e 是承载它的事件编号，d 是这一次在场景中发生的具体变化。后续事件可以继续写同一条线索的新增影响，但不重复返回同一种正式端点。程序会依据事件范围落下具体章号。{("同时返回全书长期事实 k。" if first_stage else "本阶段沿用前面已经确认的长期事实。")}
+阶段内的事件以场景为核心：在需要的地方写清本次真正发生的事实，尽量不用固定清单式要求，不为凑齐项目逐项重复。相邻事件从人物目标和现场结果自然长出新的推进方式，让人物行动、关系变化、空间压力、利益变化、能力试探、秘密暴露或突发后果带来变化，不套固定轮换。伏笔只在实际发生的阶段返回，一次只返回一个当前正式端点；f中的每项写 i、k、e、d，其中 k 为 setup 或 payoff，e 是承载它的事件编号，d 是这一次在场景中发生的具体变化。后续事件可以继续写同一条线索的新增影响，但不重复返回同一种正式端点。程序会依据事件范围落下具体章号。{("同时返回全书长期事实 k。" if first_stage else "本阶段沿用前面已经确认的长期事实。")}
 
             {opening_guidance}{subject_guidance}{final_stage_guidance}
 
@@ -6082,10 +6155,12 @@ class NovelCreationWizardDialog(QDialog):
         preferences_frame.setStyleSheet(
             "QFrame#creation_preferences { background: transparent; border: none; }"
         )
+        preferences_frame.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         preferences_layout = QVBoxLayout(preferences_frame)
         preferences_layout.setContentsMargins(8, 8, 8, 8)
         preferences_layout.setSpacing(7)
         preferences_title = QLabel("故事灵感")
+        preferences_title.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
         preferences_title.setStyleSheet("font-size: 13px; font-weight: 600; color: #e3e6eb;")
         preferences_layout.addWidget(preferences_title)
         preferences_layout.addWidget(self.inspiration_edit)
@@ -6172,6 +6247,9 @@ class NovelCreationWizardDialog(QDialog):
         body.addLayout(preview, 1)
         result_layout.addLayout(body, 1)
         layout.addWidget(self.premise_result_frame, 1)
+        # Keep the first-step controls anchored at the top when the result
+        # area is hidden after clearing the generated story directions.
+        layout.addStretch(1)
         page_layout.addLayout(layout)
         page_scroll = QScrollArea()
         page_scroll.setWidgetResizable(True)
@@ -6764,14 +6842,32 @@ class NovelCreationWizardDialog(QDialog):
         selected["end_chapter"] = spec["end_chapter"]
         selected["target_words"] = spec["target_words"]
         events = selected.get("ordered_events", [])
+        endpoint_event_aliases = {}
         if isinstance(events, list):
             for event_index, event in enumerate(events, 1):
                 if not isinstance(event, dict):
                     continue
                 raw_event_id = _as_text(event.get("id"))
-                event_match = re.search(r"E[_-]?(\d+)", raw_event_id.upper())
-                event_number = int(event_match.group(1)) if event_match else event_index
-                event["id"] = f"{spec['id']}-E{event_number:02d}"
+                normalized_raw_id = re.sub(r"\s+", "", raw_event_id.upper())
+                event_match = re.search(r"E[_-]?(\d+)", normalized_raw_id)
+                local_event_id = f"{spec['id']}-E{event_index:02d}"
+                # Event numbers are local to one stage. Models sometimes use
+                # chapter-like ids (S02-E21) or continue numbering from the
+                # previous stage (E21-E30); both must map to the stable local
+                # ids used by validation and the saved project.
+                aliases = {
+                    normalized_raw_id,
+                    local_event_id.upper(),
+                    f"E{event_index:02d}",
+                }
+                if event_match:
+                    event_number = int(event_match.group(1))
+                    aliases.add(f"E{event_number:02d}")
+                    aliases.add(f"{spec['id']}-E{event_number:02d}".upper())
+                for alias in aliases:
+                    if alias:
+                        endpoint_event_aliases[alias] = local_event_id
+                event["id"] = local_event_id
                 allowed = event.get("allowed_chapters", [])
                 if isinstance(allowed, list) and len(allowed) >= 2:
                     try:
@@ -6827,8 +6923,35 @@ class NovelCreationWizardDialog(QDialog):
         # Resolve the new event-anchored endpoint protocol before merging.  A
         # model response no longer needs to guess an independent chapter; the
         # event range and the second-step stage baseline determine it here.
+        # Derive endpoints from the same locally-renumbered stage that will
+        # be saved.  Translate transport ids such as E21/S02-E21 first so a
+        # valid model response cannot lose its setup/payoff association.
+        endpoint_result = deepcopy(result) if isinstance(result, dict) else {}
+        endpoint_stages = endpoint_result.get("stage_plan", [])
+        if isinstance(endpoint_stages, list):
+            endpoint_stage = None
+            for item in endpoint_stages:
+                if isinstance(item, dict) and _as_text(item.get("id")).upper() == spec["id"]:
+                    endpoint_stage = item
+                    break
+            if endpoint_stage is None and endpoint_stages:
+                endpoint_stage = endpoint_stages[0]
+            if endpoint_stage is not None:
+                endpoint_stage = deepcopy(selected)
+                endpoint_result["stage_plan"] = [endpoint_stage]
+        endpoint_schedule = endpoint_result.get("foreshadow_schedule", [])
+        if isinstance(endpoint_schedule, list):
+            for row in endpoint_schedule:
+                if not isinstance(row, dict):
+                    continue
+                raw_endpoint_id = re.sub(
+                    r"\s+", "", _as_text(row.get("endpoint_event_id")).upper()
+                )
+                mapped_endpoint_id = endpoint_event_aliases.get(raw_endpoint_id)
+                if mapped_endpoint_id:
+                    row["endpoint_event_id"] = mapped_endpoint_id
         stage_endpoint_rows = _derive_stage_endpoint_rows(
-            result,
+            endpoint_result,
             stage_index,
             specs,
             bible_foreshadows,

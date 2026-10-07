@@ -64,6 +64,7 @@ from .novel_utils import (
     _normalize_chapter_plan_foundation,
     _normalize_framework_analysis,
     _normalize_volume_continuity_anchors,
+    _procedural_plot_guard_guidance,
     _story_conflict_pacing_guidance,
     NOVEL_PROSE_END_MARKER,
     NOVEL_PROSE_START_MARKER,
@@ -82,6 +83,7 @@ from .novel_import import (
 from .novel_storage import save_novel_raw_model_output
 
 _BLENDER_PROBE_CACHE = {}
+_CHAPTER_TITLE_MAX_CHARS = 15
 
 
 _CHAPTER_PLAN_STATE_PROGRESSION_GUIDANCE = (
@@ -94,10 +96,11 @@ _CHAPTER_PLAN_STATE_PROGRESSION_GUIDANCE = (
 
 
 _OPENING_THREE_CHAPTER_GUIDANCE = (
-    "【开篇前三章强度】\n"
-    "当前批次包含全书开头时，前3章要以强冲突开局，并把冲突落到人物、场景、行为、动作、情绪和结果上。"
-    "第1章直接进入正在发生的具体冲突；第2章承接上一章的后果，让冲突升级并出现改变判断的反转；第3章让主角主动选择或反击，并承担已经发生的直接后果。"
-    "三章前后相扣，具体冲突、人物关系和表现方式结合题材自由发挥；让读者先看到人物正在怎样碰撞、怎样行动、怎样失去或得到，再逐步理解背景和规则。\n"
+    "当本批次从全书第1章开始时，返回数组中已经存在的第1、2、3项分别就是全书第1、2、3章。"
+    "只在这三个已有条目中加强开局：第1项直接进入正在发生的具体冲突；第2项承接第1项的后果，让冲突升级并出现改变判断的反转；"
+    "第3项让主角主动选择或反击，并承担已经发生的直接后果。"
+    "这三项已经计入本批次要求的总数量，每一项只对应一章；不要另加开篇条目，也不要重复生成这三章。"
+    "具体冲突、人物关系和表现方式结合题材自由发挥，让读者先看到人物正在怎样碰撞、怎样行动、怎样失去或得到，再逐步理解背景和规则。\n"
 )
 
 
@@ -116,21 +119,21 @@ _FINAL_CHAPTER_PLAN_GUIDANCE = (
 _CHAPTER_PLAN_STORY_LANGUAGE_GUIDANCE = (
     "【章节规划表达】\n"
     "章节规划是给后续正文扩写使用的结构化事实底稿，不是发布简介，也不是最终小说正文。"
-    "章节标题会直接展示给读者，也属于可以公开发布的内容；标题必须使用自然的网络小说叙述语言风格，具体、好读，"
+    "章节标题会直接展示给读者，也属于可以公开发布的内容；标题必须使用自然的网络小说叙述语言风格，具体、好读，长度不超过15个汉字（不含章节序号和空白），"
     "落到本章真实发生的人物、场景、动作、冲突、结果或变化上，和本章outline保持一致，不另造剧情。"
     "标题不要写成策划标签、抽象概念、空泛情绪、案件名称、报告名称、编辑摘要或工作说明。"
-    "每章先固定人物、地点、前置状态、具体行动、现实阻力、结果和章末变化；这些内容必须能直接用于后续正文扩写。"
+    "每章先抓住正文真正需要的故事事实；人物、地点、前置状态、具体行动、现实阻力、结果和章末变化按本章实际需要自然取用，尽量不用固定清单式要求。"
     "outline只写本章具体发生的故事事实，可以用清楚的短段落或分句表达，不要求文学化，也不要求单独生成一份自然语言版规划。"
     "规划可以使用清楚的结构化表达，不套固定句式；字段内容直接写人物正在经历的事情、当下压力、选择和结果。"
     "内容只保留故事事实和必要索引，字段名、内部编号、JSON、代码和生成过程留在外层结构中。"
-    "除非作者明确选择办案、破案或调查推理题材，否则不得采用案卷化、办案式、审查流程式的剧情推进；不得让文书往来、纸面说明、程序步骤或结论说明代替人物在现场的行动和冲突。"
-    "非办案题材要用场景压力、人物行动、关系碰撞、情绪变化和具体后果推进；人物必须在当下处境中遇到阻力、采取行动、作出选择并承担变化。"
-    "非办案题材中，连续两章不能都停在解释、谈话、安排或结论；至少让其中一章出现人物的主动行动、直接碰撞、利益变化、关系变化、环境压力、能力试探或突发后果，并让结果改变后续章节的起点。"
+    + _procedural_plot_guard_guidance()
+    + "剧情仍然要由当前题材自己的场景压力、人物行动、关系碰撞、情绪变化或具体后果推进；人物和环境如何推动故事由题材自然决定。"
     "章节规划使用清楚、具体、便于执行的故事事实和人物行动表达，不得出现策划术语、抽象形容、办案式表达、编辑式说明或编辑式总结。"
     "人物认知、关系和局势的变化都落到具体看见、听见、决定、行动和结果；阶段事件按自然的场景长度组合，让相邻章节有变化并共同完成节点。"
     "伏笔随着人物实际行动、关系变化和局势发展自然生长，不写固定伏笔任务；线索可以在合适的时机转化为新的选择、代价、误会、帮助或冲突。"
     "伏笔由后续扩写正文和正文分析根据实际内容动态处理，规划阶段只提供能够支撑故事继续发展的线索和变化空间。"
-    "阶段剧情节点提供连续性依据，不能决定本章写什么题材内容；本章题材内容仍由当前人物、场景、关系和正在发生的事情自然决定。\n"
+    "阶段剧情节点提供连续性依据，不能决定本章写什么题材内容；本章题材内容仍由当前人物、场景、关系和正在发生的事情自然决定。"
+    "同一阶段节点第一次发生时完成它的核心转折；如果节点覆盖数章，后续章节只写它造成的新反应、新选择、新代价、新关系变化或新阻力，尽量不用固定清单式要求逐章重复节点。\n"
 )
 
 
@@ -6438,6 +6441,7 @@ class NovelChapterEventPlacementWorker(NovelAnalysisWorker):
             "节点原有的允许范围决定每个节点的落点，节点顺序保持输入顺序。"
             "一个节点可以覆盖连续几章，前后节点通过人物行动、关系变化和现场后果自然衔接，"
             "每个节点的核心事件、关键变化和直接结果在自己的范围内完成。\n"
+            "这里只安排已经存在的故事节点，不新增或拆分调查材料、核对记录、责任确认、协议谈判、签字验收等程序性剧情节点。"
             f"只返回类似{example}的对象，示例中的数量必须与输入节点数量一致。"
             "p中的项目数量必须与输入节点数量完全一致；n必须从1连续递增。"
             "a和b是全书绝对章号，不是批次内序号。不要返回节点文字、事件ID、章节标题或任何解释。"
@@ -6609,16 +6613,45 @@ class NovelChapterPlanWorker(NovelAnalysisWorker):
         opening_guidance = ""
         if self.existing_chapter_count == 0 and absolute_start <= 3 <= absolute_end:
             opening_guidance = _OPENING_THREE_CHAPTER_GUIDANCE
+        locked_schedule_guidance = ""
+        if self.creation_wizard_mode:
+            schedule = self.locked_node_schedule
+            schedule_range = schedule.get("range", []) if isinstance(schedule, dict) else []
+            try:
+                schedule_start = int(schedule_range[0])
+                schedule_end = int(schedule_range[1])
+            except (TypeError, ValueError, IndexError):
+                schedule_start, schedule_end = absolute_start, absolute_end
+            node_ranges = []
+            for node in schedule.get("nodes", []) if isinstance(schedule, dict) else []:
+                if not isinstance(node, dict):
+                    continue
+                try:
+                    node_number = int(node.get("n", 0) or 0)
+                    node_range = node.get("range", [])
+                    node_start = int(node_range[0])
+                    node_end = int(node_range[1])
+                except (TypeError, ValueError, IndexError):
+                    continue
+                if node_number > 0 and node_start > 0 and node_end >= node_start:
+                    node_ranges.append(f"节点{node_number}只能落在第{node_start}-{node_end}章")
+            locked_schedule_guidance = (
+                f"当前阶段的硬范围是第{schedule_start}-{schedule_end}章，"
+                "本批只在这个范围内展开；节点数量不是章节数量，不能为了讲完一个节点新增章节。"
+                + ("；".join(node_ranges) + "。" if node_ranges else "")
+            )
         if self.creation_wizard_mode:
             chapter_order_rule = (
                 f"本批次必须返回{self.chapter_count}项，列表第1项就是全书第{absolute_start}章，"
                 f"最后一项就是第{absolute_end}章。不要返回章节编号、阶段编号、事件编号或任何定位标签，"
-                "章节号和阶段归属由程序根据列表顺序写入。"
+                "章节号和阶段归属由程序根据列表顺序写入；到第"
+                f"{absolute_end}章后立即结束，不安排第{absolute_end + 1}章或任何后续阶段内容。"
             )
             event_rule = (
                 "当前阶段的剧情节点已经由程序先行安排，输入中的locked_node_schedule提供每个节点的落点范围。"
                 "节点序号不是章节号，章节提纲按节点范围展开，并通过人物行动、关系变化和现场结果完成前后衔接；"
                 "章节outline按照locked_node_schedule在对应范围内落实节点内容。"
+                + locked_schedule_guidance
             )
             output_schema = (
                 'JSON结构只保留：{"c":[{"t":"章节名","o":"本章具体故事提纲","p":[]}]}'
@@ -6664,7 +6697,6 @@ class NovelChapterPlanWorker(NovelAnalysisWorker):
             "宏观节奏负责冲突强度、信息释放和收束速度；具体场景内容由用户选定的题材和人物关系决定。"
             "故事主线跟随用户选定的题材和人物关系展开，感情、日常、经商、成长或其它题材推进方式以题材本身的现场压力为依据。\n"
             "前 10%为强钩子期，中间 70%为扩展期，后 20%为收束期；这些只是宏观节奏参考，具体场景和冲突由当前故事自然决定。"
-            "对非办案题材，通常每两章至少要让主角和路人、配角、对手或反派发生一次有效碰撞：对方可以误判、挑衅、争夺利益、提出条件或让主角必须当场选择；每次更换原因、场景和结果，让人物关系与局势一起变化。明确的办案、破案或调查推理题材则按其题材逻辑安排现场行动。\n"
             "source_stage、narrative_stage和dominant_line由程序根据阶段资料补齐。\n"
             "输入中的narrative_strategy_profile和master_plan是用户已确认的只读规划基础，本次输出直接承接其中的事实、"
             "阶段边界和题材方向；不同题材使用各自的冲突入口、状态变化与兑现方式。"
@@ -6690,8 +6722,8 @@ class NovelChapterPlanWorker(NovelAnalysisWorker):
             "outline只写本章给正文使用的具体故事事实，建议250-380字；可以是清楚的事实段落，不要求像发布简介，也不要求写成有题材气质的叙述，更不要写成代码、字段说明或工作流程。"
             "outline是提纲里的故事正文；只有需要补写的章节才输出outline。这里的‘正文’指章节规划中的故事事实，不是最终小说正文。"
             "资料确认后，只把具体事实写清楚；不额外生成一份自然语言版规划。"
-            "outline写清人物、地点、行动、现实阻力、结果和章末变化，直接写故事事实和人物选择；"
-            "可以按当前故事最自然的顺序组织，不必按处境、阻力、选择、后果的固定次序；不要复述字段含义。"
+            "outline直接写本章真正需要给正文继承的故事事实；人物、地点、行动、阻力、结果或章末变化按本章需要自然取用，"
+            "按当前故事最自然的顺序组织，不要为了凑齐项目补写没有发生的内容。不要复述字段含义。"
             "提纲可以像这本小说的作者在讲述下一章一样清楚，但仍然保留执行所需的事实密度。"
             "章节规划保留后续正文真正需要的故事事实和人物索引，正文扩写时转换成自然的网络小说叙述语言，"
             "结构字段名、编号和规划过程停留在外层数据中。剧情推进落到人物正在经历的事情、行动和结果，不安排任何固定的工作步骤或说明流程。\n"
@@ -6704,11 +6736,12 @@ class NovelChapterPlanWorker(NovelAnalysisWorker):
             "或框架判断为 supplement/generate 且当前章节确实缺少可写内容时，才返回 outline_mode=generate 并生成约300字具体故事提纲。"
             "模型只做缺口判断，不要另建审核任务。"
             + event_rule
-            + "阶段结局和最终关系状态在阶段后部自然兑现；扩展章继续深化当前阶段的人物、关系、处境和现场后果，"
-            "下一阶段从上一阶段留下的变化继续展开。\n"
+            + "阶段结局在当前批次范围内自然兑现；扩展章继续深化当前阶段的人物、关系、处境和现场后果。"
+            "超出本批范围的后续阶段只作为未来承接方向，本批返回不得提前安排。\n"
             "characters只列出本章自然涉及的主要人物，没有则用空数组；它是索引，不是强制出场清单。\n"
             + output_schema
-            + "章节数量必须严格等于请求章节数。"
+            + f"最后只检查一个数量：c数组必须恰好包含{self.chapter_count}个章节对象，不能多出、少掉或重复任何章节；"
+            "开局强化只作用于数组已有的第1、2、3项，不改变这个数量。"
         )
 
     def _chunk_user_text(self, chunk_text, chunk_index, total_chunks):
@@ -6734,6 +6767,10 @@ class NovelChapterPlanWorker(NovelAnalysisWorker):
         title = re.sub(r"^\s*[\d一二三四五六七八九十百千万零〇两]+\s*[、.．]\s*", "", title)
         title = re.sub(r"\s+", "", title)
         title = title.strip(" \t\r\n\"'“”‘’《》「」『』【】[]()（）：:，,。；;、")
+        if len(title) > _CHAPTER_TITLE_MAX_CHARS:
+            # The prompt should keep titles short; this is only a final
+            # persistence guard for an occasional overlong model response.
+            title = title[:_CHAPTER_TITLE_MAX_CHARS].rstrip("：:，,。；;、")
         return title or fallback
 
     def _string_list(self, value):
@@ -6917,7 +6954,11 @@ class NovelChapterPlanWorker(NovelAnalysisWorker):
         if not normalized:
             raise ValueError("AI 返回的章节规划为空。")
         if len(normalized) != self.chapter_count:
-            raise ValueError(f"章节规划数量不一致：需要{self.chapter_count}章，实际{len(normalized)}章。")
+            raise ValueError(
+                f"章节规划数量不一致：本批次第{self.existing_chapter_count + 1}-"
+                f"{self.existing_chapter_count + self.chapter_count}章需要{self.chapter_count}章，"
+                f"实际返回{len(normalized)}章。"
+            )
         for index, item in enumerate(normalized, 1):
             item["index"] = index
         return {

@@ -774,20 +774,12 @@ _PROVIDER_REASONING_EFFORTS = {
 # Novel writing requests that should always use the stable High reasoning tier.
 # This covers normal and automatic expansion, chapter checks, post-write
 # organization, state repair, and the ten-chapter boundary reconciliation.
-# Keeping this list at the shared resolver also covers both legacy and V2 tabs.
+# Keep this list at the shared resolver so every active novel-writing pipeline
+# uses the same reasoning policy.
 _NOVEL_WRITING_HIGH_REASONING_ACTIONS = {
     "draft",
     "outline",
     "summary",
-    "execution_outline",
-    "outline_repair",
-    "audit",
-    "pov_audit",
-    "targeted_repair",
-    "length_repair",
-    "length_repair_segment",
-    "postwrite",
-    "completion_audit",
     "style_profile",
     "style_baseline",
     "style_sheet",

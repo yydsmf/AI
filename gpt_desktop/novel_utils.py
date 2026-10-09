@@ -65,7 +65,7 @@ VOLUME_TWO_FRAMEWORK_TEMPLATE = (
     "备注\n"
     "设定：\n"
     "名称\n"
-    "类型：地点、势力、物品、规则、术语、事件、其它\n"
+    "类型：地点、日常场景、物件、势力、规则、制度、异常线索，以及必要时的物件与规则、势力与制度、地点与异常边界等组合类型\n"
     "说明"
 )
 # Volume handoff is a planning request, not a manuscript request. Keep a
@@ -4825,7 +4825,7 @@ def _build_writing_check_text(project):
     lore = project.get("lore", [])
     lore = lore if isinstance(lore, list) else []
     if not lore:
-        issues.append("设定库为空；长篇建议把地点、势力、物品、规则单独记录。")
+        issues.append("设定库为空；长篇建议把地点、日常场景、物件、势力、规则和制度分别记录。")
     else:
         for name in _duplicate_values(item.get("name", "") for item in lore if isinstance(item, dict)):
             issues.append(f"设定「{name}」重复，请确认是否需要合并。")
@@ -5044,6 +5044,23 @@ SCENE_TITLE_RE = re.compile(
 )
 FRAMEWORK_IMPORT_TYPE = "小说框架 / 大纲"
 IMPORT_TYPE_OPTIONS = [FRAMEWORK_IMPORT_TYPE, "小说", "短剧 / 分集剧本", "电影 / 长剧剧本", "自由文本"]
+# ``type`` remains a string in the project schema. Keep useful compound
+# categories as ordinary choices without adding a second storage field.
+LORE_TYPE_OPTIONS = [
+    "地点",
+    "日常场景",
+    "物件",
+    "势力",
+    "规则",
+    "制度",
+    "异常线索",
+    "物件与规则",
+    "势力与制度",
+    "地点与异常边界",
+    "术语",
+    "事件",
+    "其他",
+]
 UNIT_TYPE_LABELS = {
     "chapter": "章",
     "episode": "集",
@@ -9603,6 +9620,16 @@ def _procedural_plot_guard_guidance():
     )
 
 
+def _entity_naming_guidance(project=None, limit=2600):
+    """Keep natural aliases from creating unsupported entity relationships."""
+    lines = [
+        "【实体称谓与关系边界】",
+        "资料中已有的简称可以自然使用，但简称不改变人物、人物集合、所属势力、联盟和婚约对象的实体类型。",
+        "只有资料明确写出的家族、势力、联盟、隶属或联姻关系才能作为事实；遇到含义不清的简称，优先使用已有正式名称或人物集合称呼，不要自行补出新的关系。",
+    ]
+    return _clip_context_text("\n".join(lines), max(800, int(limit or 2600)), preserve_lines=True)
+
+
 def _grounded_prose_contract():
     """Keep generated prose direct, concrete, and story-focused."""
     return (
@@ -11845,6 +11872,138 @@ def _resolve_long_form_record_ref(project, kind, value):
     return ""
 
 
+def _long_form_ref_values(value):
+    """Split one or many model reference forms into stable string values."""
+    values = value if isinstance(value, (list, tuple, set)) else [value]
+    result = []
+    for raw in values:
+        if isinstance(raw, (list, tuple, set)):
+            nested = _long_form_ref_values(raw)
+        else:
+            nested = re.split(r"[|、,，;；\n]+", str(raw or ""))
+        for item in nested:
+            item = str(item or "").strip()
+            if item and item not in result:
+                result.append(item)
+    return result
+
+
+def _long_form_character_state_refs(item):
+    """Read singular and plural character reference fields from one state."""
+    if not isinstance(item, dict):
+        return []
+    for key in (
+        "ref", "character_ref", "character_id", "character", "stable_ref",
+        "stable_id", "ref_id", "temp_key", "key", "character_refs",
+        "character_ids", "characters", "participants", "refs",
+    ):
+        values = _long_form_ref_values(item.get(key, ""))
+        if values:
+            return values
+    return []
+
+
+def _canonical_long_form_character_ref(project, value):
+    """Return the compact C### alias for an ID, alias, or unique character name."""
+    raw = str(value or "").strip()
+    if not raw:
+        return ""
+    maps = _long_form_record_reference_maps(project).get("characters", {})
+    resolved = _resolve_long_form_record_ref(project, "characters", raw)
+    if resolved:
+        return maps.get("id_to_alias", {}).get(resolved, raw)
+
+    matches = []
+    records = project.get("characters", []) if isinstance(project, dict) else []
+    for record in records if isinstance(records, list) else []:
+        if not isinstance(record, dict):
+            continue
+        name = _compact_text(record.get("name", "")).casefold()
+        if not name or name != _compact_text(raw).casefold():
+            continue
+        item_id = str(record.get("id", "") or "").strip()
+        alias = maps.get("id_to_alias", {}).get(item_id, "")
+        if alias and alias not in matches:
+            matches.append(alias)
+    return matches[0] if len(matches) == 1 else raw
+
+
+def _normalize_long_form_character_refs(project, update):
+    """Normalize character names/IDs in every long-form reference namespace."""
+    payload = deepcopy(update) if isinstance(update, dict) else {}
+
+    def canonical_list(values):
+        result = []
+        for value in _long_form_ref_values(values):
+            canonical = _canonical_long_form_character_ref(project, value)
+            if canonical and canonical not in result:
+                result.append(canonical)
+        return result
+
+    state_patch = payload.get("state_patch", {})
+    if isinstance(state_patch, dict):
+        for item in state_patch.get("character_states", []) if isinstance(state_patch.get("character_states"), list) else []:
+            if isinstance(item, dict):
+                refs = _long_form_character_state_refs(item)
+                if refs:
+                    item["ref"] = _canonical_long_form_character_ref(project, refs[0])
+        for item in state_patch.get("relationship_states", []) if isinstance(state_patch.get("relationship_states"), list) else []:
+            if isinstance(item, dict):
+                refs = item.get("refs", item.get("characters", []))
+                item["refs"] = canonical_list(refs)
+
+    for key in ("current_chapter_character_refs", "current_chapter_character_ids"):
+        if isinstance(payload.get(key), list):
+            payload[key] = canonical_list(payload[key])
+
+    state_retirements = payload.get("state_retirements", {})
+    if isinstance(state_retirements, dict):
+        if isinstance(state_retirements.get("character_refs"), list):
+            state_retirements["character_refs"] = canonical_list(
+                state_retirements["character_refs"]
+            )
+        if isinstance(state_retirements.get("relationship_refs"), list):
+            relationships = []
+            for value in state_retirements["relationship_refs"]:
+                refs = canonical_list(value if isinstance(value, list) else str(value or "").split("|"))
+                if len(refs) >= 2:
+                    relationships.append("|".join(sorted(refs)))
+            state_retirements["relationship_refs"] = list(dict.fromkeys(relationships))
+
+    next_memory = payload.get("next_chapter_memory", {})
+    if isinstance(next_memory, dict) and isinstance(next_memory.get("character_refs"), list):
+        next_memory["character_refs"] = canonical_list(next_memory["character_refs"])
+
+    for event in payload.get("long_term_events", []) if isinstance(payload.get("long_term_events"), list) else []:
+        storage = event.get("storage", {}) if isinstance(event, dict) else {}
+        if isinstance(storage, dict) and isinstance(storage.get("character_refs"), list):
+            storage["character_refs"] = canonical_list(storage["character_refs"])
+
+    reconciliation = payload.get("state_reconciliation", {})
+    if isinstance(reconciliation, dict):
+        if isinstance(reconciliation.get("character_refs"), list):
+            reconciliation["character_refs"] = canonical_list(reconciliation["character_refs"])
+        if isinstance(reconciliation.get("relationship_refs"), list):
+            relationships = []
+            for value in reconciliation["relationship_refs"]:
+                refs = canonical_list(str(value or "").split("|"))
+                if len(refs) >= 2:
+                    relationships.append("|".join(sorted(refs)))
+            reconciliation["relationship_refs"] = list(dict.fromkeys(relationships))
+
+    record_updates = payload.get("record_updates", {})
+    if isinstance(record_updates, dict):
+        for item in record_updates.get("characters", []) if isinstance(record_updates.get("characters"), list) else []:
+            if not isinstance(item, dict):
+                continue
+            operation = str(item.get("operation", "") or "").strip().lower()
+            if operation != "create":
+                refs = _long_form_character_state_refs(item)
+                if refs:
+                    item["ref"] = _canonical_long_form_character_ref(project, refs[0])
+    return payload
+
+
 def _repair_invalid_long_form_record_refs_by_name(project, update):
     """Replace invented opaque refs only when an exact record name is unique."""
     project = project if isinstance(project, dict) else {}
@@ -12852,6 +13011,8 @@ def _long_form_update_contract_instructions(project, chapter_index, compact=Fals
         "所有fact_updates、record_updates和foreshadow_updates必须附带最终正文中连续逐字出现的8-60字evidence_quote。"
         "keep不改写事实，可不填evidence_quote；其余事实操作必须有逐字证据。"
         "state_patch只写本章新增或变化的状态，未变化项省略；已结束冲突、任务或对象必须放入state_retirements。"
+        "state_patch.character_states每项只记录一个人物，必须使用单数ref字段，例如{\"ref\":\"C001\"}；"
+        "character_refs/character_ids数组只用于relationship_states、事件存储或下一章选择。若多人共享同一状态，character_states必须拆成多项，不能把数组直接放进单项。"
         "story_time、location和notes只保留本章结束时真正需要下一章继承的最短状态；state_delta只记录归类后的少量变化，不复制正文流水账。"
         "更新已有CF-ID或TASK-ID时必须分别逐字填写previous_conflict或previous_task，确认仍是同一冲突或任务；"
         "新语义必须新建临时key，绝不能借用旧ID。"
@@ -13062,7 +13223,7 @@ def _expand_compact_long_form_memory_update(project, chapter_index, update):
     for item in state_patch.get("object_states", []) if isinstance(state_patch.get("object_states"), list) else []:
         if not isinstance(item, dict):
             continue
-        append_ref(reconciliation["lore_refs"], item.get("lore_ref", item.get("lore_id", "")))
+        append_ref(reconciliation["lore_refs"], item.get("lore_ref", "") or item.get("lore_id", ""))
         append_ref(reconciliation["object_keys"], item.get("key", item.get("name", "")))
     for value in retirements.get("object_keys", []):
         append_ref(reconciliation["object_keys"], value)
@@ -13226,7 +13387,7 @@ def _expand_compact_long_form_memory_update(project, chapter_index, update):
         lore_id = _resolve_long_form_record_ref(
             project,
             "lore",
-            item.get("lore_ref", item.get("lore_id", "")),
+            item.get("lore_ref", "") or item.get("lore_id", ""),
         )
         if lore_id in existing_object_key_by_lore:
             append_ref(reviewed_objects, existing_object_key_by_lore[lore_id])
@@ -13278,14 +13439,7 @@ def _normalize_long_form_state_aliases(update):
         return ""
 
     def ref_list(value):
-        values = value if isinstance(value, list) else [value]
-        result = []
-        for raw in values:
-            for item in re.split(r"[|、,，;；\n]+", str(raw or "")):
-                item = item.strip()
-                if item and item not in result:
-                    result.append(item)
-        return result
+        return _long_form_ref_values(value)
 
     had_state_patch = "state_patch" in payload
     state_patch = payload.get("state_patch", {})
@@ -13302,24 +13456,39 @@ def _normalize_long_form_state_aliases(update):
             tasks = payload.get("tasks")
             if isinstance(tasks, list):
                 state_patch["unresolved_tasks"] = deepcopy(tasks)
-        for item in state_patch.get("character_states", []) if isinstance(state_patch.get("character_states"), list) else []:
-            if not isinstance(item, dict):
-                continue
-            if not str(item.get("ref", "") or "").strip():
-                item["ref"] = first_value(
-                    item,
-                    (
-                        "character_ref", "character_id", "character", "stable_ref",
-                        "stable_id", "ref_id", "temp_key", "key",
-                    ),
-                )
-            if not str(item.get("state", "") or "").strip():
-                item["state"] = first_value(
-                    item,
-                    ("status", "dynamic", "runtime", "runtime_update", "change", "description"),
-                )
-            if not str(item.get("evidence_quote", "") or "").strip():
-                item["evidence_quote"] = first_value(item, ("evidence", "quote"))
+        raw_character_states = state_patch.get("character_states")
+        if isinstance(raw_character_states, list):
+            normalized_character_states = []
+            character_ref_aliases = {
+                "ref", "character_ref", "character_id", "character", "stable_ref",
+                "stable_id", "ref_id", "temp_key", "key", "character_refs",
+                "character_ids", "characters", "participants", "refs",
+            }
+            for source_item in raw_character_states:
+                if not isinstance(source_item, dict):
+                    normalized_character_states.append(source_item)
+                    continue
+                refs = _long_form_character_state_refs(source_item)
+                # character_states is a single-person state collection.  Some
+                # models use the relationship-style character_refs array here;
+                # split it into one canonical state per character so no state is
+                # lost and validation can keep its existing semantics.
+                refs = refs or [""]
+                for ref in refs:
+                    item = deepcopy(source_item)
+                    for alias in character_ref_aliases:
+                        if alias != "ref":
+                            item.pop(alias, None)
+                    item["ref"] = ref
+                    if not str(item.get("state", "") or "").strip():
+                        item["state"] = first_value(
+                            source_item,
+                            ("status", "dynamic", "runtime", "runtime_update", "change", "description"),
+                        )
+                    if not str(item.get("evidence_quote", "") or "").strip():
+                        item["evidence_quote"] = first_value(source_item, ("evidence", "quote"))
+                    normalized_character_states.append(item)
+            state_patch["character_states"] = normalized_character_states
         for item in state_patch.get("relationship_states", []) if isinstance(state_patch.get("relationship_states"), list) else []:
             if not isinstance(item, dict):
                 continue
@@ -14205,10 +14374,13 @@ def _normalize_long_form_update_payload(project, chapter_index, update):
     ):
         payload = _normalize_long_form_state_aliases(payload)
         payload = _expand_compact_long_form_memory_update(project, chapter_index, payload)
+        payload = _normalize_long_form_state_aliases(payload)
+        payload = _normalize_long_form_character_refs(project, payload)
     else:
         if "state_patch" not in payload and isinstance(payload.get("state_snapshot"), dict):
             payload["state_patch"] = deepcopy(payload.get("state_snapshot", {}))
         payload = _normalize_long_form_state_aliases(payload)
+        payload = _normalize_long_form_character_refs(project, payload)
     payload = _drop_empty_long_form_state_items(project, payload)
     payload = _repair_invalid_long_form_record_refs_by_name(project, payload)
     payload = _normalize_long_form_ephemeral_actor_refs(project, payload)
@@ -14610,7 +14782,7 @@ def _long_form_object_record_namespace(project, item):
         if not record_id:
             continue
         if kind == "lore":
-            lore_ref = item.get("lore_ref", item.get("lore_id", ""))
+            lore_ref = item.get("lore_ref", "") or item.get("lore_id", "")
             bound_lore_id = _resolve_long_form_record_ref(project, "lore", lore_ref)
             if bound_lore_id and bound_lore_id == record_id:
                 return ""
@@ -14676,7 +14848,7 @@ def _normalize_long_form_structural_refs(project, chapter_index, update):
     for item in state_patch.get("object_states", []) if isinstance(state_patch.get("object_states"), list) else []:
         if not isinstance(item, dict):
             continue
-        append_unique("lore_refs", item.get("lore_ref", item.get("lore_id", "")))
+        append_unique("lore_refs", item.get("lore_ref", "") or item.get("lore_id", ""))
         append_unique("object_keys", item.get("key", item.get("name", "")))
     for value in retirements.get("object_keys", []) if isinstance(retirements.get("object_keys"), list) else []:
         append_unique("object_keys", value)
@@ -14711,13 +14883,148 @@ def _normalize_long_form_structural_refs(project, chapter_index, update):
     snapshot = snapshot if isinstance(snapshot, dict) else {}
     state_patch = payload.get("state_patch", {})
     state_patch = state_patch if isinstance(state_patch, dict) else {}
+    lifecycle_review = payload.get("state_lifecycle_review", {})
+    lifecycle_review = lifecycle_review if isinstance(lifecycle_review, dict) else {}
+    payload["state_lifecycle_review"] = lifecycle_review
+    next_memory = payload.get("next_chapter_memory", {})
+    next_memory = next_memory if isinstance(next_memory, dict) else {}
+    payload["next_chapter_memory"] = next_memory
     canonical_object_keys = {}
+    object_aliases = {}
     object_key_by_lore_id = {}
     ambiguous_object_lore_ids = set()
-    for source in (
-        snapshot.get("object_states", []),
-        state_patch.get("object_states", []),
-    ):
+    snapshot_objects = snapshot.get("object_states", [])
+    snapshot_objects = snapshot_objects if isinstance(snapshot_objects, list) else []
+    for item in snapshot_objects:
+        if not isinstance(item, dict):
+            continue
+        raw_key = str(item.get("key", item.get("name", "")) or "").strip()
+        compact_key = _compact_text(raw_key)
+        if compact_key and compact_key not in canonical_object_keys:
+            canonical_object_keys[compact_key] = raw_key
+        lore_id = _long_form_object_lore_id(project, item)
+        if lore_id and raw_key:
+            if lore_id in object_key_by_lore_id and object_key_by_lore_id[lore_id] != raw_key:
+                ambiguous_object_lore_ids.add(lore_id)
+            else:
+                object_key_by_lore_id[lore_id] = raw_key
+
+    # Canonicalize a model's temporary object row before its references are
+    # copied into events, reconciliation, and the next-chapter handoff. This
+    # is intentionally conservative: only an unambiguous existing object can
+    # absorb the temporary row.
+    object_rows = state_patch.get("object_states", [])
+    object_rows = object_rows if isinstance(object_rows, list) else []
+    for item in object_rows:
+        if not isinstance(item, dict):
+            continue
+        raw_key = str(item.get("key", item.get("name", "")) or "").strip()
+        canonical = _long_form_find_existing_object_key(
+            project, snapshot_objects, item
+        )
+        if not canonical:
+            continue
+        if raw_key and raw_key != canonical:
+            object_aliases[_compact_text(raw_key)] = canonical
+        raw_name = str(item.get("name", "") or "").strip()
+        if raw_name and raw_name != canonical:
+            object_aliases[_compact_text(raw_name)] = canonical
+        item["key"] = canonical
+        existing = next(
+            (
+                row for row in snapshot_objects
+                if isinstance(row, dict)
+                and str(row.get("key", row.get("name", "")) or "").strip() == canonical
+            ),
+            None,
+        )
+        if isinstance(existing, dict):
+            existing_lore = str(existing.get("lore_id", "") or "").strip()
+            if existing_lore and not str(item.get("lore_id", item.get("lore_ref", "")) or "").strip():
+                item["lore_id"] = existing_lore
+
+    # A lore update can carry the real runtime state even when the model
+    # forgot to repeat the object row in state_patch. Mirror that explicit
+    # state into the existing object identity so record_runtime and the state
+    # snapshot cannot drift apart.
+    record_updates = payload.get("record_updates", {})
+    record_updates = record_updates if isinstance(record_updates, dict) else {}
+    for item in record_updates.get("lore", []) if isinstance(record_updates.get("lore"), list) else []:
+        if not isinstance(item, dict):
+            continue
+        lore_id = _resolve_long_form_record_ref(
+            project, "lore", item.get("ref", item.get("id", ""))
+        )
+        if not lore_id or lore_id in ambiguous_object_lore_ids:
+            continue
+        object_key = object_key_by_lore_id.get(lore_id, "")
+        state = str(item.get("state", "") or "").strip()
+        if not state and isinstance(item.get("fields"), dict):
+            state = str(item.get("fields", {}).get("notes", "") or "").strip()
+        if not object_key or not state:
+            continue
+        existing_row = next(
+            (
+                row for row in object_rows
+                if isinstance(row, dict)
+                and (
+                    _compact_text(row.get("key", row.get("name", "")))
+                    == _compact_text(object_key)
+                    or _long_form_object_lore_id(project, row) == lore_id
+                )
+            ),
+            None,
+        )
+        if not isinstance(existing_row, dict):
+            existing_object = next(
+                (
+                    row for row in snapshot_objects
+                    if isinstance(row, dict)
+                    and str(row.get("key", row.get("name", "")) or "").strip() == object_key
+                ),
+                {},
+            )
+            existing_row = {
+                "key": object_key,
+                "name": str(existing_object.get("name", "") or object_key).strip(),
+                "lore_id": lore_id,
+                "state": state,
+            }
+            object_rows.append(existing_row)
+        else:
+            if not str(existing_row.get("key", "") or "").strip():
+                existing_row["key"] = object_key
+            if not str(existing_row.get("lore_id", existing_row.get("lore_ref", "")) or "").strip():
+                existing_row["lore_id"] = lore_id
+            # An explicit state row already supplied by the model remains the
+            # most local description; otherwise use the lore runtime state.
+            if not str(existing_row.get("state", "") or "").strip():
+                existing_row["state"] = state
+        object_aliases[_compact_text(object_key)] = object_key
+        append_unique("object_keys", object_key)
+        reviewed_values = lifecycle_review.get("reviewed_object_keys")
+        if not isinstance(reviewed_values, list):
+            reviewed_values = []
+            lifecycle_review["reviewed_object_keys"] = reviewed_values
+        if object_key not in reviewed_values:
+            reviewed_values.append(object_key)
+        next_values = next_memory.get("object_keys")
+        if not isinstance(next_values, list):
+            next_values = []
+            next_memory["object_keys"] = next_values
+        if object_key not in next_values:
+            next_values.append(object_key)
+    state_patch["object_states"] = object_rows
+    payload["state_patch"] = state_patch
+    for object_key in object_key_by_lore_id.values():
+        compact_object_key = _compact_text(object_key)
+        if compact_object_key:
+            canonical_object_keys.setdefault(compact_object_key, object_key)
+    for alias, canonical in object_aliases.items():
+        if alias:
+            canonical_object_keys[alias] = canonical
+
+    for source in (state_patch.get("object_states", []),):
         for item in source if isinstance(source, list) else []:
             if not isinstance(item, dict):
                 continue
@@ -14725,13 +15032,9 @@ def _normalize_long_form_structural_refs(project, chapter_index, update):
             compact_key = _compact_text(raw_key)
             if compact_key and compact_key not in canonical_object_keys:
                 canonical_object_keys[compact_key] = raw_key
-            lore_ref = str(item.get("lore_id", item.get("lore_ref", "")) or "").strip()
-            lore_id = _resolve_long_form_record_ref(project, "lore", lore_ref)
-            if lore_id and raw_key:
-                if lore_id in object_key_by_lore_id and object_key_by_lore_id[lore_id] != raw_key:
-                    ambiguous_object_lore_ids.add(lore_id)
-                else:
-                    object_key_by_lore_id[lore_id] = raw_key
+            lore_id = _long_form_object_lore_id(project, item)
+            if lore_id and raw_key and lore_id not in ambiguous_object_lore_ids:
+                object_key_by_lore_id.setdefault(lore_id, raw_key)
 
     def record_namespace(raw_value):
         raw_value = str(raw_value or "").strip()
@@ -14804,17 +15107,16 @@ def _normalize_long_form_structural_refs(project, chapter_index, update):
         "object_keys",
         preserve_record_namespace=True,
     )
-    lifecycle_review = payload.get("state_lifecycle_review", {})
-    if isinstance(lifecycle_review, dict):
-        normalize_object_references(lifecycle_review, "reviewed_object_keys")
-    next_memory = payload.get("next_chapter_memory", {})
-    if isinstance(next_memory, dict):
-        normalize_object_references(
-            next_memory,
-            "object_keys",
-            preserve_record_namespace=True,
-        )
+    normalize_object_references(lifecycle_review, "reviewed_object_keys")
+    normalize_object_references(
+        next_memory,
+        "object_keys",
+        preserve_record_namespace=True,
+    )
     normalize_object_references(retirements, "object_keys")
+    for event in payload.get("long_term_events", []) if isinstance(payload.get("long_term_events"), list) else []:
+        if isinstance(event, dict) and isinstance(event.get("storage"), dict):
+            normalize_object_references(event["storage"], "object_keys")
     return payload
 
 
@@ -15291,7 +15593,7 @@ def _validate_long_form_memory_update(
             if not isinstance(item, dict):
                 errors.append(f"物品状态第{index}项不是对象")
                 continue
-            lore_ref = item.get("lore_ref", item.get("lore_id", ""))
+            lore_ref = item.get("lore_ref", "") or item.get("lore_id", "")
             if str(lore_ref or "").strip() and not resolves_existing_or_proposed("lore", lore_ref):
                 errors.append(f"物品状态第{index}项引用未知设定：{lore_ref}")
             if not str(item.get("key", item.get("name", "")) or "").strip():
@@ -15504,7 +15806,7 @@ def _validate_long_form_memory_update(
                 required_state_review["object_keys"].add(existing_object_keys[compact])
                 continue
             lore_id = _resolve_long_form_record_ref(
-                project, "lore", item.get("lore_ref", item.get("lore_id", ""))
+                project, "lore", item.get("lore_ref", "") or item.get("lore_id", "")
             )
             if lore_id in existing_object_key_by_lore:
                 required_state_review["object_keys"].add(existing_object_key_by_lore[lore_id])
@@ -16477,9 +16779,31 @@ def _merge_long_form_memory_repair_patch(memory_update, patch):
     if not isinstance(replacements, dict):
         return merged
     allowed = set(_LONG_FORM_MEMORY_PATCH_FIELDS)
+    expected_types = {
+        "state_patch": dict,
+        "state_retirements": dict,
+        "state_lifecycle_review": dict,
+        "fact_updates": list,
+        "fact_lifecycle_review": dict,
+        "long_term_events": list,
+        "state_reconciliation": dict,
+        "state_delta": dict,
+        "current_chapter_character_refs": list,
+        "record_updates": dict,
+        "foreshadow_updates": list,
+        "next_chapter_memory": dict,
+    }
     for key, value in replacements.items():
-        if key in allowed:
-            merged[key] = deepcopy(value)
+        if key not in allowed:
+            continue
+        expected_type = expected_types.get(key)
+        if expected_type is list and not isinstance(value, list):
+            continue
+        if expected_type is dict and not isinstance(value, dict):
+            continue
+        if key == "stage_archive" and value not in (None, {}) and not isinstance(value, dict):
+            continue
+        merged[key] = deepcopy(value)
     return merged
 
 
@@ -16707,6 +17031,9 @@ _CHAPTER_LOGIC_AUDIT_CATEGORIES = {
     "spatial_state",
     "pronoun_reference",
     "knowledge_permission",
+    "numeric_consistency",
+    "entity_relationship",
+    "fact_boundary",
 }
 
 
@@ -17618,6 +17945,7 @@ def _build_long_form_memory_patch_context(
             7000,
             False,
         ),
+        ("实体称谓与关系边界", _entity_naming_guidance(project), 2600, False),
         ("最终正文", final_text, 34000, True),
         (
             "待修复的原正文字段",
@@ -17708,7 +18036,7 @@ def _build_long_form_memory_repair_context(
         "进出场、知识权限和代词指向；只报告有前后正文逐字证据的critical或major硬矛盾，最多3项。"
         "每项结构为severity、category、earlier_quote、later_quote、explanation；没有明确矛盾时issues为空。"
         "category只能使用chronology、causality、character_state、character_location、object_state、object_ownership、"
-        "spatial_state、pronoun_reference或knowledge_permission。"
+        "spatial_state、pronoun_reference、knowledge_permission、numeric_consistency、entity_relationship或fact_boundary。"
         "不能把文风、剧情选择、人物判断失误或现实流程不完整当成逻辑矛盾。"
         "每条evidence_quote必须从【最终正文】中原样复制一个连续子串，保留原文全部中文引号、标点和换行；"
         "尤其不得把正文中的“对白”改成不带引号的对白。输出前必须按字面检查该字符串能在最终正文中直接找到；"
@@ -17725,6 +18053,7 @@ def _build_long_form_memory_repair_context(
             7000,
             False,
         ),
+        ("实体称谓与关系边界", _entity_naming_guidance(project), 2600, False),
         ("最终正文", final_text, 32000, True),
         (
             "原长篇记忆增量",
@@ -17789,6 +18118,7 @@ def _build_chapter_logic_repair_context(project, chapter_index, final_text, issu
             5000,
             False,
         ),
+        ("实体称谓与关系边界", _entity_naming_guidance(project), 2600, False),
         ("最终正文", final_text, 34000, True),
     ]
     return _assemble_bounded_long_form_context(sections, requirements)
@@ -17880,12 +18210,12 @@ def _build_long_form_memory_finalize_context(project, chapter_index, final_text)
     output_requirements = (
         "【输出要求】\n严格输出一个合法JSON对象，顶层结构为"
         '{"logic_audit":{"checked":true,"issues":[{"severity":"critical|major",'
-        '"category":"chronology|causality|character_state|character_location|object_state|object_ownership|spatial_state|pronoun_reference|knowledge_permission",'
+        '"category":"chronology|causality|character_state|character_location|object_state|object_ownership|spatial_state|pronoun_reference|knowledge_permission|numeric_consistency|entity_relationship|fact_boundary",'
         '"earlier_quote":"较早的正文逐字原文","later_quote":"较晚的正文逐字原文","explanation":"两种状态为何不能同时成立"}]},'
         '"prose_review":{"checked":true,"issues":["仅记录可逐字定位的读感问题"]},'
         '"repair_patches":[{"before":"正文中唯一出现的原句片段","after":"局部替换文本","reason":"重复说明|流程赘述|机械短碎|局部语言冲突"}],'
         '"outline":"6-10条实际提纲","summary":"本章摘要","key_facts":["事实"],"long_form_memory":{...}}。'
-        "logic_audit只审查最终正文内部已经发生的直接矛盾，不评价文风和剧情选择；checked必须为true。"
+        "logic_audit必须同时检查最终正文内部的直接矛盾，以及正文与【实体称谓与关系边界】之间的明确冲突；不评价文风和剧情选择，checked必须为true。"
         "prose_review只记录有明确原文位置的重复说明、无结果流程赘述、机械短碎或局部语言冲突；"
         "正常留白、剧情选择、文风偏好和现实流程不完整都不是问题。repair_patches通常为空；"
         "只有确实需要修补且before在最终正文中逐字唯一出现时才返回，最多3项。"
@@ -17977,6 +18307,19 @@ def _normalize_long_form_reconciliation_patch(project, patch):
     payload = deepcopy(patch) if isinstance(patch, dict) else {}
     nested = payload.get("replace")
     target = deepcopy(nested) if isinstance(nested, dict) else payload
+
+    # Boundary corrections use the same state collections as a normal memory
+    # update. Normalize plural character_refs before merging; otherwise a
+    # multi-person row would be treated as a third state instead of replacing
+    # the corresponding single-person rows already in the memory patch.
+    if isinstance(target.get("state_patch"), dict):
+        state_payload = _normalize_long_form_state_aliases({
+            "state_patch": target.get("state_patch", {}),
+        })
+        state_payload = _normalize_long_form_character_refs(project, state_payload)
+        target["state_patch"] = state_payload.get(
+            "state_patch", target.get("state_patch", {})
+        )
 
     def first_value(item, keys):
         for key in keys:
@@ -18236,7 +18579,7 @@ def _merge_long_form_memory_reconciliation_patch(memory_update, patch, project=N
             if str(state_patch.get(key, "") or "").strip():
                 current_state[key] = str(state_patch.get(key, "") or "").strip()
         list_keys = {
-            "character_states": lambda item: str(item.get("ref", "") or item.get("character_id", "")).strip(),
+            "character_states": lambda item: "|".join(sorted(_long_form_character_state_refs(item))),
             "relationship_states": lambda item: "|".join(sorted(
                 str(ref or "").strip()
                 for ref in item.get("refs", item.get("characters", []))
@@ -18319,9 +18662,10 @@ def _merge_long_form_memory_reconciliation_patch(memory_update, patch, project=N
     if isinstance(state_patch, dict):
         for item in state_patch.get("character_states", []) if isinstance(state_patch.get("character_states"), list) else []:
             if isinstance(item, dict):
-                value = str(item.get("ref", "") or item.get("character_id", "") or "").strip()
-                if value and value not in reconciliation["character_refs"]:
-                    reconciliation["character_refs"].append(value)
+                for value in _long_form_character_state_refs(item):
+                    value = str(value or "").strip()
+                    if value and value not in reconciliation["character_refs"]:
+                        reconciliation["character_refs"].append(value)
         for item in state_patch.get("relationship_states", []) if isinstance(state_patch.get("relationship_states"), list) else []:
             if isinstance(item, dict):
                 refs = item.get("refs", item.get("characters", []))
@@ -18629,6 +18973,109 @@ def _long_form_same_object_entity(existing, incoming):
     return len(shorter) >= 4 and shorter.casefold() in longer.casefold()
 
 
+def _long_form_object_lore_id(project, item):
+    """Resolve the lore record bound to one object state, if it is explicit."""
+    if not isinstance(item, dict):
+        return ""
+    raw_ref = item.get("lore_ref", "") or item.get("lore_id", "")
+    return _resolve_long_form_record_ref(project, "lore", raw_ref)
+
+
+def _long_form_object_identity_score(project, existing, incoming):
+    """Score a possible object alias without merging ambiguous short names."""
+    existing = existing if isinstance(existing, dict) else {}
+    incoming = incoming if isinstance(incoming, dict) else {}
+    existing_lore = _long_form_object_lore_id(project, existing)
+    incoming_lore = _long_form_object_lore_id(project, incoming)
+    if existing_lore and incoming_lore and existing_lore == incoming_lore:
+        return 100
+
+    def stable_name(value, key=""):
+        text = _compact_text(value)
+        if not text or _long_form_object_name_is_placeholder(text, key):
+            return ""
+        generic = {
+            "物件", "物品", "东西", "东西", "盒子", "匣子", "资料",
+            "文件", "证物", "道具", "东西", "未知物件",
+        }
+        if text in generic or len(text) < 2:
+            return ""
+        return text
+
+    existing_key = str(existing.get("key", "") or "").strip()
+    incoming_key = str(incoming.get("key", "") or "").strip()
+    existing_names = [
+        stable_name(existing.get("name", ""), existing_key),
+        stable_name(existing_key, existing_key),
+    ]
+    incoming_names = [
+        stable_name(incoming.get("name", ""), incoming_key),
+        stable_name(incoming_key, incoming_key),
+    ]
+
+    lore_records = project.get("lore", []) if isinstance(project, dict) else []
+    if existing_lore:
+        lore_record = next(
+            (
+                item for item in lore_records
+                if isinstance(item, dict)
+                and str(item.get("id", "") or "").strip() == existing_lore
+            ),
+            None,
+        )
+        if isinstance(lore_record, dict):
+            existing_names.append(stable_name(lore_record.get("name", "")))
+
+    existing_names = list(dict.fromkeys(value for value in existing_names if value))
+    incoming_names = list(dict.fromkeys(value for value in incoming_names if value))
+    if not existing_names or not incoming_names:
+        return 0
+
+    best = 0
+    for old_name in existing_names:
+        for new_name in incoming_names:
+            if old_name.casefold() == new_name.casefold():
+                best = max(best, 90)
+                continue
+            shorter, longer = sorted((old_name, new_name), key=len)
+            if len(shorter) >= 2 and shorter.casefold() in longer.casefold():
+                # A short alias is safe only when it identifies one existing
+                # object. The caller rejects ties between different objects.
+                best = max(best, 72 + min(len(shorter), 8))
+
+    old_state = _compact_text(existing.get("state", ""))
+    new_state = _compact_text(incoming.get("state", ""))
+    for name in incoming_names:
+        if len(name) >= 2 and name.casefold() in old_state.casefold():
+            best = max(best, 64 + min(len(name), 8))
+    for name in existing_names:
+        if len(name) >= 2 and name.casefold() in new_state.casefold():
+            best = max(best, 64 + min(len(name), 8))
+    return best
+
+
+def _long_form_find_existing_object_key(project, existing_objects, incoming):
+    """Return one unambiguous existing object key for an incoming state row."""
+    if not isinstance(incoming, dict):
+        return ""
+    rows = [item for item in existing_objects if isinstance(item, dict)]
+    if not rows:
+        return ""
+    scored = []
+    for item in rows:
+        key = str(item.get("key", item.get("name", "")) or "").strip()
+        if not key:
+            continue
+        score = _long_form_object_identity_score(project, item, incoming)
+        if score:
+            scored.append((score, key))
+    if not scored:
+        return ""
+    highest = max(score for score, _key in scored)
+    winners = [key for score, key in scored if score == highest]
+    return winners[0] if len(set(winners)) == 1 and highest >= 72 else ""
+
+
 def _next_long_form_object_key(issued_keys, preferred_key=""):
     values = {
         str(value or "").strip()
@@ -18793,7 +19240,7 @@ def _merge_long_form_state_patch(
         if not isinstance(item, dict):
             return None
         lore_id = resolve_record(
-            "lore", item.get("lore_ref", item.get("lore_id", ""))
+            "lore", item.get("lore_ref", "") or item.get("lore_id", "")
         )
         name = str(item.get("name", "") or item.get("key", "")).strip()
         state = str(item.get("state", "") or "").strip()
@@ -18829,6 +19276,19 @@ def _merge_long_form_state_patch(
                 )
             ):
                 value["name"] = previous["name"]
+            else:
+                previous_name = _compact_text(previous.get("name", ""))
+                incoming_name = _compact_text(value.get("name", ""))
+                if (
+                    previous_name
+                    and incoming_name
+                    and previous_name.casefold() != incoming_name.casefold()
+                    and len(incoming_name) < len(previous_name)
+                    and incoming_name.casefold() in previous_name.casefold()
+                ):
+                    # Keep the project's established formal name when a
+                    # later chapter uses a shorter natural alias.
+                    value["name"] = previous["name"]
         object_records[item_key] = value
 
     for item in existing_objects:
@@ -18848,6 +19308,30 @@ def _merge_long_form_state_patch(
         normalized = normalize_object(item)
         if not normalized:
             continue
+        requested_before_alias = object_key(normalized)
+        canonical = _long_form_find_existing_object_key(
+            project, existing_objects, normalized
+        )
+        if canonical and canonical != requested_before_alias:
+            temp_refs.setdefault("objects", {})[requested_before_alias] = canonical
+            normalized["key"] = canonical
+            existing_canonical = next(
+                (
+                    row for row in existing_objects
+                    if isinstance(row, dict)
+                    and str(row.get("key", row.get("name", "")) or "").strip() == canonical
+                ),
+                None,
+            )
+            if isinstance(existing_canonical, dict):
+                if not normalized.get("lore_id") and existing_canonical.get("lore_id"):
+                    normalized["lore_id"] = existing_canonical["lore_id"]
+                if _long_form_object_name_is_placeholder(
+                    normalized.get("name", ""), canonical
+                ):
+                    normalized["name"] = str(
+                        existing_canonical.get("name", "") or canonical
+                    ).strip()
         requested_key = object_key(normalized)
         if not requested_key:
             continue
@@ -20320,6 +20804,7 @@ def _build_chapter_ai_context(project, chapter_index, action):
         current_lines.append(
             "明确事实锁定：章节提纲、已有正文、状态快照与连续性资料中已明确写出的专名、日期、时刻、地点、"
             "房间号、物件编号、金额、关系称谓和条件，正文涉及到时必须逐字继承；未明确具体值的内容才可自然补足。"
+            "简称只用于自然表达，不新增实体或关系；资料没有明确的家族、势力、联盟或联姻含义时，不要自行补全。"
         )
     current_lines.append(f"正文草稿：{_clip_context_text(chap.get('text', ''), current_text_limit, keep_tail=True)}")
     if reverse_from_body:

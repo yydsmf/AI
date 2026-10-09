@@ -4,7 +4,6 @@ import hashlib
 import re
 import json
 import time
-import random
 import traceback
 import uuid
 from copy import deepcopy
@@ -104,6 +103,7 @@ from .novel_storage import (
 from .novel_utils import (
     CHAPTER_ANALYSIS_HASH_VERSION,
     IMPORT_TYPE_OPTIONS,
+    LORE_TYPE_OPTIONS,
     NOVEL_AI_CONTEXT_LIMIT,
     STYLE_CARD_CACHE_VERSION,
     STYLE_SHEET_CACHE_VERSION,
@@ -188,6 +188,7 @@ from .novel_utils import (
     _volume_two_framework_template_text,
     _normalize_semantic_style_archive,
     _normalize_project,
+    _entity_naming_guidance,
     _strip_static_foreshadow_outline_fields,
     _strip_volume_handoff_outline_metadata,
     _project_without_private_notes,
@@ -251,6 +252,32 @@ NOVEL_PERF_LOG_ENABLED = str(os.environ.get("GPT_NOVEL_PERF_LOG", "") or "").str
     "yes",
     "on",
 }
+
+# Every request in the chapter-writing workflow shares one stage-level retry
+# budget. The initial request is followed by at most three retries.
+_CHAPTER_AI_RETRY_DELAYS = (10, 20, 30)
+_CHAPTER_AI_MAX_RETRIES = len(_CHAPTER_AI_RETRY_DELAYS)
+_CHAPTER_AI_RETRY_STAGES = frozenset(
+    {
+        "context_build",
+        "draft",
+        "style_profile",
+        "style_baseline",
+        "style_sheet",
+        "style_sheet_merge",
+        "style_persona",
+        "style_cards",
+        "style_rules",
+        "style_audit",
+        "style_rewrite",
+        "style_plot_extract",
+        "style_finalize",
+        "memory_finalize",
+        "memory_repair",
+        "logic_repair",
+        "memory_reconcile",
+    }
+)
 
 
 class QInputDialog(_QtInputDialog):
@@ -3255,7 +3282,7 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
         self._setup_form(form)
         self.lore_name = QLineEdit()
         self.lore_type = WideComboBox()
-        self.lore_type.addItems(["地点", "势力", "物品", "规则", "术语", "事件", "其他"])
+        self.lore_type.addItems(LORE_TYPE_OPTIONS)
         self.lore_desc = PlainTextEdit()
         self._wide_field(self.lore_name)
         self._wide_field(self.lore_type)
@@ -4605,7 +4632,13 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
                 return
             lore = self.current_project["lore"][row]
             self.lore_name.setText(lore.get("name", ""))
-            idx = self.lore_type.findText(lore.get("type", "地点"))
+            lore_type = str(lore.get("type", "地点") or "地点").strip() or "地点"
+            idx = self.lore_type.findText(lore_type)
+            if idx < 0:
+                # Preserve a legacy/custom type instead of silently changing
+                # the stored record to the first visible option.
+                self.lore_type.addItem(lore_type)
+                idx = self.lore_type.findText(lore_type)
             self.lore_type.setCurrentIndex(idx if idx >= 0 else 0)
             self.lore_desc.setPlainText(lore.get("description", ""))
             self.current_lore_index = row
@@ -8655,6 +8688,7 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
                 "stage_boundary_rule": "当前阶段的事件、人物、关系和后果在本阶段自然展开，下一阶段承接上一阶段留下的变化继续发展。",
                 "material_rule": "项目资料是只读事实底稿，不重新生成，不把背景资料自动变成章节任务。",
             },
+            "entity_naming_guidance": _entity_naming_guidance(project),
             "target": {
                 "target_words": int(target_words or 0),
                 "average_chapter_words": int(average_chapter_words or 0),
@@ -8864,6 +8898,8 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
                 "创作意图、阶段边界、人物关系和结尾方向已经确认，优先沿用它们；"
                 "宏观节奏只作参考，不新增全书总规划，不提前解释后续阶段。"
                 "每章都要留下可承接的具体结果，下一章从新反应、新结果或新阻力继续。\n"
+                "entity_naming_guidance 是当前项目的正式称谓和实体关系边界，优先于模型自行压缩出的简称；"
+                "涉及人物集合、组织集合和势力集合时，必须保留实体类型，不要把人数简称写成组织名称。\n"
                 + _story_conflict_pacing_guidance()
                 + _procedural_plot_guard_guidance()
                 + "状态变化要落到人物正在经历的场景、行动和后果，不把同一句状态连续复制到多章。"
@@ -10999,6 +11035,23 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
                         editor = getattr(self, attr_name, None)
                         if editor is not None:
                             editor.setPlainText(str(chapter.get(field, "") or ""))
+                context_chapter_id = str(chapter_id or self._current_chapter_id())
+                retry_scheduled = self._schedule_transient_chapter_ai_retry(
+                    "context_build",
+                    str(exc),
+                    force_retry=True,
+                    retry_context="context_build",
+                    retry_chapter_id=context_chapter_id,
+                    retry_callback=lambda: self._start_chapter_context_build(
+                        action,
+                        mode,
+                        project_snapshot=None,
+                        chapter_index=chapter_index,
+                        chapter_id=context_chapter_id,
+                        rewrite_on_ready=rewrite_on_ready,
+                        status_text=status_text,
+                    ),
+                )
                 self._log_novel_diagnostic(
                     "chapter_ai_context_build_failed",
                     level="error",
@@ -11007,6 +11060,8 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
                     error_category="context_build",
                     **self._novel_exception_details(exc),
                 )
+                if retry_scheduled:
+                    return False
                 if getattr(self, "_auto_expand_all_active", False):
                     self._stop_auto_expand_all(
                         f"自动扩写已停止：第{self.current_chapter_index + 1}章上下文组装失败。"
@@ -11017,9 +11072,11 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
             if mode == "style_draft":
                 chapters = self.current_project.get("chapters", [])
                 chapter = chapters[self.current_chapter_index]
+                self._clear_transient_chapter_ai_retry("context_build")
                 self._mark_current_chapter_ai_sync_pending(chapter)
                 self._start_style_locked_draft(context)
             else:
+                self._clear_transient_chapter_ai_retry("context_build")
                 self._start_chapter_ai_worker(action, context, status_text)
             return True
 
@@ -11058,7 +11115,36 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
         worker.result_ready.connect(self._on_chapter_context_ready)
         worker.failed.connect(self._on_chapter_context_failed)
         worker.finished.connect(self._cleanup_chapter_context_worker)
-        worker.start()
+        try:
+            worker.start()
+        except Exception as exc:
+            self.context_build_worker = None
+            retry_scheduled = self._schedule_transient_chapter_ai_retry(
+                "context_build",
+                str(exc),
+                force_retry=True,
+                retry_context="context_build",
+                retry_chapter_id=target_id,
+                retry_callback=lambda: self._start_chapter_context_build(
+                    action,
+                    mode,
+                    project_snapshot=None,
+                    chapter_index=index,
+                    chapter_id=target_id,
+                    rewrite_on_ready=rewrite_on_ready,
+                    status_text=status_text,
+                ),
+            )
+            if not retry_scheduled:
+                raise
+            self._log_novel_diagnostic(
+                "chapter_context_worker_start_failed",
+                level="error",
+                action=action,
+                chapter_id=target_id,
+                error_category="context_build",
+                **self._novel_exception_details(exc),
+            )
         return True
 
     def _context_build_target_is_current(self, pending):
@@ -11080,6 +11166,10 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
             self._set_chapter_ai_actions_enabled(True)
             self.set_status_tip("章节或项目已切换，旧章节资料已丢弃，不会写入当前项目。")
             return
+        self._clear_transient_chapter_ai_retry(
+            "context_build",
+            chapter_id=str(pending.get("chapter_id", "") or ""),
+        )
         elapsed_ms = (time.perf_counter() - float(pending.get("started_at", 0.0) or 0.0)) * 1000
         self._log_novel_diagnostic(
             "chapter_context_built_in_background",
@@ -11117,6 +11207,25 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
         if str(token or "") != str(pending.get("token", "") or ""):
             return
         self._context_build_pending = {}
+        target_chapter_id = str(
+            pending.get("chapter_id", "") or chapter_id or self._current_chapter_id()
+        )
+        retry_scheduled = self._schedule_transient_chapter_ai_retry(
+            "context_build",
+            str(error),
+            force_retry=True,
+            retry_context="context_build",
+            retry_chapter_id=target_chapter_id,
+            retry_callback=lambda: self._start_chapter_context_build(
+                action,
+                str(pending.get("mode", "direct") or "direct"),
+                project_snapshot=None,
+                chapter_index=int(pending.get("chapter_index", -1) or -1),
+                chapter_id=target_chapter_id,
+                rewrite_on_ready=bool(pending.get("rewrite_on_ready", False)),
+                status_text=str(pending.get("status_text", "") or ""),
+            ),
+        )
         self._log_novel_diagnostic(
             "chapter_ai_context_build_failed",
             level="error",
@@ -11125,6 +11234,8 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
             error_category="context_build",
             **self._novel_exception_details(error),
         )
+        if retry_scheduled:
+            return
         if getattr(self, "_auto_expand_all_active", False):
             self._stop_auto_expand_all(
                 f"自动扩写已停止：第{int(pending.get('chapter_index', 0) or 0) + 1}章上下文组装失败。"
@@ -12510,7 +12621,9 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
         except Exception as e:
             log_debug("小说文风画像持久化失败", e)
 
-    def _start_style_candidate_finalize(self, candidate, rescue=False, gate_errors=None):
+    def _start_style_candidate_finalize(
+        self, candidate, rescue=False, gate_errors=None, transient_retry=False
+    ):
         self._chapter_ai_style_candidate = str(candidate or "").strip()
         self._chapter_ai_style_finalize_count = int(
             getattr(self, "_chapter_ai_style_finalize_count", 0) or 0
@@ -12562,11 +12675,13 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
                 ],
                 candidate_chars=len(self._chapter_ai_style_candidate),
             )
+        worker_kwargs = {"transient_retry": True} if transient_retry else {}
         self._start_chapter_ai_worker(
             "style_finalize",
             finalize_context,
             "正文存在严重偏差，正在执行一次终稿补救..." if rescue else
             "正文已生成，正在专门审校并修订正文终稿...",
+            **worker_kwargs,
         )
 
     @staticmethod
@@ -13203,7 +13318,13 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
             self._persist_ai_generation_state()
         return True
 
-    def _start_memory_finalize(self, final_text, resumed=False, prose_patch_applied=False):
+    def _start_memory_finalize(
+        self,
+        final_text,
+        resumed=False,
+        prose_patch_applied=False,
+        transient_retry=False,
+    ):
         text = str(final_text or "").strip()
         if not text:
             self._fail_memory_sync("正文终稿为空，无法整理章节状态")
@@ -13273,10 +13394,12 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
             if resumed else
             "正文已完成，正在整理摘要、关键事实、长期状态并检查本章读感..."
         )
+        worker_kwargs = {"transient_retry": True} if transient_retry else {}
         self._start_chapter_ai_worker(
             "memory_finalize",
             context,
             status_text,
+            **worker_kwargs,
         )
 
     def _start_memory_reconciliation(self, final_text, bundle, resumed=False):
@@ -13393,6 +13516,12 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
             correction_count=len(corrections),
         )
         if not parsed.get("parsed"):
+            if self._schedule_transient_chapter_ai_retry(
+                "memory_reconcile",
+                "边界语义对账结果无法解析",
+                force_retry=True,
+            ):
+                return
             self._apply_memory_reconciliation_fallback("边界语义对账结果无法解析")
             return
         original_bundle = deepcopy(pending.get("bundle", {})) if isinstance(pending.get("bundle"), dict) else {}
@@ -13423,6 +13552,12 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
                 bundle_summary=self._novel_memory_bundle_summary(bundle),
                 state_before=self._novel_memory_state_summary(),
             )
+            if self._schedule_transient_chapter_ai_retry(
+                "memory_reconcile",
+                "对账纠错补丁未通过完整校验：" + "；".join(errors),
+                force_retry=True,
+            ):
+                return
             self._apply_memory_reconciliation_fallback(
                 "对账纠错补丁未通过完整校验，已保留原状态包等待下次对账：" + "；".join(errors)
             )
@@ -13432,6 +13567,7 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
             chapter = chapters[self.current_chapter_index]
             chapter["memory_reconciliation_status"] = "complete"
             chapter["memory_reconciliation_error"] = ""
+        self._clear_transient_chapter_ai_retry("memory_reconcile")
         mode = str(pending.get("mode", "style") or "style")
         self._chapter_ai_memory_pending = {}
         if mode == "summary":
@@ -13491,6 +13627,12 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
                 package_summary=self._novel_memory_bundle_summary(bundle),
                 resume_required=True,
             )
+            if self._schedule_transient_chapter_ai_retry(
+                "memory_finalize",
+                "独立状态整理结果无法解析（JSON格式错误）",
+                force_retry=True,
+            ):
+                return
             self._fail_memory_sync("独立状态整理结果无法解析（JSON格式错误）")
             return
         package_summary = self._novel_memory_bundle_summary(bundle)
@@ -13527,6 +13669,12 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
                 package_summary=package_summary,
                 resume_required=True,
             )
+            if self._schedule_transient_chapter_ai_retry(
+                "memory_finalize",
+                "独立状态整理结果为空，已保留正文并等待下次状态整理",
+                force_retry=True,
+            ):
+                return
             self._fail_memory_sync("独立状态整理结果为空，已保留正文并等待下次状态整理")
             return
         audit_errors = _chapter_logic_audit_validation_errors(
@@ -13537,6 +13685,7 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
         # its derived state bundle: the repair may change the evidence that
         # supports the summary and long-form memory update.
         if logic_issues:
+            self._clear_transient_chapter_ai_retry("memory_finalize")
             self._start_chapter_logic_repair(final_text, bundle, logic_issues)
             return
         bundle_errors = self._memory_bundle_validation_errors(final_text, bundle)
@@ -13553,6 +13702,19 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
                 audit_error_count=len(audit_errors),
                 bundle_error_count=len(bundle_errors),
             )
+            if self._schedule_transient_chapter_ai_retry(
+                "memory_finalize",
+                "状态整理结果未通过校验：" + "；".join(validation_errors),
+                force_retry=True,
+                retry_callback=lambda: self._start_memory_finalize(
+                    final_text,
+                    resumed=True,
+                    prose_patch_applied=bool(pending.get("prose_patch_applied")),
+                    transient_retry=True,
+                ),
+            ):
+                return
+            self._clear_transient_chapter_ai_retry("memory_finalize")
             self._start_memory_repair(final_text, bundle, validation_errors, "style")
             return
         patches = bundle.get("repair_patches", [])
@@ -13569,6 +13731,7 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
                     after_chars=len(repaired_text),
                 )
                 self.chapter_ai_preview.setPlainText(repaired_text)
+                self._clear_transient_chapter_ai_retry("memory_finalize")
                 self._start_memory_finalize(repaired_text, prose_patch_applied=True)
                 return
             self._log_novel_diagnostic(
@@ -13578,9 +13741,20 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
                 patch_count=len(patches),
                 validation_errors=patch_errors,
             )
+            if patch_errors:
+                if self._schedule_transient_chapter_ai_retry(
+                    "memory_finalize",
+                    "正文修复补丁校验失败：" + "；".join(patch_errors),
+                    force_retry=True,
+                ):
+                    return
+                self._fail_memory_sync("正文修复补丁校验失败：" + "；".join(patch_errors))
+                return
         if (self.current_chapter_index + 1) % 10 == 0 and not pending.get("reconciliation_started"):
+            self._clear_transient_chapter_ai_retry("memory_finalize")
             self._start_memory_reconciliation(final_text, bundle)
             return
+        self._clear_transient_chapter_ai_retry("memory_finalize")
         self._chapter_ai_memory_pending = {}
         self.chapter_ai_preview.setPlainText(final_text)
         self._apply_style_final_result(final_text, bundle, memory_validated=True)
@@ -13617,7 +13791,14 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
         errors.extend(update_errors)
         return errors
 
-    def _start_memory_repair(self, final_text, bundle, validation_errors=None, mode="style"):
+    def _start_memory_repair(
+        self,
+        final_text,
+        bundle,
+        validation_errors=None,
+        mode="style",
+        transient_retry=False,
+    ):
         previous_pending = getattr(self, "_chapter_ai_memory_pending", {})
         logic_audit_required = bool(
             previous_pending.get("logic_audit_required", False)
@@ -13671,14 +13852,18 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
         )
         self.chapter_ai_preview.setPlainText(str(final_text or "").strip())
         self.chapter_ai_stream_text = ""
+        worker_kwargs = {"transient_retry": True} if transient_retry else {}
         self._start_chapter_ai_worker(
             "memory_repair",
             context,
             f"正文终稿已保留，状态数据有{len(validation_errors)}项需修复，"
-            f"正在处理（{attempts}/2）...",
+            f"正在处理（阶段重试预算 {_CHAPTER_AI_MAX_RETRIES} 次）...",
+            **worker_kwargs,
         )
 
-    def _start_chapter_logic_repair(self, final_text, bundle, logic_issues):
+    def _start_chapter_logic_repair(
+        self, final_text, bundle, logic_issues, transient_retry=False
+    ):
         previous_pending = getattr(self, "_chapter_ai_memory_pending", {})
         previous_pending = previous_pending if isinstance(previous_pending, dict) else {}
         attempts = int(getattr(self, "_chapter_ai_logic_repair_attempts", 0) or 0) + 1
@@ -13696,7 +13881,7 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
             "logic_audit_required": True,
             "logic_issues": issues,
         }
-        if attempts > 2 or not issues:
+        if not issues:
             self._fail_memory_sync(
                 "终稿逻辑审查仍发现明确矛盾，已停止自动写入，正文保留在恢复检查点中"
             )
@@ -13728,11 +13913,13 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
         )
         self.chapter_ai_preview.setPlainText(str(final_text or "").strip())
         self.chapter_ai_stream_text = ""
+        worker_kwargs = {"transient_retry": True} if transient_retry else {}
         self._start_chapter_ai_worker(
             "logic_repair",
             context,
             f"终稿审查发现{len(issues)}处有原文证据的逻辑矛盾，"
-            f"正在局部修复（{attempts}/2）...",
+            f"正在局部修复（阶段重试预算 {_CHAPTER_AI_MAX_RETRIES} 次）...",
+            **worker_kwargs,
         )
 
     def _handle_chapter_logic_repair_ready(self, content):
@@ -13752,12 +13939,17 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
         if not parsed.get("parsed"):
             errors.insert(0, "局部逻辑修复结果无法解析")
         if errors:
-            if int(getattr(self, "_chapter_ai_logic_repair_attempts", 0) or 0) < 2:
-                self._start_chapter_logic_repair(
+            if self._schedule_transient_chapter_ai_retry(
+                "logic_repair",
+                "；".join(errors),
+                force_retry=True,
+                retry_callback=lambda: self._start_chapter_logic_repair(
                     final_text,
                     pending.get("bundle", {}),
                     issues,
-                )
+                    transient_retry=True,
+                ),
+            ):
                 return
             self._fail_memory_sync("；".join(errors))
             return
@@ -13772,6 +13964,7 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
             after_chars=len(repaired_text),
         )
         self.chapter_ai_preview.setPlainText(repaired_text)
+        self._clear_transient_chapter_ai_retry("logic_repair")
         self._start_memory_finalize(repaired_text)
 
     def _fail_memory_sync(self, message):
@@ -13931,36 +14124,23 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
             bundle_summary=self._novel_memory_bundle_summary(bundle),
         )
         if not parsed.get("parsed"):
-            parse_signature = hashlib.sha256(
-                json.dumps(
-                    {
-                        "final_text": self._chapter_ai_checkpoint_hash(final_text),
-                        "output": self._chapter_ai_checkpoint_hash(content),
-                        "error": "状态修复结果无法解析（JSON格式错误）",
-                    },
-                    ensure_ascii=False,
-                    sort_keys=True,
-                    separators=(",", ":"),
-                ).encode("utf-8")
-            ).hexdigest()
-            if parse_signature == getattr(
-                self, "_chapter_ai_last_memory_repair_signature", ""
-            ):
-                self._fail_memory_sync("状态修复结果重复且仍无法解析")
-                return
-            self._chapter_ai_last_memory_repair_signature = parse_signature
-            if int(getattr(self, "_chapter_ai_memory_repair_attempts", 0) or 0) < 2:
-                retry_errors = [
-                    str(item) for item in pending.get("errors", []) if str(item or "").strip()
-                ]
-                if "状态修复结果无法解析（JSON格式错误）" not in retry_errors:
-                    retry_errors.insert(0, "状态修复结果无法解析（JSON格式错误）")
-                self._start_memory_repair(
+            retry_errors = [
+                str(item) for item in pending.get("errors", []) if str(item or "").strip()
+            ]
+            if "状态修复结果无法解析（JSON格式错误）" not in retry_errors:
+                retry_errors.insert(0, "状态修复结果无法解析（JSON格式错误）")
+            if self._schedule_transient_chapter_ai_retry(
+                "memory_repair",
+                "状态修复结果无法解析（JSON格式错误）",
+                force_retry=True,
+                retry_callback=lambda: self._start_memory_repair(
                     final_text,
                     bundle,
                     retry_errors,
                     pending.get("mode", "style"),
-                )
+                    transient_retry=True,
+                ),
+            ):
                 return
             self._fail_memory_sync("状态修复结果无法解析（JSON格式错误）")
             return
@@ -14000,35 +14180,18 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
                 audit_error_count=len(audit_errors),
                 bundle_error_count=len(bundle_errors),
             )
-            validation_signature = hashlib.sha256(
-                json.dumps(
-                    {
-                        "final_text": self._chapter_ai_checkpoint_hash(final_text),
-                        "errors": validation_errors,
-                        "bundle": bundle,
-                    },
-                    ensure_ascii=False,
-                    sort_keys=True,
-                    separators=(",", ":"),
-                    default=str,
-                ).encode("utf-8")
-            ).hexdigest()
-            if validation_signature == getattr(
-                self, "_chapter_ai_last_memory_repair_signature", ""
+            if self._schedule_transient_chapter_ai_retry(
+                "memory_repair",
+                "；".join(validation_errors),
+                force_retry=True,
+                retry_callback=lambda: self._start_memory_repair(
+                    final_text,
+                    bundle,
+                    validation_errors,
+                    pending.get("mode", "style"),
+                    transient_retry=True,
+                ),
             ):
-                self._log_novel_diagnostic(
-                    "memory_repair_duplicate_output_stopped",
-                    level="warning",
-                    action="memory_repair",
-                    transaction_id=transaction_id,
-                    validation_errors=validation_errors,
-                    final_text_sha256=self._chapter_ai_checkpoint_hash(final_text),
-                )
-                self._fail_memory_sync("状态修复结果与上次完全相同，已停止重复推理")
-                return
-            self._chapter_ai_last_memory_repair_signature = validation_signature
-            if int(getattr(self, "_chapter_ai_memory_repair_attempts", 0) or 0) < 2:
-                self._start_memory_repair(final_text, bundle, validation_errors, pending.get("mode", "style"))
                 return
             self._fail_memory_sync("；".join(validation_errors))
             return
@@ -14037,6 +14200,7 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
             if pending.get("logic_audit_required") else []
         )
         if logic_issues:
+            self._clear_transient_chapter_ai_retry("memory_repair")
             self._start_chapter_logic_repair(final_text, bundle, logic_issues)
             return
         # A repair response is still a memory-finalize result. At a ten-chapter
@@ -14047,8 +14211,10 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
             (self.current_chapter_index + 1) % 10 == 0
             and not pending.get("reconciliation_started")
         ):
+            self._clear_transient_chapter_ai_retry("memory_repair")
             self._start_memory_reconciliation(final_text, bundle)
             return
+        self._clear_transient_chapter_ai_retry("memory_repair")
         self._chapter_ai_memory_pending = {}
         self.chapter_ai_preview.setPlainText(final_text)
         if pending.get("mode") == "summary":
@@ -14269,7 +14435,19 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
                 error_category=self._novel_diagnostic_error_category(exc),
                 **error_details,
             )
-            raise
+            retry_scheduled = False
+            if (
+                getattr(self, "_chapter_ai_sequence_active", False)
+                or getattr(self, "_auto_expand_all_active", False)
+            ):
+                retry_scheduled = self._schedule_transient_chapter_ai_retry(
+                    action,
+                    error_details["error"],
+                    force_retry=True,
+                )
+            if not retry_scheduled:
+                raise
+            return
         self.writing_worker.diagnostic_request_id = request_id
         self.writing_worker.diagnostic_started_at = diagnostic_started_at
         self.writing_worker.diagnostic_project_path = project_path
@@ -14350,7 +14528,18 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
                 error_category=self._novel_diagnostic_error_category(exc),
                 **error_details,
             )
-            raise
+            retry_scheduled = False
+            if (
+                getattr(self, "_chapter_ai_sequence_active", False)
+                or getattr(self, "_auto_expand_all_active", False)
+            ):
+                retry_scheduled = self._schedule_transient_chapter_ai_retry(
+                    action,
+                    error_details["error"],
+                    force_retry=True,
+                )
+            if not retry_scheduled:
+                raise
 
     @staticmethod
     def _is_transient_chapter_ai_error(err):
@@ -14391,87 +14580,71 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
 
     @staticmethod
     def _transient_chapter_ai_retry_delay(attempt, err=""):
+        """Return the shared chapter-workflow retry delay in seconds."""
+        del err
         attempt = max(1, int(attempt or 1))
-        base_seconds = min(120, 15 * (2 ** (attempt - 1)))
-        retry_after_seconds = 0
-        retry_after_match = re.search(
-            r"retry[-_ ]?after[^\d]*(\d{1,4})",
-            clean_error_text(err).lower(),
-        )
-        if retry_after_match:
-            retry_after_seconds = min(300, int(retry_after_match.group(1)))
-            base_seconds = max(base_seconds, retry_after_seconds)
-        jittered = round(base_seconds * random.uniform(0.85, 1.15))
-        return max(5, retry_after_seconds, min(300, int(jittered)))
+        index = min(attempt, len(_CHAPTER_AI_RETRY_DELAYS)) - 1
+        return int(_CHAPTER_AI_RETRY_DELAYS[index])
 
-    def _schedule_transient_chapter_ai_retry(self, action, err):
-        if not self._is_transient_chapter_ai_error(err):
+    def _schedule_transient_chapter_ai_retry(
+        self,
+        action,
+        err,
+        *,
+        force_retry=False,
+        retry_context="",
+        retry_chapter_id="",
+        retry_callback=None,
+    ):
+        """Schedule one bounded retry for an automatic chapter workflow stage.
+
+        The same stage budget is used for transport failures and for a response
+        that cannot be accepted (empty output, malformed JSON, missing fields,
+        or failed validation).  Callers may provide a callback for stages that
+        are assembled outside ``NovelWritingWorker`` such as context building
+        or a repair response that needs a refreshed prompt.
+        """
+        if not force_retry and not self._is_transient_chapter_ai_error(err):
             return False
         if getattr(self, "_chapter_ai_stop_requested_by_user", False):
             return False
-        context = str(getattr(self, "_chapter_ai_running_context", "") or "")
-        chapter_id = str(getattr(self, "_chapter_ai_running_chapter_id", "") or "")
-        if not action or not context or not chapter_id:
+        action = str(action or "").strip()
+        stage = str(retry_context or action or "").strip()
+        context = str(
+            retry_context if retry_context and retry_context not in _CHAPTER_AI_RETRY_STAGES
+            else getattr(self, "_chapter_ai_running_context", "")
+        )
+        chapter_id = str(
+            retry_chapter_id
+            or getattr(self, "_chapter_ai_running_chapter_id", "")
+            or self._current_chapter_id()
+            or ""
+        )
+        if stage not in _CHAPTER_AI_RETRY_STAGES:
+            return False
+        if not callable(retry_callback) and (not action or not context or not chapter_id):
+            return False
+        if callable(retry_callback) and not chapter_id:
             return False
         retry_counts = getattr(self, "_chapter_ai_transient_retry_counts", None)
         if not isinstance(retry_counts, dict):
             retry_counts = {}
             self._chapter_ai_transient_retry_counts = retry_counts
-        retry_key = f"{chapter_id}:{action}"
-        structural_draft_retry = (
-            action == "draft"
-            and "剧情执行稿结构不完整" in clean_error_text(err)
-        )
-        empty_output_retry = "没有返回有效内容" in clean_error_text(err)
-        oversized_output_retry = "输出异常膨胀" in clean_error_text(err)
-        # Bounded format fallbacks have independent allowances. Network
-        # attempts from the same chapter step must not consume them.
-        retry_kind = (
-            "structural_draft" if structural_draft_retry
-            else "empty_output" if empty_output_retry
-            else "oversized_output" if oversized_output_retry
-            else "default"
-        )
-        retry_count_key = (
-            f"{retry_key}:{retry_kind}" if retry_kind != "default" else retry_key
-        )
-        attempt = int(retry_counts.get(retry_count_key, 0) or 0) + 1
-        max_retries = 1 if (
-            action in {"memory_repair", "logic_repair"}
-            or structural_draft_retry
-            or empty_output_retry
-            or oversized_output_retry
-        ) else 4
+        retry_key = f"{chapter_id}:{stage}"
+        attempt = int(retry_counts.get(retry_key, 0) or 0) + 1
+        max_retries = _CHAPTER_AI_MAX_RETRIES
         if attempt > max_retries:
             return False
-        retry_counts[retry_count_key] = attempt
-        delay_seconds = (
-            5 if structural_draft_retry
-            else self._transient_chapter_ai_retry_delay(attempt, err)
-        )
+        retry_counts[retry_key] = attempt
+        delay_seconds = self._transient_chapter_ai_retry_delay(attempt, err)
         status_text = str(getattr(self, "_chapter_ai_running_status_text", "") or "")
         self._chapter_ai_transient_retry_pending = True
         token = int(getattr(self, "_chapter_ai_transient_retry_token", 0) or 0) + 1
         self._chapter_ai_transient_retry_token = token
-        if structural_draft_retry:
-            self.set_status_tip(
-                f"AI 返回的剧情执行稿不完整，已丢弃半成品；{delay_seconds} 秒后整章重试"
-                f"（{attempt}/{max_retries}）..."
-            )
-        elif empty_output_retry:
-            self.set_status_tip(
-                f"厂商返回空内容，已丢弃本次结果；{delay_seconds} 秒后自动重试当前步骤"
-                f"（{attempt}/{max_retries}）..."
-            )
-        elif oversized_output_retry:
-            self.set_status_tip(
-                f"厂商状态返回异常过长，已中止并丢弃；{delay_seconds} 秒后自动重试状态整理"
-                f"（{attempt}/{max_retries}）..."
-            )
-        else:
-            self.set_status_tip(
-                f"AI 上游暂时异常，{delay_seconds} 秒后自动重试当前步骤（{attempt}/{max_retries}）..."
-            )
+        self.set_status_tip(
+            f"当前步骤未通过，已丢弃本次结果；{delay_seconds} 秒后自动重试"
+            f"（{attempt}/{max_retries}）..."
+        )
 
         def retry():
             if token != int(getattr(self, "_chapter_ai_transient_retry_token", 0) or 0):
@@ -14490,7 +14663,11 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
                 self.set_status_tip("章节已切换，已取消上一个章节的自动重试。")
                 self._set_chapter_ai_actions_enabled(True)
                 return
-            if action.startswith("style_") and not getattr(self, "_chapter_ai_style_workflow_active", False):
+            if (
+                not callable(retry_callback)
+                and action.startswith("style_")
+                and not getattr(self, "_chapter_ai_style_workflow_active", False)
+            ):
                 self._chapter_ai_transient_retry_pending = False
                 return
             worker = getattr(self, "writing_worker", None)
@@ -14498,19 +14675,23 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
                 QTimer.singleShot(500, retry)
                 return
             self._chapter_ai_transient_retry_pending = False
-            self._start_chapter_ai_worker(
-                action,
-                context,
-                f"正在自动重试当前步骤（{attempt}/{max_retries}）..." if not status_text else
-                f"{status_text.rstrip('。.')}，自动重试 {attempt}/{max_retries}...",
-                transient_retry=True,
-            )
+            if callable(retry_callback):
+                retry_callback()
+            else:
+                self._start_chapter_ai_worker(
+                    action,
+                    context,
+                    f"正在自动重试当前步骤（{attempt}/{max_retries}）..." if not status_text else
+                    f"{status_text.rstrip('。.')}，自动重试 {attempt}/{max_retries}...",
+                    transient_retry=True,
+                )
 
         QTimer.singleShot(delay_seconds * 1000, retry)
         self._log_novel_diagnostic(
             "chapter_ai_retry_scheduled",
             level="warning",
             action=action,
+            retry_stage=stage,
             chapter_id=chapter_id,
             request_id=str(getattr(self, "_chapter_ai_diagnostic_request_id", "") or ""),
             retry_attempt=attempt,
@@ -14521,13 +14702,15 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
         )
         return True
 
-    def _clear_transient_chapter_ai_retry(self, action):
-        chapter_id = str(getattr(self, "_chapter_ai_running_chapter_id", "") or "")
+    def _clear_transient_chapter_ai_retry(self, action, chapter_id="", stage=""):
+        chapter_id = str(
+            chapter_id or getattr(self, "_chapter_ai_running_chapter_id", "") or ""
+        )
         retry_counts = getattr(self, "_chapter_ai_transient_retry_counts", None)
         if isinstance(retry_counts, dict) and chapter_id and action:
-            retry_key = f"{chapter_id}:{action}"
+            retry_key = f"{chapter_id}:{stage or action}"
             for key in list(retry_counts):
-                if key == retry_key or key.startswith(retry_key + ":"):
+                if key == retry_key:
                     retry_counts.pop(key, None)
         self._chapter_ai_transient_retry_pending = False
         self._chapter_ai_transient_retry_token = int(
@@ -14668,7 +14851,7 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
             if stage == "memory_repair":
                 # Retry the failed request in the same logical repair slot; do
                 # not reset the validation budget or create an automatic loop.
-                resume_attempt = stored_attempt if 0 < stored_attempt <= 2 else 0
+                resume_attempt = stored_attempt if 0 < stored_attempt <= _CHAPTER_AI_MAX_RETRIES else 0
                 self._chapter_ai_memory_repair_attempts = max(0, resume_attempt - 1)
                 self._start_memory_repair(
                     final_text,
@@ -14677,9 +14860,9 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
                     self._chapter_ai_memory_pending["mode"],
                 )
             else:
-                # A terminal third-attempt checkpoint is only retried after
-                # this explicit user action, with a fresh two-attempt budget.
-                resume_attempt = stored_attempt if 0 < stored_attempt <= 2 else 0
+                # Resume the same three-retry stage budget after an explicit
+                # user restart; do not silently create a separate allowance.
+                resume_attempt = stored_attempt if 0 < stored_attempt <= _CHAPTER_AI_MAX_RETRIES else 0
                 self._chapter_ai_logic_repair_attempts = max(0, resume_attempt - 1)
                 self._start_chapter_logic_repair(
                     final_text,
@@ -15136,7 +15319,6 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
     def on_chapter_ai_ready(self, action, content):
         if not self._chapter_ai_callback_is_current():
             return
-        self._clear_transient_chapter_ai_retry(action)
         self.set_chapter_ai_panel_expanded(True)
         raw_final_text = str(content or "").strip() or self.chapter_ai_stream_text.strip()
         resume_prefix = getattr(self, "_chapter_ai_resume_prefix", "") if action == "draft" else ""
@@ -15207,6 +15389,7 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
         if action in {"style_baseline", "style_sheet", "style_sheet_merge", "style_persona", "style_cards"} and getattr(
             self, "_chapter_ai_style_workflow_active", False
         ):
+            self._clear_transient_chapter_ai_retry(action)
             entry = self._chapter_ai_style_cache_entry if isinstance(self._chapter_ai_style_cache_entry, dict) else {}
             units = entry.get("units", []) if isinstance(entry.get("units"), list) else []
             index = int(getattr(self, "_chapter_ai_style_build_unit_index", -1) or 0)
@@ -15234,6 +15417,7 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
             self._continue_style_profile_build()
             return
         if action == "style_profile" and getattr(self, "_chapter_ai_style_workflow_active", False):
+            self._clear_transient_chapter_ai_retry(action)
             self._chapter_ai_style_profile = final_text
             self._chapter_ai_style_combined_sheet = final_text
             reference_hash = hashlib.sha256(self._chapter_ai_style_reference.encode("utf-8")).hexdigest()
@@ -15243,6 +15427,7 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
             self._start_style_profiled_draft()
             return
         if action == "style_rules" and getattr(self, "_chapter_ai_style_workflow_active", False):
+            self._clear_transient_chapter_ai_retry(action)
             self._chapter_ai_style_rules = final_text
             self._start_style_draft_with_rules()
             return
@@ -15254,12 +15439,44 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
             self._chapter_ai_style_retry_attempted = True
             self._chapter_ai_style_fallback_text = ""
             self.chapter_ai_preview.setPlainText(candidate)
+            self._clear_transient_chapter_ai_retry("draft")
             self._start_memory_finalize(candidate)
             return
         if action == "style_finalize" and getattr(self, "_chapter_ai_style_workflow_active", False):
             bundle = _parse_style_finalize_result(final_text)
             initial = str(getattr(self, "_chapter_ai_style_candidate", "") or "").strip()
             revised = str(bundle.get("text", "") or "").strip()
+            if not bundle.get("parsed"):
+                rescue_candidate = revised or initial
+                if self._schedule_transient_chapter_ai_retry(
+                    "style_finalize",
+                    "终稿审校结果无法解析或缺少验收内容",
+                    force_retry=True,
+                    retry_callback=lambda: self._start_style_candidate_finalize(
+                        rescue_candidate,
+                        rescue=True,
+                        gate_errors=["终稿审校结果无法解析或缺少验收内容"],
+                        transient_retry=True,
+                    ),
+                ):
+                    return
+                self.on_chapter_ai_failed("终稿审校结果无法解析或缺少验收内容")
+                return
+            if not revised and not initial:
+                if self._schedule_transient_chapter_ai_retry(
+                    "style_finalize",
+                    "终稿审校没有返回可用正文",
+                    force_retry=True,
+                    retry_callback=lambda: self._start_style_candidate_finalize(
+                        initial,
+                        rescue=True,
+                        gate_errors=["终稿审校没有返回可用正文"],
+                        transient_retry=True,
+                    ),
+                ):
+                    return
+                self.on_chapter_ai_failed("终稿审校没有返回可用正文")
+                return
             execution = str(getattr(self, "_chapter_ai_style_execution", "") or "").strip()
             selected = (
                 revised or initial
@@ -15331,32 +15548,31 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
                         observations=style_observation_errors,
                         repair_triggered=False,
                     )
-                needs_rescue = bool(hard_errors)
-                if (
-                    needs_rescue
-                    and int(getattr(self, "_chapter_ai_style_finalize_count", 0) or 0) < 2
-                ):
+                self._chapter_ai_style_pending_reasons = list(selected_errors)
+                if hard_errors:
                     rescue_candidate = revised or initial
                     rescue_gate_errors = list(hard_errors)
-                    self._chapter_ai_style_pending_reasons = list(rescue_gate_errors)
-                    if needs_rescue:
-                        self._start_style_candidate_finalize(
+                    if self._schedule_transient_chapter_ai_retry(
+                        "style_finalize",
+                        "终稿验收未通过：" + "；".join(hard_errors[:6]),
+                        force_retry=True,
+                        retry_callback=lambda: self._start_style_candidate_finalize(
                             rescue_candidate,
                             rescue=True,
                             gate_errors=rescue_gate_errors,
-                        )
+                            transient_retry=True,
+                        ),
+                    ):
                         return
-                self._chapter_ai_style_pending_reasons = list(selected_errors)
-                if hard_errors:
                     self.on_chapter_ai_failed(
-                        "终稿硬验收连续两次未通过："
-                        + "；".join(hard_errors[:6])
+                        "终稿硬验收未通过：" + "；".join(hard_errors[:6])
                     )
                     return
             self._chapter_ai_style_final_bundle = bundle
             self._chapter_ai_style_retry_attempted = True
             self._chapter_ai_style_fallback_text = ""
             self.chapter_ai_preview.setPlainText(selected)
+            self._clear_transient_chapter_ai_retry("style_finalize")
             self._start_memory_finalize(selected)
             return
         if self._maybe_retry_draft_for_style(action, final_text):
@@ -15379,6 +15595,7 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
         }
         target = target_map.get(action)
         if target:
+            self._clear_transient_chapter_ai_retry(action)
             self._set_partial_chapter_ai_preview_state(False)
             self._chapter_ai_resume_prefix = ""
             if getattr(self, "_chapter_ai_sequence_active", False):
@@ -15434,7 +15651,20 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
         )
         retry_scheduled = False
         try:
+            automatic_stage_retry = bool(
+                action in _CHAPTER_AI_RETRY_STAGES
+                and (
+                    sequence_active
+                    or getattr(self, "_auto_expand_all_active", False)
+                )
+            )
             retry_scheduled = self._schedule_transient_chapter_ai_retry(action, err)
+            if not retry_scheduled and automatic_stage_retry:
+                retry_scheduled = self._schedule_transient_chapter_ai_retry(
+                    action,
+                    err,
+                    force_retry=True,
+                )
         except Exception as exc:
             self._log_novel_diagnostic(
                 "chapter_ai_retry_scheduler_failed",

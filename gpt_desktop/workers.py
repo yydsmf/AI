@@ -1986,7 +1986,7 @@ class NovelAnalysisWorker(QThread):
             "没有明确全局增量时，project_materials 对应字段请留空字符串，不要为了填满结构写普通流水账。\n"
             "JSON 结构：{\n"
             '  "characters": [{"name":"","role":"","goal":"","secret":"","voice":"","notes":""}],\n'
-            '  "lore": [{"name":"","type":"地点/势力/物品/规则/术语/事件/其他","description":""}],\n'
+            '  "lore": [{"name":"","type":"地点/日常场景/物件/势力/规则/制度/异常线索/物件与规则/势力与制度/地点与异常边界/术语/事件/其他","description":""}],\n'
             '  "foreshadows": [{"name":"","status":"","setup_chapter":"","payoff_chapter":"","description":"","target_code":"","review_action":"","review_reason":"","evidence":""}],\n'
             '  "project_materials": {"bible":"","world_rules":"","timeline":"","summary":""}\n'
             "}\n"
@@ -2042,8 +2042,8 @@ class NovelAnalysisWorker(QThread):
         return 0
 
     def _reasoning_effort_for_request(self):
-        # V2 structured writing tasks expose their action directly; legacy
-        # analysis workers use the progress label (for example 框架分类).
+        # Structured writing tasks expose their action directly; analysis
+        # workers use the progress label (for example 框架分类).
         action = str(getattr(self, "action", "") or "").strip() or self._analysis_progress_label()
         return reasoning_effort_for_model(self.model, self.base_url, action)
 
@@ -3088,7 +3088,7 @@ class NovelCandidatePostprocessWorker(NovelAnalysisWorker):
             "10. 不要把人物备注里的临时内容转写进“本章需继承事实”；章节事实只由正文后的摘要/事实流程负责。\n"
             "JSON 结构：{\n"
             '  "characters": [{"name":"","role":"","goal":"","secret":"","voice":"","notes":""}],\n'
-            '  "lore": [{"name":"","type":"地点/势力/物品/规则/术语/事件/其他","description":""}],\n'
+            '  "lore": [{"name":"","type":"地点/日常场景/物件/势力/规则/制度/异常线索/物件与规则/势力与制度/地点与异常边界/术语/事件/其他","description":""}],\n'
             '  "foreshadows": [{"name":"","status":"","setup_chapter":"","payoff_chapter":"","description":"","target_code":"","review_action":"","review_reason":"","evidence":""}],\n'
             '  "project_materials": {"bible":"","world_rules":"","timeline":"","summary":""}\n'
             "}\n"
@@ -3255,7 +3255,7 @@ class NovelFrameworkImportWorker(NovelAnalysisWorker):
             '"chapter_locations":[{"index":1,"start_line":"L000001","end_line":"L000010","anchor":"","characters":["人物名"]}],'
             '"project_materials":{"bible_sections":{"core_setting":"","reader_promise":"","theme":"","main_conflict":"","relationship_foundation":"","ending_direction":""},"bible":"","world_rules":"","timeline":"","summary":""},'
             '"characters":[{"name":"","role":"","goal":"","secret":"","voice":"","notes":""}],'
-            '"lore":[{"name":"","type":"地点/势力/物品/规则/术语/其他","description":""}],'
+            '"lore":[{"name":"","type":"地点/日常场景/物件/势力/规则/制度/异常线索/物件与规则/势力与制度/地点与异常边界/术语/其他","description":""}],'
             '"progression_systems":[{"name":"","type":"规则","description":""}],'
             '"foreshadows":[{"name":"","status":"未埋","setup_chapter":"","payoff_chapter":"","description":""}],'
             '"framework_analysis":{"foundation_mode":"reuse/supplement/generate","chapter_outline_mode":"reuse/supplement/generate","chapter_outline_count":0,"chapter_outline_missing":[],"missing_fields":[],"reason":"",'
@@ -4418,7 +4418,7 @@ class NovelVolumeFrameworkWorker(NovelFrameworkImportWorker):
             '  "meta":{"title":"","genre":"","style":"","pov":"","target_words":"","status":"草稿","premise":""},\n'
             '  "project_materials":{"bible":"","world_rules":"","timeline":"","summary":""},\n'
             '  "characters":[{"name":"","role":"","goal":"","secret":"","voice":"","notes":""}],\n'
-            '  "lore":[{"name":"","type":"地点/势力/物品/规则/术语/事件/其他","description":""}],\n'
+            '  "lore":[{"name":"","type":"地点/日常场景/物件/势力/规则/制度/异常线索/物件与规则/势力与制度/地点与异常边界/术语/事件/其他","description":""}],\n'
             '  "foreshadows":[{"name":"","status":"未埋/已埋/已回收/无需回收/废弃","setup_chapter":"","payoff_chapter":"","description":"","remaining_secret":""}],\n'
             '  "chapter_plan":{"summary":"","stages":[{"id":"","name":"","start_chapter":0,"end_chapter":0,"events":[{"order":1,"text":""}]}],"chapters":[]}\n'
             "}\n"
@@ -5191,6 +5191,8 @@ class NovelWritingWorker(QThread):
         self._stop_requested = False
         self._response = None
         self.last_response_text = ""
+        self._progress_heartbeat_stop = threading.Event()
+        self._progress_heartbeat_thread = None
         self.diagnostic_request_id = ""
         self.diagnostic_started_at = 0.0
         context_bytes = self.context.encode("utf-8", errors="replace")
@@ -5230,6 +5232,7 @@ class NovelWritingWorker(QThread):
             "finish_reason": "",
             "done_received": False,
             "response_chars": 0,
+            "received_chars": 0,
             "response_sha256": "",
             "outcome": "pending",
             "cancelled_before_headers": False,
@@ -5261,6 +5264,51 @@ class NovelWritingWorker(QThread):
         if self.proxy_mode == "提交和下载":
             return requests_proxies(self.proxy_url)
         return None
+
+    def _progress_heartbeat_text(self, started):
+        elapsed = max(0, int(time.perf_counter() - float(started or 0.0)))
+        minutes, seconds = divmod(elapsed, 60)
+        elapsed_text = f"{minutes}分{seconds:02d}秒" if minutes else f"{seconds}秒"
+        received = int(self.diagnostics.get("received_chars", 0) or 0)
+        content = int(self.diagnostics.get("response_chars", 0) or 0)
+        reasoning = int(self.diagnostics.get("ignored_reasoning_chars", 0) or 0)
+        if self.diagnostics.get("http_status") is None:
+            return f"正在连接上游，等待响应头（已等待{elapsed_text}）..."
+        if received <= 0:
+            return f"上游已连接，正在等待模型首段返回（已等待{elapsed_text}）..."
+        return (
+            f"正在接收上游返回（已接收{received}字符，正文{content}、推理{reasoning}；"
+            f"已等待{elapsed_text}）..."
+        )
+
+    def _start_progress_heartbeat(self, started):
+        self._progress_heartbeat_stop.clear()
+
+        def heartbeat():
+            while not self._progress_heartbeat_stop.wait(5.0):
+                if self._stop_requested or self.isInterruptionRequested():
+                    return
+                try:
+                    received = int(self.diagnostics.get("received_chars", 0) or 0)
+                    if received > 0:
+                        self.output_chars.emit(received)
+                    self.progress.emit(self._progress_heartbeat_text(started))
+                except Exception:
+                    return
+
+        self._progress_heartbeat_thread = threading.Thread(
+            target=heartbeat,
+            name="novel-ai-progress-heartbeat",
+            daemon=True,
+        )
+        self._progress_heartbeat_thread.start()
+
+    def _stop_progress_heartbeat(self):
+        self._progress_heartbeat_stop.set()
+        thread = self._progress_heartbeat_thread
+        self._progress_heartbeat_thread = None
+        if thread is not None and thread is not threading.current_thread():
+            thread.join(timeout=1.0)
 
     def _post_stream_request_interruptibly(self, url, headers, payload):
         """让中止操作可以脱离厂商迟迟不返回响应头的 requests.post。"""
@@ -5716,7 +5764,9 @@ class NovelWritingWorker(QThread):
                 "你是长篇小说连续性总编辑。最终正文是唯一事实来源；独立逐段检查正文并生成实际提纲、摘要、关键事实和版本2长篇记忆增量，"
                 "不得重写正文，不得把原提纲、未来规划、人物秘密或伏笔答案当成已经发生。"
                 "生成状态前必须单独审查正文内部的硬逻辑矛盾，尤其是人物位置与清醒状态、物件撤走后再次出现、"
-                "开合/损毁/持有人互斥、时间因果和代词歧义；只报告有前后逐字原文直接证明的问题，"
+                "开合/损毁/持有人互斥、时间因果、数字前后不一致、人物与组织关系混用、"
+                "把人数简称当成组织名称或把规划内容写成已发生事实，以及代词歧义；"
+                "同时对照【实体称谓与关系边界】检查正文，只有有前后逐字原文或明确资料对照的证据才报告，"
                 "不得把文风、剧情选择或现实流程不完整误报为逻辑错误。"
                 "必须识别所有会影响后文的命名人物行动、伤势与能力边界、关系变化、物件去向、未决任务、"
                 "新线索、证据异常、记录缺失或覆盖、未知来源、责任边界、设施规则、伏笔推进和章节结尾状态。"
@@ -5852,6 +5902,7 @@ class NovelWritingWorker(QThread):
     def run(self):
         started = time.perf_counter()
         full = ""
+        received_chars = 0
         finish_reason = ""
         done_received = False
         first_piece_seen = False
@@ -5871,6 +5922,7 @@ class NovelWritingWorker(QThread):
                 raise Exception("没有可用的章节资料。")
 
             self.progress.emit(self._initial_progress_text())
+            self._start_progress_heartbeat(started)
             url = api_url(self.base_url, "/v1/chat/completions")
             system_prompt = self._action_prompt()
             sent_context = self.context[:NOVEL_AI_CONTEXT_LIMIT]
@@ -6009,7 +6061,13 @@ class NovelWritingWorker(QThread):
                 raise Exception(f"接口错误 {r.status_code}：{extract_api_error(r)}")
 
             r.encoding = "utf-8"
-            for raw_line in r.iter_lines(decode_unicode=False):
+            try:
+                line_iterator = r.iter_lines(chunk_size=1, decode_unicode=False)
+            except TypeError:
+                # Keep compatibility with lightweight test doubles and older
+                # response wrappers that do not expose chunk_size.
+                line_iterator = r.iter_lines(decode_unicode=False)
+            for raw_line in line_iterator:
                 self.diagnostics["sse_lines"] = int(self.diagnostics.get("sse_lines", 0) or 0) + 1
                 if self._stop_requested or self.isInterruptionRequested():
                     break
@@ -6047,9 +6105,11 @@ class NovelWritingWorker(QThread):
                 message = choice.get("message") or {}
                 reasoning_piece = delta.get("reasoning_content") or delta.get("reasoning")
                 if reasoning_piece:
+                    reasoning_piece = str(reasoning_piece)
                     self.diagnostics["ignored_reasoning_chars"] = int(
                         self.diagnostics.get("ignored_reasoning_chars", 0) or 0
-                    ) + len(str(reasoning_piece))
+                    ) + len(reasoning_piece)
+                    received_chars += len(reasoning_piece)
                 piece = (
                     delta.get("content")
                     or delta.get("text")
@@ -6058,6 +6118,9 @@ class NovelWritingWorker(QThread):
                 )
                 if piece:
                     piece = str(piece)
+                    received_chars += len(piece)
+                    self.diagnostics["received_chars"] = received_chars
+                    self.output_chars.emit(received_chars)
                     if json_payload_complete and piece.isspace():
                         self.diagnostics["ignored_trailing_whitespace_chars"] = int(
                             self.diagnostics.get("ignored_trailing_whitespace_chars", 0) or 0
@@ -6083,7 +6146,6 @@ class NovelWritingWorker(QThread):
                                     self.diagnostics.get("ignored_trailing_whitespace_chars", 0) or 0
                                 ) + ignored
                                 full = candidate
-                    self.output_chars.emit(len(full))
                     self.last_response_text = full
                     response_char_limit = self._response_char_limit()
                     if response_char_limit and len(full) > response_char_limit:
@@ -6099,6 +6161,9 @@ class NovelWritingWorker(QThread):
                         "memory_repair", "logic_repair",
                     }:
                         self.chunk.emit(piece)
+                elif reasoning_piece:
+                    self.diagnostics["received_chars"] = received_chars
+                    self.output_chars.emit(received_chars)
 
             content = full.strip()
             self.last_response_text = full
@@ -6150,6 +6215,7 @@ class NovelWritingWorker(QThread):
                 "finish_reason": finish_reason,
                 "done_received": bool(done_received),
                 "response_chars": len(content),
+                "received_chars": int(received_chars),
                 "response_sha256": hashlib.sha256(content.encode("utf-8")).hexdigest(),
                 "elapsed_ms": round((time.perf_counter() - started) * 1000, 1),
                 "finished_at": now_str(),
@@ -6169,6 +6235,7 @@ class NovelWritingWorker(QThread):
                 "finish_reason": finish_reason,
                 "done_received": bool(done_received),
                 "response_chars": len(str(full or "").strip()),
+                "received_chars": int(received_chars),
                 "response_sha256": hashlib.sha256(
                     str(full or "").strip().encode("utf-8")
                 ).hexdigest() if str(full or "").strip() else "",
@@ -6183,6 +6250,7 @@ class NovelWritingWorker(QThread):
             else:
                 self.failed.emit(str(e))
         finally:
+            self._stop_progress_heartbeat()
             self.diagnostics["elapsed_ms"] = round((time.perf_counter() - started) * 1000, 1)
             self._close_network_handles()
 
@@ -6646,11 +6714,15 @@ class NovelChapterPlanWorker(NovelAnalysisWorker):
                 f"最后一项就是第{absolute_end}章。不要返回章节编号、阶段编号、事件编号或任何定位标签，"
                 "章节号和阶段归属由程序根据列表顺序写入；到第"
                 f"{absolute_end}章后立即结束，不安排第{absolute_end + 1}章或任何后续阶段内容。"
+                f"先按全书第{absolute_start}章到第{absolute_end}章建立{self.chapter_count}个固定章节位置，"
+                "再把阶段节点压入这些位置；每一项只对应一个固定位置，节点内容再多也不能新增章节。"
             )
             event_rule = (
                 "当前阶段的剧情节点已经由程序先行安排，输入中的locked_node_schedule提供每个节点的落点范围。"
                 "节点序号不是章节号，章节提纲按节点范围展开，并通过人物行动、关系变化和现场结果完成前后衔接；"
                 "章节outline按照locked_node_schedule在对应范围内落实节点内容。"
+                "locked_node_schedule中每个range是该节点允许使用的固定章节槽位，节点的多个动作、人物反应和结果必须在这些槽位内合并展开；"
+                "节点不能因为包含多个场面就延长范围，不能把一个节点拆成范围外的新章节，也不能把下一个节点提前写入当前节点的槽位。"
                 + locked_schedule_guidance
             )
             output_schema = (

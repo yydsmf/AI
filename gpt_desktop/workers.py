@@ -5191,8 +5191,6 @@ class NovelWritingWorker(QThread):
         self._stop_requested = False
         self._response = None
         self.last_response_text = ""
-        self._progress_heartbeat_stop = threading.Event()
-        self._progress_heartbeat_thread = None
         self.diagnostic_request_id = ""
         self.diagnostic_started_at = 0.0
         context_bytes = self.context.encode("utf-8", errors="replace")
@@ -5264,51 +5262,6 @@ class NovelWritingWorker(QThread):
         if self.proxy_mode == "提交和下载":
             return requests_proxies(self.proxy_url)
         return None
-
-    def _progress_heartbeat_text(self, started):
-        elapsed = max(0, int(time.perf_counter() - float(started or 0.0)))
-        minutes, seconds = divmod(elapsed, 60)
-        elapsed_text = f"{minutes}分{seconds:02d}秒" if minutes else f"{seconds}秒"
-        received = int(self.diagnostics.get("received_chars", 0) or 0)
-        content = int(self.diagnostics.get("response_chars", 0) or 0)
-        reasoning = int(self.diagnostics.get("ignored_reasoning_chars", 0) or 0)
-        if self.diagnostics.get("http_status") is None:
-            return f"正在连接上游，等待响应头（已等待{elapsed_text}）..."
-        if received <= 0:
-            return f"上游已连接，正在等待模型首段返回（已等待{elapsed_text}）..."
-        return (
-            f"正在接收上游返回（已接收{received}字符，正文{content}、推理{reasoning}；"
-            f"已等待{elapsed_text}）..."
-        )
-
-    def _start_progress_heartbeat(self, started):
-        self._progress_heartbeat_stop.clear()
-
-        def heartbeat():
-            while not self._progress_heartbeat_stop.wait(5.0):
-                if self._stop_requested or self.isInterruptionRequested():
-                    return
-                try:
-                    received = int(self.diagnostics.get("received_chars", 0) or 0)
-                    if received > 0:
-                        self.output_chars.emit(received)
-                    self.progress.emit(self._progress_heartbeat_text(started))
-                except Exception:
-                    return
-
-        self._progress_heartbeat_thread = threading.Thread(
-            target=heartbeat,
-            name="novel-ai-progress-heartbeat",
-            daemon=True,
-        )
-        self._progress_heartbeat_thread.start()
-
-    def _stop_progress_heartbeat(self):
-        self._progress_heartbeat_stop.set()
-        thread = self._progress_heartbeat_thread
-        self._progress_heartbeat_thread = None
-        if thread is not None and thread is not threading.current_thread():
-            thread.join(timeout=1.0)
 
     def _post_stream_request_interruptibly(self, url, headers, payload):
         """让中止操作可以脱离厂商迟迟不返回响应头的 requests.post。"""
@@ -5608,6 +5561,11 @@ class NovelWritingWorker(QThread):
                 "\n正文写作要求：让人物的欲望、阻力、选择和后果自然形成推进与情绪变化；"
                 "需要时用具体动作、环境、感官或生活细节承接场景，不设细节数量配额。"
                 "对话要保留人物各自的关注点和潜台词，避免角色互相解释已经知道的事。"
+                "人物先按照当下的目的、关系和情绪接话，再自然传递信息；可以顺着对方的话说，也可以停顿、改口、反问、打断、回避、试探、调侃、施压、让步，或把话题带回自己真正关心的地方。"
+                "让具体措辞、称呼变化、句子长短、停顿、语气词和说话后的动作共同显出情绪变化；语气词只在符合人物当下状态时自然出现，不要为了制造口语感硬塞。"
+                "避免连续使用机械的提问—直接回答—继续提问—继续回答节奏，也不要让所有人物采用同样的短句和接话方式；每次接话都应让关系、现场压力或人物选择发生一点变化。"
+                "人物当场作出的承诺、约定、挑战条件或规则判断，后续要用具体结果或明确原因接住；如果条件没有生效，要让正文交代是哪条规则、权限或意外阻止了它，不能让前后结果无解释地并列。"
+                "人物的姓名、身份、职位、实力层级和称谓要按项目资料保持一致；实力等级或临时称呼不能自行变成正式职位，也不要把人物、家族、势力和婚约关系混为一谈。"
                 "不要写摘要式过场、百科式设定说明、空泛金句、重复句式、同义反复或模板化转折词堆叠。"
                 "网文阅读感随当前项目定位自然形成；具体落笔优先仿写文风档案中的人物声音、信息差、即时反应、关系变化和节奏起伏。"
                 "结尾要来自冲突本身，留下继续读下去的张力。"
@@ -5922,7 +5880,6 @@ class NovelWritingWorker(QThread):
                 raise Exception("没有可用的章节资料。")
 
             self.progress.emit(self._initial_progress_text())
-            self._start_progress_heartbeat(started)
             url = api_url(self.base_url, "/v1/chat/completions")
             system_prompt = self._action_prompt()
             sent_context = self.context[:NOVEL_AI_CONTEXT_LIMIT]
@@ -6161,10 +6118,6 @@ class NovelWritingWorker(QThread):
                         "memory_repair", "logic_repair",
                     }:
                         self.chunk.emit(piece)
-                elif reasoning_piece:
-                    self.diagnostics["received_chars"] = received_chars
-                    self.output_chars.emit(received_chars)
-
             content = full.strip()
             self.last_response_text = full
             stopped = bool(self._stop_requested or self.isInterruptionRequested())
@@ -6250,7 +6203,6 @@ class NovelWritingWorker(QThread):
             else:
                 self.failed.emit(str(e))
         finally:
-            self._stop_progress_heartbeat()
             self.diagnostics["elapsed_ms"] = round((time.perf_counter() - started) * 1000, 1)
             self._close_network_handles()
 

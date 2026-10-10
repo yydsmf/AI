@@ -155,6 +155,7 @@ from .novel_utils import (
     _merge_text_lines_without_duplicates,
     _merge_foreshadow_status,
     _default_project,
+    _default_long_form_memory,
     _foreshadow_list_text,
     _normalize_foreshadow_code,
     _infer_linked_character_names,
@@ -3375,6 +3376,11 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
             )),
             (1, 0, self._ghost_button("删除", self.delete_chapter)),
             (1, 1, self._ghost_button(
+                "重置所有章节",
+                self.reset_all_chapters,
+                "清除所有章节的正文和状态整理，保留章节标题、提纲、阶段、字数和规划关联人物。",
+            )),
+            (2, 0, self._ghost_button(
                 "按章节导出/拆分导出",
                 self.choose_chapter_export_mode,
                 "按现有章节和章节名直接导出，或按目标字数重新拆分并本地快速取名",
@@ -11337,6 +11343,7 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
         chapter["state_reconciliation"] = {}
         chapter["fact_lifecycle_review"] = {}
         chapter["state_lifecycle_review"] = {}
+        chapter["memory_sync_status"] = "pending"
         chapter["memory_revision"] = 0
         chapter["memory_update_hash"] = ""
         chapter["memory_sync_error"] = ""
@@ -11344,6 +11351,7 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
         chapter["memory_reconciliation_status"] = ""
         chapter["memory_reconciliation_error"] = ""
         chapter["ai_generation_checkpoint"] = {}
+        chapter["auto_expand_resume_required"] = False
         chapter["analysis_hash"] = ""
         chapter["analysis_hash_version"] = ""
         chapter["analysis_analyzed_at"] = ""
@@ -11366,6 +11374,169 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
             else:
                 editor.setPlainText("")
         return True
+
+    @staticmethod
+    def _chapter_has_generated_output(chapter):
+        if not isinstance(chapter, dict):
+            return False
+        if any(
+            str(chapter.get(key, "") or "").strip()
+            for key in ("text", "summary", "key_facts")
+        ):
+            return True
+        if str(chapter.get("status", "大纲") or "大纲").strip() in {"写作中", "已完成", "待重写"}:
+            return True
+        if any(
+            chapter.get(key)
+            for key in (
+                "actual_linked_character_ids",
+                "state_delta",
+                "long_term_events",
+                "state_reconciliation",
+                "fact_lifecycle_review",
+                "state_lifecycle_review",
+                "memory_boundary_integrity",
+                "ai_generation_checkpoint",
+                "analysis_hash",
+                "analysis_baseline",
+            )
+        ):
+            return True
+        try:
+            if int(chapter.get("memory_revision", 0) or 0) > 0:
+                return True
+        except (TypeError, ValueError):
+            pass
+        return bool(
+            str(chapter.get("memory_update_hash", "") or "").strip()
+            or bool(chapter.get("auto_expand_resume_required", False))
+        )
+
+    def _chapter_clear_has_active_work(self):
+        if any(
+            bool(getattr(self, name, False))
+            for name in (
+                "_auto_expand_all_active",
+                "_auto_expand_all_waiting_next",
+                "_chapter_ai_sequence_active",
+                "_chapter_ai_transient_retry_pending",
+                "_chapter_plan_auto_active",
+            )
+        ):
+            return True
+        for name in ("writing_worker", "chapter_plan_worker", "context_build_worker"):
+            worker = getattr(self, name, None)
+            if worker is None:
+                continue
+            try:
+                if worker.isRunning():
+                    return True
+            except Exception:
+                continue
+        detached = getattr(self, "_detached_auto_runner", None)
+        if detached is not None and not getattr(self, "_is_detached_auto_runner", False):
+            try:
+                source_path = os.path.abspath(str(getattr(self, "_detached_auto_project_path", "") or ""))
+                current_path = os.path.abspath(str(getattr(self, "current_project_path", "") or ""))
+                if source_path and source_path == current_path and detached._status_has_active_work():
+                    return True
+            except Exception:
+                return True
+        return False
+
+    def reset_all_chapters(self):
+        """Reset all generated chapter results while keeping the chapter plan."""
+        if self._chapter_clear_has_active_work():
+            self.set_status_tip("当前仍有 AI 任务在运行，完成或中止后才能重置章节。")
+            return
+
+        self._flush_current_editors()
+        chapters = self.current_project.get("chapters", []) if isinstance(self.current_project, dict) else []
+        chapters = chapters if isinstance(chapters, list) else []
+        if not chapters:
+            self.set_status_tip("当前项目还没有章节。")
+            return
+
+        generated_count = sum(
+            1
+            for chapter in chapters
+            if self._chapter_has_generated_output(chapter)
+        )
+        if not generated_count:
+            self.set_status_tip("当前没有需要重置的章节内容。")
+            return
+        ret = QMessageBox.question(
+            self,
+            "重置所有章节确认",
+            "确定重置所有章节吗？\n\n"
+            f"将清除 {generated_count} 个章节的正文、摘要、关键事实、状态整理、"
+            "分析缓存、修复检查点和自动扩写恢复标记，并重置长期记忆。\n\n"
+            "章节标题、提纲、阶段、扩写字数和规划关联人物会保留，"
+            "重置后可以从第1章重新扩写。",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if ret != QMessageBox.Yes:
+            return
+
+        project_snapshot = deepcopy(self.current_project)
+        backup_path = ""
+        try:
+            backup_path = unique_project_backup_path(
+                self._project_title() or "未命名小说",
+                "重置所有章节前备份",
+            )
+            save_project_file(backup_path, project_snapshot)
+        except Exception as exc:
+            self._log_novel_diagnostic(
+                "chapter_reset_backup_failed",
+                level="error",
+                chapter_count=len(chapters),
+                error_category="storage",
+                **self._novel_exception_details(exc),
+            )
+            self.set_status_tip("重置未执行：重置前备份失败。")
+            QMessageBox.warning(self, "重置失败", "重置前备份失败，原章节内容未改变。")
+            return
+
+        selected_index = int(getattr(self, "current_chapter_index", -1) or -1)
+        for chapter in chapters:
+            if not isinstance(chapter, dict):
+                continue
+            self._reset_chapter_data_for_ai_rewrite(chapter)
+            chapter["status"] = "大纲"
+        self.current_project["long_form_memory"] = _default_long_form_memory()
+        self.pending_analysis_chapter_ids = []
+        self.failed_analysis_chunks = []
+        self._reload_chapter_list(selected_index)
+
+        self.chapter_ai_preview.clear()
+        self.chapter_ai_stream_text = ""
+        self._chapter_ai_resume_prefix = ""
+        self._set_partial_chapter_ai_preview_state(False)
+        self._reset_chapter_ai_sequence()
+        self._reset_chapter_ai_style_retry()
+        self._note_project_dirty()
+        saved_path = self._save_current_work(
+            "重置所有章节",
+            refresh_project_list=False,
+        )
+        if not saved_path:
+            self.current_project.clear()
+            self.current_project.update(project_snapshot)
+            self._reload_chapter_list(selected_index)
+            self.set_status_tip("重置失败：项目保存失败，已恢复原章节内容。")
+            QMessageBox.warning(self, "重置失败", "项目保存失败，原章节内容已恢复。")
+            return
+
+        self._notify_project_store_changed()
+        self.set_status_tip(
+            f"已重置所有章节，可以从第1章重新扩写。已自动备份为：{os.path.basename(backup_path)}"
+        )
+
+    def clear_current_chapter(self):
+        """Compatibility alias for callers of the previous single-chapter action."""
+        return self.reset_all_chapters()
 
     def _mark_current_chapter_ai_sync_pending(self, chapter):
         if not isinstance(chapter, dict):

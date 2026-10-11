@@ -61,8 +61,9 @@ VOLUME_TWO_FRAMEWORK_TEMPLATE = (
     "身份\n"
     "人物目标\n"
     "隐藏秘密\n"
+    "人物性格/特点\n"
     "语言风格\n"
-    "备注\n"
+    "长期备注\n"
     "设定：\n"
     "名称\n"
     "类型：地点、日常场景、物件、势力、规则、制度、异常线索，以及必要时的物件与规则、势力与制度、地点与异常边界等组合类型\n"
@@ -517,7 +518,21 @@ def _prepare_character_candidate(item, default_notes="AI 分析候选"):
         "role": role,
         "goal": str(item.get("goal", "") or ""),
         "secret": str(item.get("secret", "") or ""),
-        "voice": str(item.get("voice", "") or ""),
+        "personality": str(
+            item.get("personality", "")
+            or item.get("traits", "")
+            or item.get("人物性格", "")
+            or item.get("人物特点", "")
+            or item.get("性格特点", "")
+        ),
+        "voice": str(
+            item.get("voice", "")
+            or item.get("language_style", "")
+            or item.get("speaking_style", "")
+            or item.get("语言风格", "")
+            or item.get("说话风格", "")
+            or item.get("口吻", "")
+        ),
         "notes": notes or default_notes,
     }, None
 
@@ -1339,6 +1354,7 @@ def _new_character(index):
         "role": "",
         "goal": "",
         "secret": "",
+        "personality": "",
         "voice": "",
         "notes": "",
     }
@@ -1427,7 +1443,7 @@ def _merge_character_identity_fields(record, incoming_fields):
         return {}
 
     changed = {}
-    for field in ("role", "goal", "secret", "voice"):
+    for field in ("role", "goal", "secret", "personality", "voice"):
         incoming = str(incoming_fields.get(field, "") or "").strip()
         current = str(record.get(field, "") or "").strip()
         merged = _merge_character_identity_text(current, incoming)
@@ -1453,11 +1469,15 @@ def _character_identity_fields_from_item(item):
         "role": ("role", "identity", "character_role", "身份", "角色定位", "人物身份", "定位"),
         "goal": ("goal", "target", "motive", "motivation", "objective", "目标", "人物目标", "动机", "诉求"),
         "secret": ("secret", "hidden_secret", "private_secret", "秘密", "隐藏秘密", "隐情"),
+        "personality": (
+            "personality", "traits", "character_traits", "character_personality",
+            "人物性格", "人物特点", "性格特点", "人物性格/特点", "性格/特点",
+        ),
         "voice": ("voice", "language_style", "speaking_style", "tone", "语言风格", "说话风格", "口吻", "语气"),
         "notes": ("notes", "说明", "备注", "人物关系", "关系变化"),
     }
     sources = []
-    for key in ("identity_patch", "canon", "fields"):
+    for key in ("identity_patch", "canon", "fields", "patch"):
         value = item.get(key)
         if isinstance(value, dict):
             sources.append(value)
@@ -1468,6 +1488,7 @@ def _character_identity_fields_from_item(item):
         "正文明确的身份",
         "正文明确的目标",
         "正文明确且值得保留的隐情",
+        "正文明确且值得保留的人物性格/特点",
         "正文中足够明显的语言/口吻特征",
         "无证据留空",
         "证据不足留空",
@@ -2109,7 +2130,7 @@ def _normalize_project(data):
         for char in base["characters"]:
             if not str(char.get("id", "") or "").strip():
                 char["id"] = uuid.uuid4().hex
-            for key in ("id", "name", "role", "goal", "secret", "voice", "notes"):
+            for key in ("id", "name", "role", "goal", "secret", "personality", "voice", "notes"):
                 char[key] = _as_text(char.get(key, ""))
             char["notes"] = _strip_internal_candidate_markers(char.get("notes", ""))
     lore = data.get("lore", [])
@@ -2593,10 +2614,11 @@ def _compact_volume_handoff_source_for_request(source, total_limit=VOLUME_HANDOF
         source["records"] = records
         records["characters"] = _compact_volume_handoff_records(
             records.get("characters", []),
-            ("name", "role", "goal", "secret", "voice", "notes"),
+            ("name", "role", "goal", "secret", "personality", "voice", "notes"),
             {
                 "name": int(80 * field_scale), "role": int(80 * field_scale),
                 "goal": int(100 * field_scale), "secret": int(100 * field_scale),
+                "personality": int(80 * field_scale),
                 "voice": int(80 * field_scale), "notes": int(120 * field_scale),
             },
             characters_limit,
@@ -2756,8 +2778,8 @@ def _compact_volume_handoff_for_framework(handoff, total_limit=VOLUME_FRAMEWORK_
     )
     handoff["reusable_characters"] = _compact_volume_handoff_records(
         handoff.get("reusable_characters", []),
-        ("name", "role", "goal", "secret", "voice", "notes"),
-        {"name": 80, "role": 80, "goal": 100, "secret": 100, "voice": 80, "notes": 120},
+        ("name", "role", "goal", "secret", "personality", "voice", "notes"),
+        {"name": 80, "role": 80, "goal": 100, "secret": 100, "personality": 80, "voice": 80, "notes": 120},
         9000,
         minimal_fields=("name", "role", "goal"),
     )
@@ -2826,8 +2848,8 @@ def _compact_volume_handoff_for_framework(handoff, total_limit=VOLUME_FRAMEWORK_
             )
         handoff["reusable_characters"] = _compact_volume_handoff_records(
             handoff.get("reusable_characters", []),
-            ("name", "role", "goal", "secret", "voice", "notes"),
-            {"name": 70, "role": 60, "goal": 70, "secret": 70, "voice": 60, "notes": 80},
+            ("name", "role", "goal", "secret", "personality", "voice", "notes"),
+            {"name": 70, "role": 60, "goal": 70, "secret": 70, "personality": 60, "voice": 60, "notes": 80},
             6000,
             minimal_fields=("name", "role"),
         )
@@ -2903,8 +2925,8 @@ def _enforce_volume_framework_handoff_limit(handoff, total_limit):
     handoff["relationship_states"] = _compact_volume_handoff_text_list(handoff.get("relationship_states", []), 1600, 160)
     handoff["reusable_characters"] = _compact_volume_handoff_records(
         handoff.get("reusable_characters", []),
-        ("name", "role", "goal", "secret", "voice", "notes"),
-        {"name": 60, "role": 50, "goal": 60, "secret": 60, "voice": 50, "notes": 70},
+        ("name", "role", "goal", "secret", "personality", "voice", "notes"),
+        {"name": 60, "role": 50, "goal": 60, "secret": 60, "personality": 50, "voice": 50, "notes": 70},
         4000,
         minimal_fields=("name", "role"),
     )
@@ -3140,7 +3162,7 @@ def _build_volume_handoff_source(project):
     )
 
     character_records = [
-        _volume_handoff_record(item, ("name", "role", "goal", "secret", "voice", "notes"), field_limit=180)
+        _volume_handoff_record(item, ("name", "role", "goal", "secret", "personality", "voice", "notes"), field_limit=180)
         for item in project.get("characters", []) if isinstance(item, dict) and str(item.get("name", "") or "").strip()
     ]
     lore_records = [
@@ -3206,8 +3228,8 @@ def _build_volume_handoff_source(project):
     records = {
         "characters": _compact_volume_handoff_records(
             character_records,
-            ("name", "role", "goal", "secret", "voice", "notes"),
-            {"name": 80, "role": 80, "goal": 100, "secret": 100, "voice": 80, "notes": 120},
+            ("name", "role", "goal", "secret", "personality", "voice", "notes"),
+            {"name": 80, "role": 80, "goal": 100, "secret": 100, "personality": 80, "voice": 80, "notes": 120},
             8000,
             minimal_fields=("name", "role", "goal"),
         ),
@@ -3301,7 +3323,7 @@ def _build_volume_handoff_record_catalog(project):
     characters = [
         _volume_handoff_record(
             item,
-            ("id", "name", "role", "goal", "secret", "voice", "notes"),
+            ("id", "name", "role", "goal", "secret", "personality", "voice", "notes"),
             field_limit=1800,
         )
         for item in project.get("characters", [])
@@ -4451,6 +4473,7 @@ def _active_character_summary_lines(project, limit=12):
             ("身份", "role", 80),
             ("目标", "goal", 120),
             ("秘密", "secret", 100),
+            ("性格/特点", "personality", 100),
             ("语言", "voice", 100),
         ):
             value = _clip_complete_text(char.get(field, ""), clip_limit)
@@ -5126,8 +5149,9 @@ _PROJECT_SEARCH_FIELD_LABELS = {
     "role": "身份",
     "goal": "目标",
     "secret": "秘密",
+    "personality": "性格/特点",
     "voice": "语言",
-    "notes": "备注",
+        "notes": "备注",
     "type": "类型",
     "description": "说明",
     "code": "编号",
@@ -9663,15 +9687,23 @@ def _grounded_prose_contract():
         "人物可以顺着对方的话解释、补充、反问、改口、调侃、试探、施压、让步或转开话题，这些选择由人物目的、关系和现场情绪决定。"
         "句式长短、语气词、称呼变化和说话后的动作随人物身份、关系和情绪自然变化，不要机械添加语气词，也不要让所有人物采用同一种接话方式。"
         "对白要推动关系、现场压力或人物选择继续变化，不让角色互相解释已经知道的事。\n"
+        "人物受到冲突、误解、意外、吸引或关系变化影响时，要写出会改变下一步行为的当下念头、判断或身体感受；"
+        "心理描写和动作、对白交替出现，具体程度随场景需要自然变化。"
+        "不得用解释型旁白替代人物行动，不得替人物总结动机、立场和成长。"
+        "人物表达拒绝、讥讽或不满时，落到眼前的具体对象、安排和后果上，让台词像人物当场说给对方听的话。"
+        "人物反感眼前的说法或安排时，直接落到具体对象、场面和自己是否配合上；允许用人物自己的口语吐槽或拒绝，"
+        "不要把临场态度写成替所有人下判断的抽象命题。\n"
     )
 
 
 def _natural_expression_guidance():
     """Keep prose direct while separating story facts from style imitation."""
     return (
-        _grounded_prose_contract()
-        + "项目资料决定故事事实、人物和剧情；文风参考只决定表达方式，"
-        "不得把参考原文的人物、剧情、物件或句子带入当前正文。"
+        "【正文语言要求】正文必须使用自然的网络小说叙述语言，直接写人物、场景、动作、对白和具体变化；"
+        "不得出现策划术语、抽象形容、办案式表达、编辑式说明或编辑式总结。"
+        "情绪和气氛必须通过人物当下的动作、对白、心理和具体结果表现，不用漂亮形容替代剧情。"
+        "对白按关系和现场情绪自然接话，心理变化随人物自然展开；不得用解释型旁白替代人物行动。"
+        "项目资料决定故事事实、人物和剧情；文风参考只决定表达方式，不把参考原文的人物、剧情、物件或句子带入当前正文。"
     )
 
 
@@ -9695,6 +9727,7 @@ def _build_full_style_imitation_guidance(style_reference):
         "关系与处境自然说话、行动和感受。样本的特色词、口头习惯、接话方式和叙述温度随着人物和场景自然出现，"
         "形成一篇属于当前故事、同时读起来像同一位作者写出的正文。\n"
         + _natural_expression_guidance()
+        + "不得把参考原文的人物、剧情、物件或句子带入当前正文。"
     )
 
 
@@ -12879,8 +12912,8 @@ def _long_form_compact_update_contract_instructions(project, chapter_index):
         "不能因为新增了一条更宽泛的概括而退役精确旧事实；仍有效的精确旧事实必须继续保留。"
         "本章选择索引中未发生变化的已有事实由程序自动保留并生成复核索引，不得为它们输出keep；"
         "fact_updates只提交正文明确新增、更新、退出或取代的事实。"
-        "record_updates只写人物或设定的动态变化。新人物create使用NC/NL临时key并填写稳定名称和canon；人物canon的role、goal、secret、voice、notes逐项只填写最终正文能够支持的内容，不能为了填满字段猜测。人物字段必须独立判断：直接对白足够辨识时必须提取voice；明确争夺资源/机缘、控制或进入地点、保护/排除/追杀/阻止对象、职责或利益诉求时必须提取goal；只有正文明确揭示的隐情才提取secret。不能因为secret无证据而连带留空goal或voice。"
-        "已有人物若正文补出了此前空缺的身份、目标、秘密或语言风格，使用identity_patch逐项补齐；程序保留已有内容，并只追加正文有证据的新补充，不覆盖或替换旧资料。已有姓名未明或临时称谓人物正式命名时，继续沿用原人物ref并用name升级同一ID。"
+        "record_updates只写人物或设定的动态变化。新人物create使用NC/NL临时key并填写稳定名称和canon；人物canon的role、goal、secret、personality、voice、notes逐项只填写最终正文能够支持的内容，不能为了填满字段猜测。人物字段必须独立判断：直接对白足够辨识时必须提取voice；正文明确呈现出可长期保留的性格变化时才提取personality；明确争夺资源/机缘、控制或进入地点、保护/排除/追杀/阻止对象、职责或利益诉求时必须提取goal；只有正文明确揭示的隐情才提取secret。personality和voice都只保留能够迁移到其它场景的长期特点，notes只保留稳定关系底色、长期身份变化或后文必须继承的资料；固定笑点、固定口头禅、固定动作套路、具体食物/道具/地点、某章行为、出场桥段、一次性反应和临时情绪不得写入人物卡。不能因为secret无证据而连带留空goal、personality或voice。"
+        "已有人物若正文补出了此前空缺的身份、目标、秘密、人物性格/特点或语言风格，使用identity_patch逐项补齐；程序保留已有内容，并只追加正文有证据的新补充，不覆盖或替换旧资料。已有姓名未明或临时称谓人物正式命名时，继续沿用原人物ref并用name升级同一ID。"
         "如果正文把已有的姓名未明或临时称谓人物正式命名，必须沿用原人物ref并用update填写name为正式姓名，"
         "不得新建第二张人物卡；只有正文没有对应旧人物时才create。"
         "不得改写导入的人物卡、设定定义或伏笔计划。新增记录不要生成真实ID，真实ID由程序分配。"
@@ -13036,7 +13069,7 @@ def _long_form_update_contract_instructions(project, chapter_index, compact=Fals
             if stage_boundary else
             "state_lifecycle_review.scope必须为current_chapter；复核本章已选及本章触及的物件、冲突和任务。"
         )
-        + "record_updates只记录动态状态和本章变化；新人物使用canon逐项填写正文有证据的身份、目标、秘密、语言风格和备注，不能猜测。人物字段必须独立判断：直接对白足够辨识时必须提取voice；明确争夺资源/机缘、控制或进入地点、保护/排除/追杀/阻止对象、职责或利益诉求时必须提取goal；只有正文明确揭示的隐情才提取secret。不能因为secret无证据而连带留空goal或voice。已有角色只在正文补出原卡空缺信息时使用identity_patch逐项补齐，程序保留已有内容并追加明确的新补充，不覆盖或替换旧资料。已有临时人物正式命名时也使用原ref和identity_patch完成同一ID升级。"
+        + "record_updates只记录动态状态和本章变化；新人物使用canon逐项填写正文有证据的身份、目标、秘密、人物性格/特点、语言风格和长期备注，不能猜测。人物字段必须独立判断：直接对白足够辨识时必须提取voice；正文明确呈现出可长期保留的性格变化时才提取personality；明确争夺资源/机缘、控制或进入地点、保护/排除/追杀/阻止对象、职责或利益诉求时必须提取goal；只有正文明确揭示的隐情才提取secret。personality和voice都只保留能够迁移到其它场景的长期特点，notes只保留稳定关系底色、长期身份变化或后文必须继承的资料；固定笑点、固定口头禅、固定动作套路、具体食物/道具/地点、某章行为、出场桥段、一次性反应和临时情绪不得写入人物卡。不能因为secret无证据而连带留空goal、personality或voice。已有角色只在正文补出原卡空缺信息时使用identity_patch逐项补齐，程序保留已有内容并追加明确的新补充，不覆盖或替换旧资料。已有临时人物正式命名时也使用原ref和identity_patch完成同一ID升级。"
         "已有临时人物在正文中获得正式姓名时，必须用原ref加name完成同一ID升级；不能把正式姓名另建为新人物。"
         "所有fact_updates、record_updates和foreshadow_updates必须附带最终正文中连续逐字出现的8-60字evidence_quote。"
         "keep不改写事实，可不填evidence_quote；其余事实操作必须有逐字证据。"
@@ -13788,10 +13821,18 @@ def _normalize_long_form_state_aliases(update):
                 if not isinstance(item, dict):
                     continue
                 operation = str(item.get("operation", "") or "").strip().lower()
+                nested_patch = item.get("patch")
+                nested_updates = item.get("updates")
+                if not operation and str(
+                    item.get("ref", item.get("id", item.get("character_ref", item.get("lore_ref", ""))))
+                    or ""
+                ).strip() and isinstance(nested_updates, (dict, str)):
+                    operation = "update"
+                    item["operation"] = operation
                 if operation in {"add", "new", "insert"}:
                     operation = "create"
                     item["operation"] = operation
-                elif operation in {"modify", "change", "patch"}:
+                elif operation in {"modify", "change", "patch", "identity_patch"}:
                     operation = "update"
                     item["operation"] = operation
                 if kind == "characters":
@@ -13852,6 +13893,29 @@ def _normalize_long_form_state_aliases(update):
                     "new_status", "status_update", "update", "content", "status",
                     "description",
                 ))
+                # Some model responses keep the canonical operation at the
+                # top level but put the actual identity/runtime delta inside
+                # ``patch``.  Read that already-returned content here; do not
+                # invent a state or relax the evidence checks.
+                nested_patch = item.get("patch")
+                if not dynamic and isinstance(nested_patch, dict):
+                    dynamic = first_value(nested_patch, (
+                        "state", "dynamic", "runtime", "runtime_update", "current_dynamic",
+                        "change", "latest_state", "new_state", "current_state", "state_update",
+                        "new_status", "status_update", "update", "content", "status", "public_state",
+                        "description",
+                    ))
+                elif not dynamic and isinstance(nested_patch, str):
+                    dynamic = nested_patch.strip()
+                if not dynamic and isinstance(nested_updates, dict):
+                    dynamic = first_value(nested_updates, (
+                        "state", "dynamic", "runtime", "runtime_update", "current_dynamic",
+                        "change", "latest_state", "new_state", "current_state", "state_update",
+                        "new_status", "status_update", "update", "content", "status", "public_state",
+                        "description",
+                    ))
+                elif not dynamic and isinstance(nested_updates, str):
+                    dynamic = nested_updates.strip()
                 if not dynamic:
                     changes = item.get("changes", [])
                     if isinstance(changes, str):
@@ -18250,12 +18314,17 @@ def _build_long_form_memory_finalize_context(project, chapter_index, final_text)
     )
     output_requirements = (
         "【输出要求】\n严格输出一个合法JSON对象，顶层结构为"
-        '{"logic_audit":{"checked":true,"issues":[{"severity":"critical|major",'
+        '{"outline":"6-10条实际提纲","summary":"本章摘要","key_facts":["事实"],"long_form_memory":{...},'
+        '"logic_audit":{"checked":true,"issues":[{"severity":"critical|major",'
         '"category":"chronology|causality|character_state|character_location|object_state|object_ownership|spatial_state|pronoun_reference|knowledge_permission|numeric_consistency|entity_relationship|fact_boundary",'
         '"earlier_quote":"较早的正文逐字原文","later_quote":"较晚的正文逐字原文","explanation":"两种状态为何不能同时成立"}]},'
         '"prose_review":{"checked":true,"issues":["仅记录可逐字定位的读感问题"]},'
-        '"repair_patches":[{"before":"正文中唯一出现的原句片段","after":"局部替换文本","reason":"重复说明|流程赘述|机械短碎|局部语言冲突"}],'
-        '"outline":"6-10条实际提纲","summary":"本章摘要","key_facts":["事实"],"long_form_memory":{...}}。'
+        '"repair_patches":[{"before":"正文中唯一出现的原句片段","after":"局部替换文本","reason":"重复说明|流程赘述|机械短碎|局部语言冲突"}]}。'
+        "输出顺序必须是outline、summary、key_facts、long_form_memory、logic_audit、prose_review、repair_patches。"
+        "outline、summary、key_facts和long_form_memory是必填的核心结果；即使没有逻辑问题、没有读感修补、"
+        "或本章没有新的长期状态变化，也绝不能只返回logic_audit、prose_review或repair_patches。"
+        "logic_audit没有问题时写checked:true、issues:[]；prose_review没有问题时写checked:true、issues:[]；"
+        "repair_patches没有必要时写[]。核心结果必须先完整写出，再写三个审校字段。"
         "logic_audit必须同时检查最终正文内部的直接矛盾，以及正文与【实体称谓与关系边界】之间的明确冲突；不评价文风和剧情选择，checked必须为true。"
         "prose_review只记录有明确原文位置的重复说明、无结果流程赘述、机械短碎或局部语言冲突；"
         "正常留白、剧情选择、文风偏好和现实流程不完整都不是问题。repair_patches通常为空；"
@@ -20033,7 +20102,7 @@ def _apply_long_form_memory_update_unchecked(project, chapter_index, payload, up
 
     record_updates = payload.get("record_updates", {}) if isinstance(payload.get("record_updates"), dict) else {}
     for kind, project_key, factory, canon_fields in (
-        ("characters", "characters", _new_character, ("role", "goal", "secret", "voice", "notes")),
+        ("characters", "characters", _new_character, ("role", "goal", "secret", "personality", "voice", "notes")),
         ("lore", "lore", _new_lore, ("type", "description")),
     ):
         records = project.setdefault(project_key, [])
@@ -20893,8 +20962,9 @@ def _build_chapter_ai_context(project, chapter_index, action):
         fields = [
             ("身份", "role", 120),
             ("目标", "goal", 180),
+            ("性格/特点", "personality", 180),
             ("语言", "voice", 180),
-            ("备注", "notes", 220),
+            ("长期备注", "notes", 220),
         ]
         if expose_author_secrets:
             fields.insert(2, ("秘密", "secret", 160))
@@ -21074,7 +21144,7 @@ def _build_chapter_ai_context(project, chapter_index, action):
         "伏笔推进与回收以动态伏笔调度参考和正文自然性为准。"
         "必须继承承接点里的时间、天气、地点、人物位置、情绪和未完成动作；如果上一章写明雨已停或场景已变化，"
         "不要在下一章开头改成仍在下雨或回到旧场景，除非本章提纲明确发生了新的天气/场景变化。"
-        "优先参考本章需继承的关键事实，其次参考本章摘要、前文摘要、人物目标、语言风格和世界规则。"
+        "优先参考本章需继承的关键事实，其次参考本章摘要、前文摘要、人物目标、人物性格/特点、语言风格和世界规则。"
         "正文风格：口语化、自然、有网文阅读感，不要太工整、太书面、太像范文。"
         "句子长短混用，按人物当下状态自然变化。"
         "不得使用抽象情绪判断、四字词堆叠和模板化反应。"
@@ -21082,7 +21152,7 @@ def _build_chapter_ai_context(project, chapter_index, action):
         "不得写段尾总结、抽象情绪判断和万能反应动作；"
         "不得用“沉默、皱眉、冷意、压迫感、空气安静、所有人愣住、下一秒”等模板化表达替代具体剧情。"
         "场景描写优先用具体物件、动作和细节承载情绪，不要总用氛围词概括。"
-        "人物心理不要解释过满，能让读者从动作和对白看懂的，就不要再总结一遍。"
+        "心理描写贴着人物当下的动作、对白、选择和感受展开；需要时写出人物的判断、犹豫、后悔或心动，让心理变化推动下一步。"
         "不得用解释型旁白替代人物行动，不得替人物总结动机、立场和成长。"
         "不得用金句式、总结式、标语式句子替代剧情，不得刻意拔高主题；章节结尾优先用具体动作、对白、信息变化或悬念收住。"
         "段落结构要有变化，不要连续使用“动作描写 + 心理解释 + 氛围总结”的固定结构。"
@@ -21102,7 +21172,7 @@ def _build_chapter_ai_context(project, chapter_index, action):
         "不要在本章开头改成仍在下雨或回到旧场景，除非本章提纲明确发生了新的天气/场景变化。"
         "如果有【后章衔接点】，本章结尾必须自然接到下一章开头的时间、地点、人物状态、动作和悬念；"
         "后章衔接点只用于对齐当前章结尾，不要复述、改写或提前写完下一章正文。"
-        "优先参考本章需继承的关键事实，其次参考本章摘要、前文摘要、人物目标、语言风格和世界规则。"
+        "优先参考本章需继承的关键事实，其次参考本章摘要、前文摘要、人物目标、人物性格/特点、语言风格和世界规则。"
         "正文风格：口语化、自然、有网文阅读感，不要太工整、太书面、太像范文。"
         "句子长短混用，按人物当下状态自然变化。"
         "不得使用抽象情绪判断、四字词堆叠和模板化反应。"
@@ -21110,7 +21180,7 @@ def _build_chapter_ai_context(project, chapter_index, action):
         "不得写段尾总结、抽象情绪判断和万能反应动作；"
         "不得用“沉默、皱眉、冷意、压迫感、空气安静、所有人愣住、下一秒”等模板化表达替代具体剧情。"
         "场景描写优先用具体物件、动作和细节承载情绪，不要总用氛围词概括。"
-        "人物心理不要解释过满，能让读者从动作和对白看懂的，就不要再总结一遍。"
+        "心理描写贴着人物当下的动作、对白、选择和感受展开；需要时写出人物的判断、犹豫、后悔或心动，让心理变化推动下一步。"
         "不得用解释型旁白替代人物行动，不得替人物总结动机、立场和成长。"
         "不得用金句式、总结式、标语式句子替代剧情，不得刻意拔高主题；章节结尾优先用具体动作、对白、信息变化或悬念收住。"
         "段落结构要有变化，不要连续使用“动作描写 + 心理解释 + 氛围总结”的固定结构。"
@@ -21189,7 +21259,8 @@ def _build_chapter_ai_context(project, chapter_index, action):
         "继承优先级：本章需继承的关键事实 > 当前状态快照/活跃连续性事实 > 前文继承摘要 > 人物卡 > 小说圣经/世界规则 > 设定库。",
         "章节提纲是创作计划，不等同于已经发生的事实；如与已确认正文事实冲突，保留本章剧情目标，并按已确认时间顺序、人物视角和物件状态自然调整细节。",
         "不得改写已发生事实；如果资料冲突，优先保留更具体、更新、更接近当前章节的记录。",
-        "续写时要继承人物公开目标、故事内已知动机、称呼和语言风格，以及伤势、物品、地点、关系和情绪变化。",
+        "续写时要继承人物公开目标、故事内已知动机、人物性格/特点、称呼和语言风格，以及伤势、物品、地点、关系和情绪变化。",
+        "人物卡中的人物性格/特点、语言风格和长期备注只作为可跨场景继承的长期参考，不是本章剧情任务；固定笑点、固定口头禅、固定动作、具体食物/道具/地点、某次行为和一次性反应不应被重复放大，人物的说话和行动随当前场景、关系、压力和结果自然变化。",
         "跨章开头必须继承上一章结尾状态：时间、天气、地点、人物位置、人物手中物品、身体状态和未完成动作不能凭空回退。",
         "上一章结尾原文已经发布，不能把末句、对白、声音、动作落点、结论或情绪再次原样或同义写出；"
         "下一章必须从新反应、新结果、新阻力或新信息开始，不能让同一触发句同时作为上一章结尾和下一章开头。",

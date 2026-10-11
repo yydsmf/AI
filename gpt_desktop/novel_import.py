@@ -1121,7 +1121,7 @@ def _extract_import_candidates(text):
     lore_candidates = [{"name": name, "type": "其他", "description": "文档导入候选"} for name in _unique_keep_order(lore, 40)]
     for name in _unique_keep_order(names, 40):
         char_item, lore_item = _prepare_character_candidate(
-            {"name": name, "role": "", "goal": "", "secret": "", "voice": "", "notes": "文档导入候选"},
+            {"name": name, "role": "", "goal": "", "secret": "", "personality": "", "voice": "", "notes": "文档导入候选"},
             default_notes="文档导入候选",
         )
         if char_item:
@@ -1155,8 +1155,9 @@ def _candidate_detail_text(kind, item):
             f"身份：{item.get('role', '')}",
             f"人物目标：{item.get('goal', '')}",
             f"隐藏秘密：{item.get('secret', '')}",
+            f"人物性格/特点：{item.get('personality', '')}",
             f"语言风格：{item.get('voice', '')}",
-            f"备注：{item.get('notes', '')}",
+            f"长期备注：{item.get('notes', '')}",
         ]
     elif kind == "lore":
         lines = [
@@ -1762,6 +1763,7 @@ def _normalize_ai_candidates(data):
             "role": str(_candidate_field(item, "role", "身份", "角色定位", "人物身份", "定位") or ""),
             "goal": str(_candidate_field(item, "goal", "目标", "人物目标", "动机", "诉求") or ""),
             "secret": str(_candidate_field(item, "secret", "秘密", "隐藏秘密", "隐情") or ""),
+            "personality": str(_candidate_field(item, "personality", "traits", "人物性格", "人物特点", "性格特点", "人物性格/特点") or ""),
             "voice": str(_candidate_field(item, "voice", "语言风格", "说话风格", "口吻") or ""),
             "notes": str(_candidate_field(item, "notes", "备注", "说明", "关系变化", "人物关系", "description") or ""),
         }
@@ -2192,7 +2194,7 @@ def _apply_import_candidates(project, candidates, checked):
     result["added"]["characters"], result["merged"]["characters"] = apply_group(
         "characters",
         chars,
-        ("role", "goal", "secret", "voice", "notes"),
+        ("role", "goal", "secret", "personality", "voice", "notes"),
         append_fields=("notes",),
     )
     result["added"]["lore"], result["merged"]["lore"] = apply_group(
@@ -2275,7 +2277,7 @@ def _rank_candidate_dossier_characters(project, limit=40):
         count = int(stat.get("chapters", 0) or 0)
         detail_score = _candidate_dossier_detail_score(
             item,
-            (("role", 160), ("goal", 120), ("secret", 120), ("voice", 80), ("notes", 50)),
+            (("role", 160), ("goal", 120), ("secret", 120), ("personality", 100), ("voice", 80), ("notes", 50)),
         )
         if count <= 0 and detail_score <= 0:
             continue
@@ -2377,7 +2379,7 @@ def _candidate_analysis_dossier_text(project):
             continue
         detail = "｜".join(
             str(item.get(key, "") or "").strip()
-            for key in ("role", "goal", "secret", "voice")
+            for key in ("role", "goal", "secret", "personality", "voice")
             if str(item.get(key, "") or "").strip()
         )
         notes = _clip_context_text(_stable_character_notes_context(item.get("notes", "")), 180)

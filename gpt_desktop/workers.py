@@ -126,6 +126,9 @@ _CHAPTER_PLAN_STORY_LANGUAGE_GUIDANCE = (
     "outline只写本章具体发生的故事事实，可以用清楚的短段落或分句表达，不要求文学化，也不要求单独生成一份自然语言版规划。"
     "规划可以使用清楚的结构化表达，不套固定句式；字段内容直接写人物正在经历的事情、当下压力、选择和结果。"
     "内容只保留故事事实和必要索引，字段名、内部编号、JSON、代码和生成过程留在外层结构中。"
+    "人物卡里的人物性格/特点、语言风格和长期备注只是可以跨场景继承的人物底色，不是章节脚本或固定笑点清单。"
+    "不要把其中的具体食物、道具、地点、固定笑点、固定口头禅、固定动作、某次行为或一次性反应扩写成每章重复的桥段；"
+    "本章人物怎么说、怎么做，要根据当下场景、关系、压力、选择和结果自然变化，同一人物不必为了体现人物卡而重复同一种表现。"
     + _procedural_plot_guard_guidance()
     + "剧情仍然要由当前题材自己的场景压力、人物行动、关系碰撞、情绪变化或具体后果推进；人物和环境如何推动故事由题材自然决定。"
     "章节规划使用清楚、具体、便于执行的故事事实和人物行动表达，不得出现策划术语、抽象形容、办案式表达、编辑式说明或编辑式总结。"
@@ -1966,14 +1969,16 @@ class NovelAnalysisWorker(QThread):
             "没有名字、没有独立行动、只围观/传话/完成一次普通动作且不影响后续的人物可以不提取。\n"
             "不要为了压缩结果而丢失会影响后续剧情、人物关系、地点道具、伏笔线索的信息。\n"
             "请按 20 万字左右长篇小说的连续性需求提取：优先保留后续章节必须继承的事实、"
-            "人物目标/秘密/关系变化、地点/势力/物品规则、时间顺序和未回收伏笔；"
+            "人物目标/性格特点/秘密/关系变化、地点/势力/物品规则、时间顺序和未回收伏笔；"
             "弱化一次性描写、普通动作和不会影响后文的临时信息。\n"
             "如果用户内容含有【已有项目档案】，它只作为合并和去重参考：同名、别称或同一线索不要重复新增，"
-            "长期有效的人物变化才写入已有人物 notes，例如身份、目标、秘密、阵营、称呼、关系质变、长期伤势/物品或语言风格变化；"
+            "长期有效的人物变化才写入已有人物 notes，例如身份、目标、人物性格/特点、秘密、阵营、称呼、关系质变、长期伤势/物品或语言风格变化；"
             "主角或高频人物的 notes 更要克制：如果只是本章行动、临时判断、短暂情绪、重复性性格表现或已经存在于人物卡的特征，不要输出 notes 更新；"
             "只有确实改变长期人物档案的新状态才输出。"
             "普通章节行动、临时情绪、一次性互动和只在本章成立的关系推进，不要写入人物 notes，"
             "也不要转写到本章需继承事实；其中只有会影响全局连续性的长期变化，才放入 project_materials.summary 或 timeline。"
+            "人物的 personality、voice 和 notes 都不能承载固定笑点、固定口头禅、固定动作套路、具体食物/道具/地点、某章出场桥段、一次性剧情行为或临时反应；"
+            "这类内容只保留在正文事实、timeline、summary 或伏笔推进中。人物卡只保留能跨场景继承的性格类别、表达类别、稳定关系底色和长期变化。"
             "章节事实只由正文后的摘要/事实流程负责，AI 分析候选不要追加或改写本章需继承事实。"
             "稳定设定变化才写入 lore.description，例如长期有效的规则、制度、结构关系、地点/势力/物品属性、能力限制、固定渠道或所有权；"
             "本章出现、追问、调查、发送、发现线索、谁去问谁等临时推进，不要写入 lore.description，改放 timeline/summary/foreshadows；"
@@ -1985,7 +1990,7 @@ class NovelAnalysisWorker(QThread):
             "如果这是长文分块的一部分，只提取本片段明确出现或能稳定判断的信息；"
             "没有明确全局增量时，project_materials 对应字段请留空字符串，不要为了填满结构写普通流水账。\n"
             "JSON 结构：{\n"
-            '  "characters": [{"name":"","role":"","goal":"","secret":"","voice":"","notes":""}],\n'
+            '  "characters": [{"name":"","role":"","goal":"","secret":"","personality":"","voice":"","notes":""}],\n'
             '  "lore": [{"name":"","type":"地点/日常场景/物件/势力/规则/制度/异常线索/物件与规则/势力与制度/地点与异常边界/术语/事件/其他","description":""}],\n'
             '  "foreshadows": [{"name":"","status":"","setup_chapter":"","payoff_chapter":"","description":"","target_code":"","review_action":"","review_reason":"","evidence":""}],\n'
             '  "project_materials": {"bible":"","world_rules":"","timeline":"","summary":""}\n'
@@ -2008,10 +2013,10 @@ class NovelAnalysisWorker(QThread):
             "characters 要求：在满足具体人物或可复用单人称谓的前提下，本章主要行动人物、冲突人物、造成长期结果的人物要保留为候选；"
             "复数无名群体排除规则高于主要行动人物保留规则，不要输出无名群体/复数路人，例如“王六的两名同伙”“几名手下”“围观者”；"
             "删除人物候选时不能丢失剧情作用，需把该群体造成的围堵、袭击、传话、误判、资源变化等后果移入 timeline、summary 或 foreshadows.description；"
-            "人物身份字段必须逐项独立判断，不能因为目标或秘密证据不足就把其它字段一并留空：正文中有足够可辨识的直接对白时，voice 必须提炼其稳定的句式、语气、措辞、命令/反问/停顿或表达习惯；"
+            "人物身份字段必须逐项独立判断，不能因为目标或秘密证据不足就把其它字段一并留空：正文中有足够可辨识的直接对白时，voice 必须提炼其稳定的句式、语气、措辞、命令/反问/停顿或表达习惯；正文明确呈现并会影响后文的长期性格变化时，personality 才填写；"
             "正文明确写出人物正在争夺的资源/机缘/位置、要控制或进入的地点、要保护/排除/追杀/阻止的对象，或明确职责与利益诉求时，goal 必须写成当前正文可证实的行动目标；"
             "secret 只有正文直接揭示、承认或由叙述明确确认时才填写，传闻、旁观者猜测、未证实的能力来源和未知境界不得写成 secret；"
-            "voice、goal、secret 分别输出，任何一个字段有证据都必须单独保留，不得用‘证据不足’替代有证据字段。"
+            "personality、voice、goal、secret 分别输出，任何一个字段有证据都必须单独保留，不得用‘证据不足’替代有证据字段。"
             "notes 只写会帮助后续识别和继承的身份、关系、冲突作用、造成的后果或可复用特征，"
             "不要把完整章节流水账塞进 notes。如果是已有主角/高频人物，notes 只写新增且长期有效的档案变化；"
             "如果只是本章发生了什么、短暂情绪、普通互动、重复性性格表现或已有备注的同义复述，就留空字符串。\n"
@@ -2861,7 +2866,7 @@ class NovelAnalysisWorker(QThread):
                 output,
                 "characters",
                 item,
-                ("role", "goal", "secret", "voice", "notes"),
+                ("role", "goal", "secret", "personality", "voice", "notes"),
                 append_fields=("notes",),
             )
         for item in data.get("lore", []) if isinstance(data.get("lore", []), list) else []:
@@ -3060,7 +3065,7 @@ class NovelCandidatePostprocessWorker(NovelAnalysisWorker):
             "3. 只保留确实需要入库或补充到已有档案的长期信息；但不要把本章主要行动人物、冲突人物、造成长期结果的人物当作普通流水账删掉。"
             "普通章节行动、临时情绪、一次性互动、调查过程和流水账不要进入人物备注或设定说明。\n"
             "对于已有主角/高频人物，characters.notes 只允许保留新增且长期有效的人物档案变化；"
-            "如果候选只是本章行动、临时判断、短暂情绪、重复性性格表现，或已有备注/身份/目标/秘密/语言风格的同义复述，必须清空 notes 或删除该人物候选。\n"
+            "如果候选只是本章行动、临时判断、短暂情绪、重复性性格表现、固定笑点或具体道具行为，或已有备注/身份/目标/人物性格/特点/秘密/语言风格的同义复述，必须清空 notes 或删除该人物候选。\n"
             "3a. characters 中应保留本章直接推动剧情的人、和主角发生冲突/追杀/审问/交易/救援/试探的人、"
             "影响主角资源/去向/身份判断/后续事实的人；但 name 必须是具体人物或可复用单人称谓。"
             "可以保留“黑衣人”“蒙面女子”“白发老者”“苏家管事”等能在后文继续追踪的单个人物称谓；"
@@ -3069,8 +3074,9 @@ class NovelCandidatePostprocessWorker(NovelAnalysisWorker):
             "也删除只围观、传话、无姓名、无独立行动、无后续影响的路人。\n"
             "3b. 最终输出前逐条检查 characters.name：如果是复数无名群体，必须从 characters 删除；"
             "删除人物候选时不能丢失剧情作用，需把该群体造成的围堵、袭击、传话、误判、资源变化等后果保留到 timeline、summary 或 foreshadows.description。\n"
-            "3c. 人物字段必须逐项复核后再合并：有稳定直接对白的候选必须保留 voice；有明确争夺对象、行动方向、职责或利益诉求的候选必须保留 goal；只有正文明确揭示的隐情才保留 secret。"
+            "3c. 人物字段必须逐项复核后再合并：有稳定直接对白的候选必须保留 voice；正文明确呈现并会影响后文的长期性格变化才保留 personality；有明确争夺对象、行动方向、职责或利益诉求的候选必须保留 goal；只有正文明确揭示的隐情才保留 secret。"
             "不能因为 secret 不明确而清空同一人物已有的 goal 或 voice，也不能把传闻、推测、未知能力来源合并成 secret；字段有正文证据就不得删除。\n"
+            "人物的 personality、voice 和 notes 都只保留可迁移的长期资料：固定笑点、固定口头禅、固定动作套路、具体食物/道具/地点、某章行为、一次性反应和临时情绪必须清空，不得为了让人物卡看起来完整而保留。\n"
             "4. 如果候选与已有项目档案是同一对象，请使用已有档案中的规范名称；不确定是否同一对象时分开保留，不要强行合并。\n"
             "5. 伏笔要保守：同一线索才合并；只是相似主题但回收目标不同的伏笔要分开。\n"
             "6. 对照已有伏笔逐条复核：如果分块候选或本次片段已经明确兑现、揭示、解释、回收某个已有未埋/已埋伏笔，"
@@ -3087,7 +3093,7 @@ class NovelCandidatePostprocessWorker(NovelAnalysisWorker):
             "9. 时间线和摘要只承接全局剧情进展，避免和人物备注、设定说明重复表达同一件事。\n"
             "10. 不要把人物备注里的临时内容转写进“本章需继承事实”；章节事实只由正文后的摘要/事实流程负责。\n"
             "JSON 结构：{\n"
-            '  "characters": [{"name":"","role":"","goal":"","secret":"","voice":"","notes":""}],\n'
+            '  "characters": [{"name":"","role":"","goal":"","secret":"","personality":"","voice":"","notes":""}],\n'
             '  "lore": [{"name":"","type":"地点/日常场景/物件/势力/规则/制度/异常线索/物件与规则/势力与制度/地点与异常边界/术语/事件/其他","description":""}],\n'
             '  "foreshadows": [{"name":"","status":"","setup_chapter":"","payoff_chapter":"","description":"","target_code":"","review_action":"","review_reason":"","evidence":""}],\n'
             '  "project_materials": {"bible":"","world_rules":"","timeline":"","summary":""}\n'
@@ -3229,7 +3235,7 @@ class NovelFrameworkImportWorker(NovelAnalysisWorker):
             "圣经保留故事的根本设定、人物为何行动、关系、结局和不能违反的限制；世界规则保留能力、境界、地点与运行规则。"
             "人物不只抄原文的人物栏目：凡是在章节中有姓名或稳定称谓、实际参与冲突、救援、谈判、调查、决策或造成长期结果，"
             "并且跨两章出现或承担明显剧情作用的人，都要建立人物档案；一次性路人、无名群体和只被顺带提到的人不要加入。"
-            "人物档案各字段保持简短，只写一两句事实，不要为了补人物数量扩写；章节定位优先于人物备注。"
+            "人物档案各字段保持简短，只写一两句事实，不要为了补人物数量扩写；章节定位优先于人物备注。人物的 personality、voice 和 notes 只保留能跨场景继承的性格类别、表达类别、稳定关系底色和长期变化；固定笑点、固定口头禅、固定动作套路、具体食物/道具/地点、某章行为、出场桥段和一次性反应不要写入人物档案。"
             "设定留稳定的地点、组织、物品与规则；伏笔留以后需要回答的秘密。"
             "完整的实力体系不能只埋在world_rules里：只要原文出现按顺序的修炼境界、武道等级、天赋等级、"
             "段位或其他能力层级，必须在lore中单独返回完整条目，name要明确写成“高武境界体系”“天赋等级体系”"
@@ -3254,7 +3260,7 @@ class NovelFrameworkImportWorker(NovelAnalysisWorker):
             'JSON结构请优先按以下顺序输出，chapter_locations不能省略：{"meta":{"title":"","genre":"","style":"","pov":"","target_words":"","status":"","premise":""},'
             '"chapter_locations":[{"index":1,"start_line":"L000001","end_line":"L000010","anchor":"","characters":["人物名"]}],'
             '"project_materials":{"bible_sections":{"core_setting":"","reader_promise":"","theme":"","main_conflict":"","relationship_foundation":"","ending_direction":""},"bible":"","world_rules":"","timeline":"","summary":""},'
-            '"characters":[{"name":"","role":"","goal":"","secret":"","voice":"","notes":""}],'
+            '"characters":[{"name":"","role":"","goal":"","secret":"","personality":"","voice":"","notes":""}],'
             '"lore":[{"name":"","type":"地点/日常场景/物件/势力/规则/制度/异常线索/物件与规则/势力与制度/地点与异常边界/术语/其他","description":""}],'
             '"progression_systems":[{"name":"","type":"规则","description":""}],'
             '"foreshadows":[{"name":"","status":"未埋","setup_chapter":"","payoff_chapter":"","description":""}],'
@@ -3667,6 +3673,7 @@ class NovelFrameworkImportWorker(NovelAnalysisWorker):
                     "role": "",
                     "goal": "",
                     "secret": "",
+                    "personality": "",
                     "voice": "",
                     "notes": "章节中出现；原框架未单独提供完整人物资料。",
                 })
@@ -4404,7 +4411,7 @@ class NovelVolumeFrameworkWorker(NovelFrameworkImportWorker):
             "严格按小说模板返回：meta 写项目信息；project_materials.bible 只写本卷新增或变更的圣经内容；"
             "project_materials.world_rules 只写本卷新增或变更的世界规则；上一卷圣经和世界规则由程序本地继承，"
             "不要在这两个字段重复改写上一卷原文。确认窗口和最终项目会显示‘上一卷基础资料 + 本卷新增内容’；"
-            "characters 写主要人物；lore 写稳定设定；"
+            "characters 写主要人物；人物的 personality、voice 和 notes 只写能跨场景继承的长期资料，不写固定笑点、固定口头禅、具体道具、固定动作、某章行为或一次性反应；lore 写稳定设定；"
             "foreshadows 写需要继续追踪的伏笔。上一卷已经发生的时间线和全局摘要不要填入本卷的 timeline/summary，"
             "它们应由本卷正文完成后再产生。\n"
             "交接资料中的reusable_foreshadows才是本卷默认可用的旧伏笔；被标记为deferred的上一卷旧线不在本次请求中，"
@@ -4417,7 +4424,7 @@ class NovelVolumeFrameworkWorker(NovelFrameworkImportWorker):
             "JSON 结构：{\n"
             '  "meta":{"title":"","genre":"","style":"","pov":"","target_words":"","status":"草稿","premise":""},\n'
             '  "project_materials":{"bible":"","world_rules":"","timeline":"","summary":""},\n'
-            '  "characters":[{"name":"","role":"","goal":"","secret":"","voice":"","notes":""}],\n'
+            '  "characters":[{"name":"","role":"","goal":"","secret":"","personality":"","voice":"","notes":""}],\n'
             '  "lore":[{"name":"","type":"地点/日常场景/物件/势力/规则/制度/异常线索/物件与规则/势力与制度/地点与异常边界/术语/事件/其他","description":""}],\n'
             '  "foreshadows":[{"name":"","status":"未埋/已埋/已回收/无需回收/废弃","setup_chapter":"","payoff_chapter":"","description":"","remaining_secret":""}],\n'
             '  "chapter_plan":{"summary":"","stages":[{"id":"","name":"","start_chapter":0,"end_chapter":0,"events":[{"order":1,"text":""}]}],"chapters":[]}\n'
@@ -5731,6 +5738,8 @@ class NovelWritingWorker(QThread):
                 "机械短碎表达或局部语言冲突。没有明确可替换原文时必须不提出修补；不得把剧情选择、"
                 "文风偏好、现实流程不完整或正常留白当成问题。"
                 "必须使用用户资料提供的短引用和当前修订号，所有动态更新都附正文逐字证据。"
+                "输出时必须先完成outline、summary、key_facts和long_form_memory四个核心字段，再输出logic_audit、prose_review和repair_patches。"
+                "这四个核心字段即使内容为空或没有动态更新也必须存在；禁止只返回审校字段，禁止先返回审校字段后停止。"
                 "严格输出一个合法JSON对象，不输出Markdown、分析、说明或额外文字。"
                 "JSON字符串中出现英文双引号时必须写成\\\"，不能漏掉字符串末尾的英文双引号。"
             )

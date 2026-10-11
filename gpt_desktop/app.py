@@ -238,6 +238,7 @@ class MainWindow(QMainWindow):
             self.novel_writing_tab.stop_read_aloud(silent=True, keep_resume=True)
             self.novel_writing_tab.stop_import_candidate_analysis()
             self.novel_writing_tab.stop_chapter_ai_action()
+            self.novel_writing_tab.stop_background_chapter_ai_runners()
             self._stop_worker_attrs(
                 self.novel_writing_tab,
                 (

@@ -25,7 +25,11 @@ from PySide6.QtWidgets import (
 )
 
 from .core import HISTORY_DIR, load_json_file, now_str, safe_remove_file, save_json_file
-from .novel_utils import _entity_naming_guidance, _procedural_plot_guard_guidance
+from .novel_utils import (
+    _entity_naming_guidance,
+    _normalize_foreshadow_code,
+    _procedural_plot_guard_guidance,
+)
 from .workers import NovelAnalysisWorker
 
 
@@ -235,6 +239,12 @@ CREATION_LORE_TYPE_GUIDANCE = """
 """.strip()
 
 
+CREATION_CHARACTER_PROFILE_GUIDANCE = """
+人物卡只保存能够跨场景继承的人物底色，不保存某一章的剧情。把“人物性格/特点”和“语言风格”分开：人物性格/特点写长期稳定的性格类别，例如搞笑、优柔寡断、好胜、敏感、嘴硬或爱操心；语言风格写可迁移的表达类别，例如话多、话少、喜欢开玩笑、无厘头、爱打岔、反问多、绕弯或直白。每项用一到几个词或短句说清即可，不要展开成剧情段落。
+人物性格/特点、语言风格和人物备注都不能写固定笑点、固定口头禅、固定动作套路、具体食物或道具、具体地点、某次出场桥段、某章发生的行为、临时情绪或一次性反应，也不要写“遇到某件事就……”的固定触发模式。这样的内容属于章节剧情、正文事实或当时的关系变化，不属于人物卡。备注只保留稳定身份、长期关系底色、持续有效的秘密和确实会影响后文的长期变化；如果一条内容只因为某件事发生过一次才成立，就不要放入人物卡。语言分类可以随关系、情绪和压力自然变化，不把人物锁成每次都重复同一种说法。
+""".strip()
+
+
 COMMON_CREATION_RULES = f"""
 你正在和作者一起搭建一部长篇网络小说。外层 JSON 只是程序读取用的容器，不能在 JSON 之外添加解释、Markdown 或注释。
 1. 沿着作者已经说过和已经确认的故事继续写，稳住题材、主角、核心悬念、人物关系和结尾方向。作者灵感中的题材组合、人物身份、关系状态、具体情节、场景、爽点和节奏要求都要进入故事；第一步的主分类、主题、读者方向、主角起点和风格选择是创作底色。
@@ -243,11 +253,12 @@ COMMON_CREATION_RULES = f"""
 4. 小说圣经、世界规则、人物、设定和伏笔各自承担不同作用：圣经托住整本书，世界规则说明长期运转方式，人物承载选择和关系，设定提供反复使用的生活落点，伏笔保留线索和后续变化。
 5. 危险和代价优先落到躲避、交换、资源变化、身份暴露、关系破裂、空间变化和局势改变上；身体伤势随题材和现场需要自然出现。
 6. 实力体系跟随题材本身生长：明确需要修炼、境界或能力层次的故事，在设定库里展开来源、层次、边界和成长条件；普通都市、言情、悬疑、灵异、现实和没有明确力量体系的科幻，把重点放在人物处境、规则边界和具体事件上。
-7. 不使用“短促直接”“温和克制”“冷淡”“命令式”这几类语言风格，其它可以正常使用。
-8. {CREATION_PROCEDURAL_PLOT_GUARD}
-9. {CREATION_ENTITY_NAMING_GUIDANCE}
-10. 字段值直接写具体内容，保持清楚、稳定、方便后续执行；内容呈现为作者自己的故事底稿，各资料类别各自承担作用，同一段剧情只放在最合适的位置。
-11. JSON 只作为程序读取的容器：保持紧凑，不用 Markdown、缩进、空行或多余空格；压缩外壳，不压缩事实、人物数量、设定数量、伏笔数量或故事内容。
+7. {CREATION_CHARACTER_PROFILE_GUIDANCE}
+8. 不使用“短促直接”“温和克制”“冷淡”“命令式”这几类语言风格，其它可以正常使用。
+9. {CREATION_PROCEDURAL_PLOT_GUARD}
+10. {CREATION_ENTITY_NAMING_GUIDANCE}
+11. 字段值直接写具体内容，保持清楚、稳定、方便后续执行；内容呈现为作者自己的故事底稿，各资料类别各自承担作用，同一段剧情只放在最合适的位置。
+12. JSON 只作为程序读取的容器：保持紧凑，不用 Markdown、缩进、空行或多余空格；压缩外壳，不压缩事实、人物数量、设定数量、伏笔数量或故事内容。
 """.strip()
 
 
@@ -274,20 +285,20 @@ STEP_PROMPTS = {
 
 世界规则回答“这个世界怎样运转”。它写日常生活、空间和社会关系、异常或力量从哪里来、什么条件会让它发生、人物要为触碰它付出什么，以及不同人物会怎样应对。它只写长期成立的运行方式；没有明确力量体系的题材，世界规则就围绕空间、社会、异常和代价展开；明确有修炼或境界的题材，再写力量来源和总边界，详细层次统一放进设定库里的“规则”条目。
 
-人物回答“这些人各自想得到或守住什么”。人物的欲望、顾虑、秘密、说话方式和与主角的关系，都要在原故事里找到根，并能在具体场景中推动选择。设定库统一收录后面会反复用到的地点、物件、制度、势力、能力边界和日常场景。伏笔写成现在能看见的线索、人物当下的理解，以及它在后续阶段会怎样改变判断、关系和行动；把正式故事内容写进 description、revealed 和 remaining_secret，notes 留空。
+人物回答“这些人各自想得到或守住什么”。人物的欲望、顾虑、秘密、人物性格/特点、语言风格和与主角的关系，都要在原故事里找到根，并能在具体场景中推动选择。人物卡中的性格、语言和备注只保留长期资料，不写固定笑点、固定口头禅、具体道具或食物、固定动作、某章行为、出场桥段和临时反应；人物之间怎样靠近、利用、误会或翻脸，交给阶段和章节中的具体事情表现，不要把场景行为塞回人物卡。设定库统一收录后面会反复用到的地点、物件、制度、势力、能力边界和日常场景。伏笔写成现在能看见的线索、人物当下的理解，以及它在后续阶段会怎样改变判断、关系和行动；把正式故事内容写进 description、revealed 和 remaining_secret，notes 留空。
 
 {CREATION_LORE_TYPE_GUIDANCE}
 
 选定故事尚未确定的部分，保留为人物正在面对的问题、线索和可能解释；从故事自然延伸出来、后面反复会用到的人物、地点、势力、物件、制度和暗线，都补足为可落地的故事资料。字段值以清楚、稳定、方便后续执行为先，简介字段保持可公开发布的自然网络小说语言，其余内容像作者自己的故事底稿一样具体易读。
 
-只输出一个合法 JSON 对象，使用短键和固定顺序数组：{{"b":["核心设定","读者承诺","主题","主线矛盾","人物关系底子","结尾方向","硬边界"],"w":["世界概况","力量或能力体系","长期规则数组","代价限制数组","地理与生活"],"c":[["姓名","身份和故事位置","当前目标","秘密","说话方式","害怕失去什么、怎样牵制主角以及长期变化"]],"l":[["名称","类型","具体内容","人物当前知道多少"]],"f":[["编号","名称","埋设阶段","回收阶段","读者能看到的线索及后续变化","揭开后会改变什么","仍未揭开的部分"]]}}。实际输出时：b固定7项，w固定5项，c每项固定6项，l每项固定4项，f每项固定7项；空内容保留空字符串占位，资料数量和文字事实完整保留。""",
+只输出一个合法 JSON 对象，使用短键和固定顺序数组：{{"b":["核心设定","读者承诺","主题","主线矛盾","人物关系底子","结尾方向","硬边界"],"w":["世界概况","力量或能力体系","长期规则数组","代价限制数组","地理与生活"],"c":[["姓名","身份和故事位置","当前目标","秘密","人物性格/特点","语言风格","害怕失去什么、与主角的长期关系底色和长期变化"]],"l":[["名称","类型","具体内容","人物当前知道多少"]],"f":[["编号","名称","埋设阶段","回收阶段","读者能看到的线索及后续变化","揭开后会改变什么","仍未揭开的部分"]]}}。实际输出时：b固定7项，w固定5项，c每项固定7项，l每项固定4项，f每项固定7项；人物字段只写长期资料，具体剧情动作留给阶段和章节；空内容保留空字符串占位，资料数量和文字事实完整保留。""",
     "story_assets": f"""{COMMON_CREATION_RULES}
 
 接着前面已经确定的故事，把后面真的会反复出现的人物、地方、势力、物件、规矩和暗线写出来。每一项都要落到人物看得见、摸得着的生活里，并且在某一次选择中起作用；线索的意义随着人物行动、关系变化和局势变化逐步显现。
 
-每个重要人物都要有自己想得到或守住的东西，有现实阻力，有不愿让别人知道的部分，也要有说话方式。请把人物害怕失去什么、与主角怎样牵制、以后怎样改变，写进人物的 notes。人物和主角怎样靠近、利用、误会或翻脸，要通过具体事情表现出来。
+每个重要人物都要有自己想得到或守住的东西，有现实阻力，有不愿让别人知道的部分，也要有人物性格/特点和语言风格。人物性格/特点写长期稳定的性格底色，语言风格写可迁移的表达分类和习惯；性格、语言和 notes 都不写具体事件、食物、地点、道具、固定笑点、固定动作、固定口头禅、某一次剧情反应或固定触发模式。请把人物害怕失去什么、与主角的长期关系底色和会影响后文的长期变化，写进人物的 notes；具体怎样牵制、靠近、利用、误会或翻脸，要通过后面的场景和事件表现，不要提前写成人物卡里的动作脚本。
 
-人物说明不要只停在身份标签：每个人的“身份和故事位置”以及“害怕失去什么、怎样牵制主角以及长期变化”各用一两句写清正式身份、所属关系和与相近人物的区别；人物是组织代表时，要把“这个人”和“他代表的组织”分开写。
+人物说明不要只停在身份标签：每个人的“身份和故事位置”以及“害怕失去什么、与主角的长期关系底色和长期变化”各用一两句写清正式身份、所属关系和与相近人物的区别；人物是组织代表时，要把“这个人”和“他代表的组织”分开写。具体剧情行为不要写进人物卡。
 
 只补充后面真的会用到的地点、势力、组织、物品、能力规矩、制度、日常生活和反复出现的场景落点，统一写入 lore。身体代价随题材和现场需要自然出现。明确需要修炼、境界或能力层次的题材，在 lore 中建立“能力体系/规则”设定，并把详细层次、能做到什么、做不到什么和提升条件写进 description；悬疑、灵异、言情、现实和普通都市故事把设定落在空间、生活、社会关系和异常边界上。
 
@@ -299,7 +310,7 @@ STEP_PROMPTS = {
 
 伏笔的说明用一两句写清线索实际指向的正式人物、势力、设定或关系：现在已经出现什么，人物目前怎样理解，后面会改变什么；当前只保留阶段位置，不提前写具体章号，也不要把人物或势力的基本身份重复伪装成伏笔。
 
-只输出一个合法 JSON 对象，使用短键和固定顺序数组：{{"c":[["姓名","身份和故事位置","当前目标","秘密","说话方式","害怕失去什么、怎样牵制主角以及长期变化"]],"l":[["名称","类型","具体内容","人物当前知道多少"]],"f":[["编号","名称","埋设阶段","回收阶段","读者能看到的线索及后续变化","揭开后会改变什么","仍未揭开的部分"]]}}。c每项固定6项，l每项固定4项，f每项固定7项；资料数量和文字事实完整保留。""",
+只输出一个合法 JSON 对象，使用短键和固定顺序数组：{{"c":[["姓名","身份和故事位置","当前目标","秘密","人物性格/特点","语言风格","害怕失去什么、与主角的长期关系底色和长期变化"]],"l":[["名称","类型","具体内容","人物当前知道多少"]],"f":[["编号","名称","埋设阶段","回收阶段","读者能看到的线索及后续变化","揭开后会改变什么","仍未揭开的部分"]]}}。c每项固定7项，l每项固定4项，f每项固定7项；人物字段只写长期资料，具体剧情动作留给阶段和章节；资料数量和文字事实完整保留。""",
 }
 
 
@@ -1238,6 +1249,10 @@ _CHARACTER_FIELD_ALIASES = {
     "secret": (
         "secret", "hidden_secret", "秘密", "隐藏秘密", "隐瞒",
     ),
+    "personality": (
+        "personality", "traits", "character_traits", "character_personality",
+        "人物性格", "人物特点", "性格特点", "人物性格/特点", "性格/特点",
+    ),
     "voice": (
         "voice", "speech", "language_style", "speaking_style", "tone",
         "语言风格", "说话风格", "说话方式", "口吻", "语气",
@@ -1366,6 +1381,15 @@ def _clean_chapter_plan_note(value):
     text = _as_text(value)
     if not text:
         return ""
+    # Older drafts could contain a transport row serialized by a previous
+    # endpoint-matching bug. Drop only those generated diagnostic lines; keep
+    # all other user/model planning notes intact.
+    text = "\n".join(
+        line for line in text.splitlines()
+        if "未识别的伏笔章位记录：" not in line
+    ).strip()
+    if not text:
+        return ""
     if text.startswith(("{", "[")):
         return ""
     if any(token in text for token in ("'range'", "'stage'", "'cadence'", "'boundary'", '"range"')):
@@ -1373,12 +1397,40 @@ def _clean_chapter_plan_note(value):
     return text
 
 
+def _expand_character_transport(item):
+    """Expand the character transport shape while accepting the old six-slot form."""
+    if isinstance(item, dict):
+        return _expand_transport_aliases(
+            _compact_record(
+                item,
+                ("name", "role", "goal", "secret", "personality", "voice", "notes"),
+            ),
+            {
+                "n": "name",
+                "r": "role",
+                "g": "goal",
+                "s": "secret",
+                "p": "personality",
+                "v": "voice",
+                "q": "notes",
+            },
+        )
+    if isinstance(item, (list, tuple)):
+        fields = (
+            ("name", "role", "goal", "secret", "personality", "voice", "notes")
+            if len(item) >= 7
+            else ("name", "role", "goal", "secret", "voice", "notes")
+        )
+        return _compact_record(item, fields)
+    return {}
+
+
 def _normalize_character_record(value):
     if not isinstance(value, dict):
         return {}
     record = _normalize_text_record(
         value,
-        ("name", "role", "goal", "secret", "voice", "notes"),
+        ("name", "role", "goal", "secret", "personality", "voice", "notes"),
         _CHARACTER_FIELD_ALIASES,
     )
     record["notes"] = _clean_character_notes(record.get("notes"))
@@ -1481,6 +1533,7 @@ def _normalize_foreshadow_record(value, stage_count=None):
         ),
         _FORESHADOW_FIELD_ALIASES,
     )
+    record["code"] = _normalize_foreshadow_code(record.get("code"))
     # 第二步只确定阶段，不应把“第八阶段”这样的文本放进主程序的
     # 具体章节字段。旧草稿如果曾经把阶段写进 setup_chapter/payoff_chapter，
     # 这里也一并搬回独立的阶段字段，避免后续再把数字 8 当成第 8 章。
@@ -2359,20 +2412,7 @@ def _expand_creation_transport(step, payload):
             )
         if "characters" not in data and isinstance(data.get("c"), list):
             data["characters"] = [
-                _expand_transport_aliases(
-                    _compact_record(
-                        item,
-                        ("name", "role", "goal", "secret", "voice", "notes"),
-                    ),
-                    {
-                        "n": "name",
-                        "r": "role",
-                        "g": "goal",
-                        "s": "secret",
-                        "v": "voice",
-                        "q": "notes",
-                    },
-                )
+                _expand_character_transport(item)
                 for item in data.get("c", [])
                 if isinstance(item, (list, dict))
             ]
@@ -2899,8 +2939,9 @@ def _format_characters_section_body(result):
             ("身份", "role"),
             ("人物目标", "goal"),
             ("隐藏秘密", "secret"),
+            ("人物性格/特点", "personality"),
             ("语言风格", "voice"),
-            ("备注", "notes"),
+            ("长期备注", "notes"),
         ):
             value = _as_text(item.get(key))
             if value:
@@ -3604,6 +3645,7 @@ _CONTEXT_LABELS = {
     "role": "身份和故事位置",
     "goal": "想得到或守住的东西",
     "secret": "藏着的事",
+    "personality": "人物性格/特点",
     "voice": "说话的习惯",
     "long_term_change": "以后会怎样改变",
     "notes": "后面不能忘记的事实",
@@ -3959,10 +4001,43 @@ def _normalize_foreshadow_endpoint_kind(value):
 def _foreshadow_key(value):
     if not isinstance(value, dict):
         return ""
-    code = _as_text(value.get("code"))
+    code = _normalize_foreshadow_code(value.get("code"))
     if code:
-        return code.upper()
+        return code
     return _as_text(value.get("name"))
+
+
+def _foreshadow_lookup_key(value):
+    """Build the same lookup key for baseline and transport rows."""
+    if not isinstance(value, dict):
+        return ""
+    code = _normalize_foreshadow_code(value.get("code"))
+    if code:
+        return code
+    return _as_text(value.get("name"))
+
+
+def _normalize_stage_event_foreshadow_refs(event):
+    """Normalize legacy F1/F01 references without changing their meaning."""
+    if not isinstance(event, dict):
+        return
+    references = event.get("references", [])
+    was_list = isinstance(references, list)
+    values = references if was_list else ([references] if references else [])
+    normalized = []
+    for reference in values:
+        text = _as_text(reference)
+        if text:
+            text = re.sub(
+                r"(?<![A-Z0-9])F0*\d{1,7}(?![A-Z0-9])",
+                lambda match: _normalize_foreshadow_code(match.group(0))
+                or match.group(0),
+                text,
+                flags=re.IGNORECASE,
+            )
+            normalized.append(text)
+    if normalized:
+        event["references"] = normalized if was_list else normalized[0]
 
 
 def _stage_index_from_ref(value, stage_count=0):
@@ -4108,7 +4183,7 @@ def _event_references_endpoint(event, requirement):
     """
     if not isinstance(event, dict) or not isinstance(requirement, dict):
         return False
-    code = _as_text(requirement.get("code")).upper()
+    code = _normalize_foreshadow_code(requirement.get("code"))
     kind = _as_text(requirement.get("kind")).lower()
     kind_token = kind.upper()
     references = event.get("references", [])
@@ -4116,14 +4191,11 @@ def _event_references_endpoint(event, requirement):
     for reference in references:
         text = _as_text(reference)
         upper = text.upper()
-        code_match = bool(
-            code
-            and re.search(
-                rf"(?<![A-Z0-9]){re.escape(code)}(?![A-Z0-9])",
-                upper,
-            )
-        )
-        if code_match:
+        referenced_codes = {
+            _normalize_foreshadow_code(match.group(0))
+            for match in re.finditer(r"(?<![A-Z0-9])F0*\d{1,7}(?!\d)", upper)
+        }
+        if code and code in referenced_codes:
             if (
                 not kind_token
                 or kind_token in upper
@@ -4165,6 +4237,7 @@ def _derive_stage_endpoint_rows(
     events = [item for item in raw_events if isinstance(item, dict)]
     event_lookup = {}
     for index, event in enumerate(events):
+        _normalize_stage_event_foreshadow_refs(event)
         event_id = _canonical_stage_event_id(event.get("id"), stage_index)
         if not event_id:
             event_id = f"S{int(stage_index) + 1:02d}-E{index + 1:02d}"
@@ -4175,7 +4248,7 @@ def _derive_stage_endpoint_rows(
     incoming = _normalize_foreshadow_schedule(result.get("foreshadow_schedule", []), total_chapters)
     requirements = _foreshadow_stage_requirements(foreshadows, specs).get(int(stage_index), [])
     requirement_by_key = {
-        (_as_text(item.get("key")).upper() or _as_text(item.get("name"))): item
+        (_normalize_foreshadow_code(item.get("code")) or _as_text(item.get("name"))): item
         for item in requirements
     }
     resolved = []
@@ -4185,7 +4258,7 @@ def _derive_stage_endpoint_rows(
     resolved_keys = set()
 
     def row_key(row):
-        return _as_text(row.get("code")).upper() or _as_text(row.get("name"))
+        return _foreshadow_lookup_key(row)
 
     def find_requirement(row):
         key = row_key(row)
@@ -4194,7 +4267,8 @@ def _derive_stage_endpoint_rows(
             return requirement
         for candidate in requirements:
             if (
-                _as_text(candidate.get("code")).upper() == _as_text(row.get("code")).upper()
+                _normalize_foreshadow_code(candidate.get("code"))
+                == _normalize_foreshadow_code(row.get("code"))
                 and _as_text(candidate.get("kind")) == _as_text(row.get("endpoint_kind"))
             ):
                 return candidate
@@ -4231,7 +4305,7 @@ def _derive_stage_endpoint_rows(
         if not requirement:
             resolved.append(row)
             continue
-        key = _as_text(requirement.get("key")).upper() or _as_text(requirement.get("name"))
+        key = _normalize_foreshadow_code(requirement.get("code")) or _as_text(requirement.get("name"))
         resolved_key = (key, kind)
         if resolved_key in resolved_keys:
             continue
@@ -4253,7 +4327,7 @@ def _derive_stage_endpoint_rows(
     # token required in the event references.  This is reconstruction from the
     # generated event, not a fabricated chapter or a blanket acceptance rule.
     for requirement in requirements:
-        key = _as_text(requirement.get("key")).upper() or _as_text(requirement.get("name"))
+        key = _normalize_foreshadow_code(requirement.get("code")) or _as_text(requirement.get("name"))
         kind = _normalize_foreshadow_endpoint_kind(requirement.get("kind"))
         resolved_key = (key, kind)
         if resolved_key in resolved_keys or requirement.get("tail_reserved"):
@@ -4294,22 +4368,30 @@ def _canonicalize_foreshadow_schedule(
     false chapter assignment.
     """
     baseline = [item for item in foreshadows if isinstance(item, dict)]
-    by_key = {_foreshadow_key(item): item for item in baseline if _foreshadow_key(item)}
+    by_key = {
+        _foreshadow_lookup_key(item): item
+        for item in baseline
+        if _foreshadow_lookup_key(item)
+    }
     requirements = _foreshadow_stage_requirements(baseline, stage_specs)
     requirement_by_key = {}
     for rows in requirements.values():
         for requirement in rows:
-            requirement_by_key.setdefault(requirement["key"], {})[
+            requirement_key = (
+                _normalize_foreshadow_code(requirement.get("code"))
+                or _as_text(requirement.get("name"))
+            )
+            requirement_by_key.setdefault(requirement_key, {})[
                 requirement["kind"]
             ] = requirement
 
     canonical = {}
     for item in baseline:
-        key = _foreshadow_key(item)
+        key = _foreshadow_lookup_key(item)
         if not key:
             continue
         canonical[key] = {
-            "code": _as_text(item.get("code")),
+            "code": _normalize_foreshadow_code(item.get("code")) or _as_text(item.get("code")),
             "name": _as_text(item.get("name")),
             "setup_chapter": "",
             "payoff_chapter": "",
@@ -4358,7 +4440,7 @@ def _canonicalize_foreshadow_schedule(
             target[f"{kind}_event"] = _as_text(detail)
 
     for row in rows:
-        key = _foreshadow_key(row)
+        key = _foreshadow_lookup_key(row)
         target = canonical.get(key)
         explicit_kind = _normalize_foreshadow_endpoint_kind(row.get("endpoint_kind"))
         endpoint_value = row.get("endpoint_chapter")
@@ -4371,18 +4453,17 @@ def _canonicalize_foreshadow_schedule(
             )
         )
         if target is None:
-            # Old stage responses sometimes put the n-field chapter boundary
-            # into the f-array. Keep the text as a planning note, never as a
-            # made-up foreshadow. Unknown endpoint records are also retained
-            # in that note so migration cannot silently discard model output.
-            note = _as_text(row.get("code")) or _as_text(row.get("name"))
+            # Keep a readable diagnostic, not the transport JSON. The strict
+            # repair path still fails and retries; stage content is untouched.
+            identity = _as_text(row.get("code")) or _as_text(row.get("name")) or "未命名伏笔"
             if has_legacy_endpoint or explicit_kind:
-                note = "未识别的伏笔章位记录：" + json.dumps(row, ensure_ascii=False, separators=(",", ":"))
-            if note:
-                notes.append(note)
+                endpoint = "埋设" if explicit_kind == "setup" else "回收" if explicit_kind == "payoff" else "章位"
+                notes.append(
+                    f"阶段规划返回的伏笔“{identity}”{endpoint}定位未能对应第二步确认的伏笔，未写入正式章位。"
+                )
             if strict:
                 errors.append(
-                    f"{_as_text(row.get('code')) or _as_text(row.get('name')) or '未命名伏笔'}不是第二步确认的伏笔"
+                    f"{identity}不是第二步确认的伏笔"
                 )
             continue
 
@@ -4442,6 +4523,7 @@ def _normalize_foreshadow_schedule(value, total_chapters=0):
                 ("code", "foreshadow_code", "id", "i", "编号", "伏笔编号"),
             )
         )
+        code = _normalize_foreshadow_code(code) or code
         name = _as_text(
             _first_value(item, ("name", "title", "n", "伏笔名称", "名称"))
         )
@@ -4500,7 +4582,7 @@ def _apply_foreshadow_schedule(foreshadows, schedule, total_chapters=0):
     records = [deepcopy(item) for item in foreshadows if isinstance(item, dict)]
     rows = _normalize_foreshadow_schedule(schedule, total_chapters)
     by_code = {
-        _as_text(item.get("code")).upper(): item
+        _normalize_foreshadow_code(item.get("code")): item
         for item in rows if _as_text(item.get("code"))
     }
     by_name = {
@@ -4508,7 +4590,7 @@ def _apply_foreshadow_schedule(foreshadows, schedule, total_chapters=0):
         for item in rows if _as_text(item.get("name"))
     }
     for record in records:
-        match = by_code.get(_as_text(record.get("code")).upper())
+        match = by_code.get(_normalize_foreshadow_code(record.get("code")))
         if match is None:
             match = by_name.get(_as_text(record.get("name")))
         if not match:
@@ -4553,7 +4635,7 @@ def _stage_foreshadow_shortfalls(foreshadows, schedule, stage_specs, total_chapt
     specs = stage_specs if isinstance(stage_specs, list) else []
     requirements = _foreshadow_stage_requirements(foreshadows, specs)
     rows = _normalize_foreshadow_schedule(schedule, total_chapters)
-    by_key = {_foreshadow_key(row): row for row in rows if _foreshadow_key(row)}
+    by_key = {_foreshadow_lookup_key(row): row for row in rows if _foreshadow_lookup_key(row)}
     missing = []
     for stage_index, required_rows in requirements.items():
         for requirement in required_rows:
@@ -4728,7 +4810,7 @@ b 只能使用 c、r、t、m、p、e、h；w 只能使用 s、p、r、c、g。�
         elif self.creation_batch == "bible_assets":
             prompt = f"""{COMMON_CREATION_RULES}
 
-读取作者已经选定的故事，以及前一批已经生成的小说圣经和世界规则，补齐人物、设定和伏笔。人物要写各自的身份、想得到或守住的东西、秘密、说话方式，以及害怕失去什么、怎样牵制主角和长期变化。设定库统一收录后面反复会用到的地点、物件、势力、制度、日常场景和能力边界。明确有修炼、境界或力量层次的题材，在设定的规则条目里写详细层次；其它题材把设定落在空间、生活、社会关系和异常边界上。伏笔写现在能看到的线索、以后会改变的判断或关系、揭开后会发生什么和仍未揭开的部分，notes留空，状态统一为未埋。
+读取作者已经选定的故事，以及前一批已经生成的小说圣经和世界规则，补齐人物、设定和伏笔。人物要分别写身份、想得到或守住的东西、秘密、人物性格/特点、语言风格，以及害怕失去什么、与主角的长期关系底色和长期变化。人物性格/特点写长期稳定的性格底色，语言风格写可迁移的表达分类和习惯；人物性格、语言风格和 notes 都不要落到具体事件、食物、地点、道具、固定笑点、固定动作、固定口头禅、某一次剧情反应或固定触发模式上。具体怎样牵制、靠近、利用、误会或翻脸，留给后面的阶段和章节在场景中表现。设定库统一收录后面反复会用到的地点、物件、势力、制度、日常场景和能力边界。明确有修炼、境界或力量层次的题材，在设定的规则条目里写详细层次；其它题材把设定落在空间、生活、社会关系和异常边界上。伏笔写现在能看到的线索、以后会改变的判断或关系、揭开后会发生什么和仍未揭开的部分，notes留空，状态统一为未埋。
 
 {CREATION_LORE_TYPE_GUIDANCE}
 
@@ -4741,8 +4823,8 @@ b 只能使用 c、r、t、m、p、e、h；w 只能使用 s、p、r、c、g。�
 这是预计写到{_creation_scale_requirements(total_words)[0]}的长篇，按故事需要补足资料，不要把简介换个说法重复输出，也不要为了凑数量添加无根名词。伏笔位置此时只写第几阶段，不写具体章号。{_creation_foreshadow_stage_guidance(total_words)}
 
 只返回一个合法 JSON 对象，不能有 Markdown 或解释。为了避免字段名称混进内容，c、l、f 都使用短键对象，不使用定长内容数组：
-{{"c":[{{"n":"姓名","r":"身份和故事位置","g":"当前目标","s":"秘密","v":"说话方式","q":"害怕失去什么、怎样牵制主角以及长期变化"}}],"l":[{{"n":"名称","t":"类型","d":"具体内容","k":"人物当前知道多少"}}],"f":[{{"i":"编号","n":"名称","a":"埋设阶段","b":"回收阶段","d":"读者能看到的线索及后续变化","r":"揭开后会改变什么","u":"仍未揭开的部分"}}]}}
-c 中每项只能使用 n、r、g、s、v、q；l 中每项只能使用 n、t、d、k；f 中每项只能使用 i、n、a、b、d、r、u。键名只是程序标记，不能把“姓名”“身份和故事位置”等示例文字原样返回；每个值必须直接写这本小说的实际内容。只输出 c、l、f，不要重复输出 b 或 w。人物、设定和伏笔数量要达到长篇规模要求。{("高武、玄幻、仙侠、修真、武道题材的 l 中必须包含一条按从低到高排列的实力体系条目；它要使用 l 的四个字段写完整境界内容，每个境界一到两句话。" if power_levels_guidance else "")}"""
+{{"c":[{{"n":"姓名","r":"身份和故事位置","g":"当前目标","s":"秘密","p":"人物性格/特点","v":"语言风格","q":"害怕失去什么、与主角的长期关系底色和长期变化"}}],"l":[{{"n":"名称","t":"类型","d":"具体内容","k":"人物当前知道多少"}}],"f":[{{"i":"编号","n":"名称","a":"埋设阶段","b":"回收阶段","d":"读者能看到的线索及后续变化","r":"揭开后会改变什么","u":"仍未揭开的部分"}}]}}
+c 中每项只能使用 n、r、g、s、p、v、q；l 中每项只能使用 n、t、d、k；f 中每项只能使用 i、n、a、b、d、r、u。键名只是程序标记，不能把“姓名”“身份和故事位置”等示例文字原样返回；每个值必须直接写这本小说的实际内容。只输出 c、l、f，不要重复输出 b 或 w。人物、设定和伏笔数量要达到长篇规模要求。{("高武、玄幻、仙侠、修真、武道题材的 l 中必须包含一条按从低到高排列的实力体系条目；它要使用 l 的四个字段写完整境界内容，每个境界一到两句话。" if power_levels_guidance else "")}"""
             prompt += """
 
 补充方向：让人物、设定和伏笔都能在后续场景中落地。伏笔的阶段位置表示它如何进入人物生活、如何在行动和关系变化中逐步显出意义；先写线索和当下理解，再写后续变化，不把最终解释写成一开始就确定的结论。"""
@@ -4780,17 +4862,19 @@ c 中每项只能使用 n、r、g、s、v、q；l 中每项只能使用 n、t、
                 if isinstance(current_stage, dict) else ""
             )
             missing = self.creation_context.get("missing_foreshadow_endpoints", [])
-            missing_text = "、".join(
-                _as_text(item.get("code") or item.get("name"))
+            missing_codes = [
+                _normalize_foreshadow_code(item.get("code"))
+                or _as_text(item.get("code") or item.get("name"))
                 for item in missing if isinstance(item, dict)
-            ) or "指定伏笔"
+            ]
+            missing_text = "、".join(code for code in missing_codes if code) or "指定伏笔"
             prompt = f"""{COMMON_CREATION_RULES}
 
 读取已经完成的第{stage_number}/{total_stages or '?'}阶段规划和第二步确认的伏笔阶段位置，只补齐当前阶段缺失的伏笔正式端点，不重新生成阶段规划，不改写已有事件，不增加新的伏笔。当前需要补齐：{missing_text}。
 
 请根据已有事件的实际内容，为每一项选择一个真正承载这次变化的事件：setup 表示线索在场景中第一次进入人物生活，payoff 表示线索在场景中形成新的事实或决定性变化。返回的 e 必须使用已有事件编号，d 写这次在场景中发生的具体变化；只补当前缺失项目，不能把同一伏笔的普通延续重复当成正式端点。
 
-只返回一个合法 JSON 对象：{{"f":[{{"i":"F编号","k":"setup或payoff","e":"S{stage_number:02d}-E01","d":"这次在场景中发生的具体变化"}}]}}。不要返回阶段规划、章节号、Markdown、解释或其它字段。"""
+只返回一个合法 JSON 对象：{{"f":[{{"i":"{missing_codes[0] if missing_codes else 'F0001'}","k":"setup或payoff","e":"S{stage_number:02d}-E01","d":"这次在场景中发生的具体变化"}}]}}。i 必须逐字复制上面给出的精确伏笔编号（包括 F 和前导零），不能改成其它格式；只返回当前缺失项目。不要返回阶段规划、章节号、Markdown、解释或其它字段。"""
         elif self.creation_batch == "stage_plan_stage":
             current_stage = self.creation_context.get("current_stage", {})
             stage_number = current_stage.get("number", self.stage_index + 1) if isinstance(current_stage, dict) else self.stage_index + 1
@@ -5854,6 +5938,9 @@ class NovelCreationWizardDialog(QDialog):
             strict=strict,
         )
         result["foreshadow_schedule"] = schedule
+        result["chapter_plan_note"] = _clean_chapter_plan_note(
+            result.get("chapter_plan_note", "")
+        )
         for note in notes:
             result["chapter_plan_note"] = _append_note(
                 _clean_chapter_plan_note(result.get("chapter_plan_note", "")),

@@ -8,7 +8,7 @@ import traceback
 import uuid
 from copy import deepcopy
 
-from PySide6.QtCore import QFileSystemWatcher, QSize, QUrl, Qt, QTimer, Signal
+from PySide6.QtCore import QFileSystemWatcher, QObject, QSize, QUrl, Qt, QTimer, Signal
 from PySide6.QtGui import QTextCursor
 from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer
 from PySide6.QtWidgets import (
@@ -542,8 +542,9 @@ def _volume_handoff_display_text(handoff):
         "role": "身份",
         "goal": "目标",
         "secret": "隐藏秘密",
+        "personality": "性格/特点",
         "voice": "语言风格",
-        "notes": "备注",
+        "notes": "长期备注",
         "state": "当前状态",
         "relationship": "关系",
         "characters": "相关人物",
@@ -1671,6 +1672,48 @@ class ChapterPlanFoundationDialog(QDialog):
         return deepcopy(self._confirmed_plan or self.foundation())
 
 
+class _ChapterTaskSignalRouter(QObject):
+    """Keep queued worker signals attached to the same receiver across switches."""
+
+    def __init__(self, worker, owner, result_method, cleanup_method):
+        super().__init__(worker if isinstance(worker, QObject) else None)
+        self.worker = worker
+        self.result_method = result_method
+        self.cleanup_method = cleanup_method
+        worker._chapter_task_owner_tab = owner
+
+    def dispatch(self, method, *args):
+        owner = self.worker._chapter_task_owner_tab
+        previous = getattr(owner, "_chapter_task_callback_worker", None)
+        owner._chapter_task_callback_worker = self.worker
+        try:
+            getattr(owner, method)(*args)
+        finally:
+            owner._chapter_task_callback_worker = previous
+
+    def on_result(self, *args):
+        self.dispatch(self.result_method, *args)
+
+    def on_failure(self, *args):
+        method = {
+            "_on_chapter_context_ready": "_on_chapter_context_failed",
+            "on_chapter_ai_ready": "on_chapter_ai_failed",
+        }.get(self.result_method, "on_chapter_plan_failed")
+        self.dispatch(method, *args)
+
+    def on_finished(self):
+        self.dispatch(self.cleanup_method)
+
+    def on_chunk(self, piece):
+        self.dispatch("on_chapter_ai_chunk", piece)
+
+    def on_progress(self, text):
+        self.dispatch("set_status_tip", text)
+
+    def on_output_chars(self, count):
+        self.dispatch("_on_novel_output_chars", count)
+
+
 class NovelWritingTab(SimpleModelBarMixin, QWidget):
     request_settings = Signal()
     MODEL_CONFIG_SECTION = "novel"
@@ -1715,6 +1758,12 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
         self._detached_auto_project_path = ""
         self._detached_auto_timer = None
         self._detached_auto_readonly_states = []
+        # Chapter work is owned by a project path, not by whichever project
+        # happens to be visible in the single writing tab.  These hidden
+        # runners keep an in-flight foreground request alive while the user
+        # opens another project.
+        self._background_chapter_ai_runners = {}
+        self._chapter_task_timer_owner = None
         self.chapter_plan_worker = None
         self._chapter_plan_request_kind = ""
         self._chapter_plan_continue_pending = False
@@ -1886,6 +1935,7 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
         self._status_timer = QTimer(self)
         self._status_timer.setInterval(1000)
         self._status_timer.timeout.connect(self._refresh_status_display)
+        self._status_timer.timeout.connect(self._poll_background_chapter_ai_runners)
         self._status_timer.start()
         if not self._is_detached_auto_runner:
             self._init_project_sync_watcher()
@@ -2719,7 +2769,7 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
     def _chapter_ai_signal_diagnostics(self):
         worker = None
         try:
-            candidate = self.sender()
+            candidate = self._chapter_task_signal_worker()
             if candidate is not None and hasattr(candidate, "diagnostics"):
                 worker = candidate
         except Exception:
@@ -2744,7 +2794,7 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
     def _chapter_plan_signal_diagnostics(self):
         worker = None
         try:
-            candidate = self.sender()
+            candidate = self._chapter_task_signal_worker()
             if candidate is not None and hasattr(candidate, "diagnostics"):
                 worker = candidate
         except Exception:
@@ -3251,27 +3301,30 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
         self.char_role = QLineEdit()
         self.char_goal = QLineEdit()
         self.char_secret = QLineEdit()
+        self.char_personality = QLineEdit()
         self.char_voice = QLineEdit()
         self.char_name.setPlaceholderText("填写人物姓名，左侧列表会自动更新。")
         self.char_role.setPlaceholderText("例如：国公府世子、女主、反派、师父。")
         self.char_goal.setPlaceholderText("这个人物最想得到什么，或者最想避免什么。")
         self.char_secret.setPlaceholderText("暂时不能让读者或其他角色知道的隐藏信息。")
-        self.char_voice.setPlaceholderText("说话习惯，比如毒舌、文雅、话少、爱打岔。")
-        for w in (self.char_name, self.char_role, self.char_goal, self.char_secret, self.char_voice):
+        self.char_personality.setPlaceholderText("人物性格/特点，比如搞笑、好胜、敏感、嘴硬、优柔寡断。")
+        self.char_voice.setPlaceholderText("语言风格分类，比如话多、话少、喜欢开玩笑、无厘头、爱打岔。")
+        for w in (self.char_name, self.char_role, self.char_goal, self.char_secret, self.char_personality, self.char_voice):
             self._wide_field(w)
         self.char_notes = PlainTextEdit()
         self._wide_field(self.char_notes)
         self._expand_text_edit(self.char_notes, 110)
-        self.char_notes.setPlaceholderText("人物弧光、关系、外貌、习惯、禁忌、出场线索等。")
-        for w in (self.char_name, self.char_role, self.char_goal, self.char_secret, self.char_voice):
+        self.char_notes.setPlaceholderText("只写长期关系底色、稳定身份变化和后续必须继承的事实；不要写固定笑点、具体剧情动作、道具或一次性反应。")
+        for w in (self.char_name, self.char_role, self.char_goal, self.char_secret, self.char_personality, self.char_voice):
             w.textChanged.connect(self._mark_character_dirty)
         self.char_notes.textChanged.connect(self._mark_character_dirty)
         form.addRow("姓名", self.char_name)
         form.addRow("身份", self.char_role)
         form.addRow("人物目标", self.char_goal)
         form.addRow("隐藏秘密", self.char_secret)
+        form.addRow("人物性格/特点", self.char_personality)
         form.addRow("语言风格", self.char_voice)
-        form.addRow("备注", self.char_notes)
+        form.addRow("长期备注", self.char_notes)
 
         return self._two_pane_tab(left, right)
 
@@ -3984,13 +4037,7 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
         preserve_project_mtime=False,
         update_draft=True,
     ):
-        detached_source = os.path.abspath(str(getattr(self, "_detached_auto_project_path", "") or ""))
-        current_source = os.path.abspath(str(getattr(self, "current_project_path", "") or ""))
-        if (
-            detached_source
-            and current_source == detached_source
-            and not bool(getattr(self, "_is_detached_auto_runner", False))
-        ):
+        if self._current_background_chapter_runner() is not None:
             return self.current_project_path
         perf_start = time.perf_counter()
         summary = self._novel_perf_summary()
@@ -4258,6 +4305,7 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
         char["role"] = self.char_role.text().strip()
         char["goal"] = self.char_goal.text().strip()
         char["secret"] = self.char_secret.text().strip()
+        char["personality"] = self.char_personality.text().strip()
         char["voice"] = self.char_voice.text().strip()
         char["notes"] = self.char_notes.toPlainText().strip()
         self._refresh_character_item(index)
@@ -4375,8 +4423,9 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
             ("身份", char.get("role", "")),
             ("目标", char.get("goal", "")),
             ("秘密", char.get("secret", "")),
+            ("性格/特点", char.get("personality", "")),
             ("语言", char.get("voice", "")),
-            ("备注", char.get("notes", "")),
+            ("长期备注", char.get("notes", "")),
         )
         return "\n".join(f"{label}：{str(value).strip()}" for label, value in fields if str(value or "").strip())
 
@@ -4432,7 +4481,7 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
     def _indexed_sort_key(self, group_key, source_index, item):
         item = item if isinstance(item, dict) else {}
         if group_key == "characters":
-            order = self._first_record_appearance_order(item, ("name", "role", "goal", "secret", "voice", "notes"))
+            order = self._first_record_appearance_order(item, ("name", "role", "goal", "secret", "personality", "voice", "notes"))
             name = str(item.get("name", "") or "")
             return (order, str(item.get("name", "") or "").strip() == "", source_index, name)
         if group_key == "lore":
@@ -4579,7 +4628,7 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
         self._loading = True
         try:
             if row is None or row < 0 or row >= len(self.current_project.get("characters", [])):
-                for w in (self.char_name, self.char_role, self.char_goal, self.char_secret, self.char_voice):
+                for w in (self.char_name, self.char_role, self.char_goal, self.char_secret, self.char_personality, self.char_voice):
                     w.clear()
                 self.char_notes.clear()
                 self.current_character_index = -1
@@ -4589,6 +4638,7 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
             self.char_role.setText(char.get("role", ""))
             self.char_goal.setText(char.get("goal", ""))
             self.char_secret.setText(char.get("secret", ""))
+            self.char_personality.setText(char.get("personality", ""))
             self.char_voice.setText(char.get("voice", ""))
             self.char_notes.setPlainText(char.get("notes", ""))
             self.current_character_index = row
@@ -5001,12 +5051,376 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
                 changed = True
         return changed
 
+    def _schedule_chapter_task_callback(self, delay_ms, callback):
+        # Timers follow the project owner when a foreground task moves to a runner.
+        owner = getattr(self, "_chapter_task_timer_owner", None)
+        if owner is None:
+            owner = {"tab": self, "pending": 0}
+            self._chapter_task_timer_owner = owner
+        owner["pending"] = int(owner.get("pending", 0) or 0) + 1
+
+        def dispatch():
+            owner["pending"] -= 1
+            callback(owner["tab"])
+
+        QTimer.singleShot(delay_ms, dispatch)
+
+    def _chapter_task_signal_worker(self):
+        worker = getattr(self, "_chapter_task_callback_worker", None)
+        if worker is not None:
+            return worker
+        try:
+            return self.sender()
+        except RuntimeError:
+            return None
+
+    def _forward_chapter_task_signal(self, method, *args):
+        worker = self._chapter_task_signal_worker()
+        target = getattr(worker, "_chapter_task_owner_tab", self)
+        if target is self:
+            return False
+        previous = getattr(target, "_chapter_task_callback_worker", None)
+        target._chapter_task_callback_worker = worker
+        try:
+            getattr(target, method)(*args)
+        finally:
+            target._chapter_task_callback_worker = previous
+        return True
+
+    def _copy_chapter_task_state(self, target):
+        """Move chapter workflow state to a hidden runner for one project."""
+        if target is None:
+            return
+        names = (
+            name for name in vars(self)
+            if (name.startswith("_chapter_ai_") and name != "_chapter_ai_buttons_by_action")
+            or name.startswith("_auto_expand_all_")
+            or name.startswith("_auto_expand_restart_")
+            or name.startswith("_auto_chapter_")
+            or name.startswith("_chapter_plan_")
+        )
+        for name in names:
+            try:
+                setattr(target, name, deepcopy(getattr(self, name)))
+            except Exception:
+                setattr(target, name, getattr(self, name))
+        target._context_build_token = int(getattr(self, "_context_build_token", 0) or 0)
+        target._context_build_pending = deepcopy(
+            getattr(self, "_context_build_pending", {}) or {}
+        )
+        for name in (
+            "_status_message",
+            "_status_stage_key",
+            "_status_stage_label",
+            "_status_stage_started_at",
+            "_status_stage_started_wall",
+            "_status_stage_scope_label",
+            "_status_stage_active",
+            "_status_history",
+            "_status_workflow_active",
+            "_status_workflow_kind",
+            "_status_workflow_started_at",
+            "_status_workflow_started_wall",
+            "_status_last_run_elapsed",
+            "_status_received_chars",
+        ):
+            value = getattr(self, name, None)
+            setattr(target, name, deepcopy(value) if name == "_status_history" else value)
+        def copy_index(name, default=-1):
+            value = getattr(self, name, default)
+            try:
+                return int(default if value is None else value)
+            except (TypeError, ValueError):
+                return default
+
+        target.current_chapter_index = copy_index("current_chapter_index")
+        target.current_character_index = copy_index("current_character_index")
+        target.current_lore_index = copy_index("current_lore_index")
+        target.current_foreshadow_index = copy_index("current_foreshadow_index")
+        target._draft_saved_once = True
+
+    def _move_chapter_task_workers_to(self, target):
+        for name in ("writing_worker", "context_build_worker", "chapter_plan_worker"):
+            worker = getattr(self, name, None)
+            setattr(target, name, worker)
+            if worker is not None:
+                worker._chapter_task_owner_tab = target
+            setattr(self, name, None)
+        target.writing_retired_workers = list(
+            getattr(self, "writing_retired_workers", []) or []
+        )
+        for worker in target.writing_retired_workers:
+            worker._chapter_task_owner_tab = target
+        self.writing_retired_workers = []
+        owner = getattr(self, "_chapter_task_timer_owner", None)
+        if owner is not None:
+            owner["tab"] = target
+            target._chapter_task_timer_owner = owner
+            self._chapter_task_timer_owner = None
+
+    def _connect_chapter_task_worker(self, worker, result_method, cleanup_method):
+        router = _ChapterTaskSignalRouter(worker, self, result_method, cleanup_method)
+        worker._chapter_task_signal_router = router
+        worker.result_ready.connect(router.on_result)
+        worker.failed.connect(router.on_failure)
+        worker.finished.connect(router.on_finished)
+        if hasattr(worker, "chunk"):
+            worker.chunk.connect(router.on_chunk)
+        if hasattr(worker, "progress"):
+            worker.progress.connect(router.on_progress)
+        output_signal = getattr(worker, "output_chars", None)
+        if output_signal is not None:
+            output_signal.connect(router.on_output_chars)
+
+    def _detach_foreground_chapter_tasks(self, reason=""):
+        """Keep a named project's active chapter task alive across project switches."""
+        if getattr(self, "_is_detached_auto_runner", False):
+            return False
+        source_path = self._canonical_project_path(getattr(self, "current_project_path", ""))
+        if not source_path or source_path == self._canonical_project_path(NOVEL_DRAFT_FILE):
+            return False
+        writing_worker = getattr(self, "writing_worker", None)
+        context_worker = getattr(self, "context_build_worker", None)
+        chapter_plan_worker = getattr(self, "chapter_plan_worker", None)
+        retry_pending = bool(getattr(self, "_chapter_ai_transient_retry_pending", False))
+        plan_continuation_pending = bool(getattr(self, "_chapter_plan_continue_pending", False))
+        active = bool(
+            writing_worker is not None
+            or context_worker is not None
+            or chapter_plan_worker is not None
+            or getattr(self, "writing_retired_workers", [])
+            or getattr(self, "_chapter_ai_sequence_active", False)
+            or retry_pending
+            or getattr(self, "_auto_expand_all_active", False)
+            or getattr(self, "_auto_expand_all_waiting_next", False)
+            or getattr(self, "_chapter_plan_auto_active", False)
+            or plan_continuation_pending
+            or (getattr(self, "_chapter_task_timer_owner", None) or {}).get("pending", 0)
+        )
+        if not active:
+            return False
+        existing = (getattr(self, "_background_chapter_ai_runners", {}) or {}).get(source_path)
+        if existing is not None:
+            return False
+        try:
+            self._flush_current_editors()
+            runner = NovelWritingTab(deepcopy(self.config), None, background_runner=True)
+            runner._save_draft_snapshot = lambda: None
+            runner._notify_project_store_changed = lambda: None
+            runner._load_project_data(
+                deepcopy(self.current_project), source_path, defer_helpers=True
+            )
+            runner.current_chapter_index = self.current_chapter_index
+            runner._reload_chapter_list(self.current_chapter_index)
+            self._copy_chapter_task_state(runner)
+            # Other record editors must match their selected indexes before a save.
+            runner._load_character_to_editor(runner.current_character_index)
+            runner._load_lore_to_editor(runner.current_lore_index)
+            runner._load_foreshadow_to_editor(runner.current_foreshadow_index)
+            runner.chapter_ai_stream_text = self.chapter_ai_stream_text
+            runner.chapter_ai_preview.setPlainText(self.chapter_ai_preview.toPlainText())
+            runner._pending_chapter_plan = deepcopy(
+                getattr(self, "_pending_chapter_plan", {}) or {}
+            )
+            self._move_chapter_task_workers_to(runner)
+            runner.hide()
+            runners = getattr(self, "_background_chapter_ai_runners", None)
+            if not isinstance(runners, dict):
+                runners = {}
+                self._background_chapter_ai_runners = runners
+            runners[source_path] = runner
+            self._context_build_pending = {}
+            self._chapter_ai_memory_pending = {}
+            self._chapter_ai_sequence_active = False
+            self._chapter_ai_transient_retry_pending = False
+            self._chapter_ai_transient_retry_token = int(
+                getattr(self, "_chapter_ai_transient_retry_token", 0) or 0
+            ) + 1
+            self._chapter_ai_active_task = {}
+            self._chapter_ai_running_action = ""
+            self._chapter_plan_continue_pending = False
+            self._chapter_plan_sequence_token = int(
+                getattr(self, "_chapter_plan_sequence_token", 0) or 0
+            ) + 1
+            self._auto_expand_all_active = False
+            self._auto_expand_all_waiting_next = False
+            self._reset_chapter_ai_style_retry()
+            self._log_novel_diagnostic(
+                "chapter_ai_task_detached_for_project_switch",
+                level="info",
+                project_path=source_path,
+                reason=str(reason or "")[:500],
+                chapter_id=str(getattr(writing_worker, "diagnostic_chapter_id", "") or ""),
+                request_id=str(getattr(writing_worker, "diagnostic_request_id", "") or ""),
+            )
+            return True
+        except Exception as exc:
+            self._log_novel_diagnostic(
+                "chapter_ai_task_detach_failed",
+                level="error",
+                project_path=source_path,
+                error_category="lifecycle",
+                **self._novel_exception_details(exc),
+            )
+            return False
+
+    def _background_chapter_runner_for_path(self, path):
+        source_path = self._canonical_project_path(path)
+        if not source_path:
+            return None
+        runners = getattr(self, "_background_chapter_ai_runners", {})
+        if not isinstance(runners, dict):
+            return None
+        return runners.get(source_path)
+
+    def _attach_background_chapter_runner(self, path):
+        """Restore a project's hidden chapter worker into the visible tab."""
+        if getattr(self, "_is_detached_auto_runner", False):
+            return False
+        source_path = self._canonical_project_path(path)
+        runner = self._background_chapter_runner_for_path(source_path)
+        if runner is None:
+            return False
+        try:
+            # The project data was loaded from the runner immediately before
+            # this call. Copy the in-memory snapshot once more so a queued
+            # callback that saved just before the switch is not lost.
+            self.current_project = deepcopy(runner.current_project)
+            self.current_project_path = source_path
+            runners = getattr(self, "_background_chapter_ai_runners", {})
+            runners.pop(source_path, None)
+            self._update_detached_auto_source_lock()
+            runner._copy_chapter_task_state(self)
+            self._reload_character_list(self.current_character_index)
+            self._reload_lore_list(self.current_lore_index)
+            self._reload_foreshadow_list(self.current_foreshadow_index)
+            self._reload_chapter_list(self.current_chapter_index)
+            self._load_character_to_editor(self.current_character_index)
+            self._load_lore_to_editor(self.current_lore_index)
+            self._load_foreshadow_to_editor(self.current_foreshadow_index)
+            self.chapter_ai_stream_text = str(
+                getattr(runner, "chapter_ai_stream_text", "") or ""
+            )
+            self.chapter_ai_preview.setPlainText(
+                runner.chapter_ai_preview.toPlainText()
+            )
+            self._pending_chapter_plan = deepcopy(
+                getattr(runner, "_pending_chapter_plan", {}) or {}
+            )
+
+            runner._move_chapter_task_workers_to(self)
+
+            # The workers now belong to this tab.  Clearing the runner's
+            # references lets the runner's own status poller see that it no
+            # longer owns active work and prevents a later cleanup from
+            # deleting a worker that has already been reattached.
+            self._sync_completed_background_chapter_plan(self._pending_chapter_plan)
+            self._set_chapter_ai_actions_enabled(not self._status_has_active_work())
+            self._refresh_status_display()
+            runner.deleteLater()
+            self._log_novel_diagnostic(
+                "chapter_ai_task_attached_after_project_switch",
+                level="info",
+                project_path=source_path,
+                chapter_id=self._current_chapter_id(),
+                request_id=str(
+                    getattr(self, "_chapter_ai_diagnostic_request_id", "") or ""
+                ),
+            )
+            return True
+        except Exception as exc:
+            self._background_chapter_ai_runners[source_path] = runner
+            self._log_novel_diagnostic(
+                "chapter_ai_task_attach_failed",
+                level="error",
+                project_path=source_path,
+                error_category="lifecycle",
+                **self._novel_exception_details(exc),
+            )
+            return False
+
+    def _current_background_chapter_runner(self):
+        if getattr(self, "_is_detached_auto_runner", False):
+            return None
+        source_path = self._canonical_project_path(getattr(self, "current_project_path", ""))
+        runners = getattr(self, "_background_chapter_ai_runners", {})
+        runner = runners.get(source_path) if isinstance(runners, dict) else None
+        if runner is not None:
+            return runner
+        detached = getattr(self, "_detached_auto_runner", None)
+        detached_path = self._canonical_project_path(getattr(self, "_detached_auto_project_path", ""))
+        return detached if source_path and source_path == detached_path else None
+
+    def _poll_background_chapter_ai_runners(self):
+        runners = getattr(self, "_background_chapter_ai_runners", None)
+        if not isinstance(runners, dict) or not runners:
+            return
+        for source_path, runner in list(runners.items()):
+            try:
+                visible = self._current_background_chapter_runner() is runner
+                if visible:
+                    self._sync_detached_auto_status(runner)
+                if runner._status_has_active_work():
+                    continue
+                runner._save_current_project_snapshot_if_named()
+                runners.pop(source_path, None)
+                if visible:
+                    data = deepcopy(runner.current_project)
+                    plan = deepcopy(getattr(runner, "_pending_chapter_plan", {}) or {})
+                    self._update_detached_auto_source_lock()
+                    self._load_project_data(data, source_path, defer_helpers=True)
+                    self._sync_completed_background_chapter_plan(plan)
+                    self.set_status_tip(str(getattr(runner, "_status_message", "") or "章节任务已结束。"))
+                runner.deleteLater()
+                self._notify_project_store_changed()
+                self._log_novel_diagnostic(
+                    "chapter_ai_background_task_finished",
+                    level="info",
+                    project_path=source_path,
+                    status=str(getattr(runner, "_status_message", "") or ""),
+                )
+            except Exception as exc:
+                self._log_novel_diagnostic(
+                    "chapter_ai_background_task_poll_failed",
+                    level="error",
+                    project_path=source_path,
+                    error_category="lifecycle",
+                    **self._novel_exception_details(exc),
+                )
+
+    def _sync_completed_background_chapter_plan(self, plan=None):
+        if plan is None:
+            project = getattr(self, "current_project", {})
+            state = project.get("chapter_plan_generation_state", {}) if isinstance(project, dict) else {}
+            plan = self._chapter_plan_from_generation_state(state) if state.get("status") == "complete" else {}
+        if not isinstance(plan, dict) or not plan.get("chapters"):
+            return
+        self._pending_chapter_plan = deepcopy(plan)
+        self.chapter_ai_preview.setPlainText(self._format_chapter_plan_preview(plan))
+        self.chapter_plan_apply_btn.setVisible(True)
+        self.chapter_plan_apply_btn.setEnabled(True)
+
+    def stop_background_chapter_ai_runners(self):
+        runners = getattr(self, "_background_chapter_ai_runners", {})
+        if not isinstance(runners, dict):
+            return
+        for runner in list(runners.values()):
+            try:
+                runner.stop_chapter_ai_action()
+                runner._save_current_project_snapshot_if_named()
+            except Exception as exc:
+                log_debug("退出时停止后台章节任务失败", exc)
+        runners.clear()
+
     def _load_project_data(self, data, path="", defer_helpers=False):
+        detached_task = self._detach_foreground_chapter_tasks(
+            "加载新项目数据，旧项目章节任务转入后台"
+        )
         self._invalidate_chapter_plan_generation(
             "加载项目数据，旧章节规划预览和回调已失效",
             clear_project_state=False,
         )
-        if not getattr(self, "_is_detached_auto_runner", False):
+        if not getattr(self, "_is_detached_auto_runner", False) and not detached_task:
             foreground_worker = getattr(self, "writing_worker", None)
             has_foreground_task = bool(
                 foreground_worker is not None
@@ -5104,6 +5518,7 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
         finally:
             self._loading = False
         self.refresh_project_summary_label()
+        self._update_detached_auto_source_lock()
         self._update_stats_label()
         self._refresh_framework_import_retry_action()
         if defer_helpers:
@@ -7596,8 +8011,8 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
             )
         payload["characters"] = _compact_volume_handoff_records(
             payload.get("characters", []),
-            ("name", "role", "goal", "secret", "voice", "notes"),
-            {"name": 80, "role": 90, "goal": 130, "secret": 130, "voice": 100, "notes": 120},
+            ("name", "role", "goal", "secret", "personality", "voice", "notes"),
+            {"name": 80, "role": 90, "goal": 130, "secret": 130, "personality": 100, "voice": 100, "notes": 120},
             10000 if batch_mode else 14000,
             minimal_fields=("name", "role", "goal"),
         )
@@ -8291,7 +8706,7 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
             ),
             "characters": compact_records(
                 framework.get("characters", []),
-                ("name", "role", "goal", "secret", "voice", "notes"),
+                ("name", "role", "goal", "secret", "personality", "voice", "notes"),
                 item_limit=700,
                 total_limit=9000,
             ),
@@ -8753,7 +9168,7 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
             },
             "characters": self._chapter_plan_records(
                 project.get("characters", []),
-                ("name", "role", "goal", "secret", "voice", "notes"),
+                ("name", "role", "goal", "secret", "personality", "voice", "notes"),
                 120,
                 700,
                 keep_tail_fields={"notes"},
@@ -10157,10 +10572,9 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
             ).get("title", "")
             or ""
         ).strip()
-        self._connect_novel_worker_status(worker)
-        worker.result_ready.connect(self.on_chapter_plan_event_placement_ready)
-        worker.failed.connect(self.on_chapter_plan_failed)
-        worker.finished.connect(self._cleanup_chapter_plan_worker)
+        self._connect_chapter_task_worker(
+            worker, "on_chapter_plan_event_placement_ready", "_cleanup_chapter_plan_worker"
+        )
         request_id = self._next_novel_diagnostic_request_id("chapter-plan-placement")
         diagnostic_started_at = time.perf_counter()
         self._chapter_plan_diagnostic_request_id = request_id
@@ -10244,6 +10658,8 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
         return ""
 
     def on_chapter_plan_event_placement_ready(self, placement):
+        if self._forward_chapter_task_signal("on_chapter_plan_event_placement_ready", placement):
+            return
         if not self._chapter_plan_callback_is_current():
             return
         stage_data = self._creation_wizard_stage_nodes_for_range(
@@ -10445,10 +10861,9 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
             ).get("title", "")
             or ""
         ).strip()
-        self._connect_novel_worker_status(worker)
-        worker.result_ready.connect(self.on_chapter_plan_ready)
-        worker.failed.connect(self.on_chapter_plan_failed)
-        worker.finished.connect(self._cleanup_chapter_plan_worker)
+        self._connect_chapter_task_worker(
+            worker, "on_chapter_plan_ready", "_cleanup_chapter_plan_worker"
+        )
         request_id = self._next_novel_diagnostic_request_id("chapter-plan")
         diagnostic_started_at = time.perf_counter()
         self._chapter_plan_diagnostic_request_id = request_id
@@ -10603,6 +11018,8 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
         self._start_chapter_plan_worker_for_state(state)
 
     def on_chapter_plan_ready(self, plan):
+        if self._forward_chapter_task_signal("on_chapter_plan_ready", plan):
+            return
         if not self._chapter_plan_callback_is_current():
             return
         request_id, started_at, worker_diagnostics = self._chapter_plan_signal_diagnostics()
@@ -10753,9 +11170,16 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
             ):
                 self._start_chapter_plan_worker_for_state(state)
 
-        QTimer.singleShot(100, continue_planning)
+        self._schedule_chapter_task_callback(100, lambda tab: (
+            tab._start_chapter_plan_worker_for_state(state)
+            if tab._chapter_plan_auto_active
+            and int(getattr(tab, "_chapter_plan_sequence_token", 0) or 0) == token
+            else None
+        ))
 
     def on_chapter_plan_failed(self, err):
+        if self._forward_chapter_task_signal("on_chapter_plan_failed", err):
+            return
         if not self._chapter_plan_callback_is_current():
             return
         request_id, started_at, worker_diagnostics = self._chapter_plan_signal_diagnostics()
@@ -10806,45 +11230,48 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
             self.chapter_plan_apply_btn.setVisible(False)
             self.chapter_plan_apply_btn.setEnabled(False)
         self.set_status_tip(f"章节规划当前批次失败，进度已保存：{err_text[:100]}")
-        QMessageBox.warning(self, "章节规划生成失败", err_text)
+        if not getattr(self, "_is_detached_auto_runner", False):
+            QMessageBox.warning(self, "章节规划生成失败", err_text)
 
     def _cleanup_chapter_plan_worker(self):
-        worker = self.sender()
+        if self._forward_chapter_task_signal("_cleanup_chapter_plan_worker"):
+            return
+        worker = self._chapter_task_signal_worker()
 
-        def cleanup():
+        def cleanup(tab):
             try:
-                was_current = self.chapter_plan_worker is worker
+                was_current = tab.chapter_plan_worker is worker
                 if was_current:
-                    self.chapter_plan_worker = None
+                    tab.chapter_plan_worker = None
                 if worker is not None:
                     worker.deleteLater()
                 if was_current:
-                    continue_pending = bool(getattr(self, "_chapter_plan_continue_pending", False))
-                    self._set_chapter_ai_actions_enabled(not continue_pending)
-                    if getattr(self, "_chapter_ai_stop_requested_by_user", False):
-                        state = deepcopy(self.current_project.get("chapter_plan_generation_state", {}))
+                    continue_pending = bool(getattr(tab, "_chapter_plan_continue_pending", False))
+                    tab._set_chapter_ai_actions_enabled(not continue_pending)
+                    if getattr(tab, "_chapter_ai_stop_requested_by_user", False):
+                        state = deepcopy(tab.current_project.get("chapter_plan_generation_state", {}))
                         if isinstance(state, dict) and state and state.get("status") != "complete":
                             state["status"] = "interrupted"
-                            self._persist_chapter_plan_generation_state(state)
-                        self.set_status_tip("章节规划生成已中止。")
-                    self._chapter_ai_stop_requested_by_user = False
+                            tab._persist_chapter_plan_generation_state(state)
+                        tab.set_status_tip("章节规划生成已中止。")
+                    tab._chapter_ai_stop_requested_by_user = False
                     if continue_pending:
-                        self._chapter_plan_continue_pending = False
-                        state = deepcopy(self.current_project.get("chapter_plan_generation_state", {}))
-                        token = int(getattr(self, "_chapter_plan_sequence_token", 0) or 0)
-                        QTimer.singleShot(
+                        tab._chapter_plan_continue_pending = False
+                        state = deepcopy(tab.current_project.get("chapter_plan_generation_state", {}))
+                        token = int(getattr(tab, "_chapter_plan_sequence_token", 0) or 0)
+                        tab._schedule_chapter_task_callback(
                             100,
-                            lambda s=state, t=token: (
-                                self._start_chapter_plan_worker_for_state(s)
-                                if getattr(self, "_chapter_plan_auto_active", False)
-                                and int(getattr(self, "_chapter_plan_sequence_token", 0) or 0) == t
+                            lambda owner, s=state, t=token: (
+                                owner._start_chapter_plan_worker_for_state(s)
+                                if getattr(owner, "_chapter_plan_auto_active", False)
+                                and int(getattr(owner, "_chapter_plan_sequence_token", 0) or 0) == t
                                 else None
                             ),
                         )
             except Exception as e:
                 log_debug("小说章节规划线程清理失败", e)
 
-        QTimer.singleShot(0, cleanup)
+        self._schedule_chapter_task_callback(0, cleanup)
 
     def apply_chapter_plan(self):
         plan = deepcopy(getattr(self, "_pending_chapter_plan", {}) or {})
@@ -11052,7 +11479,7 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
                     force_retry=True,
                     retry_context="context_build",
                     retry_chapter_id=context_chapter_id,
-                    retry_callback=lambda: self._start_chapter_context_build(
+                    retry_callback=lambda tab: tab._start_chapter_context_build(
                         action,
                         mode,
                         project_snapshot=None,
@@ -11122,9 +11549,9 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
             target_id,
         )
         self.context_build_worker = worker
-        worker.result_ready.connect(self._on_chapter_context_ready)
-        worker.failed.connect(self._on_chapter_context_failed)
-        worker.finished.connect(self._cleanup_chapter_context_worker)
+        self._connect_chapter_task_worker(
+            worker, "_on_chapter_context_ready", "_cleanup_chapter_context_worker"
+        )
         try:
             worker.start()
         except Exception as exc:
@@ -11135,7 +11562,7 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
                 force_retry=True,
                 retry_context="context_build",
                 retry_chapter_id=target_id,
-                retry_callback=lambda: self._start_chapter_context_build(
+                retry_callback=lambda tab: tab._start_chapter_context_build(
                     action,
                     mode,
                     project_snapshot=None,
@@ -11167,6 +11594,10 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
         )
 
     def _on_chapter_context_ready(self, token, action, chapter_id, context):
+        if self._forward_chapter_task_signal(
+            "_on_chapter_context_ready", token, action, chapter_id, context
+        ):
+            return
         pending = dict(getattr(self, "_context_build_pending", {}) or {})
         if str(token or "") != str(pending.get("token", "") or ""):
             return
@@ -11213,6 +11644,10 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
         self._start_chapter_ai_worker(action, context, str(pending.get("status_text", "") or ""))
 
     def _on_chapter_context_failed(self, token, action, chapter_id, error):
+        if self._forward_chapter_task_signal(
+            "_on_chapter_context_failed", token, action, chapter_id, error
+        ):
+            return
         pending = dict(getattr(self, "_context_build_pending", {}) or {})
         if str(token or "") != str(pending.get("token", "") or ""):
             return
@@ -11226,11 +11661,11 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
             force_retry=True,
             retry_context="context_build",
             retry_chapter_id=target_chapter_id,
-            retry_callback=lambda: self._start_chapter_context_build(
+            retry_callback=lambda tab: tab._start_chapter_context_build(
                 action,
                 str(pending.get("mode", "direct") or "direct"),
                 project_snapshot=None,
-                chapter_index=int(pending.get("chapter_index", -1) or -1),
+                chapter_index=int(pending.get("chapter_index", -1)),
                 chapter_id=target_chapter_id,
                 rewrite_on_ready=bool(pending.get("rewrite_on_ready", False)),
                 status_text=str(pending.get("status_text", "") or ""),
@@ -11255,7 +11690,9 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
         self._show_chapter_ai_failure(str(error))
 
     def _cleanup_chapter_context_worker(self):
-        worker = self.sender()
+        if self._forward_chapter_task_signal("_cleanup_chapter_context_worker"):
+            return
+        worker = self._chapter_task_signal_worker()
         if self.context_build_worker is worker:
             self.context_build_worker = None
         if worker is not None:
@@ -11834,9 +12271,7 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
         if getattr(self, "_is_detached_auto_runner", False):
             return False
         runner = runner if runner is not None else getattr(self, "_detached_auto_runner", None)
-        source = os.path.abspath(str(getattr(self, "_detached_auto_project_path", "") or ""))
-        current = os.path.abspath(str(getattr(self, "current_project_path", "") or ""))
-        return bool(runner is not None and source and source == current)
+        return runner is not None and runner is self._current_background_chapter_runner()
 
     def _sync_detached_auto_status(self, runner):
         """Mirror detached expansion status into the visible project tab."""
@@ -11941,13 +12376,19 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
         states.clear()
 
     def _update_detached_auto_source_lock(self):
-        source = os.path.abspath(str(getattr(self, "_detached_auto_project_path", "") or ""))
-        current = os.path.abspath(str(getattr(self, "current_project_path", "") or ""))
-        locked = bool(source and current == source)
+        detached_runner = self._current_background_chapter_runner()
+        detached_path = self._canonical_project_path(
+            getattr(self, "_detached_auto_project_path", "")
+        )
+        current_path = self._canonical_project_path(
+            getattr(self, "current_project_path", "")
+        )
+        locked = detached_runner is not None or bool(
+            detached_path and detached_path == current_path
+        )
         if not locked:
             self._clear_detached_auto_status_mirror()
         self._set_detached_auto_source_read_only(locked)
-        detached_runner = getattr(self, "_detached_auto_runner", None)
         detached_active = False
         if detached_runner is not None and not getattr(self, "_is_detached_auto_runner", False):
             try:
@@ -11957,7 +12398,7 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
         if hasattr(self, "chapter_ai_stop_btn"):
             if detached_active and locked:
                 self.chapter_ai_stop_btn.setText("中止后台扩写")
-                self.chapter_ai_stop_btn.setToolTip("中止正在后台运行的自动扩写任务")
+                self.chapter_ai_stop_btn.setToolTip("中止当前项目正在后台运行的章节任务")
                 self.chapter_ai_stop_btn.setVisible(True)
                 self.chapter_ai_stop_btn.setEnabled(True)
             else:
@@ -11968,7 +12409,7 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
             self.auto_expand_all_btn.setEnabled(not locked)
             self.auto_expand_all_btn.setText("后台自动扩写中" if locked else "自动扩写全部")
         if locked and hasattr(self, "project_hint"):
-            self.project_hint.setText("当前项目正在后台自动扩写，可查看最新已保存内容；编辑和启动写作已锁定。")
+            self.project_hint.setText("当前项目正在后台处理章节，可查看最新已保存内容；任务完成后自动恢复编辑。")
         elif hasattr(self, "project_hint"):
             self.project_hint.setText("单击列表可打开已保存小说。")
 
@@ -12062,7 +12503,7 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
             pending_count=len(pending),
             **self._novel_perf_summary(),
         )
-        QTimer.singleShot(0, self._start_next_auto_expand_chapter)
+        self._schedule_chapter_task_callback(0, lambda tab: tab._start_next_auto_expand_chapter())
 
     def _start_next_auto_expand_chapter(self):
         if not getattr(self, "_auto_expand_all_active", False):
@@ -12126,21 +12567,21 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
         self.set_status_tip(
             f"自动扩写 {chapter_number}/{project_total}：第{index + 1}章《{title}》...{rewrite_notice}"
         )
-        def start_sequence_after_ui_update():
-            if not getattr(self, "_auto_expand_all_active", False):
+        def start_sequence_after_ui_update(tab):
+            if not getattr(tab, "_auto_expand_all_active", False):
                 return
-            if self._current_chapter_id() != str(chapter.get("id", "") or ""):
+            if tab._current_chapter_id() != str(chapter.get("id", "") or ""):
                 return
-            self._start_chapter_ai_sequence()
+            tab._start_chapter_ai_sequence()
             if (
-                getattr(self, "_auto_expand_all_active", False)
-                and not getattr(self, "_chapter_ai_sequence_active", False)
-                and getattr(self, "writing_worker", None) is None
+                getattr(tab, "_auto_expand_all_active", False)
+                and not getattr(tab, "_chapter_ai_sequence_active", False)
+                and getattr(tab, "writing_worker", None) is None
             ):
-                self._stop_auto_expand_all(f"自动扩写已停止：第{index + 1}章《{title}》未能启动。")
-                self._set_chapter_ai_actions_enabled(True)
+                tab._stop_auto_expand_all(f"自动扩写已停止：第{index + 1}章《{title}》未能启动。")
+                tab._set_chapter_ai_actions_enabled(True)
 
-        QTimer.singleShot(0, start_sequence_after_ui_update)
+        self._schedule_chapter_task_callback(0, start_sequence_after_ui_update)
 
     def _on_auto_expand_chapter_completed(self, memory_changed):
         if not getattr(self, "_auto_expand_all_active", False):
@@ -12321,7 +12762,7 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
         """Reject late worker signals before they can touch the visible project."""
         worker = None
         try:
-            candidate = self.sender()
+            candidate = self._chapter_task_signal_worker()
             if candidate is not None and hasattr(candidate, "diagnostic_request_id"):
                 worker = candidate
         except Exception:
@@ -12479,7 +12920,7 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
         """Reject late chapter-plan worker signals after context replacement."""
         worker = None
         try:
-            candidate = self.sender()
+            candidate = self._chapter_task_signal_worker()
             if candidate is not None and hasattr(candidate, "_chapter_plan_sequence_token"):
                 worker = candidate
         except Exception:
@@ -13560,6 +14001,14 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
             self.current_chapter_index,
             text,
         )
+        if transient_retry:
+            context = (
+                "【本次是状态整理重试】\n"
+                "上一次状态整理结果未能通过解析或完整校验，正文尚未提交长期状态。"
+                "本次必须先完整返回outline、summary、key_facts和long_form_memory，再返回三个审校字段；"
+                "不能只返回审校字段。请依据下方完整资料重新整理本章状态。\n\n"
+                + context
+            )
         self.chapter_ai_preview.setPlainText(text)
         self.chapter_ai_stream_text = ""
         status_text = (
@@ -13806,6 +14255,12 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
                 "memory_finalize",
                 "独立状态整理结果无法解析（JSON格式错误）",
                 force_retry=True,
+                retry_callback=lambda tab: tab._start_memory_finalize(
+                    final_text,
+                    resumed=True,
+                    prose_patch_applied=bool(pending.get("prose_patch_applied")),
+                    transient_retry=True,
+                ),
             ):
                 return
             self._fail_memory_sync("独立状态整理结果无法解析（JSON格式错误）")
@@ -13848,6 +14303,12 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
                 "memory_finalize",
                 "独立状态整理结果为空，已保留正文并等待下次状态整理",
                 force_retry=True,
+                retry_callback=lambda tab: tab._start_memory_finalize(
+                    final_text,
+                    resumed=True,
+                    prose_patch_applied=bool(pending.get("prose_patch_applied")),
+                    transient_retry=True,
+                ),
             ):
                 return
             self._fail_memory_sync("独立状态整理结果为空，已保留正文并等待下次状态整理")
@@ -13881,7 +14342,7 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
                 "memory_finalize",
                 "状态整理结果未通过校验：" + "；".join(validation_errors),
                 force_retry=True,
-                retry_callback=lambda: self._start_memory_finalize(
+                retry_callback=lambda tab: tab._start_memory_finalize(
                     final_text,
                     resumed=True,
                     prose_patch_applied=bool(pending.get("prose_patch_applied")),
@@ -14118,7 +14579,7 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
                 "logic_repair",
                 "；".join(errors),
                 force_retry=True,
-                retry_callback=lambda: self._start_chapter_logic_repair(
+                retry_callback=lambda tab: tab._start_chapter_logic_repair(
                     final_text,
                     pending.get("bundle", {}),
                     issues,
@@ -14308,7 +14769,7 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
                 "memory_repair",
                 "状态修复结果无法解析（JSON格式错误）",
                 force_retry=True,
-                retry_callback=lambda: self._start_memory_repair(
+                retry_callback=lambda tab: tab._start_memory_repair(
                     final_text,
                     bundle,
                     retry_errors,
@@ -14359,7 +14820,7 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
                 "memory_repair",
                 "；".join(validation_errors),
                 force_retry=True,
-                retry_callback=lambda: self._start_memory_repair(
+                retry_callback=lambda tab: tab._start_memory_repair(
                     final_text,
                     bundle,
                     validation_errors,
@@ -14653,11 +15114,9 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
                     "task_generation": task_generation,
                 }
             )
-        self._connect_novel_worker_status(self.writing_worker)
-        self.writing_worker.chunk.connect(self.on_chapter_ai_chunk)
-        self.writing_worker.result_ready.connect(self.on_chapter_ai_ready)
-        self.writing_worker.failed.connect(self.on_chapter_ai_failed)
-        self.writing_worker.finished.connect(self._cleanup_writing_worker)
+        self._connect_chapter_task_worker(
+            self.writing_worker, "on_chapter_ai_ready", "_cleanup_writing_worker"
+        )
         self._chapter_ai_stop_requested_by_user = False
         if not transient_retry or not str(getattr(self, "_chapter_ai_running_status_text", "") or ""):
             self._chapter_ai_running_status_text = str(status_text or "")
@@ -14835,39 +15294,39 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
             f"（{attempt}/{max_retries}）..."
         )
 
-        def retry():
-            if token != int(getattr(self, "_chapter_ai_transient_retry_token", 0) or 0):
+        def retry(tab):
+            if token != int(getattr(tab, "_chapter_ai_transient_retry_token", 0) or 0):
                 return
-            if not getattr(self, "_chapter_ai_transient_retry_pending", False):
+            if not getattr(tab, "_chapter_ai_transient_retry_pending", False):
                 return
-            if getattr(self, "_chapter_ai_stop_requested_by_user", False):
-                self._chapter_ai_transient_retry_pending = False
+            if getattr(tab, "_chapter_ai_stop_requested_by_user", False):
+                tab._chapter_ai_transient_retry_pending = False
                 return
-            if self._current_chapter_id() != chapter_id:
-                self._chapter_ai_transient_retry_pending = False
-                for key in list(self._chapter_ai_transient_retry_counts):
+            if tab._current_chapter_id() != chapter_id:
+                tab._chapter_ai_transient_retry_pending = False
+                for key in list(tab._chapter_ai_transient_retry_counts):
                     if key == retry_key or key.startswith(retry_key + ":"):
-                        self._chapter_ai_transient_retry_counts.pop(key, None)
-                self._reset_chapter_ai_sequence()
-                self.set_status_tip("章节已切换，已取消上一个章节的自动重试。")
-                self._set_chapter_ai_actions_enabled(True)
+                        tab._chapter_ai_transient_retry_counts.pop(key, None)
+                tab._reset_chapter_ai_sequence()
+                tab.set_status_tip("章节已切换，已取消上一个章节的自动重试。")
+                tab._set_chapter_ai_actions_enabled(True)
                 return
             if (
                 not callable(retry_callback)
                 and action.startswith("style_")
-                and not getattr(self, "_chapter_ai_style_workflow_active", False)
+                and not getattr(tab, "_chapter_ai_style_workflow_active", False)
             ):
-                self._chapter_ai_transient_retry_pending = False
+                tab._chapter_ai_transient_retry_pending = False
                 return
-            worker = getattr(self, "writing_worker", None)
+            worker = getattr(tab, "writing_worker", None)
             if worker is not None and worker.isRunning():
-                QTimer.singleShot(500, retry)
+                tab._schedule_chapter_task_callback(500, retry)
                 return
-            self._chapter_ai_transient_retry_pending = False
+            tab._chapter_ai_transient_retry_pending = False
             if callable(retry_callback):
-                retry_callback()
+                retry_callback(tab)
             else:
-                self._start_chapter_ai_worker(
+                tab._start_chapter_ai_worker(
                     action,
                     context,
                     f"正在自动重试当前步骤（{attempt}/{max_retries}）..." if not status_text else
@@ -14875,7 +15334,7 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
                     transient_retry=True,
                 )
 
-        QTimer.singleShot(delay_seconds * 1000, retry)
+        self._schedule_chapter_task_callback(delay_seconds * 1000, retry)
         self._log_novel_diagnostic(
             "chapter_ai_retry_scheduled",
             level="warning",
@@ -15181,7 +15640,10 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
             if hasattr(self, "context_build_worker"):
                 self._set_chapter_ai_actions_enabled(False)
                 self.set_status_tip("正在后台准备本章资料...")
-                QTimer.singleShot(0, self._start_chapter_ai_sequence)
+                self._chapter_ai_sequence_active = True
+                self._schedule_chapter_task_callback(
+                    0, lambda tab: tab._start_chapter_ai_sequence()
+                )
                 return
             self._start_chapter_ai_sequence()
             return
@@ -15202,7 +15664,7 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
         )
 
     def stop_chapter_ai_action(self):
-        detached = getattr(self, "_detached_auto_runner", None)
+        detached = self._current_background_chapter_runner()
         if detached is not None and not getattr(self, "_is_detached_auto_runner", False):
             local_writing = getattr(self, "writing_worker", None)
             local_context = getattr(self, "context_build_worker", None)
@@ -15306,6 +15768,8 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
         return True
 
     def on_chapter_ai_chunk(self, piece):
+        if self._forward_chapter_task_signal("on_chapter_ai_chunk", piece):
+            return
         if not self._chapter_ai_callback_is_current():
             return
         piece = str(piece or "")
@@ -15506,6 +15970,8 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
         return marked
 
     def on_chapter_ai_ready(self, action, content):
+        if self._forward_chapter_task_signal("on_chapter_ai_ready", action, content):
+            return
         if not self._chapter_ai_callback_is_current():
             return
         self.set_chapter_ai_panel_expanded(True)
@@ -15641,7 +16107,7 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
                     "style_finalize",
                     "终稿审校结果无法解析或缺少验收内容",
                     force_retry=True,
-                    retry_callback=lambda: self._start_style_candidate_finalize(
+                    retry_callback=lambda tab: tab._start_style_candidate_finalize(
                         rescue_candidate,
                         rescue=True,
                         gate_errors=["终稿审校结果无法解析或缺少验收内容"],
@@ -15656,7 +16122,7 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
                     "style_finalize",
                     "终稿审校没有返回可用正文",
                     force_retry=True,
-                    retry_callback=lambda: self._start_style_candidate_finalize(
+                    retry_callback=lambda tab: tab._start_style_candidate_finalize(
                         initial,
                         rescue=True,
                         gate_errors=["终稿审校没有返回可用正文"],
@@ -15745,7 +16211,7 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
                         "style_finalize",
                         "终稿验收未通过：" + "；".join(hard_errors[:6]),
                         force_retry=True,
-                        retry_callback=lambda: self._start_style_candidate_finalize(
+                        retry_callback=lambda tab: tab._start_style_candidate_finalize(
                             rescue_candidate,
                             rescue=True,
                             gate_errors=rescue_gate_errors,
@@ -15826,6 +16292,8 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
             self.set_status_tip(f"AI {labels.get(action, '内容')}已生成，可确认后应用。")
 
     def on_chapter_ai_failed(self, err):
+        if self._forward_chapter_task_signal("on_chapter_ai_failed", err):
+            return
         if not self._chapter_ai_callback_is_current():
             return
         action = getattr(self, "_chapter_ai_running_action", "")
@@ -15987,31 +16455,35 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
         self._show_chapter_ai_failure(err_text)
 
     def _cleanup_writing_worker(self):
-        worker = self.sender()
-        def cleanup():
+        if self._forward_chapter_task_signal("_cleanup_writing_worker"):
+            return
+        worker = self._chapter_task_signal_worker()
+        def cleanup(tab):
             try:
-                was_current = self.writing_worker is worker
+                was_current = tab.writing_worker is worker
                 if was_current:
-                    self.writing_worker = None
-                retired = getattr(self, "writing_retired_workers", None)
+                    tab.writing_worker = None
+                retired = getattr(tab, "writing_retired_workers", None)
                 if isinstance(retired, list) and worker in retired:
                     retired.remove(worker)
                 if worker is not None:
                     worker.deleteLater()
                 if was_current:
-                    retry_pending = bool(getattr(self, "_chapter_ai_transient_retry_pending", False))
-                    self._set_chapter_ai_actions_enabled(not retry_pending)
+                    retry_pending = bool(getattr(tab, "_chapter_ai_transient_retry_pending", False))
+                    tab._set_chapter_ai_actions_enabled(not retry_pending)
                     if not retry_pending:
-                        self._chapter_ai_stop_requested_by_user = False
-                    self._chapter_ai_running_action = ""
+                        tab._chapter_ai_stop_requested_by_user = False
+                        tab._chapter_ai_running_action = ""
                     if (
-                        getattr(self, "_auto_expand_all_active", False)
-                        and getattr(self, "_auto_expand_all_waiting_next", False)
+                        getattr(tab, "_auto_expand_all_active", False)
+                        and getattr(tab, "_auto_expand_all_waiting_next", False)
                     ):
-                        QTimer.singleShot(100, self._start_next_auto_expand_chapter)
+                        tab._schedule_chapter_task_callback(
+                            100, lambda owner: owner._start_next_auto_expand_chapter()
+                        )
             except Exception as e:
                 log_debug("小说章节 AI 线程清理失败", e)
-        QTimer.singleShot(0, cleanup)
+        self._schedule_chapter_task_callback(0, cleanup)
 
     def apply_chapter_ai_preview(self, target):
         text = self.chapter_ai_preview.toPlainText().strip()
@@ -17064,6 +17536,8 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
         self._draft_saved_once = True
 
     def _save_current_project_snapshot_if_named(self):
+        if self._current_background_chapter_runner() is not None:
+            return
         path = str(self.current_project_path or "").strip()
         if not path or path == NOVEL_DRAFT_FILE:
             return
@@ -17098,9 +17572,8 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
         remember_project_path(path)
 
     def save_current_project(self):
-        detached_source = os.path.abspath(str(getattr(self, "_detached_auto_project_path", "") or ""))
-        if detached_source and os.path.abspath(str(self.current_project_path or "")) == detached_source:
-            self.set_status_tip("当前项目正在后台自动扩写，任务结束前不允许从界面覆盖保存。")
+        if self._current_background_chapter_runner() is not None:
+            self.set_status_tip("当前项目正在后台处理章节，任务结束前不允许从界面覆盖保存。")
             return True
         self._flush_current_editors()
         self._sync_candidate_analysis_state()
@@ -17220,7 +17693,11 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
         self._opening_project = True
         try:
             step_start = time.perf_counter()
-            data = load_json_file(path, None)
+            runner = self._background_chapter_runner_for_path(path)
+            data = (
+                deepcopy(runner.current_project)
+                if runner is not None else load_json_file(path, None)
+            )
             self._log_novel_perf(
                 "切换小说-读取文件",
                 step_start,
@@ -17241,10 +17718,14 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
                     update_draft=False,
                 )
             self._load_project_data(data, path, defer_helpers=True)
+            attached = self._attach_background_chapter_runner(path)
+            if not attached and self._current_background_chapter_runner() is None:
+                self._sync_completed_background_chapter_plan()
             self._remember_project_path(path)
             self._select_project_list_path(path)
-            self._update_detached_auto_source_lock()
-            self.set_status_tip(f"已打开：{os.path.basename(path)}")
+            if not attached:
+                self._update_detached_auto_source_lock()
+                self.set_status_tip(f"已打开：{os.path.basename(path)}")
             self._log_novel_perf(
                 "切换小说-总计",
                 perf_start,
@@ -17340,6 +17821,14 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
                 item.get("secret", "")
                 or item.get("秘密", "")
                 or item.get("隐藏秘密", "")
+            ).strip()
+            record["personality"] = str(
+                item.get("personality", "")
+                or item.get("traits", "")
+                or item.get("人物性格", "")
+                or item.get("人物特点", "")
+                or item.get("性格特点", "")
+                or item.get("人物性格/特点", "")
             ).strip()
             record["voice"] = str(
                 item.get("voice", "")
@@ -19776,7 +20265,7 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
         self._status_workflow_active = False
 
     def _status_has_active_work(self):
-        detached = getattr(self, "_detached_auto_runner", None)
+        detached = self._current_background_chapter_runner()
         if self._detached_auto_status_is_current(detached):
             try:
                 if detached._status_has_active_work():
@@ -19789,7 +20278,10 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
             "_chapter_ai_sequence_active",
             "_chapter_ai_transient_retry_pending",
             "_chapter_plan_auto_active",
+            "_chapter_plan_continue_pending",
         )):
+            return True
+        if (getattr(self, "_chapter_task_timer_owner", None) or {}).get("pending", 0):
             return True
         retired_workers = getattr(self, "writing_retired_workers", None)
         if isinstance(retired_workers, list) and any(
@@ -19798,17 +20290,9 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
             return True
         for name in ("writing_worker", "chapter_plan_worker", "context_build_worker"):
             worker = getattr(self, name, None)
-            if worker is None:
-                continue
-            if name == "writing_worker":
-                # The finished signal clears this reference asynchronously. A
-                # stopped worker is therefore still part of runner teardown.
+            if worker is not None:
+                # Queued result/finished signals must run before runner teardown.
                 return True
-            try:
-                if worker.isRunning():
-                    return True
-            except Exception:
-                continue
         return False
 
     def _track_status_message(self, text):
@@ -19998,6 +20482,8 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
             self.status_meta_label.setToolTip(meta_text)
 
     def _on_novel_output_chars(self, count):
+        if self._forward_chapter_task_signal("_on_novel_output_chars", count):
+            return
         try:
             count = max(0, int(count or 0))
         except (TypeError, ValueError):
@@ -20014,6 +20500,8 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
             output_signal.connect(self._on_novel_output_chars)
 
     def set_status_tip(self, text):
+        if self._forward_chapter_task_signal("set_status_tip", text):
+            return
         text = str(text or "")
         self.setToolTip("")
         self._status_message = text

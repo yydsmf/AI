@@ -567,6 +567,22 @@ def _strip_internal_candidate_markers(value):
     return _dedupe_text_lines("\n".join(kept))
 
 
+_INTERNAL_FORESHADOW_STATUS_WORD_RE = re.compile(
+    r"(?i)(?<![a-z])(?:progressed|advanced|reinforced)(?![a-z])"
+)
+
+
+def _strip_internal_foreshadow_status_words(value):
+    """Remove internal lifecycle markers from user-facing foreshadow text."""
+    kept = []
+    for raw in str(value or "").splitlines():
+        line = _INTERNAL_FORESHADOW_STATUS_WORD_RE.sub("", str(raw or ""))
+        line = re.sub(r"[ \t]*([|｜,，;；、])?[ \t]*$", "", line).strip()
+        if line:
+            kept.append(line)
+    return _dedupe_text_lines("\n".join(kept))
+
+
 def _clean_continuation_record_markers(item, text_fields):
     if not isinstance(item, dict):
         return deepcopy(item)
@@ -2217,6 +2233,8 @@ def _normalize_project(data):
             item["revealed"] = _strip_internal_candidate_markers(item.get("revealed", ""))
             item["remaining_secret"] = _strip_internal_candidate_markers(item.get("remaining_secret", ""))
             item["notes"] = _strip_internal_candidate_markers(item.get("notes", ""))
+            for field in ("description", "revealed", "remaining_secret", "notes"):
+                item[field] = _strip_internal_foreshadow_status_words(item.get(field, ""))
     candidates = data.get("import_candidates", {})
     if isinstance(candidates, dict):
         normalized_candidates = _normalize_import_candidates(candidates)
@@ -4376,6 +4394,7 @@ def _sanitize_candidate_for_long_form(project, kind, item):
 
     if kind == "foreshadows":
         desc = _dedupe_text_lines(item.get("description", ""))
+        desc = _strip_internal_foreshadow_status_words(desc)
         stable_desc = _stable_foreshadow_description_context(desc)
         if desc != stable_desc:
             item["description"] = stable_desc
@@ -8635,7 +8654,7 @@ def _build_style_cards_context(style_reference, combined_sheet="", persona="", l
         "不得改写、拼接、补字、纠错或省略；正文有效长度控制在220至700个中文字符。"
         "片段应完整展示一种写法怎样落地，不能只截一句金句，也不能依赖原文专有设定才能理解写法。"
         "use_when写适用场景，avoid_when写不适用边界，voice_features只写片段中可直接观察到的"
-        "段落组织、惯用词、句式、对白停顿、说话标签、角色区分或收束方式。"
+        "段落组织、惯用词、句式、说话标签、角色区分或收束方式。"
         "只输出合法JSON对象，不要Markdown或说明。结构："
         '{"cards":[{"category":"","title":"","use_when":"","avoid_when":"",'
         '"voice_features":"","source_excerpt":""}]}。'
@@ -8907,7 +8926,7 @@ def _build_style_sheet_context(unit, unit_index=0, unit_total=0):
         "作者原文中的逐字证据和不适用边界；证据末尾标注当前编号。"
         "叙述用词与句法声纹必须识别真实反复出现的句首、连接词、判断词、动作修饰词、生理反应短语、"
         "感官与颜色词、解释框架、强调框架、说话标签和拟声词，不得只写‘语言简洁’等空泛评价。"
-        "对白声纹必须识别对白长短、停顿、结巴、省略、重复称呼、语气词、反问、接话方式、"
+        "对白声纹必须识别人物的词序、称呼、语气词、反问、接话方式、"
         "对白前后插入动作的方式，以及主角、权威者、弱势者、对手、专业解释者、喜剧角色等功能角色的可迁移说话模式。"
         "重点比较原文和基准稿：哪些词作者会反复原样使用而不换同义词，哪些句式和说话方式是原文独有。"
         "排除人物名、专有设定名、当前情节名词、只出现一次的偶然措辞，以及异常空格、异形字符、断词和错误标点。"
@@ -8950,7 +8969,7 @@ def _build_style_persona_context(combined_sheet):
         "【功能角色说话方式】【格式节奏与使用边界】。"
         "叙述声纹必须保留高频、稳定、局部三个层级的惯用词组和句式框架，并写清各自在什么场景使用、"
         "什么情况下不能使用；不得把所有词堆进每一章。"
-        "对白声纹必须写清对白长度、停顿、省略、结巴、称呼、语气词、反问、接话、说话标签及对白与动作的衔接方式。"
+        "对白声纹必须写清人物的词序、称呼、语气词、反问、接话、说话标签及对白与动作的衔接方式。"
         "功能角色至少覆盖主角、权威或专业角色、弱势或恐惧角色、对手、喜剧或口语角色；这些是说话机制，不得带入原文人物和剧情。"
         "只描述这位作者实际怎样写，保留其不工整、直白、重复、解释性叙述、长短段和慢快节奏等真实倾向。"
         "不要提到档案、证据、样本、基准稿或分析过程，不要加入通用商业网文规则，不要写具体人物、设定和剧情。"
@@ -9094,10 +9113,18 @@ def _style_runtime_profile(profile_text, style_reference="", include_structure=T
         ("你高频用", "你会按场景用"),
         ("高频使用", "可使用"),
         ("规则和解释高频", "规则和解释中可"),
-        ("对白总体偏短、偏口语", "对白允许短句和口语"),
-        ("对白整体偏短、偏口语", "对白允许短句和口语"),
+        ("对白总体偏短、偏口语", "对白随人物和场景自然变化"),
+        ("对白整体偏短、偏口语", "对白随人物和场景自然变化"),
     ):
         text = text.replace(source, replacement)
+    # Older saved style profiles may still contain the former incomplete-dialogue
+    # direction. Remove those whole guidance lines before the profile reaches a
+    # prose request, while leaving ordinary sample prose untouched.
+    text = re.sub(
+        r"(?m)^.*(?:不完整感|不完整句|只说半句|不要每句都完整).*$",
+        "",
+        text,
+    )
     if not include_structure:
         text = _remove_style_layout_metrics(text)
     reference_structure = _style_text_structure(style_reference)
@@ -9116,10 +9143,10 @@ def _style_runtime_profile(profile_text, style_reference="", include_structure=T
             + distribution
             + "档案中的‘大量、高频、常用、经常、偏短、偏多’只说明这种写法出现时的形态或相对辨识度，"
             "不能决定它在单章出现多少；频率、段落结构和对白总量一律以完整样本实际分布为准。"
-            "每章常驻的只有作者惯用词、句法松紧、动作与反应词、说话标签、对白长短与停顿、称呼语气和人物接话方式。"
+            "每章常驻的只有作者惯用词、句法松紧、动作与反应词、说话标签、句子长短、称呼语气和人物接话方式。"
             "推理链、反复验证、群体同步反应、误读布局、喜剧反差、危机升级、专业排除和等待揭露都属于条件性剧情手法，"
             "只有当前提纲确实需要且符合片段卡适用边界时才能调用；不得为了证明文风相似而增加对应场面。"
-            "档案中‘你习惯、常用、会用、高频’等表述不构成每章配额。日常口语指人物自然的词序、称呼、语气词和停顿，"
+            "档案中‘你习惯、常用、会用、高频’等表述不构成每章配额。日常口语指人物自然的词序、称呼、语气和接话方式，"
             "不等于每章必须讲笑话；严肃、危险或情绪落点允许全章没有喜剧。"
             "剧情准确、人物自然反应和当前场景适配高于任何单项写法手法。"
         )
@@ -9131,7 +9158,7 @@ def _style_runtime_profile(profile_text, style_reference="", include_structure=T
             "不能决定它在单章出现多少，也不能把全章写成统一节拍。"
             "推理链、反复验证、群体同步反应、误读布局、喜剧反差、危机升级、专业排除和等待揭露都属于条件性剧情手法，"
             "只有当前提纲确实需要且符合片段卡适用边界时才能调用；不得为了证明文风相似而增加对应场面。"
-            "日常口语指人物自然的词序、称呼、语气词和停顿，不等于每章必须讲笑话；严肃、危险或情绪落点允许全章没有喜剧。"
+            "日常口语指人物自然的词序、称呼、语气和接话方式，不等于每章必须讲笑话；严肃、危险或情绪落点允许全章没有喜剧。"
             "剧情准确、人物自然反应和当前场景适配高于任何单项写法手法。"
         )
     return "\n\n".join(part for part in (boundary, text) if part)
@@ -9189,17 +9216,11 @@ def _style_execution_structure_contract(style_reference, context):
         f"- 15字以内短段占比中心区间为{bands['short_pct_low']:.0f}%-{bands['short_pct_high']:.0f}%。",
         f"- 非对白35字以内单句短段占比可参考{max(0, single_short_pct - 15):.0f}%-{min(100, single_short_pct + 15):.0f}%。",
         f"- 对白字数占比中心区间为{bands['dialogue_pct_low']:.0f}%-{bands['dialogue_pct_high']:.0f}%；人物没必要开口时直接用叙述，不为比例制造问答。",
-        (
-            f"- 按本章篇幅，对白约{bands['dialogue_turn_low']}-{bands['dialogue_turn_high']}轮，"
-            f"其中15字以内短对白约{bands['short_dialogue_turn_low']}-{bands['short_dialogue_turn_high']}轮；"
-            "下限只供观察，绝不能为了数量增加台词。"
-            if target and bands["dialogue_turn_high"] else
-            "- 对白轮数和短对白轮数按完整样本密度控制；不为数量增加台词。"
-        ),
+        "- 对白根据人物、场景和剧情需要自然出现，不设置固定句长、轮数或表达形式。",
         f"- 普通对象名、操作名、阴性结果不得独立成段；约本章篇幅最多保留{noun_short_limit}个非对白名词独段，只留给真正改变认知的首次命名。",
         "- 连续3个及以上普通非对白短段应合并；真正的转折、对白、打断和样本式强调不为统计强行合并。",
-        "- 同一人物相邻的两句短对白若每句都不超过15字，必须合成一个对白段，或用承担反应/操作的动作标签连接；只有结巴、打断、裁决和样本明确的命令递进可以分开。",
-        "- 段落密度、短段、对白占比、对白轮数、短对白轮数中有两项以上同时超过中心区间时，必须整体减少无效换行和功能性问答。",
+        "- 只有在连续对白没有新增信息、行动或关系变化时，才自然合并重复的问答；具体排版跟随场景和样本文本。",
+        "- 段落密度、短段和对白占比明显同时漂移时，优先合并无效换行和功能性问答，不为统计数字新增或截断对白。",
     ]
     return "\n".join(lines)
 
@@ -9421,9 +9442,9 @@ def _style_recent_vocabulary_usage_text(
 def _mandatory_style_voice_contract(style_cards=None):
     return (
         "【常驻人物语言声纹｜每章静默执行】\n"
-        "常驻的是实际说话人物各自的对白长短、停顿、省略、称呼、语气词、接话方式和动作标签，不是固定剧情场面。"
-        "人物开口时必须保持彼此可区分，不得统一写成准确、克制、完整的标准工作句；人物没有必要开口时，不得为了展示声纹新增对白。"
-        "日常口语指符合身份的自然词序、称呼、语气和不完整句，不等于必须出现笑话、误读或俏皮话。"
+        "常驻的是实际说话人物各自的词序、称呼、语气、接话方式和动作衔接，不是固定剧情场面。"
+        "人物开口时必须保持彼此可区分，不能让所有人物采用同一种固定腔调；人物没有必要开口时，不得为了展示声纹新增对白。"
+        "日常口语指符合身份的自然表达，不等于必须出现笑话、误读或俏皮话。"
         "质疑、拒绝、反驳、群体反应和喜剧反差只有当前提纲本来存在相应冲突且场景适用时才写，不设次数、不要求两轮接话，也不单独制造反应来验收。"
         "功能型原文片段卡全部按适用与禁用边界选择；没有真正匹配的卡时不选。"
     )
@@ -9526,7 +9547,7 @@ def _build_legacy_style_execution_context(
         f"三、段落节奏，把上方样本结构数字作为防止严重漂移的软参考；普通说明怎样合并，约本章篇幅最多保留{short_noun_limit}个非对白名词独段，"
         "非对白单句短段不得连续超过2段。专业过程只保留会改变剧情结果的一步，其他步骤合并成结果句；"
         "不能把每条信息都扩写成‘观察—理解—操作’的固定三段式，也不得为了命中比例新增对白、短段或笑点。"
-        "四、本章核心声纹人物只列1至2人，写‘人物｜句长与停顿｜称呼/语气｜接话方式｜应避免的标准工作句’；"
+        "四、本章核心声纹人物只列1至2人，写‘人物｜句子长短与称呼语气｜接话方式｜应避免的标准工作句’；"
         "其他人物静默继承人物卡，不逐人列满、不生成示例台词、不要求每个出场人物开口；"
         "五、章末具体落点与本章最需要避免的一种模型腔。必须指定最后一个可见、可听或可执行的具体事件；"
         "如果多路报告在章末连续接入，只先写一个打断现场的声音，再用人物接线、窗口增加或操作被迫改变承接其余报告；"
@@ -9637,6 +9658,11 @@ def _grounded_prose_contract():
         "正文必须使用自然的网络小说叙述语言，直接写人物、场景、动作、对白和具体变化；"
         "不得出现策划术语、抽象形容、文学化意象、空泛比喻、办案式表达、编辑式说明或编辑式总结。"
         "情绪和气氛必须通过人物当下的动作、对白、反应和具体结果表现，不要用漂亮形容替代剧情。\n"
+        "【对白自然衔接】\n"
+        "对白要像人物当面说话。人物回答时，按当下的关系和语境自然接住对方；需要说明来由、指代或态度时，把意思说清楚，让前一句与下一句接得上。"
+        "人物可以顺着对方的话解释、补充、反问、改口、调侃、试探、施压、让步或转开话题，这些选择由人物目的、关系和现场情绪决定。"
+        "句式长短、语气词、称呼变化和说话后的动作随人物身份、关系和情绪自然变化，不要机械添加语气词，也不要让所有人物采用同一种接话方式。"
+        "对白要推动关系、现场压力或人物选择继续变化，不让角色互相解释已经知道的事。\n"
     )
 
 
@@ -9661,12 +9687,12 @@ def _build_full_style_imitation_guidance(style_reference):
         "把完整样本当作同一位作者正在写另一部作品的连续正文来阅读。顺着全文感受旁白怎样落句，人物怎样接话，"
         "动作和心理怎样互相接住，口语怎样嵌进人物当下的情绪，场景细节怎样带出人物的选择，以及一个场景怎样自然转入下一个场景。\n"
         "写当前章节时，让样本中的人物功能映射成当前小说的人物，让样本中的场景和事件映射成当前小说的场景和事件。"
-        "以全文反复出现的语言习惯和每一处细微变化为依据，吸收其中的常用说法、句法松紧、叙述视角、对白间隙、"
+        "以全文反复出现的语言习惯和每一处细微变化为依据，吸收其中的常用说法、句法松紧、叙述视角、对白衔接、"
         "情绪递进、信息露出、反应落点和章节收束。\n"
         "留意同一种情绪在样本中会随着人物关系和现场温度改变落点：有时落在一句接话，有时落在一个动作、一个物件，"
-        "有时由带着停顿的旁白慢慢显出。把这种自然变化带进当前正文，让每一章保留作者的熟悉感，也保留当前人物独有的反应与节奏。\n"
+        "有时由旁白中的具体变化自然显出。把这种自然变化带进当前正文，让每一章保留作者的熟悉感，也保留当前人物独有的反应与节奏。\n"
         "轻松、尴尬、紧张、难过、关系拉扯和情节推进都可以从完整样本里寻找相应的写法，让当前人物按照自己的身份、"
-        "关系与处境自然说话、行动和感受。样本的特色词、口头习惯、停顿方式和叙述温度随着人物和场景自然出现，"
+        "关系与处境自然说话、行动和感受。样本的特色词、口头习惯、接话方式和叙述温度随着人物和场景自然出现，"
         "形成一篇属于当前故事、同时读起来像同一位作者写出的正文。\n"
         + _natural_expression_guidance()
     )
@@ -9884,7 +9910,7 @@ def _build_style_audit_context(style_reference, draft_text, profile_text="", loc
         "【审校任务】\n"
         "独立比较样本与候选正文的写法。忽略两者剧情、人物和题材不同，不因候选剧情完整或好看而加分。"
         "逐项检查：叙事口吻、语言粗糙/工整程度、习惯词及其使用场景、常用句首和句式框架、"
-        "动作与生理反应词、说话标签、对白长度与停顿、称呼与语气词、不同功能角色的说话方式、"
+        "动作与生理反应词、说话标签、对白表达、称呼与语气词、不同功能角色的说话方式、"
         "段落起落、对白与叙述结合方式、背景插入方式、"
         "情绪来源、场景推进逻辑、信息揭示顺序、强调句习惯和章节收束。"
         "必须判断候选是否为了词汇丰富而替换了样本会重复使用的词，或让所有人物使用了同一种模型口吻。"
@@ -10408,8 +10434,8 @@ def _build_style_finalize_context(
         "句首、连接词、动作修饰词、生理反应短语、解释框架和说话标签，不得为了词汇丰富强行换同义词；"
         "作者人格的宽泛‘高频’概括必须让位于【作者原生用词池】标注的完整样本实际次数；"
         "局部或限定场景的词不得硬塞，低频词不能变成每章口头禅，任何惯用词都不得集中堆砌或明显超过样本密度。"
-        "必须单独完成一次对白声纹校准：只重点校准声纹表列出的1至2名核心人物，结合角色卡落实其对白长短、"
-        "停顿、省略、称呼、语气词、接话和动作插入方式；其他人物只在剧情必须开口时自然继承人物卡，不能为了区分口吻轮流发言。"
+        "必须单独完成一次对白声纹校准：只重点校准声纹表列出的1至2名核心人物，结合角色卡落实其称呼、"
+        "语气词、接话和动作插入方式；其他人物只在剧情必须开口时自然继承人物卡，不能为了区分口吻轮流发言。"
         + narrative_mode_contract
         + mandatory_voice_contract
         + "如果提供【本章声纹执行表】，它只校准同一剧情的语言，不得新增剧情任务；剧情完整、人物自然反应和片段卡适用边界优先。"
@@ -10420,14 +10446,14 @@ def _build_style_finalize_context(
         "连续性事实只用于后续验收和修复，不能逐条显性写进正文；不得给每个判断机械补齐风险说明或写成处置报告。"
         "专业信息先写它造成的决定、冲突或结果，再补读者非知道不可的最短原因；"
         "不得自行补齐提纲没有要求的现实处置流程，也不得把同一判断拆给多人重复确认。"
-        "角色差异必须体现在句法、停顿、称呼和接话，不能只靠职责术语区分。"
+        "角色差异必须体现在句法、称呼、语气和接话，不能只靠职责术语区分。"
         "必须逐段完成逻辑连续性核对：时间词、年份和先后顺序不能互相打架；原因必须先于结果；"
         "代词必须只有一个明确指向，同时出现两个可能对象时直接写姓名；人物的生死、清醒、伤势、位置、权限和物件持有状态"
         "必须与已发布正文及当前状态一致。提纲内部存在互斥描述时，以已确认事实为准，正文只保留一种成立状态。"
         "必须把前两章已经成立的期限、倒计时、预约和承诺与终稿当前时间安排并列核对；若当前计划会占满期限、倒置先后或让承诺无法履行，"
         "先按已发布正文最小调整当前时间，再在timeline_commitment_check中写出前文约束、终稿安排并确认兼容，不能直接填true。"
         "章首承接状态合并成一个自然中段，不得把人物站姿、伤势、环境和能力状态连续拆成电影分镜。"
-        "同一人物连续说出的短促命令、短问和短答必须自然衔接，或由真正承担反应/操作的动作标签连接；不能每句都另起一段。"
+        "同一人物连续说出的几句对白必须自然衔接，或由真正承担反应/操作的动作标签连接；不能每句都另起一段。"
         "多路消息在章末接入时禁止使用‘第一路、第二路、第三路、第四路’逐项播报；先用一个声音打断，再由人物动作和窗口变化承接后续升级。"
         "章末必须停在声纹表指定的具体动作、声音、异常、后果或一句人物对白上；落点之后禁止追加抽象阶段宣告、对称三段总结或商业预告句。"
         "输出前静默检查字数、自然排版读感、句式、对白衔接、习惯用词、对白声纹以及人物、物品、地点、伤势和结尾状态。"
@@ -10492,7 +10518,7 @@ def _build_style_finalize_context(
             "在这些内容不变的前提下，可以彻底重组句式、自然排版、对白衔接、叙述节奏和信息揭示方式。"
             "不要保留备用草稿或模型默认写法中的碎片化排版、机械强调、分镜动作流或对白堆砌。"
             + fallback_instruction
-            + "必须按作者人格和原文证据校准习惯词、句式框架、说话标签、对白停顿、称呼、语气词和接话方式；"
+            + "必须按作者人格和原文证据校准习惯词、句式框架、说话标签、称呼、语气词和接话方式；"
             "样本会重复使用的词不应被模型默认同义词替换，但主导语言节奏不是待覆盖词表；局部词不能硬塞，"
             "不得把多个习惯词平均撒在整章，不同人物不能写成同一种口气。"
             + (
@@ -10513,12 +10539,12 @@ def _build_style_finalize_context(
             "连续性事实不得逐条显性改写成正文；事实冲突由逻辑验收和局部修复处理，不得为每个判断机械补齐风险限定。"
             "专业信息先写它造成的决定、冲突或结果，再补读者非知道不可的最短原因；"
             "不得自行补齐提纲没有要求的现实处置流程，也不得把同一判断拆给多人重复确认。"
-            "角色差异必须体现在句法、停顿、称呼和接话，不能只靠职责术语区分。"
+            "角色差异必须体现在句法、称呼、语气和接话，不能只靠职责术语区分。"
             "必须逐段核对时间顺序、因果、代词指向和人物生死/清醒/位置/持有状态；"
             "提纲内部出现互斥描述时，以已发布正文、当前状态和更具体的已确认事实为准，正文只保留一种成立状态。"
             "章首承接状态合并成一个自然中段，不得拆成电影分镜；多路消息在章末接入时禁止用‘第一路、第二路、第三路、第四路’逐项播报，"
             "先用一个声音打断，再由人物动作和窗口变化承接后续升级。"
-            "同一人物连续说出的短促命令、短问和短答必须自然衔接，或由真正承担反应/操作的动作标签连接，不能每句都另起一段。"
+            "同一人物连续说出的几句对白必须自然衔接，或由真正承担反应/操作的动作标签连接，不能每句都另起一段。"
             "章末必须停在声纹表指定的具体动作、声音、异常、后果或一句人物对白上，禁止再追加抽象阶段宣告或对称三段总结。"
             + "输出前静默检查人物、物品、地点、伤势、时间、因果、结尾状态、对白声纹、办案式流程扩张和机械化表达。"
             + "段落排版指标已删除；自然排版、句式、对白衔接和习惯用词只用于贴近读感，不能据此新增、拆分或删改剧情。"
@@ -11026,19 +11052,7 @@ def _build_style_reference_profile(style_reference, output_target=0, include_str
             for label, terms in lexical_groups
             if ranked_terms(terms, compact)
         ),
-        (
-            "对白句长与停顿："
-            + (
-                f"共识别{len(dialogue_lines)}句对白，单句中位数约{_style_percentile(dialogue_lengths, 0.5)}字，"
-                f"中间一半主要落在{_style_percentile(dialogue_lengths, 0.25)}-"
-                f"{_style_percentile(dialogue_lengths, 0.75)}字；"
-                f"含省略停顿的对白约占{sum(('…' in line or '...' in line) for line in dialogue_lines) * 100 / len(dialogue_lines):.0f}%，"
-                f"疑问对白约占{sum(('？' in line or '?' in line) for line in dialogue_lines) * 100 / len(dialogue_lines):.0f}%，"
-                f"感叹对白约占{sum(('！' in line or '!' in line) for line in dialogue_lines) * 100 / len(dialogue_lines):.0f}%。"
-                if dialogue_lines else
-                "样本未识别到稳定对白，不设置对白声纹硬指标。"
-            )
-        ),
+        "对白表达观察：结合样本识别自然的称呼、语气、接话和动作衔接，生成时随人物和场景使用。",
         (
             "对白高频口语/接话词："
             + (
@@ -11226,6 +11240,8 @@ def _long_form_existing_state_refs(project, memory=None):
     snapshot = memory.get("state_snapshot", {})
     snapshot = snapshot if isinstance(snapshot, dict) else {}
     object_key_by_compact = {}
+    object_key_by_lore_id = {}
+    ambiguous_object_lore_ids = set()
     for item in snapshot.get("object_states", []) if isinstance(snapshot.get("object_states"), list) else []:
         if not isinstance(item, dict):
             continue
@@ -11233,8 +11249,22 @@ def _long_form_existing_state_refs(project, memory=None):
         compact = _compact_text(key)
         if compact and compact not in object_key_by_compact:
             object_key_by_compact[compact] = key
+        lore_id = _long_form_object_lore_id(project, item)
+        if lore_id and key:
+            previous = object_key_by_lore_id.get(lore_id, "")
+            if previous and previous != key:
+                ambiguous_object_lore_ids.add(lore_id)
+            elif not previous:
+                object_key_by_lore_id[lore_id] = key
+            lore_record = _long_form_object_lore_record(project, lore_id)
+            formal_name = _compact_text(lore_record.get("name", "")) if isinstance(lore_record, dict) else ""
+            if formal_name and formal_name not in object_key_by_compact:
+                object_key_by_compact[formal_name] = key
+    for lore_id in ambiguous_object_lore_ids:
+        object_key_by_lore_id.pop(lore_id, None)
     return {
         "object_key_by_compact": object_key_by_compact,
+        "object_key_by_lore_id": object_key_by_lore_id,
         "conflict_ids": {
             str(item.get("id", "") or "").strip()
             for item in snapshot.get("active_conflicts", [])
@@ -14021,6 +14051,9 @@ def _normalize_long_form_state_aliases(update):
                 item["remaining_secret"] = ""
         if not str(item.get("evidence_quote", "") or "").strip():
             item["evidence_quote"] = first_value(item, ("evidence", "quote"))
+        for field in ("description", "revealed", "remaining_secret", "notes", "state"):
+            if field in item:
+                item[field] = _strip_internal_foreshadow_status_words(item.get(field, ""))
 
     events = payload.get("long_term_events", [])
     events = deepcopy(events if isinstance(events, list) else [])
@@ -14792,6 +14825,14 @@ def _long_form_object_record_namespace(project, item):
 
 def _normalize_long_form_structural_refs(project, chapter_index, update):
     payload = _normalize_long_form_event_storage_refs(project, chapter_index, update)
+    payload = _bind_first_seen_long_form_object_aliases(
+        project,
+        _normalize_long_form_memory(
+            project.get("long_form_memory", {})
+            if isinstance(project, dict) else {}
+        ),
+        payload,
+    )
     reconciliation = payload.get("state_reconciliation", {})
     if not isinstance(reconciliation, dict):
         return payload
@@ -18950,6 +18991,24 @@ def _long_form_same_object_entity(existing, incoming):
 
     old_placeholder = _long_form_object_name_is_placeholder(old_name, old_key)
     new_placeholder = _long_form_object_name_is_placeholder(new_name, new_key)
+    if old_key and new_key and old_key.casefold() == new_key.casefold():
+        if old_lore or new_lore:
+            return True
+        if old_placeholder and new_placeholder:
+            old_state = _compact_text(existing.get("state", ""))
+            new_state = _compact_text(incoming.get("state", ""))
+            if not old_state or not new_state:
+                return True
+            shorter, longer = sorted((old_state, new_state), key=len)
+            return (
+                len(shorter) >= 8 and shorter.casefold() in longer.casefold()
+            ) or SequenceMatcher(None, old_state, new_state).ratio() >= 0.42
+        if old_placeholder != new_placeholder:
+            return _long_form_object_name_matches_state(
+                new_name if old_placeholder else old_name,
+                existing.get("state", "") if old_placeholder else incoming.get("state", ""),
+            )
+        return old_name.casefold() == new_name.casefold()
     if old_placeholder and not new_placeholder:
         return _long_form_object_name_matches_state(
             new_name, existing.get("state", "")
@@ -18974,11 +19033,241 @@ def _long_form_same_object_entity(existing, incoming):
 
 
 def _long_form_object_lore_id(project, item):
-    """Resolve the lore record bound to one object state, if it is explicit."""
+    """Resolve the lore record bound to one object state, including its formal name."""
     if not isinstance(item, dict):
         return ""
     raw_ref = item.get("lore_ref", "") or item.get("lore_id", "")
-    return _resolve_long_form_record_ref(project, "lore", raw_ref)
+    resolved = _resolve_long_form_record_ref(project, "lore", raw_ref)
+    if resolved:
+        return resolved
+
+    candidate_names = []
+    name_value = _compact_text(item.get("name", ""))
+    if name_value:
+        candidate_names.append(name_value.casefold())
+    lore_name_value = _compact_text(item.get("lore_name", ""))
+    if lore_name_value:
+        candidate_names.append(lore_name_value.casefold())
+    records = project.get("lore", []) if isinstance(project, dict) else []
+    matches = []
+    for record in records if isinstance(records, list) else []:
+        if not isinstance(record, dict):
+            continue
+        name = _compact_text(record.get("name", ""))
+        item_id = str(record.get("id", "") or "").strip()
+        if name and item_id and name.casefold() in candidate_names and item_id not in matches:
+            matches.append(item_id)
+    if len(matches) == 1:
+        return matches[0]
+    state = str(item.get("state", "") or "").strip()
+    state_matches = []
+    if state:
+        compact_state = _compact_text(state).casefold()
+        exact_state_matches = []
+        for record in records if isinstance(records, list) else []:
+            if not isinstance(record, dict):
+                continue
+            item_id = str(record.get("id", "") or "").strip()
+            formal_name = _compact_text(record.get("name", ""))
+            if (
+                item_id
+                and formal_name
+                and formal_name.casefold() in compact_state
+                and item_id not in exact_state_matches
+            ):
+                exact_state_matches.append(item_id)
+        if len(exact_state_matches) == 1:
+            return exact_state_matches[0]
+        for record in records if isinstance(records, list) else []:
+            if not isinstance(record, dict):
+                continue
+            item_id = str(record.get("id", "") or "").strip()
+            formal_name = str(record.get("name", "") or "").strip()
+            if (
+                item_id
+                and formal_name
+                and _long_form_object_name_matches_state(formal_name, state)
+                and item_id not in state_matches
+            ):
+                state_matches.append(item_id)
+    return state_matches[0] if len(state_matches) == 1 else ""
+
+
+def _long_form_object_lore_record(project, lore_id):
+    lore_id = str(lore_id or "").strip()
+    if not lore_id:
+        return None
+    records = project.get("lore", []) if isinstance(project, dict) else []
+    return next(
+        (
+            item for item in records if isinstance(item, dict)
+            and str(item.get("id", "") or "").strip() == lore_id
+        ),
+        None,
+    )
+
+
+def _long_form_lore_is_explicit_object(project, lore_id):
+    """Return whether a lore record explicitly represents a persistent object."""
+    record = _long_form_object_lore_record(project, lore_id)
+    if not isinstance(record, dict):
+        return False
+    type_text = _compact_text(
+        record.get("type", "") or record.get("category", "")
+    )
+    return any(marker in type_text for marker in ("物件", "物品", "关键物件", "关键物品"))
+
+
+def _bind_first_seen_long_form_object_aliases(project, memory, payload):
+    """Bind a lore alias to a stable object key when the lore record proves it is an object.
+
+    Models sometimes use the compact lore alias (for example ``L011``) in an
+    object row on the first chapter where that object appears. Existing rows
+    can already be matched by lore id, but a new row needs a canonical object
+    key before strict validation and event-link normalization run.
+    """
+    if not isinstance(payload, dict):
+        return payload
+    state_patch = payload.get("state_patch", {})
+    if not isinstance(state_patch, dict):
+        return payload
+    object_rows = state_patch.get("object_states", [])
+    if not isinstance(object_rows, list):
+        return payload
+    project = project if isinstance(project, dict) else {}
+    memory = memory if isinstance(memory, dict) else _normalize_long_form_memory(
+        project.get("long_form_memory", {})
+    )
+    snapshot = memory.get("state_snapshot", {})
+    snapshot = snapshot if isinstance(snapshot, dict) else {}
+    snapshot_objects = snapshot.get("object_states", [])
+    snapshot_objects = snapshot_objects if isinstance(snapshot_objects, list) else []
+    issued_keys = _long_form_issued_state_ids(project, memory).get("objects", set())
+    object_key_by_lore_id = {}
+    ambiguous_lore_ids = set()
+    for item in snapshot_objects:
+        if not isinstance(item, dict):
+            continue
+        key = str(item.get("key", item.get("name", "")) or "").strip()
+        lore_id = _long_form_object_lore_id(project, item)
+        if not key or not lore_id:
+            continue
+        previous = object_key_by_lore_id.get(lore_id, "")
+        if previous and previous != key:
+            ambiguous_lore_ids.add(lore_id)
+        elif not previous:
+            object_key_by_lore_id[lore_id] = key
+    for lore_id in ambiguous_lore_ids:
+        object_key_by_lore_id.pop(lore_id, None)
+
+    aliases = {}
+    lore_alias_by_object_key = {}
+    for item in object_rows:
+        if not isinstance(item, dict):
+            continue
+        raw_key = str(
+            item.get("key", "")
+            or item.get("object_key", "")
+            or item.get("object_id", "")
+            or item.get("name", "")
+        ).strip()
+        if not raw_key:
+            continue
+        raw_lore_ref = str(
+            item.get("lore_ref", "") or item.get("lore_id", "")
+        ).strip()
+        lore_id = _resolve_long_form_record_ref(
+            project, "lore", raw_lore_ref or raw_key
+        )
+        if not lore_id:
+            # A formal lore name in the state/evidence is acceptable only as a
+            # secondary proof. It must still be explicitly typed as an object.
+            lore_id = _long_form_object_lore_id(project, item)
+        if not lore_id or not _long_form_lore_is_explicit_object(project, lore_id):
+            continue
+
+        existing_key = object_key_by_lore_id.get(lore_id, "")
+        if not existing_key and lore_id not in ambiguous_lore_ids:
+            for previous in object_rows:
+                if previous is item or not isinstance(previous, dict):
+                    continue
+                previous_lore = _long_form_object_lore_id(project, previous)
+                previous_key = str(
+                    previous.get("key", previous.get("name", "")) or ""
+                ).strip()
+                if previous_lore == lore_id and previous_key:
+                    existing_key = previous_key
+                    break
+        assigned_key = existing_key or _next_long_form_object_key(issued_keys)
+        issued_keys.add(assigned_key)
+        if raw_key != assigned_key:
+            aliases[_compact_text(raw_key)] = assigned_key
+        if str(item.get("object_key", "") or "").strip():
+            item["object_key"] = assigned_key
+        item["key"] = assigned_key
+        lore_record = _long_form_object_lore_record(project, lore_id)
+        formal_name = str(lore_record.get("name", "") or "").strip() if isinstance(lore_record, dict) else ""
+        if formal_name and not str(item.get("name", "") or "").strip():
+            item["name"] = formal_name
+        if not str(item.get("lore_ref", "") or "").strip():
+            maps = _long_form_record_reference_maps(project).get("lore", {})
+            item["lore_ref"] = maps.get("id_to_alias", {}).get(lore_id, lore_id)
+        lore_alias = str(item.get("lore_ref", "") or "").strip()
+        lore_alias_by_object_key[_compact_text(assigned_key)] = lore_alias or lore_id
+        object_key_by_lore_id[lore_id] = assigned_key
+
+    if not aliases:
+        return payload
+
+    def replace_object_values(owner, field):
+        if not isinstance(owner, dict):
+            return
+        values = owner.get(field)
+        if not isinstance(values, list):
+            return
+        owner[field] = [
+            aliases.get(_compact_text(value), value)
+            for value in values
+            if str(value or "").strip()
+        ]
+        deduped = []
+        for value in owner[field]:
+            if value not in deduped:
+                deduped.append(value)
+        owner[field] = deduped
+
+    reconciliation = payload.get("state_reconciliation")
+    replace_object_values(reconciliation, "object_keys")
+    lifecycle = payload.get("state_lifecycle_review")
+    replace_object_values(lifecycle, "reviewed_object_keys")
+    next_memory = payload.get("next_chapter_memory")
+    replace_object_values(next_memory, "object_keys")
+    retirements = payload.get("state_retirements")
+    replace_object_values(retirements, "object_keys")
+    for event in payload.get("long_term_events", []) if isinstance(payload.get("long_term_events"), list) else []:
+        if not isinstance(event, dict) or not isinstance(event.get("storage"), dict):
+            continue
+        storage = event["storage"]
+        original_values = list(storage.get("object_keys", [])) if isinstance(storage.get("object_keys"), list) else []
+        replace_object_values(storage, "object_keys")
+        for value in original_values:
+            canonical = aliases.get(_compact_text(value), str(value or "").strip())
+            lore_alias = lore_alias_by_object_key.get(_compact_text(canonical), "")
+            if lore_alias:
+                lore_refs = storage.setdefault("lore_refs", [])
+                if isinstance(lore_refs, list) and lore_alias not in lore_refs:
+                    lore_refs.append(lore_alias)
+
+    state_delta = payload.get("state_delta")
+    if isinstance(state_delta, dict):
+        for item in state_delta.get("objects", []) if isinstance(state_delta.get("objects"), list) else []:
+            if not isinstance(item, dict):
+                continue
+            raw_value = str(item.get("object_key", "") or "").strip()
+            if raw_value:
+                item["object_key"] = aliases.get(_compact_text(raw_value), raw_value)
+        replace_object_values(state_delta, "object_keys")
+    return payload
 
 
 def _long_form_object_identity_score(project, existing, incoming):
@@ -18987,8 +19276,8 @@ def _long_form_object_identity_score(project, existing, incoming):
     incoming = incoming if isinstance(incoming, dict) else {}
     existing_lore = _long_form_object_lore_id(project, existing)
     incoming_lore = _long_form_object_lore_id(project, incoming)
-    if existing_lore and incoming_lore and existing_lore == incoming_lore:
-        return 100
+    if existing_lore and incoming_lore:
+        return 100 if existing_lore == incoming_lore else 0
 
     def stable_name(value, key=""):
         text = _compact_text(value)
@@ -19013,18 +19302,18 @@ def _long_form_object_identity_score(project, existing, incoming):
         stable_name(incoming_key, incoming_key),
     ]
 
-    lore_records = project.get("lore", []) if isinstance(project, dict) else []
-    if existing_lore:
-        lore_record = next(
-            (
-                item for item in lore_records
-                if isinstance(item, dict)
-                and str(item.get("id", "") or "").strip() == existing_lore
-            ),
-            None,
-        )
+    if existing_key and incoming_key and existing_key.casefold() == incoming_key.casefold():
+        return 96
+
+    for lore_id in (existing_lore, incoming_lore):
+        lore_record = _long_form_object_lore_record(project, lore_id)
         if isinstance(lore_record, dict):
-            existing_names.append(stable_name(lore_record.get("name", "")))
+            formal_name = stable_name(lore_record.get("name", ""))
+            if formal_name:
+                if lore_id == existing_lore:
+                    existing_names.append(formal_name)
+                if lore_id == incoming_lore:
+                    incoming_names.append(formal_name)
 
     existing_names = list(dict.fromkeys(value for value in existing_names if value))
     incoming_names = list(dict.fromkeys(value for value in incoming_names if value))
@@ -19061,6 +19350,23 @@ def _long_form_find_existing_object_key(project, existing_objects, incoming):
     rows = [item for item in existing_objects if isinstance(item, dict)]
     if not rows:
         return ""
+    incoming_key = str(incoming.get("key", "") or "").strip()
+    incoming_lore = _long_form_object_lore_id(project, incoming)
+    if incoming_key:
+        same_key = []
+        for item in rows:
+            item_key = str(item.get("key", item.get("name", "")) or "").strip()
+            if item_key.casefold() != incoming_key.casefold():
+                continue
+            item_lore = _long_form_object_lore_id(project, item)
+            if item_lore and incoming_lore and item_lore != incoming_lore:
+                continue
+            if incoming_lore or item_lore:
+                same_key.append(item_key)
+            elif _long_form_same_object_entity(item, incoming):
+                same_key.append(item_key)
+        if len(set(same_key)) == 1:
+            return same_key[0]
     scored = []
     for item in rows:
         key = str(item.get("key", item.get("name", "")) or "").strip()
@@ -19243,6 +19549,11 @@ def _merge_long_form_state_patch(
             "lore", item.get("lore_ref", "") or item.get("lore_id", "")
         )
         name = str(item.get("name", "") or item.get("key", "")).strip()
+        if not lore_id:
+            lore_id = _long_form_object_lore_id(project, item)
+        lore_record = _long_form_object_lore_record(project, lore_id)
+        if isinstance(lore_record, dict) and str(lore_record.get("name", "") or "").strip():
+            name = str(lore_record.get("name", "") or "").strip()
         state = str(item.get("state", "") or "").strip()
         result = {"lore_id": lore_id, "name": name, "state": state}
         if str(item.get("key", "") or "").strip():
@@ -19291,12 +19602,50 @@ def _merge_long_form_state_patch(
                     value["name"] = previous["name"]
         object_records[item_key] = value
 
+    existing_groups = {}
+    existing_group_order = []
+
+    def is_dynamic_object_key(value):
+        return bool(re.fullmatch(r"(?:NO|NOBJ)(?:-[A-Z0-9]+)*\d+", str(value or "").strip(), re.IGNORECASE))
+
     for item in existing_objects:
         if not isinstance(item, dict):
             continue
-        item_key = object_key(item)
+        value = deepcopy(item)
+        lore_id = _long_form_object_lore_id(project, value)
+        lore_record = _long_form_object_lore_record(project, lore_id)
+        if lore_id:
+            value["lore_id"] = lore_id
+            formal_name = str(lore_record.get("name", "") or "").strip() if isinstance(lore_record, dict) else ""
+            if formal_name:
+                value["name"] = formal_name
+        item_key = object_key(value)
         if not item_key:
             continue
+        group_key = f"lore:{lore_id}" if lore_id else f"key:{_compact_text(item_key).casefold()}"
+        previous = existing_groups.get(group_key)
+        if previous is None:
+            existing_groups[group_key] = value
+            existing_group_order.append(group_key)
+            continue
+        previous_key = object_key(previous)
+        preferred_key = (
+            item_key if is_dynamic_object_key(item_key) and not is_dynamic_object_key(previous_key)
+            else previous_key
+        )
+        merged = deepcopy(value)
+        merged["key"] = preferred_key
+        if lore_id:
+            merged["lore_id"] = lore_id
+        if str(value.get("state", "") or "").strip():
+            merged["state"] = str(value.get("state", "") or "").strip()
+        elif str(previous.get("state", "") or "").strip():
+            merged["state"] = str(previous.get("state", "") or "").strip()
+        existing_groups[group_key] = merged
+
+    for group_key in existing_group_order:
+        item = existing_groups[group_key]
+        item_key = object_key(item)
         if item_key not in object_records:
             object_order.append(item_key)
         store_object(item_key, item)
@@ -19358,6 +19707,50 @@ def _merge_long_form_state_patch(
             object_order.append(assigned_key)
         store_object(assigned_key, normalized)
         issued_state_ids["objects"].add(assigned_key)
+
+    # A later explicit lore binding can reveal that an old formal-name row and
+    # a stable dynamic-ID row were the same object. Collapse only rows with the
+    # same resolved lore ID; NO001 and NO002 therefore remain independent.
+    deduped_records = {}
+    deduped_order = []
+    deduped_groups = {}
+    for item_key in object_order:
+        item = object_records.get(item_key)
+        if not isinstance(item, dict):
+            continue
+        lore_id = _long_form_object_lore_id(project, item)
+        group = f"lore:{lore_id}" if lore_id else f"key:{_compact_text(item_key).casefold()}"
+        previous_key = deduped_groups.get(group, "")
+        if not previous_key:
+            deduped_groups[group] = item_key
+            deduped_order.append(item_key)
+            deduped_records[item_key] = item
+            continue
+        target_key = previous_key
+        if is_dynamic_object_key(item_key) and not is_dynamic_object_key(previous_key):
+            target_key = item_key
+            previous = deduped_records.pop(previous_key, {})
+            deduped_order[deduped_order.index(previous_key)] = target_key
+            deduped_records[target_key] = previous
+            deduped_groups[group] = target_key
+        target = deduped_records[target_key]
+        target["key"] = target_key
+        if lore_id:
+            target["lore_id"] = lore_id
+            lore_record = _long_form_object_lore_record(project, lore_id)
+            if isinstance(lore_record, dict) and str(lore_record.get("name", "") or "").strip():
+                target["name"] = str(lore_record.get("name", "") or "").strip()
+        if is_dynamic_object_key(item_key) and not is_dynamic_object_key(previous_key):
+            if str(item.get("state", "") or "").strip():
+                target["state"] = str(item.get("state", "") or "").strip()
+        elif not is_dynamic_object_key(previous_key) or is_dynamic_object_key(item_key):
+            if str(item.get("state", "") or "").strip():
+                target["state"] = str(item.get("state", "") or "").strip()
+        for field in ("last_reviewed_chapter_index", "last_reviewed_chapter_id", "last_reviewed_at"):
+            if not str(target.get(field, "") or "").strip() and str(item.get(field, "") or "").strip():
+                target[field] = item[field]
+    object_records = deduped_records
+    object_order = deduped_order
     snapshot["object_states"] = [
         object_records[item_key]
         for item_key in object_order
@@ -19515,6 +19908,112 @@ def _merge_cumulative_story_text(existing, incoming):
     if old in new:
         return new
     return _dedupe_text_lines(_append_text_without_duplicate_overlap(old, new))
+
+
+_FORESHADOW_EVIDENCE_STOP_NGRAMS = {
+    "不会", "使用", "城市", "一个", "这个", "那个", "后来", "以及", "因为",
+    "之后", "发生", "出现", "秘密", "真相", "问题", "事情", "时候", "知道",
+    "发现", "有人", "自己", "已经", "将会", "可能", "能够", "是否", "关于",
+}
+
+
+def _foreshadow_setup_matches_chapter(setup_ref, chapter_index, chapter):
+    if _chapter_reference_score(
+        setup_ref, chapter_index, str(chapter.get("title", "") or "")
+    ):
+        return True
+    text = _compact_text(setup_ref)
+    match = re.search(r"第\s*([一二两三四五六七八九十百千万零〇\d]+)\s*[章节回卷部集场]", text)
+    if not match:
+        match = re.search(r"(?:^|[^\d])([一二两三四五六七八九十百千万零〇\d]+)\s*[章节回卷部集场]", text)
+    number = _chinese_numeral_to_int(match.group(1)) if match else None
+    return number == chapter_index + 1
+
+
+def _foreshadow_setup_evidence_quote(item, final_text, chapter_index, chapter):
+    """Return body evidence for a planned setup only when the chapter contains it."""
+    item = item if isinstance(item, dict) else {}
+    body = str(final_text or "").strip()
+    if not body or str(item.get("status", "") or "").strip() not in {"", "未埋"}:
+        return ""
+    if not _foreshadow_setup_matches_chapter(item.get("setup_chapter", ""), chapter_index, chapter):
+        return ""
+
+    name = _compact_text(_clean_foreshadow_name(item.get("name", "")))
+    if len(name) < 2:
+        return ""
+    compact_body = _compact_text(body)
+    name_anchors = []
+    for width in (4, 3, 2):
+        for index in range(max(0, len(name) - width + 1)):
+            anchor = name[index:index + width]
+            if len(anchor) < 2 or anchor in _FORESHADOW_EVIDENCE_STOP_NGRAMS:
+                continue
+            if anchor in compact_body and anchor not in name_anchors:
+                name_anchors.append(anchor)
+    if len(name_anchors) < 2:
+        return ""
+
+    chunks = [chunk.strip() for chunk in re.split(r"(?<=[。！？!?；;])", body) if chunk.strip()]
+    if not chunks:
+        chunks = [body]
+    ranked = []
+    for index, chunk in enumerate(chunks):
+        compact_chunk = _compact_text(chunk)
+        hits = sum(1 for anchor in name_anchors if anchor in compact_chunk)
+        if hits:
+            ranked.append((-hits, abs(len(chunk) - 48), index, chunk))
+    if not ranked:
+        return ""
+    ranked.sort()
+    evidence = ranked[0][3].strip()
+    return _clip_complete_text(evidence, 60) if len(_compact_text(evidence)) >= 8 else ""
+
+
+def _sync_foreshadow_setup_from_body(project, chapter_index, final_text, payload):
+    """Add a minimal existing-record update when the body proves a planned setup."""
+    if not isinstance(payload, dict) or not str(final_text or "").strip():
+        return payload
+    chapters = project.get("chapters", []) if isinstance(project, dict) else []
+    chapter = chapters[chapter_index] if 0 <= chapter_index < len(chapters) and isinstance(chapters[chapter_index], dict) else {}
+    items = project.get("foreshadow_items", []) if isinstance(project, dict) else []
+    updates = payload.get("foreshadow_updates", [])
+    if not isinstance(items, list) or not isinstance(updates, list):
+        return payload
+    by_id = {
+        str(item.get("id", "") or "").strip(): item
+        for item in items if isinstance(item, dict) and str(item.get("id", "") or "").strip()
+    }
+    existing_updates = {}
+    for update in updates:
+        if not isinstance(update, dict):
+            continue
+        ref = _resolve_long_form_record_ref(
+            project, "foreshadows", update.get("ref", update.get("id", ""))
+        )
+        if ref:
+            existing_updates[ref] = update
+    chapter_label = _chapter_label(chapter_index + 1, chapter)
+    for item_id, item in by_id.items():
+        evidence = _foreshadow_setup_evidence_quote(item, final_text, chapter_index, chapter)
+        if not evidence:
+            continue
+        update = existing_updates.get(item_id)
+        if update is None:
+            update = {"operation": "update", "ref": item_id}
+            updates.append(update)
+            existing_updates[item_id] = update
+        current_status = str(update.get("status", "") or "").strip()
+        if current_status not in {"已回收", "无需回收", "废弃"}:
+            update["status"] = "已埋"
+            if not str(update.get("setup_chapter", "") or "").strip():
+                update["setup_chapter"] = str(item.get("setup_chapter", "") or "").strip() or chapter_label
+            if not str(update.get("evidence_quote", "") or "").strip():
+                update["evidence_quote"] = evidence
+            if not str(update.get("revealed", "") or "").strip():
+                update["revealed"] = evidence
+    payload["foreshadow_updates"] = updates
+    return payload
 
 
 def _apply_long_form_memory_update_unchecked(project, chapter_index, payload, update_hash):
@@ -20194,13 +20693,18 @@ def _apply_long_form_memory_update_unchecked(project, chapter_index, payload, up
     return True
 
 
-def _apply_long_form_memory_update(project, chapter_index, update):
+def _apply_long_form_memory_update(project, chapter_index, update, final_text=""):
     if not isinstance(project, dict) or not isinstance(update, dict) or not update:
         return False
     chapters = project.get("chapters", []) if isinstance(project.get("chapters"), list) else []
     if chapter_index < 0 or chapter_index >= len(chapters) or not isinstance(chapters[chapter_index], dict):
         return False
     payload = _normalize_long_form_structural_refs(project, chapter_index, update)
+    if str(final_text or "").strip():
+        payload = _sync_foreshadow_setup_from_body(
+            project, chapter_index, final_text, payload
+        )
+        payload = _normalize_long_form_structural_refs(project, chapter_index, payload)
     update_hash = hashlib.sha256(
         json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
     ).hexdigest()
@@ -20572,18 +21076,16 @@ def _build_chapter_ai_context(project, chapter_index, action):
         "不要在下一章开头改成仍在下雨或回到旧场景，除非本章提纲明确发生了新的天气/场景变化。"
         "优先参考本章需继承的关键事实，其次参考本章摘要、前文摘要、人物目标、语言风格和世界规则。"
         "正文风格：口语化、自然、有网文阅读感，不要太工整、太书面、太像范文。"
-        "句子长短混用，允许短句、停顿、反问和不完全对称的表达。"
+        "句子长短混用，按人物当下状态自然变化。"
         "不得使用抽象情绪判断、四字词堆叠和模板化反应。"
         "人物情绪优先通过对白、具体动作和选择体现。保持剧情高密度推进，但不要写成流水账。"
         "不得写段尾总结、抽象情绪判断和万能反应动作；"
         "不得用“沉默、皱眉、冷意、压迫感、空气安静、所有人愣住、下一秒”等模板化表达替代具体剧情。"
-        "对白要有真人说话的不完整感，可以短句、停顿、反问、打断。"
         "场景描写优先用具体物件、动作和细节承载情绪，不要总用氛围词概括。"
         "人物心理不要解释过满，能让读者从动作和对白看懂的，就不要再总结一遍。"
         "不得用解释型旁白替代人物行动，不得替人物总结动机、立场和成长。"
         "不得用金句式、总结式、标语式句子替代剧情，不得刻意拔高主题；章节结尾优先用具体动作、对白、信息变化或悬念收住。"
         "段落结构要有变化，不要连续使用“动作描写 + 心理解释 + 氛围总结”的固定结构。"
-        "对白不要每句都完整、漂亮、逻辑闭合；不同人物说话要有信息差、情绪偏差和表达习惯，可以含糊、逃避、反问或只说半句。"
         "场景细节要克制：只在能强化冲突、人物状态或信息变化时，少量加入具体物件、声音、动作痕迹和环境反馈。"
         "不要写无意义生活噪声，不要让细节拖慢剧情。"
         "写每一场时优先让人物在具体环境里做事、被打断、受阻、临时反应，不要只用旁白解释情绪和局势。"
@@ -20602,18 +21104,16 @@ def _build_chapter_ai_context(project, chapter_index, action):
         "后章衔接点只用于对齐当前章结尾，不要复述、改写或提前写完下一章正文。"
         "优先参考本章需继承的关键事实，其次参考本章摘要、前文摘要、人物目标、语言风格和世界规则。"
         "正文风格：口语化、自然、有网文阅读感，不要太工整、太书面、太像范文。"
-        "句子长短混用，允许短句、停顿、反问和不完全对称的表达。"
+        "句子长短混用，按人物当下状态自然变化。"
         "不得使用抽象情绪判断、四字词堆叠和模板化反应。"
         "人物情绪优先通过对白、具体动作和选择体现。保持剧情高密度推进，但不要写成流水账。"
         "不得写段尾总结、抽象情绪判断和万能反应动作；"
         "不得用“沉默、皱眉、冷意、压迫感、空气安静、所有人愣住、下一秒”等模板化表达替代具体剧情。"
-        "对白要有真人说话的不完整感，可以短句、停顿、反问、打断。"
         "场景描写优先用具体物件、动作和细节承载情绪，不要总用氛围词概括。"
         "人物心理不要解释过满，能让读者从动作和对白看懂的，就不要再总结一遍。"
         "不得用解释型旁白替代人物行动，不得替人物总结动机、立场和成长。"
         "不得用金句式、总结式、标语式句子替代剧情，不得刻意拔高主题；章节结尾优先用具体动作、对白、信息变化或悬念收住。"
         "段落结构要有变化，不要连续使用“动作描写 + 心理解释 + 氛围总结”的固定结构。"
-        "对白不要每句都完整、漂亮、逻辑闭合；不同人物说话要有信息差、情绪偏差和表达习惯，可以含糊、逃避、反问或只说半句。"
         "场景细节要克制：只在能强化冲突、人物状态或信息变化时，少量加入具体物件、声音、动作痕迹和环境反馈。"
         "不要写无意义生活噪声，不要让细节拖慢剧情。"
         "写每一场时优先让人物在具体环境里做事、被打断、受阻、临时反应，不要只用旁白解释情绪和局势。"

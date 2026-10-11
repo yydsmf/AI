@@ -2180,7 +2180,11 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
         self.project_hint = QLabel("单击列表可打开已保存小说。")
         self.project_hint.setObjectName("hint")
         self.project_hint.setWordWrap(True)
-        layout.addWidget(self.project_hint)
+        # The main status line below is the useful live status. The old
+        # project hint duplicated background-task state and consumed the
+        # narrow panel height, so keep it available for compatibility but do
+        # not place it in the visible layout.
+        self.project_hint.setVisible(False)
 
         self.status_label = QLabel("")
         self.status_label.setObjectName("novel_status_current")
@@ -14403,13 +14407,6 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
         if not isinstance(chapters, list) or not (0 <= chapter_index < len(chapters)):
             return None, False, "", "", "", ""
         staged_project = deepcopy(self.current_project)
-        memory_changed = _apply_long_form_memory_update(
-            staged_project,
-            chapter_index,
-            bundle.get("memory_update", {}) if isinstance(bundle, dict) else {},
-        )
-        if not memory_changed:
-            return None, False, "", "", "", ""
         staged_chapter = staged_project.get("chapters", [])[chapter_index]
         old_text = str(
             self.chapter_text.toPlainText()
@@ -14420,6 +14417,27 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
             _append_text_without_duplicate_overlap(old_text, final_text)
             if include_prose else str(staged_chapter.get("text", "") or "").strip()
         )
+        memory_update = bundle.get("memory_update", {}) if isinstance(bundle, dict) else {}
+        try:
+            memory_changed = _apply_long_form_memory_update(
+                staged_project,
+                chapter_index,
+                memory_update,
+                final_text=new_text or old_text,
+            )
+        except TypeError as error:
+            # Keep test doubles and downstream integrations using the older
+            # three-argument helper callable while the real helper accepts
+            # body evidence for deterministic foreshadow synchronization.
+            if "final_text" not in str(error):
+                raise
+            memory_changed = _apply_long_form_memory_update(
+                staged_project,
+                chapter_index,
+                memory_update,
+            )
+        if not memory_changed:
+            return None, False, "", "", "", ""
         if include_prose:
             staged_chapter["text"] = new_text
         bundle = bundle if isinstance(bundle, dict) else {}
@@ -16210,6 +16228,7 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
             staged_project,
             self.current_chapter_index,
             memory_update,
+            final_text=body_text,
         )
         if memory_changed:
             staged_chapters = staged_project.get("chapters", [])

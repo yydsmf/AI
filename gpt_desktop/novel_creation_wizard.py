@@ -258,7 +258,7 @@ STEP_PROMPTS = {
 
 先完整吸收作者灵感和全部选择，再开始写。五个方向都使用灵感中的核心内容，但各自从不同的人物选择、现实压力、关系变化或题材机制长出自己的故事；差异要来自故事本身，不靠只换名字、地点或几句设定。五个方向可以采用完全不同的剧情发动方式，不要求统一的冲突顺序、固定的网文结构或相同的推进节奏。
 
-五个方向要像五本真正不同的小说来命名和写人：每个方向的主角都要有明确姓名，主角姓名不能重复，也不能只是换一个字；重要配角的姓名也尽量错开。不要连续使用同一个姓氏、相同的姓名节奏或同一套常见网文姓名模板，要让姓名随着题材、时代、人物身份、男频或女频方向和故事气质自然变化。名字要好读、好记、有辨识度，不为了变化硬塞生僻字；简介、主角字段和人物关系里使用同一个姓名，不能前后改名。
+如果作者已经明确提供了书名，五个方向的书名必须原样使用这个书名，不改字、不换说法、不另起书名；五个方向的差异来自人物选择、现实压力、关系变化和剧情走法。只有作者没有明确提供书名时，才为五个方向分别拟题。五个方向都要像真正不同的小说来写人：每个方向的主角都要有明确姓名，主角姓名不能重复，也不能只是换一个字；重要配角的姓名也尽量错开。不要连续使用同一个姓氏、相同的姓名节奏或同一套常见网文姓名模板，要让姓名随着题材、时代、人物身份、男频或女频方向和故事气质自然变化。名字要好读、好记、有辨识度，不为了变化硬塞生僻字；简介、主角字段和人物关系里使用同一个姓名，不能前后改名。
 命名参考中的姓名和姓氏来自本地已经创建过的其它项目，只用来帮助这次换一套自然的命名方式：不要直接复用其中的姓名，不要只改一个字，也不要连续沿用同一批姓氏和姓名节奏。参考为空时，也要主动避开最常见的固定网文姓名模板；仍然以符合题材、时代、人物身份和故事气质为先，不要为了不同而使用生硬或生僻的名字。
 
 下面示例中的空对象只是为了避免重复占篇幅，实际返回时 1、2、3、4、5 五个槽位都必须各自完整填写十个字段，不能返回空对象，也不能把多个故事合并到一个槽位。
@@ -352,6 +352,50 @@ def _compact_stage_plan_prompt(prompt):
 
 def _as_text(value):
     return str(value or "").strip()
+
+
+def _extract_requested_title(value):
+    """Read a title only when the author marked it as a title explicitly."""
+    text = _as_text(value)
+    if not text:
+        return ""
+
+    # A standalone 《书名》 is unambiguous, and is common when authors paste
+    # the title together with tags or a short introduction.
+    bracketed = re.match(
+        r"^\s*(《[^》]{1,120}》)(?=\s*(?:标签|题材|类型|简介|故事简介|灵感|风格)\s*[:：=]|\s*$)",
+        text,
+    )
+    if bracketed:
+        return _as_text(bracketed.group(1))
+
+    # Keep the rest of the one-line inspiration free-form.  Only labels such
+    # as “书名：” or “标题：” turn a part of it into a fixed title.
+    labeled = re.search(
+        r"(?:书名|作品名|小说名|标题)\s*[:：=]\s*"
+        r"(?P<title>《[^》]{1,120}》|.*?)"
+        r"(?=\s*(?:标签|题材|类型|简介|故事简介|灵感|风格|主角|读者方向|篇幅|字数)\s*[:：=]|$)",
+        text,
+    )
+    if not labeled:
+        return ""
+    title = _as_text(labeled.group("title"))
+    return title.strip(" \t,，;；|。")
+
+
+def _creation_requested_title(inspiration, project_name_hint=""):
+    """Return the author's fixed title without treating free-form inspiration as one."""
+    text = _as_text(inspiration)
+    title = _extract_requested_title(text)
+    if title:
+        return title
+    hint = _as_text(project_name_hint)
+    # A draft opened with a project hint starts with that exact text in the
+    # inspiration field.  Do not use the hint after the author replaces it
+    # with a different free-form inspiration.
+    if hint and text == hint:
+        return hint
+    return ""
 
 
 def _creation_merge_display_parts(*values):
@@ -2248,6 +2292,20 @@ def _premise_transport_items(value):
     return [], "没有返回五个固定故事方向"
 
 
+def _bind_requested_title(result, requested_title):
+    """Keep an explicitly supplied book title identical in every candidate."""
+    requested_title = _as_text(requested_title)
+    if not requested_title or not isinstance(result, dict):
+        return result
+    candidates = result.get("candidates")
+    if not isinstance(candidates, list):
+        return result
+    for candidate in candidates:
+        if isinstance(candidate, dict):
+            candidate["title"] = requested_title
+    return result
+
+
 def _expand_creation_transport(step, payload):
     """展开向导专用的短键/定长数组协议，不改变正式保存字段。"""
     data = deepcopy(payload) if isinstance(payload, dict) else {}
@@ -3675,7 +3733,8 @@ def format_creation_context(context):
         "只沿着这些资料往下写，不替作者改掉题材、人物选择、结尾方向和必须守住的边界。"
         "输入 JSON 中 a=作者输入，p=已选故事，c=前面确认的资料，b=本次批次，"
         "s=当前阶段，h=前面阶段，f=暗线位置，n=命名参考；其余字段按原名读取。"
-        "a.inspiration 是作者亲自写下的灵感原文，里面的具体人物、关系、情节、场景、爽点和节奏要求都要逐项吸收；"
+        "a.inspiration 是作者亲自写下的完整灵感原文，里面的书名、标签、简介、人物、关系、情节、场景、爽点和节奏要求都要逐项吸收；"
+        "a.requested_title 是作者已经明确确定的书名；只要它非空，后续返回中的书名必须原样保留，不能改写、缩写或另起书名；"
         "a 里的主分类、主题、读者方向、风格和主角起点是硬要求，不要只在标签里提到，也不要用相似题材替换。"
         "不要逐条复述资料，直接写出人物和事情。\n"
         + json.dumps(transport, ensure_ascii=False, separators=(",", ": "))
@@ -4923,6 +4982,20 @@ c 中每项只能使用 n、r、g、s、v、q；l 中每项只能使用 n、t、
                     if isinstance(author_input, dict) else 3000
                 ),
             )
+            if self.creation_step == "premise":
+                _bind_requested_title(
+                    normalized,
+                    (
+                        _as_text(author_input.get("requested_title"))
+                        if isinstance(author_input, dict) else ""
+                    )
+                    or _creation_requested_title(
+                        author_input.get("inspiration", "")
+                        if isinstance(author_input, dict) else "",
+                        author_input.get("temporary_title", "")
+                        if isinstance(author_input, dict) else "",
+                    ),
+                )
             self._finalize_analysis_diagnostics("success", started)
             self.result_ready.emit(normalized)
         except Exception as exc:
@@ -5286,6 +5359,7 @@ class NovelCreationWizardDialog(QDialog):
         self.json_clear_buttons = {}
         self._status_text = "先输入一点灵感，再点选你喜欢的故事方向。"
         self._received_chars = 0
+        self._status_step_index = -1
         self._last_worker_error = ""
         self._draft_restoring = True
         self.target_words_spin = QSpinBox()
@@ -6175,7 +6249,7 @@ class NovelCreationWizardDialog(QDialog):
         layout.setSpacing(7)
         self.inspiration_edit = QLineEdit()
         self.inspiration_edit.setPlaceholderText(
-            "可选：一句话灵感、特殊题材、主角设想、想写的场景，或者暂定书名"
+            "可选：书名：……；标签：……；简介：……；也可以直接输入一段灵感"
         )
         if self.project_name_hint:
             self.inspiration_edit.setText(self.project_name_hint)
@@ -6353,6 +6427,11 @@ class NovelCreationWizardDialog(QDialog):
             editor.setPlainText(format_creation_preview(step, result))
 
     def _refresh_step_ui(self):
+        # 接收字符数属于当前步骤和当前请求的临时状态。切换步骤时不能把
+        # 上一步的数字拼到新的状态提示后面；同一步刷新则保留实时进度。
+        if self._status_step_index != self.current_step_index:
+            self._received_chars = 0
+            self._status_step_index = self.current_step_index
         step, title = CREATION_WIZARD_STEPS[self.current_step_index]
         self.step_label.setText(f"第 {self.current_step_index + 1}/{len(CREATION_WIZARD_STEPS)} 步：{title}")
         self.stack.setCurrentIndex(self.current_step_index)
@@ -6487,11 +6566,17 @@ class NovelCreationWizardDialog(QDialog):
         self._set_status_text(self._status_text)
 
     def _context_for_step(self, step):
+        inspiration = self.inspiration_edit.text().strip()
+        requested_title = _creation_requested_title(
+            inspiration,
+            self.project_name_hint,
+        )
         genre = self._selected_choice("genre")
         context = {
             "author_input": {
-                "inspiration": self.inspiration_edit.text().strip(),
-                "temporary_title": self.project_name_hint or self.inspiration_edit.text().strip(),
+                "inspiration": inspiration,
+                "requested_title": requested_title,
+                "temporary_title": requested_title or self.project_name_hint,
                 "genre": genre,
                 "theme": self._selected_choice("theme"),
                 "audience": self._selected_choice("audience"),
@@ -7304,6 +7389,12 @@ class NovelCreationWizardDialog(QDialog):
             self._schedule_generation_retry(str(exc), batch_kind, stage_index)
             return
         if step == "premise":
+            author_input = self._context_for_step("premise").get("author_input", {})
+            _bind_requested_title(
+                result,
+                author_input.get("requested_title", "")
+                if isinstance(author_input, dict) else "",
+            )
             candidates = [
                 deepcopy(item)
                 for item in result.get("candidates", [])

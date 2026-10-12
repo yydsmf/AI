@@ -168,7 +168,7 @@ class ToapisOfficialImageWorkerTests(unittest.TestCase):
         self.assertEqual(results[0]["images"], ["/tmp/generated.png"])
         self.assertIn(("GET", "https://example.com/out.png"), [(method, url) for method, url, _ in calls])
 
-    def test_non_toapis_gpt_image_2_keeps_existing_edit_endpoint(self):
+    def test_other_provider_edit_keeps_url_response_format(self):
         worker = ImageWorker(
             "https://api.example.com",
             "key",
@@ -187,6 +187,118 @@ class ToapisOfficialImageWorkerTests(unittest.TestCase):
         post_func, data = fallback.call_args.args
         self.assertEqual(data["size"], "1024x1024")
         self.assertEqual(data["response_format"], "url")
+
+    def test_other_provider_generation_keeps_url_response_format(self):
+        worker = ImageWorker(
+            "https://api.example.com",
+            "key",
+            "gpt-image-2.5-sunburst",
+            "1024*1024",
+            "低",
+            "1",
+            "prompt",
+            [],
+        )
+
+        with mock.patch.object(worker, "_post_with_response_format_fallback") as fallback:
+            fallback.return_value = _FakeResponse({"data": []})
+            worker._post_image_request({"Authorization": "Bearer key"})
+
+        _post_func, payload = fallback.call_args.args
+        self.assertEqual(payload["response_format"], "url")
+
+    def test_dxmcs_generation_requests_embedded_image_data(self):
+        worker = ImageWorker(
+            "https://api.dxmcs.xin/",
+            "key",
+            "gpt-image-2.5-sunburst",
+            "1024*1024",
+            "低",
+            "1",
+            "prompt",
+            [],
+        )
+
+        with mock.patch.object(worker, "_post_with_response_format_fallback") as fallback:
+            fallback.return_value = _FakeResponse({"data": []})
+            worker._post_image_request({"Authorization": "Bearer key"})
+
+        _post_func, payload = fallback.call_args.args
+        self.assertEqual(payload["response_format"], "b64_json")
+
+    def test_embedded_image_format_falls_back_to_url_when_unsupported(self):
+        worker = ImageWorker(
+            "https://api.example.com",
+            "key",
+            "image-model",
+            "1024*1024",
+            "自动",
+            "1",
+            "prompt",
+            [],
+        )
+        calls = []
+        messages = []
+        worker.progress.connect(messages.append)
+
+        def post_func(payload):
+            calls.append(dict(payload))
+            if payload.get("response_format") == "b64_json":
+                return _FakeResponse(
+                    {"error": {"message": "response_format b64_json is not supported"}},
+                    status_code=400,
+                )
+            return _FakeResponse({"data": [{"url": "https://example.com/out.png"}]})
+
+        response = worker._post_with_response_format_fallback(
+            post_func,
+            {"model": "image-model", "response_format": "b64_json"},
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual([call["response_format"] for call in calls], ["b64_json", "url"])
+        self.assertIn("接口不支持内嵌图片数据，已自动改用 URL 返回重试...", messages)
+
+    def test_run_prefers_embedded_image_and_does_not_download_returned_url(self):
+        worker = ImageWorker(
+            "https://api.dxmcs.xin",
+            "key",
+            "gpt-image-2.5-sunburst",
+            "1024*1024",
+            "低",
+            "1",
+            "prompt",
+            [],
+        )
+        calls = []
+
+        def fake_request(method, url, **kwargs):
+            calls.append((method, url, kwargs))
+            if method == "GET":
+                raise AssertionError("返回 b64_json 时不应请求图片 URL")
+            return _FakeResponse({
+                "data": [{
+                    "b64_json": "aW1hZ2UtYnl0ZXM=",
+                    "url": "http://156.238.224.67:13000/unreachable.png",
+                }]
+            })
+
+        results = []
+        failures = []
+        worker._request = fake_request
+        worker.result_ready.connect(results.append)
+        worker.failed.connect(failures.append)
+
+        with mock.patch(
+            "gpt_desktop.workers.save_base64_to_image",
+            return_value="/tmp/generated-from-base64.png",
+        ) as save_base64:
+            worker.run()
+
+        self.assertEqual(failures, [])
+        self.assertEqual(results[0]["images"], ["/tmp/generated-from-base64.png"])
+        self.assertEqual([method for method, _url, _kwargs in calls], ["POST"])
+        save_base64.assert_called_once_with("aW1hZ2UtYnl0ZXM=", ".png")
 
     def test_failed_image_request_emits_diagnostics_without_api_key(self):
         worker = ImageWorker(

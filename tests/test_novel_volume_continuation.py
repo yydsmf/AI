@@ -27,7 +27,6 @@ from gpt_desktop.novel_writing_tab import (
     _volume_handoff_display_text,
 )
 from gpt_desktop.workers import (
-    NovelChapterPlanMasterWorker,
     NovelChapterPlanWorker,
     NovelVolumeFrameworkWorker,
     NovelVolumeFrameworkAlignmentWorker,
@@ -1075,7 +1074,6 @@ class NovelVolumeContinuationTests(unittest.TestCase):
             context_mode="master",
         )
         batch_context = tab._chapter_plan_batch_context(state, 30)
-        master_worker = NovelChapterPlanMasterWorker("", "", "", master_context, 500000, 2000, 250)
         batch_worker = NovelChapterPlanWorker(
             "", "", "", batch_context, 500000, 2000, 30, 250, 0, batch_number=8, total_batches=9
         )
@@ -1084,10 +1082,6 @@ class NovelVolumeContinuationTests(unittest.TestCase):
         self.assertLessEqual(len(batch_context), _CHAPTER_PLAN_CONTEXT_CHAR_BUDGET)
         self.assertLessEqual(
             len(batch_context) + len(batch_worker._analysis_prompt()),
-            NOVEL_AI_CONTEXT_LIMIT,
-        )
-        self.assertLessEqual(
-            len(master_context) + len(master_worker._analysis_prompt()),
             NOVEL_AI_CONTEXT_LIMIT,
         )
         batch_payload = json.loads(batch_context[batch_context.find("{"):])

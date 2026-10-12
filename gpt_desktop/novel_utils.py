@@ -13922,7 +13922,7 @@ def _normalize_long_form_state_aliases(update):
                     item,
                     (
                         "ref", "record_ref", "character_ref", "lore_ref", "character_id",
-                        "lore_id", "stable_ref", "stable_id", "ref_id", "id",
+                        "lore_id", "stable_ref", "stable_id", "ref_id", "canonical_ref", "id",
                     ),
                 )
                 has_delta = any(
@@ -13966,7 +13966,7 @@ def _normalize_long_form_state_aliases(update):
                         item,
                         (
                             "record_ref", "character_ref", "lore_ref", kind_specific_ref, "stable_ref",
-                            "stable_id", "ref_id", "temp_key", "id", "key",
+                            "stable_id", "ref_id", "canonical_ref", "temp_key", "id", "key",
                         ),
                     )
                 if kind == "characters" and operation != "create" and not str(item.get("name", "") or "").strip():
@@ -14000,6 +14000,25 @@ def _normalize_long_form_state_aliases(update):
                     "new_status", "status_update", "update", "content", "status",
                     "description",
                 ))
+                nested_fields = item.get("fields")
+                if not dynamic and isinstance(nested_fields, dict):
+                    dynamic = first_value(nested_fields, (
+                        "state", "dynamic", "runtime", "runtime_update", "runtime_patch",
+                        "operational_state", "spatial_state", "current_dynamic", "change",
+                        "latest_state", "new_state", "current_state", "state_update",
+                        "new_status", "status_update", "update", "content", "status",
+                        "public_state", "description", "notes",
+                    ))
+                    if not dynamic:
+                        field_changes = nested_fields.get("changes", [])
+                        if isinstance(field_changes, str):
+                            dynamic = field_changes.strip()
+                        elif isinstance(field_changes, list):
+                            dynamic = "；".join(
+                                str(value or "").strip()
+                                for value in field_changes
+                                if str(value or "").strip()
+                            )
                 # Some model responses keep the canonical operation at the
                 # top level but put the actual identity/runtime delta inside
                 # ``patch``.  Read that already-returned content here; do not
@@ -14610,6 +14629,52 @@ def _normalize_long_form_ephemeral_actor_refs(project, payload):
     return payload
 
 
+def _normalize_long_form_canonical_character_refs(project, update):
+    """Map safe legacy canonical_ref character rows to existing records."""
+    project = project if isinstance(project, dict) else {}
+    payload = deepcopy(update) if isinstance(update, dict) else {}
+    record_updates = payload.get("record_updates", {})
+    if not isinstance(record_updates, dict):
+        return payload
+
+    reference_maps = _long_form_record_reference_maps(project).get("characters", {})
+    id_to_record = reference_maps.get("id_to_record", {})
+    for item in record_updates.get("characters", []) if isinstance(
+        record_updates.get("characters"), list
+    ) else []:
+        if not isinstance(item, dict):
+            continue
+        canonical_ref = str(item.get("canonical_ref", "") or "").strip()
+        incoming_name = str(item.get("name", "") or "").strip()
+        resolved_ref = _resolve_long_form_record_ref(
+            project, "characters", canonical_ref
+        )
+        if not resolved_ref or not incoming_name:
+            continue
+        explicit_ref = str(item.get("ref", item.get("id", "")) or "").strip()
+        resolved_explicit_ref = _resolve_long_form_record_ref(
+            project, "characters", explicit_ref
+        )
+        if resolved_explicit_ref and resolved_explicit_ref != resolved_ref:
+            continue
+        record = id_to_record.get(resolved_ref, {})
+        current_name = str(record.get("name", "") or "").strip()
+        if (
+            not current_name
+            or _compact_text(current_name).casefold()
+            != _compact_text(incoming_name).casefold()
+        ):
+            continue
+        item["ref"] = resolved_ref
+        item["operation"] = "update"
+        identity_fields = _character_identity_fields_from_item(item)
+        if identity_fields:
+            item["identity_patch"] = identity_fields
+            item["canon"] = {}
+    payload["record_updates"] = record_updates
+    return payload
+
+
 def _normalize_long_form_update_payload(project, chapter_index, update):
     payload = deepcopy(update) if isinstance(update, dict) else {}
     payload.pop("_parse_repaired", None)
@@ -14632,6 +14697,7 @@ def _normalize_long_form_update_payload(project, chapter_index, update):
             payload["state_patch"] = deepcopy(payload.get("state_snapshot", {}))
         payload = _normalize_long_form_state_aliases(payload)
         payload = _normalize_long_form_character_refs(project, payload)
+    payload = _normalize_long_form_canonical_character_refs(project, payload)
     payload = _drop_empty_long_form_state_items(project, payload)
     payload = _repair_invalid_long_form_record_refs_by_name(project, payload)
     payload = _normalize_long_form_ephemeral_actor_refs(project, payload)

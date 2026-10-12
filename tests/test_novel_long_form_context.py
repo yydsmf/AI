@@ -1022,6 +1022,142 @@ class NovelLongFormContextTests(unittest.TestCase):
             ["C002", "C010"],
         )
 
+    def test_state_aliases_split_multiple_relationship_pairs_without_merging_them(self):
+        normalized = _normalize_long_form_state_aliases({
+            "state_patch": {
+                "relationship_states": [{
+                    "refs": "C001-C002,C001-C003",
+                    "runtime_patch": "三人关系发生变化。",
+                }],
+            },
+        })
+
+        relationships = normalized["state_patch"]["relationship_states"]
+        self.assertEqual(
+            [item["refs"] for item in relationships],
+            [["C001", "C002"], ["C001", "C003"]],
+        )
+        self.assertEqual(
+            [item["state"] for item in relationships],
+            ["三人关系发生变化。", "三人关系发生变化。"],
+        )
+
+    def test_state_aliases_accept_plural_relationship_refs(self):
+        normalized = _normalize_long_form_state_aliases({
+            "state_patch": {
+                "relationship_states": [{
+                    "relationship_refs": ["C001-C002", "C001-C003"],
+                    "state": "三份婚书分别指向贺沉舟与三人。",
+                }],
+            },
+        })
+
+        relationships = normalized["state_patch"]["relationship_states"]
+        self.assertEqual(
+            [item["refs"] for item in relationships],
+            [["C001", "C002"], ["C001", "C003"]],
+        )
+
+    def test_state_aliases_accept_runtime_patch_and_infer_only_real_updates(self):
+        normalized = _normalize_long_form_state_aliases({
+            "record_updates": {
+                "characters": [
+                    {"ref": "C001", "runtime_patch": "甲暂时离开港口。"},
+                    {"ref": "C002"},
+                ],
+                "lore": [{"ref": "L001", "operational_state": "封锁仍在继续。"}],
+            },
+            "foreshadow_updates": [{
+                "ref": "F001",
+                "spatial_state": "线索仍指向旧码头。",
+            }],
+        })
+
+        characters = normalized["record_updates"]["characters"]
+        self.assertEqual(characters[0]["operation"], "update")
+        self.assertEqual(characters[0]["state"], "甲暂时离开港口。")
+        self.assertNotIn("operation", characters[1])
+        self.assertEqual(normalized["record_updates"]["lore"][0]["operation"], "update")
+        self.assertEqual(normalized["record_updates"]["lore"][0]["state"], "封锁仍在继续。")
+        self.assertEqual(normalized["foreshadow_updates"][0]["operation"], "update")
+        self.assertEqual(normalized["foreshadow_updates"][0]["state"], "线索仍指向旧码头。")
+
+    def test_update_payload_expands_runtime_fields_and_safe_canonical_character_ref(self):
+        chapter = _new_chapter(0)
+        project = self._project_with_current_chapter(chapter)
+        project["characters"] = [
+            {"id": "char-c001", "name": "贺知微"},
+            {"id": "char-c002", "name": "林见夏"},
+            {"id": "char-c003", "name": "周既白"},
+        ]
+
+        normalized = _normalize_long_form_update_payload(project, 0, {
+            "record_updates": {
+                "characters": [{
+                    "operation": "create",
+                    "key": "NC003",
+                    "canonical_ref": "C003",
+                    "name": "周既白",
+                    "fields": {
+                        "current_dynamic": "周既白记得类似场景，但不能确定发生次数。",
+                    },
+                    "evidence_quote": "只是每次细节都不一样。",
+                }],
+                "lore": [],
+            },
+        })
+
+        item = normalized["record_updates"]["characters"][0]
+        self.assertEqual(item["operation"], "update")
+        self.assertEqual(item["ref"], "char-c003")
+        self.assertEqual(
+            item["state"],
+            "周既白记得类似场景，但不能确定发生次数。",
+        )
+        self.assertEqual(item["changes"], [item["state"]])
+
+        identity_update = _normalize_long_form_update_payload(project, 0, {
+            "record_updates": {
+                "characters": [{
+                    "operation": "create",
+                    "key": "NC003",
+                    "canonical_ref": "C003",
+                    "name": "周既白",
+                    "canon": {"voice": "语气平静，回答简短直接"},
+                }],
+                "lore": [],
+            },
+        })["record_updates"]["characters"][0]
+        self.assertEqual(identity_update["operation"], "update")
+        self.assertEqual(identity_update["identity_patch"]["voice"], "语气平静，回答简短直接")
+        self.assertEqual(identity_update["canon"], {})
+
+    def test_canonical_character_ref_does_not_convert_on_name_mismatch(self):
+        chapter = _new_chapter(0)
+        project = self._project_with_current_chapter(chapter)
+        project["characters"] = [
+            {"id": "char-c001", "name": "贺知微"},
+            {"id": "char-c002", "name": "林见夏"},
+            {"id": "char-c003", "name": "周既白"},
+        ]
+
+        normalized = _normalize_long_form_update_payload(project, 0, {
+            "record_updates": {
+                "characters": [{
+                    "operation": "create",
+                    "key": "NC003",
+                    "canonical_ref": "C003",
+                    "name": "周既白同学",
+                    "fields": {"current_dynamic": "正文只确认他在场。"},
+                }],
+                "lore": [],
+            },
+        })
+
+        item = normalized["record_updates"]["characters"][0]
+        self.assertEqual(item["operation"], "create")
+        self.assertNotIn("ref", item)
+
     def test_state_aliases_normalize_foreshadow_advance_operation(self):
         normalized = _normalize_long_form_state_aliases({
             "foreshadow_updates": [{
@@ -2058,15 +2194,16 @@ class NovelLongFormContextTests(unittest.TestCase):
         self.assertIn("不要太工整、太书面、太像范文", context)
         self.assertIn("句子长短混用", context)
         self.assertIn("不要写成流水账", context)
-        self.assertIn("去 AI 味要求", context)
-        self.assertIn("少写段尾总结、抽象情绪判断和万能反应动作", context)
-        self.assertIn("不要频繁使用“沉默、皱眉、冷意、压迫感、空气安静、所有人愣住、下一秒”", context)
-        self.assertIn("对白要有真人说话的不完整感", context)
+        self.assertIn("不得写段尾总结、抽象情绪判断和万能反应动作", context)
+        self.assertIn("不得用“沉默、皱眉、冷意、压迫感、空气安静、所有人愣住、下一秒”等模板化表达替代具体剧情", context)
+        self.assertIn("【对白自然衔接】", context)
+        self.assertIn("需要说明来由、指代或态度时，把意思说清楚", context)
         self.assertIn("场景描写优先用具体物件、动作和细节承载情绪", context)
-        self.assertIn("少用解释型旁白", context)
-        self.assertIn("少写金句式、总结式、标语式句子", context)
+        self.assertIn("不得用解释型旁白替代人物行动", context)
+        self.assertIn("不得用金句式、总结式、标语式句子替代剧情", context)
         self.assertIn("段落结构要有变化", context)
-        self.assertIn("对白不要每句都完整、漂亮、逻辑闭合", context)
+        self.assertNotIn("对白要有真人说话的不完整感", context)
+        self.assertNotIn("对白不要每句都完整、漂亮、逻辑闭合", context)
         self.assertIn("场景细节要克制", context)
         self.assertIn("少量加入具体物件、声音、动作痕迹和环境反馈", context)
         self.assertIn("不要写无意义生活噪声", context)
@@ -2095,14 +2232,17 @@ class NovelLongFormContextTests(unittest.TestCase):
         self.assertIn("第一段样本文。\n\n第二段样本文，保留段落格式。", draft_context)
         self.assertIn("完整原文", guidance)
         self.assertIn("当前项目资料是本章故事事实", guidance)
-        self.assertIn("她很漂亮", guidance)
-        self.assertIn("他很难过", guidance)
-        self.assertIn("他用袖子擦眼睛", guidance)
-        self.assertIn("不把这些例子当固定动作模板", guidance)
+        self.assertIn("正文必须使用自然的网络小说叙述语言", draft_context)
+        self.assertIn("不得出现策划术语、抽象形容", draft_context)
+        self.assertIn("情绪和气氛必须通过人物当下的动作", draft_context)
+        self.assertIn("不得把参考原文的人物、剧情、物件或句子带入当前正文", guidance)
         self.assertNotIn("空得很有存在感", draft_context)
         self.assertNotIn("沉默很有情绪", draft_context)
-        self.assertIn("幽默、吐槽、夸张和比喻可以自由使用", guidance)
-        self.assertGreaterEqual(len(guidance), 500)
+        self.assertIn("【正文语言要求】", guidance)
+        self.assertIn("文学化意象、空泛比喻", draft_context)
+        self.assertNotIn("比喻可以自由使用", guidance)
+        expression_boundary = self._context_section(draft_context, "正文自然表达边界")
+        self.assertLess(len(expression_boundary), 500)
         self.assertLessEqual(len(guidance), 1200)
         self.assertNotIn("【风格锁定规则】", draft_context)
         self.assertNotIn("【AI文风画像】", draft_context)
@@ -2421,7 +2561,7 @@ class NovelLongFormContextTests(unittest.TestCase):
         self.assertIn("动作修饰词", profile)
         self.assertIn("生理/神态反应", profile)
         self.assertIn("说话标签", profile)
-        self.assertIn("对白句长与停顿", profile)
+        self.assertIn("对白表达观察", profile)
         self.assertIn("对白高频口语/接话词", profile)
 
     def test_style_reference_space_is_reserved_in_large_context(self):
@@ -3925,6 +4065,109 @@ class NovelLongFormContextTests(unittest.TestCase):
         self.assertEqual(normalized["state_reconciliation"]["object_keys"], ["L010"])
         self.assertTrue(any("object_keys引用未知物件" in error for error in errors))
 
+    def test_first_seen_explicit_object_lore_alias_gets_stable_object_key(self):
+        chapter = _new_chapter(0)
+        project = self._project_with_current_chapter(chapter)
+        project["lore"] = [
+            {"id": f"lore-{index:02d}", "name": f"设定{index:02d}", "type": "规则"}
+            for index in range(1, 11)
+        ] + [{
+            "id": "lore-box",
+            "name": "婚书铜匣",
+            "type": "物件",
+            "description": "跨章持有的关键物件。",
+        }]
+        project["long_form_memory"] = {
+            "schema_version": "2",
+            "revision": 0,
+            "state_snapshot": {
+                "object_states": [{
+                    "key": "NO001",
+                    "name": "装面钱的布袋",
+                    "state": "仍由主角持有。",
+                }],
+            },
+            "active_facts": [],
+            "stage_archives": [],
+        }
+        update = self._strict_update(project)
+        update["state_patch"] = {
+            "object_states": [{
+                "object_key": "L011",
+                "state": "婚书铜匣由主角携带，八枚锁钉同时震响。",
+                "evidence_quote": "婚书铜匣由主角携带",
+            }],
+        }
+        update["state_reconciliation"]["object_keys"] = ["L011"]
+        update["state_lifecycle_review"]["reviewed_object_keys"] = ["L011"]
+        update["next_chapter_memory"]["object_keys"] = ["L011"]
+        update["long_term_events"] = [{
+            "event": "婚书铜匣继续由主角携带。",
+            "category": "key_object",
+            "evidence_quote": "婚书铜匣由主角携带",
+            "storage": {"object_keys": ["L011"]},
+        }]
+
+        normalized = _normalize_long_form_structural_refs(project, 0, update)
+        object_row = normalized["state_patch"]["object_states"][0]
+        object_key = object_row["key"]
+        self.assertNotEqual(object_key, "L011")
+        self.assertTrue(object_key.startswith("NOBJ-NF"))
+        self.assertEqual(object_row["lore_ref"], "L011")
+        self.assertEqual(normalized["state_reconciliation"]["object_keys"], [object_key])
+        self.assertEqual(normalized["state_lifecycle_review"]["reviewed_object_keys"], [object_key])
+        self.assertEqual(normalized["next_chapter_memory"]["object_keys"], [object_key])
+        self.assertEqual(
+            normalized["long_term_events"][0]["storage"]["object_keys"],
+            [object_key],
+        )
+        self.assertIn("L011", normalized["state_reconciliation"]["lore_refs"])
+        self.assertIn("L011", normalized["long_term_events"][0]["storage"]["lore_refs"])
+
+    def test_first_seen_object_alias_reuses_existing_lore_bound_key(self):
+        chapter = _new_chapter(0)
+        project = self._project_with_current_chapter(chapter)
+        project["lore"] = [
+            {"id": f"lore-{index:02d}", "name": f"设定{index:02d}", "type": "规则"}
+            for index in range(1, 11)
+        ] + [{"id": "lore-box", "name": "婚书铜匣", "type": "物件"}]
+        project["long_form_memory"] = {
+            "schema_version": "2",
+            "revision": 1,
+            "state_snapshot": {
+                "object_states": [
+                    {
+                        "key": "NO001",
+                        "name": "装面钱的布袋",
+                        "state": "上一章仍由主角持有。",
+                    },
+                    {
+                        "key": "NO002",
+                        "name": "婚书铜匣",
+                        "lore_id": "lore-box",
+                        "state": "上一章已经出现。",
+                    },
+                ],
+            },
+            "active_facts": [],
+            "stage_archives": [],
+        }
+        update = self._strict_update(project)
+        update["state_patch"] = {
+            "object_states": [{
+                "object_key": "L011",
+                "state": "婚书铜匣仍由主角携带。",
+                "evidence_quote": "婚书铜匣仍由主角携带",
+            }],
+        }
+        update["state_reconciliation"]["object_keys"] = ["L011"]
+
+        normalized = _normalize_long_form_structural_refs(project, 0, update)
+        self.assertEqual(normalized["state_patch"]["object_states"][0]["key"], "NO002")
+        self.assertEqual(normalized["state_reconciliation"]["object_keys"], ["NO002"])
+        self.assertNotEqual("NO001", normalized["state_reconciliation"]["object_keys"][0])
+
+
     def test_tenth_chapter_rejects_empty_archive_and_unknown_archive_selection(self):
         chapters = [_new_chapter(index) for index in range(11)]
         project = self._project_with_current_chapter(chapters[9])
@@ -5201,10 +5444,11 @@ class NovelLongFormContextTests(unittest.TestCase):
 
         self.assertIn("历史规划元数据只作参考", context)
         self.assertIn("不要逐项执行、解释或扩展成任务清单", context)
-        self.assertIn("所属阶段：强钩子阶段", context)
-        self.assertIn("本章功能：开局爆点", context)
-        self.assertIn("冲突强度：高", context)
-        self.assertIn("人物任务：快速建立主角行动风格", context)
+        self.assertNotIn("所属阶段：强钩子阶段", context)
+        self.assertNotIn("本章功能：开局爆点", context)
+        self.assertNotIn("冲突强度：高", context)
+        self.assertNotIn("人物任务：快速建立主角行动风格", context)
+        self.assertIn("快速建立主角行动风格", context)
         self.assertIn("旧提纲中若残留固定伏笔编号、伏笔任务或伏笔动作", context)
         self.assertIn("动态伏笔调度参考", context)
         self.assertNotIn("伏笔任务：埋下风雨信号", context)
@@ -6173,8 +6417,8 @@ class NovelLongFormContextTests(unittest.TestCase):
         self.assertIn("【长篇进度 / 节奏】", context)
         self.assertIn("项目总目标规模：20万字", context)
         self.assertIn("当前进度字数：160000 / 200000 字，约 80.0%", context)
-        self.assertIn("自动判断阶段：后段收束", context)
-        self.assertIn("集中回收伏笔", context)
+        self.assertIn("自动判断阶段：故事接近收束", context)
+        self.assertIn("集中处理正在发酵的冲突", context)
         self.assertIn("控制本章推进密度", context)
 
     def test_chapter_context_includes_future_plan_boundary(self):
@@ -8206,9 +8450,9 @@ class NovelLongFormContextTests(unittest.TestCase):
         )
         self.assertIn("当前提纲未明确安排的事项必须保持未决", finalize_context)
         self.assertIn("【自然表达边界】", finalize_context)
-        self.assertIn("她很漂亮", finalize_context)
-        self.assertIn("他很难过", finalize_context)
-        self.assertIn("他人看见或听见后的心理和行为变化", finalize_context)
+        self.assertIn("正文必须使用自然的网络小说叙述语言", finalize_context)
+        self.assertIn("不得出现策划术语、抽象形容", finalize_context)
+        self.assertIn("情绪和气氛必须通过人物当下的动作", finalize_context)
         self.assertNotIn("空得很有存在感", finalize_context)
 
     def test_direct_style_context_uses_source_cards_without_procedural_routing(self):
@@ -8798,12 +9042,68 @@ class NovelLongFormContextTests(unittest.TestCase):
         self.assertIn("CF-0009", project["long_form_memory"]["issued_state_ids"]["conflicts"])
         self.assertIn("TASK-0012", project["long_form_memory"]["issued_state_ids"]["tasks"])
 
+    def test_object_state_mentioning_another_lore_name_keeps_its_explicit_key(self):
+        current = _new_chapter(2)
+        current["memory_selection"] = {"object_keys": ["NOBJ-NF2"]}
+        project = self._project_with_current_chapter(current)
+        project["lore"] = [
+            {"id": "lore-crystal", "name": "异兽晶核", "type": "关键物件"},
+            {"id": "lore-echo", "name": "深海回波", "type": "异常线索"},
+        ]
+        project["long_form_memory"] = {
+            "schema_version": "2",
+            "revision": 2,
+            "state_snapshot": {
+                "object_states": [{
+                    "key": "NOBJ-NF2",
+                    "name": "异兽晶核",
+                    "lore_ref": "lore-crystal",
+                    "state": "晶核仍在金属箱内，正与塔内回波产生反应。",
+                }],
+            },
+            "issued_state_ids": {"objects": ["NOBJ-NF1", "NOBJ-NF2"]},
+        }
+        update = self._strict_update(project, 2)
+        update["compact_delta_version"] = LONG_FORM_COMPACT_DELTA_VERSION
+        update["state_patch"] = {
+            "object_states": [{
+                "key": "NOBJ-NF2",
+                "state": "沈砚秋继续携带晶核箱；箱内暗红光增强，深海回波再次出现在海面。",
+                "evidence_quote": "箱内暗红光增强，深海回波再次出现在海面。",
+            }],
+        }
+        update["long_term_events"] = [{
+            "event": "晶核箱随沈砚秋移动，深海回波再次出现。",
+            "evidence_quote": "晶核箱随沈砚秋移动，深海回波再次出现。",
+            "storage": {"object_keys": ["NOBJ-NF2"]},
+        }]
+        update["next_chapter_memory"] = {"object_keys": ["NOBJ-NF2"]}
+
+        normalized = _normalize_long_form_update_payload(project, 2, update)
+
+        object_state = normalized["state_patch"]["object_states"][0]
+        self.assertEqual(object_state["key"], "NOBJ-NF2")
+        self.assertEqual(
+            _resolve_long_form_record_ref(project, "lore", object_state["lore_ref"]),
+            "lore-crystal",
+        )
+        self.assertEqual(
+            normalized["long_term_events"][0]["storage"]["object_keys"],
+            ["NOBJ-NF2"],
+        )
+        self.assertEqual(normalized["next_chapter_memory"]["object_keys"], ["NOBJ-NF2"])
+
     def test_different_object_reusing_existing_key_gets_new_permanent_key(self):
         current = _new_chapter(0)
         current["memory_selection"] = {"object_keys": ["NOBJ-NF1"]}
         following = _new_chapter(1)
         project = self._project_with_current_chapter(current)
         project["chapters"] = [current, following]
+        project["lore"] = [
+            {"id": "lore-order", "name": "棠记首张半年长单", "type": "关键物件"},
+            {"id": "lore-contract", "name": "棠记产权及经营契约文书", "type": "关键物件"},
+            {"id": "lore-copy", "name": "旧订单副本", "type": "关键物件"},
+        ]
         project["long_form_memory"] = {
             "schema_version": "2",
             "revision": 5,
@@ -8812,11 +9112,13 @@ class NovelLongFormContextTests(unittest.TestCase):
                     {
                         "key": "NOBJ-NF6",
                         "name": "棠记首张半年长单",
+                        "lore_ref": "lore-order",
                         "state": "已收首月定银，未来半年按月交付。",
                     },
                     {
                         "key": "NOBJ-NF7",
                         "name": "棠记产权及经营契约文书",
+                        "lore_ref": "lore-contract",
                         "state": "产权文书及长期采购契约均已落印生效。",
                     },
                 ],
@@ -8834,6 +9136,7 @@ class NovelLongFormContextTests(unittest.TestCase):
             "object_states": [{
                 "key": "NOBJ-NF6",
                 "name": "NOBJ-NF6",
+                "lore_ref": "lore-copy",
                 "state": "姜晚棠现持有旧订单副本，记载香料与麻袋同车交往永丰货栈。",
             }],
         }
@@ -8859,7 +9162,7 @@ class NovelLongFormContextTests(unittest.TestCase):
         }
         self.assertEqual(objects["NOBJ-NF6"]["name"], "棠记首张半年长单")
         self.assertEqual(objects["NOBJ-NF7"]["name"], "棠记产权及经营契约文书")
-        self.assertEqual(objects["NOBJ-NF8"]["name"], "NOBJ-NF8")
+        self.assertEqual(objects["NOBJ-NF8"]["name"], "旧订单副本")
         self.assertIn("NOBJ-NF8", project["long_form_memory"]["issued_state_ids"]["objects"])
         chapter = project["chapters"][0]
         self.assertEqual(chapter["long_term_events"][0]["storage"]["object_keys"], ["NOBJ-NF8"])

@@ -11,7 +11,7 @@ from PySide6.QtCore import Qt
 from PySide6.QtWidgets import QMessageBox, QPlainTextEdit
 
 from gpt_desktop.core import load_json_file, save_json_file
-from gpt_desktop.novel_import import Document as DocxDocument, WD_ALIGN_PARAGRAPH, _write_docx_text
+from gpt_desktop.novel_import import Document as DocxDocument, WD_ALIGN_PARAGRAPH, _write_docx_text, _extract_structured_framework_chapter_plan, _extract_framework_planning_parameters
 from gpt_desktop.novel_storage import list_project_summaries
 from gpt_desktop.novel_utils import (
     CHAPTER_ANALYSIS_HASH_VERSION,
@@ -48,6 +48,390 @@ from gpt_desktop.workers import EdgeTTSWorker
 
 
 class NovelWritingStateTests(unittest.TestCase):
+    @staticmethod
+    def _imported_framework_fixture():
+        lines = [
+            "故事核心", "冷秋白从病房醒来，一边寻找老药，一边为来求医的人治病。",
+            "一、圣经", "主线矛盾", "他想找回丢失的千年。", "男主三不医原则", "心术不正不医。",
+            "四、阶段规划", "全书计划约50万字，100章，每章约5000字。",
+        ]
+        for stage in range(1, 6):
+            lines.extend([
+                f"第{stage}阶段：第{stage}次求医", f"章节：第{(stage-1)*20+1}—{stage*20}章",
+                "字数：约10万字", "主要剧情",
+            ])
+            lines.extend(f"{event}. 冷秋白在第{stage}次求医中见到了第{event}位病人。" for event in range(1, 21))
+            if stage == 5:
+                lines.extend(["结尾场景", "神秘病人睁开眼睛，问他是否还记得那扇门。", "第一部完。"])
+        lines.extend(["五、整体节奏", "感情节奏", "81—100章：两人被危机打断。", "六、前十章建议标题"])
+        lines.extend(f"第{index}章：病房来客{index}" for index in range(1, 11))
+        return "\n".join(lines)
+
+    def _imported_planning_tab(self, text=None):
+        tab = NovelWritingTab.__new__(NovelWritingTab)
+        text = self._imported_framework_fixture() if text is None else text
+        tab.current_project = _normalize_project({
+            "meta": {"title": "白衣医圣", "target_words": "50", "genre": "都市神医", "style": "轻松爽文"},
+            "imported_framework_source": {"text": text, "source_title": "医圣框架", "source_label": "Word"},
+        })
+        tab.config = {"novel": {"chapter_plan_average_words": 5000}}
+        tab.writing_worker = None
+        tab.chapter_plan_worker = None
+        provider = {"base_url": "http://example.test", "api_key": "key"}
+        tab._current_novel_ai_selection = lambda: (provider, "model", "")
+        tab._chapter_plan_provider = provider
+        tab._chapter_plan_model = "model"
+        tab._chapter_plan_auto_active = True
+        tab._chapter_plan_sequence_token = 1
+        tab._provider_proxy_mode = lambda _provider: "不使用代理"
+        tab._flush_current_editors = lambda: None
+        tab._set_chapter_ai_actions_enabled = lambda _enabled: None
+        tab.set_chapter_ai_panel_expanded = lambda _expanded: None
+        tab._note_project_dirty = lambda: None
+        tab._log_novel_diagnostic = lambda *args, **kwargs: None
+        tab.chapter_ai_preview = _FakePlainTextEdit("")
+        tab.chapter_plan_apply_btn = _FakeButton()
+        tab._framework_test_status = []
+        tab.set_status_tip = tab._framework_test_status.append
+        return tab
+
+    @staticmethod
+    def _mock_complete_framework_ai_analysis(tab):
+        text = tab.current_project["imported_framework_source"]["text"]
+        tab.current_project["imported_framework_source"]["sha256"] = hashlib.sha256(
+            text.encode("utf-8")
+        ).hexdigest()
+        plan = _extract_structured_framework_chapter_plan(text)
+        tab._store_imported_chapter_plan_reference(plan)
+        tab.current_project["imported_framework_analysis"] = {
+            "source_hash": hashlib.sha256(text.strip().encode("utf-8")).hexdigest(),
+            "foundation_mode": "reuse", "missing_fields": [],
+            "planning_parameters": _extract_framework_planning_parameters(text),
+            "foundation": {"summary": "原文里的完整故事", "core_mainline": "他走进一扇扇旧门。",
+                           "ending_promise": "第七门打开后，故事仍未结束。",
+                           "narrative_strategy_profile": {"genre_world": "都市", "primary_story_engine": "门后的旧名字让众人重新相认。"},
+                           "arcs": [{"name": stage["name"], "source_stage": stage["name"],
+                                     "start_chapter": stage["start_chapter"], "end_chapter": stage["end_chapter"],
+                                     "end_state": stage.get("summary", "") or stage["events"][-1]["text"]}
+                                    for stage in plan["stages"]]},
+        }
+
+    def test_imported_detailed_framework_click_skips_master_and_uses_framework_words(self):
+        class BatchWorker:
+            instances = []
+            def __init__(self, *args, **kwargs):
+                self.args, self.kwargs = args, kwargs
+                self.result_ready, self.failed, self.finished = _FakeSignal(), _FakeSignal(), _FakeSignal()
+                self.progress = _FakeSignal()
+                self.diagnostics = {}
+                BatchWorker.instances.append(self)
+            def _analysis_prompt(self):
+                return "测试章节提示"
+            def start(self):
+                self.started = True
+
+        tab = self._imported_planning_tab()
+        self._mock_complete_framework_ai_analysis(tab)
+        with patch("gpt_desktop.novel_writing_tab.NovelChapterPlanWorker", BatchWorker), \
+             patch("gpt_desktop.novel_writing_tab.QInputDialog.getInt") as word_dialog:
+            tab.generate_chapter_plan()
+        word_dialog.assert_not_called()
+        state = tab.current_project["chapter_plan_generation_state"]
+        self.assertEqual((state["target_words"], state["average_chapter_words"], state["total_chapter_count"]),
+                         (500000, 5000, 100))
+        self.assertEqual(tab.config["novel"]["chapter_plan_average_words"], 5000)
+        self.assertTrue(state["profile_confirmed"])
+        self.assertEqual(state["master_plan"]["source"], "imported_framework")
+        self.assertEqual(len(state["master_plan"]["arcs"]), 5)
+        self.assertTrue(state["master_plan"]["ending_promise"])
+        self.assertEqual(tab._chapter_plan_request_kind, "batch")
+        worker = BatchWorker.instances[0]
+        self.assertEqual(worker.args[6], 20)
+        self.assertEqual(worker.kwargs["total_batches"], 5)
+        self.assertTrue(worker.started)
+        self.assertIn("已读取原框架", tab._framework_test_status[-1])
+        reference = tab.current_project["imported_chapter_plan_reference"]
+        self.assertEqual([len(stage["events"]) for stage in reference["stages"]], [20] * 5)
+        self.assertEqual(reference["chapters"][0]["title"], "病房来客1")
+        self.assertEqual(reference["chapters"][0]["outline"], "")
+        self.assertEqual(tab._chapter_plan_event_assignment_error([], [{"index": 25, "source_event_ids": []}])[:4], "阶段S0")
+
+    def test_creation_wizard_foundation_survives_state_rebuild_without_master_call(self):
+        class BatchWorker:
+            instances = []
+
+            def __init__(self, *args, **kwargs):
+                self.args, self.kwargs = args, kwargs
+                self.result_ready = _FakeSignal()
+                self.failed = _FakeSignal()
+                self.finished = _FakeSignal()
+                self.progress = _FakeSignal()
+                self.diagnostics = {}
+                BatchWorker.instances.append(self)
+
+            def _analysis_prompt(self):
+                return "章节规划提示"
+
+            def start(self):
+                self.started = True
+
+        tab = self._imported_planning_tab("")
+        tab.current_project = {
+            "meta": {
+                "title": "向导项目",
+                "genre": "都市逆袭",
+                "style": "自然网文",
+                "premise": "主角在旧城重新开始。",
+            },
+            "creation_framework": {
+                "source": "creation_wizard",
+                "novel_name": "向导项目",
+                "premise": {
+                    "title": "向导项目",
+                    "synopsis": "主角在旧城重新开始。",
+                    "main_line": "他要把失去的生活一点点夺回来。",
+                },
+                "stage_plan": [{
+                    "name": "旧城开局",
+                    "start_chapter": 1,
+                    "end_chapter": 20,
+                    "summary": "主角回到旧城，先面对生活和人情上的阻力。",
+                    "main_conflict": "旧关系和现实压力逼他作出选择。",
+                }],
+                "total_words": 40000,
+                "average_chapter_words": 2000,
+                "chapter_plan_foundation": {
+                    "summary": "主角从旧城开局，逐步夺回生活。",
+                    "core_mainline": "他要把失去的生活一点点夺回来。",
+                    "ending_promise": "旧城的人和事留下新的选择。",
+                    "target_words": 40000,
+                    "average_chapter_words": 2000,
+                    "total_chapter_count": 20,
+                    "existing_chapter_count": 0,
+                    "narrative_strategy_profile": {
+                        "genre_world": "都市逆袭",
+                        "primary_story_engine": "现实阻力逼出人物选择。",
+                    },
+                    "arcs": [{
+                        "name": "旧城开局",
+                        "start_chapter": 1,
+                        "end_chapter": 20,
+                        "source_stage": "旧城开局",
+                        "dominant_line": "旧关系和现实压力逼他作出选择。",
+                        "end_state": "主角站稳脚跟。",
+                    }],
+                },
+            },
+            "bible": "小说圣经：主角要夺回失去的生活。",
+            "world_rules": "世界规则：现实城市，人物要承担选择的后果。",
+            "summary": "主角在旧城重新开始。",
+            "timeline": "阶段规划：旧城开局。",
+            "characters": [{"name": "主角", "role": "回到旧城的人", "goal": "夺回生活"}],
+            "lore": [{"name": "旧城", "type": "地点", "description": "故事反复发生的城市"}],
+            "foreshadow_items": [{
+                "name": "旧钥匙",
+                "type": "物件",
+                "status": "未埋",
+                "description": "主角手里的旧钥匙会牵出过去。",
+            }],
+            "chapters": [],
+        }
+        state = {
+            "version": 3,
+            "status": "pending",
+            "target_words": 40000,
+            "average_chapter_words": 2000,
+            "total_chapter_count": 20,
+            "existing_chapter_count": 0,
+            "requested_chapter_count": 20,
+            "batch_size": 50,
+            "master_plan": {},
+            "chapters": [],
+            "profile_confirmed": False,
+        }
+
+        with patch("gpt_desktop.novel_writing_tab.NovelChapterPlanWorker", BatchWorker):
+            tab._start_chapter_plan_worker_for_state(deepcopy(state))
+
+        self.assertEqual(tab._chapter_plan_request_kind, "batch")
+        self.assertTrue(BatchWorker.instances[-1].started)
+        restored = tab.current_project["chapter_plan_generation_state"]
+        self.assertEqual(restored["master_plan"]["source"], "creation_wizard")
+        context = tab._chapter_plan_batch_context(restored, 20)
+        self.assertIn("旧城开局", context)
+        self.assertIn("小说圣经：主角要夺回失去的生活。", context)
+        self.assertIn("世界规则：现实城市", context)
+        self.assertIn("旧钥匙", context)
+
+    def test_imported_foundation_and_reference_survive_storage_roundtrip(self):
+        tab = self._imported_planning_tab()
+        self._mock_complete_framework_ai_analysis(tab)
+        state = {"target_words": 500000, "average_chapter_words": 5000, "total_chapter_count": 100}
+        master = tab._chapter_plan_imported_foundation(state)
+        tab.current_project["chapter_plan_foundation"] = master
+        tab.current_project["chapter_plan_generation_state"] = {
+            **state, "version": 3, "status": "pending", "master_plan": master, "profile_confirmed": True,
+            "chapters": [], "existing_chapter_count": 0, "requested_chapter_count": 100,
+        }
+        restored = _normalize_project(json.loads(json.dumps(tab.current_project, ensure_ascii=False)))
+        self.assertEqual(restored["chapter_plan_foundation"]["source"], "imported_framework")
+        self.assertEqual(restored["chapter_plan_foundation"]["source_hash"], tab._framework_import_source()["sha256"])
+        self.assertEqual(len(restored["imported_chapter_plan_reference"]["stages"]), 5)
+        self.assertTrue(restored["chapter_plan_generation_state"]["profile_confirmed"])
+
+    def test_framework_recovery_does_not_rewrite_existing_event_ledger(self):
+        tab = self._imported_planning_tab()
+        tab.current_project["chapter_plan_generation_state"] = {"chapters": [{"index": 1, "source_event_ids": ["S01-E01"]}]}
+        tab._chapter_plan_restore_imported_reference()
+        self.assertEqual(tab.current_project["imported_chapter_plan_reference"], {})
+
+    def test_framework_recovery_preserves_existing_structured_reference(self):
+        tab = self._imported_planning_tab()
+        reference = {"stages": [{"id": "S01", "name": "用户原有阶段"}]}
+        tab.current_project["imported_chapter_plan_reference"] = deepcopy(reference)
+        tab._chapter_plan_restore_imported_reference()
+        self.assertEqual(tab.current_project["imported_chapter_plan_reference"], reference)
+
+    def test_reused_regenerated_foundation_keeps_explicit_source_choice(self):
+        tab = self._imported_planning_tab("")
+        saved = {"target_words": 500000, "average_chapter_words": 3000,
+                 "total_chapter_count": 100, "existing_chapter_count": 0,
+                 "profile_confirmed": True, "force_master_regeneration": True,
+                 "master_plan": {"summary": "用户重新选择的方向"}}
+        state = {**saved, "average_chapter_words": 5000, "master_plan": {}, "profile_confirmed": False}
+        state.pop("force_master_regeneration")
+        tab._chapter_plan_reuse_foundation(state, saved)
+        self.assertTrue(state["force_master_regeneration"])
+        self.assertEqual(state["master_plan"]["summary"], "用户重新选择的方向")
+
+    def test_saved_project_chapter_words_win_over_global_default(self):
+        tab = self._imported_planning_tab("")
+        tab.current_project["chapter_plan_generation_state"] = {"average_chapter_words": 2000}
+        self.assertEqual(tab._chapter_plan_default_average_words(), 2000)
+        tab.current_project["chapter_plan_generation_state"] = {}
+        self.assertEqual(tab._chapter_plan_default_average_words(), 5000)
+
+    def test_average_word_change_keeps_confirmed_foundation_when_ranges_unchanged(self):
+        tab = self._imported_planning_tab("")
+        old = {"target_words": 500000, "average_chapter_words": 3000, "total_chapter_count": 250,
+               "existing_chapter_count": 0, "profile_confirmed": True,
+               "master_plan": {"summary": "用户确认的故事简介", "arcs": [{"name": "开局", "start_chapter": 1, "end_chapter": 250}],
+                               "narrative_strategy_profile": {"genre_world": "都市"}}}
+        new = {**old, "average_chapter_words": 2000, "master_plan": {}, "profile_confirmed": False}
+        tab._chapter_plan_reuse_foundation(new, old)
+        self.assertTrue(new["profile_confirmed"])
+        self.assertEqual(new["master_plan"]["summary"], "用户确认的故事简介")
+        self.assertEqual(new["master_plan"]["average_chapter_words"], 2000)
+        self.assertEqual(old["average_chapter_words"], 3000)
+        for key in ("target_words", "total_chapter_count", "existing_chapter_count"):
+            changed = {**new, key: new.get(key, 0) + 1, "master_plan": {}, "profile_confirmed": False}
+            tab._chapter_plan_reuse_foundation(changed, old)
+            self.assertEqual(changed["master_plan"], {})
+
+    def test_complete_original_outline_stays_available_for_same_call_reuse(self):
+        original = "雨夜里，冷秋白被敲门声惊醒。老人捧着药盒求他救命，他发现盒底藏着旧日圣印。神魂仍在医圣境，肉身却只是残躯。"
+        tab = self._imported_planning_tab("第一阶段：夜访\n章节：第1—1章\n第1章《敲门的人》" + original)
+        tab._chapter_plan_restore_imported_reference()
+        explicit = tab.current_project["imported_chapter_plan_reference"]["chapters"][0]
+        self.assertEqual(explicit["outline"], original)
+        output = tab._chapter_plan_apply_imported_outline({"outline": "模型新提纲", "outline_mode": "use_imported"}, explicit)
+        self.assertEqual(output["outline"], original)
+        output = tab._chapter_plan_apply_imported_outline({"outline": "模型新提纲", "outline_mode": "generate"}, explicit)
+        self.assertEqual(output["outline"], "模型新提纲")
+
+    @staticmethod
+    def _number_only_full_framework_fixture():
+        lines = [
+            "正文规划为五个阶段、100章，约50万字。",
+            "故事核心：江夜在觉醒日找回力量，想让街坊继续过安稳日子。",
+            "一、圣经", "主线矛盾：江夜不愿再替旧王座发号施令。",
+            "结局方向：第七门打开，门后传来江夜自己的声音，故事停在这里。",
+        ]
+        numerals = ["一", "二", "三", "四", "五"]
+        for stage, name in enumerate(numerals, 1):
+            lines.extend([
+                f"第{name}阶段：城门{stage}（第{(stage-1)*20+1:03d}-{stage*20:03d}章，约十万字）",
+                f"江夜在城门{stage}遇到了从前看不起他的邻居。",
+                f"第{name}阶段落点：第{stage}扇门里的声音已经认出了他。",
+            ])
+        lines.extend(["二、主要人物", "姓名：江夜"])
+        for stage, name in enumerate(numerals, 1):
+            lines.extend([f"《天门开时我无敌》第{name}阶段：城门{stage}", f"第{name}阶段：城门{stage}",
+                          "每章约五千字正文容量，以下为可直接扩写的故事提纲。"])
+            for index in range((stage-1)*20+1, stage*20+1):
+                lines.extend([f"第{index:03d}章", f"第{index}次天门响起时，江夜站在街口。邻居想关门，他把手里的钥匙递给林晚照。门后喊出了他的旧名字，实际仍是无极境。"])
+        return "\n".join(lines)
+
+    def test_active_framework_resume_recovers_100_outlines_and_skips_old_master(self):
+        class BatchWorker:
+            instances = []
+            def __init__(self, *args, **kwargs):
+                self.args, self.kwargs = args, kwargs
+                self.result_ready, self.failed, self.finished, self.progress = (_FakeSignal() for _ in range(4))
+                self.diagnostics = {}
+                BatchWorker.instances.append(self)
+            def _analysis_prompt(self):
+                return "章节提示"
+            def start(self):
+                self.started = True
+
+        tab = self._imported_planning_tab(self._number_only_full_framework_fixture())
+        tab.config["novel"]["chapter_plan_average_words"] = 2000
+        tab.current_project["imported_chapter_plan_reference"] = {"stages": [{
+            "id": f"S{i:02d}", "name": f"城门{i}", "start_chapter": (i-1)*20+1, "end_chapter": i*20,
+            "events": [{"id": f"S{i:02d}-E01", "order": 1, "text": "旧的简略节点。"}],
+        } for i in range(1, 6)]}
+        tab.current_project["chapter_plan_generation_state"] = {
+            "version": 1, "status": "failed", "target_words": 500000,
+            "average_chapter_words": 5000, "total_chapter_count": 100,
+            "existing_chapter_count": 0, "requested_chapter_count": 100,
+            "chapters": [], "profile_confirmed": True,
+            "master_plan": {"summary": "旧AI走向，不该代替原文。", "arcs": []},
+        }
+        self._mock_complete_framework_ai_analysis(tab)
+        with patch("gpt_desktop.novel_writing_tab.NovelChapterPlanWorker", BatchWorker), \
+             patch("gpt_desktop.novel_writing_tab.QInputDialog.getInt", side_effect=AssertionError("原文有字数，不应再弹窗")), \
+             patch("gpt_desktop.novel_writing_tab.save_config") as save:
+            tab.generate_chapter_plan()
+        save.assert_not_called()
+        state = tab.current_project["chapter_plan_generation_state"]
+        self.assertEqual((state["average_chapter_words"], state["total_chapter_count"]), (5000, 100))
+        self.assertEqual(state["master_plan"]["source"], "imported_framework")
+        self.assertIn("第七门", state["master_plan"]["ending_promise"])
+        self.assertEqual(tab.config["novel"]["chapter_plan_average_words"], 2000)
+        self.assertEqual(BatchWorker.instances[0].args[6], 20)
+        self.assertEqual(BatchWorker.instances[0].kwargs["total_batches"], 5)
+        reference = tab.current_project["imported_chapter_plan_reference"]
+        self.assertEqual(len(reference["chapters"]), 100)
+        self.assertEqual([len(stage["events"]) for stage in reference["stages"]], [20]*5)
+        self.assertEqual(reference["chapters"][0]["title"], "")
+        original = reference["chapters"][0]["outline"]
+        self.assertIn("实际仍是无极境", original)
+        result = tab._chapter_plan_apply_imported_outline(
+            {"title": "灰石亮起", "outline": "AI另写的内容", "outline_mode": "use_imported"}, reference["chapters"][0])
+        self.assertEqual(result["outline"], original)
+        self.assertEqual(result["title"], "灰石亮起")
+        restored = _normalize_project(json.loads(json.dumps(tab.current_project, ensure_ascii=False)))
+        self.assertEqual(restored["imported_chapter_plan_reference"]["chapters"][0]["outline"], original)
+        self.assertIn("第1扇门", restored["imported_chapter_plan_reference"]["stages"][0]["summary"])
+        context = tab._chapter_plan_reference_context(1, 20)
+        self.assertEqual(len(context["chapters"]), 20)
+        self.assertEqual(len(context["stages"]), 1)
+        self.assertIn("第1扇门", context["stages"][0]["summary"])
+        self.assertTrue(all("summary" not in stage for stage in context["stage_index"]))
+        valid = [{"index": index, "source_event_ids": [f"S01-E{index:02d}"]} for index in range(1, 21)]
+        self.assertEqual(tab._chapter_plan_event_assignment_error([], valid), "")
+        valid[1]["source_event_ids"] = ["S01-E01"]
+        self.assertIn("重复", tab._chapter_plan_event_assignment_error([], valid))
+
+    def test_number_only_outline_recovery_never_changes_started_event_ledger(self):
+        tab = self._imported_planning_tab(self._number_only_full_framework_fixture())
+        reference = {"stages": [{"id": "S01", "name": "用户原阶段"}]}
+        tab.current_project["imported_chapter_plan_reference"] = deepcopy(reference)
+        tab.current_project["chapter_plan_generation_state"] = {"chapters": [{"index": 1, "source_event_ids": ["S01-E01"]}]}
+        tab._chapter_plan_restore_imported_reference()
+        self.assertEqual(tab.current_project["imported_chapter_plan_reference"], reference)
+
     def test_late_chapter_callback_is_discarded_after_project_switch(self):
         chapter = _new_chapter(0)
 
@@ -750,6 +1134,129 @@ class NovelWritingStateTests(unittest.TestCase):
             (0, 50), (50, 50), (100, 50), (150, 50), (200, 50),
         ])
 
+    def test_chapter_plan_stage_batches_do_not_cross_explicit_framework_stages(self):
+        tab = NovelWritingTab.__new__(NovelWritingTab)
+        tab.current_project = {
+            "imported_chapter_plan_reference": {
+                "stages": [
+                    {"id": f"S{index:02d}", "name": f"阶段{index}", "start_chapter": start, "end_chapter": end}
+                    for index, (start, end) in enumerate(
+                        ((1, 20), (21, 40), (41, 60), (61, 80)), 1
+                    )
+                ]
+            }
+        }
+        state = {
+            "existing_chapter_count": 0,
+            "requested_chapter_count": 80,
+            "batch_size": 50,
+            "master_plan": {
+                "arcs": [
+                    {"start_chapter": start, "end_chapter": end}
+                    for start, end in ((1, 20), (21, 40), (41, 60), (61, 80))
+                ]
+            },
+            "chapters": [],
+        }
+
+        self.assertEqual(
+            tab._chapter_plan_stage_batch_ranges(state),
+            [(1, 20), (21, 40), (41, 60), (61, 80)],
+        )
+
+    def test_chapter_plan_stage_longer_than_batch_size_splits_inside_stage_only(self):
+        tab = NovelWritingTab.__new__(NovelWritingTab)
+        tab.current_project = {
+            "imported_chapter_plan_reference": {
+                "stages": [
+                    {"id": "S01", "name": "长阶段", "start_chapter": 1, "end_chapter": 80},
+                    {"id": "S02", "name": "第二阶段", "start_chapter": 81, "end_chapter": 100},
+                ]
+            }
+        }
+        state = {
+            "existing_chapter_count": 0,
+            "requested_chapter_count": 100,
+            "batch_size": 50,
+            "master_plan": {
+                "arcs": [
+                    {"start_chapter": 1, "end_chapter": 80},
+                    {"start_chapter": 81, "end_chapter": 100},
+                ]
+            },
+            "chapters": [],
+        }
+
+        self.assertEqual(
+            tab._chapter_plan_stage_batch_ranges(state),
+            [(1, 50), (51, 80), (81, 100)],
+        )
+
+    def test_chapter_plan_without_explicit_stages_keeps_fixed_batches(self):
+        tab = NovelWritingTab.__new__(NovelWritingTab)
+        tab.current_project = {"imported_chapter_plan_reference": {}}
+        state = {
+            "existing_chapter_count": 0,
+            "requested_chapter_count": 120,
+            "batch_size": 50,
+            "master_plan": {
+                "arcs": [
+                    {"start_chapter": 1, "end_chapter": 30},
+                    {"start_chapter": 31, "end_chapter": 60},
+                    {"start_chapter": 61, "end_chapter": 120},
+                ]
+            },
+            "chapters": [],
+        }
+
+        self.assertIsNone(tab._chapter_plan_stage_batch_ranges(state))
+        self.assertEqual(
+            tab._chapter_plan_next_batch_info(state),
+            (50, 1, 3, 1, 50),
+        )
+
+    def test_chapter_plan_stage_batches_resume_from_existing_chapters(self):
+        tab = NovelWritingTab.__new__(NovelWritingTab)
+        tab.current_project = {
+            "imported_chapter_plan_reference": {
+                "stages": [
+                    {"id": f"S{index:02d}", "name": f"阶段{index}", "start_chapter": start, "end_chapter": end}
+                    for index, (start, end) in enumerate(
+                        ((1, 20), (21, 40), (41, 60), (61, 80), (81, 100),
+                         (101, 120), (121, 140), (141, 160), (161, 180), (181, 200)), 1
+                    )
+                ]
+            }
+        }
+        state = {
+            "existing_chapter_count": 150,
+            "requested_chapter_count": 50,
+            "batch_size": 50,
+            "master_plan": {
+                "arcs": [
+                    {"start_chapter": 151, "end_chapter": 160},
+                    {"start_chapter": 161, "end_chapter": 180},
+                    {"start_chapter": 181, "end_chapter": 200},
+                ]
+            },
+            "chapters": [],
+        }
+
+        self.assertEqual(
+            tab._chapter_plan_next_batch_info(state),
+            (10, 1, 3, 151, 160),
+        )
+        state["chapters"] = [{"index": index} for index in range(151, 161)]
+        self.assertEqual(
+            tab._chapter_plan_next_batch_info(state),
+            (20, 2, 3, 161, 180),
+        )
+        state["chapters"].extend({"index": index} for index in range(161, 181))
+        self.assertEqual(
+            tab._chapter_plan_next_batch_info(state),
+            (20, 3, 3, 181, 200),
+        )
+
     def test_numbered_export_chapter_title_uses_chinese_order_without_duplicate_prefix(self):
         self.assertEqual(_numbered_export_chapter_title(1, "开局被献祭"), "第一章 开局被献祭")
         self.assertEqual(_numbered_export_chapter_title(12, "第 99 章：旧标题"), "第十二章 旧标题")
@@ -831,6 +1338,7 @@ class NovelWritingStateTests(unittest.TestCase):
                         "source_event_ids": ["S01-E01"],
                     }
                 ],
+                "source": "local_framework_parser",
                 "stages": [{
                     "id": "S01",
                     "name": "开局",
@@ -4055,13 +4563,16 @@ class NovelWritingStateTests(unittest.TestCase):
         tab._chapter_ai_style_fallback_text = ""
         tab._chapter_ai_memory_pending = {}
         tab._chapter_ai_memory_finalize_attempted = False
+        tab.set_status_tip = lambda _text: None
         tab._ai_project_snapshot = lambda: deepcopy(tab.current_project)
         started = []
         tab._start_chapter_ai_worker = lambda action, context, status_text="", resume_prefix="": started.append(
             (action, context, status_text)
         )
         terminal = (
-            f"【终稿正文】\n{revised}"
+            f"【终稿正文】\n{revised}\n\n"
+            "【终稿验收】\n"
+            '{"previous_chapter_repetition_check":true,"logic_continuity_check":true}'
         )
 
         tab.on_chapter_ai_ready("style_finalize", terminal)
@@ -5511,7 +6022,7 @@ class NovelWritingStateTests(unittest.TestCase):
         self.assertEqual(len(memory["active_facts"]), 2)
         self.assertEqual(memory["active_facts"][-1]["fact"], "赵明已经取得旧案卷宗")
 
-    def test_memory_repair_stops_auto_expand_after_two_invalid_results(self):
+    def test_memory_repair_stops_auto_expand_after_three_retries(self):
         chapter = _new_chapter(0)
         tab = NovelWritingTab.__new__(NovelWritingTab)
         tab.current_project = {
@@ -5545,7 +6056,7 @@ class NovelWritingStateTests(unittest.TestCase):
             stopped.append(message)
         tab._stop_auto_expand_all = stop_auto_expand
         started = []
-        tab._start_chapter_ai_worker = lambda action, context, status_text="", resume_prefix="": started.append(
+        tab._start_chapter_ai_worker = lambda action, context, status_text="", resume_prefix="", **_kwargs: started.append(
             (action, context, status_text)
         )
         final_text = "赵明进入王城，亲手取出封存多年的旧案卷宗。"
@@ -5557,11 +6068,17 @@ class NovelWritingStateTests(unittest.TestCase):
         }
 
         tab._apply_style_final_result(final_text, invalid_bundle)
-        tab._handle_memory_repair_ready("不是合法JSON")
-        tab._handle_memory_repair_ready("仍然不是合法JSON")
+        with patch(
+            "gpt_desktop.novel_writing_tab.QTimer.singleShot",
+            side_effect=lambda _delay, callback: callback(),
+        ):
+            tab._handle_memory_repair_ready("不是合法JSON")
+            tab._handle_memory_repair_ready("仍然不是合法JSON")
+            tab._handle_memory_repair_ready("第三次仍然不是合法JSON")
+            tab._handle_memory_repair_ready("第四次仍然不是合法JSON")
 
-        self.assertEqual([item[0] for item in started], ["memory_repair", "memory_repair"])
-        self.assertEqual(tab._chapter_ai_memory_repair_attempts, 2)
+        self.assertEqual([item[0] for item in started], ["memory_repair"] * 4)
+        self.assertEqual(tab._chapter_ai_memory_repair_attempts, 4)
         self.assertFalse(tab._auto_expand_all_active)
         self.assertEqual(len(stopped), 1)
         self.assertIn("状态同步失败", stopped[0])
@@ -5885,7 +6402,7 @@ class NovelWritingStateTests(unittest.TestCase):
         scheduled = []
         tab.set_status_tip = lambda text: statuses.append(text)
 
-        with patch("gpt_desktop.novel_writing_tab.random.uniform", return_value=1.0), patch(
+        with patch(
             "gpt_desktop.novel_writing_tab.QTimer.singleShot",
             side_effect=lambda delay, callback: scheduled.append((delay, callback)),
         ):
@@ -5894,7 +6411,7 @@ class NovelWritingStateTests(unittest.TestCase):
         self.assertTrue(tab._chapter_ai_sequence_active)
         self.assertTrue(tab._auto_expand_all_active)
         self.assertTrue(tab._chapter_ai_transient_retry_pending)
-        self.assertEqual(scheduled[0][0], 15000)
+        self.assertEqual(scheduled[0][0], 10000)
         self.assertIn("自动重试", statuses[-1])
 
     def test_transient_style_finalize_retry_reuses_same_action_and_context(self):
@@ -5929,7 +6446,7 @@ class NovelWritingStateTests(unittest.TestCase):
         self.assertEqual(started[0][1], "不能重建的终稿审校上下文")
         self.assertTrue(started[0][3]["transient_retry"])
 
-    def test_transient_chapter_ai_retry_is_capped_at_four(self):
+    def test_transient_chapter_ai_retry_is_capped_at_three_with_fixed_delays(self):
         chapter = _new_chapter(0)
         tab = NovelWritingTab.__new__(NovelWritingTab)
         tab.current_project = {"chapters": [chapter]}
@@ -5943,11 +6460,7 @@ class NovelWritingStateTests(unittest.TestCase):
         tab._chapter_ai_stop_requested_by_user = False
         tab.set_status_tip = lambda _text: None
 
-        with patch("gpt_desktop.novel_writing_tab.random.uniform", return_value=1.0), patch(
-            "gpt_desktop.novel_writing_tab.QTimer.singleShot"
-        ) as single_shot:
-            self.assertTrue(tab._schedule_transient_chapter_ai_retry("style_finalize", "接口错误 503"))
-            tab._chapter_ai_transient_retry_pending = False
+        with patch("gpt_desktop.novel_writing_tab.QTimer.singleShot") as single_shot:
             self.assertTrue(tab._schedule_transient_chapter_ai_retry("style_finalize", "接口错误 503"))
             tab._chapter_ai_transient_retry_pending = False
             self.assertTrue(tab._schedule_transient_chapter_ai_retry("style_finalize", "接口错误 503"))
@@ -5956,13 +6469,10 @@ class NovelWritingStateTests(unittest.TestCase):
             tab._chapter_ai_transient_retry_pending = False
             self.assertFalse(tab._schedule_transient_chapter_ai_retry("style_finalize", "接口错误 503"))
 
-        self.assertEqual(single_shot.call_count, 4)
-        self.assertEqual(single_shot.call_args_list[0].args[0], 15000)
-        self.assertEqual(single_shot.call_args_list[1].args[0], 30000)
-        self.assertEqual(single_shot.call_args_list[2].args[0], 60000)
-        self.assertEqual(single_shot.call_args_list[3].args[0], 120000)
+        self.assertEqual(single_shot.call_count, 3)
+        self.assertEqual([call.args[0] for call in single_shot.call_args_list], [10000, 20000, 30000])
 
-    def test_transient_memory_repair_retries_only_once(self):
+    def test_transient_memory_repair_uses_same_three_retry_budget(self):
         chapter = _new_chapter(0)
         tab = NovelWritingTab.__new__(NovelWritingTab)
         tab.current_project = {"chapters": [chapter]}
@@ -5976,17 +6486,19 @@ class NovelWritingStateTests(unittest.TestCase):
         tab._chapter_ai_stop_requested_by_user = False
         tab.set_status_tip = lambda _text: None
 
-        with patch("gpt_desktop.novel_writing_tab.random.uniform", return_value=1.0), patch(
-            "gpt_desktop.novel_writing_tab.QTimer.singleShot"
-        ) as single_shot:
+        with patch("gpt_desktop.novel_writing_tab.QTimer.singleShot") as single_shot:
+            self.assertTrue(tab._schedule_transient_chapter_ai_retry("memory_repair", "remote end closed"))
+            tab._chapter_ai_transient_retry_pending = False
+            self.assertTrue(tab._schedule_transient_chapter_ai_retry("memory_repair", "remote end closed"))
+            tab._chapter_ai_transient_retry_pending = False
             self.assertTrue(tab._schedule_transient_chapter_ai_retry("memory_repair", "remote end closed"))
             tab._chapter_ai_transient_retry_pending = False
             self.assertFalse(tab._schedule_transient_chapter_ai_retry("memory_repair", "remote end closed"))
 
-        self.assertEqual(single_shot.call_count, 1)
-        self.assertEqual(single_shot.call_args.args[0], 15000)
+        self.assertEqual(single_shot.call_count, 3)
+        self.assertEqual([call.args[0] for call in single_shot.call_args_list], [10000, 20000, 30000])
 
-    def test_empty_output_retries_current_step_only_once_with_clear_status(self):
+    def test_empty_output_uses_same_three_retry_budget_with_clear_status(self):
         chapter = _new_chapter(0)
         tab = NovelWritingTab.__new__(NovelWritingTab)
         tab.current_project = {"chapters": [chapter]}
@@ -6002,19 +6514,21 @@ class NovelWritingStateTests(unittest.TestCase):
         tab.set_status_tip = statuses.append
         error = "AI 没有返回有效内容。 finish_reason=stop"
 
-        with patch("gpt_desktop.novel_writing_tab.random.uniform", return_value=1.0), patch(
-            "gpt_desktop.novel_writing_tab.QTimer.singleShot"
-        ) as single_shot:
+        with patch("gpt_desktop.novel_writing_tab.QTimer.singleShot") as single_shot:
+            self.assertTrue(tab._schedule_transient_chapter_ai_retry("style_finalize", error))
+            tab._chapter_ai_transient_retry_pending = False
+            self.assertTrue(tab._schedule_transient_chapter_ai_retry("style_finalize", error))
+            tab._chapter_ai_transient_retry_pending = False
             self.assertTrue(tab._schedule_transient_chapter_ai_retry("style_finalize", error))
             tab._chapter_ai_transient_retry_pending = False
             self.assertFalse(tab._schedule_transient_chapter_ai_retry("style_finalize", error))
 
-        self.assertEqual(single_shot.call_count, 1)
-        self.assertEqual(single_shot.call_args.args[0], 15000)
-        self.assertIn("厂商返回空内容", statuses[0])
-        self.assertIn("（1/1）", statuses[0])
+        self.assertEqual(single_shot.call_count, 3)
+        self.assertEqual([call.args[0] for call in single_shot.call_args_list], [10000, 20000, 30000])
+        self.assertIn("当前步骤未通过", statuses[0])
+        self.assertIn("（1/3）", statuses[0])
 
-    def test_oversized_memory_output_retries_only_once_with_clear_status(self):
+    def test_oversized_memory_output_uses_same_three_retry_budget(self):
         chapter = _new_chapter(0)
         tab = NovelWritingTab.__new__(NovelWritingTab)
         tab.current_project = {"chapters": [chapter]}
@@ -6030,21 +6544,22 @@ class NovelWritingStateTests(unittest.TestCase):
         tab.set_status_tip = statuses.append
         error = "AI 章节状态整理输出异常膨胀（已超过36000字），已中止本次结果。"
 
-        with patch("gpt_desktop.novel_writing_tab.random.uniform", return_value=1.0), patch(
-            "gpt_desktop.novel_writing_tab.QTimer.singleShot"
-        ) as single_shot:
+        with patch("gpt_desktop.novel_writing_tab.QTimer.singleShot") as single_shot:
+            self.assertTrue(tab._schedule_transient_chapter_ai_retry("memory_finalize", error))
+            tab._chapter_ai_transient_retry_pending = False
+            self.assertTrue(tab._schedule_transient_chapter_ai_retry("memory_finalize", error))
+            tab._chapter_ai_transient_retry_pending = False
             self.assertTrue(tab._schedule_transient_chapter_ai_retry("memory_finalize", error))
             tab._chapter_ai_transient_retry_pending = False
             self.assertFalse(tab._schedule_transient_chapter_ai_retry("memory_finalize", error))
 
-        self.assertEqual(single_shot.call_count, 1)
-        self.assertEqual(single_shot.call_args.args[0], 15000)
-        self.assertIn("厂商状态返回异常过长", statuses[0])
-        self.assertIn("状态整理", statuses[0])
-        self.assertIn("（1/1）", statuses[0])
+        self.assertEqual(single_shot.call_count, 3)
+        self.assertEqual([call.args[0] for call in single_shot.call_args_list], [10000, 20000, 30000])
+        self.assertIn("当前步骤未通过", statuses[0])
+        self.assertIn("（1/3）", statuses[0])
         self.assertTrue(NovelWritingTab._is_transient_chapter_ai_error(error))
 
-    def test_incomplete_style_execution_retries_whole_draft_only_once(self):
+    def test_incomplete_style_execution_retries_whole_draft_with_three_budget(self):
         chapter = _new_chapter(0)
         tab = NovelWritingTab.__new__(NovelWritingTab)
         tab.current_project = {"chapters": [chapter]}
@@ -6063,13 +6578,17 @@ class NovelWritingStateTests(unittest.TestCase):
         with patch("gpt_desktop.novel_writing_tab.QTimer.singleShot") as single_shot:
             self.assertTrue(tab._schedule_transient_chapter_ai_retry("draft", error))
             tab._chapter_ai_transient_retry_pending = False
+            self.assertTrue(tab._schedule_transient_chapter_ai_retry("draft", error))
+            tab._chapter_ai_transient_retry_pending = False
+            self.assertTrue(tab._schedule_transient_chapter_ai_retry("draft", error))
+            tab._chapter_ai_transient_retry_pending = False
             self.assertFalse(tab._schedule_transient_chapter_ai_retry("draft", error))
 
-        self.assertEqual(single_shot.call_count, 1)
-        self.assertEqual(single_shot.call_args.args[0], 5000)
-        self.assertIn("整章重试", statuses[0])
+        self.assertEqual(single_shot.call_count, 3)
+        self.assertEqual([call.args[0] for call in single_shot.call_args_list], [10000, 20000, 30000])
+        self.assertIn("当前步骤未通过", statuses[0])
 
-    def test_empty_output_keeps_one_retry_after_network_retry_budget_is_used(self):
+    def test_empty_output_shares_budget_with_network_failures(self):
         chapter = _new_chapter(0)
         tab = NovelWritingTab.__new__(NovelWritingTab)
         tab.current_project = {"chapters": [chapter]}
@@ -6084,10 +6603,8 @@ class NovelWritingStateTests(unittest.TestCase):
         statuses = []
         tab.set_status_tip = statuses.append
 
-        with patch("gpt_desktop.novel_writing_tab.random.uniform", return_value=1.0), patch(
-            "gpt_desktop.novel_writing_tab.QTimer.singleShot"
-        ) as single_shot:
-            for _ in range(4):
+        with patch("gpt_desktop.novel_writing_tab.QTimer.singleShot") as single_shot:
+            for _ in range(2):
                 self.assertTrue(tab._schedule_transient_chapter_ai_retry("draft", "接口错误 503"))
                 tab._chapter_ai_transient_retry_pending = False
             empty_error = (
@@ -6097,18 +6614,14 @@ class NovelWritingStateTests(unittest.TestCase):
             tab._chapter_ai_transient_retry_pending = False
             self.assertFalse(tab._schedule_transient_chapter_ai_retry("draft", empty_error))
 
-        self.assertEqual(single_shot.call_count, 5)
-        self.assertIn("厂商返回空内容", statuses[-1])
-        self.assertIn("（1/1）", statuses[-1])
+        self.assertEqual(single_shot.call_count, 3)
+        self.assertIn("当前步骤未通过", statuses[-1])
+        self.assertIn("（3/3）", statuses[-1])
 
-    def test_transient_retry_delay_adds_jitter_and_honors_retry_after_minimum(self):
-        with patch("gpt_desktop.novel_writing_tab.random.uniform", return_value=0.9):
-            self.assertEqual(NovelWritingTab._transient_chapter_ai_retry_delay(1), 14)
-        with patch("gpt_desktop.novel_writing_tab.random.uniform", return_value=0.85):
-            self.assertEqual(
-                NovelWritingTab._transient_chapter_ai_retry_delay(1, "Retry-After: 90"),
-                90,
-            )
+    def test_transient_retry_delay_is_fixed(self):
+        self.assertEqual(NovelWritingTab._transient_chapter_ai_retry_delay(1), 10)
+        self.assertEqual(NovelWritingTab._transient_chapter_ai_retry_delay(2), 20)
+        self.assertEqual(NovelWritingTab._transient_chapter_ai_retry_delay(3), 30)
 
     def test_ssl_eof_connection_failure_is_treated_as_transient(self):
         error = (
@@ -6776,32 +7289,19 @@ class NovelWritingStateTests(unittest.TestCase):
         self.assertEqual(len(calls), 1)
         self.assertEqual(calls[0][0], "主角：赵明\n主线：旧案复仇")
 
-    def test_framework_import_text_can_direct_import_without_api(self):
+    def test_framework_import_always_uses_ai_without_processing_choice(self):
         tab = NovelWritingTab.__new__(NovelWritingTab)
-        choices = []
-        prepared = []
-        direct = []
-
-        def choose(title, _label, options, current_index=0):
-            choices.append((title, list(options), current_index))
-            if title == "选择框架处理方式":
-                return "直接导入", True
-            if title == "选择导入方式":
-                return "追加到当前项目", True
-            return options[current_index], True
-
-        tab._get_combo_choice = choose
-        tab._current_novel_ai_selection = lambda: self.fail("直接导入不应要求 API 配置")
-        tab._prepare_framework_import_project = lambda text, path, source, mode: prepared.append((text, path, source, mode)) or "框架"
-        tab._apply_direct_framework_import = lambda text, title, source: direct.append((text, title, source))
-        tab._start_framework_import_worker = lambda *args: self.fail("直接导入不应启动 AI 分类")
-
+        choices, started = [], []
+        tab._get_combo_choice = lambda title, _label, options, current_index=0: (choices.append(title) or "追加到当前项目", True)
+        provider = {"base_url": "http://example.test", "api_key": "key"}
+        tab._current_novel_ai_selection = lambda: (provider, "model", "")
+        tab._prepare_framework_import_project = lambda *_args: "框架"
+        tab._start_framework_import_worker = lambda *args: started.append(args)
         tab._import_framework_text("主线：旧案复仇", "/tmp/框架.txt", "TXT")
-
-        self.assertEqual([choice[0] for choice in choices], ["选择导入方式", "选择框架处理方式"])
-        self.assertIn(("选择框架处理方式", ["直接导入", "AI 智能分类"], 0), choices)
-        self.assertEqual(prepared, [("主线：旧案复仇", "/tmp/框架.txt", "TXT", "追加到当前项目")])
-        self.assertEqual(direct, [("主线：旧案复仇", "框架", "TXT")])
+        self.assertEqual(choices, ["选择导入方式"])
+        self.assertEqual(len(started), 1)
+        self.assertEqual(started[0][:3], (provider, "model", "主线：旧案复仇"))
+        self.assertFalse(hasattr(NovelWritingTab, "_apply_direct_framework_import"))
 
     def test_framework_import_text_can_choose_ai_classification(self):
         tab = NovelWritingTab.__new__(NovelWritingTab)
@@ -6825,12 +7325,68 @@ class NovelWritingStateTests(unittest.TestCase):
 
         tab._import_framework_text("主线：旧案复仇", "/tmp/框架.txt", "TXT")
 
-        self.assertEqual(choices, ["选择导入方式", "选择框架处理方式"])
+        self.assertEqual(choices, ["选择导入方式"])
         self.assertEqual(len(started), 1)
         self.assertEqual(started[0][0], provider)
         self.assertEqual(started[0][1], "model")
         self.assertEqual(started[0][2], "主线：旧案复仇")
         self.assertEqual(started[0][3], "框架")
+
+    def test_framework_import_clears_interrupted_chapter_plan_preview_and_checkpoint(self):
+        tab = NovelWritingTab.__new__(NovelWritingTab)
+        tab.current_project = {
+            "chapter_plan_generation_state": {
+                "status": "interrupted",
+                "requested_chapter_count": 200,
+                "chapters": [{"index": index} for index in range(1, 151)],
+            }
+        }
+        tab.chapter_ai_preview = _FakePlainTextEdit(
+            "正在自动分批生成章节规划\n已完成：150/200章"
+        )
+        tab.chapter_plan_apply_btn = _FakeButton()
+        tab._pending_chapter_plan = {"chapters": [{"title": "旧规划"}]}
+        tab.chapter_plan_worker = None
+        tab._chapter_plan_sequence_token = 4
+        tab._chapter_plan_auto_active = False
+        tab._chapter_plan_continue_pending = False
+        tab._chapter_ai_stop_requested_by_user = False
+        tab._set_chapter_ai_actions_enabled = lambda _enabled: None
+        tab._note_project_dirty = lambda: None
+        tab._get_combo_choice = lambda title, _label, options, current_index=0: (
+            ("追加到当前项目" if title == "选择导入方式" else "AI 智能分类"),
+            True,
+        )
+        provider = {"base_url": "http://example.test", "api_key": "key"}
+        tab._current_novel_ai_selection = lambda: (provider, "model", "")
+        tab._prepare_framework_import_project = lambda *_args: "新框架"
+        started = []
+        tab._start_framework_import_worker = lambda *args: started.append(args)
+
+        tab._import_framework_text("新框架正文", "/tmp/new-framework.txt", "TXT")
+
+        self.assertEqual(tab.chapter_ai_preview.toPlainText(), "")
+        self.assertNotIn("chapter_plan_generation_state", tab.current_project)
+        self.assertEqual(tab._pending_chapter_plan, {})
+        self.assertFalse(tab.chapter_plan_apply_btn.visible)
+        self.assertEqual(tab._chapter_plan_sequence_token, 5)
+        self.assertEqual(len(started), 1)
+
+    def test_late_chapter_plan_callback_is_discarded_after_invalidation(self):
+        class Worker:
+            _chapter_plan_sequence_token = 3
+
+        worker = Worker()
+        tab = NovelWritingTab.__new__(NovelWritingTab)
+        tab.chapter_plan_worker = None
+        tab._chapter_plan_sequence_token = 4
+        tab._chapter_plan_auto_active = False
+        events = []
+        tab.sender = lambda: worker
+        tab._log_novel_diagnostic = lambda event, **details: events.append((event, details))
+
+        self.assertFalse(tab._chapter_plan_callback_is_current())
+        self.assertEqual(events[0][0], "chapter_plan_stale_callback_discarded")
 
     def test_framework_import_retry_reuses_saved_source_in_current_project(self):
         tab = NovelWritingTab.__new__(NovelWritingTab)
@@ -6940,24 +7496,15 @@ class NovelWritingStateTests(unittest.TestCase):
         self.assertTrue(tab.framework_import_retry_btn.visible)
         self.assertEqual(tab.framework_import_retry_btn.text, "重试框架 AI 分类")
 
-    def test_direct_framework_import_writes_raw_text_to_bible_only(self):
-        tab = NovelWritingTab.__new__(NovelWritingTab)
-        status = []
-        tab.current_project = {"bible": "旧圣经", "timeline": "", "summary": ""}
-        tab._refresh_project_material_editors = lambda: None
-        tab._update_stats_label = lambda: None
-        tab._note_project_dirty = lambda: None
-        tab._save_after_import = lambda: "已保存。"
-        tab.set_status_tip = status.append
-
-        tab._apply_direct_framework_import("主线：旧案复仇", "框架文件", "TXT")
-
-        self.assertIn("旧圣经", tab.current_project["bible"])
-        self.assertIn("导入框架原文（TXT：框架文件）", tab.current_project["bible"])
-        self.assertIn("主线：旧案复仇", tab.current_project["bible"])
-        self.assertEqual(tab.current_project["timeline"], "")
-        self.assertEqual(tab.current_project["summary"], "")
-        self.assertIn("框架已直接导入到小说圣经", status[-1])
+    def test_ai_framework_assessment_invalidates_when_original_changes(self):
+        tab = self._imported_planning_tab()
+        self._mock_complete_framework_ai_analysis(tab)
+        restored = _normalize_project(json.loads(json.dumps(tab.current_project, ensure_ascii=False)))
+        self.assertEqual(restored["imported_framework_analysis"]["foundation_mode"], "reuse")
+        tab.current_project["imported_framework_source"]["text"] += "\n故事结局修改。"
+        self.assertEqual(tab._framework_ai_analysis(), {})
+        normalized = _normalize_project(tab.current_project)
+        self.assertNotIn("imported_framework_analysis", normalized)
 
     def test_apply_framework_import_result_writes_directly_to_project_sections(self):
         tab = NovelWritingTab.__new__(NovelWritingTab)
@@ -7042,6 +7589,7 @@ class NovelWritingStateTests(unittest.TestCase):
             "lore": [{"name": "遗物规则", "type": "规则", "description": "遗物只能留下有限提示。"}],
             "foreshadows": [{"name": "死亡真相", "status": "未埋", "description": "最终揭示真正凶手。"}],
             "chapter_plan": {
+                "source": "local_framework_parser",
                 "summary": "前三章强钩子。",
                 "stages": [
                     {
@@ -7095,17 +7643,66 @@ class NovelWritingStateTests(unittest.TestCase):
         self.assertIn("陈序收到第一件会复仇的遗物", reference["chapters"][0]["outline"])
         self.assertEqual(len(reference["stages"]), 1)
         self.assertEqual(reference["stages"][0]["name"], "第一阶段：遗物苏醒")
-        self.assertEqual(
-            [event["id"] for event in reference["stages"][0]["events"]],
-            ["S01-E01", "S01-E02"],
-        )
-        self.assertEqual(reference["stages"][0]["events"][1]["text"], "镜子留下真正凶手的第一条线索。")
+        self.assertEqual(reference["stages"][0]["events"], [])
         self.assertEqual(tab.import_candidates, {"characters": [], "lore": [], "foreshadows": [], "project_materials": {}})
         self.assertNotIn("import_candidates", tab.current_project)
         self.assertGreaterEqual(meta_changed, 3)
         self.assertEqual(plan_added, 1)
         self.assertEqual(save_message, "已保存。")
         self.assertEqual(result["added"]["characters"], 1)
+
+    def test_complete_imported_framework_writes_chapters_and_linked_characters_directly(self):
+        tab = NovelWritingTab.__new__(NovelWritingTab)
+        tab.current_project = {"chapters": []}
+
+        count = tab._apply_complete_imported_chapter_plan(
+            {
+                "local_mapping_status": "mapped_by_ai",
+                "chapters": [
+                    {
+                        "index": 1,
+                        "title": "雨夜醒来",
+                        "outline": "主角在雨夜醒来，发现门外有人等候。",
+                        "narrative_stage": "第一阶段：开局",
+                        "characters": ["主角", "林晚"],
+                    },
+                    {
+                        "index": 2,
+                        "title": "门外来客",
+                        "outline": "林晚说明来意，主角决定跟她离开。",
+                        "narrative_stage": "第一阶段：开局",
+                        "characters": ["主角", "林晚"],
+                    },
+                ],
+            },
+            {
+                "foundation_mode": "reuse",
+                "chapter_outline_mode": "reuse",
+                "chapter_outline_count": 2,
+                "planning_parameters": {
+                    "average_chapter_words": 2800,
+                },
+            },
+        )
+
+        self.assertEqual(count, 2)
+        self.assertEqual(len(tab.current_project["chapters"]), 2)
+        self.assertEqual(
+            tab.current_project["chapters"][0]["linked_characters"],
+            ["主角", "林晚"],
+        )
+        self.assertEqual(
+            tab.current_project["chapters"][1]["source_stage"],
+            "第一阶段：开局",
+        )
+        self.assertEqual(
+            tab.current_project["chapters"][1]["draft_words"],
+            "2800",
+        )
+        self.assertEqual(
+            tab.current_project["chapters"][1]["outline"],
+            "林晚说明来意，主角决定跟她离开。",
+        )
 
     def test_imported_chapter_plan_reference_drops_generic_placeholder_title(self):
         tab = NovelWritingTab.__new__(NovelWritingTab)
@@ -7526,25 +8123,18 @@ class NovelWritingStateTests(unittest.TestCase):
         self.assertEqual(appended["draft_words"], "3200")
         self.assertEqual(appended["linked_characters"], ["陈景川"])
         self.assertEqual(appended["source_event_ids"], ["S01-E01"])
-        self.assertIn("所属阶段：强钩子阶段", appended["outline"])
-        self.assertIn("原框架阶段：第1-10章：城市立足", appended["outline"])
-        self.assertIn("涉及设定：景辰总部", appended["outline"])
-        self.assertIn("禁止/边界：不要提前揭晓幕后人。", appended["outline"])
-        self.assertIn("本章主导线：人物冲突", appended["outline"])
-        self.assertIn("关系推进：建立临时信任", appended["outline"])
-        self.assertIn("调查范围：卷宗只带来一个新结果", appended["outline"])
-        self.assertIn("本章功能：开局爆点", appended["outline"])
-        self.assertIn("冲突强度：高", appended["outline"])
-        self.assertIn("铺垫比例：低，只允许事件中带出", appended["outline"])
-        self.assertIn("人物任务：快速建立陈景川行动风格", appended["outline"])
-        self.assertIn("主线任务：进入京城主线冲突", appended["outline"])
-        self.assertIn("伏笔任务：埋下风雨信号", appended["outline"])
-        self.assertIn("本章目标：主角进入京城。", appended["outline"])
-        self.assertIn("本章涉及设定：景辰总部", appended["outline"])
-        self.assertIn("本章伏笔动作：F0001 风雨信号", appended["outline"])
-        self.assertIn("结尾悬念：旧案卷宗出现。", appended["outline"])
+        self.assertEqual(appended["outline"], "主角进入京城。")
+        self.assertNotIn("所属阶段：", appended["outline"])
+        self.assertNotIn("原框架阶段：", appended["outline"])
+        for planning_label in (
+            "涉及设定：", "禁止/边界：", "本章主导线：", "关系推进：",
+            "调查范围：", "本章功能：", "冲突强度：", "铺垫比例：",
+            "人物任务：", "主线任务：", "伏笔任务：", "本章目标：",
+            "本章涉及设定：", "本章伏笔动作：", "结尾悬念：",
+        ):
+            self.assertNotIn(planning_label, appended["outline"])
         self.assertIn("旧全局备注", tab.current_project["draft_note"])
-        self.assertIn("全书/阶段规划：", tab.current_project["draft_note"])
+        self.assertIn("阶段规划摘要：", tab.current_project["draft_note"])
         self.assertIn("第一卷先立住主线", tab.current_project["draft_note"])
         self.assertEqual(tab.draft_note_edit.toPlainText(), tab.current_project["draft_note"])
         self.assertIn("imported_chapter_plan_reference", tab.current_project)
@@ -7558,6 +8148,83 @@ class NovelWritingStateTests(unittest.TestCase):
         self.assertFalse(tab.chapter_plan_apply_btn.visible)
         self.assertEqual(tab.chapter_ai_preview.toPlainText(), "")
         self.assertTrue(statuses[-1].startswith("已追加 1 章章节规划"))
+
+    def test_chapter_plan_direct_use_keeps_imported_outline_when_model_decides_use_imported(self):
+        tab = NovelWritingTab.__new__(NovelWritingTab)
+        tab.current_project = {
+            "imported_chapter_plan_reference": {
+                "chapters": [{
+                    "index": 1,
+                    "title": "灰烬醒来",
+                    "outline": "母亲葬礼后的雨夜，林烬在旧宅醒来，听见妹妹咳嗽，带她去早餐店并当众压服闹事者，最后在雨幕外听见整齐脚步声。",
+                }],
+            },
+        }
+        model_result = {
+            "index": 1,
+            "title": "模型改写标题",
+            "outline": "模型重新写了一版，不应覆盖用户原文。",
+            "outline_mode": "use_imported",
+        }
+
+        merged = tab._chapter_plan_apply_imported_outline(
+            model_result,
+            tab.current_project["imported_chapter_plan_reference"]["chapters"][0],
+        )
+
+        self.assertEqual(merged["title"], "灰烬醒来")
+        self.assertEqual(
+            merged["outline"],
+            "母亲葬礼后的雨夜，林烬在旧宅醒来，听见妹妹咳嗽，带她去早餐店并当众压服闹事者，最后在雨幕外听见整齐脚步声。",
+        )
+        self.assertEqual(merged["outline_source"], "imported_framework")
+
+    def test_chapter_plan_generated_outline_is_kept_when_model_decides_generate(self):
+        tab = NovelWritingTab.__new__(NovelWritingTab)
+        source = {"index": 1, "title": "框架标题", "outline": "用户原始细纲。"}
+        model_result = {
+            "index": 1,
+            "title": "模型标题",
+            "outline": "模型判断原文不足后生成的约300字提纲。",
+            "outline_mode": "generate",
+        }
+
+        merged = tab._chapter_plan_apply_imported_outline(model_result, source)
+
+        self.assertEqual(merged["title"], "框架标题")
+        self.assertEqual(merged["outline"], "模型判断原文不足后生成的约300字提纲。")
+        self.assertNotIn("outline_source", merged)
+
+    def test_chapter_plan_direct_use_requires_nonempty_imported_outline(self):
+        tab = NovelWritingTab.__new__(NovelWritingTab)
+        source = {"index": 1, "title": "只有标题", "outline": ""}
+        model_result = {
+            "index": 1,
+            "title": "模型标题",
+            "outline": "模型生成的完整章节提纲。",
+            "outline_mode": "use_imported",
+        }
+
+        merged = tab._chapter_plan_apply_imported_outline(model_result, source)
+
+        self.assertEqual(merged["title"], "只有标题")
+        self.assertEqual(merged["outline"], "模型生成的完整章节提纲。")
+        self.assertNotIn("outline_source", merged)
+
+    def test_chapter_plan_missing_outline_mode_defaults_to_generated_result(self):
+        tab = NovelWritingTab.__new__(NovelWritingTab)
+        source = {"index": 1, "title": "框架标题", "outline": "用户原始细纲。"}
+        model_result = {
+            "index": 1,
+            "title": "模型标题",
+            "outline": "模型生成的约300字提纲。",
+        }
+
+        merged = tab._chapter_plan_apply_imported_outline(model_result, source)
+
+        self.assertEqual(merged["title"], "框架标题")
+        self.assertEqual(merged["outline"], "模型生成的约300字提纲。")
+        self.assertNotIn("outline_source", merged)
 
     def test_chapter_plan_context_uses_remaining_chapter_count(self):
         chapter = _new_chapter(0)
@@ -7616,7 +8283,8 @@ class NovelWritingStateTests(unittest.TestCase):
         self.assertIn("不要重写已有章节", context)
         self.assertIn("下一章必须从触发后的新反应、新结果或新阻力开始", context)
         self.assertIn("后章outline只需写触发后可能出现的新增变量", context)
-        self.assertNotIn("风雨信号", context)
+        self.assertIn("风雨信号", context)
+        self.assertIn("旧固定伏笔", context)
         self.assertNotIn("私有备注锚点", context)
 
     def test_chapter_plan_batch_context_keeps_ledger_and_only_last_five_detailed_outlines(self):
@@ -7914,6 +8582,26 @@ class NovelWritingStateTests(unittest.TestCase):
             "",
         )
 
+        compatibility_aliases = [
+            "STAGE_1-E1",
+            "STAGE_01-E01",
+            "STAGE-1-E-1",
+            "S1-E1",
+            "S01_E01",
+        ]
+        for alias in compatibility_aliases:
+            tab.current_project = {
+                "imported_chapter_plan_reference": {"stages": [stage]}
+            }
+            self.assertEqual(
+                tab._chapter_plan_event_assignment_error(
+                    [],
+                    [{"index": 1, "source_event_ids": [alias]}],
+                ),
+                "",
+                alias,
+            )
+
     def test_opening_event_mapping_does_not_repeat_events_already_grouped_into_first_ten_chapters(self):
         tab = NovelWritingTab.__new__(NovelWritingTab)
         events = [
@@ -8098,7 +8786,7 @@ class NovelWritingStateTests(unittest.TestCase):
         self.assertEqual(state["status"], "interrupted")
         self.assertIn("已保存当前批次进度", statuses[-1])
 
-    def test_chapter_plan_dispatches_master_then_second_detailed_batch(self):
+    def test_chapter_plan_requires_foundation_before_detailed_batch(self):
         class FakePlanWorker:
             instances = []
 
@@ -8155,19 +8843,15 @@ class NovelWritingStateTests(unittest.TestCase):
             "chapters": [],
         }
 
-        with patch("gpt_desktop.novel_writing_tab.NovelChapterPlanMasterWorker", FakePlanWorker):
-            tab._start_chapter_plan_worker_for_state(deepcopy(base_state))
+        tab._start_chapter_plan_worker_for_state(deepcopy(base_state))
 
-        self.assertEqual(tab._chapter_plan_request_kind, "master")
-        self.assertTrue(FakePlanWorker.instances[-1].started)
-        master_event = diagnostic_events[-1]
-        self.assertEqual(master_event[0], "chapter_plan_request_started")
-        self.assertEqual(master_event[1]["request_kind"], "master")
-        self.assertEqual(master_event[1]["model"], "model")
-        self.assertEqual(master_event[1]["absolute_start"], 0)
-        self.assertEqual(master_event[1]["absolute_end"], 0)
-        self.assertGreater(master_event[1]["input_chars"], 0)
-        self.assertEqual(master_event[1]["system_prompt_chars"], len("规划系统提示词"))
+        self.assertEqual(tab._chapter_plan_request_kind, "")
+        self.assertFalse(tab._chapter_plan_auto_active)
+        self.assertEqual(
+            tab.current_project["chapter_plan_generation_state"]["status"],
+            "failed",
+        )
+        self.assertEqual(diagnostic_events, [])
 
         batch_state = deepcopy(base_state)
         batch_state["master_plan"] = {
@@ -8197,27 +8881,7 @@ class NovelWritingStateTests(unittest.TestCase):
         self.assertEqual(batch_event[1]["absolute_start"], 51)
         self.assertEqual(batch_event[1]["absolute_end"], 100)
 
-    def test_short_chapter_plan_also_generates_master_profile_first(self):
-        class FakePlanWorker:
-            instances = []
-
-            def __init__(self, *args, **kwargs):
-                self.args = args
-                self.kwargs = kwargs
-                self.progress = _FakeSignal()
-                self.result_ready = _FakeSignal()
-                self.failed = _FakeSignal()
-                self.finished = _FakeSignal()
-                self.started = False
-                self.diagnostics = {}
-                FakePlanWorker.instances.append(self)
-
-            def _analysis_prompt(self):
-                return "规划系统提示词"
-
-            def start(self):
-                self.started = True
-
+    def test_short_chapter_plan_without_foundation_stops_without_api_call(self):
         tab = NovelWritingTab.__new__(NovelWritingTab)
         tab.current_project = {"meta": {}, "chapters": [], "characters": [], "lore": []}
         tab._chapter_plan_provider = {
@@ -8247,91 +8911,21 @@ class NovelWritingStateTests(unittest.TestCase):
             "profile_confirmed": False,
         }
 
-        with patch("gpt_desktop.novel_writing_tab.NovelChapterPlanMasterWorker", FakePlanWorker):
+        with patch("gpt_desktop.novel_writing_tab.NovelChapterPlanWorker") as batch:
             tab._start_chapter_plan_worker_for_state(state)
 
-        self.assertEqual(tab._chapter_plan_request_kind, "master")
-        self.assertTrue(FakePlanWorker.instances[-1].started)
-
-    def test_master_plan_waits_for_user_profile_confirmation_and_saves_edits(self):
-        tab = NovelWritingTab.__new__(NovelWritingTab)
-        tab.current_project = {
-            "chapters": [],
-            "chapter_plan_generation_state": {
-                "version": 3,
-                "status": "generating",
-                "target_words": 40000,
-                "average_chapter_words": 2000,
-                "total_chapter_count": 20,
-                "existing_chapter_count": 0,
-                "requested_chapter_count": 20,
-                "master_plan": {},
-                "chapters": [],
-                "profile_confirmed": False,
-            },
-        }
-        tab._chapter_plan_request_kind = "master"
-        tab._chapter_plan_auto_active = True
-        tab._chapter_plan_continue_pending = False
-        tab.chapter_plan_worker = object()
-        tab._chapter_plan_source_stage_for_index = lambda _index: {}
-        tab._chapter_plan_master_reference_error = lambda _plan: ""
-        def edit_foundation(master_plan, _state):
-            edited = deepcopy(master_plan)
-            edited["core_mainline"] = "用户修正后的全书主线"
-            edited["ending_promise"] = "在终局兑现关系与身份成长"
-            edited["arcs"][0]["dominant_line"] = "用户修正后的阶段主线"
-            edited["narrative_strategy_profile"] = {
-                "audience_direction": "女频",
-                "primary_story_engine": "用户修改后的关系选择",
-                "planning_grammar": "人物先选择，后果改变关系",
-            }
-            return "confirmed", edited
-
-        tab._edit_chapter_plan_foundation = edit_foundation
-        tab._persist_chapter_plan_generation_state = lambda state: tab.current_project.__setitem__(
-            "chapter_plan_generation_state", deepcopy(state)
-        )
-        tab._show_chapter_plan_generation_progress = lambda _state, _message="": None
-        tab.set_status_tip = lambda _text: None
-
-        tab.on_chapter_plan_ready({
-            "summary": "全书规划",
-            "arcs": [{"start_chapter": 1, "end_chapter": 20, "name": "开局卷"}],
-            "narrative_strategy_profile": {
-                "audience_direction": "女频",
-                "primary_story_engine": "AI原始判断",
-                "planning_grammar": "原始规划语法",
-            },
-        })
-
-        state = tab.current_project["chapter_plan_generation_state"]
-        self.assertTrue(state["profile_confirmed"])
-        self.assertEqual(state["status"], "generating")
-        self.assertTrue(tab._chapter_plan_continue_pending)
+        batch.assert_not_called()
+        self.assertEqual(tab._chapter_plan_request_kind, "")
+        self.assertFalse(tab._chapter_plan_auto_active)
         self.assertEqual(
-            tab.current_project["narrative_strategy_profile"]["primary_story_engine"],
-            "用户修改后的关系选择",
-        )
-        self.assertEqual(
-            state["master_plan"]["narrative_strategy_profile"]["primary_story_engine"],
-            "用户修改后的关系选择",
-        )
-        self.assertEqual(state["master_plan"]["core_mainline"], "用户修正后的全书主线")
-        self.assertEqual(
-            state["master_plan"]["arcs"][0]["dominant_line"],
-            "用户修正后的阶段主线",
-        )
-        self.assertEqual(len(state["foundation_hash"]), 64)
-        self.assertEqual(
-            tab.current_project["narrative_strategy_confirmation"]["foundation_hash"],
-            state["foundation_hash"],
+            tab.current_project["chapter_plan_generation_state"]["status"],
+            "failed",
         )
 
     def test_quick_foundation_review_keeps_hidden_strategy_details(self):
         dialog = ChapterPlanFoundationDialog.__new__(ChapterPlanFoundationDialog)
         dialog._plan = {
-            "summary": "原始全书走向",
+            "summary": "原始故事简介",
             "core_mainline": "原始主线",
             "ending_promise": "原始结局",
             "global_hard_boundaries": "不得扩大办案流程。",
@@ -8348,7 +8942,7 @@ class NovelWritingStateTests(unittest.TestCase):
 
         plan = dialog.foundation()
 
-        self.assertEqual(plan["summary"], "原始全书走向")
+        self.assertEqual(plan["summary"], "原始故事简介")
         self.assertEqual(plan["narrative_strategy_profile"]["planning_grammar"], "人物选择推动后果")
         self.assertEqual(
             plan["narrative_strategy_profile"]["satisfaction_currencies"],
@@ -8495,7 +9089,7 @@ class NovelWritingStateTests(unittest.TestCase):
         tab = NovelWritingTab.__new__(NovelWritingTab)
         tab._chapter_plan_master_reference_error = lambda _plan: ""
         plan = {
-            "summary": "全书走向",
+            "summary": "故事简介",
             "existing_chapter_count": 0,
             "total_chapter_count": 100,
             "narrative_strategy_profile": {"primary_story_engine": "人物成长"},
@@ -8513,53 +9107,6 @@ class NovelWritingStateTests(unittest.TestCase):
         truncated = deepcopy(plan)
         truncated["arcs"][-1]["end_chapter"] = 99
         self.assertIn("覆盖到第100章", tab._validate_chapter_plan_foundation(truncated))
-
-    def test_regenerate_foundation_discards_unconfirmed_master_without_starting_details(self):
-        tab = NovelWritingTab.__new__(NovelWritingTab)
-        state = {
-            "version": 3,
-            "status": "awaiting_profile_confirmation",
-            "target_words": 200000,
-            "average_chapter_words": 2000,
-            "total_chapter_count": 100,
-            "existing_chapter_count": 0,
-            "requested_chapter_count": 100,
-            "master_plan": {
-                "summary": "错误方向",
-                "arcs": [{"name": "错误阶段", "start_chapter": 1, "end_chapter": 100}],
-                "narrative_strategy_profile": {"primary_story_engine": "错误发动机"},
-            },
-            "chapters": [],
-            "profile_confirmed": False,
-        }
-        tab.current_project = {
-            "chapters": [],
-            "narrative_strategy_profile": {"primary_story_engine": "错误发动机"},
-            "narrative_strategy_confirmation": {"status": "pending"},
-            "chapter_plan_generation_state": deepcopy(state),
-        }
-        tab._chapter_plan_auto_active = True
-        tab._chapter_plan_continue_pending = False
-        tab._chapter_plan_foundation_regenerate_pending = False
-        tab._edit_chapter_plan_foundation = lambda master_plan, _state: (
-            "regenerate", deepcopy(master_plan)
-        )
-        tab._persist_chapter_plan_generation_state = lambda value: tab.current_project.__setitem__(
-            "chapter_plan_generation_state", deepcopy(value)
-        )
-        tab._show_chapter_plan_generation_progress = lambda _state, _message="": None
-        tab.set_status_tip = lambda _text: None
-
-        confirmed = tab._confirm_chapter_plan_strategy_profile(state)
-
-        saved = tab.current_project["chapter_plan_generation_state"]
-        self.assertFalse(confirmed)
-        self.assertTrue(tab._chapter_plan_foundation_regenerate_pending)
-        self.assertEqual(saved["status"], "pending")
-        self.assertEqual(saved["master_plan"], {})
-        self.assertEqual(saved["chapters"], [])
-        self.assertEqual(tab.current_project["narrative_strategy_profile"], {})
-
 
 class _FakeSignal:
     def __init__(self):

@@ -6,10 +6,15 @@ from gpt_desktop.novel_import import (
     _candidate_analysis_dossier_text,
     _candidate_analysis_text,
     _extract_import_candidates,
+    _extract_structured_framework_chapter_plan,
+    _extract_framework_chapter_plan_from_locations,
+    _build_local_framework_chapter_plan,
+    _extract_framework_planning_parameters,
     _foreshadow_review_chapter_chunks,
     _foreshadow_review_context,
     _foreshadow_review_dossier_text,
     _normalize_ai_candidates,
+    _parse_framework_explicit_chapter_line,
     _is_framework_scope_title,
 )
 from gpt_desktop.novel_utils import _new_chapter, _normalize_project
@@ -17,6 +22,223 @@ from gpt_desktop.novel_utils import _sanitize_import_candidates_for_long_form
 
 
 class NovelImportCandidateTests(unittest.TestCase):
+    def test_ai_compact_locations_restore_source_without_returning_outline_text(self):
+        text = "\n".join([
+            "《测试书》",
+            "一些不规则说明",
+            "【开篇】",
+            "第1节：醒来",
+            "主角在雨夜睁开眼。",
+            "第2节：出门",
+            "主角推门看见陌生人。",
+        ])
+        plan = _extract_framework_chapter_plan_from_locations(text, [
+            {"index": 1, "start_line": "L000004", "end_line": "L000005", "anchor": "第1节：醒来", "characters": ["主角"]},
+            {"index": 2, "start_line": "L000006", "end_line": "L000007", "anchor": "第2节：出门", "characters": ["主角", "陌生人"]},
+        ])
+        self.assertEqual(plan["local_mapping_status"], "mapped_by_ai")
+        self.assertEqual([item["title"] for item in plan["chapters"]], ["第1节：醒来", "第2节：出门"])
+        self.assertEqual(plan["chapters"][0]["outline"], "主角在雨夜睁开眼。")
+        self.assertEqual(plan["chapters"][1]["characters"], ["主角", "陌生人"])
+        self.assertNotIn("outline", plan["chapters"][0]["source_location"])
+
+    def test_ai_location_failure_is_pending_not_semantic_generate(self):
+        text = "书名：测试\n第一段故事没有明确章节格式。"
+        plan = _build_local_framework_chapter_plan(
+            text,
+            {"chapter_outline_mode": "reuse", "chapter_outline_count": 1},
+            [{"index": 1, "start_line": "L009999", "end_line": "L010000"}],
+        )
+        self.assertEqual(plan["local_mapping_status"], "pending")
+        self.assertEqual(plan["semantic_outline_mode"], "reuse")
+        self.assertEqual(plan["chapters"], [])
+
+    def test_ai_location_anchor_mismatch_is_unresolved(self):
+        plan = _extract_framework_chapter_plan_from_locations(
+            "第1节：醒来\n主角睁开眼。",
+            [{
+                "index": 1,
+                "start_line": "L000001",
+                "end_line": "L000002",
+                "anchor": "第1节：出门",
+            }],
+        )
+        self.assertEqual(plan["local_mapping_status"], "pending")
+        self.assertEqual(plan["unresolved_chapters"], [1])
+
+    def test_local_recovery_clears_locator_failure_and_keeps_ai_characters(self):
+        text = "\n".join([
+            "第一阶段：开局（第001-001章，约五千字）",
+            "第001章",
+            "主角在雨夜醒来，林晚站在门外。",
+        ])
+        plan = _build_local_framework_chapter_plan(
+            text,
+            {"chapter_outline_mode": "reuse", "chapter_outline_count": 1},
+            [{
+                "index": 1,
+                "start_line": "L000003",
+                "end_line": "L000003",
+                "anchor": "并不存在的锚点",
+                "characters": ["主角", "林晚"],
+            }],
+        )
+        self.assertEqual(plan["local_mapping_status"], "mapped")
+        self.assertEqual(plan["unresolved_chapters"], [])
+        self.assertEqual(plan["chapters"][0]["characters"], ["主角", "林晚"])
+
+    def test_merge_does_not_keep_unresolved_for_locally_recovered_chapter(self):
+        merged = _merge_framework_chapter_plans(
+            {
+                "chapters": [{
+                    "index": 1,
+                    "title": "AI短锚点",
+                    "outline": "",
+                }],
+                "local_mapping_status": "pending",
+                "unresolved_chapters": [1],
+            },
+            {
+                "chapters": [{
+                    "index": 1,
+                    "title": "",
+                    "outline": "原始章节细纲。",
+                }],
+                "local_mapping_status": "mapped",
+                "unresolved_chapters": [],
+            },
+        )
+        self.assertEqual(merged["local_mapping_status"], "mapped")
+        self.assertEqual(merged["unresolved_chapters"], [])
+        self.assertEqual(merged["chapters"][0]["title"], "AI短锚点")
+        self.assertEqual(merged["chapters"][0]["outline"], "原始章节细纲。")
+
+    def test_semantic_ai_anchor_titles_survive_number_only_source_headings(self):
+        text = "\n".join([
+            "第一阶段：开局（第001-002章）",
+            "第001章",
+            "江夜在觉醒台上取回前世记忆。",
+            "第002章",
+            "林晚照站到江夜身旁。",
+        ])
+        plan = _build_local_framework_chapter_plan(
+            text,
+            {"chapter_outline_mode": "reuse", "chapter_outline_count": 2},
+            [
+                {"index": 1, "start_line": "L000002", "end_line": "L000003",
+                 "anchor": "觉醒日取回力量", "characters": ["江夜"]},
+                {"index": 2, "start_line": "L000004", "end_line": "L000005",
+                 "anchor": "林晚照站到身旁", "characters": ["江夜", "林晚照"]},
+            ],
+        )
+        self.assertEqual(plan["local_mapping_status"], "mapped")
+        self.assertEqual(
+            [item["title"] for item in plan["chapters"]],
+            ["觉醒日取回力量", "林晚照站到身旁"],
+        )
+    def test_number_only_chapter_headings_keep_original_outline_without_fake_title(self):
+        plan = _extract_structured_framework_chapter_plan("第一阶段：旧城醒龙（第001-002章，约一万字）\n第001章\n江夜在觉醒台上取回前世记忆，实际仍是无极境。\n第002章\n林晚照站到江夜身旁，教官收回了轻蔑的话。")
+        self.assertEqual([c["index"] for c in plan["chapters"]], [1, 2])
+        self.assertEqual([c["title"] for c in plan["chapters"]], ["", ""])
+        self.assertEqual(plan["chapters"][0]["outline"], "江夜在觉醒台上取回前世记忆，实际仍是无极境。")
+        self.assertEqual(len(plan["stages"][0]["events"]), 2)
+        self.assertEqual(plan["stages"][0]["name"], "第一阶段：旧城醒龙")
+
+    def test_repeated_stage_overview_and_detailed_outlines_do_not_duplicate_stages(self):
+        text = "\n".join([
+            "第一阶段：旧城醒龙（第001-002章，约一万字）", "江夜醒来，林晚照逐渐相信他。",
+            "第一阶段落点：教官不再轻视他。", "第二阶段：天门入世（第003-004章，约一万字）",
+            "江夜打开了城外的天门。", "二、主要人物", "姓名：江夜",
+            "《天门开时我无敌》第一阶段：旧城醒龙", "第一阶段：旧城醒龙",
+            "每章约五千字正文容量，以下为可直接扩写的故事提纲。",
+            "第001章", "江夜醒来。", "第002章", "林晚照相信了他。",
+            "《天门开时我无敌》第二阶段：天门入世", "第二阶段：天门入世",
+            "第003章", "江夜走到天门前。", "第004章", "门后的声音喊出了他的名字。",
+        ])
+        plan = _extract_structured_framework_chapter_plan(text)
+        self.assertEqual([(s["start_chapter"], s["end_chapter"]) for s in plan["stages"]], [(1, 2), (3, 4)])
+        self.assertEqual([len(s["events"]) for s in plan["stages"]], [2, 2])
+        self.assertEqual(plan["chapters"][1]["outline"], "林晚照相信了他。")
+        self.assertIn("教官不再轻视他", plan["stages"][0]["summary"])
+        self.assertNotIn("天门入世", plan["stages"][0]["summary"])
+        self.assertNotIn("姓名", plan["stages"][1]["summary"])
+
+    def test_title_only_chapters_do_not_become_fake_imported_outlines(self):
+        plan = _extract_structured_framework_chapter_plan("第001章\n第2章：病房来客")
+        self.assertEqual([c["outline"] for c in plan["chapters"]], ["", ""])
+
+    def test_chinese_chapter_word_size_and_full_book_declaration(self):
+        result = _extract_framework_planning_parameters("正文规划为五个阶段、100章，约50万字。\n每章约五千字正文容量，以下为可直接扩写的故事提纲。")
+        self.assertEqual(result, {"target_words": 500000, "average_chapter_words": 5000, "total_chapter_count": 100})
+
+    def test_partial_stage_count_does_not_override_full_book_word_sizes(self):
+        text = "全书约50万字，每章约5000字。\n第一阶段：开局\n章节范围：第1-20章\n1. 江夜醒来。"
+        result = _extract_framework_planning_parameters(text)
+        self.assertEqual(result["target_words"], 500000)
+        self.assertEqual(result["average_chapter_words"], 5000)
+        self.assertNotIn("total_chapter_count", result)
+
+    def test_stage_realm_climax_and_hook_notes_survive_event_extraction(self):
+        text = "第一阶段：旧城醒龙\n阶段境界：公开淬骨，实际无极。\n章节范围：第1-2章\n主要剧情\n1. 江夜走到觉醒台上。\n2. 林晚照向他走来。\n阶段高潮\n教官不再敢开口。\n结尾钩子\n天门里有人叫出了夜帝。"
+        stage = _extract_structured_framework_chapter_plan(text)["stages"][0]
+        self.assertEqual(len(stage["events"]), 2)
+        self.assertIn("实际无极", stage["summary"])
+        self.assertIn("教官不再敢开口", stage["summary"])
+        self.assertIn("天门里有人叫出了夜帝", stage["summary"])
+
+    def test_partial_title_list_does_not_replace_stage_story_events(self):
+        plan = _extract_structured_framework_chapter_plan("\n".join([
+            "第一阶段：医圣苏醒", "章节：第1—3章", "主要剧情",
+            "1. 他在病房醒来。", "2. 他发现旧伤尚未痊愈。", "3. 他救醒邻床老人。",
+            "六、开篇建议标题", "第1章：归来", "第2章：病房里的老人",
+        ]))
+        self.assertEqual(len(plan["stages"]), 1)
+        self.assertEqual([e["text"] for e in plan["stages"][0]["events"]],
+                         ["他在病房醒来。", "他发现旧伤尚未痊愈。", "他救醒邻床老人。"])
+
+    def test_partial_chapter_outlines_do_not_hide_remaining_stage_events(self):
+        plan = _extract_structured_framework_chapter_plan("\n".join([
+            "第一阶段：归来", "章节：第1—3章",
+            "1. 他醒来。", "2. 她赶到病房。", "3. 老人忽然倒下。",
+            "六、开篇细纲", "第1章《归来》他醒来后走出病房，想起失去的千年。",
+        ]))
+        self.assertEqual(len(plan["stages"][0]["events"]), 3)
+        self.assertIn("走出病房", plan["chapters"][0]["outline"])
+
+    def test_final_stage_is_not_replaced_by_later_relationship_ranges(self):
+        plan = _extract_structured_framework_chapter_plan("\n".join([
+            "第一阶段：两界之门", "章节：第1—2章", "1. 遗迹里的门打开了。",
+            "2. 病人喊出了医圣的名字。", "五、整体节奏", "感情节奏",
+            "1—2章：两人互相信任。", "六、建议标题", "第1章：门外来客",
+        ]))
+        self.assertEqual(plan["stages"][0]["name"], "第一阶段：两界之门")
+        self.assertEqual(len(plan["stages"][0]["events"]), 2)
+        self.assertEqual(plan["stages"][0]["events"][-1]["text"], "病人喊出了医圣的名字。")
+
+    def test_framework_sizes_read_book_not_stage_words(self):
+        text = "全书计划约50万字，250章，每章约2000字。\n第一阶段：苏醒\n章节：第1—25章\n字数：约5万字"
+        self.assertEqual(_extract_framework_planning_parameters(text), {
+            "target_words": 500000, "average_chapter_words": 2000, "total_chapter_count": 250,
+        })
+
+    def test_framework_sizes_support_split_declarations(self):
+        self.assertEqual(_extract_framework_planning_parameters(
+            "总字数：500,000字\n总章节数：250章\n单章目标字数：2000字"
+        ), {"target_words": 500000, "total_chapter_count": 250, "average_chapter_words": 2000})
+
+    def test_framework_sizes_derive_missing_average_from_explicit_count(self):
+        result = _extract_framework_planning_parameters("全书约50万字\n总章数：250章")
+        self.assertEqual(result["average_chapter_words"], 2000)
+
+    def test_framework_sizes_do_not_invent_book_words_from_stage_word_label(self):
+        result = _extract_framework_planning_parameters("第一阶段：开局\n字数：5万字\n每阶段25章")
+        self.assertNotIn("target_words", result)
+        self.assertNotIn("total_chapter_count", result)
+
+    def test_framework_explicit_count_wins_over_word_ratio(self):
+        result = _extract_framework_planning_parameters("全书约50万字，170章，每章约3000字。")
+        self.assertEqual(result["total_chapter_count"], 170)
+
     def test_framework_plan_keeps_ai_stages_when_source_has_no_explicit_stage_ranges(self):
         ai_plan = {
             "summary": "全书分三阶段推进。",
@@ -37,9 +259,66 @@ class NovelImportCandidateTests(unittest.TestCase):
     def test_framework_scope_title_detection_distinguishes_single_chapters(self):
         self.assertTrue(_is_framework_scope_title("4—10章：新婚立威"))
         self.assertTrue(_is_framework_scope_title("第51—100章"))
+        self.assertTrue(_is_framework_scope_title("字数与章节：第1—20章，约10万字；每章约5000字。"))
         self.assertTrue(_is_framework_scope_title("第二卷：首辅夫人搞钱"))
         self.assertFalse(_is_framework_scope_title("第一章：新婚夜，她被指控通奸"))
         self.assertFalse(_is_framework_scope_title("半日查出三千两亏空"))
+
+    def test_framework_explicit_chapter_parser_supports_bracket_and_colon_titles(self):
+        bracket = _parse_framework_explicit_chapter_line("第 1 章《灰烬醒来·早餐店插队》母亲葬礼后的雨夜")
+        self.assertEqual(bracket["index"], 1)
+        self.assertEqual(bracket["title"], "灰烬醒来·早餐店插队")
+        self.assertEqual(bracket["inline_outline"], "母亲葬礼后的雨夜")
+
+        colon = _parse_framework_explicit_chapter_line("第2章：学校的废灵牌")
+        self.assertEqual(colon["index"], 2)
+        self.assertEqual(colon["title"], "学校的废灵牌")
+        self.assertEqual(colon["inline_outline"], "")
+
+    def test_structured_framework_plan_keeps_split_chapter_outlines_and_stage_realms(self):
+        lines = [
+            "第1阶段：灰烬醒来",
+            "字数与章节：第1—20章，约10万字；每章约5000字。",
+            "阶段境界：引灵境为男主在这一阶段对外展现的实力境界。",
+            "第1阶段章节细纲",
+        ]
+        for index in range(1, 21):
+            title = "灰烬醒来·早餐店插队" if index == 1 else f"灰烬醒来·第{index}章"
+            lines.extend([
+                f"第{index}章《{title}》",
+                (
+                    "母亲葬礼后的雨夜，林烬在早餐店替苏晚出头；"
+                    "林烬对外展现出的境界，仍是引灵境。"
+                ),
+            ])
+
+        plan = _extract_structured_framework_chapter_plan("\n".join(lines))
+
+        self.assertEqual(len(plan["chapters"]), 20)
+        self.assertEqual(len(plan["stages"]), 1)
+        self.assertEqual(plan["chapters"][0]["index"], 1)
+        self.assertEqual(plan["chapters"][0]["title"], "灰烬醒来·早餐店插队")
+        self.assertIn("引灵境", plan["chapters"][0]["outline"])
+        self.assertEqual((plan["stages"][0]["start_chapter"], plan["stages"][0]["end_chapter"]), (1, 20))
+        self.assertEqual(len(plan["stages"][0]["events"]), 20)
+        self.assertEqual(plan["stages"][0]["events"][0]["order"], 1)
+        self.assertIn("引灵境", plan["stages"][0]["events"][0]["text"])
+
+    def test_structured_framework_plan_supports_same_line_outline(self):
+        plan = _extract_structured_framework_chapter_plan(
+            "\n".join([
+                "第一阶段：开局",
+                "章节范围：第1到2章",
+                "第1章《雨夜醒来》主角在旧宅觉醒，仍对外隐藏真实境界。",
+                "第2章：早餐店冲突",
+                "主角当众击退挑衅者。",
+            ])
+        )
+
+        self.assertEqual([item["index"] for item in plan["chapters"]], [1, 2])
+        self.assertIn("旧宅觉醒", plan["chapters"][0]["outline"])
+        self.assertIn("当众击退", plan["chapters"][1]["outline"])
+        self.assertEqual(len(plan["stages"][0]["events"]), 2)
 
     def test_framework_tables_are_not_forced_into_generic_candidates(self):
         text = """二、主要人物

@@ -10,7 +10,6 @@ from gpt_desktop.core import reasoning_effort_for_model
 from gpt_desktop.workers import (
     NovelAnalysisWorker,
     NovelCandidatePostprocessWorker,
-    NovelChapterPlanMasterWorker,
     NovelChapterPlanWorker,
     NovelChapterTitleWorker,
     NovelFrameworkImportWorker,
@@ -28,15 +27,6 @@ class NovelAnalysisWorkerTests(unittest.TestCase):
             "draft",
             "outline",
             "summary",
-            "execution_outline",
-            "outline_repair",
-            "audit",
-            "pov_audit",
-            "targeted_repair",
-            "length_repair",
-            "length_repair_segment",
-            "postwrite",
-            "completion_audit",
             "style_profile",
             "style_baseline",
             "style_sheet",
@@ -65,7 +55,7 @@ class NovelAnalysisWorkerTests(unittest.TestCase):
                 )
 
     def test_framework_and_chapter_planning_reasoning_is_fixed_at_high(self):
-        for action in ("框架分类", "全书阶段规划", "章节规划"):
+        for action in ("框架分类", "章节规划"):
             with self.subTest(action=action):
                 self.assertEqual(
                     reasoning_effort_for_model(
@@ -166,6 +156,11 @@ class NovelAnalysisWorkerTests(unittest.TestCase):
                     "ending_hook": "旧案卷宗出现。",
                     "forbidden": "不要提前揭晓幕后人。",
                     "source_event_ids": ["s01-e03", "S01-E04"],
+                    "source_location": {
+                        "start_line": "L000120",
+                        "end_line": "L000126",
+                        "anchor": "第2章",
+                    },
                 },
                 {
                     "index": 1,
@@ -189,6 +184,10 @@ class NovelAnalysisWorkerTests(unittest.TestCase):
         self.assertEqual(plan["chapters"][1]["dominant_line"], "人物冲突")
         self.assertEqual(plan["chapters"][1]["characters"], ["陈景川", "林晚"])
         self.assertEqual(plan["chapters"][1]["source_event_ids"], ["S01-E03", "S01-E04"])
+        self.assertEqual(
+            plan["chapters"][1]["source_location"]["start_line"],
+            "L000120",
+        )
         self.assertEqual(plan["chapters"][1]["relationship_task"], "建立临时信任")
         self.assertEqual(
             plan["chapters"][1]["investigation_scope"],
@@ -222,11 +221,16 @@ class NovelAnalysisWorkerTests(unittest.TestCase):
         self.assertIn("必须只输出一个合法 JSON 对象", prompt)
         self.assertIn("必须输出接下来的 67 章", prompt)
         self.assertIn("不要擅自推翻小说圣经和世界规则", prompt)
-        self.assertIn("outline是提纲里的故事正文", prompt)
+        self.assertIn("outline是提纲里的故事正文；只有需要补写的章节才输出outline", prompt)
         self.assertIn("像这本小说的作者在讲述下一章", prompt)
-        self.assertIn("不超过300个字符（含标点、不计空白）", prompt)
+        self.assertIn("约300字", prompt)
+        self.assertIn("建议250-380字", prompt)
+        self.assertNotIn("约500字", prompt)
+        self.assertNotIn("350-700字", prompt)
+        self.assertIn("outline_mode", prompt)
+        self.assertIn("use_imported", prompt)
+        self.assertIn("不要重抄、改写、缩写、扩写或替换本地原文", prompt)
         self.assertIn("不要复述字段含义", prompt)
-        self.assertIn("不必按处境、阻力、选择、后果的固定次序", prompt)
         self.assertIn("narrative_strategy_profile", prompt)
         self.assertIn("用户已确认的只读规划基础", prompt)
         self.assertIn("不得重新生成、改写、总结或返回", prompt)
@@ -237,6 +241,7 @@ class NovelAnalysisWorkerTests(unittest.TestCase):
         self.assertIn("不能让同一句状态原样跨多个章节", prompt)
         self.assertIn("恢复或解决必须有资料中已有或剧情自然建立的时间、资源、事件依据", prompt)
         self.assertIn("不写固定伏笔任务", prompt)
+        self.assertIn("source_location", prompt)
         self.assertIn("伏笔由后续扩写正文和正文分析根据实际内容动态处理", prompt)
         self.assertIn("前 10%", prompt)
         self.assertIn("中间 70%", prompt)
@@ -250,6 +255,10 @@ class NovelAnalysisWorkerTests(unittest.TestCase):
         self.assertIn("提纲仍给正文留下场景、对白和节奏空间", prompt)
         self.assertIn("不安排任何固定的工作步骤或说明流程", prompt)
         self.assertIn("有题材气质的叙述", prompt)
+        self.assertIn("自然的网络小说叙述语言", prompt)
+        self.assertIn("不得出现策划术语、抽象形容、办案式表达、编辑式说明或编辑式总结", prompt)
+        self.assertIn("每两章至少要让主角", prompt)
+        self.assertIn("和路人、配角、对手或反派发生一次有效碰撞", prompt)
         self.assertNotIn('"planning_method"', prompt)
         self.assertNotIn('"dynamic_modules"', prompt)
         self.assertNotIn('"satisfaction_payoff"', prompt)
@@ -266,185 +275,39 @@ class NovelAnalysisWorkerTests(unittest.TestCase):
         self.assertNotIn('"character_task"', prompt)
         self.assertNotIn('"mainline_task"', prompt)
 
-    def test_chapter_plan_master_requires_contiguous_full_book_coverage(self):
-        worker = NovelChapterPlanMasterWorker(
-            "http://example.test", "key", "model", "context", 500000, 2000, 250
-        )
-        self.assertTrue(worker._retry_stream_transport_before_nonstream)
-
-        plan = worker._normalize_master_plan({
-            "summary": "全书主线持续推进到终局。",
-            "core_mainline": "主角通过能力成长改变家族命运。",
-            "ending_promise": "主角完成身份跃迁并兑现关系承诺。",
-            "global_hard_boundaries": "不得把成长主线改成办案主线。",
-            "arcs": [
-                {
-                    "name": f"阶段{index + 1}",
-                    "start_chapter": index * 25 + 1,
-                    "end_chapter": (index + 1) * 25,
-                    "macro_phase": "主线扩展阶段",
-                    "source_stage": f"原框架阶段{index + 1}",
-                    "dominant_line": "人物成长",
-                    "supporting_lines": "轻悬疑",
-                    "relationship_goal": "关系向前变化",
-                    "goal": "推进主线",
-                    "end_state": "进入下一阶段",
-                    "investigation_scope": "流程只保留改变结果的一步",
-                    "main_conflict": "旧任务型冲突",
-                    "turning_points": "固定转折",
-                    "reader_payoff": "固定兑现",
-                }
-                for index in range(10)
-            ],
-        })
-
-        self.assertEqual(len(plan["arcs"]), 10)
-        self.assertEqual(plan["arcs"][0]["start_chapter"], 1)
-        self.assertEqual(plan["arcs"][-1]["end_chapter"], 250)
-        self.assertEqual(plan["arcs"][0]["source_stage"], "原框架阶段1")
-        self.assertEqual(plan["arcs"][0]["dominant_line"], "人物成长")
-        self.assertEqual(
-            plan["arcs"][0]["investigation_scope"],
-            "流程只保留改变结果的一步",
-        )
-        self.assertEqual(plan["arcs"][0]["goal"], "推进主线")
-        self.assertEqual(plan["arcs"][0]["main_conflict"], "旧任务型冲突")
-        self.assertEqual(plan["arcs"][0]["turning_points"], "固定转折")
-        self.assertEqual(plan["arcs"][0]["reader_payoff"], "固定兑现")
-        self.assertEqual(plan["arcs"][0]["supporting_lines"], "轻悬疑")
-        self.assertIn("家族命运", plan["core_mainline"])
-        self.assertIn("身份跃迁", plan["ending_promise"])
-        self.assertIn("办案主线", plan["global_hard_boundaries"])
-
-        with self.assertRaisesRegex(ValueError, "不连续"):
-            worker._normalize_master_plan({
-                "arcs": [
-                    {"name": "阶段1", "start_chapter": 1, "end_chapter": 25},
-                    {"name": "阶段2", "start_chapter": 27, "end_chapter": 250},
-                ]
-            })
-
-        chapter_label_plan = worker._normalize_master_plan({
-            "arcs": [
-                {
-                    "name": f"阶段{index + 1}",
-                    "start_chapter": f"第{index * 25 + 1}章",
-                    "end_chapter": f"第{(index + 1) * 25}章",
-                }
-                for index in range(10)
-            ],
-        })
-        self.assertEqual(chapter_label_plan["arcs"][0]["start_chapter"], 1)
-        self.assertEqual(chapter_label_plan["arcs"][-1]["end_chapter"], 250)
-
-        wrapped_plan = worker._normalize_master_plan({
-            "master_plan": {
-                "summary": "包装后的全书规划",
-                "strategy_profile": {"primary_story_engine": "人物成长"},
-                "stages": [
-                    {
-                        "阶段名称": f"阶段{index + 1}",
-                        "开始章节": f"第{index * 25 + 1}章",
-                        "结束章节": f"第{(index + 1) * 25}章",
-                    }
-                    for index in range(10)
-                ],
-            },
-        })
-        self.assertEqual(wrapped_plan["summary"], "包装后的全书规划")
-        self.assertEqual(wrapped_plan["arcs"][0]["name"], "阶段1")
-        self.assertEqual(
-            wrapped_plan["narrative_strategy_profile"]["primary_story_engine"],
-            "人物成长",
-        )
-
-    def test_chapter_plan_master_prompt_starts_after_existing_chapters(self):
-        worker = NovelChapterPlanMasterWorker(
+    def test_framework_import_prompt_uses_compact_chapter_locations(self):
+        worker = NovelFrameworkImportWorker(
             "http://example.test",
             "key",
             "model",
-            "context",
-            500000,
-            2000,
-            250,
-            existing_chapter_count=34,
+            "第一节：开场\n主角醒来。",
         )
-
         prompt = worker._analysis_prompt()
+        self.assertIn("chapter_locations", prompt)
+        self.assertIn("起止行号", prompt)
+        self.assertIn("不要返回原文摘录", prompt)
+        self.assertIn("characters", prompt)
+        self.assertIn("本章实际关联的人物名", prompt)
 
-        self.assertIn("第一个阶段必须从第35章开始", prompt)
-        self.assertIn('"start_chapter":35', prompt)
-        self.assertIn("阶段边界和阶段顺序", prompt)
-        self.assertIn("stages.events", prompt)
-        self.assertIn("用户原始框架的具体章段", prompt)
-        self.assertIn("如果原框架明确分卷或分阶段", prompt)
-        self.assertIn("narrative_strategy_profile", prompt)
-        self.assertIn('"core_mainline":""', prompt)
-        self.assertIn('"ending_promise":""', prompt)
-        self.assertNotIn('"global_hard_boundaries"', prompt)
-        self.assertNotIn('"forbidden_drift"', prompt)
-        self.assertIn("不能借空白转入下一阶段", prompt)
-        self.assertIn("arcs必须一次性返回完整阶段数组", prompt)
-        self.assertIn("严禁只返回第一个阶段", prompt)
-        self.assertIn("实际JSON必须展开全部阶段", prompt)
-        self.assertIn("不能让同一句状态原样跨多个章节", prompt)
-        self.assertIn("恢复或解决必须有资料中已有或剧情自然建立的时间、资源、事件依据", prompt)
-
-    def test_chapter_plan_master_repairs_incomplete_ranges_from_previous_result(self):
-        context = (
-            "请根据项目规划。\n\n"
-            + json.dumps({
-                "target": {"estimated_total_chapters": 40},
-                "meta": {"title": "谎言回收店"},
-                "project_materials": {"bible": "全书五卷。", "world_rules": "谎言可以成物。"},
-                "imported_chapter_plan_reference": {"summary": "第一卷到第五卷各约四万字。"},
-            }, ensure_ascii=False)
+    def test_chapter_plan_outline_mode_is_normalized_without_extra_call(self):
+        worker = NovelChapterPlanWorker(
+            "http://example.test", "key", "model", "context", 200000, 3000, 1
         )
-        worker = NovelChapterPlanMasterWorker(
-            "http://example.test", "key", "model", context, 200000, 5000, 40
+
+        plan = worker._normalize_plan({
+            "chapters": [{
+                "index": 1,
+                "title": "雨夜",
+                "outline": "原框架已经写好的完整细纲。",
+                "outline_mode": "use-framework",
+            }],
+        })
+
+        self.assertEqual(plan["chapters"][0]["outline_mode"], "use_imported")
+        self.assertEqual(
+            worker._normalize_outline_mode("generate"),
+            "generate",
         )
-        incomplete = {
-            "summary": "完整全书走向",
-            "narrative_strategy_profile": {"primary_story_engine": "女性成长"},
-            "arcs": [{"name": "第一卷", "start_chapter": 1, "end_chapter": 25}],
-        }
-        repaired = {
-            "summary": "完整全书走向",
-            "narrative_strategy_profile": {"primary_story_engine": "女性成长"},
-            "arcs": [
-                {"name": "第一卷", "start_chapter": 1, "end_chapter": 20},
-                {"name": "后续卷", "start_chapter": 21, "end_chapter": 40},
-            ],
-        }
-        calls = []
-        progress = []
-        results = []
-        errors = []
-
-        def fake_analyze(prompt, chunk, label, total, use_response_format):
-            calls.append((prompt, chunk, label, total, use_response_format))
-            return (incomplete if len(calls) == 1 else repaired), use_response_format
-
-        worker._analyze_chunk_with_retries = fake_analyze
-        worker.progress.connect(progress.append)
-        worker.result_ready.connect(results.append)
-        worker.failed.connect(errors.append)
-
-        worker.run()
-
-        self.assertEqual(errors, [])
-        self.assertEqual(len(results), 1)
-        self.assertEqual(results[0]["arcs"][-1]["end_chapter"], 40)
-        self.assertEqual(len(calls), 2)
-        self.assertIn("结构补正编辑", calls[1][0])
-        self.assertIn('"previous_plan"', calls[1][1])
-        self.assertIn("第一卷到第五卷", calls[1][1])
-        self.assertTrue(any("1-25" in text and "只覆盖到第25章" in text for text in progress))
-        self.assertFalse(any("重做总规划" in text for text in progress))
-        self.assertEqual(worker.diagnostics["structure_repair_count"], 1)
-        self.assertEqual(worker.diagnostics["structure_regeneration_count"], 0)
-        self.assertEqual(worker.diagnostics["outcome"], "success")
-        self.assertGreaterEqual(worker.diagnostics["elapsed_ms"], 0)
 
     def test_chapter_plan_batch_records_structure_regeneration(self):
         worker = NovelChapterPlanWorker(
@@ -747,6 +610,9 @@ class NovelAnalysisWorkerTests(unittest.TestCase):
                 self.assertIn("不设细节数量配额", prompt)
                 self.assertIn("结尾要来自冲突本身", prompt)
                 self.assertIn("不要为了贴字数截断", prompt)
+                self.assertNotIn("剧情推进要求", prompt)
+                self.assertNotIn("每两章至少要让主角", prompt)
+                self.assertIn("不得出现策划术语、抽象形容", prompt)
 
         worker = NovelWritingWorker("http://example.test", "key", "model", "draft", "context")
         prompt = worker._action_prompt()
@@ -879,9 +745,8 @@ class NovelAnalysisWorkerTests(unittest.TestCase):
 
         prompt = worker._action_prompt()
 
-        self.assertIn("短提纲", prompt)
-        self.assertIn("6-10", prompt)
-        self.assertIn("600-1200 字", prompt)
+        self.assertIn("约300字", prompt)
+        self.assertIn("250-380字", prompt)
         self.assertIn("不要写正文、对白或长段场景描写", prompt)
         self.assertIn("只概括正文已经写出来的内容", prompt)
         self.assertIn("正文没有发生", prompt)
@@ -1130,8 +995,6 @@ class NovelAnalysisWorkerTests(unittest.TestCase):
             ("draft", "high"),
             ("style_finalize", "high"),
             ("style_rewrite", "high"),
-            ("audit", "high"),
-            ("postwrite", "high"),
             ("memory_reconcile", "high"),
             ("memory_repair", "high"),
             ("logic_repair", "high"),
@@ -1209,6 +1072,30 @@ class NovelAnalysisWorkerTests(unittest.TestCase):
         self.assertEqual(results, [("memory_finalize", content)])
         self.assertFalse(worker.diagnostics["response_char_limit_exceeded"])
         self.assertEqual(worker.diagnostics["ignored_trailing_whitespace_chars"], 40000)
+
+    def test_memory_worker_reports_reasoning_and_content_in_received_char_count(self):
+        worker = NovelWritingWorker(
+            "http://example.test", "key", "model", "memory_finalize", "context"
+        )
+        lines = [
+            "data: " + json.dumps({
+                "choices": [{"delta": {"reasoning_content": "思考"}}]
+            }, ensure_ascii=False),
+            "data: " + json.dumps({
+                "choices": [{"delta": {"content": "{}"}, "finish_reason": "stop"}]
+            }, ensure_ascii=False),
+            "data: [DONE]",
+        ]
+        worker._session = _FakeStreamSession(lines)
+        received = []
+        worker.output_chars.connect(received.append)
+
+        worker.run()
+
+        self.assertEqual(worker.diagnostics["response_chars"], 2)
+        self.assertEqual(worker.diagnostics["ignored_reasoning_chars"], 2)
+        self.assertEqual(worker.diagnostics["received_chars"], 4)
+        self.assertEqual(received[-1], 4)
 
     def test_memory_worker_only_falls_back_for_response_format_compatibility_errors(self):
         self.assertTrue(NovelWritingWorker._json_response_format_not_supported(
@@ -2248,16 +2135,17 @@ class NovelAnalysisWorkerTests(unittest.TestCase):
             },
         })
 
-        self.assertIn("只根据【导入框架原文】明确写出的内容分类", prompt)
-        self.assertIn("不要把整段框架原文原样塞进", prompt)
-        self.assertIn("核心设定、读者承诺、长期主题、主线矛盾", prompt)
-        self.assertNotIn('"hard_boundaries"', prompt)
-        self.assertIn("详细结局事件不得写入小说圣经", prompt)
-        self.assertIn("timeline 和 summary 默认留空", prompt)
-        self.assertIn('"stages"', prompt)
-        self.assertIn("不要凭空生成完整章节规划", prompt)
-        self.assertIn("绝对不能作为某一章", prompt)
+        self.assertIn("根据实际内容识别", prompt)
+        self.assertIn("不要求固定标题", prompt)
+        self.assertIn("不新增剧情", prompt)
+        self.assertIn("完整的实力体系不能只埋在world_rules里", prompt)
+        self.assertIn("progression_systems", prompt)
+        self.assertIn("foundation_mode", prompt)
+        self.assertIn("outline_ref", prompt)
+        self.assertIn("没有正文时这两项留空", prompt)
+        self.assertIn("不编造阶段", prompt)
         self.assertIn("导入框架原文", user_text)
+        self.assertIn("L000001", user_text)
         self.assertEqual(normalized["meta"]["title"], "旧案录")
         self.assertEqual(normalized["meta"]["target_words"], "5")
         self.assertEqual(normalized["project_materials"]["bible"], "主线复仇")
@@ -2272,7 +2160,63 @@ class NovelAnalysisWorkerTests(unittest.TestCase):
             "赵明收到缺页卷宗。",
         )
 
-    def test_framework_import_drops_untitled_chapter_references(self):
+    def test_framework_import_promotes_complete_progression_systems_to_lore(self):
+        worker = NovelFrameworkImportWorker(
+            "http://example.test",
+            "key",
+            "model",
+            "高武境界和天赋等级",
+        )
+        normalized = worker._normalize_framework_result({
+            "project_materials": {
+                "world_rules": (
+                    "天赋分为凡、铜、银、金、曜、王、帝、天门八阶；"
+                    "境界分为一阶淬骨至十阶无极，每境分初、中、后、圆满。"
+                ),
+            },
+            "progression_systems": [
+                {
+                    "name": "高武境界体系",
+                    "type": "规则",
+                    "description": "一阶淬骨、二阶引气、三阶开脉、十阶无极；每境分初、中、后、圆满。",
+                }
+            ],
+        })
+        lore = {item["name"]: item["description"] for item in normalized["lore"]}
+        self.assertIn("高武境界体系", lore)
+        self.assertIn("天赋等级体系", lore)
+        self.assertIn("十阶无极", lore["高武境界体系"])
+        self.assertIn("天门八阶", lore["天赋等级体系"])
+
+    def test_framework_import_keeps_location_characters_without_full_dossier(self):
+        worker = NovelFrameworkImportWorker(
+            "http://example.test",
+            "key",
+            "model",
+            "章节中出现白棠",
+        )
+        normalized = worker._normalize_framework_result({
+            "chapter_locations": [
+                {
+                    "index": 1,
+                    "start_line": "L000001",
+                    "end_line": "L000002",
+                    "anchor": "白棠出现",
+                    "characters": ["白棠"],
+                }
+            ],
+            "framework_analysis": {
+                "chapter_outline_count": 1,
+                "chapter_outline_mode": "reuse",
+                "foundation_mode": "reuse",
+            },
+        })
+        names = {item["name"] for item in normalized["characters"]}
+        self.assertIn("白棠", names)
+        white_tang = next(item for item in normalized["characters"] if item["name"] == "白棠")
+        self.assertIn("原框架未单独提供", white_tang["notes"])
+
+    def test_framework_import_keeps_untitled_outline_but_drops_placeholder_titles(self):
         worker = NovelFrameworkImportWorker(
             "http://example.test",
             "key",
@@ -2289,7 +2233,9 @@ class NovelAnalysisWorkerTests(unittest.TestCase):
             },
         })
 
-        self.assertEqual(normalized["chapter_plan"]["chapters"], [])
+        self.assertEqual(len(normalized["chapter_plan"]["chapters"]), 1)
+        self.assertEqual(normalized["chapter_plan"]["chapters"][0]["title"], "")
+        self.assertEqual(normalized["chapter_plan"]["chapters"][0]["outline"], "开篇样章方向。")
 
     def test_framework_import_formats_all_present_bible_sections(self):
         worker = NovelFrameworkImportWorker(

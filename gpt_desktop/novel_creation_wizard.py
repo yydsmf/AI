@@ -17,6 +17,7 @@ import uuid
 from copy import deepcopy
 
 from PySide6.QtCore import Qt, QTimer, Signal
+from PySide6.QtGui import QColor
 from PySide6.QtWidgets import (
     QAbstractItemView, QApplication, QDialog, QDialogButtonBox, QFrame,
     QGridLayout, QHBoxLayout, QLabel, QListWidget, QListWidgetItem, QLineEdit,
@@ -245,6 +246,11 @@ CREATION_CHARACTER_PROFILE_GUIDANCE = """
 """.strip()
 
 
+CREATION_INSPIRATION_FACT_GUIDANCE = """
+作者灵感中明确写出的事实都属于故事底盘的一部分，要完整吸收并保留事实含义。人物身份、人生阶段、职业或学业状态、关系状态、时间顺序、已经发生的事件、具体地点、关键限制、爽点和结局方向，都要在后续资料中继续体现；与主角处境、故事开场和主线直接相关的关键事实，要在每个故事方向的简介中自然写出来，不能只留在主角字段或资料字段里。人物字段、故事引子、简介、主线和关系线表达同一事实时，要保持同一时间、身份和因果关系。五个方向可以用不同的场景、人物选择、冲突形状和推进方式呈现这些事实，差异继续来自故事本身；作者没有明确的部分保留自由创作空间。
+""".strip()
+
+
 COMMON_CREATION_RULES = f"""
 你正在和作者一起搭建一部长篇网络小说。外层 JSON 只是程序读取用的容器，不能在 JSON 之外添加解释、Markdown 或注释。
 1. 沿着作者已经说过和已经确认的故事继续写，稳住题材、主角、核心悬念、人物关系和结尾方向。作者灵感中的题材组合、人物身份、关系状态、具体情节、场景、爽点和节奏要求都要进入故事；第一步的主分类、主题、读者方向、主角起点和风格选择是创作底色。
@@ -259,6 +265,7 @@ COMMON_CREATION_RULES = f"""
 10. {CREATION_ENTITY_NAMING_GUIDANCE}
 11. 字段值直接写具体内容，保持清楚、稳定、方便后续执行；内容呈现为作者自己的故事底稿，各资料类别各自承担作用，同一段剧情只放在最合适的位置。
 12. JSON 只作为程序读取的容器：保持紧凑，不用 Markdown、缩进、空行或多余空格；压缩外壳，不压缩事实、人物数量、设定数量、伏笔数量或故事内容。
+13. {CREATION_INSPIRATION_FACT_GUIDANCE}
 """.strip()
 
 
@@ -773,6 +780,10 @@ def _creation_wizard_summary(payload):
         created_at_ns = int(payload.get("created_at_ns", 0) or 0)
     except (TypeError, ValueError):
         created_at_ns = 0
+    completion_status = _as_text(payload.get("completion_status")).lower()
+    is_completed = completion_status in {"completed", "complete", "已完成"} or bool(
+        _as_text(payload.get("completed_at"))
+    )
     return {
         "draft_id": _as_text(payload.get("draft_id")),
         "title": title,
@@ -781,6 +792,10 @@ def _creation_wizard_summary(payload):
         "updated_at": _as_text(payload.get("updated_at")),
         "step": _creation_wizard_step_summary(payload),
         "current_step_index": step_index,
+        "completion_status": "completed" if is_completed else "in_progress",
+        "status_label": "已完成" if is_completed else "进行中",
+        "completed_at": _as_text(payload.get("completed_at")),
+        "imported_project_path": _as_text(payload.get("imported_project_path")),
     }
 
 
@@ -825,7 +840,7 @@ def _migrate_legacy_creation_wizard_draft():
 
 
 def list_creation_wizard_drafts():
-    """Return unfinished wizard projects ordered by creation time."""
+    """Return saved wizard projects, including completed records."""
     _migrate_legacy_creation_wizard_draft()
     index = _creation_wizard_index()
     records = {}
@@ -921,6 +936,24 @@ def delete_creation_wizard_draft(draft_id):
         if _as_text(item.get("draft_id")) != _as_text(draft_id)
     ]
     _save_creation_wizard_index(index)
+
+
+def mark_creation_wizard_draft_completed(draft_id, project_path="", result_payload=None):
+    """Keep a finished wizard draft as a completed, inspectable archive."""
+    draft_id = _as_text(draft_id)
+    if not draft_id:
+        return ""
+    payload = load_creation_wizard_draft(draft_id)
+    if not isinstance(payload, dict) or not payload:
+        return ""
+    payload["completion_status"] = "completed"
+    payload["completed_at"] = now_str()
+    project_path = _as_text(project_path)
+    if project_path:
+        payload["imported_project_path"] = os.path.abspath(project_path)
+    if isinstance(result_payload, dict):
+        payload["completed_result_payload"] = deepcopy(result_payload)
+    return save_creation_wizard_draft(payload)
 
 
 def _first_value(mapping, keys, default=""):
@@ -5420,6 +5453,10 @@ class NovelCreationWizardDialog(QDialog):
         self.draft_id = _as_text(draft_id) or _new_creation_wizard_draft_id()
         self.created_at = ""
         self.created_at_ns = 0
+        self.completion_status = ""
+        self.completed_at = ""
+        self.imported_project_path = ""
+        self.completed_result_payload = {}
         self.worker = None
         self._active_batch_kind = ""
         self._active_stage_index = -1
@@ -5531,6 +5568,10 @@ class NovelCreationWizardDialog(QDialog):
             "premise_candidates": deepcopy(self.premise_candidates),
             "premise_selected_index": self.premise_selected_index,
             "step_results": deepcopy(self.step_results),
+            "completion_status": self.completion_status,
+            "completed_at": self.completed_at,
+            "imported_project_path": self.imported_project_path,
+            "completed_result_payload": deepcopy(self.completed_result_payload),
             "updated_at": now_str(),
         }
 
@@ -5622,6 +5663,14 @@ class NovelCreationWizardDialog(QDialog):
         self.project_name_hint = _as_text(
             draft.get("project_name_hint")
         ) or self.project_name_hint
+        self.completion_status = _as_text(draft.get("completion_status"))
+        self.completed_at = _as_text(draft.get("completed_at"))
+        self.imported_project_path = _as_text(draft.get("imported_project_path"))
+        saved_completed_payload = draft.get("completed_result_payload", {})
+        self.completed_result_payload = (
+            deepcopy(saved_completed_payload)
+            if isinstance(saved_completed_payload, dict) else {}
+        )
         self._draft_restoring = True
         try:
             saved_choices = draft.get("choice_values", {})
@@ -7887,14 +7936,14 @@ class NovelCreationWizardDialog(QDialog):
 
 
 class NovelCreationWorkspaceDialog(QDialog):
-    """管理多个尚未完成的向导项目；每个项目由独立向导窗口负责生成。"""
+    """管理向导项目及其完成后的可查看记录。"""
 
     new_draft_requested = Signal()
     draft_open_requested = Signal(str)
 
     def __init__(self, open_draft_ids=None, parent=None):
         super().__init__(parent)
-        self.setWindowTitle("新建小说：创作中的项目")
+        self.setWindowTitle("新建小说：向导项目")
         _fit_dialog_to_screen(
             self,
             width_ratio=0.52,
@@ -7913,11 +7962,11 @@ class NovelCreationWorkspaceDialog(QDialog):
         root.setContentsMargins(16, 16, 16, 16)
         root.setSpacing(10)
 
-        title = QLabel("创作中的项目")
+        title = QLabel("向导项目")
         title.setStyleSheet("font-size: 16px; font-weight: bold;")
         root.addWidget(title)
 
-        hint = QLabel("未完成的向导项目会按创建时间独立保存，完成后才会进入主程序项目列表。")
+        hint = QLabel("向导内容会按项目独立保存；导入完成后仍保留原始灵感和三步资料，并在列表中标记为已完成。")
         hint.setObjectName("hint")
         hint.setWordWrap(True)
         root.addWidget(hint)
@@ -7930,7 +7979,7 @@ class NovelCreationWorkspaceDialog(QDialog):
         actions = QHBoxLayout()
         self.new_btn = QPushButton("新建项目")
         self.open_btn = QPushButton("打开选中")
-        self.delete_btn = QPushButton("删除草稿")
+        self.delete_btn = QPushButton("删除记录")
         self.refresh_btn = QPushButton("刷新")
         self.new_btn.clicked.connect(self.new_draft_requested)
         self.open_btn.clicked.connect(self._open_selected)
@@ -7963,7 +8012,7 @@ class NovelCreationWorkspaceDialog(QDialog):
         title = item.text().splitlines()[0] if item is not None else "这个项目"
         answer = QMessageBox.question(
             self,
-            "删除草稿",
+            "删除向导记录",
             f"确定删除“{title}”吗？\n删除后不能恢复。",
             QMessageBox.Yes | QMessageBox.No,
             QMessageBox.No,
@@ -7982,12 +8031,20 @@ class NovelCreationWorkspaceDialog(QDialog):
             selected_row = -1
             for row, record in enumerate(records):
                 title = _as_text(record.get("title")) or "未命名项目"
+                status_label = _as_text(record.get("status_label")) or "进行中"
                 step = _as_text(record.get("step")) or "故事定位"
                 created_at = _as_text(record.get("created_at")) or "创建时间未知"
-                item = QListWidgetItem(f"{title}\n{step} · 创建于 {created_at}")
+                item = QListWidgetItem(
+                    f"{title}\n{status_label} · {step} · 创建于 {created_at}"
+                )
                 item.setData(Qt.UserRole, _as_text(record.get("draft_id")))
+                if _as_text(record.get("completion_status")) == "completed":
+                    item.setForeground(QColor("#4CAF50"))
+                imported_path = _as_text(record.get("imported_project_path"))
+                imported_line = f"\n导入项目：{imported_path}" if imported_path else ""
                 item.setToolTip(
                     f"创建时间：{created_at}\n最近保存：{_as_text(record.get('updated_at'))}"
+                    f"{imported_line}"
                 )
                 self.draft_list.addItem(item)
                 if _as_text(record.get("draft_id")) == selected_id:

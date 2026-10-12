@@ -241,6 +241,7 @@ from .novel_creation_wizard import (
     creation_wizard_payload_from_project_draft,
     format_creation_preview,
     format_creation_text,
+    mark_creation_wizard_draft_completed,
     normalize_creation_result,
     story_requires_explicit_power_levels,
 )
@@ -18013,7 +18014,8 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
             return
         try:
             self._save_current_work("新建前保存")
-            data = self._apply_creation_wizard_payload(_default_project(), dialog.result_payload())
+            wizard_payload = dialog.result_payload()
+            data = self._apply_creation_wizard_payload(_default_project(), wizard_payload)
             project_title = (
                 data.get("meta", {}).get("title", "")
                 if isinstance(data.get("meta"), dict)
@@ -18035,12 +18037,30 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
             workspace.activateWindow()
             dialog.deleteLater()
             return
-        # 只有正式项目已经写入成功，才删除当前向导草稿。
-        dialog.clear_draft()
+        archive_error = ""
+        try:
+            archived_path = mark_creation_wizard_draft_completed(
+                draft_id,
+                project_path,
+                wizard_payload,
+            )
+            if not archived_path:
+                archive_error = "没有找到向导草稿文件"
+        except Exception as exc:
+            archive_error = str(exc)
         self._ensure_creation_wizard_workspace().refresh()
         dialog.deleteLater()
         self._update_stats_label()
-        self.set_status_tip("已完成创作框架向导并保存到项目列表。请到“章节”页面手动点击“AI生成章节规划”。")
+        if archive_error:
+            log_debug("新建向导完成记录保存失败", archive_error)
+            self.set_status_tip(
+                "项目已保存，但向导完成记录保存失败；请检查历史目录。"
+            )
+        else:
+            self.set_status_tip(
+                "已完成创作框架向导并保存到项目列表；向导资料已保留。"
+                "请到“章节”页面手动点击“AI生成章节规划”。"
+            )
 
     def new_project(self):
         workspace = self._ensure_creation_wizard_workspace()

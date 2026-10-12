@@ -1755,14 +1755,12 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
         self._context_build_token = 0
         self._context_build_pending = {}
         self._is_detached_auto_runner = bool(background_runner)
-        self._detached_auto_runner = None
-        self._detached_auto_project_path = ""
-        self._detached_auto_timer = None
         self._detached_auto_readonly_states = []
+        self._background_task_kind = ""
         # Chapter work is owned by a project path, not by whichever project
         # happens to be visible in the single writing tab.  These hidden
-        # runners keep an in-flight foreground request alive while the user
-        # opens another project.
+        # runners keep in-flight chapter and automatic expansion requests
+        # alive while the user opens another project.
         self._background_chapter_ai_runners = {}
         self._chapter_task_timer_owner = None
         self.chapter_plan_worker = None
@@ -2183,6 +2181,10 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
         content_layout.addWidget(self.tabs, 1)
         right_layout.addWidget(content_area, 1)
 
+        # Background expansion locks the currently visible project workspace,
+        # while the project-management area remains available for switching
+        # projects and starting work elsewhere.
+        self.project_workspace = right
         root.addWidget(right, 1)
         self.set_project_panel_expanded(True)
 
@@ -5206,6 +5208,7 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
         try:
             self._flush_current_editors()
             runner = NovelWritingTab(deepcopy(self.config), None, background_runner=True)
+            runner._background_task_kind = "chapter_ai"
             runner._save_draft_snapshot = lambda: None
             runner._notify_project_store_changed = lambda: None
             runner._load_project_data(
@@ -5282,6 +5285,11 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
         runner = self._background_chapter_runner_for_path(source_path)
         if runner is None:
             return False
+        # Automatic expansion remains a hidden owner of the project.  Loading
+        # the project should show its latest snapshot without moving the
+        # worker back into the foreground tab.
+        if str(getattr(runner, "_background_task_kind", "") or "") == "auto_expand":
+            return False
         try:
             # The project data was loaded from the runner immediately before
             # this call. Copy the in-memory snapshot once more so a queued
@@ -5345,12 +5353,7 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
             return None
         source_path = self._canonical_project_path(getattr(self, "current_project_path", ""))
         runners = getattr(self, "_background_chapter_ai_runners", {})
-        runner = runners.get(source_path) if isinstance(runners, dict) else None
-        if runner is not None:
-            return runner
-        detached = getattr(self, "_detached_auto_runner", None)
-        detached_path = self._canonical_project_path(getattr(self, "_detached_auto_project_path", ""))
-        return detached if source_path and source_path == detached_path else None
+        return runners.get(source_path) if isinstance(runners, dict) else None
 
     def _poll_background_chapter_ai_runners(self):
         runners = getattr(self, "_background_chapter_ai_runners", None)
@@ -11875,12 +11878,10 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
                     return True
             except Exception:
                 continue
-        detached = getattr(self, "_detached_auto_runner", None)
+        detached = self._current_background_chapter_runner()
         if detached is not None and not getattr(self, "_is_detached_auto_runner", False):
             try:
-                source_path = os.path.abspath(str(getattr(self, "_detached_auto_project_path", "") or ""))
-                current_path = os.path.abspath(str(getattr(self, "current_project_path", "") or ""))
-                if source_path and source_path == current_path and detached._status_has_active_work():
+                if detached._status_has_active_work():
                     return True
             except Exception:
                 return True
@@ -12165,18 +12166,23 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
         if not hasattr(self, "_is_detached_auto_runner") or self._is_detached_auto_runner:
             self._start_auto_expand_all_local()
             return
-        runner = getattr(self, "_detached_auto_runner", None)
-        if runner is not None and runner._status_has_active_work():
-            title = str((runner.current_project.get("meta", {}) or {}).get("title", "") or "当前项目")
-            self.set_status_tip(f"《{title}》仍在后台自动扩写，可继续操作其他小说。")
-            return
         self._flush_current_editors()
         if not self._has_saved_project_path():
             if not self.save_current_project():
                 return
-        source_path = os.path.abspath(str(self.current_project_path or ""))
-        if not source_path or source_path == os.path.abspath(str(NOVEL_DRAFT_FILE)):
+        source_path = self._canonical_project_path(self.current_project_path)
+        if not source_path or source_path == self._canonical_project_path(NOVEL_DRAFT_FILE):
             QMessageBox.warning(self, "自动扩写失败", "请先把小说保存为项目，再启动后台自动扩写。")
+            return
+        runner = self._background_chapter_runner_for_path(source_path)
+        if runner is not None:
+            title = str((runner.current_project.get("meta", {}) or {}).get("title", "") or "当前项目")
+            task_label = (
+                "后台自动扩写"
+                if str(getattr(runner, "_background_task_kind", "") or "") == "auto_expand"
+                else "后台章节任务"
+            )
+            self.set_status_tip(f"《{title}》仍在{task_label}，可继续操作其他小说。")
             return
         if hasattr(self, "auto_expand_all_btn"):
             self.auto_expand_all_btn.setEnabled(False)
@@ -12185,6 +12191,8 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
         QTimer.singleShot(0, lambda p=source_path: self._launch_detached_auto_expand(p))
 
     def _launch_detached_auto_expand(self, source_path):
+        runner = None
+        source_path = self._canonical_project_path(source_path)
         try:
             saved_path = self._save_current_work("启动后台自动扩写", refresh_project_list=False)
             if not saved_path:
@@ -12193,25 +12201,40 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
             if not isinstance(data, dict):
                 raise RuntimeError("无法读取要自动扩写的项目。")
             runner = NovelWritingTab(deepcopy(self.config), None, background_runner=True)
+            runner._background_task_kind = "auto_expand"
             runner._save_draft_snapshot = lambda: None
             runner._notify_project_store_changed = lambda: None
             runner._load_project_data(data, source_path, defer_helpers=True)
             runner.hide()
-            self._detached_auto_runner = runner
-            self._detached_auto_project_path = source_path
+            runners = getattr(self, "_background_chapter_ai_runners", None)
+            if not isinstance(runners, dict):
+                runners = {}
+                self._background_chapter_ai_runners = runners
+            if source_path in runners:
+                raise RuntimeError("当前项目已经有后台章节任务。")
+            runners[source_path] = runner
             self._update_detached_auto_source_lock()
-            timer = QTimer(self)
-            timer.setInterval(500)
-            timer.timeout.connect(self._poll_detached_auto_expand)
-            self._detached_auto_timer = timer
-            timer.start()
             runner._start_auto_expand_all_local()
             self._update_detached_auto_source_lock()
             title = str((data.get("meta", {}) or {}).get("title", "") or os.path.basename(source_path))
-            self.set_status_tip(f"《{title}》已在后台自动扩写，可从左侧打开其他小说继续工作。")
+            active_count = sum(
+                1
+                for item in runners.values()
+                if item is not None and item._status_has_active_work()
+            )
+            self.set_status_tip(
+                f"《{title}》已在后台自动扩写，可继续操作其他小说。"
+                f"当前后台任务：{active_count} 个。"
+            )
         except Exception as exc:
-            self._detached_auto_runner = None
-            self._detached_auto_project_path = ""
+            runners = getattr(self, "_background_chapter_ai_runners", {})
+            if isinstance(runners, dict) and runner is not None and runners.get(source_path) is runner:
+                runners.pop(source_path, None)
+            if runner is not None:
+                try:
+                    runner.deleteLater()
+                except Exception:
+                    pass
             self._update_detached_auto_source_lock()
             if hasattr(self, "auto_expand_all_btn"):
                 self.auto_expand_all_btn.setEnabled(True)
@@ -12225,37 +12248,8 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
             QMessageBox.warning(self, "自动扩写失败", str(exc))
 
     def _poll_detached_auto_expand(self):
-        runner = getattr(self, "_detached_auto_runner", None)
-        if runner is None:
-            return
-        active = runner._status_has_active_work()
-        if active:
-            self._sync_detached_auto_status(runner)
-            return
-        # Copy the terminal state before releasing the runner so the final
-        # stage duration and total queue progress remain visible.
-        self._sync_detached_auto_status(runner)
-        timer = getattr(self, "_detached_auto_timer", None)
-        if timer is not None:
-            timer.stop()
-            timer.deleteLater()
-        self._detached_auto_timer = None
-        message = str(getattr(runner, "_status_message", "") or "后台自动扩写已结束。")
-        try:
-            runner._save_current_project_snapshot_if_named()
-        except Exception as exc:
-            log_debug("后台自动扩写结束保存失败", exc)
-        runner.deleteLater()
-        self._detached_auto_runner = None
-        source_path = str(getattr(self, "_detached_auto_project_path", "") or "")
-        self._detached_auto_project_path = ""
-        self._update_detached_auto_source_lock()
-        self._notify_project_store_changed()
-        if source_path and os.path.abspath(str(self.current_project_path or "")) == source_path:
-            data = load_json_file(source_path, None)
-            if isinstance(data, dict):
-                self._load_project_data(data, source_path, defer_helpers=True)
-        self.set_status_tip(message)
+        """Compatibility wrapper for the unified multi-project poller."""
+        self._poll_background_chapter_ai_runners()
 
     def _show_chapter_ai_failure(self, message):
         error_text = clean_error_text(message)
@@ -12271,7 +12265,7 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
     def _detached_auto_status_is_current(self, runner=None):
         if getattr(self, "_is_detached_auto_runner", False):
             return False
-        runner = runner if runner is not None else getattr(self, "_detached_auto_runner", None)
+        runner = runner if runner is not None else self._current_background_chapter_runner()
         return runner is not None and runner is self._current_background_chapter_runner()
 
     def _sync_detached_auto_status(self, runner):
@@ -12349,7 +12343,9 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
         if locked:
             if states:
                 return
-            root = self
+            # Do not lock the whole NovelWritingTab: its project-management
+            # panel must remain usable while this project's content is busy.
+            root = getattr(self, "project_workspace", None)
             if root is None or not hasattr(root, "findChildren"):
                 return
             try:
@@ -12378,15 +12374,7 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
 
     def _update_detached_auto_source_lock(self):
         detached_runner = self._current_background_chapter_runner()
-        detached_path = self._canonical_project_path(
-            getattr(self, "_detached_auto_project_path", "")
-        )
-        current_path = self._canonical_project_path(
-            getattr(self, "current_project_path", "")
-        )
-        locked = detached_runner is not None or bool(
-            detached_path and detached_path == current_path
-        )
+        locked = detached_runner is not None
         if not locked:
             self._clear_detached_auto_status_mirror()
         self._set_detached_auto_source_read_only(locked)

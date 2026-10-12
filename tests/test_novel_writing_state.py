@@ -526,7 +526,9 @@ class NovelWritingStateTests(unittest.TestCase):
 
     def test_detached_auto_source_lock_only_locks_source_project_editors(self):
         tab = NovelWritingTab.__new__(NovelWritingTab)
-        tab._detached_auto_project_path = "/tmp/source.json"
+        tab._background_chapter_ai_runners = {
+            os.path.realpath("/tmp/source.json"): object(),
+        }
         tab.current_project_path = "/tmp/source.json"
         tab.tabs = _FakeButton()
         tab.nav_list = _FakeButton()
@@ -548,6 +550,67 @@ class NovelWritingStateTests(unittest.TestCase):
         self.assertTrue(tab.auto_expand_all_btn.enabled)
         self.assertEqual(tab.auto_expand_all_btn.text, "自动扩写全部")
 
+    def test_detached_auto_source_lock_scopes_to_project_workspace(self):
+        class FakeReadOnlyWidget:
+            def __init__(self):
+                self.read_only = False
+
+            def isReadOnly(self):
+                return self.read_only
+
+            def setReadOnly(self, value):
+                self.read_only = bool(value)
+
+        class FakeEnabledWidget:
+            def __init__(self):
+                self.enabled = True
+
+            def isEnabled(self):
+                return self.enabled
+
+            def setEnabled(self, value):
+                self.enabled = bool(value)
+
+        class FakeWorkspace:
+            def __init__(self, children):
+                self.children = children
+                self.find_children_called = False
+
+            def findChildren(self, _widget_type):
+                self.find_children_called = True
+                return list(self.children)
+
+        editor = FakeReadOnlyWidget()
+        action = FakeEnabledWidget()
+        stop = FakeEnabledWidget()
+        workspace = FakeWorkspace([editor, action, stop])
+        project_panel = FakeWorkspace([FakeEnabledWidget()])
+
+        tab = NovelWritingTab.__new__(NovelWritingTab)
+        tab._detached_auto_readonly_states = []
+        tab.project_workspace = workspace
+        tab.project_panel = project_panel
+        tab.chapter_ai_stop_btn = stop
+
+        with patch("gpt_desktop.novel_writing_tab.QPlainTextEdit", FakeReadOnlyWidget), \
+             patch("gpt_desktop.novel_writing_tab.QTextEdit", FakeReadOnlyWidget), \
+             patch("gpt_desktop.novel_writing_tab.QLineEdit", FakeReadOnlyWidget), \
+             patch("gpt_desktop.novel_writing_tab.QAbstractButton", FakeEnabledWidget), \
+             patch("gpt_desktop.novel_writing_tab.QComboBox", FakeEnabledWidget), \
+             patch("gpt_desktop.novel_writing_tab.QAbstractSpinBox", FakeEnabledWidget):
+            tab._set_detached_auto_source_read_only(True)
+
+            self.assertTrue(workspace.find_children_called)
+            self.assertTrue(editor.read_only)
+            self.assertFalse(action.enabled)
+            self.assertTrue(stop.enabled)
+            self.assertTrue(project_panel.children[0].enabled)
+
+            tab._set_detached_auto_source_read_only(False)
+
+        self.assertFalse(editor.read_only)
+        self.assertTrue(action.enabled)
+
     def test_detached_auto_runner_exposes_background_stop_button(self):
         class RunningDetached:
             def _status_has_active_work(self):
@@ -555,8 +618,9 @@ class NovelWritingStateTests(unittest.TestCase):
 
         tab = NovelWritingTab.__new__(NovelWritingTab)
         tab._is_detached_auto_runner = False
-        tab._detached_auto_runner = RunningDetached()
-        tab._detached_auto_project_path = "/tmp/source.json"
+        tab._background_chapter_ai_runners = {
+            os.path.realpath("/tmp/source.json"): RunningDetached(),
+        }
         tab.current_project_path = "/tmp/source.json"
         tab.chapter_ai_stop_btn = _FakeButton()
         tab.auto_expand_all_btn = _FakeButton()
@@ -597,13 +661,15 @@ class NovelWritingStateTests(unittest.TestCase):
 
         tab = NovelWritingTab.__new__(NovelWritingTab)
         tab._is_detached_auto_runner = False
-        tab._detached_auto_runner = RunningDetached()
-        tab._detached_auto_project_path = "/tmp/source.json"
+        tab._background_chapter_ai_runners = {
+            os.path.realpath("/tmp/source.json"): RunningDetached(),
+        }
         tab.current_project_path = "/tmp/source.json"
         refreshed = []
         tab._refresh_status_display = lambda: refreshed.append(True)
 
-        self.assertTrue(tab._sync_detached_auto_status(tab._detached_auto_runner))
+        runner = tab._current_background_chapter_runner()
+        self.assertTrue(tab._sync_detached_auto_status(runner))
         self.assertEqual(tab._status_received_chars, 2929)
         self.assertEqual(tab._status_stage_label, "正文直写")
         self.assertEqual(tab._detached_auto_status_auto_progress, (12, 250))
@@ -612,7 +678,7 @@ class NovelWritingStateTests(unittest.TestCase):
 
         tab.current_project_path = "/tmp/other.json"
         tab._status_received_chars = 0
-        self.assertFalse(tab._sync_detached_auto_status(tab._detached_auto_runner))
+        self.assertFalse(tab._sync_detached_auto_status(runner))
         self.assertEqual(tab._status_received_chars, 0)
 
         tab._detached_auto_status_mirrored = True
@@ -648,21 +714,6 @@ class NovelWritingStateTests(unittest.TestCase):
     def test_detached_auto_runner_is_created_without_widget_parent(self):
         created = []
 
-        class FakeSignal:
-            def connect(self, callback):
-                self.callback = callback
-
-        class FakeTimer:
-            def __init__(self, parent):
-                self.parent = parent
-                self.timeout = FakeSignal()
-
-            def setInterval(self, interval):
-                self.interval = interval
-
-            def start(self):
-                self.started = True
-
         class FakeRunner:
             def __init__(self, config, parent, background_runner=False):
                 created.append((config, parent, background_runner))
@@ -677,42 +728,113 @@ class NovelWritingStateTests(unittest.TestCase):
             def _start_auto_expand_all_local(self):
                 pass
 
+            def _status_has_active_work(self):
+                return True
+
+            def deleteLater(self):
+                pass
+
         tab = NovelWritingTab.__new__(NovelWritingTab)
         tab.config = {"novel": {"model": "test"}}
-        tab._detached_auto_runner = None
-        tab._detached_auto_project_path = ""
+        tab._background_chapter_ai_runners = {}
         tab._save_current_work = lambda *_args, **_kwargs: "/tmp/source.json"
         tab._update_detached_auto_source_lock = lambda: None
         tab.set_status_tip = lambda _text: None
 
         project = {"meta": {"title": "测试小说"}, "chapters": []}
         with patch("gpt_desktop.novel_writing_tab.NovelWritingTab", FakeRunner), patch(
-            "gpt_desktop.novel_writing_tab.QTimer", FakeTimer
-        ), patch("gpt_desktop.novel_writing_tab.load_json_file", return_value=project):
+            "gpt_desktop.novel_writing_tab.load_json_file", return_value=project
+        ):
             tab._launch_detached_auto_expand("/tmp/source.json")
 
         self.assertEqual(len(created), 1)
         self.assertIsNone(created[0][1])
         self.assertTrue(created[0][2])
+        self.assertEqual(
+            list(tab._background_chapter_ai_runners),
+            [os.path.realpath("/tmp/source.json")],
+        )
+
+    def test_multiple_detached_auto_runners_are_isolated_by_project_path(self):
+        created = []
+
+        class FakeRunner:
+            def __init__(self, config, parent, background_runner=False):
+                created.append((config, parent, background_runner))
+                self.current_project = {"meta": {"title": "测试小说"}}
+                self._background_task_kind = ""
+
+            def _load_project_data(self, data, source_path, defer_helpers=False):
+                self.current_project = data
+
+            def hide(self):
+                pass
+
+            def _start_auto_expand_all_local(self):
+                pass
+
+            def _status_has_active_work(self):
+                return True
+
+            def deleteLater(self):
+                pass
+
+        tab = NovelWritingTab.__new__(NovelWritingTab)
+        tab.config = {"novel": {"model": "test"}}
+        tab._background_chapter_ai_runners = {}
+        tab._save_current_work = lambda *_args, **_kwargs: "/tmp/saved.json"
+        tab._update_detached_auto_source_lock = lambda: None
+        tab.set_status_tip = lambda _text: None
+
+        projects = {
+            os.path.realpath("/tmp/source-a.json"): {"meta": {"title": "项目 A"}},
+            os.path.realpath("/tmp/source-b.json"): {"meta": {"title": "项目 B"}},
+        }
+
+        def load_project(path, _default=None):
+            return projects[os.path.realpath(path)]
+
+        with patch("gpt_desktop.novel_writing_tab.NovelWritingTab", FakeRunner), patch(
+            "gpt_desktop.novel_writing_tab.load_json_file", side_effect=load_project
+        ):
+            tab._launch_detached_auto_expand("/tmp/source-a.json")
+            tab._launch_detached_auto_expand("/tmp/source-b.json")
+
+        self.assertEqual(len(created), 2)
+        self.assertEqual(
+            set(tab._background_chapter_ai_runners),
+            {os.path.realpath("/tmp/source-a.json"), os.path.realpath("/tmp/source-b.json")},
+        )
+        self.assertTrue(
+            all(
+                runner._background_task_kind == "auto_expand"
+                for runner in tab._background_chapter_ai_runners.values()
+            )
+        )
+
+    def test_auto_expand_runner_stays_hidden_when_source_project_is_opened(self):
+        class AutoRunner:
+            _background_task_kind = "auto_expand"
+
+        tab = NovelWritingTab.__new__(NovelWritingTab)
+        tab._is_detached_auto_runner = False
+        tab._background_chapter_ai_runners = {
+            os.path.realpath("/tmp/source.json"): AutoRunner(),
+        }
+
+        self.assertFalse(tab._attach_background_chapter_runner("/tmp/source.json"))
+        self.assertIn(
+            os.path.realpath("/tmp/source.json"),
+            tab._background_chapter_ai_runners,
+        )
 
     def test_detached_auto_runner_waits_for_writing_worker_cleanup(self):
         class FinishedWorker:
             def isRunning(self):
                 return False
 
-        class FakeTimer:
-            def __init__(self):
-                self.stopped = False
-
-            def stop(self):
-                self.stopped = True
-
-            def deleteLater(self):
-                pass
-
         runner = NovelWritingTab.__new__(NovelWritingTab)
         runner._is_detached_auto_runner = True
-        runner._detached_auto_runner = None
         runner._auto_expand_all_active = False
         runner._auto_expand_all_waiting_next = False
         runner._chapter_ai_sequence_active = False
@@ -728,29 +850,28 @@ class NovelWritingStateTests(unittest.TestCase):
         runner.deleteLater = lambda: runner_deleted.append(True)
 
         tab = NovelWritingTab.__new__(NovelWritingTab)
-        tab._detached_auto_runner = runner
-        tab._detached_auto_timer = FakeTimer()
-        tab._detached_auto_project_path = "/tmp/source.json"
+        tab._background_chapter_ai_runners = {
+            os.path.realpath("/tmp/source.json"): runner,
+        }
         tab.current_project_path = "/tmp/other.json"
         tab._update_detached_auto_source_lock = lambda: None
         tab._notify_project_store_changed = lambda: None
         tab.set_status_tip = lambda _text: None
 
-        tab._poll_detached_auto_expand()
+        tab._poll_background_chapter_ai_runners()
 
-        self.assertIs(tab._detached_auto_runner, runner)
+        self.assertIs(tab._background_chapter_ai_runners[os.path.realpath("/tmp/source.json")], runner)
         self.assertEqual(runner_deleted, [])
 
         runner.writing_worker = None
-        tab._poll_detached_auto_expand()
+        tab._poll_background_chapter_ai_runners()
 
-        self.assertIsNone(tab._detached_auto_runner)
+        self.assertNotIn(os.path.realpath("/tmp/source.json"), tab._background_chapter_ai_runners)
         self.assertEqual(runner_deleted, [True])
 
     def test_status_active_work_includes_retired_writing_workers(self):
         runner = NovelWritingTab.__new__(NovelWritingTab)
         runner._is_detached_auto_runner = True
-        runner._detached_auto_runner = None
         runner.writing_worker = None
         runner.writing_retired_workers = [object()]
         runner.chapter_plan_worker = None
@@ -777,23 +898,11 @@ class NovelWritingStateTests(unittest.TestCase):
             def deleteLater(self):
                 self.deleted = True
 
-        class FakeTimer:
-            def __init__(self):
-                self.stopped = False
-                self.deleted = False
-
-            def stop(self):
-                self.stopped = True
-
-            def deleteLater(self):
-                self.deleted = True
-
         runner = FinishedRunner()
-        timer = FakeTimer()
         tab = NovelWritingTab.__new__(NovelWritingTab)
-        tab._detached_auto_runner = runner
-        tab._detached_auto_timer = timer
-        tab._detached_auto_project_path = "/tmp/source.json"
+        tab._background_chapter_ai_runners = {
+            os.path.realpath("/tmp/source.json"): runner,
+        }
         tab.current_project_path = "/tmp/other.json"
         tab.current_project = {"meta": {"title": "其他小说"}}
         tab._update_detached_auto_source_lock = lambda: None
@@ -802,16 +911,15 @@ class NovelWritingStateTests(unittest.TestCase):
         tab._notify_project_store_changed = lambda: notified.append(True)
         tab.set_status_tip = statuses.append
 
-        tab._poll_detached_auto_expand()
+        tab._poll_background_chapter_ai_runners()
 
         self.assertTrue(runner.saved)
         self.assertTrue(runner.deleted)
-        self.assertTrue(timer.stopped)
         self.assertEqual(tab.current_project_path, "/tmp/other.json")
         self.assertEqual(tab.current_project["meta"]["title"], "其他小说")
-        self.assertIsNone(tab._detached_auto_runner)
+        self.assertNotIn(os.path.realpath("/tmp/source.json"), tab._background_chapter_ai_runners)
         self.assertEqual(notified, [True])
-        self.assertEqual(statuses[-1], "后台自动扩写已完成。")
+        self.assertEqual(statuses, [])
 
     def test_500k_project_uses_one_hundred_5000_word_chapters(self):
         tab = NovelWritingTab.__new__(NovelWritingTab)

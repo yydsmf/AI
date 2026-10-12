@@ -11566,7 +11566,7 @@ def _long_form_boundary_integrity(project, chapter_index, before_memory, after_m
         if item_id:
             removals["characters"].add(item_id)
     for value in retirements.get("relationship_refs", []) if isinstance(retirements.get("relationship_refs"), list) else []:
-        refs = value if isinstance(value, list) else str(value or "").split("|")
+        refs = _long_form_relationship_ref_values(value)
         ids = sorted({
             _resolve_long_form_record_ref(project, "characters", ref)
             for ref in refs
@@ -11951,6 +11951,74 @@ def _long_form_ref_values(value):
     return result
 
 
+def _long_form_relationship_ref_values(value):
+    """Read a character pair from the compact relationship spellings models use."""
+    if isinstance(value, (list, tuple, set)):
+        result = []
+        for item in value:
+            for ref in _long_form_relationship_ref_values(item):
+                if ref not in result:
+                    result.append(ref)
+        return result
+    text = str(value or "").strip()
+    if not text:
+        return []
+    # Relationship rows occasionally use C001-C002 while the canonical form
+    # uses C001|C002. Only split the explicit character-code pair; never split
+    # arbitrary object keys or prose containing a hyphen.
+    refs = re.findall(r"(?<![A-Za-z0-9])C\d{3}(?!\d)", text, flags=re.IGNORECASE)
+    if len(refs) >= 2 and (
+        re.fullmatch(r"C\d{3}(?:\s*[-|+、,，;；]\s*C\d{3})+", text, flags=re.IGNORECASE)
+        or re.fullmatch(r"(?:NR|REL)_(?:C\d{3}_){2,}\d+", text, flags=re.IGNORECASE)
+    ):
+        return list(dict.fromkeys(ref.upper() for ref in refs))
+    return _long_form_ref_values(text.replace("+", "|"))
+
+
+def _long_form_relationship_ref_groups(value):
+    """Keep comma-separated pairs distinct from a single multi-person relation."""
+    if isinstance(value, (list, tuple, set)):
+        values = list(value)
+        # A plain list of character references is one relationship group even
+        # when a newly created temporary character uses a key such as ``NC1``.
+        # Only split a list when its items are themselves explicit pair forms
+        # or nested groups.
+        if len(values) >= 2 and all(
+            not isinstance(item, (list, tuple, set))
+            and not (
+                isinstance(item, str)
+                and (
+                    re.fullmatch(
+                        r"C\d{3}(?:\s*[-|+]\s*C\d{3})+",
+                        item.strip(),
+                        flags=re.IGNORECASE,
+                    )
+                    or re.fullmatch(
+                        r"(?:NR|REL)_(?:C\d{3}_){2,}\d+",
+                        item.strip(),
+                        flags=re.IGNORECASE,
+                    )
+                )
+            )
+            for item in values
+        ):
+            return [value]
+        groups = []
+        for item in values:
+            groups.extend(_long_form_relationship_ref_groups(item))
+        return groups or [value]
+    if not isinstance(value, str):
+        return [value]
+    parts = [part.strip() for part in re.split(r"[,，;；、\n]+", value) if part.strip()]
+    if len(parts) > 1 and all(
+        re.fullmatch(r"C\d{3}(?:\s*[-|+]\s*C\d{3})+", part, flags=re.IGNORECASE)
+        or re.fullmatch(r"(?:NR|REL)_(?:C\d{3}_){2,}\d+", part, flags=re.IGNORECASE)
+        for part in parts
+    ):
+        return parts
+    return [value]
+
+
 def _long_form_character_state_refs(item):
     """Read singular and plural character reference fields from one state."""
     if not isinstance(item, dict):
@@ -12003,6 +12071,17 @@ def _normalize_long_form_character_refs(project, update):
                 result.append(canonical)
         return result
 
+    def canonical_relationships(values):
+        result = []
+        for value in values:
+            for group in _long_form_relationship_ref_groups(value):
+                refs = canonical_list(_long_form_relationship_ref_values(group))
+                # Invalid references stay visible to strict validation.
+                output = "|".join(sorted(refs)) if len(refs) >= 2 else group
+                if output not in result:
+                    result.append(output)
+        return result
+
     state_patch = payload.get("state_patch", {})
     if isinstance(state_patch, dict):
         for item in state_patch.get("character_states", []) if isinstance(state_patch.get("character_states"), list) else []:
@@ -12013,7 +12092,7 @@ def _normalize_long_form_character_refs(project, update):
         for item in state_patch.get("relationship_states", []) if isinstance(state_patch.get("relationship_states"), list) else []:
             if isinstance(item, dict):
                 refs = item.get("refs", item.get("characters", []))
-                item["refs"] = canonical_list(refs)
+                item["refs"] = canonical_list(_long_form_relationship_ref_values(refs))
 
     for key in ("current_chapter_character_refs", "current_chapter_character_ids"):
         if isinstance(payload.get(key), list):
@@ -12026,12 +12105,9 @@ def _normalize_long_form_character_refs(project, update):
                 state_retirements["character_refs"]
             )
         if isinstance(state_retirements.get("relationship_refs"), list):
-            relationships = []
-            for value in state_retirements["relationship_refs"]:
-                refs = canonical_list(value if isinstance(value, list) else str(value or "").split("|"))
-                if len(refs) >= 2:
-                    relationships.append("|".join(sorted(refs)))
-            state_retirements["relationship_refs"] = list(dict.fromkeys(relationships))
+            state_retirements["relationship_refs"] = canonical_relationships(
+                state_retirements["relationship_refs"]
+            )
 
     next_memory = payload.get("next_chapter_memory", {})
     if isinstance(next_memory, dict) and isinstance(next_memory.get("character_refs"), list):
@@ -12047,12 +12123,9 @@ def _normalize_long_form_character_refs(project, update):
         if isinstance(reconciliation.get("character_refs"), list):
             reconciliation["character_refs"] = canonical_list(reconciliation["character_refs"])
         if isinstance(reconciliation.get("relationship_refs"), list):
-            relationships = []
-            for value in reconciliation["relationship_refs"]:
-                refs = canonical_list(str(value or "").split("|"))
-                if len(refs) >= 2:
-                    relationships.append("|".join(sorted(refs)))
-            reconciliation["relationship_refs"] = list(dict.fromkeys(relationships))
+            reconciliation["relationship_refs"] = canonical_relationships(
+                reconciliation["relationship_refs"]
+            )
 
     record_updates = payload.get("record_updates", {})
     if isinstance(record_updates, dict):
@@ -13273,13 +13346,14 @@ def _expand_compact_long_form_memory_update(project, chapter_index, update):
     for item in state_patch.get("relationship_states", []) if isinstance(state_patch.get("relationship_states"), list) else []:
         if not isinstance(item, dict):
             continue
-        refs = item.get("refs", item.get("characters", []))
-        refs = refs if isinstance(refs, list) else str(refs or "").split("|")
+        refs = _long_form_relationship_ref_values(
+            item.get("refs", item.get("characters", []))
+        )
         refs = sorted(str(ref or "").strip() for ref in refs if str(ref or "").strip())
         if len(refs) >= 2:
             append_ref(reconciliation["relationship_refs"], "|".join(refs))
     for value in retirements.get("relationship_refs", []):
-        refs = value if isinstance(value, list) else str(value or "").split("|")
+        refs = _long_form_relationship_ref_values(value)
         refs = sorted(str(ref or "").strip() for ref in refs if str(ref or "").strip())
         if len(refs) >= 2:
             append_ref(reconciliation["relationship_refs"], "|".join(refs))
@@ -13546,43 +13620,61 @@ def _normalize_long_form_state_aliases(update):
                     if not str(item.get("state", "") or "").strip():
                         item["state"] = first_value(
                             source_item,
-                            ("status", "dynamic", "runtime", "runtime_update", "change", "description"),
+                            (
+                                "status", "dynamic", "runtime", "runtime_update", "runtime_patch",
+                                "operational_state", "spatial_state", "change", "description",
+                            ),
                         )
                     if not str(item.get("evidence_quote", "") or "").strip():
                         item["evidence_quote"] = first_value(source_item, ("evidence", "quote"))
                     normalized_character_states.append(item)
             state_patch["character_states"] = normalized_character_states
-        for item in state_patch.get("relationship_states", []) if isinstance(state_patch.get("relationship_states"), list) else []:
-            if not isinstance(item, dict):
+        raw_relationship_states = state_patch.get("relationship_states", [])
+        had_relationship_states = "relationship_states" in state_patch
+        normalized_relationship_states = []
+        for source_item in raw_relationship_states if isinstance(raw_relationship_states, list) else []:
+            if not isinstance(source_item, dict):
+                normalized_relationship_states.append(source_item)
                 continue
             refs = first_value(
-                item,
-                ("character_refs", "character_ids", "refs", "characters", "participants"),
+                source_item,
+                (
+                    "relationship_refs", "relationship_ids",
+                    "character_refs", "character_ids", "refs", "characters", "participants",
+                ),
             )
             if not refs:
-                relationship_ref = first_value(
-                    item,
+                refs = first_value(
+                    source_item,
                     (
                         "relationship_ref", "relationship_id", "relationship_key",
                         "stable_ref", "stable_id", "temp_key", "key", "ref",
                     ),
                 )
-                refs = re.findall(r"(?<![A-Za-z0-9])C\d{3}(?!\d)", str(relationship_ref or ""))
-            item["refs"] = ref_list(refs)
-            if not str(item.get("state", "") or "").strip():
-                item["state"] = first_value(
-                    item,
-                    ("status", "dynamic", "runtime", "runtime_update", "change", "description"),
-                )
-            if not str(item.get("evidence_quote", "") or "").strip():
-                item["evidence_quote"] = first_value(item, ("evidence", "quote"))
+            groups = _long_form_relationship_ref_groups(refs)
+            for group in groups or [refs]:
+                item = deepcopy(source_item)
+                item["refs"] = _long_form_relationship_ref_values(group)
+                if not str(item.get("state", "") or "").strip():
+                    item["state"] = first_value(
+                        source_item,
+                        (
+                            "status", "dynamic", "runtime", "runtime_update", "runtime_patch",
+                            "operational_state", "spatial_state", "change", "description",
+                        ),
+                    )
+                if not str(item.get("evidence_quote", "") or "").strip():
+                    item["evidence_quote"] = first_value(source_item, ("evidence", "quote"))
+                normalized_relationship_states.append(item)
+        if had_relationship_states or normalized_relationship_states:
+            state_patch["relationship_states"] = normalized_relationship_states
         for item in state_patch.get("object_states", []) if isinstance(state_patch.get("object_states"), list) else []:
             if not isinstance(item, dict):
                 continue
             if not str(item.get("key", "") or "").strip():
                 item["key"] = first_value(
                     item,
-                    ("object_key", "object_id", "stable_ref", "temp_key", "id", "name"),
+                    ("object_key", "object_id", "stable_ref", "temp_key", "ref", "id", "name"),
                 )
             if not str(item.get("lore_ref", "") or "").strip():
                 item["lore_ref"] = first_value(
@@ -13592,7 +13684,10 @@ def _normalize_long_form_state_aliases(update):
             if not str(item.get("state", "") or "").strip():
                 item["state"] = first_value(
                     item,
-                    ("status", "dynamic", "runtime", "runtime_update", "change", "description"),
+                    (
+                        "status", "dynamic", "runtime", "runtime_update", "runtime_patch",
+                        "operational_state", "spatial_state", "change", "description",
+                    ),
                 )
             if not str(item.get("evidence_quote", "") or "").strip():
                 item["evidence_quote"] = first_value(item, ("evidence", "quote"))
@@ -13823,10 +13918,22 @@ def _normalize_long_form_state_aliases(update):
                 operation = str(item.get("operation", "") or "").strip().lower()
                 nested_patch = item.get("patch")
                 nested_updates = item.get("updates")
-                if not operation and str(
-                    item.get("ref", item.get("id", item.get("character_ref", item.get("lore_ref", ""))))
-                    or ""
-                ).strip() and isinstance(nested_updates, (dict, str)):
+                explicit_ref = first_value(
+                    item,
+                    (
+                        "ref", "record_ref", "character_ref", "lore_ref", "character_id",
+                        "lore_id", "stable_ref", "stable_id", "ref_id", "id",
+                    ),
+                )
+                has_delta = any(
+                    bool(item.get(key))
+                    for key in (
+                        "state", "dynamic", "runtime", "runtime_update", "runtime_patch",
+                        "operational_state", "spatial_state", "change", "changes", "patch",
+                        "updates", "update", "identity_patch", "fields", "description", "content",
+                    )
+                )
+                if not operation and explicit_ref and has_delta:
                     operation = "update"
                     item["operation"] = operation
                 if operation in {"add", "new", "insert"}:
@@ -13887,8 +13994,8 @@ def _normalize_long_form_state_aliases(update):
                         ),
                     )
                 dynamic = first_value(item, (
-                    "state", "dynamic", "runtime", "runtime_update", "current_dynamic",
-                    "change",
+                    "state", "dynamic", "runtime", "runtime_update", "runtime_patch",
+                    "operational_state", "spatial_state", "current_dynamic", "change",
                     "latest_state", "new_state", "current_state", "state_update",
                     "new_status", "status_update", "update", "content", "status",
                     "description",
@@ -13900,7 +14007,8 @@ def _normalize_long_form_state_aliases(update):
                 nested_patch = item.get("patch")
                 if not dynamic and isinstance(nested_patch, dict):
                     dynamic = first_value(nested_patch, (
-                        "state", "dynamic", "runtime", "runtime_update", "current_dynamic",
+                        "state", "dynamic", "runtime", "runtime_update", "runtime_patch",
+                        "operational_state", "spatial_state", "current_dynamic",
                         "change", "latest_state", "new_state", "current_state", "state_update",
                         "new_status", "status_update", "update", "content", "status", "public_state",
                         "description",
@@ -13909,7 +14017,8 @@ def _normalize_long_form_state_aliases(update):
                     dynamic = nested_patch.strip()
                 if not dynamic and isinstance(nested_updates, dict):
                     dynamic = first_value(nested_updates, (
-                        "state", "dynamic", "runtime", "runtime_update", "current_dynamic",
+                        "state", "dynamic", "runtime", "runtime_update", "runtime_patch",
+                        "operational_state", "spatial_state", "current_dynamic",
                         "change", "latest_state", "new_state", "current_state", "state_update",
                         "new_status", "status_update", "update", "content", "status", "public_state",
                         "description",
@@ -14021,6 +14130,25 @@ def _normalize_long_form_state_aliases(update):
         if not isinstance(item, dict):
             continue
         operation = str(item.get("operation", "") or "").strip().lower()
+        explicit_ref = first_value(
+            item,
+            (
+                "ref", "record_ref", "foreshadow_ref", "foreshadow_id", "stable_ref",
+                "stable_id", "ref_id", "id",
+            ),
+        )
+        has_delta = any(
+            bool(item.get(key))
+            for key in (
+                "state", "dynamic", "runtime", "runtime_update", "runtime_patch",
+                "operational_state", "spatial_state", "change", "changes", "patch",
+                "updates", "update", "progress", "content", "description", "revealed",
+                "remaining_secret", "status",
+            )
+        )
+        if not operation and explicit_ref and has_delta:
+            operation = "update"
+            item["operation"] = operation
         if operation in {"add", "new", "insert"}:
             operation = "create"
             item["operation"] = operation
@@ -14070,11 +14198,31 @@ def _normalize_long_form_state_aliases(update):
         dynamic = first_value(
             item,
             (
-                "state", "dynamic", "runtime", "runtime_update", "current_dynamic",
-                "change",
+                "state", "dynamic", "runtime", "runtime_update", "runtime_patch",
+                "operational_state", "spatial_state", "current_dynamic", "change",
                 "progress", "content", "description", "status",
             ),
         )
+        for nested in (item.get("patch"), item.get("updates")):
+            if dynamic:
+                break
+            if isinstance(nested, dict):
+                dynamic = first_value(
+                    nested,
+                    (
+                        "state", "dynamic", "runtime", "runtime_update", "runtime_patch",
+                        "operational_state", "spatial_state", "change", "progress",
+                        "content", "description",
+                    ),
+                )
+            elif isinstance(nested, str):
+                dynamic = nested.strip()
+        if not dynamic:
+            changes = item.get("changes", [])
+            if isinstance(changes, str):
+                dynamic = changes
+            elif isinstance(changes, list):
+                dynamic = "；".join(str(value).strip() for value in changes if str(value or "").strip())
         if not str(item.get("state", "") or "").strip():
             item["state"] = dynamic
         raw_status = str(item.get("status", "") or "").strip()
@@ -14470,6 +14618,12 @@ def _normalize_long_form_update_payload(project, chapter_index, update):
         or payload.get("output_mode") == "compact_delta_v1"
     ):
         payload = _normalize_long_form_state_aliases(payload)
+        payload = _normalize_long_form_character_refs(project, payload)
+        payload = _bind_first_seen_long_form_object_aliases(
+            project,
+            _normalize_long_form_memory(project.get("long_form_memory", {})),
+            payload,
+        )
         payload = _expand_compact_long_form_memory_update(project, chapter_index, payload)
         payload = _normalize_long_form_state_aliases(payload)
         payload = _normalize_long_form_character_refs(project, payload)
@@ -14959,7 +15113,7 @@ def _normalize_long_form_structural_refs(project, chapter_index, update):
         append_unique("object_keys", value)
 
     def relationship_ref(value):
-        refs = value if isinstance(value, list) else str(value or "").split("|")
+        refs = _long_form_relationship_ref_values(value)
         refs = sorted(str(ref or "").strip() for ref in refs if str(ref or "").strip())
         return "|".join(refs) if len(refs) >= 2 else ""
 
@@ -15787,7 +15941,7 @@ def _validate_long_form_memory_update(
             for item in snapshot.get("relationship_states", []) if isinstance(item, dict)
         }
         for value in state_retirements.get("relationship_refs", []) if isinstance(state_retirements.get("relationship_refs"), list) else []:
-            refs = value if isinstance(value, list) else str(value or "").split("|")
+            refs = _long_form_relationship_ref_values(value)
             ids = [_resolve_long_form_record_ref(project, "characters", ref) for ref in refs]
             key = "|".join(sorted(item_id for item_id in ids if item_id))
             if len(ids) < 2 or any(not item_id for item_id in ids) or key not in active_relationship_keys:
@@ -16446,7 +16600,7 @@ def _validate_long_form_memory_update(
             relationship_values = []
         checked_relationships = set()
         for value in relationship_values:
-            refs = value if isinstance(value, list) else str(value or "").split("|")
+            refs = _long_form_relationship_ref_values(value)
             refs = [str(ref or "").strip() for ref in refs if str(ref or "").strip()]
             if len(refs) < 2 or any(not valid_record_ref("characters", ref) for ref in refs):
                 errors.append(f"state_reconciliation关系引用无效：{value}")
@@ -16584,7 +16738,7 @@ def _validate_long_form_memory_update(
         required_relationships.update(
             "|".join(sorted(
                 str(ref or "").strip()
-                for ref in (value if isinstance(value, list) else str(value or "").split("|"))
+                for ref in _long_form_relationship_ref_values(value)
                 if str(ref or "").strip()
             ))
             for value in state_retirements.get("relationship_refs", [])
@@ -17418,7 +17572,7 @@ def _build_memory_repair_selection(
     for ref in retirements.get("character_refs", []) if isinstance(retirements.get("character_refs"), list) else []:
         add_record_ref("characters", ref)
     for value in retirements.get("relationship_refs", []) if isinstance(retirements.get("relationship_refs"), list) else []:
-        refs = value if isinstance(value, list) else str(value or "").split("|")
+        refs = _long_form_relationship_ref_values(value)
         for ref in refs:
             add_record_ref("characters", ref)
     for value in retirements.get("object_keys", []) if isinstance(retirements.get("object_keys"), list) else []:
@@ -17503,7 +17657,7 @@ def _build_memory_repair_selection(
             for ref in reconciliation.get(key, []) if isinstance(reconciliation.get(key), list) else []:
                 add_record_ref(kind, ref)
         for value in reconciliation.get("relationship_refs", []) if isinstance(reconciliation.get("relationship_refs"), list) else []:
-            refs = value if isinstance(value, list) else str(value or "").split("|")
+            refs = _long_form_relationship_ref_values(value)
             for ref in refs:
                 add_record_ref("characters", ref)
         for ref in reconciliation.get("fact_refs", []) if isinstance(reconciliation.get("fact_refs"), list) else []:
@@ -17560,14 +17714,7 @@ def _build_memory_repair_selection(
 
 
 def _canonical_relationship_ref(value):
-    if isinstance(value, list):
-        refs = [str(item or "").strip() for item in value if str(item or "").strip()]
-    else:
-        refs = [
-            item.strip()
-            for item in re.split(r"[|+]", str(value or ""))
-            if item.strip()
-        ]
+    refs = _long_form_relationship_ref_values(value)
     return "|".join(sorted(dict.fromkeys(refs))) if len(set(refs)) >= 2 else ""
 
 
@@ -19050,34 +19197,22 @@ def _long_form_same_object_entity(existing, incoming):
     incoming = incoming if isinstance(incoming, dict) else {}
     old_lore = str(existing.get("lore_id", "") or "").strip()
     new_lore = str(incoming.get("lore_id", "") or "").strip()
+    old_key = str(existing.get("key", "") or "").strip()
+    new_key = str(incoming.get("key", "") or "").strip()
+    if old_key and new_key and old_key.casefold() == new_key.casefold():
+        # A stable object key is the strongest identity signal available to
+        # the transaction. Runtime state is expected to change every chapter;
+        # it must not create a second object. An explicit pair of conflicting
+        # lore IDs remains the only reason to reject the same-key merge.
+        return not (old_lore and new_lore and old_lore != new_lore)
     if old_lore and new_lore:
         return old_lore == new_lore
 
-    old_key = str(existing.get("key", "") or "").strip()
-    new_key = str(incoming.get("key", "") or "").strip()
     old_name = _compact_text(existing.get("name", ""))
     new_name = _compact_text(incoming.get("name", ""))
 
     old_placeholder = _long_form_object_name_is_placeholder(old_name, old_key)
     new_placeholder = _long_form_object_name_is_placeholder(new_name, new_key)
-    if old_key and new_key and old_key.casefold() == new_key.casefold():
-        if old_lore or new_lore:
-            return True
-        if old_placeholder and new_placeholder:
-            old_state = _compact_text(existing.get("state", ""))
-            new_state = _compact_text(incoming.get("state", ""))
-            if not old_state or not new_state:
-                return True
-            shorter, longer = sorted((old_state, new_state), key=len)
-            return (
-                len(shorter) >= 8 and shorter.casefold() in longer.casefold()
-            ) or SequenceMatcher(None, old_state, new_state).ratio() >= 0.42
-        if old_placeholder != new_placeholder:
-            return _long_form_object_name_matches_state(
-                new_name if old_placeholder else old_name,
-                existing.get("state", "") if old_placeholder else incoming.get("state", ""),
-            )
-        return old_name.casefold() == new_name.casefold()
     if old_placeholder and not new_placeholder:
         return _long_form_object_name_matches_state(
             new_name, existing.get("state", "")
@@ -19107,7 +19242,7 @@ def _long_form_object_lore_id(project, item):
         return ""
     raw_ref = item.get("lore_ref", "") or item.get("lore_id", "")
     resolved = _resolve_long_form_record_ref(project, "lore", raw_ref)
-    if resolved:
+    if str(raw_ref or "").strip():
         return resolved
 
     candidate_names = []
@@ -19128,38 +19263,11 @@ def _long_form_object_lore_id(project, item):
             matches.append(item_id)
     if len(matches) == 1:
         return matches[0]
-    state = str(item.get("state", "") or "").strip()
-    state_matches = []
-    if state:
-        compact_state = _compact_text(state).casefold()
-        exact_state_matches = []
-        for record in records if isinstance(records, list) else []:
-            if not isinstance(record, dict):
-                continue
-            item_id = str(record.get("id", "") or "").strip()
-            formal_name = _compact_text(record.get("name", ""))
-            if (
-                item_id
-                and formal_name
-                and formal_name.casefold() in compact_state
-                and item_id not in exact_state_matches
-            ):
-                exact_state_matches.append(item_id)
-        if len(exact_state_matches) == 1:
-            return exact_state_matches[0]
-        for record in records if isinstance(records, list) else []:
-            if not isinstance(record, dict):
-                continue
-            item_id = str(record.get("id", "") or "").strip()
-            formal_name = str(record.get("name", "") or "").strip()
-            if (
-                item_id
-                and formal_name
-                and _long_form_object_name_matches_state(formal_name, state)
-                and item_id not in state_matches
-            ):
-                state_matches.append(item_id)
-    return state_matches[0] if len(state_matches) == 1 else ""
+    # Runtime state is descriptive prose, not an entity declaration. A common
+    # phrase such as "回波" or "七号院" can occur in the state of another
+    # object, so it must never bind that object to a lore record. Binding is
+    # limited to explicit refs or an exact object/lore name match above.
+    return ""
 
 
 def _long_form_object_lore_record(project, lore_id):
@@ -19248,26 +19356,31 @@ def _bind_first_seen_long_form_object_aliases(project, memory, payload):
         lore_id = _resolve_long_form_record_ref(
             project, "lore", raw_lore_ref or raw_key
         )
-        if not lore_id:
-            # A formal lore name in the state/evidence is acceptable only as a
-            # secondary proof. It must still be explicitly typed as an object.
-            lore_id = _long_form_object_lore_id(project, item)
-        if not lore_id or not _long_form_lore_is_explicit_object(project, lore_id):
+        if raw_lore_ref and not lore_id:
             continue
-
-        existing_key = object_key_by_lore_id.get(lore_id, "")
-        if not existing_key and lore_id not in ambiguous_lore_ids:
-            for previous in object_rows:
-                if previous is item or not isinstance(previous, dict):
-                    continue
-                previous_lore = _long_form_object_lore_id(project, previous)
-                previous_key = str(
-                    previous.get("key", previous.get("name", "")) or ""
-                ).strip()
-                if previous_lore == lore_id and previous_key:
-                    existing_key = previous_key
-                    break
-        assigned_key = existing_key or _next_long_form_object_key(issued_keys)
+        if not lore_id:
+            lore_id = _long_form_object_lore_id(project, item)
+        existing_key = _long_form_find_existing_object_key(project, snapshot_objects, item)
+        if existing_key and not raw_lore_ref:
+            existing = next(
+                row for row in snapshot_objects
+                if isinstance(row, dict)
+                and str(row.get("key", row.get("name", "")) or "").strip() == existing_key
+            )
+            lore_id = _long_form_object_lore_id(project, existing) or lore_id
+        is_object_lore = bool(lore_id and _long_form_lore_is_explicit_object(project, lore_id))
+        if not existing_key and not is_object_lore:
+            continue
+        if not existing_key:
+            existing_key = object_key_by_lore_id.get(lore_id, "")
+        is_record_key = any(
+            _resolve_long_form_record_ref(project, kind, raw_key)
+            for kind in ("characters", "lore", "foreshadows")
+        )
+        assigned_key = existing_key or (
+            raw_key if not is_record_key and raw_key not in issued_keys
+            else _next_long_form_object_key(issued_keys)
+        )
         issued_keys.add(assigned_key)
         if raw_key != assigned_key:
             aliases[_compact_text(raw_key)] = assigned_key
@@ -19278,12 +19391,13 @@ def _bind_first_seen_long_form_object_aliases(project, memory, payload):
         formal_name = str(lore_record.get("name", "") or "").strip() if isinstance(lore_record, dict) else ""
         if formal_name and not str(item.get("name", "") or "").strip():
             item["name"] = formal_name
-        if not str(item.get("lore_ref", "") or "").strip():
+        if is_object_lore and not raw_lore_ref:
             maps = _long_form_record_reference_maps(project).get("lore", {})
             item["lore_ref"] = maps.get("id_to_alias", {}).get(lore_id, lore_id)
         lore_alias = str(item.get("lore_ref", "") or "").strip()
-        lore_alias_by_object_key[_compact_text(assigned_key)] = lore_alias or lore_id
-        object_key_by_lore_id[lore_id] = assigned_key
+        if lore_id:
+            lore_alias_by_object_key[_compact_text(assigned_key)] = lore_alias or lore_id
+            object_key_by_lore_id[lore_id] = assigned_key
 
     if not aliases:
         return payload
@@ -19601,7 +19715,7 @@ def _merge_long_form_state_patch(
     merge_items("relationship_states", "relationship_states", relationship_key, normalize_relationship)
     retired_relationship_keys = set()
     for value in retirements.get("relationship_refs", []) if isinstance(retirements.get("relationship_refs"), list) else []:
-        refs = value if isinstance(value, list) else str(value or "").split("|")
+        refs = _long_form_relationship_ref_values(value)
         ids = [resolve_record("characters", ref) for ref in refs]
         ids = [item_id for item_id in ids if item_id]
         if len(ids) >= 2:
@@ -20583,7 +20697,7 @@ def _apply_long_form_memory_update_unchecked(project, chapter_index, payload, up
                 resolved_reconciliation.pop(source_key, None)
         relationship_ids = []
         for value in reconciliation.get("relationship_refs", []) if isinstance(reconciliation.get("relationship_refs"), list) else []:
-            refs = value if isinstance(value, list) else str(value or "").split("|")
+            refs = _long_form_relationship_ref_values(value)
             ids = resolve_event_refs("characters", refs)
             if len(ids) >= 2:
                 relationship_ids.append(ids)

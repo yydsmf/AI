@@ -879,6 +879,9 @@ def _default_project():
         "style_profile_id": "",
         "style_profile_cache": {},
         "draft_note": "",
+        # Set when a named project is first persisted.  It must remain
+        # independent from updated_at so saves cannot reorder the project list.
+        "created_at": "",
         "long_form_memory": _default_long_form_memory(),
         "imported_chapter_plan_reference": {},
         "imported_framework_source": {},
@@ -1356,6 +1359,7 @@ def _new_character(index):
         "secret": "",
         "personality": "",
         "voice": "",
+        "style_favorite_id": "",
         "notes": "",
     }
 
@@ -2130,7 +2134,10 @@ def _normalize_project(data):
         for char in base["characters"]:
             if not str(char.get("id", "") or "").strip():
                 char["id"] = uuid.uuid4().hex
-            for key in ("id", "name", "role", "goal", "secret", "personality", "voice", "notes"):
+            for key in (
+                "id", "name", "role", "goal", "secret", "personality", "voice",
+                "style_favorite_id", "notes",
+            ):
                 char[key] = _as_text(char.get(key, ""))
             char["notes"] = _strip_internal_candidate_markers(char.get("notes", ""))
     lore = data.get("lore", [])
@@ -2279,6 +2286,7 @@ def _normalize_project(data):
                 if not _chapter_analysis_is_current(chapter):
                     _mark_chapters_analyzed(base["chapters"], [auto_updated_chapter_id])
             break
+    base["created_at"] = str(data.get("created_at") or "").strip()
     base["updated_at"] = str(data.get("updated_at") or now_str())
     return base
 
@@ -6690,6 +6698,64 @@ def _build_open_foreshadow_queue(
     return guide + "\n" + "\n".join(lines)
 
 
+def _foreshadow_planned_chapter_number(value):
+    """Read the first concrete chapter number from a foreshadow plan field."""
+    text = str(value or "").strip()
+    if not text:
+        return 0
+    if re.fullmatch(r"\d{1,4}", text):
+        try:
+            return int(text)
+        except (TypeError, ValueError):
+            return 0
+    number = _story_order_from_text(text)
+    if number != _STORY_ORDER_MISSING:
+        return number
+    match = re.search(
+        r"(?:第\s*)?([一二两三四五六七八九十百千万零〇\d]+)\s*(?:章|章节)",
+        text,
+    )
+    if not match:
+        match = re.search(
+            r"(?:章节|章)\s*([一二两三四五六七八九十百千万零〇\d]+)",
+            text,
+        )
+    if not match:
+        return 0
+    parsed = _chinese_numeral_to_int(match.group(1))
+    return int(parsed or 0)
+
+
+def _foreshadow_planned_route(item, chapter_index, chapter_title=""):
+    """Return the planned writing phase(s) for one concrete chapter."""
+    item = item if isinstance(item, dict) else {}
+    current_order = _story_order_from_text(chapter_title)
+    if current_order == _STORY_ORDER_MISSING:
+        current_order = int(chapter_index or 0) + 1
+    setup_order = _foreshadow_planned_chapter_number(item.get("setup_chapter", ""))
+    payoff_order = _foreshadow_planned_chapter_number(item.get("payoff_chapter", ""))
+    phases = []
+    if setup_order > 1 and current_order == setup_order - 1:
+        phases.append("前置铺垫")
+    if setup_order and current_order == setup_order:
+        phases.append("正式埋设")
+    if payoff_order and current_order == payoff_order:
+        phases.append("正式回收")
+    return tuple(phases)
+
+
+def _planned_foreshadow_routes(items, chapter_index, chapter_title=""):
+    """Select only foreshadows planned for this chapter's writing route."""
+    routes = []
+    for item in items if isinstance(items, list) else []:
+        if not isinstance(item, dict):
+            continue
+        phases = _foreshadow_planned_route(item, chapter_index, chapter_title)
+        if phases:
+            routes.append((item, phases))
+    return routes
+
+
 def _recent_chapter_context(chapters, chapter_index, window=6, project=None):
     chapters = chapters if isinstance(chapters, list) else []
     project = project if isinstance(project, dict) else {}
@@ -9689,7 +9755,7 @@ def _grounded_prose_contract():
         "对白要推动关系、现场压力或人物选择继续变化，不让角色互相解释已经知道的事。\n"
         "人物受到冲突、误解、意外、吸引或关系变化影响时，要写出会改变下一步行为的当下念头、判断或身体感受；"
         "心理描写和动作、对白交替出现，具体程度随场景需要自然变化。"
-        "不得用解释型旁白替代人物行动，不得替人物总结动机、立场和成长。"
+        "不得用解释式、观点式和“金句式”抽象表达；"
         "人物表达拒绝、讥讽或不满时，落到眼前的具体对象、安排和后果上，让台词像人物当场说给对方听的话。"
         "人物反感眼前的说法或安排时，直接落到具体对象、场面和自己是否配合上；允许用人物自己的口语吐槽或拒绝，"
         "不要把临场态度写成替所有人下判断的抽象命题。\n"
@@ -9702,7 +9768,7 @@ def _natural_expression_guidance():
         "【正文语言要求】正文必须使用自然的网络小说叙述语言，直接写人物、场景、动作、对白和具体变化；"
         "不得出现策划术语、抽象形容、办案式表达、编辑式说明或编辑式总结。"
         "情绪和气氛必须通过人物当下的动作、对白、心理和具体结果表现，不用漂亮形容替代剧情。"
-        "对白按关系和现场情绪自然接话，心理变化随人物自然展开；不得用解释型旁白替代人物行动。"
+        "对白按关系和现场情绪自然接话，心理变化随人物自然展开。"
         "项目资料决定故事事实、人物和剧情；文风参考只决定表达方式，不把参考原文的人物、剧情、物件或句子带入当前正文。"
     )
 
@@ -12424,13 +12490,24 @@ def _build_long_form_selection_index(project, chapter_index, selection=None, lim
                 story_layer = _record_story_layer_context(project, kind, item_id)
                 revealed = str(item.get("revealed", "") or story_layer.get("revealed", "") or "").strip()
                 remaining = str(item.get("remaining_secret", "") or story_layer.get("remaining_secret", "") or "").strip()
+                description = _clip_complete_text(
+                    _stable_foreshadow_description_context(item.get("description", "")),
+                    360,
+                )
+                setup_chapter = str(item.get("setup_chapter", "") or "").strip()
+                payoff_chapter = str(item.get("payoff_chapter", "") or "").strip()
+                runtime_context = _record_runtime_context(project, kind, item_id, 260)
                 stable = "｜".join(part for part in (
                     _normalize_foreshadow_code(item.get("code", "")),
                     str(item.get("name", "") or "").strip(),
                     str(item.get("status", "") or "").strip(),
+                    "伏笔原始说明：" + description if description else "",
+                    "计划埋设：" + setup_chapter if setup_chapter else "",
+                    "计划回收：" + payoff_chapter if payoff_chapter else "",
                     "已揭示：" + _clip_complete_text(revealed, 280) if revealed else "",
                     "未揭示：" + _clip_complete_text(remaining, 280) if remaining else "",
-                    _record_runtime_context(project, kind, item_id, 260),
+                    "历史运行观察（仅供参考，不能替代本章正文证据）：" + runtime_context
+                    if runtime_context else "",
                 ) if part)
             detail_lines.append(f"- {label} {alias}｜{stable}")
 
@@ -12991,6 +13068,8 @@ def _long_form_compact_update_contract_instructions(project, chapter_index):
         "不得新建第二张人物卡；只有正文没有对应旧人物时才create。"
         "不得改写导入的人物卡、设定定义或伏笔计划。新增记录不要生成真实ID，真实ID由程序分配。"
         "foreshadow_updates只写本章实际埋设、推进、回收或废弃的伏笔；create使用NT临时key。"
+        "伏笔原始说明、计划章节和历史运行观察只用于识别背景；历史运行观察是旧章节的观察记录，不能替代本章最终正文证据。"
+        "本章伏笔是否更新必须以最终正文中的evidence_quote和当前正文语义为准；即使历史记录已经写过已埋，也不能据此把本章无关内容挂到该伏笔。"
         "state_patch只写本章结束时新增或变化的时间、地点、人物、关系、物件、冲突和任务；"
         "更新已有冲突或任务必须填写真实ID及previous_conflict/previous_task，新增使用NCF/NTASK临时key。"
         "所有非keep事实更新、人物/设定/伏笔更新以及state_patch变化都必须附最终正文中的8-60字连续逐字evidence_quote。"
@@ -13188,6 +13267,7 @@ def _long_form_update_contract_instructions(project, chapter_index, compact=Fals
         "lore.story_known和foreshadow.revealed只能写正文已公开内容；新增设定必须填写story_known，"
         "remaining_secret只写仍未揭示的边界，不得把未来答案搬进revealed。"
         "伏笔标为已埋时必须同步setup_chapter、revealed和remaining_secret；"
+        "弱线索只要确实与伏笔内容相关即可正常更新，但普通动作、相似氛围、单个词或历史记录本身不能作为本章证据。"
         "标为已回收时必须同步payoff_chapter、revealed和remaining_secret。"
         "同一人物或永久设定实体才允许update旧卡；新一轮直播、新文件、新样品、新证据批次或新物件必须create新卡，"
         "使用能区分批次的名称和临时key，绝不能覆盖旧批次当前状态。"
@@ -13622,7 +13702,8 @@ def _normalize_long_form_state_aliases(update):
                             source_item,
                             (
                                 "status", "dynamic", "runtime", "runtime_update", "runtime_patch",
-                                "operational_state", "spatial_state", "change", "description",
+                                "operational_state", "spatial_state", "current_dynamic_append",
+                                "change", "description",
                             ),
                         )
                     if not str(item.get("evidence_quote", "") or "").strip():
@@ -13660,7 +13741,8 @@ def _normalize_long_form_state_aliases(update):
                         source_item,
                         (
                             "status", "dynamic", "runtime", "runtime_update", "runtime_patch",
-                            "operational_state", "spatial_state", "change", "description",
+                            "operational_state", "spatial_state", "current_dynamic_append",
+                            "change", "description",
                         ),
                     )
                 if not str(item.get("evidence_quote", "") or "").strip():
@@ -13686,7 +13768,8 @@ def _normalize_long_form_state_aliases(update):
                     item,
                     (
                         "status", "dynamic", "runtime", "runtime_update", "runtime_patch",
-                        "operational_state", "spatial_state", "change", "description",
+                        "operational_state", "spatial_state", "current_dynamic_append",
+                        "change", "description",
                     ),
                 )
             if not str(item.get("evidence_quote", "") or "").strip():
@@ -13929,7 +14012,8 @@ def _normalize_long_form_state_aliases(update):
                     bool(item.get(key))
                     for key in (
                         "state", "dynamic", "runtime", "runtime_update", "runtime_patch",
-                        "operational_state", "spatial_state", "change", "changes", "patch",
+                        "operational_state", "spatial_state", "current_dynamic",
+                        "current_dynamic_append", "change", "changes", "patch",
                         "updates", "update", "identity_patch", "fields", "description", "content",
                     )
                 )
@@ -13995,7 +14079,8 @@ def _normalize_long_form_state_aliases(update):
                     )
                 dynamic = first_value(item, (
                     "state", "dynamic", "runtime", "runtime_update", "runtime_patch",
-                    "operational_state", "spatial_state", "current_dynamic", "change",
+                    "operational_state", "spatial_state", "current_dynamic",
+                    "current_dynamic_append", "change",
                     "latest_state", "new_state", "current_state", "state_update",
                     "new_status", "status_update", "update", "content", "status",
                     "description",
@@ -14004,7 +14089,8 @@ def _normalize_long_form_state_aliases(update):
                 if not dynamic and isinstance(nested_fields, dict):
                     dynamic = first_value(nested_fields, (
                         "state", "dynamic", "runtime", "runtime_update", "runtime_patch",
-                        "operational_state", "spatial_state", "current_dynamic", "change",
+                        "operational_state", "spatial_state", "current_dynamic",
+                        "current_dynamic_append", "change",
                         "latest_state", "new_state", "current_state", "state_update",
                         "new_status", "status_update", "update", "content", "status",
                         "public_state", "description", "notes",
@@ -14028,7 +14114,8 @@ def _normalize_long_form_state_aliases(update):
                     dynamic = first_value(nested_patch, (
                         "state", "dynamic", "runtime", "runtime_update", "runtime_patch",
                         "operational_state", "spatial_state", "current_dynamic",
-                        "change", "latest_state", "new_state", "current_state", "state_update",
+                        "current_dynamic_append", "change", "latest_state", "new_state",
+                        "current_state", "state_update",
                         "new_status", "status_update", "update", "content", "status", "public_state",
                         "description",
                     ))
@@ -14038,7 +14125,8 @@ def _normalize_long_form_state_aliases(update):
                     dynamic = first_value(nested_updates, (
                         "state", "dynamic", "runtime", "runtime_update", "runtime_patch",
                         "operational_state", "spatial_state", "current_dynamic",
-                        "change", "latest_state", "new_state", "current_state", "state_update",
+                        "current_dynamic_append", "change", "latest_state", "new_state",
+                        "current_state", "state_update",
                         "new_status", "status_update", "update", "content", "status", "public_state",
                         "description",
                     ))
@@ -18689,7 +18777,8 @@ def _normalize_long_form_reconciliation_patch(project, patch):
                     str(item.get(key, "") or "").strip()
                     for key in (
                         "update", "dynamic", "runtime", "runtime_update", "state",
-                        "change", "progress", "description", "previous", "previous_fact",
+                        "current_dynamic", "current_dynamic_append", "change", "progress",
+                        "description", "previous", "previous_fact",
                         "previous_conflict", "previous_task", "evidence_quote", "evidence",
                     )
                 )
@@ -18700,7 +18789,10 @@ def _normalize_long_form_reconciliation_patch(project, patch):
             if operation == "update" and not str(item.get("state", "") or "").strip():
                 update_text = first_value(
                     item,
-                    ("dynamic", "runtime_update", "runtime", "change", "progress", "update", "description"),
+                    (
+                        "dynamic", "runtime_update", "runtime", "current_dynamic",
+                        "current_dynamic_append", "change", "progress", "update", "description",
+                    ),
                 )
                 if update_text:
                     item["state"] = update_text
@@ -21095,6 +21187,15 @@ def _build_chapter_ai_context(project, chapter_index, action):
         chapter_outline_for_context,
     ])
     runtime_project = _chapter_memory_view(project, chapter_index)
+    planned_foreshadow_routing = action in {"draft", "script_to_novel"}
+    planned_foreshadow_routes = (
+        _planned_foreshadow_routes(
+            project.get("foreshadow_items", []),
+            chapter_index,
+            str(chap.get("title", "") or ""),
+        )
+        if planned_foreshadow_routing else []
+    )
 
     if selected_character_ids:
         selected_characters = [
@@ -21237,7 +21338,24 @@ def _build_chapter_ai_context(project, chapter_index, action):
             score -= 20
         return score
 
-    if selected_foreshadow_ids:
+    if planned_foreshadow_routing:
+        selected_foreshadows = [item for item, _phases in planned_foreshadow_routes]
+        planned_foreshadow_phase_by_id = {
+            str(
+                item.get("id", "")
+                or item.get("code", "")
+                or item.get("name", "")
+                or ""
+            ).strip(): phases
+            for item, phases in planned_foreshadow_routes
+            if str(
+                item.get("id", "")
+                or item.get("code", "")
+                or item.get("name", "")
+                or ""
+            ).strip()
+        }
+    elif selected_foreshadow_ids:
         selected_foreshadows = [
             item for item in project.get("foreshadow_items", [])
             if isinstance(item, dict) and str(item.get("id", "") or "").strip() in selected_foreshadow_ids
@@ -21251,6 +21369,7 @@ def _build_chapter_ai_context(project, chapter_index, action):
             score_func=foreshadow_score,
             min_score=100,
         )
+        planned_foreshadow_phase_by_id = {}
     foreshadow_lines = []
     for item in selected_foreshadows:
         name = str(item.get("name", "") or "").strip()
@@ -21258,6 +21377,25 @@ def _build_chapter_ai_context(project, chapter_index, action):
             continue
         code = _normalize_foreshadow_code(item.get("code", ""))
         head = f"{code}｜{name}" if code else name
+        item_id = str(
+            item.get("id", "")
+            or item.get("code", "")
+            or item.get("name", "")
+            or ""
+        ).strip()
+        if planned_foreshadow_routing:
+            phases = planned_foreshadow_phase_by_id.get(item_id, ())
+            description = _stable_foreshadow_description_context(item.get("description", ""))
+            phase_text = " + ".join(phases)
+            plan_line = (
+                f"- {head}｜本章阶段：{phase_text}"
+                f"｜计划埋设：{item.get('setup_chapter', '')}"
+                f"｜计划回收：{item.get('payoff_chapter', '')}"
+            )
+            if description:
+                plan_line += f"｜完整说明：{description}"
+            foreshadow_lines.append(plan_line)
+            continue
         aliases = _record_aliases(item, name_key="name")
         mentioned_now = any(_name_in_text(alias, current_outline_match_text) for alias in aliases)
         payoff_due = bool(_chapter_reference_score(
@@ -21321,7 +21459,7 @@ def _build_chapter_ai_context(project, chapter_index, action):
         "当前草稿结尾已经写出的句子、动作和结论也不能再次原样或同义重写。"
         "章节提纲中的核心方向、已发生事实和承接点优先；历史规划元数据只作参考，不要逐项执行、解释或扩展成任务清单。"
         "旧提纲中若残留固定伏笔编号、伏笔任务或伏笔动作，只作历史文本参考，不能当作本章硬任务；"
-        "伏笔推进与回收以动态伏笔调度参考和正文自然性为准。"
+        "正文扩写只参考【本章相关伏笔】中的计划路由；前置铺垫是可选方向，正式埋设和正式回收要结合本章提纲自然落地，其他伏笔不要主动处理。"
         "必须继承承接点里的时间、天气、地点、人物位置、情绪和未完成动作；如果上一章写明雨已停或场景已变化，"
         "不要在下一章开头改成仍在下雨或回到旧场景，除非本章提纲明确发生了新的天气/场景变化。"
         "优先参考本章需继承的关键事实，其次参考本章摘要、前文摘要、人物目标、人物性格/特点、语言风格和世界规则。"
@@ -21333,8 +21471,7 @@ def _build_chapter_ai_context(project, chapter_index, action):
         "不得用“沉默、皱眉、冷意、压迫感、空气安静、所有人愣住、下一秒”等模板化表达替代具体剧情。"
         "场景描写优先用具体物件、动作和细节承载情绪，不要总用氛围词概括。"
         "心理描写贴着人物当下的动作、对白、选择和感受展开；需要时写出人物的判断、犹豫、后悔或心动，让心理变化推动下一步。"
-        "不得用解释型旁白替代人物行动，不得替人物总结动机、立场和成长。"
-        "不得用金句式、总结式、标语式句子替代剧情，不得刻意拔高主题；章节结尾优先用具体动作、对白、信息变化或悬念收住。"
+        "章节结尾优先用具体动作、对白、信息变化或悬念收住。"
         "段落结构要有变化，不要连续使用“动作描写 + 心理解释 + 氛围总结”的固定结构。"
         "场景细节要克制：只在能强化冲突、人物状态或信息变化时，少量加入具体物件、声音、动作痕迹和环境反馈。"
         "不要写无意义生活噪声，不要让细节拖慢剧情。"
@@ -21347,7 +21484,7 @@ def _build_chapter_ai_context(project, chapter_index, action):
         "并让第一段出现新动作、新信息、新决定、新后果或必要情绪转折。"
         "章节提纲中的核心方向、已发生事实和承接点优先；历史规划元数据只作参考，不要逐项执行、解释或扩展成任务清单。"
         "旧提纲中若残留固定伏笔编号、伏笔任务或伏笔动作，只作历史文本参考，不能当作本章硬任务；"
-        "伏笔推进与回收以动态伏笔调度参考和正文自然性为准。"
+        "正文扩写只参考【本章相关伏笔】中的计划路由；前置铺垫是可选方向，正式埋设和正式回收要结合本章提纲自然落地，其他伏笔不要主动处理。"
         "必须继承上一章结尾的时间、天气、地点、人物位置、情绪和未完成动作；如果上一章写明雨已停或场景已变化，"
         "不要在本章开头改成仍在下雨或回到旧场景，除非本章提纲明确发生了新的天气/场景变化。"
         "如果有【后章衔接点】，本章结尾必须自然接到下一章开头的时间、地点、人物状态、动作和悬念；"
@@ -21361,8 +21498,7 @@ def _build_chapter_ai_context(project, chapter_index, action):
         "不得用“沉默、皱眉、冷意、压迫感、空气安静、所有人愣住、下一秒”等模板化表达替代具体剧情。"
         "场景描写优先用具体物件、动作和细节承载情绪，不要总用氛围词概括。"
         "心理描写贴着人物当下的动作、对白、选择和感受展开；需要时写出人物的判断、犹豫、后悔或心动，让心理变化推动下一步。"
-        "不得用解释型旁白替代人物行动，不得替人物总结动机、立场和成长。"
-        "不得用金句式、总结式、标语式句子替代剧情，不得刻意拔高主题；章节结尾优先用具体动作、对白、信息变化或悬念收住。"
+        "章节结尾优先用具体动作、对白、信息变化或悬念收住。"
         "段落结构要有变化，不要连续使用“动作描写 + 心理解释 + 氛围总结”的固定结构。"
         "场景细节要克制：只在能强化冲突、人物状态或信息变化时，少量加入具体物件、声音、动作痕迹和环境反馈。"
         "不要写无意义生活噪声，不要让细节拖慢剧情。"
@@ -21599,17 +21735,30 @@ def _build_chapter_ai_context(project, chapter_index, action):
     current_story_order = _story_order_from_text(chap.get("title", ""))
     if current_story_order == _STORY_ORDER_MISSING:
         current_story_order = chapter_index + 1
-    open_foreshadows = "" if selected_foreshadow_ids else _build_open_foreshadow_queue(
+    open_foreshadows = "" if planned_foreshadow_routing or selected_foreshadow_ids else _build_open_foreshadow_queue(
         project,
         selected_foreshadows,
         limit=4500,
         current_order=current_story_order,
         include_desc=action not in story_layer_actions,
     )
-    foreshadow_context = context_parts(
-        "\n".join(foreshadow_lines),
-        open_foreshadows,
-    )
+    if planned_foreshadow_routing:
+        planned_route_guide = (
+            "按伏笔计划章节提供本章相关伏笔：埋设章节前一章仅作可选的前置铺垫方向，"
+            "不要求必须出现，也不能为了铺垫改写当前主线；埋设章节按正式埋设处理，"
+            "回收章节按正式回收处理。只有当前路由列出的伏笔才是本次正文扩写的主动参考，"
+            "其他伏笔不主动传入。正式埋设或正式回收仍须结合本章提纲和人物行动自然落地，"
+            "不得凭空新增无关场景，不提前写出回收章节之后的答案。"
+        )
+        foreshadow_context = context_parts(
+            planned_route_guide if foreshadow_lines else "本章没有按计划命中的主动伏笔。",
+            "\n".join(foreshadow_lines),
+        )
+    else:
+        foreshadow_context = context_parts(
+            "\n".join(foreshadow_lines),
+            open_foreshadows,
+        )
     long_form_progress = _long_form_progress_text(project, chapter_index)
     core_project_info = "\n".join([
         f"书名：{meta.get('title', '')}",

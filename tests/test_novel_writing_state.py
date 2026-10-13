@@ -48,6 +48,19 @@ from gpt_desktop.workers import EdgeTTSWorker
 
 
 class NovelWritingStateTests(unittest.TestCase):
+    def test_first_character_can_use_style_favorite_button(self):
+        tab = NovelWritingTab.__new__(NovelWritingTab)
+        tab.current_project = {
+            "characters": [{"style_favorite_id": ""}],
+        }
+        tab.current_character_index = 0
+        tab.char_style_favorite_btn = _FakeButton()
+
+        tab._update_character_style_favorite_button()
+
+        self.assertTrue(tab.char_style_favorite_btn.enabled)
+        self.assertEqual(tab.char_style_favorite_btn.text, "收藏为主角风格")
+
     @staticmethod
     def _imported_framework_fixture():
         lines = [
@@ -690,6 +703,81 @@ class NovelWritingStateTests(unittest.TestCase):
         self.assertEqual(tab._status_message, "")
         self.assertEqual(tab._status_received_chars, 0)
         self.assertEqual(tab._status_stage_started_wall, 0.0)
+
+    def test_project_switch_clears_previous_status_snapshot(self):
+        tab = NovelWritingTab.__new__(NovelWritingTab)
+        tab._detached_auto_status_mirrored = True
+        tab._detached_auto_status_scope_id = "chapter-1"
+        tab._detached_auto_status_scope_label = "第1章《旧项目》"
+        tab._detached_auto_status_auto_progress = (1, 250)
+        tab._status_message = "正在打开：《路人甲拒绝加戏》.json"
+        tab._status_stage_key = "chapter-1:draft"
+        tab._status_stage_label = "正文直写"
+        tab._status_stage_started_at = 123.0
+        tab._status_stage_started_wall = 456.0
+        tab._status_stage_scope_label = "第1章《旧项目》"
+        tab._status_stage_active = True
+        tab._status_workflow_active = True
+        tab._status_workflow_kind = "auto_expand"
+        tab._status_workflow_started_at = 100.0
+        tab._status_workflow_started_wall = 400.0
+        tab._status_last_run_elapsed = 12.0
+        tab._status_received_chars = 8308
+        tab._status_history = [{"label": "旧项目阶段"}]
+        refreshed = []
+        tab._refresh_status_display = lambda: refreshed.append(True)
+
+        tab._reset_status_for_project_switch()
+
+        self.assertFalse(tab._detached_auto_status_mirrored)
+        self.assertEqual(tab._detached_auto_status_scope_id, "")
+        self.assertEqual(tab._detached_auto_status_scope_label, "")
+        self.assertEqual(tab._detached_auto_status_auto_progress, (0, 0))
+        self.assertEqual(tab._status_message, "")
+        self.assertEqual(tab._status_stage_key, "")
+        self.assertEqual(tab._status_stage_label, "")
+        self.assertFalse(tab._status_stage_active)
+        self.assertFalse(tab._status_workflow_active)
+        self.assertEqual(tab._status_last_run_elapsed, 0.0)
+        self.assertEqual(tab._status_received_chars, 0)
+        self.assertEqual(tab._status_history, [])
+        self.assertEqual(refreshed, [True])
+
+    def test_status_mirror_records_the_runner_project_path(self):
+        class RunningDetached:
+            current_project_path = "/tmp/source.json"
+            _status_message = "正在扩写正文..."
+            _status_stage_key = "chapter-1:draft"
+            _status_stage_label = "正文直写"
+            _status_stage_started_at = 1.0
+            _status_stage_started_wall = 2.0
+            _status_stage_scope_label = "第1章"
+            _status_stage_active = True
+            _status_history = []
+            _status_workflow_active = True
+            _status_workflow_kind = "auto_expand"
+            _status_workflow_started_at = 1.0
+            _status_workflow_started_wall = 2.0
+            _status_last_run_elapsed = 0.0
+            _status_received_chars = 10
+
+            def _status_current_chapter_scope(self):
+                return "chapter-1", "第1章"
+
+            def _auto_expand_all_chapter_progress(self):
+                return 1, 3
+
+        tab = NovelWritingTab.__new__(NovelWritingTab)
+        tab._is_detached_auto_runner = False
+        tab._background_chapter_ai_runners = {
+            os.path.realpath("/tmp/source.json"): RunningDetached(),
+        }
+        tab.current_project_path = "/tmp/source.json"
+        tab._refresh_status_display = lambda: None
+
+        tab._sync_detached_auto_status(tab._current_background_chapter_runner())
+
+        self.assertEqual(tab._status_project_path, os.path.realpath("/tmp/source.json"))
 
     def test_detached_auto_failure_uses_status_tip_without_modal_warning(self):
         tab = NovelWritingTab.__new__(NovelWritingTab)

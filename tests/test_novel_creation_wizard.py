@@ -7,6 +7,46 @@ import gpt_desktop.novel_creation_wizard as wizard
 
 
 class NovelCreationWizardPersistenceTests(unittest.TestCase):
+    def test_character_style_choice_only_exposes_personality_and_voice(self):
+        entry = {
+            "id": "style-1",
+            "name": "贺知微",
+            "source_project": "路人甲",
+            "source_character": "贺知微",
+            "personality": "先观察再行动",
+            "voice": "说话自然，少用总结句",
+            "secret": "不应传递",
+        }
+        with patch.object(wizard, "load_character_style_library", return_value=[entry]):
+            self.assertEqual(
+                wizard._character_style_choice_groups(),
+                {
+                    "已收藏人物卡风格": (
+                        "贺知微（路人甲）\n性格/特点：先观察再行动\n语言风格：说话自然，少用总结句",
+                    )
+                },
+            )
+            dialog = wizard.NovelCreationWizardDialog.__new__(
+                wizard.NovelCreationWizardDialog
+            )
+            dialog.choice_values = {"protagonist_style": "style-1"}
+            dialog.choice_display_values = {}
+            self.assertEqual(
+                dialog._choice_options("protagonist_style"),
+                [
+                    "贺知微（路人甲）\n性格/特点：先观察再行动\n语言风格：说话自然，少用总结句"
+                ],
+            )
+            self.assertEqual(
+                dialog._selected_choice_display("protagonist_style"),
+                "贺知微（路人甲）",
+            )
+            self.assertEqual(
+                dialog._selected_custom_protagonist_style(),
+                {"personality": "先观察再行动", "voice": "说话自然，少用总结句"},
+            )
+            self.assertNotIn("secret", dialog._selected_custom_protagonist_style())
+
     def test_completed_wizard_record_keeps_inspiration_and_all_steps(self):
         with tempfile.TemporaryDirectory() as tmp:
             draft_dir = os.path.join(tmp, "drafts")

@@ -85,6 +85,7 @@ from .novel_storage import (
     ensure_novel_storage,
     get_style_profile,
     list_project_summaries,
+    load_character_style_library,
     load_style_profile_library,
     load_initial_project_data,
     named_project_path,
@@ -96,6 +97,8 @@ from .novel_storage import (
     append_novel_memory_diagnostic_event,
     save_project_file,
     sync_style_profile_library_from_projects,
+    remove_character_style,
+    upsert_character_style,
     upsert_style_profile,
     unique_project_backup_path,
     unique_project_path,
@@ -1881,6 +1884,7 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
         self._status_workflow_started_wall = 0.0
         self._status_last_run_elapsed = 0.0
         self._status_received_chars = 0
+        self._status_project_path = ""
         # The foreground tab mirrors status from the detached auto-expansion
         # runner so it follows the same display path as single-chapter writing.
         self._detached_auto_status_scope_id = ""
@@ -3306,6 +3310,11 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
         self.char_secret = QLineEdit()
         self.char_personality = QLineEdit()
         self.char_voice = QLineEdit()
+        self.char_style_favorite_btn = QPushButton("收藏为主角风格")
+        self.char_style_favorite_btn.setToolTip(
+            "只收藏当前人物卡的性格/特点和语言风格，供新建向导选择"
+        )
+        self.char_style_favorite_btn.clicked.connect(self._toggle_character_style_favorite)
         self.char_name.setPlaceholderText("填写人物姓名，左侧列表会自动更新。")
         self.char_role.setPlaceholderText("例如：国公府世子、女主、反派、师父。")
         self.char_goal.setPlaceholderText("这个人物最想得到什么，或者最想避免什么。")
@@ -3326,7 +3335,13 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
         form.addRow("人物目标", self.char_goal)
         form.addRow("隐藏秘密", self.char_secret)
         form.addRow("人物性格/特点", self.char_personality)
-        form.addRow("语言风格", self.char_voice)
+        voice_row = QWidget()
+        voice_layout = QHBoxLayout(voice_row)
+        voice_layout.setContentsMargins(0, 0, 0, 0)
+        voice_layout.setSpacing(6)
+        voice_layout.addWidget(self.char_voice, 1)
+        voice_layout.addWidget(self.char_style_favorite_btn)
+        form.addRow("语言风格", voice_row)
         form.addRow("长期备注", self.char_notes)
 
         return self._two_pane_tab(left, right)
@@ -4311,7 +4326,27 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
         char["personality"] = self.char_personality.text().strip()
         char["voice"] = self.char_voice.text().strip()
         char["notes"] = self.char_notes.toPlainText().strip()
+        favorite_id = str(char.get("style_favorite_id", "") or "").strip()
+        if favorite_id:
+            if char["personality"] and char["voice"]:
+                upsert_character_style(
+                    char["personality"],
+                    char["voice"],
+                    name=char["name"],
+                    source_project=str(
+                        self.current_project.get("meta", {}).get("title", "")
+                        if isinstance(self.current_project.get("meta", {}), dict)
+                        else ""
+                    ).strip(),
+                    source_character=char["name"],
+                    style_id=favorite_id,
+                )
+            else:
+                remove_character_style(favorite_id)
+                char["style_favorite_id"] = ""
         self._refresh_character_item(index)
+        if index == self.current_character_index:
+            self._update_character_style_favorite_button()
 
     def _save_lore_from_editor(self):
         self._save_lore_at_index(self.current_lore_index)
@@ -4617,6 +4652,67 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
     def _on_character_selected(self, row):
         self._switch_indexed_editor(row, "current_character_index", self._save_character_at_index, self._load_character_to_editor)
 
+    def _update_character_style_favorite_button(self):
+        button = getattr(self, "char_style_favorite_btn", None)
+        if button is None:
+            return
+        index = getattr(self, "current_character_index", -1)
+        try:
+            index = int(index)
+        except (TypeError, ValueError):
+            index = -1
+        characters = self.current_project.get("characters", [])
+        if index < 0 or index >= len(characters):
+            button.setEnabled(False)
+            button.setText("收藏为主角风格")
+            return
+        favorite_id = str(characters[index].get("style_favorite_id", "") or "").strip()
+        button.setEnabled(True)
+        button.setText("取消主角风格收藏" if favorite_id else "收藏为主角风格")
+
+    def _toggle_character_style_favorite(self):
+        index = getattr(self, "current_character_index", -1)
+        try:
+            index = int(index)
+        except (TypeError, ValueError):
+            index = -1
+        characters = self.current_project.get("characters", [])
+        if index < 0 or index >= len(characters):
+            return
+        self._save_character_at_index(index)
+        char = characters[index]
+        favorite_id = str(char.get("style_favorite_id", "") or "").strip()
+        if favorite_id:
+            remove_character_style(favorite_id)
+            char["style_favorite_id"] = ""
+            self._update_character_style_favorite_button()
+            self._mark_dirty()
+            return
+        personality = str(char.get("personality", "") or "").strip()
+        voice = str(char.get("voice", "") or "").strip()
+        if not personality or not voice:
+            QMessageBox.information(
+                self,
+                "收藏人物风格",
+                "请先填写完整的“人物性格/特点”和“语言风格”，再收藏为主角风格。",
+            )
+            return
+        project_meta = self.current_project.get("meta", {})
+        source_project = project_meta.get("title", "") if isinstance(project_meta, dict) else ""
+        favorite_id = upsert_character_style(
+            personality,
+            voice,
+            name=char.get("name", ""),
+            source_project=source_project,
+            source_character=char.get("name", ""),
+        )
+        if not favorite_id:
+            QMessageBox.warning(self, "收藏人物风格", "保存人物风格失败，请稍后重试。")
+            return
+        char["style_favorite_id"] = favorite_id
+        self._update_character_style_favorite_button()
+        self._mark_dirty()
+
     def _on_chapter_selected(self, row):
         self._switch_indexed_editor(row, "current_chapter_index", self._save_chapter_at_index, self._load_chapter_to_editor)
 
@@ -4635,6 +4731,7 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
                     w.clear()
                 self.char_notes.clear()
                 self.current_character_index = -1
+                self._update_character_style_favorite_button()
                 return
             char = self.current_project["characters"][row]
             self.char_name.setText(char.get("name", ""))
@@ -4645,6 +4742,7 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
             self.char_voice.setText(char.get("voice", ""))
             self.char_notes.setPlainText(char.get("notes", ""))
             self.current_character_index = row
+            self._update_character_style_favorite_button()
         finally:
             self._loading = was_loading
 
@@ -5112,6 +5210,7 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
             getattr(self, "_context_build_pending", {}) or {}
         )
         for name in (
+            "_status_project_path",
             "_status_message",
             "_status_stage_key",
             "_status_stage_label",
@@ -5417,6 +5516,9 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
         runners.clear()
 
     def _load_project_data(self, data, path="", defer_helpers=False):
+        previous_project_path = self._canonical_project_path(
+            getattr(self, "current_project_path", "")
+        )
         detached_task = self._detach_foreground_chapter_tasks(
             "加载新项目数据，旧项目章节任务转入后台"
         )
@@ -5473,6 +5575,11 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
             )
             creation_meta_reconciled = self._reconcile_creation_wizard_meta()
             self.current_project_path = path
+            loaded_project_path = self._canonical_project_path(path)
+            if previous_project_path and loaded_project_path and previous_project_path != loaded_project_path:
+                self._reset_status_for_project_switch(loaded_project_path)
+            elif loaded_project_path and not str(getattr(self, "_status_project_path", "") or "").strip():
+                self._status_project_path = loaded_project_path
             self._record_current_project_file_signature(path)
             analysis_state = _normalize_candidate_analysis_state(self.current_project.get("analysis_state", {}))
             self.failed_analysis_chunks = analysis_state.get("failed_candidate_chunks", [])
@@ -12272,6 +12379,9 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
         """Mirror detached expansion status into the visible project tab."""
         if not self._detached_auto_status_is_current(runner):
             return False
+        self._status_project_path = self._canonical_project_path(
+            getattr(runner, "current_project_path", "")
+        )
         status_fields = (
             "_status_message",
             "_status_stage_key",
@@ -12314,6 +12424,34 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
     def _clear_detached_auto_status_mirror(self):
         if not bool(getattr(self, "_detached_auto_status_mirrored", False)):
             return
+        self._detached_auto_status_mirrored = False
+        self._detached_auto_status_scope_id = ""
+        self._detached_auto_status_scope_label = ""
+        self._detached_auto_status_auto_progress = (0, 0)
+        self._status_message = ""
+        self._status_stage_key = ""
+        self._status_stage_label = ""
+        self._status_stage_started_at = 0.0
+        self._status_stage_started_wall = 0.0
+        self._status_stage_scope_label = ""
+        self._status_stage_active = False
+        self._status_workflow_active = False
+        self._status_workflow_kind = ""
+        self._status_workflow_started_at = 0.0
+        self._status_workflow_started_wall = 0.0
+        self._status_last_run_elapsed = 0.0
+        self._status_received_chars = 0
+        self._status_history = []
+        self._refresh_status_display()
+
+    def _reset_status_for_project_switch(self, project_path=None):
+        """Discard status fields that belong to the project just left."""
+        target_path = (
+            project_path
+            if project_path is not None
+            else getattr(self, "current_project_path", "")
+        )
+        self._status_project_path = self._canonical_project_path(target_path)
         self._detached_auto_status_mirrored = False
         self._detached_auto_status_scope_id = ""
         self._detached_auto_status_scope_label = ""
@@ -17697,7 +17835,6 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
             if not isinstance(data, dict):
                 QMessageBox.warning(self, "打开失败", "项目文件无效。")
                 return
-            self.set_status_tip(f"正在打开：{os.path.basename(path)}")
             saved_before_open = self._has_unsaved_current_work()
             if saved_before_open:
                 self._save_current_work(
@@ -17712,7 +17849,10 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
                 self._sync_completed_background_chapter_plan()
             self._remember_project_path(path)
             self._select_project_list_path(path)
-            if not attached:
+            current_runner = self._current_background_chapter_runner()
+            if attached or current_runner is not None:
+                self._sync_detached_auto_status(current_runner)
+            else:
                 self._update_detached_auto_source_lock()
                 self.set_status_tip(f"已打开：{os.path.basename(path)}")
             self._log_novel_perf(
@@ -20411,6 +20551,20 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
         return min(end, max(start + 1, progress))
 
     def _refresh_status_display(self):
+        current_path = self._canonical_project_path(
+            getattr(self, "current_project_path", "")
+        )
+        status_path = self._canonical_project_path(
+            getattr(self, "_status_project_path", "")
+        )
+        if current_path and status_path and current_path != status_path:
+            if hasattr(self, "status_label"):
+                self.status_label.setText("")
+                self.status_label.setToolTip("")
+            if hasattr(self, "status_meta_label"):
+                self.status_meta_label.setText("")
+                self.status_meta_label.setToolTip("")
+            return
         has_active_work = self._status_has_active_work()
         if bool(getattr(self, "_status_workflow_active", False)) and not has_active_work:
             self._status_end_workflow()
@@ -20510,6 +20664,15 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
     def set_status_tip(self, text):
         if self._forward_chapter_task_signal("set_status_tip", text):
             return
+        current_path = self._canonical_project_path(
+            getattr(self, "current_project_path", "")
+        )
+        status_path = self._canonical_project_path(
+            getattr(self, "_status_project_path", "")
+        )
+        if current_path and status_path and current_path != status_path:
+            return
+        self._status_project_path = current_path or status_path
         text = str(text or "")
         self.setToolTip("")
         self._status_message = text

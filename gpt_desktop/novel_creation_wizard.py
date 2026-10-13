@@ -26,6 +26,7 @@ from PySide6.QtWidgets import (
 )
 
 from .core import HISTORY_DIR, load_json_file, now_str, safe_remove_file, save_json_file
+from .novel_storage import load_character_style_library
 from .novel_utils import (
     _entity_naming_guidance,
     _normalize_foreshadow_code,
@@ -169,6 +170,7 @@ CREATION_CHOICE_GROUPS = {
             "感情牵引", "群像共行", "幕后布局",
         ),
     },
+    "protagonist_style": {},
     "style": {
         "故事驱动": (
             "复仇逆袭", "权谋博弈", "冒险探索", "经营建设",
@@ -200,6 +202,7 @@ CREATION_CHOICE_DEFAULTS = {
     "genre": "都市脑洞",
     "theme": "",
     "protagonist_route": "觉醒金手指",
+    "protagonist_style": "",
     "style": "热血升级",
     "length": "50万字",
     "chapter_words": "3000字",
@@ -210,6 +213,7 @@ CREATION_CHOICE_TITLES = {
     "genre": "主分类",
     "theme": "主题（最多选2项）",
     "protagonist_route": "主角起点",
+    "protagonist_style": "自定义主角风格",
     "style": "风格与节奏",
     "length": "预计篇幅",
     "chapter_words": "单章字数",
@@ -220,10 +224,81 @@ CREATION_CHOICE_HINTS = {
     "genre": "主分类只能选择一项，分类详情会在弹窗内滚动查看。",
     "theme": "主题最多选择两项，用来补充世界背景、叙事视角或阅读感觉。",
     "protagonist_route": "主角从什么状态开始，会决定第一章的抓力。",
+    "protagonist_style": "从人物卡收藏中选择主角的性格/特点和语言风格，只继承表达底色。",
     "style": "分类很多，选一个最想保留的主感觉即可。",
     "length": "只是规划参考，后续可以继续调整。",
     "chapter_words": "章节总数和阶段边界会按这个字数计算，后面仍可调整。",
 }
+
+
+def _character_style_choice_label(item):
+    item = item if isinstance(item, dict) else {}
+    name = _as_text(item.get("name")) or _as_text(item.get("source_character")) or "未命名人物风格"
+    source_project = _as_text(item.get("source_project"))
+    return f"{name}（{source_project}）" if source_project else name
+
+
+def _wrap_character_style_option_text(value, width=18):
+    value = _as_text(value)
+    if not value:
+        return ""
+    return "\n".join(value[index:index + width] for index in range(0, len(value), width))
+
+
+def _character_style_choice_option_label(item):
+    """Show enough style content in the picker while keeping the summary short."""
+    item = item if isinstance(item, dict) else {}
+    lines = [_wrap_character_style_option_text(_character_style_choice_label(item))]
+    personality = _wrap_character_style_option_text(item.get("personality"))
+    voice = _wrap_character_style_option_text(item.get("voice"))
+    if personality:
+        lines.append(f"性格/特点：{personality}")
+    if voice:
+        lines.append(f"语言风格：{voice}")
+    return "\n".join(lines)
+
+
+def _character_style_choice_entries():
+    return [
+        item for item in load_character_style_library()
+        if isinstance(item, dict)
+        and (_as_text(item.get("personality")) or _as_text(item.get("voice")))
+    ]
+
+
+def _character_style_choice_groups():
+    entries = _character_style_choice_entries()
+    return {
+        "已收藏人物卡风格": tuple(
+            _character_style_choice_option_label(item) for item in entries
+        )
+    }
+
+
+def _character_style_id_for_selected(selected):
+    """Recover a library ID when reopening a completed project as a draft."""
+    selected = selected if isinstance(selected, dict) else {}
+    selected_label = _as_text(selected.get("protagonist_style"))
+    custom_style = selected.get("custom_protagonist_style", {})
+    custom_style = custom_style if isinstance(custom_style, dict) else {}
+    personality = _as_text(custom_style.get("personality"))
+    voice = _as_text(custom_style.get("voice"))
+    for item in _character_style_choice_entries():
+        if selected_label and _character_style_choice_label(item) == selected_label:
+            return _as_text(item.get("id"))
+        if (
+            personality
+            and voice
+            and _as_text(item.get("personality")) == personality
+            and _as_text(item.get("voice")) == voice
+        ):
+            return _as_text(item.get("id"))
+    return ""
+
+
+CREATION_CUSTOM_PROTAGONIST_STYLE_GUIDANCE = """
+如果作者选择了 custom_protagonist_style，只把其中的人物性格/特点和语言风格作为主角的长期表达底色；不要复制收藏人物的姓名、身份、目标、秘密、关系、经历、原项目设定或具体剧情。故事事实仍以作者灵感和当前题材为准，收藏风格只影响主角怎样观察、反应、选择和说话，让新的主角在自己的处境中自然表现出相近的底色。
+""".strip()
 
 CREATION_PROCEDURAL_PLOT_GUARD = _procedural_plot_guard_guidance().strip()
 CREATION_ENTITY_NAMING_GUIDANCE = _entity_naming_guidance().strip()
@@ -260,12 +335,13 @@ COMMON_CREATION_RULES = f"""
 5. 危险和代价优先落到躲避、交换、资源变化、身份暴露、关系破裂、空间变化和局势改变上；身体伤势随题材和现场需要自然出现。
 6. 实力体系跟随题材本身生长：明确需要修炼、境界或能力层次的故事，在设定库里展开来源、层次、边界和成长条件；普通都市、言情、悬疑、灵异、现实和没有明确力量体系的科幻，把重点放在人物处境、规则边界和具体事件上。
 7. {CREATION_CHARACTER_PROFILE_GUIDANCE}
-8. 不使用“短促直接”“温和克制”“冷淡”“命令式”这几类语言风格，其它可以正常使用。
-9. {CREATION_PROCEDURAL_PLOT_GUARD}
-10. {CREATION_ENTITY_NAMING_GUIDANCE}
-11. 字段值直接写具体内容，保持清楚、稳定、方便后续执行；内容呈现为作者自己的故事底稿，各资料类别各自承担作用，同一段剧情只放在最合适的位置。
-12. JSON 只作为程序读取的容器：保持紧凑，不用 Markdown、缩进、空行或多余空格；压缩外壳，不压缩事实、人物数量、设定数量、伏笔数量或故事内容。
-13. {CREATION_INSPIRATION_FACT_GUIDANCE}
+8. {CREATION_CUSTOM_PROTAGONIST_STYLE_GUIDANCE}
+9. 不使用“短促直接”“温和克制”“冷淡”“命令式”这几类语言风格，其它可以正常使用。
+10. {CREATION_PROCEDURAL_PLOT_GUARD}
+11. {CREATION_ENTITY_NAMING_GUIDANCE}
+12. 字段值直接写具体内容，保持清楚、稳定、方便后续执行；内容呈现为作者自己的故事底稿，各资料类别各自承担作用，同一段剧情只放在最合适的位置。
+13. JSON 只作为程序读取的容器：保持紧凑，不用 Markdown、缩进、空行或多余空格；压缩外壳，不压缩事实、人物数量、设定数量、伏笔数量或故事内容。
+14. {CREATION_INSPIRATION_FACT_GUIDANCE}
 """.strip()
 
 
@@ -2817,6 +2893,7 @@ def creation_wizard_draft_from_project_draft(project):
                 _as_text(selected.get("protagonist_route"))
                 or CREATION_CHOICE_DEFAULTS["protagonist_route"]
             ),
+            "protagonist_style": _character_style_id_for_selected(selected),
             "style": _as_text(selected.get("style")) or CREATION_CHOICE_DEFAULTS["style"],
             "length": length_choice(total_words),
             "chapter_words": chapter_choice,
@@ -5194,8 +5271,10 @@ class CreationChoicePickerDialog(QDialog):
                 seen_options.add(option)
                 button = QPushButton(option)
                 button.setCheckable(True)
-                button.setMinimumHeight(40)
+                line_count = max(1, option.count("\n") + 1)
+                button.setMinimumHeight(max(40, 14 + line_count * 20))
                 button.setCursor(Qt.PointingHandCursor)
+                button.setToolTip(option.replace("\n", " "))
                 button.setStyleSheet(
                     """
                     QPushButton {
@@ -5472,6 +5551,7 @@ class NovelCreationWizardDialog(QDialog):
         self.premise_selected_index = 0
         self._premise_loading_index = -1
         self.choice_values = {}
+        self.choice_display_values = {}
         self.choice_summary_buttons = {}
         self.choice_arrow_buttons = {}
         self.choice_widgets = []
@@ -5875,6 +5955,41 @@ class NovelCreationWizardDialog(QDialog):
     def _selected_choice(self, key):
         return str(self.choice_values.get(key, "") or "").strip()
 
+    def _selected_choice_display(self, key):
+        value = self._selected_choice(key)
+        if key == "protagonist_style" and value:
+            for item in _character_style_choice_entries():
+                if _as_text(item.get("id")) == value:
+                    return _character_style_choice_label(item)
+        return str(self.choice_display_values.get(key, "") or value or "").strip()
+
+    def _selected_choice_picker_value(self, key):
+        value = self._selected_choice(key)
+        if key == "protagonist_style" and value:
+            for item in _character_style_choice_entries():
+                if _as_text(item.get("id")) == value:
+                    return _character_style_choice_option_label(item)
+        return self._selected_choice_display(key)
+
+    def _selected_custom_protagonist_style(self):
+        selected_id = self._selected_choice("protagonist_style")
+        if not selected_id:
+            return {}
+        for item in _character_style_choice_entries():
+            if _as_text(item.get("id")) != selected_id:
+                continue
+            style = {
+                "personality": _as_text(item.get("personality")),
+                "voice": _as_text(item.get("voice")),
+            }
+            return {key: value for key, value in style.items() if value}
+        return {}
+
+    def _choice_groups(self, key):
+        if key == "protagonist_style":
+            return _character_style_choice_groups()
+        return CREATION_CHOICE_GROUPS.get(key, {})
+
     def _allow_power_levels(self):
         premise = self._current_premise()
         return story_requires_explicit_power_levels(
@@ -6180,6 +6295,30 @@ class NovelCreationWizardDialog(QDialog):
 
     def _set_choice(self, key, value):
         value = str(value or "").strip()
+        display_value = value
+        if key == "protagonist_style":
+            selected_item = next(
+                (
+                    item for item in _character_style_choice_entries()
+                    if _as_text(item.get("id")) == value
+                    or _character_style_choice_label(item) == value
+                    or _character_style_choice_option_label(item) == value
+                ),
+                None,
+            )
+            if selected_item is not None:
+                value = _as_text(selected_item.get("id"))
+                display_value = _character_style_choice_label(selected_item)
+            elif not value:
+                self.choice_values.pop(key, None)
+                self.choice_display_values.pop(key, None)
+                return
+            else:
+                # A deleted library item should not leave an unusable ID in a
+                # restored draft. The user can choose another saved style.
+                self.choice_values.pop(key, None)
+                self.choice_display_values.pop(key, None)
+                return
         if key == "theme":
             theme_values = []
             for item in re.split(r"[、,，]", value):
@@ -6191,9 +6330,10 @@ class NovelCreationWizardDialog(QDialog):
             return
         previous = self._selected_choice(key)
         self.choice_values[key] = value
+        self.choice_display_values[key] = display_value
         button = self.choice_summary_buttons.get(key)
         if button is not None:
-            button.setText(value or "点击选择")
+            button.setText(display_value or "点击选择")
         arrows = self.choice_arrow_buttons.get(key, ())
         if arrows:
             if key == "theme":
@@ -6208,9 +6348,8 @@ class NovelCreationWizardDialog(QDialog):
         self._on_choice_changed(key)
         self._save_draft()
 
-    @staticmethod
-    def _choice_options(key):
-        groups = CREATION_CHOICE_GROUPS.get(key, {})
+    def _choice_options(self, key):
+        groups = self._choice_groups(key)
         options = []
         seen = set()
         for values in groups.values():
@@ -6229,7 +6368,7 @@ class NovelCreationWizardDialog(QDialog):
         options = self._choice_options(key)
         if not options:
             return
-        current = self._selected_choice(key)
+        current = self._selected_choice_picker_value(key)
         try:
             index = options.index(current)
         except ValueError:
@@ -6345,8 +6484,8 @@ class NovelCreationWizardDialog(QDialog):
     def _open_choice_picker(self, key):
         dialog = CreationChoicePickerDialog(
             CREATION_CHOICE_TITLES.get(key, key),
-            CREATION_CHOICE_GROUPS.get(key, {}),
-            current_value=self._selected_choice(key),
+            self._choice_groups(key),
+            current_value=self._selected_choice_picker_value(key),
             max_selections=2 if key == "theme" else 1,
             parent=self,
         )
@@ -6413,7 +6552,7 @@ class NovelCreationWizardDialog(QDialog):
         for index, key in enumerate(
             (
                 "audience", "genre", "theme", "protagonist_route",
-                "style", "length", "chapter_words",
+                "protagonist_style", "style", "length", "chapter_words",
             )
         ):
             row_index, column_index = divmod(index, 3)
@@ -6725,6 +6864,11 @@ class NovelCreationWizardDialog(QDialog):
                 "ending": "开放式、非圆满",
             },
         }
+        custom_protagonist_style = self._selected_custom_protagonist_style()
+        if step in {"premise", "bible"} and custom_protagonist_style:
+            # Only the reusable personality and voice are sent to the model;
+            # source names and the original character's story data stay local.
+            context["author_input"]["custom_protagonist_style"] = custom_protagonist_style
         if step == "premise":
             current_names = [
                 _creation_premise_name(item.get("protagonist"))
@@ -7830,6 +7974,12 @@ class NovelCreationWizardDialog(QDialog):
                 selected.get("protagonist_route")
                 or self._selected_choice("protagonist_route")
             )
+            selected["protagonist_style"] = self._selected_choice_display("protagonist_style")
+            custom_protagonist_style = self._selected_custom_protagonist_style()
+            if custom_protagonist_style:
+                selected["custom_protagonist_style"] = custom_protagonist_style
+            else:
+                selected.pop("custom_protagonist_style", None)
             selected["story_engine"] = (
                 selected.get("story_engine")
                 or self._selected_choice("style")

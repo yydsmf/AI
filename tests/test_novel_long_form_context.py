@@ -1082,6 +1082,41 @@ class NovelLongFormContextTests(unittest.TestCase):
         self.assertEqual(normalized["foreshadow_updates"][0]["operation"], "update")
         self.assertEqual(normalized["foreshadow_updates"][0]["state"], "线索仍指向旧码头。")
 
+    def test_state_aliases_accept_current_dynamic_append(self):
+        normalized = _normalize_long_form_state_aliases({
+            "record_updates": {
+                "characters": [{
+                    "operation": "update",
+                    "ref": "C001",
+                    "current_dynamic_append": "甲在本章明确拒绝替同伴做决定。",
+                    "evidence_quote": "拒绝替同伴做决定",
+                }],
+                "lore": [],
+            },
+        })
+
+        item = normalized["record_updates"]["characters"][0]
+        self.assertEqual(item["state"], "甲在本章明确拒绝替同伴做决定。")
+        self.assertEqual(item["changes"], [item["state"]])
+
+    def test_reconciliation_accepts_current_dynamic_append(self):
+        project = self._project_with_current_chapter(_new_chapter(0))
+        project["characters"] = [{"id": "char-c001", "name": "甲"}]
+        normalized = _normalize_long_form_reconciliation_patch(project, {
+            "record_updates": {
+                "characters": [{
+                    "operation": "update",
+                    "ref": "char-c001",
+                    "current_dynamic_append": "甲在本章明确拒绝替同伴做决定。",
+                    "evidence_quote": "拒绝替同伴做决定",
+                }],
+                "lore": [],
+            },
+        })
+
+        item = normalized["record_updates"]["characters"][0]
+        self.assertEqual(item["state"], "甲在本章明确拒绝替同伴做决定。")
+
     def test_update_payload_expands_runtime_fields_and_safe_canonical_character_ref(self):
         chapter = _new_chapter(0)
         project = self._project_with_current_chapter(chapter)
@@ -1847,6 +1882,135 @@ class NovelLongFormContextTests(unittest.TestCase):
         self.assertIn("SA-0024", index_text)
         self.assertIn("全量紧凑引用目录", index_text)
 
+    def test_selected_foreshadow_detail_restores_source_plan_and_history_boundary(self):
+        current = _new_chapter(0)
+        current["memory_selection"] = {
+            "foreshadow_ids": ["foreshadow-selected"],
+        }
+        project = self._project_with_current_chapter(current)
+        project["foreshadow_items"] = [
+            {
+                "id": "foreshadow-selected",
+                "code": "F0016",
+                "name": "离开校园后的身份焦虑",
+                "status": "未埋",
+                "description": "贺知微面对毕业与求职时发现路人甲身份不能解决现实压力。",
+                "setup_chapter": "第64章",
+                "payoff_chapter": "第106章",
+                "revealed": "当前只确认她仍在寻找现实出口。",
+                "remaining_secret": "她是否能回到穿书前的人生。",
+            },
+            {
+                "id": "foreshadow-other",
+                "code": "F0021",
+                "name": "贺知微的存在感变弱",
+                "status": "未埋",
+                "description": "不应进入当前选中伏笔的详情。",
+                "setup_chapter": "第83章",
+                "payoff_chapter": "第140章",
+            },
+        ]
+        project["long_form_memory"] = {
+            "schema_version": 2,
+            "revision": 7,
+            "record_runtime": {
+                "foreshadows": {
+                    "foreshadow-selected": {
+                        "state": "未埋",
+                        "developments": [
+                            {
+                                "chapter_index": 4,
+                                "changes": ["旧章节曾观察到相关线索"],
+                            }
+                        ],
+                    }
+                }
+            },
+            "active_facts": [],
+            "stage_archives": [],
+        }
+
+        index_text = _build_long_form_selection_index(project, 0)
+
+        self.assertIn("伏笔原始说明：贺知微面对毕业与求职时发现路人甲身份不能解决现实压力。", index_text)
+        self.assertIn("计划埋设：第64章", index_text)
+        self.assertIn("计划回收：第106章", index_text)
+        self.assertIn("历史运行观察（仅供参考，不能替代本章正文证据）", index_text)
+        self.assertIn("旧章节曾观察到相关线索", index_text)
+        self.assertNotIn("不应进入当前选中伏笔的详情", index_text)
+
+    def test_draft_foreshadow_route_overrides_legacy_selection_and_open_queue(self):
+        chapters = [_new_chapter(index) for index in range(3)]
+        chapters[0]["title"] = "第一章 开场"
+        chapters[1]["title"] = "第二章 当前"
+        chapters[1]["outline"] = "本章推进当前冲突。"
+        chapters[1]["memory_selection"] = {
+            "foreshadow_ids": ["legacy-foreshadow"],
+        }
+        chapters[2]["title"] = "第三章 后续"
+        project = self._project_with_current_chapter(chapters[1])
+        project["chapters"] = chapters
+        project["foreshadow_items"] = [
+            {
+                "id": "planned-foreshadow",
+                "code": "F0001",
+                "name": "当前正式线索",
+                "setup_chapter": "第二章",
+                "payoff_chapter": "第三章",
+                "description": "本章应该正式出现的完整线索说明。",
+            },
+            {
+                "id": "legacy-foreshadow",
+                "code": "F0002",
+                "name": "旧选择伏笔",
+                "setup_chapter": "第十章",
+                "payoff_chapter": "第二十章",
+                "description": "不能因旧章节选择记录进入本章。",
+            },
+            {
+                "id": "open-foreshadow",
+                "code": "F0003",
+                "name": "未到章节伏笔",
+                "setup_chapter": "第八章",
+                "payoff_chapter": "第十二章",
+                "description": "未命中计划时不主动传入。",
+            },
+        ]
+
+        context = _build_chapter_ai_context(project, 1, "draft")
+        foreshadow_section = self._context_section(context, "本章相关伏笔")
+
+        self.assertIn("当前正式线索", foreshadow_section)
+        self.assertIn("本章阶段：正式埋设", foreshadow_section)
+        self.assertIn("完整说明：本章应该正式出现的完整线索说明。", foreshadow_section)
+        self.assertNotIn("旧选择伏笔", foreshadow_section)
+        self.assertNotIn("未到章节伏笔", foreshadow_section)
+        self.assertNotIn("开放伏笔队列", foreshadow_section)
+
+    def test_draft_foreshadow_route_marks_same_setup_and_payoff_chapter(self):
+        current = _new_chapter(0)
+        current["title"] = "第一章 同时落点"
+        current["outline"] = "本章完成一次短线索的出现和解释。"
+        project = self._project_with_current_chapter(current)
+        project["foreshadow_items"] = [{
+            "code": "F0001",
+            "name": "一次性线索",
+            "setup_chapter": "第一章",
+            "payoff_chapter": "第一章",
+            "description": "同一章完成出现与解释。",
+        }]
+
+        context = _build_chapter_ai_context(project, 0, "draft")
+        foreshadow_section = self._context_section(context, "本章相关伏笔")
+
+        self.assertIn("正式埋设 + 正式回收", foreshadow_section)
+        self.assertIn("计划埋设：第一章", foreshadow_section)
+        self.assertIn("计划回收：第一章", foreshadow_section)
+
+        compact_contract = _long_form_update_contract_instructions(project, 0, compact=True)
+        self.assertIn("历史运行观察是旧章节的观察记录，不能替代本章最终正文证据", compact_contract)
+        self.assertIn("本章伏笔是否更新必须以最终正文中的evidence_quote和当前正文语义为准", compact_contract)
+
     def test_selection_index_expands_past_15k_before_dropping_reference_coverage(self):
         current = _new_chapter(0)
         current["memory_selection"] = {
@@ -2199,8 +2363,7 @@ class NovelLongFormContextTests(unittest.TestCase):
         self.assertIn("【对白自然衔接】", context)
         self.assertIn("需要说明来由、指代或态度时，把意思说清楚", context)
         self.assertIn("场景描写优先用具体物件、动作和细节承载情绪", context)
-        self.assertIn("不得用解释型旁白替代人物行动", context)
-        self.assertIn("不得用金句式、总结式、标语式句子替代剧情", context)
+        self.assertIn("不得用解释式、观点式和“金句式”抽象表达", context)
         self.assertIn("段落结构要有变化", context)
         self.assertNotIn("对白要有真人说话的不完整感", context)
         self.assertNotIn("对白不要每句都完整、漂亮、逻辑闭合", context)
@@ -3305,7 +3468,9 @@ class NovelLongFormContextTests(unittest.TestCase):
         self.assertIn("甲", current_section)
         self.assertIn("账册", lore_section)
         self.assertNotIn("密室", lore_section)
-        self.assertIn("账册缺页", foreshadow_section)
+        # Body expansion now follows the chapter plan route instead of the
+        # previous chapter's memory-selection list.
+        self.assertNotIn("账册缺页", foreshadow_section)
         self.assertNotIn("旧伤", foreshadow_section)
 
         summary_context = _build_chapter_ai_context(project, 0, "summary")
@@ -5170,13 +5335,14 @@ class NovelLongFormContextTests(unittest.TestCase):
         self.assertNotIn("赵明其实是失踪皇子", context)
         self.assertIn("目前只知道日落后不得进入禁地", context)
         self.assertNotIn("进入禁地的人都会被王后控制", context)
-        self.assertIn("众人只听见旧钟在午夜响起", context)
-        self.assertNotIn("旧钟钥匙藏在井底", context)
+        self.assertNotIn("众人只听见旧钟在午夜响起", context)
+        self.assertIn("旧钟钥匙藏在井底", context)
         self.assertNotIn("幕后指使者是王后", context)
 
         converted_context = _build_chapter_ai_context(project, 0, "script_to_novel")
         self.assertNotIn("赵明其实是失踪皇子", converted_context)
         self.assertNotIn("幕后指使者是王后", converted_context)
+        self.assertIn("旧钟钥匙藏在井底", converted_context)
 
         chapter["outline"] = "本章回收旧钟异响，揭示旧钟钥匙。"
         chapter["title"] = "第十章 旧钟真相"
@@ -5450,7 +5616,7 @@ class NovelLongFormContextTests(unittest.TestCase):
         self.assertNotIn("人物任务：快速建立主角行动风格", context)
         self.assertIn("快速建立主角行动风格", context)
         self.assertIn("旧提纲中若残留固定伏笔编号、伏笔任务或伏笔动作", context)
-        self.assertIn("动态伏笔调度参考", context)
+        self.assertNotIn("动态伏笔调度参考", context)
         self.assertNotIn("伏笔任务：埋下风雨信号", context)
 
     def test_global_note_is_private_and_not_in_chapter_ai_context(self):
@@ -5632,8 +5798,8 @@ class NovelLongFormContextTests(unittest.TestCase):
             {
                 "name": "虎符失踪",
                 "status": "已埋",
-                "setup_chapter": "",
-                "payoff_chapter": "",
+                "setup_chapter": "第十章",
+                "payoff_chapter": "第二十章",
                 "description": "伏笔唯一说明。\n补充：伏笔唯一说明。",
             }
         ]
@@ -5675,7 +5841,7 @@ class NovelLongFormContextTests(unittest.TestCase):
             "name": "虎符失踪",
             "status": "已埋",
             "setup_chapter": "第2章",
-            "payoff_chapter": "",
+            "payoff_chapter": "第二十章",
             "description": "牵出兵权。",
         })
 
@@ -5712,8 +5878,8 @@ class NovelLongFormContextTests(unittest.TestCase):
 
         self.assertIn("【本章相关伏笔】", context)
         self.assertIn("虎符失踪", context)
-        self.assertIn("开放伏笔队列", context)
-        self.assertIn("密室旧钟", context)
+        self.assertNotIn("开放伏笔队列", context)
+        self.assertNotIn("密室旧钟", context)
 
     def test_chapter_context_prioritizes_actionable_open_foreshadow_queue_without_secret(self):
         current = _new_chapter(0)
@@ -5740,10 +5906,9 @@ class NovelLongFormContextTests(unittest.TestCase):
 
         context = _build_chapter_ai_context(project, 0, "draft")
 
-        self.assertIn("开放伏笔队列", context)
-        self.assertIn("终局密钥", context)
-        self.assertNotIn("关系最终真相", context)
-        self.assertLess(context.index("终局密钥"), context.index("背景待处理0"))
+        self.assertNotIn("开放伏笔队列", context)
+        self.assertNotIn("终局密钥", context)
+        self.assertNotIn("背景待处理0", context)
 
     def test_chapter_context_excludes_no_need_foreshadows_from_open_queue(self):
         current = _new_chapter(0)
@@ -5770,8 +5935,8 @@ class NovelLongFormContextTests(unittest.TestCase):
         context = _build_chapter_ai_context(project, 0, "draft")
         foreshadow_section = self._context_section(context, "本章相关伏笔")
 
-        self.assertIn("开放伏笔队列", foreshadow_section)
-        self.assertIn("终局密钥", foreshadow_section)
+        self.assertNotIn("开放伏笔队列", foreshadow_section)
+        self.assertNotIn("终局密钥", foreshadow_section)
         self.assertNotIn("白兔挂件去向", foreshadow_section)
 
     def test_chapter_context_prioritizes_due_open_foreshadow_queue(self):
@@ -5799,13 +5964,12 @@ class NovelLongFormContextTests(unittest.TestCase):
 
         context = _build_chapter_ai_context(project, 0, "draft")
 
-        self.assertIn("开放伏笔队列", context)
-        self.assertIn("动态伏笔调度参考", context)
-        self.assertIn("不要为了凑回收率强行解释", context)
-        self.assertIn("临近回收伏笔", context)
-        self.assertLess(context.index("临近回收伏笔"), context.index("普通伏笔0"))
+        self.assertNotIn("开放伏笔队列", context)
+        self.assertNotIn("动态伏笔调度参考", context)
+        self.assertNotIn("临近回收伏笔", context)
+        self.assertNotIn("普通伏笔0", context)
 
-    def test_chapter_context_keeps_open_foreshadow_route_without_future_answer(self):
+    def test_chapter_context_uses_full_planned_foreshadow_card_for_prelude(self):
         current = _new_chapter(9)
         current["title"] = "第十章 雨后总部"
         current["outline"] = "本章处理总部内斗，不直接回收伏笔。"
@@ -5814,7 +5978,7 @@ class NovelLongFormContextTests(unittest.TestCase):
             {
                 "name": "旧手机匿名短信",
                 "status": "已埋",
-                "setup_chapter": "第八章",
+                "setup_chapter": "第十一章",
                 "payoff_chapter": "第十二章",
                 "description": (
                     "匿名短信不是普通威胁。"
@@ -5828,9 +5992,11 @@ class NovelLongFormContextTests(unittest.TestCase):
         foreshadow_section = self._context_section(context, "本章相关伏笔")
 
         self.assertIn("旧手机匿名短信", foreshadow_section)
-        self.assertIn("第八章 -> 第十二章", foreshadow_section)
-        self.assertNotIn("旧手机号码会指向景辰京城总部内部泄密者。", foreshadow_section)
-        self.assertNotIn("回收时必须确认陈景川没有按短信要求走正门。", foreshadow_section)
+        self.assertIn("本章阶段：前置铺垫", foreshadow_section)
+        self.assertIn("计划埋设：第十一章", foreshadow_section)
+        self.assertIn("计划回收：第十二章", foreshadow_section)
+        self.assertIn("旧手机号码会指向景辰京城总部内部泄密者。", foreshadow_section)
+        self.assertIn("回收时必须确认陈景川没有按短信要求走正门。", foreshadow_section)
 
     def test_chapter_context_prioritizes_foreshadow_alias_from_description(self):
         current = _new_chapter(0)
@@ -5850,7 +6016,7 @@ class NovelLongFormContextTests(unittest.TestCase):
         project["foreshadow_items"].append({
             "name": "旧钟声",
             "status": "已埋",
-            "setup_chapter": "第3章",
+            "setup_chapter": "第十二章",
             "payoff_chapter": "",
             "description": "别称：密室钟声。钟声响起表示暗门开启。",
         })
@@ -5880,7 +6046,7 @@ class NovelLongFormContextTests(unittest.TestCase):
             "name": "虎符失踪",
             "status": "已埋",
             "setup_chapter": "第3章",
-            "payoff_chapter": "",
+            "payoff_chapter": "第二十章",
             "description": "代号：玄铁令。真名：半枚虎符。牵出兵权交易。",
         })
 
@@ -6033,8 +6199,8 @@ class NovelLongFormContextTests(unittest.TestCase):
         self.assertNotIn("自动章节顺序线", context)
         self.assertIn("卷宗缺少最后一页", context)
         self.assertNotIn("自动章节压缩", context)
-        self.assertIn("开放伏笔队列", context)
-        self.assertIn("虎符失踪", context)
+        self.assertNotIn("开放伏笔队列", context)
+        self.assertNotIn("虎符失踪", context)
 
     def test_chapter_context_inherits_recent_chapter_relevance_without_manual_links(self):
         previous = _new_chapter(0)

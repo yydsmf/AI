@@ -6,6 +6,7 @@ import sys
 import threading
 import time
 import traceback
+import uuid
 from copy import deepcopy
 
 from .core import HISTORY_DIR, _atomic_write_json, load_json_file, now_str
@@ -26,6 +27,10 @@ NOVEL_PROJECT_SUMMARY_CACHE_FILE = os.path.join(
     HISTORY_DIR, "novel_project_summary_cache.json"
 )
 NOVEL_STYLE_LIBRARY_FILE = os.path.join(HISTORY_DIR, "novel_style_profiles.json")
+NOVEL_CHARACTER_STYLE_LIBRARY_FILE = os.path.join(
+    HISTORY_DIR,
+    "novel_character_styles.json",
+)
 NOVEL_BUILTIN_STYLE_LIBRARY_FILE = os.path.join(
     os.path.dirname(os.path.abspath(__file__)),
     "resources",
@@ -862,13 +867,143 @@ def sync_style_profile_library_from_projects():
     return before
 
 
+def _normalized_character_style_record(item, style_id=""):
+    """Keep only reusable protagonist personality and voice fields."""
+    item = item if isinstance(item, dict) else {}
+    personality = str(item.get("personality", "") or "").strip()
+    voice = str(item.get("voice", "") or "").strip()
+    if not personality and not voice:
+        return None
+    record_id = str(style_id or item.get("id", "") or "").strip()
+    if not record_id:
+        record_id = uuid.uuid4().hex
+    return {
+        "id": record_id,
+        "name": str(item.get("name", "") or "").strip() or "未命名人物风格",
+        "personality": personality,
+        "voice": voice,
+        "source_project": str(item.get("source_project", "") or "").strip(),
+        "source_character": str(item.get("source_character", "") or "").strip(),
+        "created_at": str(item.get("created_at", "") or "").strip() or now_str(),
+        "updated_at": str(item.get("updated_at", "") or "").strip() or now_str(),
+    }
+
+
+def load_character_style_library():
+    raw = load_json_file(NOVEL_CHARACTER_STYLE_LIBRARY_FILE, {})
+    items = raw.get("styles", []) if isinstance(raw, dict) else []
+    styles = []
+    seen = set()
+    for item in items if isinstance(items, list) else []:
+        record = _normalized_character_style_record(item)
+        if not record or record["id"] in seen:
+            continue
+        seen.add(record["id"])
+        styles.append(record)
+    styles.sort(key=lambda item: (item.get("name", ""), item.get("id", "")))
+    return styles
+
+
+def save_character_style_library(styles):
+    normalized = []
+    seen = set()
+    for item in styles if isinstance(styles, list) else []:
+        record = _normalized_character_style_record(item)
+        if not record or record["id"] in seen:
+            continue
+        seen.add(record["id"])
+        normalized.append(record)
+    normalized.sort(key=lambda item: (item.get("name", ""), item.get("id", "")))
+    _save_novel_json_strict(
+        NOVEL_CHARACTER_STYLE_LIBRARY_FILE,
+        {"version": 1, "styles": normalized},
+    )
+    return normalized
+
+
+def upsert_character_style(
+    personality,
+    voice,
+    name="",
+    source_project="",
+    source_character="",
+    style_id="",
+):
+    record = _normalized_character_style_record({
+        "id": style_id,
+        "name": name,
+        "personality": personality,
+        "voice": voice,
+        "source_project": source_project,
+        "source_character": source_character,
+    })
+    if not record:
+        return ""
+    styles = load_character_style_library()
+    existing = next((item for item in styles if item.get("id") == record["id"]), None)
+    if existing:
+        record["created_at"] = existing.get("created_at", "") or record["created_at"]
+        styles = [record if item.get("id") == record["id"] else item for item in styles]
+    else:
+        styles.append(record)
+    save_character_style_library(styles)
+    return record["id"]
+
+
+def remove_character_style(style_id):
+    style_id = str(style_id or "").strip()
+    if not style_id:
+        return False
+    styles = load_character_style_library()
+    remaining = [item for item in styles if item.get("id") != style_id]
+    if len(remaining) == len(styles):
+        return False
+    save_character_style_library(remaining)
+    return True
+
+
 def safe_project_timestamp():
     return now_str().replace(":", "").replace("-", "").replace(" ", "_")
+
+
+def _project_timestamp_from_mtime(mtime):
+    try:
+        value = float(mtime or 0)
+    except (TypeError, ValueError):
+        value = 0.0
+    return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(value)) if value else ""
+
+
+def _project_file_created_at(path, fallback_mtime=0):
+    try:
+        stat = os.stat(path)
+        birthtime = float(getattr(stat, "st_birthtime", 0) or 0)
+    except Exception:
+        birthtime = 0.0
+    return _project_timestamp_from_mtime(birthtime or fallback_mtime)
+
+
+def _project_created_at_from_disk(path, mtime=0, raw=None):
+    if not isinstance(raw, dict):
+        raw = load_json_file(path, {})
+    if isinstance(raw, dict):
+        created_at = str(raw.get("created_at", "") or "").strip()
+        if created_at:
+            return created_at
+    return _project_file_created_at(path, mtime)
+
+
+def _project_sort_key(created_at, filename=""):
+    # All persisted timestamps use the sortable ``YYYY-MM-DD HH:MM:SS`` form.
+    # The filename tie-breaker keeps projects deterministic when timestamps
+    # were created in the same second or came from legacy files.
+    return str(created_at or ""), str(filename or "")
 
 
 def list_project_files(include_empty=False):
     if not os.path.exists(NOVEL_DIR):
         return []
+    cache = _load_project_summary_cache()
     out = []
     for name in os.listdir(NOVEL_DIR):
         if not name.lower().endswith(".json"):
@@ -878,9 +1013,15 @@ def list_project_files(include_empty=False):
             mtime = os.path.getmtime(path)
         except Exception:
             mtime = 0
-        out.append((mtime, name, path))
-    out.sort(reverse=True)
-    return out
+        cached = cache.get(os.path.abspath(path), {}) if isinstance(cache, dict) else {}
+        cached_record = cached.get("record", {}) if isinstance(cached, dict) else {}
+        created_at = (
+            str(cached_record.get("created_at", "") or "").strip()
+            if isinstance(cached_record, dict) else ""
+        ) or _project_file_created_at(path, mtime)
+        out.append((mtime, name, path, created_at))
+    out.sort(key=lambda item: _project_sort_key(item[3], item[1]), reverse=True)
+    return [(mtime, name, path) for mtime, name, path, _created_at in out]
 
 
 def list_project_records(include_empty=False):
@@ -890,14 +1031,22 @@ def list_project_records(include_empty=False):
         if isinstance(raw, dict) and raw.get("auto_saved_reason") and not include_empty:
             continue
         data = _normalize_project(raw)
+        created_at = str(data.get("created_at", "") or "").strip()
+        if not created_at:
+            created_at = _project_created_at_from_disk(path, mtime, raw)
         records.append(
             {
                 "mtime": mtime,
                 "filename": filename,
                 "path": path,
+                "created_at": created_at,
                 "data": data,
             }
         )
+    records.sort(
+        key=lambda item: _project_sort_key(item.get("created_at"), item.get("filename")),
+        reverse=True,
+    )
     return records
 
 
@@ -913,7 +1062,7 @@ def _project_summary_cache_path():
 
 def _load_project_summary_cache():
     cache = load_json_file(_project_summary_cache_path(), {})
-    if not isinstance(cache, dict) or cache.get("version") != 1:
+    if not isinstance(cache, dict) or cache.get("version") != 3:
         return {}
     entries = cache.get("entries", {})
     return entries if isinstance(entries, dict) else {}
@@ -922,7 +1071,7 @@ def _load_project_summary_cache():
 def _save_project_summary_cache(entries):
     try:
         _save_novel_json_strict(_project_summary_cache_path(), {
-            "version": 1,
+            "version": 3,
             "updated_at": now_str(),
             "entries": entries if isinstance(entries, dict) else {},
         })
@@ -940,7 +1089,7 @@ def _project_summary_signature(path):
         return 0, 0
 
 
-def _build_project_summary_record(mtime, filename, path, data):
+def _build_project_summary_record(mtime, filename, path, data, created_at=""):
     data = data if isinstance(data, dict) else {}
     meta = data.get("meta", {}) if isinstance(data.get("meta"), dict) else {}
     chapters = data.get("chapters", []) if isinstance(data.get("chapters"), list) else []
@@ -950,10 +1099,16 @@ def _build_project_summary_record(mtime, filename, path, data):
             continue
         body_words += _body_display_len(chap.get("text", ""))
     auto_saved_reason = str(data.get("auto_saved_reason", "") or "").strip()
+    created_at = (
+        str(data.get("created_at", "") or "").strip()
+        or str(created_at or "").strip()
+        or _project_file_created_at(path, mtime)
+    )
     return {
         "mtime": mtime,
         "filename": filename,
         "path": path,
+        "created_at": created_at,
         "title": meta.get("title") or os.path.splitext(filename)[0],
         "body_words": body_words,
         "chapters": len(chapters),
@@ -983,11 +1138,16 @@ def list_project_summaries(include_empty=False):
             record["path"] = path
         else:
             raw = load_json_file(path, {})
+            cached_record = cached.get("record", {}) if isinstance(cached, dict) else {}
             record = _build_project_summary_record(
                 mtime,
                 filename,
                 path,
                 raw if isinstance(raw, dict) else {},
+                created_at=(
+                    cached_record.get("created_at", "")
+                    if isinstance(cached_record, dict) else ""
+                ) or _project_created_at_from_disk(path, mtime, raw),
             )
             cache_changed = True
         if record.get("auto_saved_reason") and not include_empty:
@@ -1007,6 +1167,10 @@ def list_project_summaries(include_empty=False):
         cache_changed = True
     if cache_changed:
         _save_project_summary_cache(next_cache)
+    records.sort(
+        key=lambda item: _project_sort_key(item.get("created_at"), item.get("filename")),
+        reverse=True,
+    )
     return records
 
 
@@ -1069,6 +1233,24 @@ def save_project_file(path, data, preserve_mtime=False):
             old_times = (stat.st_atime, stat.st_mtime)
         except Exception:
             old_times = None
+    data = deepcopy(data) if isinstance(data, dict) else {}
+    existing_created_at = str(data.get("created_at", "") or "").strip()
+    if not existing_created_at and os.path.exists(path):
+        existing = load_json_file(path, {})
+        if isinstance(existing, dict):
+            existing_created_at = str(existing.get("created_at", "") or "").strip()
+        if not existing_created_at:
+            try:
+                existing_created_at = _project_file_created_at(
+                    path, os.path.getmtime(path)
+                )
+            except Exception:
+                existing_created_at = ""
+    data["created_at"] = (
+        str(data.get("created_at", "") or "").strip()
+        or existing_created_at
+        or now_str()
+    )
     data = _normalize_project(data)
     data["updated_at"] = now_str()
     _save_novel_json_strict(path, data)

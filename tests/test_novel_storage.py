@@ -10,6 +10,44 @@ from gpt_desktop.core import load_json_file, save_json_file
 
 
 class NovelStorageTests(unittest.TestCase):
+    def test_character_style_library_round_trip_and_update(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            old_file = novel_storage.NOVEL_CHARACTER_STYLE_LIBRARY_FILE
+            try:
+                novel_storage.NOVEL_CHARACTER_STYLE_LIBRARY_FILE = os.path.join(
+                    tmp, "novel_character_styles.json"
+                )
+                self.assertEqual(
+                    novel_storage.upsert_character_style("", "", name="空风格"),
+                    "",
+                )
+                style_id = novel_storage.upsert_character_style(
+                    "谨慎、观察细节",
+                    "说话自然，少用总结式句子",
+                    name="贺知微",
+                    source_project="路人甲",
+                    source_character="贺知微",
+                )
+                self.assertTrue(style_id)
+                self.assertEqual(
+                    novel_storage.upsert_character_style(
+                        "更谨慎，但会在压力下直接行动",
+                        "说话自然，少用总结式句子",
+                        name="贺知微",
+                        style_id=style_id,
+                    ),
+                    style_id,
+                )
+                styles = novel_storage.load_character_style_library()
+                self.assertEqual(len(styles), 1)
+                self.assertEqual(styles[0]["id"], style_id)
+                self.assertIn("压力", styles[0]["personality"])
+                self.assertTrue(novel_storage.remove_character_style(style_id))
+                self.assertEqual(novel_storage.load_character_style_library(), [])
+                self.assertFalse(novel_storage.remove_character_style(style_id))
+            finally:
+                novel_storage.NOVEL_CHARACTER_STYLE_LIBRARY_FILE = old_file
+
     def test_project_summaries_cache_avoids_rereading_unchanged_large_projects(self):
         with tempfile.TemporaryDirectory() as tmp:
             old_dir = novel_storage.NOVEL_DIR
@@ -73,6 +111,61 @@ class NovelStorageTests(unittest.TestCase):
             finally:
                 novel_storage.NOVEL_DIR = old_dir
                 novel_storage.NOVEL_BACKUP_DIR = old_backup_dir
+
+    def test_project_summaries_keep_creation_order_when_files_are_updated(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            old_dir = novel_storage.NOVEL_DIR
+            try:
+                novel_storage.NOVEL_DIR = os.path.join(tmp, "projects")
+                novel_storage.ensure_novel_storage()
+                first = os.path.join(novel_storage.NOVEL_DIR, "先创建.json")
+                second = os.path.join(novel_storage.NOVEL_DIR, "后创建.json")
+                save_json_file(first, {
+                    "created_at": "2026-10-13 09:00:00",
+                    "meta": {"title": "先创建"},
+                    "chapters": [],
+                })
+                save_json_file(second, {
+                    "created_at": "2026-10-13 10:00:00",
+                    "meta": {"title": "后创建"},
+                    "chapters": [],
+                })
+                # Simulate the later-created project being saved first and
+                # receiving the newest filesystem mtime.
+                os.utime(first, (200, 200))
+                os.utime(second, (100, 100))
+
+                self.assertEqual(
+                    [item["title"] for item in novel_storage.list_project_summaries()],
+                    ["后创建", "先创建"],
+                )
+
+                save_json_file(second, {
+                    "created_at": "2026-10-13 10:00:00",
+                    "updated_at": "2026-10-13 12:00:00",
+                    "meta": {"title": "后创建"},
+                    "chapters": [{"text": "保存后的正文"}],
+                })
+                self.assertEqual(
+                    [item["title"] for item in novel_storage.list_project_summaries()],
+                    ["后创建", "先创建"],
+                )
+            finally:
+                novel_storage.NOVEL_DIR = old_dir
+
+    def test_save_project_file_preserves_creation_time(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "项目.json")
+            novel_storage.save_project_file(path, {
+                "created_at": "2026-10-13 08:00:00",
+                "meta": {"title": "项目"},
+            })
+            novel_storage.save_project_file(path, {
+                "meta": {"title": "项目"},
+                "chapters": [{"text": "更新"}],
+            })
+            saved = load_json_file(path, {})
+            self.assertEqual(saved.get("created_at"), "2026-10-13 08:00:00")
 
     def test_old_auto_saved_projects_are_filtered_from_records(self):
         with tempfile.TemporaryDirectory() as tmp:

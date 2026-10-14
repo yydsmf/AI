@@ -61,6 +61,35 @@ class NovelWritingStateTests(unittest.TestCase):
         self.assertTrue(tab.char_style_favorite_btn.enabled)
         self.assertEqual(tab.char_style_favorite_btn.text, "收藏为主角风格")
 
+    def test_removed_character_style_is_not_recreated_when_card_is_saved(self):
+        tab = NovelWritingTab.__new__(NovelWritingTab)
+        tab.current_character_index = 0
+        tab.current_project = {
+            "meta": {"title": "测试小说"},
+            "characters": [{"style_favorite_id": "removed-style"}],
+        }
+        for field, value in (
+            ("name", "主角"), ("role", "学生"), ("goal", "完成学业"),
+            ("secret", "秘密"), ("personality", "谨慎"), ("voice", "自然"),
+        ):
+            setattr(tab, f"char_{field}", _FakeLineEdit(value))
+        tab.char_notes = _FakePlainTextEdit("长期备注")
+        tab.char_style_favorite_btn = _FakeButton()
+        tab._refresh_character_item = lambda _index: None
+
+        with patch("gpt_desktop.novel_writing_tab.load_character_style_library", return_value=[]), \
+            patch("gpt_desktop.novel_writing_tab.upsert_character_style") as upsert:
+            tab._update_character_style_favorite_button()
+            self.assertEqual(tab.char_style_favorite_btn.text, "收藏为主角风格")
+            tab._save_character_at_index(0)
+
+        upsert.assert_not_called()
+        char = tab.current_project["characters"][0]
+        self.assertEqual(char["style_favorite_id"], "")
+        self.assertEqual(char["personality"], "谨慎")
+        self.assertEqual(char["voice"], "自然")
+        self.assertEqual(char["notes"], "长期备注")
+
     @staticmethod
     def _imported_framework_fixture():
         lines = [
@@ -1203,13 +1232,31 @@ class NovelWritingStateTests(unittest.TestCase):
         tab._refresh_status_display()
 
         self.assertNotIn("已接收字符", tab.status_label.text)
-        self.assertIn("当前进度：10%", tab.status_label.text)
+        self.assertNotIn("当前进度", tab.status_label.text)
+        self.assertNotIn("%", tab.status_label.tooltip)
 
         tab._status_received_chars = 1999
         tab._refresh_status_display()
 
         self.assertIn("已接收字符：1999", tab.status_label.text)
-        self.assertIn("当前进度：", tab.status_label.text)
+        self.assertNotIn("当前进度", tab.status_label.text)
+        self.assertNotIn("%", tab.status_label.tooltip)
+        self.assertIn("第1章", tab.status_meta_label.text)
+        self.assertIn("状态整理", tab.status_meta_label.text)
+
+        for stage, message in (
+            ("draft", "正在直接扩写正文..."),
+            ("chapter_plan", "正在生成章节规划..."),
+            ("memory_repair", "正在修复本章状态..."),
+            ("memory_reconcile", "正在十章边界对账..."),
+            ("chapter_complete", "章节 AI 已完成。"),
+        ):
+            with self.subTest(stage=stage):
+                tab._status_stage_key = f"chapter-1:{stage}"
+                tab._status_message = message
+                tab._refresh_status_display()
+                self.assertNotIn("%", tab.status_label.text)
+                self.assertNotIn("%", tab.status_label.tooltip)
 
     def test_stopping_worker_does_not_clear_completed_stage_history(self):
         class RunningWorker:

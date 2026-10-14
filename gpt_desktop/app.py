@@ -2,7 +2,18 @@ import os
 import sys
 
 from PySide6.QtCore import QEvent, QObject, QSize, QTimer
-from PySide6.QtWidgets import QApplication, QLineEdit, QMainWindow, QPlainTextEdit, QTextEdit, QVBoxLayout, QWidget, QTabWidget
+from PySide6.QtWidgets import (
+    QApplication,
+    QDialogButtonBox,
+    QLineEdit,
+    QMainWindow,
+    QMessageBox,
+    QPlainTextEdit,
+    QTextEdit,
+    QVBoxLayout,
+    QWidget,
+    QTabWidget,
+)
 
 from .agent_tab import AgentTab
 from .ai_workflow_tab import AIWorkflowTab
@@ -340,6 +351,8 @@ class ChineseContextMenuFilter(QObject):
 
     def eventFilter(self, obj, event):
         try:
+            if event.type() == QEvent.Show:
+                self._translate_standard_button_texts(obj)
             if event.type() != QEvent.ContextMenu:
                 return super().eventFilter(obj, event)
 
@@ -364,6 +377,45 @@ class ChineseContextMenuFilter(QObject):
             return False
 
         return super().eventFilter(obj, event)
+
+    @staticmethod
+    def _translate_standard_button_texts(obj):
+        """Translate Qt's platform-default English dialog buttons globally."""
+        if isinstance(obj, QMessageBox):
+            labels = {
+                QMessageBox.Ok: "确认",
+                QMessageBox.Save: "保存",
+                QMessageBox.Cancel: "取消",
+                QMessageBox.Close: "关闭",
+                QMessageBox.Yes: "确认",
+                QMessageBox.No: "取消",
+                QMessageBox.Abort: "中止",
+                QMessageBox.Retry: "重试",
+                QMessageBox.Ignore: "忽略",
+            }
+            for button in obj.buttons():
+                standard_button = obj.standardButton(button)
+                text = labels.get(standard_button)
+                if text:
+                    button.setText(text)
+            return
+        if isinstance(obj, QDialogButtonBox):
+            labels = {
+                QDialogButtonBox.Ok: "确认",
+                QDialogButtonBox.Save: "保存",
+                QDialogButtonBox.Cancel: "取消",
+                QDialogButtonBox.Close: "关闭",
+                QDialogButtonBox.Yes: "确认",
+                QDialogButtonBox.No: "取消",
+                QDialogButtonBox.Abort: "中止",
+                QDialogButtonBox.Retry: "重试",
+                QDialogButtonBox.Ignore: "忽略",
+            }
+            for button in obj.buttons():
+                standard_button = obj.standardButton(button)
+                text = labels.get(standard_button)
+                if text:
+                    button.setText(text)
 
     def _parents(self, w):
         result = []

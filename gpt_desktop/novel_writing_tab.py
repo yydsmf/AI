@@ -2181,6 +2181,7 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
             item.setToolTip(full_name)
             item.setData(Qt.UserRole, page_index)
             self.nav_list.addItem(item)
+            item.setHidden(short_name == "候选")
         self.nav_list.setCurrentRow(0)
         content_layout.addWidget(self.tabs, 1)
         right_layout.addWidget(content_area, 1)
@@ -4327,6 +4328,12 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
         char["voice"] = self.char_voice.text().strip()
         char["notes"] = self.char_notes.toPlainText().strip()
         favorite_id = str(char.get("style_favorite_id", "") or "").strip()
+        if favorite_id and not any(
+            item.get("id") == favorite_id for item in load_character_style_library()
+        ):
+            # A style removed from the wizard must not be recreated by autosave.
+            char["style_favorite_id"] = ""
+            favorite_id = ""
         if favorite_id:
             if char["personality"] and char["voice"]:
                 upsert_character_style(
@@ -4667,6 +4674,10 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
             button.setText("收藏为主角风格")
             return
         favorite_id = str(characters[index].get("style_favorite_id", "") or "").strip()
+        if favorite_id and not any(
+            item.get("id") == favorite_id for item in load_character_style_library()
+        ):
+            favorite_id = ""
         button.setEnabled(True)
         button.setText("取消主角风格收藏" if favorite_id else "收藏为主角风格")
 
@@ -20576,22 +20587,9 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
             self._status_close_current_stage()
         message = str(getattr(self, "_status_message", "") or "")
         received_chars = int(getattr(self, "_status_received_chars", 0) or 0)
-        stage_key = str(getattr(self, "_status_stage_key", "") or "")
-        stage_code = stage_key.rsplit(":", 1)[-1] if stage_key else ""
-        if not stage_code or stage_code in {"status", "global:status"}:
-            _, inferred_stage_code = self._status_stage_for_message(message)
-            stage_code = inferred_stage_code
-        progress_percent = self._status_progress_percent(
-            message,
-            stage_code,
-            received_chars=received_chars,
-            active=has_active_work or bool(getattr(self, "_status_workflow_active", False)),
-        )
         suffix_parts = []
         if received_chars > 0:
             suffix_parts.append(f"已接收字符：{received_chars}")
-        if progress_percent > 0:
-            suffix_parts.append(f"当前进度：{progress_percent}%")
         if suffix_parts:
             suffix = "；" + "；".join(suffix_parts)
             available = max(0, 180 - len(suffix))

@@ -275,6 +275,74 @@ class NovelAnalysisWorkerTests(unittest.TestCase):
         self.assertNotIn('"character_task"', prompt)
         self.assertNotIn('"mainline_task"', prompt)
 
+    def test_chapter_plan_prompt_uses_dynamic_slots_for_stage_states(self):
+        cases = (
+            (3000, 34, 167, 0),
+            (2500, 40, 200, 0),
+            (4000, 25, 125, 0),
+            (3000, 34, 167, 34),
+            (3000, 20, 167, 34),
+            (3000, 31, 167, 136),
+            (3000, 1, 167, 166),
+        )
+        for wizard_mode in (False, True):
+            for average_words, count, total, existing in cases:
+                with self.subTest(wizard_mode=wizard_mode, count=count, existing=existing):
+                    worker = NovelChapterPlanWorker(
+                        "http://example.test", "key", "model", "context",
+                        500000, average_words, count,
+                        total_chapter_count=total,
+                        existing_chapter_count=existing,
+                        creation_wizard_mode=wizard_mode,
+                    )
+
+                    prompt = worker._analysis_prompt()
+
+                    self.assertIn(f"c数组必须恰好包含{count}个章节对象", prompt)
+                    self.assertIn(
+                        f"第1项对应全书第{existing + 1}章，最后一项对应全书第{existing + count}章。",
+                        prompt,
+                    )
+                    self.assertIn("阶段结束状态（exit_state/end_state）必须合并到对应的已有章节中自然完成", prompt)
+                    self.assertIn("不得另起收尾章或过渡章", prompt)
+                    self.assertIn("如果当前批次尚未到达阶段结束章，不要提前完成当前阶段", prompt)
+                    self.assertIn("超出本批范围的后续阶段只作为未来承接方向，本批返回不得提前安排", prompt)
+                    self.assertNotIn("阶段结局在当前批次范围内自然兑现", prompt)
+                    self.assertNotIn("扩展章继续深化当前阶段", prompt)
+                    if wizard_mode:
+                        self.assertIn('{"c":[{"t":"章节名","o":"本章具体故事提纲","p":[]}]}', prompt)
+                    else:
+                        self.assertIn('{"c":[{"i":1,"t":"章节名","o":"本章具体故事提纲","p":[]}]}', prompt)
+
+    def test_chapter_plan_count_validation_still_rejects_extra_or_missing_slots(self):
+        for wizard_mode in (False, True):
+            for count, existing in ((25, 0), (34, 34), (40, 0), (31, 136)):
+                with self.subTest(wizard_mode=wizard_mode, count=count, existing=existing):
+                    worker = NovelChapterPlanWorker(
+                        "http://example.test", "key", "model", "context",
+                        500000, 3000, count,
+                        total_chapter_count=200,
+                        existing_chapter_count=existing,
+                        creation_wizard_mode=wizard_mode,
+                    )
+                    chapters = [
+                        {"t": f"雨夜来客{index}", "o": "主角遇见来客，收到一封信。", "p": []}
+                        for index in range(1, count + 2)
+                    ]
+
+                    plan = worker._normalize_plan({"c": chapters[:count]})
+
+                    self.assertEqual(len(plan["chapters"]), count)
+                    self.assertEqual(plan["existing_chapter_count"], existing)
+                    self.assertEqual(
+                        [item["index"] for item in plan["chapters"]],
+                        list(range(1, count + 1)),
+                    )
+                    for actual_count in (count - 1, count + 1):
+                        with self.subTest(actual_count=actual_count):
+                            with self.assertRaisesRegex(ValueError, f"实际返回{actual_count}章"):
+                                worker._normalize_plan({"c": chapters[:actual_count]})
+
     def test_framework_import_prompt_uses_compact_chapter_locations(self):
         worker = NovelFrameworkImportWorker(
             "http://example.test",

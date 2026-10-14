@@ -22,11 +22,11 @@ from PySide6.QtWidgets import (
     QAbstractItemView, QApplication, QDialog, QDialogButtonBox, QFrame,
     QGridLayout, QHBoxLayout, QLabel, QListWidget, QListWidgetItem, QLineEdit,
     QMessageBox, QPlainTextEdit, QPushButton, QScrollArea, QSizePolicy, QSpinBox,
-    QStackedWidget, QToolButton, QVBoxLayout, QWidget,
+    QStackedWidget, QStyle, QToolButton, QVBoxLayout, QWidget,
 )
 
 from .core import HISTORY_DIR, load_json_file, now_str, safe_remove_file, save_json_file
-from .novel_storage import load_character_style_library
+from .novel_storage import load_character_style_library, remove_character_style
 from .novel_utils import (
     _entity_naming_guidance,
     _normalize_foreshadow_code,
@@ -5205,7 +5205,12 @@ c 中每项只能使用 n、r、g、s、p、v、q；l 中每项只能使用 n、
 class CreationChoicePickerDialog(QDialog):
     """弹出式偏好选择器，避免把大量分类长期铺在向导首屏。"""
 
-    def __init__(self, title, groups, current_value="", max_selections=1, parent=None):
+    style_removed = Signal(str)
+
+    def __init__(
+        self, title, groups, current_value="", max_selections=1, parent=None,
+        removable_options=None,
+    ):
         super().__init__(parent)
         self.setWindowTitle(f"选择{title}")
         _fit_dialog_to_screen(
@@ -5221,6 +5226,9 @@ class CreationChoicePickerDialog(QDialog):
         self.selected_value = ""
         self.selected_values = []
         self._selection_label = None
+        self._removable_options = dict(removable_options or {})
+        self._empty_label = None
+        self._is_style_picker = removable_options is not None
         self._build_ui(groups if isinstance(groups, dict) else {}, current_value)
 
     def _build_ui(self, groups, current_value):
@@ -5239,7 +5247,10 @@ class CreationChoicePickerDialog(QDialog):
         hint.setWordWrap(True)
         root.addWidget(hint)
 
-        current_values = self._split_values(current_value)
+        current_values = (
+            [str(current_value)] if self.max_selections == 1 and current_value
+            else self._split_values(current_value)
+        )
         self.selected_values = current_values[: self.max_selections]
         if self.max_selections > 1:
             self._selection_label = QLabel()
@@ -5255,6 +5266,7 @@ class CreationChoicePickerDialog(QDialog):
         layout.setContentsMargins(2, 2, 8, 2)
         layout.setSpacing(12)
         seen_options = set()
+        column_count = 2 if self._is_style_picker else 3
         for group_title, options in groups.items():
             title = QLabel(str(group_title))
             title.setStyleSheet("font-size: 13px; font-weight: 600; color: #e3e6eb;")
@@ -5264,6 +5276,7 @@ class CreationChoicePickerDialog(QDialog):
             grid.setHorizontalSpacing(7)
             grid.setVerticalSpacing(7)
             display_index = 0
+            row_widgets = {}
             for option in options if isinstance(options, (list, tuple)) else ():
                 option = str(option)
                 if option in seen_options:
@@ -5308,12 +5321,64 @@ class CreationChoicePickerDialog(QDialog):
                     button.clicked.connect(
                         lambda _checked=False, value=option: self._select(value)
                     )
+                option_widget = button
+                style_id = self._removable_options.get(option)
+                if style_id:
+                    option_widget = QFrame()
+                    option_widget.setObjectName("character_style_option")
+                    option_widget.setStyleSheet(
+                        "QFrame#character_style_option {"
+                        "background: #22252b; border: 1px solid #3a3f49; border-radius: 5px;"
+                        "}"
+                    )
+                    option_widget.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+                    option_layout = QHBoxLayout(option_widget)
+                    option_layout.setContentsMargins(4, 4, 4, 4)
+                    option_layout.setSpacing(3)
+                    button.setStyleSheet(
+                        "QPushButton { color: #d9dde4; background: transparent; border: 0;"
+                        "padding: 3px 5px; text-align: left; }"
+                        "QPushButton:hover { color: #ffffff; background: #2b3038; }"
+                        "QPushButton:checked { color: #ffffff; background: #315d86; }"
+                    )
+                    button.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
+                    option_layout.addWidget(button)
+                    remove_button = QToolButton()
+                    remove_button.setObjectName(f"remove_character_style_{style_id}")
+                    remove_button.setIcon(self.style().standardIcon(QStyle.SP_TrashIcon))
+                    remove_button.setFixedSize(28, 28)
+                    remove_button.setAutoRaise(True)
+                    remove_button.setStyleSheet(
+                        "QToolButton { background: transparent; border: none; padding: 0; }"
+                        "QToolButton:hover { background: #2b3038; border: none; border-radius: 4px; }"
+                        "QToolButton:pressed { background: #315d86; border: none; border-radius: 4px; }"
+                    )
+                    remove_button.setCursor(Qt.PointingHandCursor)
+                    remove_button.setToolTip("取消收藏")
+                    remove_button.setAccessibleName("取消收藏")
+                    remove_button.clicked.connect(
+                        lambda _checked=False, value=option, sid=style_id, widget=option_widget:
+                        self._remove_style(value, sid, widget)
+                    )
+                    option_layout.addWidget(remove_button, 0, Qt.AlignVCenter)
                 row, column = divmod(display_index, 3)
-                grid.addWidget(button, row, column)
+                if self._is_style_picker:
+                    row, column = divmod(display_index, column_count)
+                row_widgets.setdefault(row, []).append(option_widget)
+                grid.addWidget(option_widget, row, column)
                 display_index += 1
-            for column in range(3):
+            if self._is_style_picker:
+                for widgets in row_widgets.values():
+                    row_height = max(widget.sizeHint().height() for widget in widgets)
+                    for widget in widgets:
+                        widget.setFixedHeight(row_height)
+            for column in range(column_count):
                 grid.setColumnStretch(column, 1)
             layout.addLayout(grid)
+        if self._is_style_picker:
+            self._empty_label = QLabel("暂无收藏")
+            self._empty_label.setVisible(not self._removable_options)
+            layout.addWidget(self._empty_label)
         layout.addStretch(1)
         scroll.setWidget(content)
         root.addWidget(scroll, 1)
@@ -5371,6 +5436,35 @@ class CreationChoicePickerDialog(QDialog):
         self.selected_values = [self.selected_value] if self.selected_value else []
         if self.selected_value:
             self.accept()
+
+    def _remove_style(self, option, style_id, widget):
+        answer = QMessageBox.question(
+            self,
+            "取消收藏",
+            "确定取消收藏这个人物风格吗？\n不会修改已生成的故事或人物卡内容。",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if answer != QMessageBox.Yes:
+            return
+        try:
+            removed = remove_character_style(style_id)
+        except Exception:
+            QMessageBox.warning(self, "取消收藏失败", "收藏未能删除，请稍后重试。")
+            return
+        if not removed:
+            QMessageBox.warning(self, "取消收藏失败", "该人物风格未能从收藏列表中移除，请稍后重试。")
+            return
+        self._removable_options.pop(option, None)
+        self.selected_values = [value for value in self.selected_values if value != option]
+        if self.selected_value == option:
+            self.selected_value = ""
+        self._refresh_selection_label()
+        widget.hide()
+        widget.deleteLater()
+        if self._empty_label is not None:
+            self._empty_label.setVisible(not self._removable_options)
+        self.style_removed.emit(style_id)
 
 
 class CreationSectionedPreview(QWidget):
@@ -6309,15 +6403,13 @@ class NovelCreationWizardDialog(QDialog):
             if selected_item is not None:
                 value = _as_text(selected_item.get("id"))
                 display_value = _character_style_choice_label(selected_item)
-            elif not value:
-                self.choice_values.pop(key, None)
-                self.choice_display_values.pop(key, None)
-                return
             else:
-                # A deleted library item should not leave an unusable ID in a
-                # restored draft. The user can choose another saved style.
                 self.choice_values.pop(key, None)
                 self.choice_display_values.pop(key, None)
+                button = self.choice_summary_buttons.get(key)
+                if button is not None:
+                    button.setText("点击选择")
+                self._save_draft()
                 return
         if key == "theme":
             theme_values = []
@@ -6482,16 +6574,29 @@ class NovelCreationWizardDialog(QDialog):
         grid.addWidget(cell, row_index, column_index)
 
     def _open_choice_picker(self, key):
+        removable_options = None
+        if key == "protagonist_style":
+            removable_options = {
+                _character_style_choice_option_label(item): _as_text(item.get("id"))
+                for item in _character_style_choice_entries()
+            }
         dialog = CreationChoicePickerDialog(
             CREATION_CHOICE_TITLES.get(key, key),
             self._choice_groups(key),
             current_value=self._selected_choice_picker_value(key),
             max_selections=2 if key == "theme" else 1,
             parent=self,
+            removable_options=removable_options,
         )
+        if key == "protagonist_style":
+            dialog.style_removed.connect(self._on_character_style_removed)
         if dialog.exec() == QDialog.Accepted:
             if key == "theme" or dialog.selected_value:
                 self._set_choice(key, dialog.selected_value)
+
+    def _on_character_style_removed(self, style_id):
+        if self._selected_choice("protagonist_style") == style_id:
+            self._set_choice("protagonist_style", "")
 
     def _on_choice_changed(self, key):
         if key == "length":

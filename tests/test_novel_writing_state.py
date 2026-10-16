@@ -1773,6 +1773,89 @@ class NovelWritingStateTests(unittest.TestCase):
         self.assertEqual(chapter["analysis_status_hash"], "")
         self.assertEqual(chapter["analysis_status_version"], "1")
 
+    def test_reset_foreshadow_runtime_state_keeps_writing_plan(self):
+        project = {
+            "foreshadow_items": [{
+                "code": "F0001",
+                "name": "旧账册缺页",
+                "status": "已回收",
+                "setup_chapter": "第3章",
+                "payoff_chapter": "第20章",
+                "description": "缺页指向幕后交易。",
+                "revealed": "已经查到缺页被人取走。",
+                "remaining_secret": "取走者的真实目的。",
+                "notes": "保留到后期。",
+            }],
+        }
+
+        self.assertEqual(
+            NovelWritingTab._reset_foreshadow_runtime_state_for_ai_rewrite(project),
+            1,
+        )
+        item = project["foreshadow_items"][0]
+        self.assertEqual(item["status"], "未埋")
+        self.assertEqual(item["revealed"], "")
+        self.assertEqual(item["remaining_secret"], "")
+        self.assertEqual(item["setup_chapter"], "第3章")
+        self.assertEqual(item["payoff_chapter"], "第20章")
+        self.assertEqual(item["description"], "缺页指向幕后交易。")
+        self.assertEqual(item["notes"], "保留到后期。")
+
+    def test_reset_all_chapters_refreshes_selected_editors_before_save(self):
+        chapter = _new_chapter(0)
+        chapter["text"] = "已经写入的正文"
+        project = {
+            "meta": {"title": "测试小说"},
+            "chapters": [chapter],
+            "foreshadow_items": [
+                {"code": "F0001", "name": "第一个伏笔", "status": "已埋"},
+                {"code": "F0002", "name": "第二个伏笔", "status": "已埋"},
+            ],
+            "long_form_memory": {"revision": 4},
+        }
+        tab = NovelWritingTab.__new__(NovelWritingTab)
+        tab.current_project = project
+        tab.current_chapter_index = 0
+        tab.current_foreshadow_index = 0
+        tab.chapter_ai_preview = _FakePlainTextEdit("预览")
+        tab._chapter_clear_has_active_work = lambda: False
+        tab._flush_current_editors = lambda: None
+        tab._project_title = lambda: "测试小说"
+        tab._reload_chapter_list = lambda index: None
+        reload_calls = []
+        editor_status = ["已埋"]
+
+        def reload_foreshadow(index):
+            reload_calls.append(index)
+            editor_status[0] = project["foreshadow_items"][index]["status"]
+
+        tab._reload_foreshadow_list = reload_foreshadow
+        tab._set_partial_chapter_ai_preview_state = lambda _value: None
+        tab._reset_chapter_ai_sequence = lambda: None
+        tab._reset_chapter_ai_style_retry = lambda: None
+        tab._note_project_dirty = lambda: None
+        tab._notify_project_store_changed = lambda: None
+        tab.set_status_tip = lambda _text: None
+
+        def save_current_work(*_args, **_kwargs):
+            # Model _save_current_work's final editor flush. A stale editor
+            # would write the old selected status back into the project.
+            project["foreshadow_items"][0]["status"] = editor_status[0]
+            return "/tmp/test-novel.json"
+
+        tab._save_current_work = save_current_work
+
+        with patch("gpt_desktop.novel_writing_tab.QMessageBox.question", return_value=QMessageBox.Yes), \
+            patch("gpt_desktop.novel_writing_tab.unique_project_backup_path", return_value="/tmp/test-backup.json"), \
+            patch("gpt_desktop.novel_writing_tab.save_project_file"):
+            tab.reset_all_chapters()
+
+        self.assertEqual(reload_calls, [0])
+        self.assertEqual(
+            [item["status"] for item in project["foreshadow_items"]],
+            ["未埋", "未埋"],
+        )
+
     def test_chapter_list_text_shows_small_change_for_minor_edit(self):
         chapter = _new_chapter(0)
         chapter["title"] = "章节1"
@@ -3410,6 +3493,20 @@ class NovelWritingStateTests(unittest.TestCase):
         self.assertEqual(len(foreshadow_state["observations"]["foreshadows"]), 1)
         self.assertEqual(foreshadow_state["comparison"]["status"], "pending")
         self.assertEqual(len(foreshadow_state["failed_observation_chunks"]), 1)
+
+    def test_clear_candidate_analysis_state_clears_foreshadow_postprocess_marker(self):
+        tab = NovelWritingTab.__new__(NovelWritingTab)
+        tab.current_project = {
+            "analysis_state": {
+                "foreshadow_review": {"comparison": {"status": "pending"}},
+            },
+        }
+        tab.foreshadow_review_postprocess_pending = True
+
+        tab._clear_candidate_analysis_state()
+
+        self.assertFalse(tab.foreshadow_review_postprocess_pending)
+        self.assertNotIn("analysis_state", tab.current_project)
 
     def test_foreshadow_review_observations_sync_to_visible_candidate_drafts(self):
         tab = NovelWritingTab.__new__(NovelWritingTab)

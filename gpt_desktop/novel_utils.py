@@ -9867,6 +9867,28 @@ def _entity_naming_guidance(project=None, limit=2600):
     return _clip_context_text("\n".join(lines), max(800, int(limit or 2600)), preserve_lines=True)
 
 
+def _prose_scene_grounding_guidance(compact=False):
+    """Keep planning metadata and character labels inside the scene without fixing a prose template."""
+    if compact:
+        return (
+            "【信息落地与对白边界】\n"
+            "章节提纲、人物卡和作者规划只提供事实，不是正文措辞。旁白不要用‘第一步、第二步、第三步’或同类清单概括人物接下来要做什么，"
+            "也不要连续堆姓名、身份、职位或性格标签代替人物表现；信息要随当前视角的所见、动作、对白、判断或结果自然出现。"
+            "冲突可以保留；连续对白不要求统一节拍或每句配动作，场面需要变化时再用有效的动作、心理或现场反馈承接，不设固定频率。\n"
+        )
+    return (
+        "【信息落地与场景反应】\n"
+        "章节提纲、人物卡和作者规划只提供故事事实，不是正文措辞。旁白不要把规划、任务顺序或人物资料直接写出来；"
+        "尤其不要用‘第一步、第二步、第三步’或同类清单概括人物接下来要做什么，也不要连续堆姓名、身份、职位或性格标签代替人物表现。"
+        "需要保留的信息，要随人物当前的所见所闻、具体动作、现场判断、对白和随后结果自然显现；人物首次出现时，只保留当前场景真正有用的信息。"
+        "人物确实在现场安排行动时，可以由人物自然说出，但要符合当下目的和人物口吻，不能把资料改成作者清单。\n"
+        "【连续对白与反应】\n"
+        "冲突可以保留，但连续对白不要变成每句都反驳、质问、解释或下结论的对抗式问答；每一轮说话都应让信息、关系压力或人物选择继续变化。"
+        "当连续对白已经推进几轮且场面需要变化时，可以用能改变下一步的动作、表情、停顿、视线、心理判断、物件操作或现场反馈承接；"
+        "具体落点由人物关系、情绪、场景和项目文风决定，不设固定句数、动作频率或统一段落结构，也不要机械地每句配同类动作。\n"
+    )
+
+
 def _grounded_prose_contract():
     """Keep generated prose direct, concrete, and story-focused."""
     return (
@@ -9874,13 +9896,14 @@ def _grounded_prose_contract():
         "正文必须使用自然的网络小说叙述语言，直接写人物、场景、动作、对白和具体变化；"
         "不得出现策划术语、抽象形容、文学化意象、空泛比喻、办案式表达、编辑式说明或编辑式总结。"
         "情绪和气氛必须通过人物当下的动作、对白、反应和具体结果表现，不要用漂亮形容替代剧情。\n"
-        "【对白自然衔接】\n"
+        + _prose_scene_grounding_guidance()
+        + "【对白自然衔接】\n"
         "对白要像人物当面说话。人物回答时，按当下的关系和语境自然接住对方；需要说明来由、指代或态度时，把意思说清楚，让前一句与下一句接得上。"
         "人物可以顺着对方的话解释、补充、反问、改口、调侃、试探、施压、让步或转开话题，这些选择由人物目的、关系和现场情绪决定。"
         "句式长短、语气词、称呼变化和说话后的动作随人物身份、关系和情绪自然变化，不要机械添加语气词，也不要让所有人物采用同一种接话方式。"
         "对白要推动关系、现场压力或人物选择继续变化，不让角色互相解释已经知道的事。\n"
         "人物受到冲突、误解、意外、吸引或关系变化影响时，要写出会改变下一步行为的当下念头、判断或身体感受；"
-        "心理描写和动作、对白交替出现，具体程度随场景需要自然变化。"
+        "心理、动作和对白可以按场景需要交错、穿插或由其中一种承担推进，具体比例随人物、情绪和文风自然变化，不要求固定交替顺序。"
         "不得用解释式、观点式和“金句式”抽象表达；"
         "人物表达拒绝、讥讽或不满时，落到眼前的具体对象、安排和后果上，让台词像人物当场说给对方听的话。"
         "人物反感眼前的说法或安排时，直接落到具体对象、场面和自己是否配合上；允许用人物自己的口语吐槽或拒绝，"
@@ -9894,7 +9917,8 @@ def _natural_expression_guidance():
         "【正文语言要求】正文必须使用自然的网络小说叙述语言，直接写人物、场景、动作、对白和具体变化；"
         "不得出现策划术语、抽象形容、办案式表达、编辑式说明或编辑式总结。"
         "情绪和气氛必须通过人物当下的动作、对白、心理和具体结果表现，不用漂亮形容替代剧情。"
-        "对白按关系和现场情绪自然接话，心理变化随人物自然展开。"
+        + _prose_scene_grounding_guidance(compact=True)
+        + "对白按关系和现场情绪自然接话，心理变化随人物自然展开。"
         "项目资料决定故事事实、人物和剧情；文风参考只决定表达方式，不把参考原文的人物、剧情、物件或句子带入当前正文。"
     )
 
@@ -13189,6 +13213,8 @@ def _long_form_compact_update_contract_instructions(project, chapter_index):
         "AI仍负责判断发生了什么、哪些旧状态改变或退出、证据是什么、"
         "哪些资料传给下一章；程序只根据这些显式决定补齐重复的生命周期数组、核对引用和存储索引。"
         "不得输出fact_lifecycle_review、state_lifecycle_review、state_reconciliation或完整旧状态，它们由程序机械生成。"
+        "人物卡：只为有明确姓名或稳定称谓、后续会再次出场或持续影响关系/主线的具体人物create；"
+        "可直接使用本次新增的NC/NL/NT/NF临时key；"
         "程序生成的fact_lifecycle_review.scope和state_lifecycle_review.scope必须为"
         f"{LONG_FORM_STAGE_REVIEW_SCOPE if stage_boundary else 'current_chapter'}。"
         "未出现在增量里的旧资料默认保留并原样继承；只有fact_updates的retire/supersede和state_retirements可以退出旧状态。"
@@ -13206,7 +13232,7 @@ def _long_form_compact_update_contract_instructions(project, chapter_index):
         "不能因为新增了一条更宽泛的概括而退役精确旧事实；仍有效的精确旧事实必须继续保留。"
         "本章选择索引中未发生变化的已有事实由程序自动保留并生成复核索引，不得为它们输出keep；"
         "fact_updates只提交正文明确新增、更新、退出或取代的事实。"
-        "record_updates只写人物或设定的动态变化。新人物create使用NC/NL临时key并填写稳定名称和canon；人物canon的role、goal、secret、personality、voice、notes逐项只填写最终正文能够支持的内容，不能为了填满字段猜测。人物字段必须独立判断：直接对白足够辨识时必须提取voice；正文明确呈现出可长期保留的性格变化时才提取personality；明确争夺资源/机缘、控制或进入地点、保护/排除/追杀/阻止对象、职责或利益诉求时必须提取goal；只有正文明确揭示的隐情才提取secret。personality和voice都只保留能够迁移到其它场景的长期特点，notes只保留稳定关系底色、长期身份变化或后文必须继承的资料；固定笑点、固定口头禅、固定动作套路、具体食物/道具/地点、某章行为、出场桥段、一次性反应和临时情绪不得写入人物卡。不能因为secret无证据而连带留空goal、personality或voice。"
+        "record_updates只写人物或设定的动态变化。人物卡：只为有明确姓名或稳定称谓、后续会再次出场或持续影响关系/主线的具体人物create；一次性路人、无名群体和只完成单章功能的人物不要建卡。新人物create使用NC/NL临时key并填写稳定名称和canon；人物canon的role、goal、secret、personality、voice、notes逐项只填写最终正文能够支持的内容，不能为了填满字段猜测。人物字段必须独立判断：直接对白足够辨识时必须提取voice；正文明确呈现出可长期保留的性格变化时才提取personality；明确争夺资源/机缘、控制或进入地点、保护/排除/追杀/阻止对象、职责或利益诉求时必须提取goal；只有正文明确揭示的隐情才提取secret。personality和voice都只保留能够迁移到其它场景的长期特点，notes只保留稳定关系底色、长期身份变化或后文必须继承的资料；固定笑点、固定口头禅、固定动作套路、具体食物/道具/地点、某章行为、出场桥段、一次性反应和临时情绪不得写入人物卡。不能因为secret无证据而连带留空goal、personality或voice。"
         "已有人物若正文补出了此前空缺的身份、目标、秘密、人物性格/特点或语言风格，使用identity_patch逐项补齐；程序保留已有内容，并只追加正文有证据的新补充，不覆盖或替换旧资料。已有姓名未明或临时称谓人物正式命名时，继续沿用原人物ref并用name升级同一ID。"
         "如果正文把已有的姓名未明或临时称谓人物正式命名，必须沿用原人物ref并用update填写name为正式姓名，"
         "不得新建第二张人物卡；只有正文没有对应旧人物时才create。"
@@ -13214,6 +13240,7 @@ def _long_form_compact_update_contract_instructions(project, chapter_index):
         "foreshadow_updates只写本章实际埋设、推进、回收或废弃的伏笔；create使用NT临时key。"
         "伏笔原始说明、计划章节和历史运行观察只用于识别背景；历史运行观察是旧章节的观察记录，不能替代本章最终正文证据。"
         "本章伏笔是否更新必须以最终正文中的evidence_quote和当前正文语义为准；即使历史记录已经写过已埋，也不能据此把本章无关内容挂到该伏笔。"
+        "每条foreshadow_updates必须输出state、revealed、remaining_secret和evidence_quote；state填写本章运行态变化，revealed只写正文已公开内容，remaining_secret写仍未揭示边界；不得把operation或status当作state或revealed，evidence_quotes数组必须落实为一条正文中的连续evidence_quote。"
         "state_patch只写本章结束时新增或变化的时间、地点、人物、关系、物件、冲突和任务；"
         "更新已有冲突或任务必须填写真实ID及previous_conflict/previous_task，新增使用NCF/NTASK临时key。"
         "所有非keep事实更新、人物/设定/伏笔更新以及state_patch变化都必须附最终正文中的8-60字连续逐字evidence_quote。"
@@ -13833,6 +13860,21 @@ def _normalize_long_form_state_aliases(update):
                 return value
         return ""
 
+    def evidence_value(item):
+        """Read singular and plural evidence aliases without joining fragments."""
+        for key in ("evidence_quote", "evidence", "quote", "evidence_quotes"):
+            value = item.get(key, "")
+            if isinstance(value, list):
+                for candidate in value:
+                    if not isinstance(candidate, (dict, list)) and str(candidate or "").strip():
+                        return candidate
+                continue
+            if isinstance(value, dict):
+                continue
+            if str(value or "").strip():
+                return value
+        return ""
+
     def ref_list(value):
         return _long_form_ref_values(value)
 
@@ -14261,7 +14303,7 @@ def _normalize_long_form_state_aliases(update):
                     "current_dynamic_append", "change",
                     "latest_state", "new_state", "current_state", "state_update",
                     "new_status", "status_update", "update", "content", "status",
-                    "description",
+                    "description", "development", "note",
                 ))
                 nested_fields = item.get("fields")
                 if not dynamic and isinstance(nested_fields, dict):
@@ -14271,7 +14313,7 @@ def _normalize_long_form_state_aliases(update):
                         "current_dynamic_append", "change",
                         "latest_state", "new_state", "current_state", "state_update",
                         "new_status", "status_update", "update", "content", "status",
-                        "public_state", "description", "notes",
+                        "public_state", "description", "notes", "development", "note",
                     ))
                     if not dynamic:
                         field_changes = nested_fields.get("changes", [])
@@ -14295,7 +14337,7 @@ def _normalize_long_form_state_aliases(update):
                         "current_dynamic_append", "change", "latest_state", "new_state",
                         "current_state", "state_update",
                         "new_status", "status_update", "update", "content", "status", "public_state",
-                        "description",
+                        "description", "development", "note",
                     ))
                 elif not dynamic and isinstance(nested_patch, str):
                     dynamic = nested_patch.strip()
@@ -14306,7 +14348,7 @@ def _normalize_long_form_state_aliases(update):
                         "current_dynamic_append", "change", "latest_state", "new_state",
                         "current_state", "state_update",
                         "new_status", "status_update", "update", "content", "status", "public_state",
-                        "description",
+                        "description", "development", "note",
                     ))
                 elif not dynamic and isinstance(nested_updates, str):
                     dynamic = nested_updates.strip()
@@ -14325,7 +14367,7 @@ def _normalize_long_form_state_aliases(update):
                 if not item.get("changes") and dynamic:
                     item["changes"] = [str(dynamic)]
                 if not str(item.get("evidence_quote", "") or "").strip():
-                    item["evidence_quote"] = first_value(item, ("evidence", "quote"))
+                    item["evidence_quote"] = evidence_value(item)
         payload["record_updates"] = record_updates
 
     fact_updates = payload.get("fact_updates", [])
@@ -14397,7 +14439,7 @@ def _normalize_long_form_state_aliases(update):
                     ),
                 )
             if not str(item.get("evidence_quote", "") or "").strip():
-                item["evidence_quote"] = first_value(item, ("evidence", "quote"))
+                item["evidence_quote"] = evidence_value(item)
         payload["fact_updates"] = fact_updates
 
     foreshadow_updates = payload.get("foreshadow_updates", [])
@@ -14470,7 +14512,7 @@ def _normalize_long_form_state_aliases(update):
                 item,
                 (
                     "content", "foreshadow", "progress", "dynamic", "current_dynamic",
-                    "update", "detail", "text",
+                    "update", "detail", "text", "development", "note",
                 ),
             )
         if not str(item.get("remaining_secret", "") or "").strip():
@@ -14485,7 +14527,7 @@ def _normalize_long_form_state_aliases(update):
             (
                 "state", "dynamic", "runtime", "runtime_update", "runtime_patch",
                 "operational_state", "spatial_state", "current_dynamic", "change",
-                "progress", "content", "description", "status",
+                "progress", "content", "description", "development", "note",
             ),
         )
         for nested in (item.get("patch"), item.get("updates")):
@@ -14497,7 +14539,7 @@ def _normalize_long_form_state_aliases(update):
                     (
                         "state", "dynamic", "runtime", "runtime_update", "runtime_patch",
                         "operational_state", "spatial_state", "change", "progress",
-                        "content", "description",
+                        "content", "description", "development", "note",
                     ),
                 )
             elif isinstance(nested, str):
@@ -14526,11 +14568,13 @@ def _normalize_long_form_state_aliases(update):
         if normalized_status in {"已埋", "已回收"}:
             description = str(item.get("description", "") or "").strip()
             progress = str(
-                item.get("progress", item.get("update", "")) or ""
+                item.get("progress", item.get("update", ""))
+                or item.get("development", item.get("note", ""))
+                or ""
             ).strip()
             source = (
                 progress or description or str(dynamic or "").strip()
-                or str(first_value(item, ("evidence_quote", "evidence", "quote")) or "").strip()
+                or str(evidence_value(item) or "").strip()
             )
             if source and not str(item.get("revealed", "") or "").strip():
                 item["revealed"] = source
@@ -14547,7 +14591,7 @@ def _normalize_long_form_state_aliases(update):
             elif normalized_status == "已回收" and "remaining_secret" not in item:
                 item["remaining_secret"] = ""
         if not str(item.get("evidence_quote", "") or "").strip():
-            item["evidence_quote"] = first_value(item, ("evidence", "quote"))
+            item["evidence_quote"] = evidence_value(item)
         for field in ("description", "revealed", "remaining_secret", "notes", "state"):
             if field in item:
                 item[field] = _strip_internal_foreshadow_status_words(item.get(field, ""))
@@ -14589,7 +14633,7 @@ def _normalize_long_form_state_aliases(update):
             category = "other"
         item["category"] = category
         if not str(item.get("evidence_quote", "") or "").strip():
-            item["evidence_quote"] = first_value(item, ("evidence", "quote"))
+            item["evidence_quote"] = evidence_value(item)
     payload["long_term_events"] = events
 
     def normalize_evidence_fields(items):
@@ -14600,6 +14644,19 @@ def _normalize_long_form_state_aliases(update):
                 value = item.get(key)
                 if isinstance(value, str) and "\\n" in value:
                     item[key] = value.replace("\\n", "\n").replace("\\r", "\r").replace("\\t", "\t")
+            evidence_quotes = item.get("evidence_quotes")
+            if not str(item.get("evidence_quote", "") or "").strip():
+                if isinstance(evidence_quotes, list):
+                    item["evidence_quote"] = next(
+                        (
+                            str(value).replace("\\n", "\n").replace("\\r", "\r").replace("\\t", "\t")
+                            for value in evidence_quotes
+                            if not isinstance(value, (dict, list)) and str(value or "").strip()
+                        ),
+                        "",
+                    )
+                elif isinstance(evidence_quotes, str) and evidence_quotes.strip():
+                    item["evidence_quote"] = evidence_quotes
 
     normalize_evidence_fields(payload.get("fact_updates", []))
     normalize_evidence_fields(payload.get("foreshadow_updates", []))
@@ -15867,12 +15924,26 @@ def _literalize_long_form_memory_evidence(update, final_text):
         for item in items:
             if not isinstance(item, dict):
                 continue
-            source_key = "evidence_quote" if "evidence_quote" in item else "evidence"
-            quote = item.get(source_key, "")
-            if str(quote or "").strip():
-                item["evidence_quote"] = _literalize_long_form_evidence_quote(
-                    quote, final_text
-                )
+            candidates = []
+            for key in ("evidence_quote", "evidence", "quote", "evidence_quotes"):
+                value = item.get(key, "")
+                values = value if isinstance(value, list) else [value]
+                for candidate in values:
+                    if isinstance(candidate, (dict, list)):
+                        continue
+                    candidate = str(candidate or "").strip()
+                    if candidate and candidate not in candidates:
+                        candidates.append(candidate)
+            for candidate in candidates:
+                literal = _literalize_long_form_evidence_quote(candidate, final_text)
+                if _long_form_evidence_present(literal, final_text):
+                    item["evidence_quote"] = literal
+                    break
+            else:
+                if candidates:
+                    item["evidence_quote"] = _literalize_long_form_evidence_quote(
+                        candidates[0], final_text
+                    )
 
     literalize_items(payload.get("fact_updates", []))
     record_updates = payload.get("record_updates", {})

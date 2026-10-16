@@ -681,6 +681,8 @@ class NovelAnalysisWorkerTests(unittest.TestCase):
                 self.assertNotIn("剧情推进要求", prompt)
                 self.assertNotIn("每两章至少要让主角", prompt)
                 self.assertIn("不得出现策划术语、抽象形容", prompt)
+                self.assertIn("不要用‘第一步、第二步、第三步’或同类清单概括人物接下来要做什么", prompt)
+                self.assertIn("不设固定句数、动作频率或统一段落结构", prompt)
 
         worker = NovelWritingWorker("http://example.test", "key", "model", "draft", "context")
         prompt = worker._action_prompt()

@@ -1618,6 +1618,47 @@ class NovelLongFormContextTests(unittest.TestCase):
             "真相仍未明。",
         )
 
+    def test_foreshadow_development_and_note_aliases_supply_runtime_state(self):
+        normalized = _normalize_long_form_state_aliases({
+            "foreshadow_updates": [
+                {
+                    "operation": "update",
+                    "foreshadow_ref": "F001",
+                    "status": "progressed",
+                    "development": "本章确认旧账册缺了一页，但来源仍未查明。",
+                    "evidence_quote": "旧账册缺了一页",
+                },
+                {
+                    "operation": "update",
+                    "foreshadow_ref": "F002",
+                    "status": "advanced",
+                    "note": "本章再次出现带火漆的信封。",
+                    "evidence_quote": "带火漆的信封",
+                },
+            ],
+        })
+
+        first, second = normalized["foreshadow_updates"]
+        self.assertEqual(first["state"], "本章确认旧账册缺了一页，但来源仍未查明。")
+        self.assertEqual(first["revealed"], first["state"])
+        self.assertEqual(first["status"], "已埋")
+        self.assertEqual(second["state"], "本章再次出现带火漆的信封。")
+        self.assertEqual(second["revealed"], second["state"])
+        self.assertNotEqual(first["state"], "progressed")
+        self.assertNotEqual(second["state"], "advanced")
+
+    def test_plural_evidence_quotes_selects_one_contiguous_body_quote(self):
+        body = "她翻到旧账册的末页，指着缺口说：这里少了一页。"
+        normalized = _literalize_long_form_memory_evidence({
+            "long_term_events": [{
+                "evidence_quotes": ["这段话不在正文里", "旧账册的末页，指着缺口"],
+            }],
+        }, body)
+
+        quote = normalized["long_term_events"][0]["evidence_quote"]
+        self.assertEqual(quote, "旧账册的末页，指着缺口")
+        self.assertIn(quote, body)
+
     def test_style_finalize_compacts_duplicate_context_but_keeps_continuity_and_style(self):
         redundant = "重复规划资料标记。" * 10000
         padding = "用于模拟长篇中后期资料增长。" * 2000
@@ -2484,6 +2525,11 @@ class NovelLongFormContextTests(unittest.TestCase):
         self.assertIn("不要写成流水账", context)
         self.assertIn("不得写段尾总结、抽象情绪判断和万能反应动作", context)
         self.assertIn("不得用“沉默、皱眉、冷意、压迫感、空气安静、所有人愣住、下一秒”等模板化表达替代具体剧情", context)
+        self.assertIn("不要用‘第一步、第二步、第三步’或同类清单概括人物接下来要做什么", context)
+        self.assertIn("不要连续堆姓名、身份、职位或性格标签代替人物表现", context)
+        self.assertIn("连续对白不要变成每句都反驳、质问、解释或下结论的对抗式问答", context)
+        self.assertIn("不设固定句数、动作频率或统一段落结构", context)
+        self.assertIn("不要求固定交替顺序", context)
         self.assertIn("【对白自然衔接】", context)
         self.assertIn("需要说明来由、指代或态度时，把意思说清楚", context)
         self.assertIn("场景描写优先用具体物件、动作和细节承载情绪", context)
@@ -2522,6 +2568,8 @@ class NovelLongFormContextTests(unittest.TestCase):
         self.assertIn("正文必须使用自然的网络小说叙述语言", draft_context)
         self.assertIn("不得出现策划术语、抽象形容", draft_context)
         self.assertIn("情绪和气氛必须通过人物当下的动作", draft_context)
+        self.assertIn("不要用‘第一步、第二步、第三步’或同类清单概括人物接下来要做什么", draft_context)
+        self.assertIn("连续对白不要求统一节拍或每句配动作", draft_context)
         self.assertIn("不得把参考原文的人物、剧情、物件或句子带入当前正文", guidance)
         self.assertNotIn("空得很有存在感", draft_context)
         self.assertNotIn("沉默很有情绪", draft_context)

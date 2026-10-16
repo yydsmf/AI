@@ -6795,6 +6795,7 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
         self.foreshadow_review_observations = {"characters": [], "lore": [], "foreshadows": [], "project_materials": {}}
         self.foreshadow_review_comparison_state = {}
         self.failed_foreshadow_review_chunks = []
+        self.foreshadow_review_postprocess_pending = False
         if isinstance(self.current_project, dict):
             state = self.current_project.get("analysis_state", {})
             if isinstance(state, dict):
@@ -11925,6 +11926,24 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
         chapter["analysis_status_version"] = "1"
         return True
 
+    @staticmethod
+    def _reset_foreshadow_runtime_state_for_ai_rewrite(project):
+        """Reset generated foreshadow progress while keeping its writing plan."""
+        if not isinstance(project, dict):
+            return 0
+        items = project.get("foreshadow_items", [])
+        if not isinstance(items, list):
+            return 0
+        reset_count = 0
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            item["status"] = "未埋"
+            item["revealed"] = ""
+            item["remaining_secret"] = ""
+            reset_count += 1
+        return reset_count
+
     def _reset_current_chapter_for_ai_rewrite(self, chapter):
         if not self._reset_chapter_data_for_ai_rewrite(chapter):
             return False
@@ -12031,7 +12050,7 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
             "重置所有章节确认",
             "确定重置所有章节吗？\n\n"
             f"将清除 {generated_count} 个章节的正文、摘要、关键事实、状态整理、"
-            "分析缓存、修复检查点和自动扩写恢复标记，并重置长期记忆。\n\n"
+            "分析缓存、修复检查点和自动扩写恢复标记，并重置长期记忆与伏笔运行状态。\n\n"
             "章节标题、提纲、阶段、扩写字数和规划关联人物会保留，"
             "重置后可以从第1章重新扩写。",
             QMessageBox.Yes | QMessageBox.No,
@@ -12060,16 +12079,26 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
             QMessageBox.warning(self, "重置失败", "重置前备份失败，原章节内容未改变。")
             return
 
-        selected_index = int(getattr(self, "current_chapter_index", -1) or -1)
+        raw_selected_index = getattr(self, "current_chapter_index", -1)
+        selected_index = int(raw_selected_index) if raw_selected_index is not None else -1
+        raw_selected_foreshadow_index = getattr(self, "current_foreshadow_index", -1)
+        selected_foreshadow_index = (
+            int(raw_selected_foreshadow_index)
+            if raw_selected_foreshadow_index is not None else -1
+        )
         for chapter in chapters:
             if not isinstance(chapter, dict):
                 continue
             self._reset_chapter_data_for_ai_rewrite(chapter)
             chapter["status"] = "大纲"
+        self._reset_foreshadow_runtime_state_for_ai_rewrite(self.current_project)
         self.current_project["long_form_memory"] = _default_long_form_memory()
-        self.pending_analysis_chapter_ids = []
-        self.failed_analysis_chunks = []
+        self._clear_candidate_analysis_state()
         self._reload_chapter_list(selected_index)
+        # _save_current_work flushes all visible editors before writing. Reload
+        # the foreshadow editor after resetting the project data so a stale
+        # selected record cannot overwrite its reset runtime status.
+        self._reload_foreshadow_list(selected_foreshadow_index)
 
         self.chapter_ai_preview.clear()
         self.chapter_ai_stream_text = ""
@@ -12086,6 +12115,7 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
             self.current_project.clear()
             self.current_project.update(project_snapshot)
             self._reload_chapter_list(selected_index)
+            self._reload_foreshadow_list(selected_foreshadow_index)
             self.set_status_tip("重置失败：项目保存失败，已恢复原章节内容。")
             QMessageBox.warning(self, "重置失败", "项目保存失败，原章节内容已恢复。")
             return
@@ -14490,18 +14520,10 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
                 audit_error_count=len(audit_errors),
                 bundle_error_count=len(bundle_errors),
             )
-            if self._schedule_transient_chapter_ai_retry(
-                "memory_finalize",
-                "状态整理结果未通过校验：" + "；".join(validation_errors),
-                force_retry=True,
-                retry_callback=lambda tab: tab._start_memory_finalize(
-                    final_text,
-                    resumed=True,
-                    prose_patch_applied=bool(pending.get("prose_patch_applied")),
-                    transient_retry=True,
-                ),
-            ):
-                return
+            # Structural validation failures are deterministic for this exact
+            # package. Re-running the full finalize prompt only repeats the
+            # same omission and burns the transport retry budget; the repair
+            # prompt already receives the concrete validation errors.
             self._clear_transient_chapter_ai_retry("memory_finalize")
             self._start_memory_repair(final_text, bundle, validation_errors, "style")
             return

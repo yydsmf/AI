@@ -82,6 +82,7 @@ class NovelCreationWizardPersistenceTests(unittest.TestCase):
                 wizard._character_style_choice_groups(),
                 {
                     "已收藏人物卡风格": (
+                        wizard.CHARACTER_STYLE_NONE_OPTION,
                         "贺知微（路人甲）\n性格/特点：先观察再行动\n语言风格：说话自然，少用总结句",
                     )
                 },
@@ -94,6 +95,7 @@ class NovelCreationWizardPersistenceTests(unittest.TestCase):
             self.assertEqual(
                 dialog._choice_options("protagonist_style"),
                 [
+                    wizard.CHARACTER_STYLE_NONE_OPTION,
                     "贺知微（路人甲）\n性格/特点：先观察再行动\n语言风格：说话自然，少用总结句"
                 ],
             )
@@ -161,6 +163,51 @@ class NovelCreationWizardPersistenceTests(unittest.TestCase):
         self.assertIn("作者灵感中明确写出的事实", wizard.COMMON_CREATION_RULES)
         for step in ("premise", "bible"):
             self.assertIn("作者灵感中明确写出的事实", wizard.STEP_PROMPTS[step])
+
+    def test_character_profile_guidance_blocks_adversarial_voice_labels(self):
+        guidance = wizard.CREATION_CHARACTER_PROFILE_GUIDANCE
+        self.assertIn("语言风格可以保留“话多”等正常表达特征", guidance)
+        self.assertIn("不得生成“话少、寡言、惜字如金、解释型、反问多", guidance)
+        self.assertIn("质问式、审问式、对抗式、命令式", guidance)
+        self.assertIn("不能作为人物卡的语言风格结论", guidance)
+        self.assertIn("限制“话少”是为了避免正文模型把它误读成短句", guidance)
+
+    def test_character_name_prefix_is_moved_to_role_without_rewriting_role(self):
+        cases = (
+            ("陶大姑陶秀兰", "陶秀兰", "陶大姑"),
+            ("陶二叔陶建平", "陶建平", "陶二叔"),
+            ("闻母沈曼如", "沈曼如", "闻母"),
+            ("闻父闻承岳", "闻承岳", "闻父"),
+            ("陶小姨陶秀梅", "陶秀梅", "陶小姨"),
+            ("陶家长辈陶秀兰", "陶秀兰", "陶家长辈"),
+            ("陶知意大姑陶秀兰", "陶秀兰", "陶知意大姑"),
+        )
+        for raw_name, expected_name, expected_prefix in cases:
+            original_role = "完整身份说明，包含关系、故事位置和长期作用"
+            record = wizard._normalize_character_record({
+                "name": raw_name,
+                "role": original_role,
+                "goal": "目标",
+                "secret": "秘密",
+                "personality": "性格",
+                "voice": "话多",
+                "notes": "备注",
+            })
+            self.assertEqual(record["name"], expected_name)
+            self.assertTrue(record["role"].startswith(expected_prefix + "，"))
+            self.assertIn(original_role, record["role"])
+            self.assertEqual(record["goal"], "目标")
+            self.assertEqual(record["secret"], "秘密")
+
+    def test_standalone_title_or_formal_name_is_not_changed(self):
+        for name in ("陶大姑", "陶秀兰", "梁律师"):
+            record = wizard._normalize_character_record({"name": name, "role": "身份"})
+            self.assertEqual(record["name"], name)
+            self.assertEqual(record["role"], "身份")
+
+    def test_character_name_split_rule_is_in_bible_prompt(self):
+        self.assertIn("姓名字段只填写人物的正式姓名", wizard.STEP_PROMPTS["bible"])
+        self.assertIn("陶大姑陶秀兰", wizard.STEP_PROMPTS["bible"])
 
 
 if __name__ == "__main__":

@@ -258,6 +258,9 @@ def _character_style_choice_option_label(item):
     return "\n".join(lines)
 
 
+CHARACTER_STYLE_NONE_OPTION = "不使用自定义风格"
+
+
 def _character_style_choice_entries():
     return [
         item for item in load_character_style_library()
@@ -270,7 +273,8 @@ def _character_style_choice_groups():
     entries = _character_style_choice_entries()
     return {
         "已收藏人物卡风格": tuple(
-            _character_style_choice_option_label(item) for item in entries
+            [CHARACTER_STYLE_NONE_OPTION]
+            + [_character_style_choice_option_label(item) for item in entries]
         )
     }
 
@@ -316,7 +320,9 @@ CREATION_LORE_TYPE_GUIDANCE = """
 
 
 CREATION_CHARACTER_PROFILE_GUIDANCE = """
-人物卡只保存能够跨场景继承的人物底色，不保存某一章的剧情。把“人物性格/特点”和“语言风格”分开：人物性格/特点写长期稳定的性格类别，例如搞笑、优柔寡断、好胜、敏感、嘴硬或爱操心；语言风格写可迁移的表达类别，例如话多、话少、喜欢开玩笑、无厘头、爱打岔、反问多、绕弯或直白。每项用一到几个词或短句说清即可，不要展开成剧情段落。
+人物卡只保存能够跨场景继承的人物底色，不保存某一章的剧情。把“人物性格/特点”和“语言风格”分开：人物性格/特点写长期稳定的性格类别，例如搞笑、优柔寡断、好胜、敏感、嘴硬或爱操心；语言风格写可迁移的表达类别，例如话多、喜欢开玩笑、无厘头、爱打岔、绕弯或直白。每项用一到几个词或短句说清即可，不要展开成剧情段落。
+姓名字段只填写人物的正式姓名，不要把称呼、亲属关系、身份、职位或身份说明拼在姓名前面；例如“陶大姑陶秀兰”应拆成姓名“陶秀兰”，把“陶大姑”写入身份和故事位置。身份字段可以保留完整、自然的说明，不要为了拆分姓名而压缩成单一标签。
+语言风格可以保留“话多”等正常表达特征，但不得生成“话少、寡言、惜字如金、解释型、反问多、连续反问、质问式、审问式、对抗式、命令式、攻击性强、强硬压迫”等标签。限制“话少”是为了避免正文模型把它误读成短句、半句、连续回击或只用反问，进而把普通交流写成对抗式问答；也不要把人物语言写成围绕质问、反驳、施压、试探或争夺解释权展开的对抗话术，这类内容不能作为人物卡的语言风格结论。
 人物性格/特点、语言风格和人物备注都不能写固定笑点、固定口头禅、固定动作套路、具体食物或道具、具体地点、某次出场桥段、某章发生的行为、临时情绪或一次性反应，也不要写“遇到某件事就……”的固定触发模式。这样的内容属于章节剧情、正文事实或当时的关系变化，不属于人物卡。备注只保留稳定身份、长期关系底色、持续有效的秘密和确实会影响后文的长期变化；如果一条内容只因为某件事发生过一次才成立，就不要放入人物卡。语言分类可以随关系、情绪和压力自然变化，不把人物锁成每次都重复同一种说法。
 """.strip()
 
@@ -1369,6 +1375,61 @@ _CHARACTER_FIELD_ALIASES = {
     "notes": ("notes", "备注", "人物备注", "后续注意"),
 }
 
+_CHARACTER_NAME_ROLE_MARKERS = (
+    "董事长", "继承人", "经纪人", "负责人", "未婚夫", "未婚妻", "经纪",
+    "大伯母", "大伯父", "继父", "继母", "养父", "养母", "祖父", "祖母",
+    "外公", "外婆", "爷爷", "奶奶", "姑姑", "姑妈", "舅舅", "舅妈",
+    "叔叔", "婶婶", "伯伯", "父亲", "母亲", "爸爸", "妈妈", "丈夫", "妻子",
+    "前夫", "前妻", "老公", "老婆", "大姑", "二姑", "三姑", "小姑",
+    "大姨", "二姨", "三姨", "小姨", "大叔", "二叔", "三叔", "小叔",
+    "大伯", "二伯", "三伯", "婶母", "姨母", "舅父", "伯父", "伯母",
+    "堂哥", "堂姐", "表哥", "表姐", "哥哥", "姐姐", "弟弟", "妹妹",
+    "兄长", "师兄", "师姐", "师弟", "师妹", "师父", "师傅", "长辈", "亲戚",
+    "家长", "儿子", "女儿", "前辈", "后辈", "太太", "夫人", "先生", "小姐",
+    "少爷", "公子", "姑娘", "掌门", "长老", "皇后", "皇帝", "王爷", "公主",
+    "太子", "殿下", "大人", "将军", "统领", "老师", "班主任", "校长", "医生",
+    "护士", "律师", "法官", "警察", "记者", "老板", "经理", "总监", "董事",
+    "秘书", "助理", "管家", "保姆", "司机", "店长", "店员", "邻居", "同学",
+    "同事", "朋友", "闺蜜", "教练", "编辑", "作者", "导演", "演员", "教授",
+    "院长", "主任", "院士", "专家", "顾问", "保镖", "掌柜", "代表", "的人",
+    "父", "母", "姑", "姨", "叔", "舅", "伯", "婶",
+)
+
+
+def _split_character_name_role_prefix(name, role):
+    """Split an obvious title/identity prefix from a formal Chinese name.
+
+    This deliberately accepts only prefixes ending in a known relationship or
+    role marker. A standalone title such as ``陶大姑`` and ordinary names are
+    left untouched.
+    """
+    name = _as_text(name)
+    role = _as_text(role)
+    if not name:
+        return name, role
+    markers = tuple(sorted(_CHARACTER_NAME_ROLE_MARKERS, key=len, reverse=True))
+    # Three-character names are the common case. Trying them before two- and
+    # four-character names avoids treating a shorter marker inside a longer
+    # identity description as the boundary.
+    for name_length in (3, 2, 4):
+        if len(name) <= name_length:
+            continue
+        prefix = name[:-name_length]
+        formal_name = name[-name_length:]
+        if not all("一" <= char <= "龥" for char in formal_name):
+            continue
+        if not any(prefix.endswith(marker) for marker in markers):
+            continue
+        break
+    else:
+        return name, role
+    prefix = prefix.strip(" \t\r\n:：,，、-/")
+    if not prefix or not formal_name:
+        return name, role
+    if prefix not in role:
+        role = "，".join(part for part in (prefix, role) if part)
+    return formal_name, role
+
 _LORE_FIELD_ALIASES = {
     "name": ("name", "title", "名称", "设定名"),
     "type": ("type", "category", "类别", "类型"),
@@ -1541,6 +1602,10 @@ def _normalize_character_record(value):
         value,
         ("name", "role", "goal", "secret", "personality", "voice", "notes"),
         _CHARACTER_FIELD_ALIASES,
+    )
+    record["name"], record["role"] = _split_character_name_role_prefix(
+        record.get("name"),
+        record.get("role"),
     )
     record["notes"] = _clean_character_notes(record.get("notes"))
     optional_notes = (

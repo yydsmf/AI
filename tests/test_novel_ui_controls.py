@@ -107,6 +107,37 @@ class NovelUIControlsTests(unittest.TestCase):
             self.assertEqual(dialog.selected_values, [option])
             self.assertEqual(len(novel_storage.load_character_style_library()), 1)
 
+    def test_style_picker_can_clear_custom_style(self):
+        with tempfile.TemporaryDirectory() as tmp, patch.object(
+            novel_storage, "NOVEL_CHARACTER_STYLE_LIBRARY_FILE", os.path.join(tmp, "styles.json")
+        ):
+            style_id = self._saved_style()
+            dialog, option = self._style_picker(style_id)
+            parent = wizard.NovelCreationWizardDialog.__new__(wizard.NovelCreationWizardDialog)
+            parent.choice_values = {"protagonist_style": style_id}
+            parent.choice_display_values = {"protagonist_style": "主角"}
+            parent.choice_summary_buttons = {"protagonist_style": QPushButton("主角")}
+            parent.choice_arrow_buttons = {}
+            parent.premise_candidates = []
+            parent._on_choice_changed = lambda _key: None
+            parent._save_draft = lambda: None
+
+            none_button = next(
+                button for button in dialog.findChildren(QPushButton)
+                if button.text() == wizard.CHARACTER_STYLE_NONE_OPTION
+            )
+            self.assertTrue(next(
+                button for button in dialog.findChildren(QPushButton)
+                if button.text() == option
+            ).isChecked())
+            none_button.click()
+            self.assertEqual(dialog.selected_value, wizard.CHARACTER_STYLE_NONE_OPTION)
+
+            parent._set_choice("protagonist_style", dialog.selected_value)
+            self.assertEqual(parent.choice_values, {})
+            self.assertEqual(parent.choice_display_values, {})
+            self.assertEqual(parent.choice_summary_buttons["protagonist_style"].text(), "点击选择")
+
     def test_other_choice_categories_have_no_remove_buttons(self):
         dialog = wizard.CreationChoicePickerDialog(
             "主题", {"分类": ("都市", "日常")}, current_value="都市", max_selections=2

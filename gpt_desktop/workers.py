@@ -1,4 +1,5 @@
 import asyncio
+from email.utils import parsedate_to_datetime
 import gc
 import hashlib
 import json
@@ -14,7 +15,7 @@ import threading
 import time
 import traceback
 import uuid
-from datetime import datetime
+from datetime import datetime, timezone
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from copy import deepcopy
 from urllib.parse import urlsplit
@@ -5723,6 +5724,11 @@ class NovelWritingWorker(QThread):
             return (
                 "你是长篇小说连续性总编辑。最终正文是唯一事实来源；独立逐段检查正文并生成实际提纲、摘要、关键事实和版本2长篇记忆增量，"
                 "不得重写正文，不得把原提纲、未来规划、人物秘密或伏笔答案当成已经发生。"
+                "在状态整理前必须额外做一次正文成品泄漏检查：识别正文中误写入的内部人物/设定/伏笔短引用、任务或状态字段名、JSON/代码片段、"
+                "AI推理、提示词、输出要求、校验说明和工作流程说明。只有它们明显不是故事内人物看到的界面文字、手机消息、文件内容或自然对白时才算泄漏；"
+                "不要把剧情中合理出现的全角括号提示、聊天消息、文件名、普通英文缩写或角色对内部内容的讨论误报为泄漏。"
+                "发现明确泄漏时，在repair_patches中用最终正文里唯一出现的连续原文做最小替换，改成符合上下文的自然叙事；"
+                "无法确定或需要猜测剧情时不要修，不要因为程序目录里存在某个C/L/F编号就强行替换。"
                 "生成状态前必须单独审查正文内部的硬逻辑矛盾，尤其是人物位置与清醒状态、物件撤走后再次出现、"
                 "开合/损毁/持有人互斥、时间因果、数字前后不一致、人物与组织关系混用、"
                 "把人数简称当成组织名称或把规划内容写成已发生事实，以及代词歧义；"
@@ -6216,6 +6222,42 @@ class NovelWritingWorker(QThread):
             self._close_network_handles()
 
 
+def _parse_edge_tts_server_date(value):
+    """Parse HTTP dates without depending on the process locale."""
+    try:
+        parsed = parsedate_to_datetime(str(value or "").strip())
+        if parsed is None:
+            return None
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed.timestamp()
+    except (TypeError, ValueError, OverflowError, IndexError):
+        return None
+
+
+def _patch_edge_tts_date_parser():
+    """Make edge-tts accept English RFC dates under non-English locales."""
+    try:
+        from edge_tts.drm import DRM
+    except Exception:
+        return
+    if getattr(DRM, "_gpt_desktop_date_parser_patched", False):
+        return
+    original = DRM.parse_rfc2616_date
+
+    def parse_server_date(value):
+        parsed = _parse_edge_tts_server_date(value)
+        if parsed is not None:
+            return parsed
+        try:
+            return original(value)
+        except Exception:
+            return None
+
+    DRM.parse_rfc2616_date = staticmethod(parse_server_date)
+    DRM._gpt_desktop_date_parser_patched = True
+
+
 class EdgeTTSWorker(QThread):
     result_ready = Signal(str)
     failed = Signal(str)
@@ -6242,6 +6284,7 @@ class EdgeTTSWorker(QThread):
     async def _save_audio(self):
         import edge_tts
 
+        _patch_edge_tts_date_parser()
         communicate = edge_tts.Communicate(self.text, self.voice, rate=self.rate, receive_timeout=10)
         with open(self.output_path, "wb") as audio_file:
             async for chunk in communicate.stream():
@@ -7298,7 +7341,10 @@ class ImageWorker(QThread):
 
     def _post_with_response_format_fallback(self, post_func, payload_or_data):
         first = post_func(payload_or_data)
-        if not self._response_format_not_supported(first):
+        if (
+            "response_format" not in payload_or_data
+            or not self._response_format_not_supported(first)
+        ):
             return first
 
         try:
@@ -7328,7 +7374,10 @@ class ImageWorker(QThread):
         return post_func(retry_payload)
 
     def _preferred_image_response_format(self):
-        """仅对已验证支持内嵌图片数据的网关启用 b64_json。"""
+        """Choose a response format only for models that expose that parameter."""
+        model = str(self.model or "").strip().lower()
+        if model.startswith("gpt-image-"):
+            return ""
         try:
             host = (urlsplit(str(self.base_url or "")).hostname or "").lower()
         except Exception:
@@ -7721,8 +7770,10 @@ class ImageWorker(QThread):
                 "n": int(self.n),
                 "size": self.SIZE_MAP.get(self.size, "auto"),
                 "quality": self.QUALITY_MAP.get(self.quality, "auto"),
-                "response_format": self._preferred_image_response_format(),
             }
+            response_format = self._preferred_image_response_format()
+            if response_format:
+                payload["response_format"] = response_format
             return self._post_with_response_format_fallback(
                 lambda data: self._post_json_image_request(url, headers, data),
                 payload,
@@ -7735,8 +7786,10 @@ class ImageWorker(QThread):
             "n": str(int(self.n)),
             "size": self.SIZE_MAP.get(self.size, "auto"),
             "quality": self.QUALITY_MAP.get(self.quality, "auto"),
-            "response_format": self._preferred_image_response_format(),
         }
+        response_format = self._preferred_image_response_format()
+        if response_format:
+            data["response_format"] = response_format
         return self._post_with_response_format_fallback(
             lambda form_data: self._post_multipart_image_request(url, headers, form_data),
             data,

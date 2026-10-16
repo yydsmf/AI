@@ -1,0 +1,8 @@
+#!/bin/sh
+
+export LANG=zh_CN.UTF-8
+export LANGUAGE=zh_CN:zh
+export BLENDER_PATH=/usr/local/bin/blender
+export GPT_TOOLBOX_SHARED_ASSET_LIBRARY=/srv/gpt-data/assets/three_kingdoms/library
+cd /srv/gpt-data/app/gpt-toolbox || exit 1
+exec .venv/bin/python main.py "$@"

@@ -1,12 +1,72 @@
 import os
 import tempfile
 import unittest
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import gpt_desktop.novel_creation_wizard as wizard
 
 
 class NovelCreationWizardPersistenceTests(unittest.TestCase):
+    @staticmethod
+    def _scale_sized_assets(stage_counts):
+        characters = [{"name": f"人物{i}"} for i in range(25)]
+        lore = [{"name": f"设定{i}"} for i in range(25)]
+        foreshadows = []
+        for stage_number, count in enumerate(stage_counts, 1):
+            for item_number in range(count):
+                foreshadows.append({
+                    "code": f"F{stage_number}{item_number}",
+                    "name": f"伏笔{stage_number}-{item_number}",
+                    "setup_stage": f"第{stage_number}阶段",
+                    "payoff_stage": f"第{stage_number}阶段",
+                })
+        return {
+            "characters": characters,
+            "lore": lore,
+            "foreshadows": foreshadows,
+        }
+
+    def test_creation_scale_requires_three_foreshadows_per_stage(self):
+        _size_label, ranges = wizard._creation_scale_requirements(500000)
+        self.assertEqual(ranges["characters"], (25, 25))
+        self.assertEqual(ranges["lore"], (25, 25))
+        self.assertEqual(ranges["foreshadows"], (15, 15))
+
+        assets = self._scale_sized_assets([3, 3, 3, 3, 3])
+        self.assertEqual(
+            wizard._creation_scale_shortfalls(assets, 500000),
+            [],
+        )
+
+    def test_creation_scale_rejects_total_enough_but_stage_shortfall(self):
+        assets = self._scale_sized_assets([2, 4, 3, 3, 3])
+        shortfalls = wizard._creation_scale_shortfalls(assets, 500000)
+        self.assertIn("伏笔第1阶段 2/3", shortfalls)
+        self.assertNotIn("伏笔 15/15", shortfalls)
+
+    def test_bible_confirmation_uses_stage_foreshadow_minimum(self):
+        dialog = wizard.NovelCreationWizardDialog.__new__(
+            wizard.NovelCreationWizardDialog
+        )
+        dialog.target_words_spin = SimpleNamespace(value=lambda: 500000)
+        dialog._normalize_step_result = lambda step, payload: payload
+        result = {
+            "bible": {"core": "核心冲突"},
+            "world_rules": {"rules": ["规则"]},
+            **self._scale_sized_assets([2, 4, 3, 3, 3]),
+        }
+
+        error = dialog._bible_validation_error(result)
+
+        self.assertIn("资料数量未达到按阶段计算的最低要求", error)
+        self.assertIn("伏笔第1阶段 2/3", error)
+
+    def test_creation_scale_guidance_uses_positive_foreshadow_prompt(self):
+        guidance = wizard._creation_scale_guidance(500000)
+        self.assertIn("每个阶段至少生成3条真正有长期回收价值的新增伏笔", guidance)
+        self.assertNotIn("每个阶段至少准备5条", guidance)
+
     def test_character_style_choice_only_exposes_personality_and_voice(self):
         entry = {
             "id": "style-1",

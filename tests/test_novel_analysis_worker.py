@@ -789,6 +789,8 @@ class NovelAnalysisWorkerTests(unittest.TestCase):
         self.assertIn("当前章节资料", rules_worker._action_prompt())
         self.assertIn("连续性总编辑", memory_finalize_worker._action_prompt())
         self.assertIn("记录缺失或覆盖", memory_finalize_worker._action_prompt())
+        self.assertIn("正文成品泄漏检查", memory_finalize_worker._action_prompt())
+        self.assertIn("无法确定或需要猜测剧情时不要修", memory_finalize_worker._action_prompt())
         self.assertIn("只能填写在fact_updates各项的key字段", memory_finalize_worker._action_prompt())
         self.assertIn("至少被一个long_term_events.storage.fact_refs引用", memory_finalize_worker._action_prompt())
         self.assertEqual(profile_worker._max_tokens_for_request(), 2800)

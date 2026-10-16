@@ -1,0 +1,13 @@
+[Unit]
+Description=GPT Toolbox collaborator noVNC gateway
+After=network.target gpt-vnc-user2.service
+Requires=gpt-vnc-user2.service
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/websockify --web=/usr/share/novnc 127.0.0.1:6082 127.0.0.1:5902
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,14 @@
+[Unit]
+Description=GPT Toolbox administrator NVIDIA desktop VNC bridge
+After=network.target gpt-gpu-admin-session.service
+Requires=gpt-gpu-admin-session.service
+
+[Service]
+Type=simple
+User=root
+ExecStart=/usr/bin/x11vnc -display :0 -localhost -rfbport 5901 -forever -shared -nopw -noxrecord -noxfixes -noxdamage
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

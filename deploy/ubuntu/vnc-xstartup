@@ -1,0 +1,21 @@
+#!/bin/sh
+
+unset SESSION_MANAGER
+unset DBUS_SESSION_BUS_ADDRESS
+export LANG=zh_CN.UTF-8
+export LANGUAGE=zh_CN:zh
+export GPT_TOOLBOX_KIOSK=1
+if [ "$(id -un)" = "gptadmin" ]; then
+    export GPT_TOOLBOX_DEVICE_STATUS=1
+else
+    unset GPT_TOOLBOX_DEVICE_STATUS
+fi
+
+exec dbus-run-session sh -c '
+    xsetroot -solid "#202124"
+    xfwm4 --replace &
+    while true; do
+        /usr/local/bin/gpt-toolbox
+        sleep 2
+    done
+'

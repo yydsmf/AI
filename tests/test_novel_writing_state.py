@@ -3,6 +3,7 @@ import hashlib
 import os
 import unittest
 import tempfile
+from datetime import datetime, timezone
 from copy import deepcopy
 from pathlib import Path
 from unittest.mock import patch
@@ -44,7 +45,7 @@ from gpt_desktop.novel_writing_tab import (
     NovelWritingTab,
     _numbered_export_chapter_title,
 )
-from gpt_desktop.workers import EdgeTTSWorker
+from gpt_desktop.workers import EdgeTTSWorker, _parse_edge_tts_server_date
 
 
 class NovelWritingStateTests(unittest.TestCase):
@@ -625,7 +626,13 @@ class NovelWritingStateTests(unittest.TestCase):
         editor = FakeReadOnlyWidget()
         action = FakeEnabledWidget()
         stop = FakeEnabledWidget()
-        workspace = FakeWorkspace([editor, action, stop])
+        read_aloud = FakeEnabledWidget()
+        read_aloud_stop = FakeEnabledWidget()
+        read_aloud_scope = FakeEnabledWidget()
+        read_aloud_rate = FakeEnabledWidget()
+        workspace = FakeWorkspace(
+            [editor, action, stop, read_aloud, read_aloud_stop, read_aloud_scope, read_aloud_rate]
+        )
         project_panel = FakeWorkspace([FakeEnabledWidget()])
 
         tab = NovelWritingTab.__new__(NovelWritingTab)
@@ -633,6 +640,10 @@ class NovelWritingStateTests(unittest.TestCase):
         tab.project_workspace = workspace
         tab.project_panel = project_panel
         tab.chapter_ai_stop_btn = stop
+        tab.read_aloud_btn = read_aloud
+        tab.read_aloud_stop_btn = read_aloud_stop
+        tab.read_aloud_scope_combo = read_aloud_scope
+        tab.read_aloud_rate_combo = read_aloud_rate
 
         with patch("gpt_desktop.novel_writing_tab.QPlainTextEdit", FakeReadOnlyWidget), \
              patch("gpt_desktop.novel_writing_tab.QTextEdit", FakeReadOnlyWidget), \
@@ -646,6 +657,10 @@ class NovelWritingStateTests(unittest.TestCase):
             self.assertTrue(editor.read_only)
             self.assertFalse(action.enabled)
             self.assertTrue(stop.enabled)
+            self.assertTrue(read_aloud.enabled)
+            self.assertTrue(read_aloud_stop.enabled)
+            self.assertTrue(read_aloud_scope.enabled)
+            self.assertTrue(read_aloud_rate.enabled)
             self.assertTrue(project_panel.children[0].enabled)
 
             tab._set_detached_auto_source_read_only(False)
@@ -1962,6 +1977,13 @@ class NovelWritingStateTests(unittest.TestCase):
         worker.stop()
 
         self.assertTrue(worker._stop_requested)
+
+    def test_edge_tts_server_date_parser_accepts_english_rfc_date(self):
+        parsed = _parse_edge_tts_server_date("Thu, 15 Oct 2026 02:41:15 GMT")
+
+        self.assertIsInstance(parsed, float)
+        expected = datetime(2026, 10, 15, 2, 41, 15, tzinfo=timezone.utc).timestamp()
+        self.assertEqual(parsed, expected)
 
     def test_novel_default_read_aloud_rate_exists(self):
         tab = NovelWritingTab.__new__(NovelWritingTab)

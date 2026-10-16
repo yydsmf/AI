@@ -1,0 +1,14 @@
+[Unit]
+Description=GPT Toolbox NVIDIA desktop
+After=systemd-udev-settle.service
+Conflicts=display-manager.service
+Before=gpt-gpu-admin-session.service
+
+[Service]
+Type=simple
+ExecStart=/usr/lib/xorg/Xorg :0 -config /etc/gpt-toolbox/nvidia-xorg.conf -sharevts -novtswitch -nolisten tcp -noreset -logfile /var/log/gpt-toolbox-Xorg.0.log
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

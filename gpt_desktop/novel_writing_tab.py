@@ -12501,8 +12501,22 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
                 child_widgets = root.findChildren(QWidget)
             except RuntimeError:
                 return
+            # Listening is read-only and does not mutate the project. Keep
+            # these controls available while the source project is locked.
+            read_aloud_controls = {
+                widget
+                for name in (
+                    "read_aloud_btn",
+                    "read_aloud_stop_btn",
+                    "read_aloud_scope_combo",
+                    "read_aloud_rate_combo",
+                )
+                if (widget := getattr(self, name, None)) is not None
+            }
             for widget in child_widgets:
                 if widget is getattr(self, "chapter_ai_stop_btn", None):
+                    continue
+                if widget in read_aloud_controls:
                     continue
                 if isinstance(widget, (QPlainTextEdit, QTextEdit, QLineEdit)):
                     states.append((widget, "read_only", bool(widget.isReadOnly())))

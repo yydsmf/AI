@@ -1,0 +1,19 @@
+[Unit]
+Description=GPT Toolbox administrator fallback VNC desktop
+After=network.target
+Conflicts=gpt-vnc-admin.service
+
+[Service]
+Type=forking
+User=gptadmin
+Environment=HOME=/home/gptadmin
+WorkingDirectory=/home/gptadmin
+PIDFile=/home/gptadmin/.vnc/%H:1.pid
+ExecStartPre=-/usr/bin/tigervncserver -kill :1
+ExecStart=/usr/bin/tigervncserver :1 -localhost yes -SecurityTypes None -geometry 1920x1080 -depth 24
+ExecStop=-/usr/bin/tigervncserver -kill :1
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

@@ -585,13 +585,19 @@ def _strip_internal_candidate_markers(value):
 _INTERNAL_FORESHADOW_STATUS_WORD_RE = re.compile(
     r"(?i)(?<![a-z])(?:progressed|advanced|reinforced)(?![a-z])"
 )
+_INTERNAL_FORESHADOW_STATUS_LINE_RE = re.compile(
+    r"(?i)^(?:未埋|已埋|推进|已推进|本章首次埋设|seeded|advanced|progressed|reinforced)$"
+)
 
 
 def _strip_internal_foreshadow_status_words(value):
     """Remove internal lifecycle markers from user-facing foreshadow text."""
     kept = []
     for raw in str(value or "").splitlines():
-        line = _INTERNAL_FORESHADOW_STATUS_WORD_RE.sub("", str(raw or ""))
+        line = str(raw or "").strip()
+        if _INTERNAL_FORESHADOW_STATUS_LINE_RE.fullmatch(line):
+            continue
+        line = _INTERNAL_FORESHADOW_STATUS_WORD_RE.sub("", line)
         line = re.sub(r"[ \t]*([|｜,，;；、])?[ \t]*$", "", line).strip()
         if line:
             kept.append(line)
@@ -2207,6 +2213,9 @@ def _normalize_project(data):
                     if isinstance(chap.get("state_reconciliation"), dict) else {}
                 )
                 chap["memory_selection"] = deepcopy(chap.get("memory_selection", {})) if isinstance(chap.get("memory_selection"), dict) else {}
+                # Foreshadows are routed by chapter plan now.  Do not retain
+                # the old handoff field as an active source for model context.
+                chap["memory_selection"].pop("foreshadow_ids", None)
                 memory_sync_status = str(chap.get("memory_sync_status", "") or "").strip()
                 if memory_sync_status not in {"pending", "complete", "failed"}:
                     memory_sync_status = "complete" if _chapter_analysis_is_current(chap) else "pending"
@@ -6754,6 +6763,123 @@ def _planned_foreshadow_routes(items, chapter_index, chapter_title=""):
         if phases:
             routes.append((item, phases))
     return routes
+
+
+def _foreshadow_plan_routing_enabled(project):
+    """Return whether the project uses the chapter-routed foreshadow scheme."""
+    project = project if isinstance(project, dict) else {}
+    items = project.get("foreshadow_items", [])
+    return any(
+        isinstance(item, dict)
+        and (
+            _foreshadow_planned_chapter_number(item.get("setup_chapter", ""))
+            or _foreshadow_planned_chapter_number(item.get("payoff_chapter", ""))
+        )
+        for item in items if isinstance(item, dict)
+    )
+
+
+def _planned_foreshadow_ids(project, chapter_index, chapter_title=""):
+    """Return canonical IDs for the current chapter's planned foreshadow route."""
+    project = project if isinstance(project, dict) else {}
+    routes = _planned_foreshadow_routes(
+        project.get("foreshadow_items", []), chapter_index, chapter_title
+    )
+    result = []
+    for item, _phases in routes:
+        raw_ref = str(
+            item.get("id", "") or item.get("code", "") or item.get("name", "") or ""
+        ).strip()
+        resolved = _resolve_long_form_record_ref(project, "foreshadows", raw_ref) or raw_ref
+        if resolved and resolved not in result:
+            result.append(resolved)
+    return result
+
+
+def _active_foreshadow_selection(
+    project, chapter_index, selection=None, extra_foreshadow_ids=None
+):
+    """Build current-chapter foreshadow context without legacy handoff data."""
+    project = project if isinstance(project, dict) else {}
+    effective = deepcopy(selection) if isinstance(selection, dict) else {}
+    effective.pop("foreshadow_ids", None)
+    chapters = project.get("chapters", [])
+    chapter = (
+        chapters[chapter_index]
+        if isinstance(chapters, list)
+        and 0 <= chapter_index < len(chapters)
+        and isinstance(chapters[chapter_index], dict)
+        else {}
+    )
+    routes = _planned_foreshadow_routes(
+        project.get("foreshadow_items", []),
+        chapter_index,
+        str(chapter.get("title", "") or ""),
+    )
+    route_ids = _planned_foreshadow_ids(
+        project,
+        chapter_index,
+        str(chapter.get("title", "") or ""),
+    )
+    touched_ids = []
+    for value in extra_foreshadow_ids if isinstance(extra_foreshadow_ids, (list, tuple, set)) else []:
+        raw_ref = str(value or "").strip()
+        if not raw_ref:
+            continue
+        resolved = _resolve_long_form_record_ref(project, "foreshadows", raw_ref) or raw_ref
+        if resolved and resolved not in touched_ids:
+            touched_ids.append(resolved)
+    # This is an in-memory context only. It is never written to chapter
+    # memory_selection, so stale foreshadow choices cannot cross chapters.
+    effective["foreshadow_ids"] = []
+    for item_id in route_ids + touched_ids:
+        if item_id and item_id not in effective["foreshadow_ids"]:
+            effective["foreshadow_ids"].append(item_id)
+    return effective, routes
+
+
+def _foreshadow_ids_from_update(project, update):
+    """Collect existing foreshadow refs explicitly touched by one memory payload."""
+    project = project if isinstance(project, dict) else {}
+    payload = update if isinstance(update, dict) else {}
+    refs = []
+
+    def add(value):
+        raw_ref = str(value or "").strip()
+        if not raw_ref:
+            return
+        resolved = _resolve_long_form_record_ref(project, "foreshadows", raw_ref)
+        if resolved and resolved not in refs:
+            refs.append(resolved)
+
+    for item in payload.get("foreshadow_updates", []) if isinstance(payload.get("foreshadow_updates"), list) else []:
+        if isinstance(item, dict):
+            add(item.get("ref", item.get("id", item.get("key", ""))))
+    for event in payload.get("long_term_events", []) if isinstance(payload.get("long_term_events"), list) else []:
+        if not isinstance(event, dict):
+            continue
+        storage = event.get("storage", {})
+        if isinstance(storage, dict):
+            for value in storage.get("foreshadow_refs", []) if isinstance(storage.get("foreshadow_refs"), list) else []:
+                add(value)
+    reconciliation = payload.get("state_reconciliation", {})
+    if isinstance(reconciliation, dict):
+        for value in reconciliation.get("foreshadow_refs", []) if isinstance(reconciliation.get("foreshadow_refs"), list) else []:
+            add(value)
+    next_memory = payload.get("next_chapter_memory", {})
+    if isinstance(next_memory, dict):
+        for value in next_memory.get("foreshadow_refs", []) if isinstance(next_memory.get("foreshadow_refs"), list) else []:
+            add(value)
+    verification = payload.get("verification", {})
+    if isinstance(verification, dict):
+        for key in ("unchanged_foreshadow_refs",):
+            for value in verification.get(key, []) if isinstance(verification.get(key), list) else []:
+                add(value)
+        runtime_unchanged = verification.get("runtime_unchanged", {})
+        if isinstance(runtime_unchanged, dict):
+            for value in runtime_unchanged.get("foreshadow_refs", []) if isinstance(runtime_unchanged.get("foreshadow_refs"), list) else []:
+                add(value)
+    return refs
 
 
 def _recent_chapter_context(chapters, chapter_index, window=6, project=None):
@@ -12422,7 +12548,11 @@ def _build_long_form_selection_index(project, chapter_index, selection=None, lim
     memory = _normalize_long_form_memory(project.get("long_form_memory", {}))
     if not isinstance(selection, dict):
         chapter_selection = chapter.get("memory_selection", {})
-        selection = chapter_selection if isinstance(chapter_selection, dict) else {}
+        selection, _planned_routes = _active_foreshadow_selection(
+            project,
+            chapter_index,
+            chapter_selection if isinstance(chapter_selection, dict) else {},
+        )
     restrict_records = bool(selection.get("_restrict_records"))
     finalize_compact_index = bool(selection.get("_finalize_compact_index"))
     selected_record_id_lists = {
@@ -12932,7 +13062,11 @@ def _long_form_compact_update_contract_instructions(project, chapter_index):
         else {}
     )
     selection = chapter.get("memory_selection", {})
-    selection = selection if isinstance(selection, dict) else {}
+    selection, _planned_routes = _active_foreshadow_selection(
+        project,
+        chapter_index,
+        selection if isinstance(selection, dict) else {},
+    )
     existing_fact_ids = {
         str(item.get("id", "") or "").strip()
         for item in memory.get("active_facts", [])
@@ -12965,6 +13099,15 @@ def _long_form_compact_update_contract_instructions(project, chapter_index):
     )
     outlined_lore_refs = sorted(
         lore_aliases.get(item_id, item_id) for item_id in outlined_lore_ids
+    )
+    planned_foreshadow_refs = (
+        _planned_foreshadow_ids(
+            project,
+            chapter_index,
+            str(chapter.get("title", "") or ""),
+        )
+        if _foreshadow_plan_routing_enabled(project)
+        else []
     )
     stage_boundary = (chapter_index + 1) % 10 == 0
     catalog_summary = json.dumps(
@@ -13034,6 +13177,7 @@ def _long_form_compact_update_contract_instructions(project, chapter_index):
             "notes": "",
         },
     }
+    example["verification"]["runtime_unchanged"]["foreshadow_refs"] = planned_foreshadow_refs
     required_state_text = json.dumps({
         "object_keys": required_objects,
         "conflict_refs": required_conflicts,
@@ -13086,7 +13230,9 @@ def _long_form_compact_update_contract_instructions(project, chapter_index):
         "已经进入record_updates或foreshadow_updates的引用不要再列为unchanged。"
         f"本章必须复核的已有事实为{json.dumps(required_fact_refs, ensure_ascii=False, separators=(',', ':'))}；"
         f"必须复核的已有物件/冲突/任务为{required_state_text}；"
-        f"原提纲直接点名、必须给出更新或runtime_unchanged结论的设定ID为{json.dumps(outlined_lore_refs, ensure_ascii=False, separators=(',', ':'))}。"
+        f"原提纲直接点名、必须给出更新或runtime_unchanged结论的设定ID为{json.dumps(outlined_lore_refs, ensure_ascii=False, separators=(',', ':'))}；"
+        f"本章计划路由伏笔为{json.dumps(planned_foreshadow_refs, ensure_ascii=False, separators=(',', ':'))}，"
+        "必须依据最终正文判断这些伏笔是发生了实际变化还是保持不变；不得按计划章节强制改状态。"
         "next_chapter_memory只选择下一章真正需要的引用和状态键；本章新增且会影响下一章的资料必须选入。"
         "next_chapter_memory可直接使用本次新增的NC/NL/NT/NF临时key，真实ID仍由程序统一分配。"
         + (
@@ -13118,7 +13264,11 @@ def _long_form_update_contract_instructions(project, chapter_index, compact=Fals
         else {}
     )
     selection = chapter.get("memory_selection", {})
-    selection = selection if isinstance(selection, dict) else {}
+    selection, _planned_routes = _active_foreshadow_selection(
+        project,
+        chapter_index,
+        selection if isinstance(selection, dict) else {},
+    )
     required_review_refs = sorted({
         str(value or "").strip()
         for value in selection.get("fact_ids", [])
@@ -13131,6 +13281,15 @@ def _long_form_update_contract_instructions(project, chapter_index, compact=Fals
     )
     outlined_lore_refs = sorted(
         lore_aliases.get(item_id, item_id) for item_id in outlined_lore_ids
+    )
+    planned_foreshadow_refs = (
+        _planned_foreshadow_ids(
+            project,
+            chapter_index,
+            str(chapter.get("title", "") or ""),
+        )
+        if _foreshadow_plan_routing_enabled(project)
+        else []
     )
     outlined_lore_text = json.dumps(
         outlined_lore_refs, ensure_ascii=False, separators=(",", ":")
@@ -13172,6 +13331,10 @@ def _long_form_update_contract_instructions(project, chapter_index, compact=Fals
     example_payload["state_reconciliation"]["record_runtime_review"][
         "reviewed_lore_refs"
     ] = outlined_lore_refs
+    example_payload["state_reconciliation"]["foreshadow_refs"] = planned_foreshadow_refs
+    example_payload["state_reconciliation"]["record_runtime_review"][
+        "reviewed_foreshadow_refs"
+    ] = planned_foreshadow_refs
     example = json.dumps(example_payload, ensure_ascii=False, separators=(",", ":"))
     catalog_summary = json.dumps(
         _long_form_catalog_summary(_long_form_active_catalog(project, memory)),
@@ -13243,6 +13406,10 @@ def _long_form_update_contract_instructions(project, chapter_index, compact=Fals
         f"当前提纲直接点名的设定引用为{outlined_lore_text}；这些设定必须全部进入state_reconciliation.lore_refs和"
         "record_runtime_review.reviewed_lore_refs。逐项对照最终正文：正文确实推进其公开层、路线、权限、位置或状态时更新record_updates.lore，"
         "正文没有推进时才放入unchanged_lore_refs；提纲点名本身不能当作正文证据。"
+        f"本章计划路由伏笔引用为{json.dumps(planned_foreshadow_refs, ensure_ascii=False, separators=(',', ':'))}；"
+        "这些伏笔必须逐项依据最终正文判断：发生推进/埋设/回收时进入foreshadow_updates，正文明确触及但状态未变时进入"
+        "state_reconciliation.record_runtime_review.reviewed_foreshadow_refs和unchanged_foreshadow_refs；"
+        "没有正文证据时不得因为计划章节、历史记录或伏笔说明而更新。"
         "最终正文中实际行动、说话、来电或提供关键信息的已有命名人物，必须同时进入"
         "current_chapter_character_refs和state_reconciliation.character_refs；有持续变化时还必须进入record_updates.characters。"
         "必须逐段检查新线索、证据异常、记录缺失/覆盖/删除/清空、未知来源和责任边界；"
@@ -13312,7 +13479,11 @@ def _expand_compact_long_form_memory_update(project, chapter_index, update):
     )
     memory = _normalize_long_form_memory(project.get("long_form_memory", {}))
     selection = chapter.get("memory_selection", {}) if isinstance(chapter, dict) else {}
-    selection = selection if isinstance(selection, dict) else {}
+    selection, _planned_routes = _active_foreshadow_selection(
+        project,
+        chapter_index,
+        selection if isinstance(selection, dict) else {},
+    )
     existing_state_refs = _long_form_existing_state_refs(project, memory)
     stage_scope = (
         LONG_FORM_STAGE_REVIEW_SCOPE
@@ -13472,6 +13643,13 @@ def _expand_compact_long_form_memory_update(project, chapter_index, update):
     # the chapter did not change it.
     for ref in _chapter_outline_named_lore_refs(project, chapter_index):
         append_ref(reconciliation["lore_refs"], ref)
+    if _foreshadow_plan_routing_enabled(project):
+        for ref in _planned_foreshadow_ids(
+            project,
+            chapter_index,
+            str(chapter.get("title", "") or ""),
+        ):
+            append_ref(reconciliation["foreshadow_refs"], ref)
     for ref in payload.get("current_chapter_character_refs", []):
         append_ref(reconciliation["character_refs"], ref)
 
@@ -15885,7 +16063,11 @@ def _validate_long_form_memory_update(
         state_retirements = {}
     existing_state_refs = _long_form_existing_state_refs(project, memory)
     chapter_selection = chapters[chapter_index].get("memory_selection", {})
-    chapter_selection = chapter_selection if isinstance(chapter_selection, dict) else {}
+    chapter_selection, _planned_routes = _active_foreshadow_selection(
+        project,
+        chapter_index,
+        chapter_selection if isinstance(chapter_selection, dict) else {},
+    )
     selected_fact_ids = {
         str(value or "").strip()
         for value in chapter_selection.get("fact_ids", [])
@@ -16794,6 +16976,18 @@ def _validate_long_form_memory_update(
                     else item.get("ref", item.get("id", ""))
                     or ""
                 ).strip())
+        planned_foreshadow_refs = set(
+            _planned_foreshadow_ids(
+                project,
+                chapter_index,
+                str(chapters[chapter_index].get("title", "") or ""),
+            )
+            if _foreshadow_plan_routing_enabled(project)
+            else []
+        )
+        required_checked_foreshadow_refs = (
+            set(required_foreshadow_refs) | planned_foreshadow_refs
+        )
         changed_runtime_refs = {
             "lore": {
                 _resolve_long_form_record_ref(project, "lore", ref) or ref
@@ -16811,7 +17005,7 @@ def _validate_long_form_memory_update(
         )
         required_runtime_refs = {
             "lore": event_runtime_refs["lore"] | outlined_lore_refs,
-            "foreshadows": set(event_runtime_refs["foreshadows"]),
+            "foreshadows": set(event_runtime_refs["foreshadows"]) | planned_foreshadow_refs,
         }
         runtime_review = reconciliation.get("record_runtime_review", {})
         if any(required_runtime_refs.values()) and not isinstance(runtime_review, dict):
@@ -16972,7 +17166,7 @@ def _validate_long_form_memory_update(
             ("fact_refs", required_fact_refs),
             ("character_refs", required_character_refs),
             ("lore_refs", required_lore_refs),
-            ("foreshadow_refs", required_foreshadow_refs),
+            ("foreshadow_refs", required_checked_foreshadow_refs),
             ("object_keys", required_object_keys),
             ("conflict_refs", required_conflict_refs),
             ("task_refs", required_task_refs),
@@ -17688,7 +17882,11 @@ def _build_memory_repair_selection(
         append_unique(output_key, item_id)
 
     current_selection = chapter.get("memory_selection", {})
-    current_selection = current_selection if isinstance(current_selection, dict) else {}
+    current_selection, _planned_routes = _active_foreshadow_selection(
+        project,
+        chapter_index,
+        current_selection if isinstance(current_selection, dict) else {},
+    )
     for key in (
         "character_ids", "lore_ids", "foreshadow_ids", "fact_ids", "stage_archive_ids",
         "object_keys", "conflict_ids", "task_ids",
@@ -17864,6 +18062,17 @@ def _build_memory_repair_selection(
     for item in memory.get("stage_archives", [])[-2:]:
         if isinstance(item, dict):
             append_unique("stage_archive_ids", item.get("id", ""))
+    payload_foreshadow_ids = _foreshadow_ids_from_update(project, payload)
+    for ref in re.findall(r"\bF\d{3,}\b", error_text, flags=re.IGNORECASE):
+        resolved = _resolve_long_form_record_ref(project, "foreshadows", ref.upper())
+        if resolved and resolved not in payload_foreshadow_ids:
+            payload_foreshadow_ids.append(resolved)
+    selection, _routes = _active_foreshadow_selection(
+        project,
+        chapter_index,
+        selection,
+        extra_foreshadow_ids=payload_foreshadow_ids,
+    )
     return selection
 
 
@@ -18361,7 +18570,23 @@ def _build_long_form_memory_patch_context(
         ),
     ]
     if targets["memory_fields"]:
+        patch_selection = _active_foreshadow_selection(
+            project,
+            chapter_index,
+            (
+                chapters[chapter_index].get("memory_selection", {})
+                if isinstance(chapters[chapter_index], dict)
+                else {}
+            ),
+            extra_foreshadow_ids=_foreshadow_ids_from_update(project, memory_update),
+        )[0]
         sections.extend([
+            (
+                "当前章节伏笔路由",
+                _build_long_form_selection_index(project, chapter_index, patch_selection, limit=12000),
+                12000,
+                False,
+            ),
             (
                 "待修复的原状态字段",
                 json.dumps(original_memory, ensure_ascii=False, separators=(",", ":")),
@@ -18544,7 +18769,11 @@ def _build_long_form_memory_finalize_context(project, chapter_index, final_text)
         else {}
     )
     current_selection = chapter.get("memory_selection", {})
-    current_selection = current_selection if isinstance(current_selection, dict) else {}
+    current_selection, _planned_routes = _active_foreshadow_selection(
+        project,
+        chapter_index,
+        current_selection if isinstance(current_selection, dict) else {},
+    )
     has_scoped_selection = any(
         current_selection.get(key)
         for key in (
@@ -18573,6 +18802,9 @@ def _build_long_form_memory_finalize_context(project, chapter_index, final_text)
     task = (
         "只读取已经完成的【最终正文】，独立生成实际提纲、本章摘要、需继承关键事实和版本2长篇记忆增量；"
         "不得重写正文，不得把原规划提纲或下一章资料中的未来事件写成已经发生。\n"
+        "状态整理前必须检查正文成品是否误写入内部人物/设定/伏笔短引用、任务或状态字段名、JSON/代码、AI推理、提示词、输出要求、校验说明或工作流程说明；"
+        "只有明确不是故事内界面文字、手机消息、文件内容或自然对白时才算泄漏。发现确定泄漏时才在repair_patches中给出最终正文里唯一出现的最小替换；"
+        "无法确定或需要猜测剧情时不要修，不要仅因项目目录存在某个C/L/F编号就替换。\n"
         "生成状态资料前，先独立审查最终正文内部是否存在有前后逐字原文直接证明的硬矛盾。"
         "重点检查同一人物的生死、清醒、伤势和位置，物件的存在、撤走、开合、损毁、移动和持有人，"
         "人物进出场、时间先后、原因结果、明确知识或权限以及代词唯一指向。"
@@ -18620,16 +18852,18 @@ def _build_long_form_memory_finalize_context(project, chapter_index, final_text)
         '"category":"chronology|causality|character_state|character_location|object_state|object_ownership|spatial_state|pronoun_reference|knowledge_permission|numeric_consistency|entity_relationship|fact_boundary",'
         '"earlier_quote":"较早的正文逐字原文","later_quote":"较晚的正文逐字原文","explanation":"两种状态为何不能同时成立"}]},'
         '"prose_review":{"checked":true,"issues":["仅记录可逐字定位的读感问题"]},'
-        '"repair_patches":[{"before":"正文中唯一出现的原句片段","after":"局部替换文本","reason":"重复说明|流程赘述|机械短碎|局部语言冲突"}]}。'
+        '"repair_patches":[{"before":"正文中唯一出现的原句片段","after":"局部替换文本","reason":"重复说明|流程赘述|机械短碎|局部语言冲突|正文泄漏"}]}。'
         "输出顺序必须是outline、summary、key_facts、long_form_memory、logic_audit、prose_review、repair_patches。"
         "outline、summary、key_facts和long_form_memory是必填的核心结果；即使没有逻辑问题、没有读感修补、"
         "或本章没有新的长期状态变化，也绝不能只返回logic_audit、prose_review或repair_patches。"
         "logic_audit没有问题时写checked:true、issues:[]；prose_review没有问题时写checked:true、issues:[]；"
         "repair_patches没有必要时写[]。核心结果必须先完整写出，再写三个审校字段。"
         "logic_audit必须同时检查最终正文内部的直接矛盾，以及正文与【实体称谓与关系边界】之间的明确冲突；不评价文风和剧情选择，checked必须为true。"
-        "prose_review只记录有明确原文位置的重复说明、无结果流程赘述、机械短碎或局部语言冲突；"
+        "prose_review还必须检查正文是否误写入内部人物/设定/伏笔短引用、任务或状态字段名、JSON/代码、AI推理、提示词、输出要求、校验说明或工作流程说明；"
+        "只有明确属于生成过程而不是故事内界面文字、手机消息、文件内容或自然对白时才记录为正文泄漏。"
+        "prose_review只记录有明确原文位置的重复说明、无结果流程赘述、机械短碎、局部语言冲突或确定的正文泄漏；"
         "正常留白、剧情选择、文风偏好和现实流程不完整都不是问题。repair_patches通常为空；"
-        "只有确实需要修补且before在最终正文中逐字唯一出现时才返回，最多3项。"
+        "只有确实需要修补且before在最终正文中逐字唯一出现时才返回，最多3项；不确定的疑似泄漏不要修。"
         "每项只能做一处局部替换，不能改剧情事实、人物决定、时间线、关系结果、伏笔或章末结果，"
         "更不能重写整段或整章。"
         "outline、summary和key_facts只能概括最终正文已经发生的内容。summary控制在500字以内；"
@@ -19193,10 +19427,15 @@ def _build_long_form_memory_reconcile_context(
     chapters = project.get("chapters", []) if isinstance(project.get("chapters"), list) else []
     chapter = chapters[chapter_index] if 0 <= chapter_index < len(chapters) and isinstance(chapters[chapter_index], dict) else {}
     memory = _normalize_long_form_memory(project.get("long_form_memory", {}))
-    selection = chapter.get("memory_selection", {}) if isinstance(chapter, dict) else {}
-    selection = selection if isinstance(selection, dict) else {}
-    memory_sections = _long_form_memory_sections(project, selection)
     proposed = _normalize_long_form_update_payload(project, chapter_index, memory_update or {})
+    selection = chapter.get("memory_selection", {}) if isinstance(chapter, dict) else {}
+    selection, _routes = _active_foreshadow_selection(
+        project,
+        chapter_index,
+        selection if isinstance(selection, dict) else {},
+        extra_foreshadow_ids=_foreshadow_ids_from_update(project, proposed),
+    )
+    memory_sections = _long_form_memory_sections(project, selection)
     recent_blocks = []
     for index in range(max(0, chapter_index - 9), chapter_index + 1):
         item = chapters[index] if 0 <= index < len(chapters) and isinstance(chapters[index], dict) else {}
@@ -20911,7 +21150,6 @@ def _apply_long_form_memory_update_unchecked(project, chapter_index, payload, up
         for output_key, input_key, kind in (
             ("character_ids", "character_refs", "characters"),
             ("lore_ids", "lore_refs", "lore"),
-            ("foreshadow_ids", "foreshadow_refs", "foreshadows"),
         ):
             legacy_key = input_key.replace("_refs", "_ids")
             values = next_memory.get(input_key, next_memory.get(legacy_key, []))
@@ -20927,6 +21165,9 @@ def _apply_long_form_memory_update_unchecked(project, chapter_index, payload, up
                 if item_id and item_id not in ids:
                     ids.append(item_id)
             selection[output_key] = ids
+        # Foreshadows are intentionally excluded from durable next-chapter
+        # selections. The current chapter route and explicit transaction refs
+        # are assembled in memory when a context is built.
         fact_values = next_memory.get("fact_refs", next_memory.get("fact_ids", []))
         valid_fact_ids = {str(item.get("id", "") or "") for item in memory.get("active_facts", []) if isinstance(item, dict)}
         selection["fact_ids"] = []
@@ -21135,7 +21376,11 @@ def _build_chapter_ai_context(project, chapter_index, action):
     if not isinstance(linked_characters, list):
         linked_characters = []
     planned_linked_characters = _normalize_name_list(linked_characters)
-    memory_selection = chap.get("memory_selection", {}) if isinstance(chap.get("memory_selection"), dict) else {}
+    memory_selection, _planned_routes = _active_foreshadow_selection(
+        project,
+        chapter_index,
+        chap.get("memory_selection", {}) if isinstance(chap.get("memory_selection"), dict) else {},
+    )
     selected_character_id_list = _normalize_name_list(memory_selection.get("character_ids", []))
     selected_character_ids = set(selected_character_id_list)
     character_names_by_id = {
@@ -21188,14 +21433,7 @@ def _build_chapter_ai_context(project, chapter_index, action):
     ])
     runtime_project = _chapter_memory_view(project, chapter_index)
     planned_foreshadow_routing = action in {"draft", "script_to_novel"}
-    planned_foreshadow_routes = (
-        _planned_foreshadow_routes(
-            project.get("foreshadow_items", []),
-            chapter_index,
-            str(chap.get("title", "") or ""),
-        )
-        if planned_foreshadow_routing else []
-    )
+    planned_foreshadow_routes = _planned_routes if planned_foreshadow_routing else []
 
     if selected_character_ids:
         selected_characters = [

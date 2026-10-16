@@ -36,5 +36,11 @@ _code_backups/
 _data_backups/
 api_test_outputs/
 
+# Local Codex backups, diagnostics, and generated evaluation artifacts.
+.codex-openclash/
+.codex_backups/
+artifacts/
+temperature_tests/
+
 *.spec.bak
 *.blend1

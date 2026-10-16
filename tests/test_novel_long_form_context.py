@@ -80,6 +80,7 @@ from gpt_desktop.novel_utils import (
     _normalize_long_form_update_payload,
     _normalize_long_form_structural_refs,
     _validate_long_form_memory_update,
+    _strip_internal_foreshadow_status_words,
     _normalize_semantic_style_archive,
     _select_style_reference_excerpts,
     _select_style_execution_cards,
@@ -97,6 +98,27 @@ from gpt_desktop.novel_utils import (
 
 
 class NovelLongFormContextTests(unittest.TestCase):
+    def test_foreshadow_lifecycle_cleanup_removes_standalone_markers_only(self):
+        value = (
+            "未埋\n"
+            "已埋\n"
+            "本章首次埋设\n"
+            "推进\n"
+            "线索推进但未确认超常机制\n"
+            "推进关系，但来源仍未知\n"
+            "正文证据：她没有把这件事当成答案。"
+        )
+
+        cleaned = _strip_internal_foreshadow_status_words(value)
+
+        self.assertNotIn("未埋", cleaned)
+        self.assertNotIn("已埋", cleaned)
+        self.assertNotIn("本章首次埋设", cleaned)
+        self.assertNotIn("\n推进\n", f"\n{cleaned}\n")
+        self.assertIn("线索推进但未确认超常机制", cleaned)
+        self.assertIn("推进关系，但来源仍未知", cleaned)
+        self.assertIn("正文证据：她没有把这件事当成答案。", cleaned)
+
     def test_narrative_strategy_profile_persists_but_is_excluded_from_runtime_chapter_context(self):
         male = self._project_with_current_chapter(_new_chapter(0))
         male["narrative_strategy_profile"] = {
@@ -1870,7 +1892,9 @@ class NovelLongFormContextTests(unittest.TestCase):
             ],
         }
 
-        index_text = _build_long_form_selection_index(project, 0)
+        index_text = _build_long_form_selection_index(
+            project, 0, selection=current["memory_selection"]
+        )
 
         self.assertLessEqual(len(index_text), LONG_FORM_SELECTION_INDEX_LIMIT)
         self.assertIn("当前章已选择记录详情", index_text)
@@ -1881,6 +1905,23 @@ class NovelLongFormContextTests(unittest.TestCase):
         self.assertIn("AF-0240", index_text)
         self.assertIn("SA-0024", index_text)
         self.assertIn("全量紧凑引用目录", index_text)
+
+    def test_normalize_project_removes_legacy_foreshadow_handoff(self):
+        chapter = _new_chapter(0)
+        chapter["memory_selection"] = {
+            "character_ids": ["char-a"],
+            "foreshadow_ids": ["foreshadow-old"],
+        }
+        normalized = _normalize_project(self._project_with_current_chapter(chapter))
+        self.assertNotIn("foreshadow_ids", normalized["chapters"][0]["memory_selection"])
+
+    def test_normalize_project_does_not_guess_replace_prose_aliases(self):
+        chapter = _new_chapter(0)
+        chapter["text"] = "她离开L014后，没有回头。"
+        project = self._project_with_current_chapter(chapter)
+        project["lore"] = [{"id": "lore-a", "name": "影像社器材室", "type": "地点"}]
+        normalized = _normalize_project(project)
+        self.assertEqual(normalized["chapters"][0]["text"], chapter["text"])
 
     def test_selected_foreshadow_detail_restores_source_plan_and_history_boundary(self):
         current = _new_chapter(0)
@@ -1930,7 +1971,9 @@ class NovelLongFormContextTests(unittest.TestCase):
             "stage_archives": [],
         }
 
-        index_text = _build_long_form_selection_index(project, 0)
+        index_text = _build_long_form_selection_index(
+            project, 0, selection=current["memory_selection"]
+        )
 
         self.assertIn("伏笔原始说明：贺知微面对毕业与求职时发现路人甲身份不能解决现实压力。", index_text)
         self.assertIn("计划埋设：第64章", index_text)
@@ -1986,6 +2029,87 @@ class NovelLongFormContextTests(unittest.TestCase):
         self.assertNotIn("旧选择伏笔", foreshadow_section)
         self.assertNotIn("未到章节伏笔", foreshadow_section)
         self.assertNotIn("开放伏笔队列", foreshadow_section)
+
+    def test_memory_finalize_context_uses_current_route_not_legacy_foreshadow_selection(self):
+        chapters = [_new_chapter(index) for index in range(3)]
+        chapters[1]["title"] = "第二章 当前"
+        chapters[1]["memory_selection"] = {"foreshadow_ids": ["legacy-foreshadow"]}
+        project = self._project_with_current_chapter(chapters[1])
+        project["chapters"] = chapters
+        project["foreshadow_items"] = [
+            {
+                "id": "planned-foreshadow",
+                "code": "F0001",
+                "name": "当前正式线索",
+                "status": "未埋",
+                "setup_chapter": "第二章",
+                "payoff_chapter": "第三章",
+                "description": "当前路由必须传给整理的完整说明。",
+            },
+            {
+                "id": "legacy-foreshadow",
+                "code": "F0002",
+                "name": "旧选择伏笔",
+                "status": "已埋",
+                "setup_chapter": "第十章",
+                "payoff_chapter": "第二十章",
+                "description": "旧选择不应作为当前整理的主动伏笔。",
+            },
+        ]
+
+        context = _build_long_form_memory_finalize_context(
+            project, 1, "正文中出现了当前正式线索的具体证据。"
+        )
+        selection_section = self._context_section(context, "AI资料更新与下一章选择索引")
+
+        self.assertIn("当前路由必须传给整理的完整说明。", selection_section)
+        self.assertIn("计划埋设：第二章", selection_section)
+        self.assertNotIn("旧选择不应作为当前整理的主动伏笔。", selection_section)
+
+    def test_memory_repair_and_reconcile_contexts_restore_current_route_details(self):
+        current = _new_chapter(0)
+        current["title"] = "第一章 当前"
+        current["memory_selection"] = {"foreshadow_ids": ["legacy-foreshadow"]}
+        project = self._project_with_current_chapter(current)
+        project["foreshadow_items"] = [
+            {
+                "id": "planned-foreshadow",
+                "code": "F0001",
+                "name": "当前正式线索",
+                "status": "未埋",
+                "setup_chapter": "第一章",
+                "payoff_chapter": "第二章",
+                "description": "修复和对账都必须看到的完整说明。",
+            },
+            {
+                "id": "legacy-foreshadow",
+                "code": "F0002",
+                "name": "旧选择伏笔",
+                "status": "已埋",
+                "setup_chapter": "第十章",
+                "payoff_chapter": "第二十章",
+                "description": "旧选择说明。",
+            },
+        ]
+        update = self._strict_update(project)
+        repair = _build_long_form_memory_repair_context(
+            project,
+            0,
+            "正文中出现了当前正式线索的具体证据。",
+            memory_update=update,
+            validation_errors=["state_reconciliation.foreshadow_refs遗漏：F0001"],
+        )
+        reconcile = _build_long_form_memory_reconcile_context(
+            project,
+            0,
+            "正文中出现了当前正式线索的具体证据。",
+            update,
+        )
+
+        self.assertIn("修复和对账都必须看到的完整说明。", repair)
+        self.assertIn("修复和对账都必须看到的完整说明。", reconcile)
+        self.assertNotIn("旧选择说明。", repair)
+        self.assertNotIn("旧选择说明。", reconcile)
 
     def test_draft_foreshadow_route_marks_same_setup_and_payoff_chapter(self):
         current = _new_chapter(0)
@@ -3285,6 +3409,8 @@ class NovelLongFormContextTests(unittest.TestCase):
         self.assertIn('"logic_audit"', context)
         self.assertIn("物件的存在、撤走、开合、损毁、移动和持有人", context)
         self.assertIn("不得把人物判断失误", context)
+        self.assertIn("AI推理、提示词、输出要求", context)
+        self.assertIn("无法确定或需要猜测剧情时不要修", context)
 
     def test_logic_audit_requires_ordered_literal_evidence_and_supports_local_patch(self):
         final_text = (
@@ -3440,7 +3566,6 @@ class NovelLongFormContextTests(unittest.TestCase):
         selection = project["chapters"][1]["memory_selection"]
         character_names = {item["id"]: item["name"] for item in project["characters"]}
         lore_names = {item["id"]: item["name"] for item in project["lore"]}
-        foreshadow_names = {item["id"]: item["name"] for item in project["foreshadow_items"]}
         self.assertEqual(
             {character_names[item_id] for item_id in selection["character_ids"]},
             {"乙", "丙"},
@@ -3449,10 +3574,7 @@ class NovelLongFormContextTests(unittest.TestCase):
             {lore_names[item_id] for item_id in selection["lore_ids"]},
             {"账册", "青色锁链"},
         )
-        self.assertEqual(
-            {foreshadow_names[item_id] for item_id in selection["foreshadow_ids"]},
-            {"账册缺页", "父母死亡真相"},
-        )
+        self.assertNotIn("foreshadow_ids", selection)
         self.assertEqual(project["chapters"][1]["linked_characters"], ["甲"])
 
         context = _build_chapter_ai_context(project, 1, "draft")
@@ -8157,7 +8279,7 @@ class NovelLongFormContextTests(unittest.TestCase):
         selection = project["chapters"][1]["memory_selection"]
         self.assertIn("char-a", selection["character_ids"])
         self.assertIn("lore-a", selection["lore_ids"])
-        self.assertIn("foreshadow-a", selection["foreshadow_ids"])
+        self.assertNotIn("foreshadow_ids", selection)
         self.assertIn("AF-0001", selection["fact_ids"])
         self.assertIn("旧案卷宗", selection["object_keys"])
         self.assertIn("CF-0001", selection["conflict_ids"])

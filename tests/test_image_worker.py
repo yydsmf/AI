@@ -168,7 +168,7 @@ class ToapisOfficialImageWorkerTests(unittest.TestCase):
         self.assertEqual(results[0]["images"], ["/tmp/generated.png"])
         self.assertIn(("GET", "https://example.com/out.png"), [(method, url) for method, url, _ in calls])
 
-    def test_other_provider_edit_keeps_url_response_format(self):
+    def test_gpt_image_edit_omits_unsupported_response_format(self):
         worker = ImageWorker(
             "https://api.example.com",
             "key",
@@ -186,9 +186,9 @@ class ToapisOfficialImageWorkerTests(unittest.TestCase):
 
         post_func, data = fallback.call_args.args
         self.assertEqual(data["size"], "1024x1024")
-        self.assertEqual(data["response_format"], "url")
+        self.assertNotIn("response_format", data)
 
-    def test_other_provider_generation_keeps_url_response_format(self):
+    def test_gpt_image_generation_omits_unsupported_response_format(self):
         worker = ImageWorker(
             "https://api.example.com",
             "key",
@@ -205,9 +205,9 @@ class ToapisOfficialImageWorkerTests(unittest.TestCase):
             worker._post_image_request({"Authorization": "Bearer key"})
 
         _post_func, payload = fallback.call_args.args
-        self.assertEqual(payload["response_format"], "url")
+        self.assertNotIn("response_format", payload)
 
-    def test_dxmcs_generation_requests_embedded_image_data(self):
+    def test_gpt_image_generation_omits_response_format_for_dxmcs_too(self):
         worker = ImageWorker(
             "https://api.dxmcs.xin/",
             "key",
@@ -224,7 +224,26 @@ class ToapisOfficialImageWorkerTests(unittest.TestCase):
             worker._post_image_request({"Authorization": "Bearer key"})
 
         _post_func, payload = fallback.call_args.args
-        self.assertEqual(payload["response_format"], "b64_json")
+        self.assertNotIn("response_format", payload)
+
+    def test_legacy_image_model_keeps_url_response_format(self):
+        worker = ImageWorker(
+            "https://api.example.com",
+            "key",
+            "dall-e-3",
+            "1024*1024",
+            "自动",
+            "1",
+            "prompt",
+            [],
+        )
+
+        with mock.patch.object(worker, "_post_with_response_format_fallback") as fallback:
+            fallback.return_value = _FakeResponse({"data": []})
+            worker._post_image_request({"Authorization": "Bearer key"})
+
+        _post_func, payload = fallback.call_args.args
+        self.assertEqual(payload["response_format"], "url")
 
     def test_embedded_image_format_falls_back_to_url_when_unsupported(self):
         worker = ImageWorker(

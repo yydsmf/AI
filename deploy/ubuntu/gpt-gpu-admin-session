@@ -1,0 +1,38 @@
+#!/bin/sh
+
+unset SESSION_MANAGER
+unset DBUS_SESSION_BUS_ADDRESS
+export LANG=zh_CN.UTF-8
+export LANGUAGE=zh_CN:zh
+export GPT_TOOLBOX_KIOSK=1
+export GPT_TOOLBOX_DEVICE_STATUS=1
+
+# Sunshine 2025.924 在此环境中不会将命令行的 `-p 0` 可靠地写入配置，
+# 会继续反复探测路由器的 UPnP。显式保存设置，且不覆盖将来用户在 Web
+# 管理页保存的自定义设置。
+SUNSHINE_CONFIG="$HOME/.config/sunshine/sunshine.conf"
+if [ ! -s "$SUNSHINE_CONFIG" ]; then
+    mkdir -p "$(dirname "$SUNSHINE_CONFIG")"
+    umask 077
+    printf '%s\n' 'upnp = disabled' >"$SUNSHINE_CONFIG"
+fi
+
+exec dbus-run-session sh -c '
+    xsetroot -solid "#202124"
+    xfwm4 --replace &
+
+    # 管理员使用的是真实 NVIDIA Xorg 桌面。Sunshine 与此会话共用显示器，
+    # 让 Moonlight 可以走显卡硬件编码。Sunshine 独立守护：即便自身异常退出，
+    # 管理员桌面与 GPT 工具箱不受影响，三秒后自动恢复。
+    (
+        while true; do
+            /usr/bin/sunshine >>/home/gptadmin/.cache/gpt-toolbox-sunshine.log 2>&1
+            sleep 3
+        done
+    ) &
+
+    while true; do
+        /usr/local/bin/gpt-toolbox
+        sleep 2
+    done
+'

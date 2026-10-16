@@ -3901,6 +3901,7 @@ def _creation_scale_requirements(total_words):
         total_words = 500000
     stage_count = _expected_stage_count(total_words)
     minimum = stage_count * 5
+    foreshadow_minimum = stage_count * 3
     if stage_count >= 10:
         size_label = "100万字以上"
     elif stage_count == 5:
@@ -3912,7 +3913,7 @@ def _creation_scale_requirements(total_words):
     ranges = {
         "characters": (minimum, minimum),
         "lore": (minimum, minimum),
-        "foreshadows": (minimum, minimum),
+        "foreshadows": (foreshadow_minimum, foreshadow_minimum),
     }
     return size_label, ranges
 
@@ -3923,14 +3924,31 @@ def _creation_scale_shortfalls(result, total_words):
     labels = {
         "characters": "主要人物",
         "lore": "设定",
-        "foreshadows": "伏笔",
     }
     shortfalls = []
-    for key, (minimum, _maximum) in ranges.items():
+    for key in ("characters", "lore"):
+        minimum = ranges[key][0]
         value = result.get(key, [])
         count = len(value) if isinstance(value, list) else 0
         if count < minimum:
             shortfalls.append(f"{labels[key]} {count}/{minimum}")
+
+    stage_count = _expected_stage_count(total_words)
+    foreshadow_counts = [0] * stage_count
+    foreshadows = result.get("foreshadows", [])
+    for record in foreshadows if isinstance(foreshadows, list) else []:
+        if not isinstance(record, dict):
+            continue
+        setup_stage = _normalize_creation_stage_ref(
+            record.get("setup_stage"),
+            stage_count,
+        )
+        stage_number = _creation_chapter_number(setup_stage)
+        if 1 <= stage_number <= stage_count:
+            foreshadow_counts[stage_number - 1] += 1
+    for stage_number, count in enumerate(foreshadow_counts, 1):
+        if count < 3:
+            shortfalls.append(f"伏笔第{stage_number}阶段 {count}/3")
     return shortfalls
 
 
@@ -3940,12 +3958,11 @@ def _creation_scale_guidance(total_words):
     stage_count = _expected_stage_count(total_words)
     characters = ranges["characters"][0]
     lore = ranges["lore"][0]
-    foreshadows = ranges["foreshadows"][0]
     return f"""
 这不是只够写开头几章的简介，而是预计写到{size_label}、分为{stage_count}个十万字阶段的整本长篇底盘。数量是后续阶段规划和章节规划的最低资料规模，不要只列主角和少量配角，也不要把同一项换名字重复填写：
 - 每个阶段至少准备5名能在该阶段发挥作用的人物，全书人物最低{characters}名；人物要覆盖主角身边的人、对手、关键势力代表、现实生活中的牵连人物和后期可能改变立场的人。
 - 每个阶段至少准备5项会在该阶段反复起作用的设定，全书设定最低{lore}项；统一写入 lore，覆盖地点、场景落点、物件、势力、制度、日常生活和题材本身的能力边界。
-- 每个阶段至少准备5条会在该阶段进入、推进或产生变化的伏笔，全书伏笔最低{foreshadows}条；每条都要有现在看得见的线索、人物当下的理解，以及以后会改变判断或关系的方向。
+- 每个阶段至少生成3条真正有长期回收价值的新增伏笔。
 以上是最低数量，不是上限；所有资料都必须从作者灵感和已经选定的故事自然长出来，不要为了凑数添加没有根的名词。
 这些内容都必须从作者灵感和已经选定的故事自然长出来。人物、设定和伏笔之间要互相牵连，但不要把它们写成重复的剧情简介。故事简介仍然需要自然、可读、可以公开发布；其余字段以清楚、稳定、方便后续执行为先。
 """.strip()
@@ -4920,7 +4937,7 @@ b 只能使用 c、r、t、m、p、e、h；w 只能使用 s、p、r、c、g。�
         elif self.creation_batch == "bible_assets":
             prompt = f"""{COMMON_CREATION_RULES}
 
-读取作者已经选定的故事，以及前一批已经生成的小说圣经和世界规则，补齐人物、设定和伏笔。人物要分别写身份、想得到或守住的东西、秘密、人物性格/特点、语言风格，以及害怕失去什么、与主角的长期关系底色和长期变化。人物性格/特点写长期稳定的性格底色，语言风格写可迁移的表达分类和习惯；人物性格、语言风格和 notes 都不要落到具体事件、食物、地点、道具、固定笑点、固定动作、固定口头禅、某一次剧情反应或固定触发模式上。具体怎样牵制、靠近、利用、误会或翻脸，留给后面的阶段和章节在场景中表现。设定库统一收录后面反复会用到的地点、物件、势力、制度、日常场景和能力边界。明确有修炼、境界或力量层次的题材，在设定的规则条目里写详细层次；其它题材把设定落在空间、生活、社会关系和异常边界上。伏笔写现在能看到的线索、以后会改变的判断或关系、揭开后会发生什么和仍未揭开的部分，notes留空，状态统一为未埋。
+读取作者已经选定的故事，以及前一批已经生成的小说圣经和世界规则，补齐人物、设定和伏笔。人物要分别写身份、想得到或守住的东西、秘密、人物性格/特点、语言风格，以及害怕失去什么、与主角的长期关系底色和长期变化。人物性格/特点写长期稳定的性格底色，语言风格写可迁移的表达分类和习惯；人物性格、语言风格和 notes 都不要落到具体事件、食物、地点、道具、固定笑点、固定动作、固定口头禅、某一次剧情反应或固定触发模式上。具体怎样牵制、靠近、利用、误会或翻脸，留给后面的阶段和章节在场景中表现。设定库统一收录后面反复会用到的地点、物件、势力、制度、日常场景和能力边界。明确有修炼、境界或力量层次的题材，在设定的规则条目里写详细层次；其它题材把设定落在空间、生活、社会关系和异常边界上。伏笔围绕主线冲突、重要人物关系和关键设定展开，写清当前可见的线索、未来会改变的判断或关系，以及回收后带来的重要变化，notes留空，状态统一为未埋。
 
 {CREATION_LORE_TYPE_GUIDANCE}
 
@@ -4937,7 +4954,7 @@ b 只能使用 c、r、t、m、p、e、h；w 只能使用 s、p、r、c、g。�
 c 中每项只能使用 n、r、g、s、p、v、q；l 中每项只能使用 n、t、d、k；f 中每项只能使用 i、n、a、b、d、r、u。键名只是程序标记，不能把“姓名”“身份和故事位置”等示例文字原样返回；每个值必须直接写这本小说的实际内容。只输出 c、l、f，不要重复输出 b 或 w。人物、设定和伏笔数量要达到长篇规模要求。{("高武、玄幻、仙侠、修真、武道题材的 l 中必须包含一条按从低到高排列的实力体系条目；它要使用 l 的四个字段写完整境界内容，每个境界一到两句话。" if power_levels_guidance else "")}"""
             prompt += """
 
-补充方向：让人物、设定和伏笔都能在后续场景中落地。伏笔的阶段位置表示它如何进入人物生活、如何在行动和关系变化中逐步显出意义；先写线索和当下理解，再写后续变化，不把最终解释写成一开始就确定的结论。"""
+补充方向：让人物、设定和伏笔都能在后续场景中落地。伏笔的阶段位置表示它如何进入人物生活、如何在行动和关系变化中逐步显出意义；让线索从当前理解出发，在后续重要事件、人物关系和关键转折中逐步显出新的意义。"""
         elif self.creation_batch == "stage_skeleton":
             stage_specs = _creation_stage_batch_specs(
                 total_words,
@@ -6923,6 +6940,16 @@ class NovelCreationWizardDialog(QDialog):
                 "伏笔阶段位置无效或超出本书阶段范围："
                 + "、".join(stage_shortfalls[:12])
                 + f"。本书只有第1至第{stage_count}阶段，请重新生成故事底盘。"
+            )
+        scale_shortfalls = _creation_scale_shortfalls(
+            normalized,
+            self.target_words_spin.value(),
+        )
+        if scale_shortfalls:
+            return (
+                "故事底盘资料数量未达到按阶段计算的最低要求："
+                + "、".join(scale_shortfalls)
+                + "。请重新生成故事底盘。"
             )
         return ""
 

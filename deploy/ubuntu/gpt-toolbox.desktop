@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=GPT 工具箱
+Comment=GPT 工具箱
+Exec=/usr/local/bin/gpt-toolbox
+Icon=/srv/gpt-data/app/gpt-toolbox/app_icon_normalized.png
+Terminal=false
+Categories=Utility;Graphics;

@@ -256,8 +256,6 @@ class MainWindow(QMainWindow):
                     "model_worker",
                     "analysis_worker",
                     "writing_worker",
-                    "auto_summary_worker",
-                    "auto_outline_worker",
                     "read_aloud_worker",
                     "volume_handoff_worker",
                     "volume_intent_worker",

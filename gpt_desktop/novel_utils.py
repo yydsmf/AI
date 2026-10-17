@@ -18,7 +18,9 @@ CHAPTER_ANALYSIS_STATUS_SMALL_CHANGE = "small_change"
 CHAPTER_ANALYSIS_STATUS_PENDING = "pending"
 CHAPTER_ANALYSIS_STATUS_UNWRITTEN = "unwritten"
 CHAPTER_ANALYSIS_QUICK_SIMILARITY_LOCAL_RATIO_LIMIT = 0.50
-NOVEL_AI_CONTEXT_LIMIT = 120000
+# Shared character ceiling for chapter context construction and API transport.
+# Keep a modest reserve for the system prompt and model output budget.
+NOVEL_AI_CONTEXT_LIMIT = 128000
 
 
 def _canonical_chapter_plan_stage_id(value, fallback=""):
@@ -77,11 +79,11 @@ VOLUME_FRAMEWORK_HANDOFF_CHAR_BUDGET = 90000
 VOLUME_HANDOFF_LAST_CHAPTER_CHAR_LIMIT = 24000
 # A volume handoff is sent as a system prompt plus a structured user payload.
 # Keep a fixed reserve so either request remains below the application's
-# 120,000-character context ceiling even when its prompt changes slightly.
+# 128,000-character context ceiling even when its prompt changes slightly.
 VOLUME_CONTINUATION_REQUEST_CHAR_BUDGET = NOVEL_AI_CONTEXT_LIMIT - 8000
 VOLUME_HANDOFF_RECENT_CHAPTER_COUNT = 8
 # The compact index normally stays close to 15k, but quality-critical reference
-# coverage may grow beyond that. The overall 120k context builder remains the
+# coverage may grow beyond that. The overall 128k context builder remains the
 # final safety boundary.
 LONG_FORM_SELECTION_INDEX_LIMIT = 48000
 LONG_FORM_STATE_DIRECTORY_LIMIT = 18000
@@ -9883,7 +9885,7 @@ def _prose_scene_grounding_guidance(compact=False):
         "需要保留的信息，要随人物当前的所见所闻、具体动作、现场判断、对白和随后结果自然显现；人物首次出现时，只保留当前场景真正有用的信息。"
         "人物确实在现场安排行动时，可以由人物自然说出，但要符合当下目的和人物口吻，不能把资料改成作者清单。\n"
         "【连续对白与反应】\n"
-        "冲突可以保留，但连续对白不要变成每句都反驳、质问、解释或下结论的对抗式问答；每一轮说话都应让信息、关系压力或人物选择继续变化。"
+        "冲突可以保留，但连续对白不要变成每句都反驳、质问、解释或下结论的对抗式问答；每一轮说话都应让信息、关系压力或人物行动继续变化。"
         "当连续对白已经推进几轮且场面需要变化时，可以用能改变下一步的动作、表情、停顿、视线、心理判断、物件操作或现场反馈承接；"
         "具体落点由人物关系、情绪、场景和项目文风决定，不设固定句数、动作频率或统一段落结构，也不要机械地每句配同类动作。\n"
     )
@@ -9899,15 +9901,16 @@ def _grounded_prose_contract():
         + _prose_scene_grounding_guidance()
         + "【对白自然衔接】\n"
         "对白要像人物当面说话。人物回答时，按当下的关系和语境自然接住对方；需要说明来由、指代或态度时，把意思说清楚，让前一句与下一句接得上。"
-        "人物可以顺着对方的话解释、补充、反问、改口、调侃、试探、施压、让步或转开话题，这些选择由人物目的、关系和现场情绪决定。"
+        "人物可以顺着对方的话解释、补充、反问、改口、调侃、试探、施压、让步或转开话题，这些表达由人物目的、关系和现场情绪决定。"
         "句式长短、语气词、称呼变化和说话后的动作随人物身份、关系和情绪自然变化，不要机械添加语气词，也不要让所有人物采用同一种接话方式。"
-        "对白要推动关系、现场压力或人物选择继续变化，不让角色互相解释已经知道的事。\n"
+        "对白要推动关系、现场压力或人物行动继续变化，不让角色互相解释已经知道的事。\n"
         "人物受到冲突、误解、意外、吸引或关系变化影响时，要写出会改变下一步行为的当下念头、判断或身体感受；"
         "心理、动作和对白可以按场景需要交错、穿插或由其中一种承担推进，具体比例随人物、情绪和文风自然变化，不要求固定交替顺序。"
         "不得用解释式、观点式和“金句式”抽象表达；"
         "人物表达拒绝、讥讽或不满时，落到眼前的具体对象、安排和后果上，让台词像人物当场说给对方听的话。"
         "人物反感眼前的说法或安排时，直接落到具体对象、场面和自己是否配合上；允许用人物自己的口语吐槽或拒绝，"
-        "不要把临场态度写成替所有人下判断的抽象命题。\n"
+        "不要把具体冲突写成抽象的权利、资格、归属、责任或关系宣言，也不要反复套用‘事实+反转总结’的口号式句型；"
+        "正文尽量少用‘决定’‘选择’‘不代表’等抽象词，除非剧情确实离不开，优先写具体的人、物、动作、反应和结果。\n"
     )
 
 
@@ -9933,7 +9936,7 @@ def _build_full_style_imitation_guidance(style_reference):
         f"这份样本保留了约{sample_chars}字完整原文。当前项目资料是本章故事事实：已经确定的人名、时间、地点、关系、"
         "物件、编号、人物状态和已发生事件，随着当前章节继续延展。\n"
         "把完整样本当作同一位作者正在写另一部作品的连续正文来阅读。顺着全文感受旁白怎样落句，人物怎样接话，"
-        "动作和心理怎样互相接住，口语怎样嵌进人物当下的情绪，场景细节怎样带出人物的选择，以及一个场景怎样自然转入下一个场景。\n"
+        "动作和心理怎样互相接住，口语怎样嵌进人物当下的情绪，场景细节怎样带出人物的行动和反应，以及一个场景怎样自然转入下一个场景。\n"
         "写当前章节时，让样本中的人物功能映射成当前小说的人物，让样本中的场景和事件映射成当前小说的场景和事件。"
         "以全文反复出现的语言习惯和每一处细微变化为依据，吸收其中的常用说法、句法松紧、叙述视角、对白衔接、"
         "情绪递进、信息露出、反应落点和章节收束。\n"
@@ -10833,7 +10836,7 @@ def _build_style_finalize_context(
             "发现硬矛盾时做最小修复，不新增提纲外流程、解释或事件。"
             "正文写法以作者样本和本章声纹表为最高标准：常驻执行人物对白、冲突声纹、日常口语和自然适用的作者原生词，"
             "用它们替换模型惯用表达，但不凑词频、不把低频词写成口头禅。"
-            "项目叙事策略只决定本章兑现与情绪方向，不得显性讲解；优先写选择、动作、关系回应和后果，压缩程序过程、专业说明、重复确认和段尾总结。"
+            "项目叙事策略只决定本章兑现与情绪方向，不得显性讲解；优先写动作、关系回应和后果，压缩程序过程、专业说明、重复确认和段尾总结。"
             "当前状态快照、下一章记忆选择和未决任务只约束连续性，不是本章待办；当前提纲未明确安排的事项必须保持未决，"
             "不得扩成拍点、对白、核验或处置流程。"
             "自然排版与句式跟随样本读感变化，不执行固定换行、固定短句、固定对白数量或六种主叙事模式。"
@@ -15064,7 +15067,7 @@ def _normalize_long_form_update_payload(project, chapter_index, update):
     payload.setdefault("long_term_events", [])
     payload.setdefault("state_reconciliation", {})
     payload.setdefault("next_chapter_memory", {})
-    return payload
+    return _normalize_long_form_runtime_review_refs(project, chapter_index, payload)
 
 
 def _drop_empty_long_form_state_items(project, payload):
@@ -15765,6 +15768,137 @@ def _normalize_long_form_structural_refs(project, chapter_index, update):
     for event in payload.get("long_term_events", []) if isinstance(payload.get("long_term_events"), list) else []:
         if isinstance(event, dict) and isinstance(event.get("storage"), dict):
             normalize_object_references(event["storage"], "object_keys")
+    return _normalize_long_form_runtime_review_refs(project, chapter_index, payload)
+
+
+def _normalize_long_form_runtime_review_refs(project, chapter_index, payload):
+    """Keep repair responses compatible with deterministic runtime review rules.
+
+    Compact finalize responses already receive this treatment while being
+    expanded. Legacy/full responses and repair patches can bypass that path,
+    though, leaving planned foreshadows marked as reviewed without an explicit
+    changed/unchanged outcome. The program can determine the unchanged outcome
+    when no corresponding record update exists, so mirror that same rule for
+    every response shape before strict validation.
+    """
+    if not isinstance(payload, dict):
+        return payload
+    reconciliation = payload.get("state_reconciliation")
+    if not isinstance(reconciliation, dict):
+        return payload
+    chapters = project.get("chapters", []) if isinstance(project, dict) else []
+    chapter = (
+        chapters[chapter_index]
+        if isinstance(chapters, list)
+        and 0 <= chapter_index < len(chapters)
+        and isinstance(chapters[chapter_index], dict)
+        else {}
+    )
+
+    def canonical(kind, value):
+        text = str(value or "").strip()
+        return _resolve_long_form_record_ref(project, kind, text) or text
+
+    def values_from(items, kind, operation_key="ref"):
+        result = set()
+        for item in items if isinstance(items, list) else []:
+            if not isinstance(item, dict):
+                continue
+            operation = str(item.get("operation", "") or "").strip().lower()
+            ref = item.get("key", "") if operation == "create" else item.get(operation_key, item.get("id", ""))
+            resolved = canonical(kind, ref)
+            if resolved:
+                result.add(resolved)
+        return result
+
+    required_lore = {
+        canonical("lore", value)
+        for value in _chapter_outline_named_lore_refs(project, chapter_index)
+        if str(value or "").strip()
+    }
+    required_foreshadows = {
+        canonical("foreshadows", value)
+        for value in (
+            _planned_foreshadow_ids(
+                project,
+                chapter_index,
+                str(chapter.get("title", "") or ""),
+            )
+            if _foreshadow_plan_routing_enabled(project)
+            else []
+        )
+        if str(value or "").strip()
+    }
+    for event in payload.get("long_term_events", []) if isinstance(payload.get("long_term_events"), list) else []:
+        storage = event.get("storage", {}) if isinstance(event, dict) else {}
+        if not isinstance(storage, dict):
+            continue
+        required_lore.update(
+            canonical("lore", value)
+            for value in storage.get("lore_refs", [])
+            if str(value or "").strip()
+        )
+        required_foreshadows.update(
+            canonical("foreshadows", value)
+            for value in storage.get("foreshadow_refs", [])
+            if str(value or "").strip()
+        )
+
+    changed_lore = values_from(
+        (payload.get("record_updates", {}) or {}).get("lore", [])
+        if isinstance(payload.get("record_updates"), dict)
+        else [],
+        "lore",
+    )
+    changed_foreshadows = values_from(
+        payload.get("foreshadow_updates", []),
+        "foreshadows",
+    )
+
+    def ensure_runtime_review(kind, required, changed):
+        refs_key = "lore_refs" if kind == "lore" else "foreshadow_refs"
+        reviewed_key = "reviewed_lore_refs" if kind == "lore" else "reviewed_foreshadow_refs"
+        unchanged_key = "unchanged_lore_refs" if kind == "lore" else "unchanged_foreshadow_refs"
+
+        refs = reconciliation.get(refs_key)
+        if not isinstance(refs, list):
+            refs = []
+            reconciliation[refs_key] = refs
+        reviewed = runtime_review.get(reviewed_key)
+        if not isinstance(reviewed, list):
+            reviewed = []
+            runtime_review[reviewed_key] = reviewed
+        unchanged = runtime_review.get(unchanged_key)
+        if not isinstance(unchanged, list):
+            unchanged = []
+            runtime_review[unchanged_key] = unchanged
+
+        def append_canonical(target, value):
+            resolved = canonical(kind, value)
+            if not resolved:
+                return
+            if not any(canonical(kind, item) == resolved for item in target):
+                target.append(resolved)
+
+        for value in sorted(required):
+            append_canonical(refs, value)
+            append_canonical(reviewed, value)
+            if value not in changed:
+                append_canonical(unchanged, value)
+
+        if changed:
+            unchanged[:] = [
+                value for value in unchanged
+                if canonical(kind, value) not in changed
+            ]
+
+    runtime_review = reconciliation.get("record_runtime_review")
+    if not isinstance(runtime_review, dict):
+        runtime_review = {}
+        reconciliation["record_runtime_review"] = runtime_review
+    ensure_runtime_review("lore", required_lore, changed_lore)
+    ensure_runtime_review("foreshadows", required_foreshadows, changed_foreshadows)
+    payload["state_reconciliation"] = reconciliation
     return payload
 
 
@@ -21775,11 +21909,11 @@ def _build_chapter_ai_context(project, chapter_index, action):
         "正文风格：口语化、自然、有网文阅读感，不要太工整、太书面、太像范文。"
         "句子长短混用，按人物当下状态自然变化。"
         "不得使用抽象情绪判断、四字词堆叠和模板化反应。"
-        "人物情绪优先通过对白、具体动作和选择体现。保持剧情高密度推进，但不要写成流水账。"
+        "人物情绪优先通过对白、具体动作和当下反应体现。保持剧情高密度推进，但不要写成流水账。"
         "不得写段尾总结、抽象情绪判断和万能反应动作；"
         "不得用“沉默、皱眉、冷意、压迫感、空气安静、所有人愣住、下一秒”等模板化表达替代具体剧情。"
         "场景描写优先用具体物件、动作和细节承载情绪，不要总用氛围词概括。"
-        "心理描写贴着人物当下的动作、对白、选择和感受展开；需要时写出人物的判断、犹豫、后悔或心动，让心理变化推动下一步。"
+        "心理描写贴着人物当下的动作、对白、反应和感受展开；需要时写出人物的判断、犹豫、后悔或心动，让心理变化推动下一步。"
         "章节结尾优先用具体动作、对白、信息变化或悬念收住。"
         "段落结构要有变化，不要连续使用“动作描写 + 心理解释 + 氛围总结”的固定结构。"
         "场景细节要克制：只在能强化冲突、人物状态或信息变化时，少量加入具体物件、声音、动作痕迹和环境反馈。"
@@ -21789,8 +21923,8 @@ def _build_chapter_ai_context(project, chapter_index, action):
         if has_current_text else
         "请根据当前章节的章节提纲生成正文草稿。若有上一章结尾，开篇必须自然承接上一章的状态，"
         "但上一章结尾原文已经发布，不能原样或同义重写末句、对白、声音、动作落点、结论或情绪；"
-        "必须从对白后的新反应/回答、动作后的新结果/阻力、声音后的声源/新反应中选择一种起笔，"
-        "并让第一段出现新动作、新信息、新决定、新后果或必要情绪转折。"
+        "必须从对白后的新反应/回答、动作后的新结果/阻力、声音后的声源/新反应中挑一种起笔，"
+        "并让第一段出现新动作、新信息、新变化、新后果或必要情绪转折。"
         "章节提纲中的核心方向、已发生事实和承接点优先；历史规划元数据只作参考，不要逐项执行、解释或扩展成任务清单。"
         "旧提纲中若残留固定伏笔编号、伏笔任务或伏笔动作，只作历史文本参考，不能当作本章硬任务；"
         "正文扩写只参考【本章相关伏笔】中的计划路由；前置铺垫是可选方向，正式埋设和正式回收要结合本章提纲自然落地，其他伏笔不要主动处理。"
@@ -21802,11 +21936,11 @@ def _build_chapter_ai_context(project, chapter_index, action):
         "正文风格：口语化、自然、有网文阅读感，不要太工整、太书面、太像范文。"
         "句子长短混用，按人物当下状态自然变化。"
         "不得使用抽象情绪判断、四字词堆叠和模板化反应。"
-        "人物情绪优先通过对白、具体动作和选择体现。保持剧情高密度推进，但不要写成流水账。"
+        "人物情绪优先通过对白、具体动作和当下反应体现。保持剧情高密度推进，但不要写成流水账。"
         "不得写段尾总结、抽象情绪判断和万能反应动作；"
         "不得用“沉默、皱眉、冷意、压迫感、空气安静、所有人愣住、下一秒”等模板化表达替代具体剧情。"
         "场景描写优先用具体物件、动作和细节承载情绪，不要总用氛围词概括。"
-        "心理描写贴着人物当下的动作、对白、选择和感受展开；需要时写出人物的判断、犹豫、后悔或心动，让心理变化推动下一步。"
+        "心理描写贴着人物当下的动作、对白、反应和感受展开；需要时写出人物的判断、犹豫、后悔或心动，让心理变化推动下一步。"
         "章节结尾优先用具体动作、对白、信息变化或悬念收住。"
         "段落结构要有变化，不要连续使用“动作描写 + 心理解释 + 氛围总结”的固定结构。"
         "场景细节要克制：只在能强化冲突、人物状态或信息变化时，少量加入具体物件、声音、动作痕迹和环境反馈。"
@@ -21820,7 +21954,7 @@ def _build_chapter_ai_context(project, chapter_index, action):
                 "请根据当前章节提纲和已有正文草稿续写正文。已有正文时，只输出可以直接接在草稿末尾的新正文，"
                 "开头承接【续写承接点】里的最后状态。"
                 if has_current_text else
-                "请根据当前章节提纲生成完整正文草稿；若有上一章结尾，开篇承接其最后状态，并从当前状态自然发展出新的反应、结果、阻力、选择或信息。"
+                "请根据当前章节提纲生成完整正文草稿；若有上一章结尾，开篇承接其最后状态，并从当前状态自然发展出新的反应、结果、阻力或信息。"
             )
             + "当前项目资料决定故事事实。提纲、已发布正文、状态快照和连续性资料里已经明确写出的专名、日期、时刻、地点、房间号、"
             "物件编号、金额、关系称谓、人物位置、身体状态、持有物品、已发生事件和未完成动作，都是本章需要延续的事实。"
@@ -21890,7 +22024,7 @@ def _build_chapter_ai_context(project, chapter_index, action):
         "上一章结尾原文已经发布，不能把末句、对白、声音、动作落点、结论或情绪再次原样或同义写出；"
         "下一章必须从新反应、新结果、新阻力或新信息开始，不能让同一触发句同时作为上一章结尾和下一章开头。",
         "状态快照、活跃事实、人物卡、设定和伏笔用于静默保证连续性；未在本章发生变化的旧信息不是正文任务，"
-        "不得为了证明记住资料而让旁白或人物重新解释。只有新证据、新决定、新后果或当前行动确实依赖时才简短引用。",
+        "不得为了证明记住资料而让旁白或人物重新解释。只有新证据、新变化、新后果或当前行动确实依赖时才简短引用。",
         "伏笔只在合适章节推进；已回收/无需回收/废弃伏笔不要重复当新线索。缺资料时保持克制，不要补出会影响后文的新设定。",
         "人物秘密、伏笔完整答案和未解锁的设定属于作者层；正文只能使用本上下文已显示的故事内已知内容和当章允许推进的边界。",
     ]
@@ -22081,7 +22215,12 @@ def _build_chapter_ai_context(project, chapter_index, action):
         ("项目核心信息", core_project_info, 1200, False),
         ("长篇进度 / 节奏", long_form_progress, 1200, False),
         ("长篇继承规则", inheritance_rules, 1500, False),
-        ("本次任务", task_text, 6000 if action == "summary" else 2200, False),
+        (
+            "本次任务",
+            task_text,
+            6000 if action == "summary" else 3200 if action == "draft" else 2200,
+            False,
+        ),
         ("项目基础", "\n".join([
             f"项目总目标字数：{_target_words_label(meta.get('target_words', ''))}",
         ]), 500, False),

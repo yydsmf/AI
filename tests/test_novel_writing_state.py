@@ -528,14 +528,17 @@ class NovelWritingStateTests(unittest.TestCase):
             "memory_update": {"test": True},
         }
 
-        def fake_apply(staged, index, update):
+        evidence = []
+
+        def fake_apply(staged, index, update, final_text=""):
+            evidence.append(final_text)
             staged["chapters"][index]["memory_sync_status"] = "complete"
             staged["chapters"][index]["memory_revision"] = 1
             return True
 
         with patch("gpt_desktop.novel_writing_tab._apply_long_form_memory_update", side_effect=fake_apply):
             staged, changed, text, outline, summary, facts = tab._prepare_staged_memory_commit(
-                "新正文", bundle, include_prose=True, include_outline=True
+                "新正文", bundle
             )
 
         self.assertTrue(changed)
@@ -547,6 +550,7 @@ class NovelWritingStateTests(unittest.TestCase):
         self.assertEqual(project["chapters"][0]["memory_sync_status"], "pending")
         self.assertEqual(project["chapters"][0]["memory_revision"], 0)
         self.assertEqual(staged["chapters"][0]["text"], "旧正文\n\n新正文")
+        self.assertEqual(evidence, [text])
 
     def test_background_context_result_requires_same_project_and_chapter(self):
         first = _new_chapter(0)
@@ -2314,7 +2318,6 @@ class NovelWritingStateTests(unittest.TestCase):
         tab._chapter_ai_resume_prefix = "中止时留下的半句正文"
         tab._chapter_ai_sequence_active = True
         tab._chapter_ai_sequence_chapter_id = chapter["id"]
-        tab._chapter_ai_sequence_pending_action = "draft"
         tab._chapter_ai_buttons_by_action = {}
         snapshots = []
         events = []
@@ -4211,111 +4214,6 @@ class NovelWritingStateTests(unittest.TestCase):
         tab.current_project["chapters"][0]["text"] = "正文"
         self.assertTrue(tab._has_manuscript_body())
 
-    def test_auto_chapter_summary_applies_when_fields_unchanged(self):
-        chapter = _new_chapter(0)
-        chapter["text"] = "赵明进入王城。"
-        tab = NovelWritingTab.__new__(NovelWritingTab)
-        tab.current_project = {
-            "characters": [
-                {"name": "赵明", "role": "主角", "goal": "", "secret": "", "voice": "", "notes": ""},
-            ],
-            "chapters": [chapter],
-        }
-        tab.current_chapter_index = 0
-        tab._auto_summary_chapter_id = chapter["id"]
-        tab._auto_summary_started_summary = ""
-        tab._auto_summary_started_key_facts = ""
-        tab._auto_summary_started_linked = ""
-        tab.chapter_summary = _FakePlainTextEdit("")
-        tab.chapter_key_facts = _FakePlainTextEdit("")
-        tab.chapter_linked = _FakeLineEdit("")
-        tab._dirty = False
-        tab._loading = False
-        tab._pending_manuscript_refresh = False
-        tab._refresh_timer = _FakeTimer()
-        tab.current_project_path = ""
-        tab.project_meta_label = _FakeLabel()
-        tab.set_status_tip = lambda _text: None
-        tab._mark_chapter_dirty = lambda: None
-
-        tab.on_auto_chapter_summary_ready(
-            "summary",
-            "本章摘要：赵明进入王城。\n本章需继承的关键事实：赵明拿到旧案钥匙。\n本章关联人物：赵明",
-        )
-
-        self.assertEqual(tab.chapter_summary.toPlainText(), "赵明进入王城。")
-        self.assertEqual(tab.chapter_key_facts.toPlainText(), "赵明拿到旧案钥匙。")
-        self.assertEqual(tab.chapter_linked.text(), "赵明")
-
-    def test_auto_chapter_summary_refreshes_record_views_after_memory_update(self):
-        chapter = _new_chapter(0)
-        character = {
-            "id": "char-1",
-            "name": "赵明",
-            "role": "主角",
-            "goal": "查旧案",
-            "secret": "",
-            "voice": "",
-            "notes": "",
-        }
-        tab = NovelWritingTab.__new__(NovelWritingTab)
-        tab.current_project = {
-            "characters": [character],
-            "lore": [],
-            "foreshadow_items": [],
-            "chapters": [chapter],
-        }
-        tab.current_chapter_index = 0
-        tab._auto_summary_chapter_id = chapter["id"]
-        tab._auto_summary_started_summary = ""
-        tab._auto_summary_started_key_facts = ""
-        tab._auto_summary_started_linked = ""
-        tab.chapter_summary = _FakePlainTextEdit("")
-        tab.chapter_key_facts = _FakePlainTextEdit("")
-        tab.chapter_linked = _FakeLineEdit("")
-        tab._mark_chapter_dirty = lambda: None
-        tab.set_status_tip = lambda _text: None
-        refreshed = []
-        tab._refresh_long_form_record_views = lambda: refreshed.append(True)
-
-        bundle = json.dumps({
-            "summary": "赵明找到旧案线索。",
-            "key_facts": ["赵明决定追查到底。"],
-            "linked_characters": ["赵明"],
-            "long_form_memory": {
-                "schema_version": 2,
-                "base_revision": 0,
-                "state_patch": {},
-                "state_retirements": {},
-                "fact_updates": [],
-                "state_delta": {},
-                "current_chapter_character_refs": ["C001"],
-                "stage_archive": None,
-                "record_updates": {
-                    "characters": [{
-                        "operation": "update",
-                        "ref": "C001",
-                        "state": "已找到旧案线索，决定继续追查。",
-                        "changes": ["决定追查王城旧案"],
-                        "canon": {},
-                        "evidence_quote": "赵明找到旧案线索",
-                    }],
-                    "lore": [],
-                },
-                "foreshadow_updates": [],
-                "next_chapter_memory": {},
-            },
-        }, ensure_ascii=False)
-        tab.on_auto_chapter_summary_ready(
-            "summary",
-            bundle,
-        )
-
-        self.assertEqual(tab.current_project["characters"][0]["goal"], "查旧案")
-        runtime = tab.current_project["long_form_memory"]["record_runtime"]["characters"]["char-1"]
-        self.assertEqual(runtime["state"], "已找到旧案线索，决定继续追查。")
-        self.assertEqual(refreshed, [True])
-
     def test_mark_current_chapter_ai_result_uses_final_editor_content(self):
         chapter = _new_chapter(0)
         chapter["text"] = "审稿前正文"
@@ -4335,42 +4233,6 @@ class NovelWritingStateTests(unittest.TestCase):
         self.assertEqual(chapter["linked_characters"], ["赵明", "苏秦"])
         self.assertEqual(chapter["analysis_hash"], _chapter_analysis_hash(chapter))
         self.assertEqual(chapter["analysis_status"], "current")
-
-    def test_auto_chapter_summary_ignores_generic_role_label_for_existing_character(self):
-        chapter = _new_chapter(0)
-        chapter["outline"] = "有人进入王城。"
-        chapter["text"] = "他在王城找到旧案卷宗。"
-        tab = NovelWritingTab.__new__(NovelWritingTab)
-        tab.current_project = {
-            "characters": [
-                {"name": "赵明", "role": "主角", "goal": "查清旧案", "secret": "", "voice": "", "notes": ""},
-            ],
-            "chapters": [chapter],
-        }
-        tab.current_chapter_index = 0
-        tab._auto_summary_chapter_id = chapter["id"]
-        tab._auto_summary_started_summary = ""
-        tab._auto_summary_started_key_facts = ""
-        tab._auto_summary_started_linked = ""
-        tab.chapter_summary = _FakePlainTextEdit("")
-        tab.chapter_key_facts = _FakePlainTextEdit("")
-        tab.chapter_linked = _FakeLineEdit("")
-        tab._dirty = False
-        tab._loading = False
-        tab._pending_manuscript_refresh = False
-        tab._refresh_timer = _FakeTimer()
-        tab.current_project_path = ""
-        tab.project_meta_label = _FakeLabel()
-        tab.set_status_tip = lambda _text: None
-        tab._mark_chapter_dirty = lambda: None
-
-        tab.on_auto_chapter_summary_ready(
-            "summary",
-            "本章摘要：有人进入王城。\n本章需继承的关键事实：他拿到旧案钥匙。\n本章关联人物：主角",
-        )
-
-        self.assertEqual(tab.chapter_linked.text(), "")
-        self.assertNotEqual(tab.chapter_linked.text(), "主角")
 
     def test_apply_summary_preview_infers_linked_characters(self):
         chapter = _new_chapter(0)
@@ -4518,7 +4380,7 @@ class NovelWritingStateTests(unittest.TestCase):
         self.assertEqual(tab.chapter_linked.text(), "迟到主角")
         self.assertEqual(saved["linked_characters"], ["迟到主角"])
 
-    def test_apply_text_preview_infers_linked_characters_before_auto_summary(self):
+    def test_apply_text_preview_infers_linked_characters(self):
         chapter = _new_chapter(0)
         chapter["title"] = "第一章"
         chapter["status"] = "写作中"
@@ -4543,7 +4405,6 @@ class NovelWritingStateTests(unittest.TestCase):
         tab._loading = False
         tab._refresh_chapter_item = lambda _index: None
         tab._schedule_refresh = lambda include_manuscript=False: None
-        tab._maybe_start_auto_chapter_summary = lambda: False
         tab.set_chapter_ai_panel_expanded = lambda _expanded: None
         tab.set_status_tip = lambda _text: None
 
@@ -4553,35 +4414,7 @@ class NovelWritingStateTests(unittest.TestCase):
         self.assertEqual(tab.chapter_linked.text(), "赵明, 迟到主角")
         self.assertEqual(saved["linked_characters"], ["赵明", "迟到主角"])
 
-    def test_apply_text_preview_does_not_start_reverse_auto_outline_or_summary(self):
-        chapter = _new_chapter(0)
-        tab = NovelWritingTab.__new__(NovelWritingTab)
-        tab.current_project = {"chapters": [chapter], "characters": []}
-        tab.current_chapter_index = 0
-        tab.chapter_ai_preview = _FakePlainTextEdit("新增正文")
-        tab.chapter_title = _FakeLineEdit("第一章")
-        tab.chapter_status = _FakeComboBox(["大纲", "写作中", "已完成", "待重写"], "写作中")
-        tab.chapter_linked = _FakeLineEdit("")
-        tab.chapter_outline = _FakePlainTextEdit("")
-        tab.chapter_text = _FakePlainTextEdit("")
-        tab.chapter_summary = _FakePlainTextEdit("")
-        tab.chapter_key_facts = _FakePlainTextEdit("")
-        tab._dirty = False
-        tab._loading = False
-        tab._refresh_chapter_item = lambda _index: None
-        tab._schedule_refresh = lambda include_manuscript=False: None
-        tab.set_chapter_ai_panel_expanded = lambda _expanded: None
-        tab.set_status_tip = lambda _text: None
-        started = []
-        tab._maybe_start_auto_chapter_summary = lambda: started.append("summary") or True
-        tab._maybe_start_auto_chapter_outline = lambda: started.append("outline") or True
-
-        tab.apply_chapter_ai_preview("text")
-
-        self.assertEqual(tab.chapter_text.toPlainText(), "新增正文")
-        self.assertEqual(started, [])
-
-    def test_chapter_ai_sequence_runs_draft_outline_then_summary(self):
+    def test_chapter_ai_sequence_keeps_draft_in_preview_until_memory_finalize(self):
         chapter = _new_chapter(0)
         tab = NovelWritingTab.__new__(NovelWritingTab)
         tab.current_project = {"chapters": [chapter], "characters": []}
@@ -4614,12 +4447,14 @@ class NovelWritingStateTests(unittest.TestCase):
         tab._chapter_ai_context = lambda action: f"context:{action}"
         tab._chapter_ai_context_with_preview = lambda action: f"context:{action}"
         started = []
+        finalized = []
         statuses = []
         tab.set_status_tip = lambda text: statuses.append(text)
         tab._start_chapter_ai_worker = lambda action, _context, status_text="", resume_prefix="": (
             statuses.append(status_text) if status_text else None,
             started.append(action),
         )
+        tab._start_memory_finalize = lambda text: finalized.append(text)
 
         tab._start_chapter_ai_sequence()
         self.assertEqual(started, ["draft"])
@@ -4627,20 +4462,175 @@ class NovelWritingStateTests(unittest.TestCase):
 
         tab.chapter_ai_preview.setPlainText("AI 正文")
         tab.on_chapter_ai_ready("draft", "AI 正文")
-        self.assertEqual(tab.chapter_text.toPlainText(), "AI 正文")
-        self.assertEqual(started, ["draft", "outline"])
+        self.assertEqual(tab.chapter_text.toPlainText(), "")
+        self.assertEqual(tab.chapter_ai_preview.toPlainText(), "AI 正文")
+        self.assertEqual(started, ["draft"])
+        self.assertEqual(finalized, ["AI 正文"])
+        self.assertTrue(tab._chapter_ai_sequence_active)
 
-        tab.chapter_ai_preview.setPlainText("AI 提纲")
-        tab.on_chapter_ai_ready("outline", "AI 提纲")
-        self.assertEqual(tab.chapter_outline.toPlainText(), "AI 提纲")
-        self.assertEqual(started, ["draft", "outline", "summary"])
+    def test_single_and_auto_expand_draft_share_the_same_commit_gate(self):
+        def run_flow(auto_expand):
+            chapter = _new_chapter(0)
+            tab = NovelWritingTab.__new__(NovelWritingTab)
+            tab.current_project = {"chapters": [chapter], "characters": []}
+            tab.current_chapter_index = 0
+            tab.chapter_ai_preview = _FakePlainTextEdit("")
+            tab.chapter_title = _FakeLineEdit("第一章")
+            tab.chapter_status = _FakeComboBox(["大纲", "写作中", "已完成", "待重写"], "大纲")
+            tab.chapter_linked = _FakeLineEdit("")
+            tab.chapter_outline = _FakePlainTextEdit("章节提纲")
+            tab.chapter_text = _FakePlainTextEdit("")
+            tab.chapter_summary = _FakePlainTextEdit("")
+            tab.chapter_key_facts = _FakePlainTextEdit("")
+            tab._dirty = False
+            tab._loading = False
+            tab._auto_expand_all_active = auto_expand
+            tab._refresh_chapter_item = lambda _index: None
+            tab._schedule_refresh = lambda include_manuscript=False: None
+            tab.set_chapter_ai_panel_expanded = lambda _expanded: None
+            tab.set_status_tip = lambda _text: None
+            tab._set_chapter_ai_actions_enabled = lambda _enabled: None
+            tab._chapter_ai_resume_prefix = ""
+            tab._chapter_ai_stop_requested_by_user = False
+            tab._chapter_ai_running_action = ""
+            tab._chapter_ai_buttons_by_action = {}
+            tab._chapter_ai_provider = {
+                "base_url": "http://example.test",
+                "api_key": "key",
+                "proxy_url": "",
+            }
+            tab._chapter_ai_model = "model"
+            tab._provider_proxy_mode = lambda _provider: "不使用代理"
+            tab._current_novel_ai_selection = lambda: (
+                tab._chapter_ai_provider,
+                tab._chapter_ai_model,
+                "",
+            )
+            tab._flush_current_editors = lambda: None
+            tab._chapter_ai_context_with_preview = lambda action: f"context:{action}"
+            started = []
+            finalized = []
+            applied = []
+            tab._start_chapter_ai_worker = lambda action, _context, status_text="", resume_prefix="": started.append(action)
+            tab._start_memory_finalize = lambda text: finalized.append(text)
+            tab.apply_chapter_ai_preview = lambda target: applied.append(target)
 
-        summary_bundle = self._valid_summary_bundle()
-        tab.chapter_ai_preview.setPlainText(summary_bundle)
-        tab.on_chapter_ai_ready("summary", summary_bundle)
-        self.assertEqual(tab.chapter_summary.toPlainText(), "AI 摘要。")
-        self.assertEqual(tab.chapter_key_facts.toPlainText(), "AI 事实。")
-        self.assertFalse(tab._chapter_ai_sequence_active)
+            tab._start_chapter_ai_sequence()
+            tab.chapter_ai_preview.setPlainText("统一流程正文")
+            tab.on_chapter_ai_ready("draft", "统一流程正文")
+            return tab, started, finalized, applied
+
+        single_tab, single_started, single_finalized, single_applied = run_flow(False)
+        auto_tab, auto_started, auto_finalized, auto_applied = run_flow(True)
+
+        self.assertEqual(single_started, ["draft"])
+        self.assertEqual(auto_started, ["draft"])
+        self.assertEqual(single_finalized, ["统一流程正文"])
+        self.assertEqual(auto_finalized, ["统一流程正文"])
+        self.assertEqual(single_applied, [])
+        self.assertEqual(auto_applied, [])
+        self.assertEqual(single_tab.chapter_text.toPlainText(), "")
+        self.assertEqual(auto_tab.chapter_text.toPlainText(), "")
+        self.assertEqual(single_tab.chapter_ai_preview.toPlainText(), "统一流程正文")
+        self.assertEqual(auto_tab.chapter_ai_preview.toPlainText(), "统一流程正文")
+
+    def test_single_and_auto_expand_commit_atomically_after_memory_postprocessing(self):
+        final_text = "赵明确认资料来源仍然未知。"
+        for auto_expand in (False, True):
+            for stage in ("memory_finalize", "memory_repair", "memory_reconcile"):
+                with self.subTest(auto_expand=auto_expand, stage=stage):
+                    chapter_index = 9 if stage == "memory_reconcile" else 0
+                    chapters = [_new_chapter(index) for index in range(chapter_index + 1)]
+                    chapter = chapters[-1]
+                    tab = NovelWritingTab.__new__(NovelWritingTab)
+                    tab.current_project = {
+                        "chapters": chapters, "characters": [], "lore": [],
+                        "foreshadow_items": [],
+                        "long_form_memory": {"schema_version": "2", "revision": chapter_index},
+                    }
+                    tab.current_chapter_index = chapter_index
+                    tab.chapter_ai_preview = _FakePlainTextEdit("")
+                    tab.chapter_ai_stream_text = ""
+                    tab.chapter_text = _FakePlainTextEdit("")
+                    tab.chapter_outline = _FakePlainTextEdit("原规划提纲")
+                    tab.chapter_summary = _FakePlainTextEdit("")
+                    tab.chapter_key_facts = _FakePlainTextEdit("")
+                    tab.chapter_linked = _FakeLineEdit("")
+                    tab._auto_expand_all_active = auto_expand
+                    tab._chapter_ai_sequence_active = True
+                    tab._chapter_ai_sequence_started_outline = "原规划提纲"
+                    tab._ai_project_snapshot = lambda: deepcopy(tab.current_project)
+                    tab._set_partial_chapter_ai_preview_state = lambda *_args: None
+                    tab._refresh_long_form_record_views = lambda: None
+                    tab._mark_chapter_dirty = lambda: None
+                    tab._note_project_dirty = lambda: None
+                    tab._persist_ai_generation_state = lambda: None
+                    tab.set_chapter_ai_panel_expanded = lambda _expanded: None
+                    tab.set_status_tip = lambda _text: None
+                    started = []
+                    completed = []
+                    tab._start_chapter_ai_worker = lambda action, *_args, **_kwargs: started.append(action)
+                    tab._on_auto_expand_chapter_completed = completed.append
+
+                    tab.on_chapter_ai_ready("draft", final_text)
+
+                    self.assertEqual(started, ["memory_finalize"])
+                    self.assertEqual(tab.chapter_text.toPlainText(), "")
+                    self.assertEqual(chapter["text"], "")
+                    self.assertEqual(tab.chapter_ai_preview.toPlainText(), final_text)
+                    memory_update = {
+                        "schema_version": 2, "base_revision": chapter_index,
+                        "state_patch": {}, "state_retirements": {}, "state_delta": {},
+                        "fact_updates": [], "current_chapter_character_refs": [],
+                        "stage_archive": None,
+                        "record_updates": {"characters": [], "lore": []},
+                        "foreshadow_updates": [], "next_chapter_memory": {},
+                        **self._strict_memory_controls(),
+                    }
+                    if stage == "memory_reconcile":
+                        memory_update["state_lifecycle_review"]["scope"] = "stage_boundary_delta"
+                        memory_update["fact_lifecycle_review"]["scope"] = "stage_boundary_delta"
+                        memory_update["stage_archive"] = {
+                            "summary": "前十章完成资料核查。", "irreversible_facts": [],
+                            "relationship_changes": [], "unresolved_threads": ["资料来源未知"],
+                            "next_stage_entry": "继续核实资料来源。",
+                        }
+                    result = {
+                        "logic_audit": {"checked": True, "issues": []},
+                        "outline": "赵明核对资料来源。", "summary": final_text,
+                        "key_facts": ["资料来源仍然未知。"],
+                        "long_form_memory": memory_update,
+                    }
+                    if stage == "memory_repair":
+                        invalid = deepcopy(result)
+                        invalid["long_form_memory"]["state_reconciliation"]["checked"] = False
+                        tab._handle_memory_finalize_ready(json.dumps(invalid, ensure_ascii=False))
+                        self.assertEqual(started, ["memory_finalize", "memory_repair"])
+                        self.assertEqual(tab.chapter_text.toPlainText(), "")
+                        self.assertEqual(tab.current_project["chapters"][-1]["text"], "")
+                        self.assertEqual(tab.current_project["long_form_memory"]["revision"], chapter_index)
+                        tab._handle_memory_repair_ready(json.dumps(result, ensure_ascii=False))
+                    else:
+                        tab._handle_memory_finalize_ready(json.dumps(result, ensure_ascii=False))
+                        if stage == "memory_reconcile":
+                            self.assertEqual(started, ["memory_finalize", "memory_reconcile"])
+                            self.assertEqual(tab.chapter_text.toPlainText(), "")
+                            self.assertEqual(tab.current_project["chapters"][-1]["text"], "")
+                            self.assertEqual(tab.current_project["long_form_memory"]["revision"], chapter_index)
+                            tab._handle_memory_reconciliation_ready('{"corrections": {}}')
+
+                    saved = tab.current_project["chapters"][-1]
+                    self.assertEqual(tab.chapter_text.toPlainText(), final_text)
+                    self.assertEqual(saved["text"], final_text)
+                    self.assertEqual(saved["summary"], final_text)
+                    self.assertEqual(saved["key_facts"], "1. 资料来源仍然未知。")
+                    self.assertEqual(saved["memory_sync_status"], "complete")
+                    self.assertEqual(saved["ai_generation_checkpoint"], {})
+                    self.assertEqual(tab.current_project["long_form_memory"]["revision"], chapter_index + 1)
+                    self.assertEqual(tab.chapter_ai_preview.toPlainText(), "")
+                    self.assertEqual(completed, [True])
+                    self.assertNotIn("outline", started)
+                    self.assertNotIn("summary", started)
 
     def test_fragmented_style_draft_triggers_one_automatic_rewrite(self):
         reference = "\n".join(
@@ -4672,7 +4662,6 @@ class NovelWritingStateTests(unittest.TestCase):
         self.assertEqual(started[0][0], "draft")
         self.assertIn("【风格验收未通过：本次必须重写】", started[0][1])
         self.assertIn("正在自动重写一次", started[0][2])
-
         self.assertFalse(tab._maybe_retry_draft_for_style("draft", fragmented))
 
     def test_style_workflow_builds_full_sheet_then_runs_direct_draft_and_state_finalize(self):
@@ -4922,7 +4911,6 @@ class NovelWritingStateTests(unittest.TestCase):
         tab._chapter_ai_style_output_target = 0
         tab._chapter_ai_style_finalize_count = 1
         tab._chapter_ai_sequence_started_outline = "原规划提纲"
-        tab._chapter_ai_style_fallback_text = ""
         tab._chapter_ai_memory_pending = {}
         tab._chapter_ai_memory_finalize_attempted = False
         tab.set_status_tip = lambda _text: None
@@ -5051,7 +5039,6 @@ class NovelWritingStateTests(unittest.TestCase):
         tab._chapter_ai_style_cards = []
         tab._chapter_ai_style_pending_reasons = []
         tab._chapter_ai_sequence_started_outline = chapter["outline"]
-        tab._chapter_ai_style_fallback_text = ""
         tab._chapter_ai_memory_pending = {}
         tab._chapter_ai_memory_finalize_attempted = False
         tab._ai_project_snapshot = lambda: deepcopy(tab.current_project)
@@ -5335,7 +5322,6 @@ class NovelWritingStateTests(unittest.TestCase):
             final_text,
             bundle,
             validation_errors=["state_reconciliation.checked必须为true"],
-            mode="style",
             repair_attempt=1,
             status="failed",
         )
@@ -5944,75 +5930,6 @@ class NovelWritingStateTests(unittest.TestCase):
         self.assertEqual(len(fallback), 1)
         self.assertIn("已保留原本通过校验的状态包等待下次对账", fallback[0])
 
-    def test_no_style_tenth_chapter_summary_also_starts_boundary_reconciliation(self):
-        chapters = [_new_chapter(index) for index in range(10)]
-        chapter = chapters[-1]
-        chapter["text"] = "赵明确认资料来源仍然未知。"
-        tab = NovelWritingTab.__new__(NovelWritingTab)
-        tab.current_project = {
-            "chapters": chapters,
-            "characters": [], "lore": [], "foreshadow_items": [],
-            "long_form_memory": {"schema_version": "2", "revision": 9},
-        }
-        tab.current_chapter_index = 9
-        tab._auto_summary_chapter_id = chapter["id"]
-        tab._auto_summary_started_summary = ""
-        tab._auto_summary_started_key_facts = ""
-        tab._auto_summary_started_linked = ""
-        tab._chapter_ai_sequence_active = True
-        tab.chapter_text = _FakePlainTextEdit(chapter["text"])
-        tab.chapter_outline = _FakePlainTextEdit("赵明核对资料来源。")
-        tab.chapter_summary = _FakePlainTextEdit("")
-        tab.chapter_key_facts = _FakePlainTextEdit("")
-        tab.chapter_linked = _FakeLineEdit("")
-        started = []
-        tab._start_memory_reconciliation = lambda body, bundle: started.append((body, bundle))
-        memory_update = {
-            "schema_version": 2, "base_revision": 9,
-            "state_patch": {}, "state_retirements": {},
-            "state_lifecycle_review": {
-                "scope": "stage_boundary_delta", "reviewed_object_keys": [],
-                "reviewed_conflict_refs": [], "reviewed_task_refs": [],
-            },
-            "fact_updates": [],
-            "fact_lifecycle_review": {"scope": "stage_boundary_delta", "reviewed_refs": []},
-            "long_term_events": [],
-            "state_reconciliation": {
-                "checked": True,
-                "coverage_checks": {
-                    "named_character_actions": True, "state_changes": True,
-                    "evidence_and_unknowns": True, "mechanism_claims_match_body": True,
-                    "rules_and_boundaries": True,
-                    "foreshadow_and_ending": True,
-                },
-                "fact_refs": [], "character_refs": [], "lore_refs": [],
-                "foreshadow_refs": [], "relationship_refs": [], "object_keys": [],
-                "conflict_refs": [], "task_refs": [], "resolved_contradictions": [],
-            },
-            "state_delta": {}, "current_chapter_character_refs": [],
-            "stage_archive": {
-                "summary": "阶段资料核查完成。", "irreversible_facts": [],
-                "relationship_changes": [], "unresolved_threads": ["来源仍未知"],
-                "next_stage_entry": "继续核查来源。",
-            },
-            "record_updates": {"characters": [], "lore": []},
-            "foreshadow_updates": [], "next_chapter_memory": {},
-        }
-        content = json.dumps({
-            "summary": "赵明确认资料来源仍未知。",
-            "key_facts": ["资料来源仍然未知。"],
-            "linked_characters": [],
-            "long_form_memory": memory_update,
-        }, ensure_ascii=False)
-
-        result = tab.on_auto_chapter_summary_ready("summary", content)
-
-        self.assertIsNone(result)
-        self.assertEqual(len(started), 1)
-        self.assertEqual(started[0][0], chapter["text"])
-        self.assertEqual(tab._chapter_ai_memory_pending["mode"], "summary")
-        self.assertEqual(tab.current_project["long_form_memory"]["revision"], 9)
-
     def test_style_finalize_selects_revised_body_when_only_it_matches_memory_evidence(self):
         chapter = _new_chapter(0)
         tab = NovelWritingTab.__new__(NovelWritingTab)
@@ -6480,29 +6397,23 @@ class NovelWritingStateTests(unittest.TestCase):
         tab._flush_current_editors = lambda: None
         tab._chapter_ai_context_with_preview = lambda action: f"context:{action}"
         started = []
+        finalized = []
         statuses = []
         tab.set_status_tip = lambda text: statuses.append(text)
         tab._start_chapter_ai_worker = lambda action, _context, status_text="", resume_prefix="": (
             statuses.append(status_text) if status_text else None,
             started.append(action),
         )
+        tab._start_memory_finalize = lambda text: finalized.append(text)
 
         tab._start_chapter_ai_sequence()
         tab.chapter_ai_preview.setPlainText("AI 正文")
         tab.on_chapter_ai_ready("draft", "AI 正文")
 
-        self.assertEqual(started, ["draft", "summary"])
+        self.assertEqual(started, ["draft"])
         self.assertEqual(tab.chapter_outline.toPlainText(), "规划提纲：本章要完成权限边界会议。")
-
-        summary_bundle = self._valid_summary_bundle()
-        tab.chapter_ai_preview.setPlainText(summary_bundle)
-        tab.on_chapter_ai_ready("summary", summary_bundle)
-
-        self.assertEqual(tab.chapter_text.toPlainText(), "AI 正文")
-        self.assertEqual(tab.chapter_summary.toPlainText(), "AI 摘要。")
-        self.assertEqual(tab.chapter_key_facts.toPlainText(), "AI 事实。")
-        self.assertFalse(tab._chapter_ai_sequence_active)
-        self.assertEqual(statuses[-1], "章节 AI 已完成：正文已写入，已保留原章节提纲，并补摘要/关键事实。")
+        self.assertEqual(tab.chapter_text.toPlainText(), "")
+        self.assertEqual(finalized, ["AI 正文"])
 
     def test_partial_draft_restart_rewrites_full_chapter_then_finishes_with_summary(self):
         chapter = _new_chapter(0)
@@ -6542,7 +6453,9 @@ class NovelWritingStateTests(unittest.TestCase):
         tab._flush_current_editors = lambda: None
         tab._chapter_ai_context_with_preview = lambda action: f"context:{action}"
         started = []
+        finalized = []
         tab._start_chapter_ai_worker = lambda action, _context, status_text="", resume_prefix="": started.append(action)
+        tab._start_memory_finalize = lambda text: finalized.append(text)
 
         tab.run_chapter_ai_action("draft")
         self.assertEqual(started, ["draft"])
@@ -6551,16 +6464,11 @@ class NovelWritingStateTests(unittest.TestCase):
         tab.chapter_ai_preview.setPlainText("断线正文续完")
         tab.on_chapter_ai_ready("draft", "断线正文续完")
 
-        self.assertEqual(tab.chapter_text.toPlainText(), "断线正文续完")
+        self.assertEqual(tab.chapter_text.toPlainText(), "")
+        self.assertEqual(tab.chapter_ai_preview.toPlainText(), "断线正文续完")
         self.assertEqual(tab.chapter_outline.toPlainText(), "章节提纲")
-        self.assertEqual(started, ["draft", "summary"])
-
-        summary_bundle = self._valid_summary_bundle("续写后的摘要。", "续写后的事实。")
-        tab.chapter_ai_preview.setPlainText(summary_bundle)
-        tab.on_chapter_ai_ready("summary", summary_bundle)
-        self.assertEqual(tab.chapter_summary.toPlainText(), "续写后的摘要。")
-        self.assertEqual(tab.chapter_key_facts.toPlainText(), "续写后的事实。")
-        self.assertEqual(started, ["draft", "summary"])
+        self.assertEqual(started, ["draft"])
+        self.assertEqual(finalized, ["断线正文续完"])
 
     def test_partial_outline_restart_returns_to_full_draft(self):
         chapter = _new_chapter(0)
@@ -6662,37 +6570,6 @@ class NovelWritingStateTests(unittest.TestCase):
         self.assertEqual(button.text, "扩写正文并补提纲和摘要")
         self.assertEqual(tab.chapter_text.toPlainText(), "")
         self.assertFalse(tab._has_partial_chapter_ai_preview())
-
-    def test_auto_chapter_outline_keeps_manual_outline(self):
-        chapter = _new_chapter(0)
-        tab = NovelWritingTab.__new__(NovelWritingTab)
-        tab.current_project = {"chapters": [chapter], "characters": []}
-        tab.current_chapter_index = 0
-        tab._auto_outline_chapter_id = chapter["id"]
-        tab._auto_outline_started_outline = "旧提纲"
-        tab.chapter_outline = _FakePlainTextEdit("我手动改过的提纲")
-        tab.chapter_linked = _FakeLineEdit("")
-        tab.set_status_tip = lambda _text: None
-
-        tab.on_auto_chapter_outline_ready("outline", "AI 新提纲")
-
-        self.assertEqual(tab.chapter_outline.toPlainText(), "我手动改过的提纲")
-
-    def test_auto_chapter_outline_fills_unchanged_outline(self):
-        chapter = _new_chapter(0)
-        tab = NovelWritingTab.__new__(NovelWritingTab)
-        tab.current_project = {"chapters": [chapter], "characters": []}
-        tab.current_chapter_index = 0
-        tab._auto_outline_chapter_id = chapter["id"]
-        tab._auto_outline_started_outline = ""
-        tab.chapter_outline = _FakePlainTextEdit("")
-        tab.chapter_linked = _FakeLineEdit("")
-        tab._mark_chapter_dirty = lambda: None
-        tab.set_status_tip = lambda _text: None
-
-        tab.on_auto_chapter_outline_ready("outline", "AI 新提纲")
-
-        self.assertEqual(tab.chapter_outline.toPlainText(), "AI 新提纲")
 
     def test_partial_draft_preview_is_excluded_from_rewrite_context(self):
         chapter = _new_chapter(0)
@@ -7080,7 +6957,6 @@ class NovelWritingStateTests(unittest.TestCase):
         tab._chapter_ai_preview_action = ""
         tab._chapter_ai_preview_chapter_id = ""
         tab._chapter_ai_style_workflow_active = True
-        tab._chapter_ai_style_fallback_text = "旧兜底"
         tab._chapter_ai_style_execution = "旧执行稿"
         tab._chapter_ai_style_plan = "旧声纹表"
         button = _FakeButton()
@@ -7123,7 +6999,6 @@ class NovelWritingStateTests(unittest.TestCase):
         tab._chapter_ai_preview_chapter_id = ""
         tab._chapter_ai_sequence_active = True
         tab._chapter_ai_sequence_chapter_id = chapter["id"]
-        tab._chapter_ai_sequence_pending_action = "draft"
         tab._chapter_ai_sequence_started_outline = ""
         button = _FakeButton()
         tab._chapter_ai_buttons_by_action = {"draft": button}
@@ -7170,68 +7045,6 @@ class NovelWritingStateTests(unittest.TestCase):
         self.assertEqual(tab.chapter_ai_preview.toPlainText(), "")
         self.assertTrue(tab._has_partial_chapter_ai_preview("outline"))
         self.assertEqual(button.text, "扩写正文并补提纲和摘要")
-
-    def test_failed_sequence_outline_status_names_written_body_and_resume_step(self):
-        chapter = _new_chapter(0)
-        tab = NovelWritingTab.__new__(NovelWritingTab)
-        tab.current_project = {"chapters": [chapter], "characters": []}
-        tab.current_chapter_index = 0
-        tab.chapter_ai_preview = _FakePlainTextEdit("")
-        tab.chapter_ai_stream_text = ""
-        tab._chapter_ai_running_action = "outline"
-        tab._chapter_ai_preview_is_partial = False
-        tab._chapter_ai_preview_action = ""
-        tab._chapter_ai_preview_chapter_id = ""
-        tab._chapter_ai_sequence_active = True
-        button = _FakeButton()
-        tab._chapter_ai_buttons_by_action = {"draft": button}
-        statuses = []
-        tab.set_status_tip = lambda text: statuses.append(text)
-
-        import gpt_desktop.novel_writing_tab as writing_tab
-        original_warning = writing_tab.QMessageBox.warning
-        try:
-            writing_tab.QMessageBox.warning = lambda *_args, **_kwargs: None
-            tab.on_chapter_ai_failed("接口错误 500：server down")
-        finally:
-            writing_tab.QMessageBox.warning = original_warning
-
-        self.assertIn("正文草稿已写入", statuses[-1])
-        self.assertIn("完整流程未提交", statuses[-1])
-        self.assertIn("重写整章", statuses[-1])
-        self.assertIn("接口错误 500", statuses[-1])
-
-    def test_failed_sequence_summary_status_names_written_body_and_resume_step(self):
-        chapter = _new_chapter(0)
-        tab = NovelWritingTab.__new__(NovelWritingTab)
-        tab.current_project = {"chapters": [chapter], "characters": []}
-        tab.current_chapter_index = 0
-        tab.chapter_ai_preview = _FakePlainTextEdit("已经确定的正文终稿。")
-        tab.chapter_ai_stream_text = '```json\n{"summary":"未完成的内部摘要"}'
-        tab._chapter_ai_running_action = "summary"
-        tab._chapter_ai_preview_is_partial = False
-        tab._chapter_ai_preview_action = ""
-        tab._chapter_ai_preview_chapter_id = ""
-        tab._chapter_ai_sequence_active = True
-        button = _FakeButton()
-        tab._chapter_ai_buttons_by_action = {"draft": button}
-        statuses = []
-        tab.set_status_tip = lambda text: statuses.append(text)
-
-        import gpt_desktop.novel_writing_tab as writing_tab
-        original_warning = writing_tab.QMessageBox.warning
-        try:
-            writing_tab.QMessageBox.warning = lambda *_args, **_kwargs: None
-            tab.on_chapter_ai_failed("接口错误 500：server down")
-        finally:
-            writing_tab.QMessageBox.warning = original_warning
-
-        self.assertIn("正文草稿已写入", statuses[-1])
-        self.assertIn("长期状态未提交", statuses[-1])
-        self.assertIn("重写整章", statuses[-1])
-        self.assertIn("接口错误 500", statuses[-1])
-        self.assertEqual(tab.chapter_ai_preview.toPlainText(), "已经确定的正文终稿。")
-        self.assertFalse(tab._has_partial_chapter_ai_preview("summary"))
 
     def test_save_chapter_auto_updates_default_status(self):
         chapter = _new_chapter(0)
@@ -8370,58 +8183,6 @@ class NovelWritingStateTests(unittest.TestCase):
         }
 
         self.assertEqual(_infer_linked_character_names(project, chapter), ["赵明", "迟到主角"])
-
-    def test_auto_chapter_summary_keeps_manual_summary_but_fills_other_fields(self):
-        chapter = _new_chapter(0)
-        tab = NovelWritingTab.__new__(NovelWritingTab)
-        tab.current_project = {
-            "characters": [
-                {"name": "赵明", "role": "主角", "goal": "", "secret": "", "voice": "", "notes": ""},
-            ],
-            "chapters": [chapter],
-        }
-        tab.current_chapter_index = 0
-        tab._auto_summary_chapter_id = chapter["id"]
-        tab._auto_summary_started_summary = ""
-        tab._auto_summary_started_key_facts = ""
-        tab._auto_summary_started_linked = ""
-        tab.chapter_summary = _FakePlainTextEdit("我手动写的摘要")
-        tab.chapter_key_facts = _FakePlainTextEdit("")
-        tab.chapter_linked = _FakeLineEdit("")
-        tab._mark_chapter_dirty = lambda: None
-        tab.set_status_tip = lambda _text: None
-
-        tab.on_auto_chapter_summary_ready(
-            "summary",
-            "本章摘要：AI 摘要。\n本章需继承的关键事实：AI 事实。\n本章关联人物：赵明",
-        )
-
-        self.assertEqual(tab.chapter_summary.toPlainText(), "我手动写的摘要")
-        self.assertEqual(tab.chapter_key_facts.toPlainText(), "AI 事实。")
-        self.assertEqual(tab.chapter_linked.text(), "赵明")
-
-    def test_auto_chapter_summary_keeps_manual_key_facts_but_fills_summary(self):
-        chapter = _new_chapter(0)
-        tab = NovelWritingTab.__new__(NovelWritingTab)
-        tab.current_project = {"chapters": [chapter]}
-        tab.current_chapter_index = 0
-        tab._auto_summary_chapter_id = chapter["id"]
-        tab._auto_summary_started_summary = ""
-        tab._auto_summary_started_key_facts = ""
-        tab._auto_summary_started_linked = ""
-        tab.chapter_summary = _FakePlainTextEdit("")
-        tab.chapter_key_facts = _FakePlainTextEdit("我手动写的关键事实")
-        tab.chapter_linked = _FakeLineEdit("")
-        tab._mark_chapter_dirty = lambda: None
-        tab.set_status_tip = lambda _text: None
-
-        tab.on_auto_chapter_summary_ready(
-            "summary",
-            "本章摘要：AI 摘要。\n本章需继承的关键事实：AI 事实。",
-        )
-
-        self.assertEqual(tab.chapter_summary.toPlainText(), "AI 摘要。")
-        self.assertEqual(tab.chapter_key_facts.toPlainText(), "我手动写的关键事实")
 
     def test_apply_chapter_plan_appends_planned_chapters(self):
         existing = _new_chapter(0)

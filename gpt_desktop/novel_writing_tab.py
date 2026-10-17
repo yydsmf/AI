@@ -204,7 +204,6 @@ from .novel_utils import (
     _parse_style_cards_result,
     _parse_style_execution_result,
     _parse_style_finalize_result,
-    _parse_long_form_memory_update,
     _parse_chapter_logic_repair_result,
     _parse_memory_reconciliation_result,
     _parse_memory_repair_result,
@@ -320,7 +319,7 @@ class QInputDialog(_QtInputDialog):
 _SORT_MISSING_ORDER = 10 ** 9
 _CHAPTER_PLAN_BATCH_SIZE = 50
 # Leave room for the chapter-planning system prompt and request envelope.
-# The returned context itself remains below the application's 120,000-char
+# The returned context itself remains below the application's 128,000-char
 # limit even for large existing projects and imported frameworks.
 _CHAPTER_PLAN_CONTEXT_CHAR_BUDGET = NOVEL_AI_CONTEXT_LIMIT - 10000
 _CHAPTER_PLAN_BATCH_STATE_VERSION = 3
@@ -1728,7 +1727,6 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
         "memory_repair",
         "logic_repair",
         "memory_sync",
-        "summary",
     })
     _MEMORY_FAILURE_EVENTS = frozenset({
         "memory_validation_failed",
@@ -1743,8 +1741,6 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
         "auto_expand_chapter_save_failed",
         "auto_expand_resume_state_save_failed",
         "ai_generation_checkpoint_save_failed",
-        "auto_chapter_summary_failed",
-        "auto_chapter_summary_validation_failed",
     })
 
     def __init__(self, config=None, parent=None, background_runner=False):
@@ -1788,8 +1784,6 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
         self._volume_two_model = ""
         self._volume_two_template_hash = ""
         self.chapter_title_worker = None
-        self.auto_summary_worker = None
-        self.auto_outline_worker = None
         self.foreshadow_review_worker = None
         self.failed_foreshadow_review_chunks = []
         self.foreshadow_review_postprocess_pending = False
@@ -1860,7 +1854,6 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
         self._chapter_ai_style_plan = ""
         self._chapter_ai_sequence_active = False
         self._chapter_ai_sequence_chapter_id = ""
-        self._chapter_ai_sequence_pending_action = ""
         self._chapter_ai_sequence_started_outline = ""
         self._auto_expand_all_active = False
         self._auto_expand_all_waiting_next = False
@@ -3010,7 +3003,6 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
                 "pipeline": {
                     "action": action,
                     "sequence_active": bool(getattr(self, "_chapter_ai_sequence_active", False)),
-                    "sequence_pending_action": str(getattr(self, "_chapter_ai_sequence_pending_action", "") or ""),
                     "style_workflow_active": bool(getattr(self, "_chapter_ai_style_workflow_active", False)),
                     "auto_expand_active": bool(getattr(self, "_auto_expand_all_active", False)),
                     "auto_expand_completed": int(getattr(self, "_auto_expand_all_completed", 0) or 0),
@@ -11753,13 +11745,6 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
             self._mark_current_chapter_ai_sync_pending(chapter)
             self._start_style_locked_draft(context)
             return
-        if mode == "sequence":
-            self._start_chapter_ai_worker(
-                action,
-                context,
-                str(pending.get("status_text", "") or "正在继续 AI 写作..."),
-            )
-            return
         self.chapter_ai_stream_text = ""
         self._set_partial_chapter_ai_preview_state(False)
         self._chapter_ai_resume_prefix = ""
@@ -11857,9 +11842,21 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
     def _reset_chapter_ai_sequence(self):
         self._chapter_ai_sequence_active = False
         self._chapter_ai_sequence_chapter_id = ""
-        self._chapter_ai_sequence_pending_action = ""
         self._chapter_ai_sequence_started_outline = ""
-        self._chapter_ai_sequence_skipped_outline = False
+
+    def _stage_chapter_ai_draft_for_memory_finalize(self, final_text):
+        """Keep a complete draft in preview until the state transaction commits."""
+        candidate = str(final_text or "").strip()
+        if not candidate:
+            self._fail_memory_sync("正文终稿为空，无法整理章节状态")
+            return False
+        self._chapter_ai_style_execution = ""
+        self._chapter_ai_style_plan = ""
+        self._chapter_ai_style_candidate = candidate
+        self.chapter_ai_preview.setPlainText(candidate)
+        self._clear_transient_chapter_ai_retry("draft")
+        self._start_memory_finalize(candidate)
+        return True
 
     def _auto_expand_chapter_has_committed_memory(self, chapter):
         if not isinstance(chapter, dict):
@@ -13665,7 +13662,6 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
                 or task.get("task_generation", 0)
                 or 0
             ),
-            "mode": str(pending.get("mode", "style") or "style"),
             "final_text": text,
             "final_text_sha256": self._chapter_ai_checkpoint_hash(text),
             "source_text_sha256": self._chapter_ai_checkpoint_hash(chapter.get("text", "")),
@@ -13787,7 +13783,6 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
         bundle,
         validation_errors=None,
         logic_issues=None,
-        mode="style",
         repair_attempt=0,
         status="failed",
         error="",
@@ -13848,7 +13843,6 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
                 or task.get("task_generation", 0)
                 or 0
             ),
-            "mode": str(mode or pending.get("mode", "style") or "style"),
             "final_text": text,
             "final_text_sha256": self._chapter_ai_checkpoint_hash(text),
             "source_text_sha256": self._chapter_ai_checkpoint_hash(chapter.get("text", "")),
@@ -14164,7 +14158,6 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
             "final_text": text,
             "bundle": {},
             "errors": [],
-            "mode": "style",
             "logic_audit_required": True,
             "reconciliation_started": False,
             "prose_patch_applied": bool(prose_patch_applied),
@@ -14374,12 +14367,8 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
             chapter["memory_reconciliation_status"] = "complete"
             chapter["memory_reconciliation_error"] = ""
         self._clear_transient_chapter_ai_retry("memory_reconcile")
-        mode = str(pending.get("mode", "style") or "style")
         self._chapter_ai_memory_pending = {}
-        if mode == "summary":
-            self._apply_repaired_summary_result(bundle)
-        else:
-            self._apply_style_final_result(final_text, bundle, memory_validated=True)
+        self._apply_style_final_result(final_text, bundle, memory_validated=True)
 
     def _handle_memory_finalize_ready(self, content):
         pending = getattr(self, "_chapter_ai_memory_pending", {})
@@ -14525,7 +14514,7 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
             # same omission and burns the transport retry budget; the repair
             # prompt already receives the concrete validation errors.
             self._clear_transient_chapter_ai_retry("memory_finalize")
-            self._start_memory_repair(final_text, bundle, validation_errors, "style")
+            self._start_memory_repair(final_text, bundle, validation_errors)
             return
         patches = bundle.get("repair_patches", [])
         if patches and not pending.get("prose_patch_applied"):
@@ -14606,7 +14595,6 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
         final_text,
         bundle,
         validation_errors=None,
-        mode="style",
         transient_retry=False,
     ):
         previous_pending = getattr(self, "_chapter_ai_memory_pending", {})
@@ -14625,7 +14613,6 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
             validation_errors=validation_errors,
             final_text_chars=len(str(final_text or "").strip()),
             final_text_sha256=self._chapter_ai_checkpoint_hash(final_text),
-            repair_mode=str(mode or "style"),
         )
         self._chapter_ai_memory_pending = {
             "chapter_id": self._current_chapter_id(),
@@ -14637,7 +14624,6 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
             "final_text": str(final_text or "").strip(),
             "bundle": deepcopy(bundle) if isinstance(bundle, dict) else {},
             "errors": validation_errors,
-            "mode": str(mode or "style"),
             "logic_audit_required": logic_audit_required,
         }
         self._store_memory_repair_checkpoint(
@@ -14645,7 +14631,6 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
             final_text,
             self._chapter_ai_memory_pending["bundle"],
             validation_errors=validation_errors,
-            mode=self._chapter_ai_memory_pending["mode"],
             repair_attempt=attempts,
             status="pending",
         )
@@ -14687,7 +14672,6 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
             "final_text": str(final_text or "").strip(),
             "bundle": deepcopy(bundle) if isinstance(bundle, dict) else {},
             "errors": [],
-            "mode": "style",
             "logic_audit_required": True,
             "logic_issues": issues,
         }
@@ -14701,7 +14685,6 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
             final_text,
             self._chapter_ai_memory_pending["bundle"],
             logic_issues=issues,
-            mode="style",
             repair_attempt=attempts,
             status="pending",
         )
@@ -14835,7 +14818,6 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
                     pending.get("bundle", {}) if isinstance(pending, dict) else {},
                     validation_errors=pending.get("errors", []) if isinstance(pending, dict) else [],
                     logic_issues=pending.get("logic_issues", []) if isinstance(pending, dict) else [],
-                    mode=pending.get("mode", "style") if isinstance(pending, dict) else "style",
                     repair_attempt=(
                         getattr(self, "_chapter_ai_logic_repair_attempts", 0)
                         if repair_stage == "logic_repair" else
@@ -14947,7 +14929,6 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
                     final_text,
                     bundle,
                     retry_errors,
-                    pending.get("mode", "style"),
                     transient_retry=True,
                 ),
             ):
@@ -14998,7 +14979,6 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
                     final_text,
                     bundle,
                     validation_errors,
-                    pending.get("mode", "style"),
                     transient_retry=True,
                 ),
             ):
@@ -15027,12 +15007,9 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
         self._clear_transient_chapter_ai_retry("memory_repair")
         self._chapter_ai_memory_pending = {}
         self.chapter_ai_preview.setPlainText(final_text)
-        if pending.get("mode") == "summary":
-            self._apply_repaired_summary_result(bundle)
-        else:
-            self._apply_style_final_result(final_text, bundle, memory_validated=True)
+        self._apply_style_final_result(final_text, bundle, memory_validated=True)
 
-    def _prepare_staged_memory_commit(self, final_text, bundle, include_prose=False, include_outline=False):
+    def _prepare_staged_memory_commit(self, final_text, bundle):
         """Build the complete chapter update without mutating the live project."""
         if not isinstance(getattr(self, "current_project", None), dict):
             return None, False, "", "", "", ""
@@ -15048,38 +15025,22 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
             if hasattr(self, "chapter_text") else staged_chapter.get("text", "")
         ).strip()
         final_text = str(final_text or "").strip()
-        new_text = (
-            _append_text_without_duplicate_overlap(old_text, final_text)
-            if include_prose else str(staged_chapter.get("text", "") or "").strip()
-        )
+        new_text = _append_text_without_duplicate_overlap(old_text, final_text)
         memory_update = bundle.get("memory_update", {}) if isinstance(bundle, dict) else {}
-        try:
-            memory_changed = _apply_long_form_memory_update(
-                staged_project,
-                chapter_index,
-                memory_update,
-                final_text=new_text or old_text,
-            )
-        except TypeError as error:
-            # Keep test doubles and downstream integrations using the older
-            # three-argument helper callable while the real helper accepts
-            # body evidence for deterministic foreshadow synchronization.
-            if "final_text" not in str(error):
-                raise
-            memory_changed = _apply_long_form_memory_update(
-                staged_project,
-                chapter_index,
-                memory_update,
-            )
+        memory_changed = _apply_long_form_memory_update(
+            staged_project,
+            chapter_index,
+            memory_update,
+            final_text=new_text or old_text,
+        )
         if not memory_changed:
             return None, False, "", "", "", ""
-        if include_prose:
-            staged_chapter["text"] = new_text
+        staged_chapter["text"] = new_text
         bundle = bundle if isinstance(bundle, dict) else {}
         outline = str(bundle.get("outline", "") or "").strip()
         summary = str(bundle.get("summary", "") or "").strip()
         key_facts = str(bundle.get("key_facts", "") or "").strip()
-        if include_outline and outline and not str(
+        if outline and not str(
             getattr(self, "_chapter_ai_sequence_started_outline", "") or ""
         ).strip():
             staged_chapter["outline"] = outline
@@ -15088,68 +15049,6 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
         if key_facts:
             staged_chapter["key_facts"] = key_facts
         return staged_project, True, new_text, outline, summary, key_facts
-
-    def _apply_repaired_summary_result(self, bundle):
-        pending = getattr(self, "_chapter_ai_memory_pending", {})
-        pending = pending if isinstance(pending, dict) else {}
-        transaction_id = str(
-            pending.get("transaction_id", "")
-            or getattr(self, "_chapter_ai_memory_transaction_id", "")
-        )
-        state_before = self._novel_memory_state_summary()
-        self._log_novel_diagnostic(
-            "memory_transaction_started",
-            action="memory_sync",
-            transaction_id=transaction_id,
-            bundle_summary=self._novel_memory_bundle_summary(bundle),
-            state_before=state_before,
-        )
-        final_text = str(pending.get("final_text", "") or "").strip()
-        staged_project, memory_changed, _new_text, _outline, summary, key_facts = (
-            self._prepare_staged_memory_commit(final_text, bundle)
-        )
-        if not memory_changed:
-            self._log_novel_diagnostic(
-                "memory_transaction_failed",
-                level="error",
-                action="memory_sync",
-                transaction_id=transaction_id,
-                state_before=state_before,
-                state_after=self._novel_memory_state_summary(),
-                bundle_summary=self._novel_memory_bundle_summary(bundle),
-            )
-            self._fail_memory_sync("修复后的状态事务未能提交")
-            return
-        self.current_project = staged_project
-        self._log_novel_diagnostic(
-            "memory_transaction_committed",
-            action="memory_sync",
-            transaction_id=transaction_id,
-            state_before=state_before,
-            state_after=self._novel_memory_state_summary(),
-            bundle_summary=self._novel_memory_bundle_summary(bundle),
-        )
-        if summary:
-            self._set_text_without_signals(self.chapter_summary, summary)
-        if key_facts:
-            self._set_text_without_signals(self.chapter_key_facts, key_facts)
-        chapters = self.current_project.get("chapters", [])
-        chapter = chapters[self.current_chapter_index] if 0 <= self.current_chapter_index < len(chapters) else {}
-        self._clear_current_chapter_ai_resume_required()
-        self._set_line_text_without_signals(
-            self.chapter_linked,
-            ", ".join(_normalize_name_list(chapter.get("linked_characters", []))),
-        )
-        self._refresh_long_form_record_views()
-        self._mark_chapter_dirty()
-        self._mark_current_chapter_ai_result_analyzed()
-        self._note_project_dirty()
-        self.chapter_ai_preview.clear()
-        self._set_partial_chapter_ai_preview_state(False)
-        self._reset_chapter_ai_sequence()
-        self.set_chapter_ai_panel_expanded(False)
-        self.set_status_tip("章节 AI 已完成：摘要、关键事实和长篇状态已自动修复并提交。")
-        self._on_auto_expand_chapter_completed(True)
 
     def _start_chapter_ai_worker(
         self, action, context, status_text="", resume_prefix="", transient_retry=False
@@ -15607,7 +15506,6 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
                 "final_text": final_text,
                 "bundle": bundle,
                 "errors": [],
-                "mode": str(reconciliation_checkpoint.get("mode", "style") or "style"),
                 "logic_audit_required": False,
                 "reconciliation_started": False,
                 "resumed_reconciliation": True,
@@ -15616,9 +15514,7 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
                 ),
             }
             self._mark_current_chapter_ai_sync_pending(chapter)
-            self._chapter_ai_style_workflow_active = (
-                str(self._chapter_ai_memory_pending.get("mode", "style") or "style") == "style"
-            )
+            self._chapter_ai_style_workflow_active = True
             self.chapter_ai_preview.setPlainText(final_text)
             self._start_memory_reconciliation(final_text, bundle, resumed=True)
             return
@@ -15650,7 +15546,6 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
                     str(item) for item in repair_checkpoint.get("validation_errors", [])
                     if str(item or "").strip()
                 ],
-                "mode": str(repair_checkpoint.get("mode", "style") or "style"),
                 "logic_audit_required": bool(
                     repair_checkpoint.get("logic_audit_required", stage == "logic_repair")
                 ),
@@ -15661,10 +15556,7 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
                 "resumed_repair": True,
             }
             self._mark_current_chapter_ai_sync_pending(chapter)
-            self._chapter_ai_style_workflow_active = bool(
-                stage == "logic_repair"
-                or str(self._chapter_ai_memory_pending.get("mode", "style") or "style") == "style"
-            )
+            self._chapter_ai_style_workflow_active = True
             self.chapter_ai_preview.setPlainText(final_text)
             try:
                 stored_attempt = int(repair_checkpoint.get("repair_attempt", 0) or 0)
@@ -15679,7 +15571,6 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
                     final_text,
                     bundle,
                     self._chapter_ai_memory_pending["errors"],
-                    self._chapter_ai_memory_pending["mode"],
                 )
             else:
                 # Resume the same three-retry stage budget after an explicit
@@ -15768,33 +15659,6 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
             chapter_id=self._current_chapter_id(),
             rewrite_on_ready=rewrite_on_ready,
             status_text="正在后台组装本章资料...",
-        )
-
-    def _continue_chapter_ai_sequence(self, next_action):
-        if not getattr(self, "_chapter_ai_sequence_active", False):
-            return False
-        if self._current_chapter_id() != getattr(self, "_chapter_ai_sequence_chapter_id", ""):
-            self._reset_chapter_ai_sequence()
-            return False
-        if next_action == "outline":
-            self._auto_outline_chapter_id = self._current_chapter_id()
-            self._auto_outline_started_outline = self.chapter_outline.toPlainText().strip()
-        if next_action == "summary":
-            self._auto_summary_chapter_id = self._current_chapter_id()
-            self._auto_summary_started_summary = self.chapter_summary.toPlainText().strip()
-            self._auto_summary_started_key_facts = self.chapter_key_facts.toPlainText().strip()
-            self._auto_summary_started_linked = self.chapter_linked.text().strip()
-        status_map = {
-            "outline": "正文已应用，正在根据实际正文补章节提纲...",
-            "summary": "正文已应用，正在提炼本章摘要/关键事实...",
-        }
-        self._chapter_ai_sequence_pending_action = next_action
-        return self._start_chapter_context_build(
-            next_action,
-            "sequence",
-            chapter_index=self.current_chapter_index,
-            chapter_id=self._current_chapter_id(),
-            status_text=status_map.get(next_action, "正在继续 AI 写作..."),
         )
 
     def run_chapter_ai_action(self, action):
@@ -15935,10 +15799,6 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
             return False
         if action == "draft" and bool(getattr(self, "_chapter_ai_style_workflow_active", False)):
             return False
-        if action in {"outline", "summary"} and bool(
-            getattr(self, "_chapter_ai_sequence_active", False)
-        ):
-            return False
         return True
 
     def on_chapter_ai_chunk(self, piece):
@@ -15967,9 +15827,7 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
         original_context = str(getattr(self, "_chapter_ai_last_context", "") or "")
         output_target = _style_output_target_from_context(original_context)
         reasons = _style_draft_mismatch_reasons(style_reference, final_text, output_target)
-        if not reasons:
-            return False
-        if not original_context:
+        if not reasons or not original_context:
             return False
         repair_context = _build_style_rewrite_context(
             original_context,
@@ -16043,12 +15901,7 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
             outline,
             summary,
             key_facts,
-        ) = self._prepare_staged_memory_commit(
-            text,
-            bundle,
-            include_prose=True,
-            include_outline=True,
-        )
+        ) = self._prepare_staged_memory_commit(text, bundle)
         if not memory_changed:
             self._log_novel_diagnostic(
                 "memory_transaction_failed",
@@ -16260,16 +16113,14 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
             self._chapter_ai_style_rules = final_text
             self._start_style_draft_with_rules()
             return
-        if action == "draft" and getattr(self, "_chapter_ai_style_workflow_active", False):
-            candidate = str(final_text or "").strip()
-            self._chapter_ai_style_execution = ""
-            self._chapter_ai_style_plan = ""
-            self._chapter_ai_style_candidate = candidate
-            self._chapter_ai_style_retry_attempted = True
-            self._chapter_ai_style_fallback_text = ""
-            self.chapter_ai_preview.setPlainText(candidate)
-            self._clear_transient_chapter_ai_retry("draft")
-            self._start_memory_finalize(candidate)
+        if action == "draft":
+            # Both single-chapter expansion and automatic expansion use this
+            # same transaction boundary: draft -> memory_finalize -> commit.
+            # The body must stay in the preview until the complete package is
+            # validated and committed. Treat every chapter draft callback this
+            # way so legacy or queued state-marker handoffs cannot fall back to
+            # the ordinary preview-apply path.
+            self._stage_chapter_ai_draft_for_memory_finalize(final_text)
             return
         if action == "style_finalize" and getattr(self, "_chapter_ai_style_workflow_active", False):
             bundle = _parse_style_finalize_result(final_text)
@@ -16427,40 +16278,6 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
             self._clear_transient_chapter_ai_retry(action)
             self._set_partial_chapter_ai_preview_state(False)
             self._chapter_ai_resume_prefix = ""
-            if getattr(self, "_chapter_ai_sequence_active", False):
-                if self._current_chapter_id() != getattr(self, "_chapter_ai_sequence_chapter_id", ""):
-                    self._reset_chapter_ai_sequence()
-                    self.set_status_tip("章节已切换，已停止本次顺序写作流程。")
-                    return
-                if action == "outline":
-                    self.on_auto_chapter_outline_ready("outline", final_text)
-                    self.chapter_ai_preview.clear()
-                    self._continue_chapter_ai_sequence("summary")
-                    return
-                if action == "draft":
-                    self.chapter_ai_preview.setPlainText(final_text)
-                    self.apply_chapter_ai_preview("text")
-                    if str(getattr(self, "_chapter_ai_sequence_started_outline", "") or "").strip():
-                        self._chapter_ai_sequence_skipped_outline = True
-                        self._continue_chapter_ai_sequence("summary")
-                    else:
-                        self._continue_chapter_ai_sequence("outline")
-                    return
-                if action == "summary":
-                    memory_changed = self.on_auto_chapter_summary_ready("summary", final_text)
-                    if memory_changed is None:
-                        self.chapter_ai_preview.clear()
-                        return
-                    self.chapter_ai_preview.clear()
-                    skipped_outline = bool(getattr(self, "_chapter_ai_sequence_skipped_outline", False))
-                    self._reset_chapter_ai_sequence()
-                    self.set_chapter_ai_panel_expanded(False)
-                    if skipped_outline:
-                        self.set_status_tip("章节 AI 已完成：正文已写入，已保留原章节提纲，并补摘要/关键事实。")
-                    else:
-                        self.set_status_tip("章节 AI 已完成：正文、提纲、摘要/关键事实已按顺序更新。")
-                    self._on_auto_expand_chapter_completed(bool(memory_changed))
-                    return
             self.apply_chapter_ai_preview(target)
         else:
             self.set_status_tip(f"AI {labels.get(action, '内容')}已生成，可确认后应用。")
@@ -16612,19 +16429,14 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
             self._refresh_chapter_ai_action_labels()
         self._reset_chapter_ai_sequence()
         action_label = {"draft": "正文", "outline": "提纲", "summary": "摘要"}.get(action, "正文")
-        if sequence_active and action == "outline":
-            status = f"正文草稿已写入但完整流程未提交；重新点击会按提纲重写整章：{err_text[:80]}"
-        elif sequence_active and action == "summary":
-            status = f"正文草稿已写入但摘要和长期状态未提交；重新点击会按提纲重写整章：{err_text[:80]}"
+        kept_hint = "已保留预览，" if kept_preview else ""
+        if kept_preview:
+            action_text = "预览仅供查看；重新点击扩写会丢弃半成品并重写整章"
+        elif action in {"outline", "summary"}:
+            action_text = "可重新扩写整章"
         else:
-            kept_hint = "已保留预览，" if kept_preview else ""
-            if kept_preview:
-                action_text = "预览仅供查看；重新点击扩写会丢弃半成品并重写整章"
-            elif action in {"outline", "summary"}:
-                action_text = "可重新扩写整章"
-            else:
-                action_text = "可重新扩写正文" if action == "draft" else f"可重新生成{action_label}"
-            status = f"AI 写作失败，{kept_hint}{action_text}：{err_text[:80]}"
+            action_text = "可重新扩写正文" if action == "draft" else f"可重新生成{action_label}"
+        status = f"AI 写作失败，{kept_hint}{action_text}：{err_text[:80]}"
         self.set_status_tip(status)
         self._show_chapter_ai_failure(err_text)
 
@@ -16664,7 +16476,6 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
         if not text or text == "正在生成，请稍等...":
             self.set_status_tip("没有可应用的 AI 结果。")
             return
-        should_auto_summary = False
         if target == "outline":
             self.chapter_outline.setPlainText(text)
             inferred_names = self._infer_current_chapter_linked_names(extra_text=text)
@@ -16683,12 +16494,10 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
             self._merge_chapter_linked_names(_normalize_name_list(linked_names + inferred_names))
         elif target == "replace_text":
             self.chapter_text.setPlainText(text)
-            should_auto_summary = True
         elif target == "text":
             old = self.chapter_text.toPlainText().strip()
             self.chapter_text.setPlainText(_append_text_without_duplicate_overlap(old, text))
-            should_auto_summary = True
-        if should_auto_summary:
+        if target in {"replace_text", "text"}:
             inferred_names = self._infer_current_chapter_linked_names(
                 extra_text=self.chapter_text.toPlainText()
             )
@@ -16698,83 +16507,10 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
         self._set_partial_chapter_ai_preview_state(False)
         self._chapter_ai_resume_prefix = ""
         self.set_chapter_ai_panel_expanded(False)
-        if should_auto_summary:
+        if target in {"replace_text", "text"}:
             self.set_status_tip("正文已应用。")
         else:
             self.set_status_tip("AI 结果已应用到当前章节。")
-
-    def _maybe_start_auto_chapter_outline(self):
-        if self.current_chapter_index < 0:
-            return False
-        if getattr(self, "auto_outline_worker", None) is not None and self.auto_outline_worker.isRunning():
-            return False
-        if not str(self.chapter_text.toPlainText() or "").strip():
-            return False
-        if not hasattr(self, "config") or not hasattr(self, "bar"):
-            return False
-        provider, model, error = self._current_novel_ai_selection()
-        if error:
-            return False
-        try:
-            context = self._chapter_ai_context("outline")
-        except Exception as e:
-            log_debug("小说章节自动提纲上下文生成失败", e)
-            return False
-        self._auto_outline_chapter_id = self._current_chapter_id()
-        self._auto_outline_started_outline = self.chapter_outline.toPlainText().strip()
-        worker = NovelWritingWorker(
-            provider.get("base_url", ""),
-            provider.get("api_key", ""),
-            model,
-            "outline",
-            context,
-            provider.get("proxy_url", ""),
-            self._provider_proxy_mode(provider),
-        )
-        self.auto_outline_worker = worker
-        self._connect_novel_worker_status(worker)
-        worker.result_ready.connect(self.on_auto_chapter_outline_ready)
-        worker.failed.connect(self.on_auto_chapter_outline_failed)
-        worker.finished.connect(self._cleanup_auto_outline_worker)
-        worker.start()
-        return True
-
-    def _maybe_start_auto_chapter_summary(self):
-        if self.current_chapter_index < 0:
-            return False
-        if self.auto_summary_worker is not None and self.auto_summary_worker.isRunning():
-            return False
-        if not str(self.chapter_text.toPlainText() or "").strip():
-            return False
-        provider, model, error = self._current_novel_ai_selection()
-        if error:
-            return False
-        try:
-            context = self._chapter_ai_context("summary")
-        except Exception as e:
-            log_debug("小说章节自动摘要上下文生成失败", e)
-            return False
-        self._auto_summary_chapter_id = self._current_chapter_id()
-        self._auto_summary_started_summary = self.chapter_summary.toPlainText().strip()
-        self._auto_summary_started_key_facts = self.chapter_key_facts.toPlainText().strip()
-        self._auto_summary_started_linked = self.chapter_linked.text().strip()
-        worker = NovelWritingWorker(
-            provider.get("base_url", ""),
-            provider.get("api_key", ""),
-            model,
-            "summary",
-            context,
-            provider.get("proxy_url", ""),
-            self._provider_proxy_mode(provider),
-        )
-        self.auto_summary_worker = worker
-        self._connect_novel_worker_status(worker)
-        worker.result_ready.connect(self.on_auto_chapter_summary_ready)
-        worker.failed.connect(self.on_auto_chapter_summary_failed)
-        worker.finished.connect(self._cleanup_auto_summary_worker)
-        self.set_status_tip("正文已应用，正在自动提炼本章摘要/关键事实...")
-        worker.start()
-        return True
 
     def _current_chapter_id(self):
         chapters = self.current_project.get("chapters", [])
@@ -16783,231 +16519,6 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
         chap = chapters[self.current_chapter_index]
         return str(chap.get("id", "") or "") if isinstance(chap, dict) else ""
 
-    def on_auto_chapter_summary_ready(self, action, content):
-        if action != "summary":
-            return False
-        if self._current_chapter_id() != getattr(self, "_auto_summary_chapter_id", ""):
-            return False
-        current_summary = self.chapter_summary.toPlainText().strip()
-        current_key_facts = self.chapter_key_facts.toPlainText().strip()
-        current_linked = self.chapter_linked.text().strip()
-        summary_text, key_facts_text, linked_names = self._split_chapter_summary_bundle(content)
-        memory_update = _parse_long_form_memory_update(content)
-        if not summary_text and not key_facts_text and not linked_names and not memory_update:
-            self._log_novel_diagnostic(
-                "auto_chapter_summary_invalid_output",
-                level="error",
-                action="summary",
-                chapter_id=self._current_chapter_id(),
-                error="自动摘要结果为空或无法解析",
-                error_category="invalid_output",
-            )
-            return False
-        body_editor = getattr(self, "chapter_text", None)
-        if body_editor is not None:
-            body_text = body_editor.toPlainText().strip()
-        else:
-            chapters = self.current_project.get("chapters", []) if isinstance(self.current_project, dict) else []
-            chapter = chapters[self.current_chapter_index] if 0 <= self.current_chapter_index < len(chapters) else {}
-            body_text = str(chapter.get("text", "") or "").strip() if isinstance(chapter, dict) else ""
-        strict_sync = bool(getattr(self, "_chapter_ai_sequence_active", False))
-        validation_errors = (
-            _validate_long_form_memory_update(
-                self.current_project,
-                self.current_chapter_index,
-                memory_update,
-                final_text=body_text,
-                require_revision=True,
-                require_evidence=True,
-            )
-            if strict_sync else []
-        )
-        if validation_errors:
-            self._log_novel_diagnostic(
-                "auto_chapter_summary_validation_failed",
-                level="warning",
-                action="summary",
-                chapter_id=self._current_chapter_id(),
-                validation_errors=validation_errors,
-                repair_triggered=bool(getattr(self, "_chapter_ai_sequence_active", False)),
-            )
-            chapters = self.current_project.get("chapters", []) if isinstance(self.current_project, dict) else []
-            if 0 <= self.current_chapter_index < len(chapters) and isinstance(chapters[self.current_chapter_index], dict):
-                chapters[self.current_chapter_index]["memory_sync_status"] = "failed"
-                chapters[self.current_chapter_index]["memory_sync_error"] = "；".join(validation_errors)[:1000]
-            if getattr(self, "_chapter_ai_sequence_active", False):
-                self._start_memory_repair(
-                    body_text,
-                    {
-                        "outline": self.chapter_outline.toPlainText().strip(),
-                        "summary": summary_text,
-                        "key_facts": key_facts_text,
-                        "memory_update": memory_update,
-                    },
-                    validation_errors,
-                    mode="summary",
-                )
-                return None
-            return False
-        if strict_sync and (self.current_chapter_index + 1) % 10 == 0:
-            bundle = {
-                "outline": self.chapter_outline.toPlainText().strip(),
-                "summary": summary_text,
-                "key_facts": key_facts_text,
-                "memory_update": memory_update,
-            }
-            self._chapter_ai_memory_pending = {
-                "chapter_id": self._current_chapter_id(),
-                "final_text": body_text,
-                "bundle": bundle,
-                "errors": [],
-                "mode": "summary",
-                "reconciliation_started": False,
-            }
-            self._start_memory_reconciliation(body_text, bundle)
-            return None
-        summary_unchanged = current_summary == getattr(self, "_auto_summary_started_summary", "")
-        key_facts_unchanged = current_key_facts == getattr(self, "_auto_summary_started_key_facts", "")
-        linked_unchanged = current_linked == getattr(self, "_auto_summary_started_linked", "")
-        staged_project = deepcopy(self.current_project)
-        memory_changed = _apply_long_form_memory_update(
-            staged_project,
-            self.current_chapter_index,
-            memory_update,
-            final_text=body_text,
-        )
-        if memory_changed:
-            staged_chapters = staged_project.get("chapters", [])
-            staged_chapter = (
-                staged_chapters[self.current_chapter_index]
-                if 0 <= self.current_chapter_index < len(staged_chapters)
-                and isinstance(staged_chapters[self.current_chapter_index], dict)
-                else {}
-            )
-            if summary_text and summary_unchanged:
-                staged_chapter["summary"] = summary_text
-            if key_facts_text and key_facts_unchanged:
-                staged_chapter["key_facts"] = key_facts_text
-            self.current_project = staged_project
-            self._refresh_long_form_record_views()
-        changed = memory_changed
-        if summary_text and summary_unchanged:
-            self._set_text_without_signals(self.chapter_summary, summary_text)
-            changed = True
-        if key_facts_text and key_facts_unchanged:
-            self._set_text_without_signals(self.chapter_key_facts, key_facts_text)
-            changed = True
-        actual_ids_provided = isinstance(memory_update.get("current_chapter_character_ids"), list)
-        if memory_changed and actual_ids_provided:
-            chapters = self.current_project.get("chapters", [])
-            chapter = chapters[self.current_chapter_index] if 0 <= self.current_chapter_index < len(chapters) else {}
-            self._set_line_text_without_signals(
-                self.chapter_linked,
-                ", ".join(_normalize_name_list(chapter.get("linked_characters", []))),
-            )
-            changed = True
-        elif memory_changed and linked_names:
-            self._set_line_text_without_signals(self.chapter_linked, ", ".join(linked_names))
-            changed = True
-        elif linked_unchanged:
-            inferred_names = self._infer_current_chapter_linked_names(
-                extra_text="\n".join([summary_text, key_facts_text, "、".join(linked_names)])
-            )
-            merged_names = _normalize_name_list(
-                [
-                    name
-                    for name in (_normalize_name_list(current_linked) + linked_names + inferred_names)
-                    if not _is_generic_character_role_label(name)
-                ]
-            )
-            if merged_names:
-                self._set_line_text_without_signals(self.chapter_linked, ", ".join(merged_names))
-                changed = True
-        if not changed:
-            return False
-        if memory_changed and hasattr(self, "chapter_status"):
-            completed_index = self.chapter_status.findText("已完成")
-            if completed_index >= 0:
-                self.chapter_status.blockSignals(True)
-                try:
-                    self.chapter_status.setCurrentIndex(completed_index)
-                finally:
-                    self.chapter_status.blockSignals(False)
-        if memory_changed:
-            self._clear_current_chapter_ai_resume_required()
-        self._mark_chapter_dirty()
-        if memory_changed and isinstance(getattr(self, "current_project", None), dict):
-            self._mark_current_chapter_ai_result_analyzed()
-        skipped = []
-        if summary_text and not summary_unchanged:
-            skipped.append("摘要")
-        if key_facts_text and not key_facts_unchanged:
-            skipped.append("关键事实")
-        if linked_names and not linked_unchanged:
-            skipped.append("关联人物")
-        if skipped:
-            self.set_status_tip(f"已自动补齐未手动修改的摘要资料；已保留你手动修改的{'、'.join(skipped)}。")
-        else:
-            self.set_status_tip("已自动提炼本章摘要/关键事实，并更新本章关联人物。")
-        return memory_changed
-
-    def on_auto_chapter_summary_failed(self, err):
-        error = clean_error_text(err)
-        self._log_novel_diagnostic(
-            "auto_chapter_summary_failed",
-            level="error",
-            action="summary",
-            chapter_id=str(getattr(self, "_auto_summary_chapter_id", "") or ""),
-            error=error,
-            error_category=self._novel_diagnostic_error_category(error),
-        )
-        log_debug("小说章节自动摘要失败", error)
-
-    def _cleanup_auto_summary_worker(self):
-        worker = self.sender()
-        def cleanup():
-            try:
-                if self.auto_summary_worker is worker:
-                    self.auto_summary_worker = None
-                if worker is not None:
-                    worker.deleteLater()
-            except Exception as e:
-                log_debug("小说章节自动摘要线程清理失败", e)
-        QTimer.singleShot(0, cleanup)
-
-    def on_auto_chapter_outline_ready(self, action, content):
-        if action != "outline":
-            return
-        if self._current_chapter_id() != getattr(self, "_auto_outline_chapter_id", ""):
-            return
-        outline_text = str(content or "").strip()
-        if not outline_text:
-            return
-        current_outline = self.chapter_outline.toPlainText().strip()
-        outline_unchanged = current_outline == getattr(self, "_auto_outline_started_outline", "")
-        if not outline_unchanged:
-            self.set_status_tip("已保留你手动修改的章节提纲。")
-            return
-        self._set_text_without_signals(self.chapter_outline, outline_text)
-        inferred_names = self._infer_current_chapter_linked_names(extra_text=outline_text)
-        self._merge_chapter_linked_names(inferred_names)
-        self._mark_chapter_dirty()
-        self.set_status_tip("已自动补齐章节提纲。")
-
-    def on_auto_chapter_outline_failed(self, err):
-        log_debug("小说章节自动提纲失败", clean_error_text(err))
-
-    def _cleanup_auto_outline_worker(self):
-        worker = self.sender()
-        def cleanup():
-            try:
-                if self.auto_outline_worker is worker:
-                    self.auto_outline_worker = None
-                if worker is not None:
-                    worker.deleteLater()
-            except Exception as e:
-                log_debug("小说章节自动提纲线程清理失败", e)
-        QTimer.singleShot(0, cleanup)
 
     def _split_chapter_summary_bundle(self, text):
         text = str(text or "").strip()

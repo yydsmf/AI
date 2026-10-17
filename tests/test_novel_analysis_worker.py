@@ -674,13 +674,15 @@ class NovelAnalysisWorkerTests(unittest.TestCase):
 
                 prompt = worker._action_prompt()
 
-                self.assertIn("让人物的欲望、阻力、选择和后果自然形成推进", prompt)
+                self.assertIn("让人物的欲望、阻力、行动和后果自然形成推进", prompt)
                 self.assertIn("不设细节数量配额", prompt)
                 self.assertIn("结尾要来自冲突本身", prompt)
                 self.assertIn("不要为了贴字数截断", prompt)
                 self.assertNotIn("剧情推进要求", prompt)
                 self.assertNotIn("每两章至少要让主角", prompt)
                 self.assertIn("不得出现策划术语、抽象形容", prompt)
+                self.assertIn("不要把具体冲突写成抽象的权利、资格、归属、责任或关系宣言", prompt)
+                self.assertIn("正文尽量少用‘决定’‘选择’‘不代表’等抽象词", prompt)
                 self.assertIn("不要用‘第一步、第二步、第三步’或同类清单概括人物接下来要做什么", prompt)
                 self.assertIn("不设固定句数、动作频率或统一段落结构", prompt)
 

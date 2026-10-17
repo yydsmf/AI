@@ -2266,7 +2266,7 @@ class NovelLongFormContextTests(unittest.TestCase):
         self.assertIn("CF-0100=第0100项冲突", index_text)
         self.assertIn("TASK-0130=第0130项任务", index_text)
 
-    def test_250_chapter_memory_finalize_context_keeps_full_index_under_120k(self):
+    def test_250_chapter_memory_finalize_context_keeps_full_index_under_shared_limit(self):
         project = self._large_250_chapter_state_project()
         final_text = "赵明核对完最后一页卷宗，确认旧案仍有三条线索需要继续追查。" * 30
 
@@ -8197,7 +8197,7 @@ class NovelLongFormContextTests(unittest.TestCase):
         self.assertIn("四类身份数据库全空", sections["活跃连续性事实"])
         self.assertIn("衣物材质不属于已知现代生产体系", sections["活跃连续性事实"])
 
-    def test_outline_named_lore_requires_runtime_review_outcome(self):
+    def test_outline_named_lore_gets_runtime_review_outcome_before_validation(self):
         chapter = _new_chapter(0)
         chapter["outline"] = "本章涉及设定：生命方舟基金会；主线任务：揭示其技术路线。"
         project = self._project_with_current_chapter(chapter)
@@ -8215,8 +8215,8 @@ class NovelLongFormContextTests(unittest.TestCase):
             require_revision=True, require_evidence=True,
         )
 
-        self.assertTrue(any("提纲或长期事件设定运行态未复核" in error for error in errors))
-        self.assertTrue(any("lore_refs遗漏提纲或长期事件引用" in error for error in errors))
+        self.assertFalse(any("提纲或长期事件设定运行态未复核" in error for error in errors), errors)
+        self.assertFalse(any("lore_refs遗漏提纲或长期事件引用" in error for error in errors), errors)
 
         update["state_reconciliation"]["lore_refs"] = ["lore-ark"]
         update["state_reconciliation"]["record_runtime_review"] = {
@@ -8333,7 +8333,7 @@ class NovelLongFormContextTests(unittest.TestCase):
         self.assertIn("CF-0001", selection["conflict_ids"])
         self.assertIn("TASK-0001", selection["task_ids"])
 
-    def test_long_term_lore_event_requires_explicit_runtime_review_outcome(self):
+    def test_long_term_lore_event_gets_runtime_review_outcome_before_validation(self):
         chapter = _new_chapter(0)
         project = self._project_with_current_chapter(chapter)
         project["lore"] = [{"id": "lore-a", "name": "黑色石片", "type": "关键物"}]
@@ -8357,7 +8357,7 @@ class NovelLongFormContextTests(unittest.TestCase):
             require_revision=True, require_evidence=True,
         )
 
-        self.assertTrue(any("设定运行态未复核" in error for error in errors))
+        self.assertFalse(any("设定运行态未复核" in error for error in errors), errors)
         update["state_reconciliation"]["record_runtime_review"] = {
             "reviewed_lore_refs": ["lore-a"],
             "unchanged_lore_refs": ["lore-a"],

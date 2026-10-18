@@ -501,6 +501,64 @@ class NovelWritingStateTests(unittest.TestCase):
         self.assertEqual(len(events), 1)
         self.assertEqual(events[0][0], "chapter_ai_stale_callback_discarded")
 
+    def test_foreground_single_chapter_draft_starts_through_detached_runner(self):
+        tab = NovelWritingTab.__new__(NovelWritingTab)
+        tab._is_detached_auto_runner = False
+        tab.context_build_worker = None
+        tab.writing_worker = None
+        tab.chapter_plan_worker = None
+        tab._discard_partial_preview_for_auto_rewrite = lambda source="": None
+        started = []
+        tab._start_detached_single_chapter_ai = lambda: started.append(True)
+
+        tab.run_chapter_ai_action("draft")
+
+        self.assertEqual(started, [True])
+
+    def test_detached_single_runner_reselects_target_chapter_by_id(self):
+        chapters = [_new_chapter(0), _new_chapter(1)]
+        chapters[0]["id"] = "chapter-one"
+        chapters[1]["id"] = "chapter-two"
+        project = {"chapters": chapters, "meta": {"title": "测试小说"}}
+        created = []
+
+        class FakeRunner:
+            def __init__(self, config, parent, background_runner=False):
+                self.current_project = {}
+                self.current_chapter_index = -1
+                self._background_task_kind = ""
+                self.reloaded_index = -1
+                created.append(self)
+
+            def _load_project_data(self, data, source_path, defer_helpers=False):
+                self.current_project = deepcopy(data)
+
+            def _reload_chapter_list(self, index):
+                self.reloaded_index = index
+
+            def hide(self):
+                pass
+
+        tab = NovelWritingTab.__new__(NovelWritingTab)
+        tab.config = {}
+        tab._background_chapter_ai_runners = {}
+        tab._update_detached_auto_source_lock = lambda: None
+
+        with patch("gpt_desktop.novel_writing_tab.NovelWritingTab", FakeRunner), patch(
+            "gpt_desktop.novel_writing_tab.load_json_file", return_value=project
+        ):
+            runner, _data = tab._create_detached_chapter_runner(
+                "/tmp/project.json",
+                "single_chapter",
+                chapter_index=0,
+                chapter_id="chapter-two",
+            )
+
+        self.assertIs(runner, created[0])
+        self.assertEqual(runner.current_chapter_index, 1)
+        self.assertEqual(runner.reloaded_index, 1)
+        self.assertIs(tab._background_chapter_ai_runners[os.path.realpath("/tmp/project.json")], runner)
+
     def test_staged_memory_commit_does_not_mutate_live_project_before_apply(self):
         chapter = _new_chapter(0)
         chapter["text"] = "旧正文"

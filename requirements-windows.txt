@@ -6,3 +6,7 @@ pypdf>=5,<6
 edge-tts>=7.3.1,<8
 Pillow>=10,<11
 pyinstaller>=6.0,<7
+# Playwright itself is downloaded on first use so it does not enlarge the main
+# installer. Its small runtime dependencies remain available to the packaged app.
+greenlet>=3.0,<4
+pyee>=12,<14

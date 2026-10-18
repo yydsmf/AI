@@ -15,6 +15,11 @@ from html import escape
 from pathlib import Path
 
 from .core import APP_DIR
+from .optional_components import (
+    OptionalComponentError,
+    blender_asset_cache_path,
+    ensure_blender_assets,
+)
 
 
 DIRECTOR_PROJECT_ROOT = os.path.join(APP_DIR, "blender_director_projects")
@@ -37,7 +42,7 @@ def _default_shared_director_asset_library():
     return ""
 
 
-def _bundled_blender_resource_path(filename):
+def _local_blender_resource_path(filename):
     filename = str(filename or "").strip()
     package_path = Path(__file__).resolve().parent / "resources" / "blender" / filename
     candidates = [package_path]
@@ -50,6 +55,33 @@ def _bundled_blender_resource_path(filename):
     return package_path
 
 
+def _bundled_blender_resource_path(filename, progress_callback=None):
+    local_path = _local_blender_resource_path(filename)
+    if local_path.exists():
+        return local_path
+    cached_path = blender_asset_cache_path(filename)
+    if cached_path.exists():
+        return cached_path
+    try:
+        ensure_blender_assets(progress_callback=progress_callback)
+    except OptionalComponentError as exc:
+        raise RuntimeError(f"准备 Blender 导演台资源失败：{exc}") from exc
+    return blender_asset_cache_path(filename)
+
+
+def blender_director_resources_available():
+    return all(
+        _local_blender_resource_path(filename).exists()
+        or blender_asset_cache_path(filename).exists()
+        for filename in (
+            BUNDLED_MANNEQUIN_FILENAME,
+            BUNDLED_MANNEQUIN_ATTRIBUTION_FILENAME,
+            BUNDLED_FURNITURE_FILENAME,
+            BUNDLED_FURNITURE_ATTRIBUTION_FILENAME,
+        )
+    )
+
+
 def _file_sha256(path):
     digest = hashlib.sha256()
     with open(path, "rb") as source:
@@ -58,13 +90,13 @@ def _file_sha256(path):
     return digest.hexdigest()
 
 
-def _copy_bundled_mannequin_assets(character_assets_dir):
+def _copy_bundled_mannequin_assets(character_assets_dir, progress_callback=None):
     character_assets_dir = str(character_assets_dir or "").strip()
     if not character_assets_dir:
         raise RuntimeError("导演台人物资产目录不可用。")
     os.makedirs(character_assets_dir, exist_ok=True)
-    source_blend = _bundled_blender_resource_path(BUNDLED_MANNEQUIN_FILENAME)
-    source_attribution = _bundled_blender_resource_path(BUNDLED_MANNEQUIN_ATTRIBUTION_FILENAME)
+    source_blend = _bundled_blender_resource_path(BUNDLED_MANNEQUIN_FILENAME, progress_callback)
+    source_attribution = _bundled_blender_resource_path(BUNDLED_MANNEQUIN_ATTRIBUTION_FILENAME, progress_callback)
     if not source_blend.exists():
         raise RuntimeError("缺少内置骨骼人偶资源：" + str(source_blend))
     target_blend = Path(character_assets_dir) / BUNDLED_MANNEQUIN_FILENAME
@@ -82,13 +114,13 @@ def _copy_bundled_mannequin_assets(character_assets_dir):
     }
 
 
-def _copy_bundled_furniture_assets(prop_assets_dir):
+def _copy_bundled_furniture_assets(prop_assets_dir, progress_callback=None):
     prop_assets_dir = str(prop_assets_dir or "").strip()
     if not prop_assets_dir:
         raise RuntimeError("导演台道具资产目录不可用。")
     os.makedirs(prop_assets_dir, exist_ok=True)
-    source_blend = _bundled_blender_resource_path(BUNDLED_FURNITURE_FILENAME)
-    source_attribution = _bundled_blender_resource_path(BUNDLED_FURNITURE_ATTRIBUTION_FILENAME)
+    source_blend = _bundled_blender_resource_path(BUNDLED_FURNITURE_FILENAME, progress_callback)
+    source_attribution = _bundled_blender_resource_path(BUNDLED_FURNITURE_ATTRIBUTION_FILENAME, progress_callback)
     if not source_blend.exists():
         raise RuntimeError("缺少内置现代家具资源：" + str(source_blend))
     target_blend = Path(prop_assets_dir) / BUNDLED_FURNITURE_FILENAME
@@ -223,7 +255,7 @@ def _safe_project_id(project_id):
     return project_id[:64] or uuid.uuid4().hex
 
 
-def prepare_blender_director_project(project_id="", project_name="", plan=None):
+def prepare_blender_director_project(project_id="", project_name="", plan=None, component_progress=None):
     """Create/update the local Blender director project bridge files."""
     project_id = _safe_project_id(project_id)
     project_name = str(project_name or "").strip() or "AI短剧导演台"
@@ -248,8 +280,12 @@ def prepare_blender_director_project(project_id="", project_name="", plan=None):
     }
     for path in (project_dir, scripts_dir, renders_dir, assets_dir, shots_dir, presets_dir, set_packages_dir, *asset_dirs.values()):
         os.makedirs(path, exist_ok=True)
-    bundled_mannequin = _copy_bundled_mannequin_assets(asset_dirs["characters"])
-    bundled_furniture = _copy_bundled_furniture_assets(asset_dirs["props"])
+    bundled_mannequin = _copy_bundled_mannequin_assets(
+        asset_dirs["characters"], progress_callback=component_progress
+    )
+    bundled_furniture = _copy_bundled_furniture_assets(
+        asset_dirs["props"], progress_callback=component_progress
+    )
     default_asset_library_path = _default_shared_director_asset_library()
 
     blend_path = os.path.join(project_dir, f"{_safe_name(project_name)}.blend")

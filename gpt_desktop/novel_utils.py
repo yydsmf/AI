@@ -859,6 +859,77 @@ def _volume_two_framework_template_text():
     return VOLUME_TWO_FRAMEWORK_TEMPLATE
 
 
+def _normalize_fanqie_upload_state(value):
+    """Keep the platform upload checkpoint when projects are normalized."""
+    raw = value if isinstance(value, dict) else {}
+    completed = []
+    for item in raw.get("completed_chapter_ids", []):
+        item = str(item or "").strip()
+        if item and item not in completed:
+            completed.append(item)
+    failed = []
+    for item in raw.get("failed_chapters", []):
+        if not isinstance(item, dict):
+            continue
+        chapter_id = str(item.get("chapter_id", "") or "").strip()
+        if not chapter_id:
+            continue
+        try:
+            chapter_number = max(0, int(item.get("chapter_number", 0) or 0))
+        except (TypeError, ValueError):
+            chapter_number = 0
+        failed.append({
+            "chapter_id": chapter_id,
+            "chapter_number": chapter_number,
+            "title": str(item.get("title", "") or "").strip(),
+            "error": str(item.get("error", "") or "").strip(),
+            "updated_at": str(item.get("updated_at", "") or "").strip(),
+        })
+    try:
+        start_chapter = max(1, int(raw.get("start_chapter", 1) or 1))
+    except (TypeError, ValueError):
+        start_chapter = 1
+    try:
+        end_chapter = max(0, int(raw.get("end_chapter", 0) or 0))
+    except (TypeError, ValueError):
+        end_chapter = 0
+    try:
+        current_chapter = max(0, int(raw.get("current_chapter", 0) or 0))
+    except (TypeError, ValueError):
+        current_chapter = 0
+    try:
+        last_successful_chapter_number = max(
+            0, int(raw.get("last_successful_chapter_number", 0) or 0)
+        )
+    except (TypeError, ValueError):
+        last_successful_chapter_number = 0
+    mode = str(raw.get("mode", "draft") or "draft").strip().lower()
+    status = str(raw.get("status", "idle") or "idle").strip().lower()
+    if mode != "draft":
+        mode = "draft"
+    if status not in {"idle", "pending", "running", "paused", "failed", "stopped", "completed"}:
+        status = "idle"
+    return {
+        "version": 1,
+        "platform_work_id": str(raw.get("platform_work_id", "") or "").strip(),
+        "platform_work_title": str(raw.get("platform_work_title", "") or "").strip(),
+        "platform_work_url": str(raw.get("platform_work_url", "") or "").strip(),
+        "mode": mode,
+        "start_chapter": start_chapter,
+        "end_chapter": end_chapter,
+        "current_chapter": current_chapter,
+        "current_chapter_id": str(raw.get("current_chapter_id", "") or "").strip(),
+        "completed_chapter_ids": completed,
+        "failed_chapters": failed,
+        "last_successful_chapter_id": str(raw.get("last_successful_chapter_id", "") or "").strip(),
+        "last_successful_chapter_number": last_successful_chapter_number,
+        "status": status,
+        "error": str(raw.get("error", "") or "").strip(),
+        "pause_reason": str(raw.get("pause_reason", "") or "").strip(),
+        "updated_at": str(raw.get("updated_at", "") or "").strip(),
+    }
+
+
 def _default_project():
     return {
         "meta": {
@@ -880,6 +951,7 @@ def _default_project():
         "lore": [],
         "chapters": [],
         "foreshadow_items": [],
+        "fanqie_upload": _normalize_fanqie_upload_state({}),
         "timeline": "",
         "foreshadows": "",
         "summary": "",
@@ -1786,6 +1858,9 @@ def _normalize_project(data):
     )
     base["creative_intent_contract"] = _normalize_creative_intent_contract(
         data.get("creative_intent_contract", {})
+    )
+    base["fanqie_upload"] = _normalize_fanqie_upload_state(
+        data.get("fanqie_upload", {})
     )
     base["chapter_plan_foundation"] = _normalize_chapter_plan_foundation(
         data.get("chapter_plan_foundation", {})

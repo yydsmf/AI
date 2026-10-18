@@ -247,6 +247,11 @@ from .novel_creation_wizard import (
     normalize_creation_result,
     story_requires_explicit_power_levels,
 )
+from .fanqie_upload import (
+    FanqieBatchUploadDialog,
+    FanqieBatchUploadWorker,
+    build_fanqie_upload_task,
+)
 from .widgets import ProviderModelBar, WideComboBox, install_combo_arrow_overlay
 from .workers import EdgeTTSWorker, NovelAnalysisWorker, NovelCandidatePostprocessWorker, NovelChapterEventPlacementWorker, NovelChapterPlanWorker, NovelContextBuildWorker, NovelForeshadowReviewPostprocessWorker, NovelForeshadowReviewWorker, NovelFrameworkImportWorker, NovelVolumeFrameworkAlignmentWorker, NovelVolumeFrameworkWorker, NovelVolumeHandoffWorker, NovelVolumeIntentWorker, NovelWritingWorker
 
@@ -1761,6 +1766,9 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
         # runners keep in-flight chapter and automatic expansion requests
         # alive while the user opens another project.
         self._background_chapter_ai_runners = {}
+        self._fanqie_upload_workers = {}
+        self._fanqie_upload_dialog = None
+        self._fanqie_upload_locked_path = ""
         self._chapter_task_timer_owner = None
         self.chapter_plan_worker = None
         self._chapter_plan_request_kind = ""
@@ -1878,8 +1886,8 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
         self._status_last_run_elapsed = 0.0
         self._status_received_chars = 0
         self._status_project_path = ""
-        # The foreground tab mirrors status from the detached auto-expansion
-        # runner so it follows the same display path as single-chapter writing.
+        # The foreground tab mirrors status from detached chapter runners so
+        # single-chapter and automatic expansion share one display path.
         self._detached_auto_status_scope_id = ""
         self._detached_auto_status_scope_label = ""
         self._detached_auto_status_auto_progress = (0, 0)
@@ -3453,9 +3461,16 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
                 self.choose_chapter_export_mode,
                 "按现有章节和章节名直接导出，或按目标字数重新拆分并本地快速取名",
             )),
+            (2, 1, self._ghost_button(
+                "番茄批量上传",
+                self.open_fanqie_batch_upload,
+                "选择本地项目和番茄后台目标作品，按章节顺序保存为草稿；支持断点续传。",
+            )),
         )
         for row, column, btn in chapter_action_buttons:
             chapter_action_grid.addWidget(btn, row, column)
+            if btn.text() == "番茄批量上传":
+                self.fanqie_upload_btn = btn
             if btn.text() == "AI生成章节规划":
                 self.chapter_plan_btn = btn
                 self.chapter_ai_action_buttons.append(btn)
@@ -4049,6 +4064,8 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
         update_draft=True,
     ):
         if self._current_background_chapter_runner() is not None:
+            return self.current_project_path
+        if self._current_fanqie_upload_worker() is not None:
             return self.current_project_path
         perf_start = time.perf_counter()
         summary = self._novel_perf_summary()
@@ -5003,6 +5020,192 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
         elif selected == options[1]:
             self.split_current_chapter()
 
+    def _fanqie_upload_worker_for_path(self, path):
+        target = self._canonical_project_path(path)
+        workers = getattr(self, "_fanqie_upload_workers", {})
+        if not target or not isinstance(workers, dict):
+            return None
+        worker = workers.get(target)
+        if worker is not None and worker.isRunning():
+            return worker
+        return None
+
+    def _current_fanqie_upload_worker(self):
+        return self._fanqie_upload_worker_for_path(
+            getattr(self, "current_project_path", "")
+        )
+
+    def open_fanqie_batch_upload(self):
+        if getattr(self, "_is_detached_auto_runner", False):
+            return
+        active_upload = self._current_fanqie_upload_worker()
+        if active_upload is not None:
+            ret = QMessageBox.question(
+                self,
+                "中止番茄批量上传",
+                "当前项目的番茄批量上传正在运行，是否中止并保存当前断点？",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No,
+            )
+            if ret == QMessageBox.Yes:
+                active_upload.stop()
+                active_upload.requestInterruption()
+                self.set_status_tip("正在中止番茄批量上传，并保存当前断点...")
+            return
+        if self._current_background_chapter_runner() is not None:
+            QMessageBox.information(
+                self,
+                "番茄批量上传",
+                "当前项目正在后台扩写章节，请等扩写完成后再启动番茄批量上传。",
+            )
+            return
+        self._flush_current_editors()
+        if not self._has_saved_project_path():
+            if not self.save_current_project():
+                return
+        current_path = self._canonical_project_path(self.current_project_path)
+        if self._fanqie_upload_worker_for_path(current_path) is not None:
+            self.set_status_tip("当前项目已经有番茄批量上传任务在运行。")
+            return
+        summaries = list_project_summaries()
+        if current_path and not any(
+            self._canonical_project_path(item.get("path", "")) == current_path
+            for item in summaries
+            if isinstance(item, dict)
+        ):
+            summaries.append({
+                "path": self.current_project_path,
+                "title": self._project_title(),
+            })
+        dialog = FanqieBatchUploadDialog(summaries, self.current_project_path, self)
+        self._fanqie_upload_dialog = dialog
+        try:
+            if dialog.exec() != QDialog.Accepted:
+                return
+            config = dialog.config()
+        finally:
+            self._fanqie_upload_dialog = None
+            dialog.deleteLater()
+        if not config:
+            return
+        self._start_fanqie_upload(config)
+
+    def _start_fanqie_upload(self, config):
+        config = config if isinstance(config, dict) else {}
+        path = self._canonical_project_path(config.get("project_path", ""))
+        if not path:
+            QMessageBox.warning(self, "番茄批量上传", "没有选择有效的本地小说项目。")
+            return
+        if self._fanqie_upload_worker_for_path(path) is not None:
+            self.set_status_tip("这个项目已经有番茄批量上传任务在运行。")
+            return
+        if self._active_background_chapter_runner_for_path(path) is not None:
+            QMessageBox.information(
+                self,
+                "番茄批量上传",
+                "所选项目正在后台扩写章节，请等扩写完成后再启动番茄批量上传。",
+            )
+            return
+        try:
+            project = load_json_file(path, {})
+            task = build_fanqie_upload_task(path, config, project=project)
+        except Exception as exc:
+            QMessageBox.warning(self, "番茄批量上传", clean_error_text(exc))
+            return
+        worker = FanqieBatchUploadWorker(task, self)
+        workers = getattr(self, "_fanqie_upload_workers", {})
+        if not isinstance(workers, dict):
+            workers = {}
+            self._fanqie_upload_workers = workers
+        workers[path] = worker
+        worker.progress.connect(
+            lambda text, project_path=path: self._on_fanqie_upload_progress(project_path, text)
+        )
+        worker.state_changed.connect(
+            lambda state, project_path=path: self._on_fanqie_upload_state_changed(project_path, state)
+        )
+        worker.chapter_succeeded.connect(
+            lambda item, project_path=path: self._on_fanqie_upload_chapter_succeeded(project_path, item)
+        )
+        worker.completed.connect(
+            lambda state, project_path=path: self._on_fanqie_upload_completed(project_path, state)
+        )
+        worker.failed.connect(
+            lambda message, project_path=path: self._on_fanqie_upload_failed(project_path, message)
+        )
+        worker.finished.connect(
+            lambda project_path=path, task_worker=worker: self._cleanup_fanqie_upload_worker(
+                project_path, task_worker
+            )
+        )
+        if self._canonical_project_path(self.current_project_path) == path:
+            self._fanqie_upload_locked_path = path
+            self._set_detached_auto_source_read_only(True)
+            if hasattr(self, "fanqie_upload_btn"):
+                self.fanqie_upload_btn.setText("中止番茄上传")
+        title = str(config.get("platform_work_title", "") or "番茄目标作品").strip()
+        self.set_status_tip(f"已启动番茄批量上传：{title}，后台按顺序保存草稿。")
+        worker.start()
+
+    def _on_fanqie_upload_progress(self, project_path, message):
+        if self._canonical_project_path(self.current_project_path) != self._canonical_project_path(project_path):
+            return
+        self.set_status_tip(f"番茄批量上传：{str(message or '').strip()}")
+
+    def _on_fanqie_upload_state_changed(self, project_path, state):
+        if self._canonical_project_path(self.current_project_path) != self._canonical_project_path(project_path):
+            return
+        if isinstance(state, dict):
+            self.current_project["fanqie_upload"] = deepcopy(state)
+
+    def _on_fanqie_upload_chapter_succeeded(self, project_path, item):
+        if self._canonical_project_path(self.current_project_path) != self._canonical_project_path(project_path):
+            return
+        number = item.get("chapter_number", "") if isinstance(item, dict) else ""
+        self.set_status_tip(f"番茄批量上传：第{number}章草稿已保存。")
+
+    def _on_fanqie_upload_completed(self, project_path, state):
+        status = str(state.get("status", "") or "") if isinstance(state, dict) else ""
+        if self._canonical_project_path(self.current_project_path) != self._canonical_project_path(project_path):
+            return
+        if status == "completed":
+            self.set_status_tip("番茄批量上传完成，所有选定章节已保存为草稿。")
+        elif status == "paused":
+            self.set_status_tip("番茄批量上传已暂停：请完成登录后重新启动并继续断点。")
+        elif status == "stopped":
+            self.set_status_tip("番茄批量上传已中止，已保存当前断点。")
+
+    def _on_fanqie_upload_failed(self, project_path, message):
+        if self._canonical_project_path(self.current_project_path) == self._canonical_project_path(project_path):
+            self.set_status_tip(f"番茄批量上传失败：{clean_error_text(message)}")
+
+    def _cleanup_fanqie_upload_worker(self, project_path, worker):
+        workers = getattr(self, "_fanqie_upload_workers", {})
+        target = self._canonical_project_path(project_path)
+        if isinstance(workers, dict) and workers.get(target) is worker:
+            workers.pop(target, None)
+        if self._fanqie_upload_locked_path == target:
+            self._set_detached_auto_source_read_only(False)
+            self._fanqie_upload_locked_path = ""
+            if hasattr(self, "fanqie_upload_btn"):
+                self.fanqie_upload_btn.setText("番茄批量上传")
+        try:
+            worker.deleteLater()
+        except RuntimeError:
+            pass
+        self._notify_project_store_changed()
+
+    def stop_fanqie_upload_workers(self):
+        workers = getattr(self, "_fanqie_upload_workers", {})
+        if not isinstance(workers, dict):
+            return
+        for worker in list(workers.values()):
+            try:
+                worker.stop()
+                worker.requestInterruption()
+            except Exception as exc:
+                log_debug("退出时停止番茄批量上传失败", exc)
+
     def export_existing_chapters_docx(self):
         try:
             self._flush_current_editors()
@@ -5379,6 +5582,15 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
             return None
         return runners.get(source_path)
 
+    def _active_background_chapter_runner_for_path(self, path):
+        runner = self._background_chapter_runner_for_path(path)
+        if runner is None:
+            return None
+        try:
+            return runner if runner._status_has_active_work() else None
+        except Exception:
+            return runner
+
     def _attach_background_chapter_runner(self, path):
         """Restore a project's hidden chapter worker into the visible tab."""
         if getattr(self, "_is_detached_auto_runner", False):
@@ -5507,6 +5719,7 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
         self.chapter_plan_apply_btn.setEnabled(True)
 
     def stop_background_chapter_ai_runners(self):
+        self.stop_fanqie_upload_workers()
         runners = getattr(self, "_background_chapter_ai_runners", {})
         if not isinstance(runners, dict):
             return
@@ -5519,6 +5732,9 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
         runners.clear()
 
     def _load_project_data(self, data, path="", defer_helpers=False):
+        if getattr(self, "_fanqie_upload_locked_path", ""):
+            self._set_detached_auto_source_read_only(False)
+            self._fanqie_upload_locked_path = ""
         previous_project_path = self._canonical_project_path(
             getattr(self, "current_project_path", "")
         )
@@ -5579,6 +5795,11 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
             creation_meta_reconciled = self._reconcile_creation_wizard_meta()
             self.current_project_path = path
             loaded_project_path = self._canonical_project_path(path)
+            if self._fanqie_upload_worker_for_path(loaded_project_path) is not None:
+                self._fanqie_upload_locked_path = loaded_project_path
+                self._set_detached_auto_source_read_only(True)
+                if hasattr(self, "fanqie_upload_btn"):
+                    self.fanqie_upload_btn.setText("中止番茄上传")
             if previous_project_path and loaded_project_path and previous_project_path != loaded_project_path:
                 self._reset_status_for_project_switch(loaded_project_path)
             elif loaded_project_path and not str(getattr(self, "_status_project_path", "") or "").strip():
@@ -12307,6 +12528,39 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
         ):
             self._set_chapter_ai_actions_enabled(True)
 
+    def _start_detached_single_chapter_ai(self):
+        self._flush_current_editors()
+        if not self._has_saved_project_path():
+            if not self.save_current_project():
+                return
+        source_path = self._canonical_project_path(self.current_project_path)
+        if not source_path or source_path == self._canonical_project_path(NOVEL_DRAFT_FILE):
+            QMessageBox.warning(self, "单章扩写失败", "请先把小说保存为项目，再启动后台单章扩写。")
+            return
+        runner = self._background_chapter_runner_for_path(source_path)
+        if runner is not None:
+            title = str((runner.current_project.get("meta", {}) or {}).get("title", "") or "当前项目")
+            task_label = (
+                "后台自动扩写"
+                if str(getattr(runner, "_background_task_kind", "") or "") == "auto_expand"
+                else "后台单章扩写"
+            )
+            self.set_status_tip(f"《{title}》仍在{task_label}，可继续操作其他章节。")
+            return
+        chapter_index = int(getattr(self, "current_chapter_index", -1) or -1)
+        chapter_id = self._current_chapter_id()
+        if chapter_index < 0 or not chapter_id:
+            self.set_status_tip("当前没有可扩写的章节。")
+            return
+        self._set_chapter_ai_actions_enabled(False)
+        self.set_status_tip("正在保存项目并启动后台单章扩写...")
+        QTimer.singleShot(
+            0,
+            lambda p=source_path, i=chapter_index, c=chapter_id: self._launch_detached_single_chapter_ai(
+                p, i, c
+            ),
+        )
+
     def start_auto_expand_all_chapters(self):
         if not hasattr(self, "_is_detached_auto_runner") or self._is_detached_auto_runner:
             self._start_auto_expand_all_local()
@@ -12335,6 +12589,92 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
         self.set_status_tip("正在保存项目并启动后台自动扩写...")
         QTimer.singleShot(0, lambda p=source_path: self._launch_detached_auto_expand(p))
 
+    def _create_detached_chapter_runner(
+        self, source_path, task_kind, chapter_index=None, chapter_id=""
+    ):
+        source_path = self._canonical_project_path(source_path)
+        data = load_json_file(source_path, None)
+        if not isinstance(data, dict):
+            raise RuntimeError("无法读取要处理的项目。")
+        runner = NovelWritingTab(deepcopy(self.config), None, background_runner=True)
+        runner._background_task_kind = str(task_kind or "chapter_ai")
+        runner._save_draft_snapshot = lambda: None
+        runner._notify_project_store_changed = lambda: None
+        runner._load_project_data(data, source_path, defer_helpers=True)
+        if chapter_index is not None or chapter_id:
+            chapters = runner.current_project.get("chapters", [])
+            target_index = -1
+            if chapter_id:
+                chapter_id = str(chapter_id or "")
+                target_index = next(
+                    (
+                        index
+                        for index, chapter in enumerate(chapters)
+                        if isinstance(chapter, dict)
+                        and str(chapter.get("id", "") or "") == chapter_id
+                    ),
+                    -1,
+                )
+            if target_index < 0 and chapter_index is not None:
+                try:
+                    candidate_index = int(chapter_index)
+                except (TypeError, ValueError):
+                    candidate_index = -1
+                if 0 <= candidate_index < len(chapters):
+                    target_index = candidate_index
+            if target_index < 0:
+                raise RuntimeError("目标章节不存在，未启动后台单章扩写。")
+            runner.current_chapter_index = target_index
+            runner._reload_chapter_list(target_index)
+        runner.hide()
+        runners = getattr(self, "_background_chapter_ai_runners", None)
+        if not isinstance(runners, dict):
+            runners = {}
+            self._background_chapter_ai_runners = runners
+        if source_path in runners:
+            raise RuntimeError("当前项目已经有后台章节任务。")
+        runners[source_path] = runner
+        self._update_detached_auto_source_lock()
+        return runner, data
+
+    def _launch_detached_single_chapter_ai(self, source_path, chapter_index, chapter_id):
+        runner = None
+        source_path = self._canonical_project_path(source_path)
+        try:
+            saved_path = self._save_current_work(
+                "启动后台单章扩写", refresh_project_list=False
+            )
+            if not saved_path:
+                raise RuntimeError("项目保存失败，未启动后台单章扩写。")
+            runner, _data = self._create_detached_chapter_runner(
+                source_path,
+                "single_chapter",
+                chapter_index=chapter_index,
+                chapter_id=chapter_id,
+            )
+            runner.run_chapter_ai_action("draft")
+            self._update_detached_auto_source_lock()
+            self._sync_detached_auto_status(runner)
+        except Exception as exc:
+            runners = getattr(self, "_background_chapter_ai_runners", {})
+            if isinstance(runners, dict) and runner is not None and runners.get(source_path) is runner:
+                runners.pop(source_path, None)
+            if runner is not None:
+                try:
+                    runner.deleteLater()
+                except Exception:
+                    pass
+            self._update_detached_auto_source_lock()
+            self._set_chapter_ai_actions_enabled(True)
+            self._log_novel_diagnostic(
+                "detached_single_chapter_start_failed",
+                level="error",
+                project_path=source_path,
+                chapter_id=str(chapter_id or ""),
+                **self._novel_exception_details(exc),
+            )
+            QMessageBox.warning(self, "单章扩写失败", str(exc))
+
     def _launch_detached_auto_expand(self, source_path):
         runner = None
         source_path = self._canonical_project_path(source_path)
@@ -12342,26 +12682,13 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
             saved_path = self._save_current_work("启动后台自动扩写", refresh_project_list=False)
             if not saved_path:
                 raise RuntimeError("项目保存失败，未启动后台任务。")
-            data = load_json_file(source_path, None)
-            if not isinstance(data, dict):
-                raise RuntimeError("无法读取要自动扩写的项目。")
-            runner = NovelWritingTab(deepcopy(self.config), None, background_runner=True)
-            runner._background_task_kind = "auto_expand"
-            runner._save_draft_snapshot = lambda: None
-            runner._notify_project_store_changed = lambda: None
-            runner._load_project_data(data, source_path, defer_helpers=True)
-            runner.hide()
-            runners = getattr(self, "_background_chapter_ai_runners", None)
-            if not isinstance(runners, dict):
-                runners = {}
-                self._background_chapter_ai_runners = runners
-            if source_path in runners:
-                raise RuntimeError("当前项目已经有后台章节任务。")
-            runners[source_path] = runner
-            self._update_detached_auto_source_lock()
+            runner, data = self._create_detached_chapter_runner(
+                source_path, "auto_expand"
+            )
             runner._start_auto_expand_all_local()
             self._update_detached_auto_source_lock()
             title = str((data.get("meta", {}) or {}).get("title", "") or os.path.basename(source_path))
+            runners = getattr(self, "_background_chapter_ai_runners", {})
             active_count = sum(
                 1
                 for item in runners.values()
@@ -12403,7 +12730,12 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
             if not current_status or not any(
                 marker in current_status for marker in ("失败", "停止", "中止")
             ):
-                self.set_status_tip(f"后台自动扩写已停止：{error_text[:120]}")
+                task_label = (
+                    "后台自动扩写"
+                    if str(getattr(self, "_background_task_kind", "") or "") != "single_chapter"
+                    else "后台单章扩写"
+                )
+                self.set_status_tip(f"{task_label}已停止：{error_text[:120]}")
             return
         QMessageBox.warning(self, "AI 写作失败", error_text)
 
@@ -12540,6 +12872,8 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
                 )
                 if (widget := getattr(self, name, None)) is not None
             }
+            if getattr(self, "fanqie_upload_btn", None) is not None:
+                read_aloud_controls.add(self.fanqie_upload_btn)
             for widget in child_widgets:
                 if widget is getattr(self, "chapter_ai_stop_btn", None):
                     continue
@@ -12586,7 +12920,12 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
                 self.chapter_ai_stop_btn.setVisible(False)
         if hasattr(self, "auto_expand_all_btn"):
             self.auto_expand_all_btn.setEnabled(not locked)
-            self.auto_expand_all_btn.setText("后台自动扩写中" if locked else "自动扩写全部")
+            if locked:
+                task_kind = str(getattr(detached_runner, "_background_task_kind", "") or "")
+                task_label = "后台单章扩写中" if task_kind == "single_chapter" else "后台自动扩写中"
+                self.auto_expand_all_btn.setText(task_label)
+            else:
+                self.auto_expand_all_btn.setText("自动扩写全部")
         if locked and hasattr(self, "project_hint"):
             self.project_hint.setText("当前项目正在后台处理章节，可查看最新已保存内容；任务完成后自动恢复编辑。")
         elif hasattr(self, "project_hint"):
@@ -15675,6 +16014,9 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
             return
         if action == "draft":
             self._discard_partial_preview_for_auto_rewrite(source="single_chapter")
+            if hasattr(self, "_is_detached_auto_runner") and not self._is_detached_auto_runner:
+                self._start_detached_single_chapter_ai()
+                return
             if hasattr(self, "context_build_worker"):
                 self._set_chapter_ai_actions_enabled(False)
                 self.set_status_tip("正在后台准备本章资料...")
@@ -17168,6 +17510,8 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
     def _autosave_draft(self):
         if self._loading:
             return
+        if self._current_fanqie_upload_worker() is not None:
+            return
         if not self._dirty and self._draft_saved_once:
             return
         if getattr(self, "_autosave_in_progress", False):
@@ -17223,6 +17567,8 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
     def _save_current_project_snapshot_if_named(self):
         if self._current_background_chapter_runner() is not None:
             return
+        if self._current_fanqie_upload_worker() is not None:
+            return
         path = str(self.current_project_path or "").strip()
         if not path or path == NOVEL_DRAFT_FILE:
             return
@@ -17259,6 +17605,9 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
     def save_current_project(self):
         if self._current_background_chapter_runner() is not None:
             self.set_status_tip("当前项目正在后台处理章节，任务结束前不允许从界面覆盖保存。")
+            return True
+        if self._current_fanqie_upload_worker() is not None:
+            self.set_status_tip("当前项目正在番茄批量上传，任务结束前不允许从界面覆盖保存。")
             return True
         self._flush_current_editors()
         self._sync_candidate_analysis_state()

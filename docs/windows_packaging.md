@@ -132,11 +132,21 @@ C:\Program Files\Python312\python.exe
 
 ## 运行库和系统依赖
 
-当前程序是 PySide6/Qt 桌面程序，PyInstaller 会把 Python、PySide6、Qt、requests、python-docx、pypdf、edge-tts、Pillow 等 Python 依赖打进 `GPTLocalToolbox.exe`。
+当前程序是 PySide6/Qt 桌面程序，PyInstaller 会把 Python、PySide6、Qt、requests、python-docx、pypdf、edge-tts、Pillow 和番茄批量上传需要的小型运行依赖打进 `GPTLocalToolbox.exe`。Playwright 运行库和 Blender 导演台资源改为首次使用时按需下载，不会把这两类大文件放进主安装包。番茄上传会调用电脑上已经安装的 Edge 或 Chrome，不会把浏览器本体打进安装包。
 
 在线更新用的 `GPTToolboxUpdater.exe` 也会单独打包，并显式携带 Python 启动所需的 VC++ 运行库 DLL。这样它被复制到系统临时目录后，仍能在缺少 VC++ 运行库的 Windows 机器上启动。
 
-当前代码没有发现必须单独安装的 Node.js、.NET Runtime 或 WebView2 Runtime 依赖。
+当前代码没有发现必须单独安装的 Node.js、.NET Runtime 或 WebView2 Runtime 依赖。番茄批量上传要求电脑上有可用的 Edge 或 Chrome 浏览器。
+
+如果直接从源码运行，程序会在首次点击“番茄批量上传”时自动从清华 PyPI 源下载 Playwright wheel，并缓存到应用数据目录。也可以预先在启动程序使用的同一个 Python 环境中安装 `playwright` Python 包：
+
+```bat
+python -m pip install playwright
+```
+
+正式安装包也会在首次使用“番茄批量上传”时自动下载 Playwright Python 运行库，不需要用户安装 Python，也不需要执行 `playwright install`。程序会调用电脑上已经安装的 Edge、Chrome 或 Chromium；如果这些浏览器都不存在，番茄批量上传会提示先安装浏览器。下载完成后会复用本地缓存。
+
+首次打开 Blender 导演台时，如果安装包中没有缓存资源，程序会自动下载独立的 Blender 导演台资源包并缓存到应用数据目录。发布流程会把资源包作为单独的 Release 附件上传；程序默认优先尝试国内 GitHub 加速地址，再回退到 Release 直连地址。部署到其他国内对象存储时，可以用 `GPT_TOOLBOX_BLENDER_ASSET_URL` 指定资源包地址，用逗号分隔多个备用地址。
 
 少数 Windows 电脑可能缺少 Microsoft Visual C++ Redistributable。安装脚本已经预留了检测和自动安装逻辑：
 

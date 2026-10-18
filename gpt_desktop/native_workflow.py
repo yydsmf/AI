@@ -9,6 +9,7 @@ import uuid
 from PySide6.QtCore import QLineF, QPointF, QRectF, QSize, Qt, QTimer, Signal
 from PySide6.QtGui import QColor, QIcon, QPainter, QPainterPath, QPen, QPixmap, QTransform
 from PySide6.QtWidgets import (
+    QApplication,
     QCheckBox,
     QComboBox,
     QDialog,
@@ -32,6 +33,7 @@ from PySide6.QtWidgets import (
     QListWidgetItem,
     QMenu,
     QMessageBox,
+    QProgressDialog,
     QPushButton,
     QScrollArea,
     QSlider,
@@ -63,6 +65,7 @@ from .widgets import WideComboBox, show_image_preview
 from .blender_director_project import (
     build_blender_director_action_matches,
     build_blender_director_storyboard,
+    blender_director_resources_available,
     launch_blender_director_project,
     load_blender_director_metadata,
     prepare_blender_director_project,
@@ -4211,12 +4214,40 @@ class WorkflowScene(QGraphicsScene):
             node.data["director_project_id"] = project_id
         project_text = str(plan.get("project_prompt") or "").strip()
         project_name = project_text.splitlines()[0].strip() if project_text else "AI短剧导演台"
+        progress_dialog = None
+        if not blender_director_resources_available():
+            parent = self.views()[0].window() if self.views() else None
+            progress_dialog = QProgressDialog("正在准备 Blender 导演台资源…", "", 0, 0, parent)
+            progress_dialog.setWindowTitle("准备 Blender 资源")
+            progress_dialog.setWindowModality(Qt.WindowModal)
+            progress_dialog.setAutoClose(False)
+            progress_dialog.setMinimumDuration(0)
+            progress_dialog.show()
+            QApplication.processEvents()
+
+        def component_progress(message, done=0, total=0):
+            if progress_dialog is None:
+                return
+            progress_dialog.setLabelText(str(message))
+            if total:
+                progress_dialog.setRange(0, max(1, int(total)))
+                progress_dialog.setValue(min(int(done), int(total)))
+            QApplication.processEvents()
+
         try:
-            project = prepare_blender_director_project(project_id, project_name, plan)
+            project = prepare_blender_director_project(
+                project_id,
+                project_name,
+                plan,
+                component_progress=component_progress,
+            )
             launch_blender_director_project(blender_path, project)
         except Exception as e:
             self.notify(f"打开 Blender 导演台失败：{e}")
             return
+        finally:
+            if progress_dialog is not None:
+                progress_dialog.close()
         node.data["director_project"] = project
         self._refresh_blender_director_project_summary(node, load_blender_director_metadata(project))
         node.data["value"] = project_text or node.data.get("value", "")

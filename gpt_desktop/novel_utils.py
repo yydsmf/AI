@@ -904,9 +904,41 @@ def _normalize_fanqie_upload_state(value):
     except (TypeError, ValueError):
         last_successful_chapter_number = 0
     mode = str(raw.get("mode", "draft") or "draft").strip().lower()
-    status = str(raw.get("status", "idle") or "idle").strip().lower()
-    if mode != "draft":
+    mode_aliases = {
+        "save_draft": "draft",
+        "publish": "direct_publish",
+        "direct": "direct_publish",
+        "schedule": "scheduled_publish",
+        "scheduled": "scheduled_publish",
+    }
+    mode = mode_aliases.get(mode, mode)
+    if mode not in {"draft", "direct_publish", "scheduled_publish"}:
         mode = "draft"
+    work_type = str(raw.get("work_type", "unknown") or "unknown").strip().lower()
+    if work_type not in {"unknown", "serial", "completed"}:
+        work_type = "unknown"
+    schedule_entries = []
+    raw_entries = raw.get("schedule_entries", [])
+    if isinstance(raw_entries, list):
+        for item in raw_entries:
+            if not isinstance(item, dict):
+                continue
+            try:
+                chapter_number = max(0, int(item.get("chapter_number", 0) or 0))
+            except (TypeError, ValueError):
+                chapter_number = 0
+            chapter_id = str(item.get("chapter_id", "") or "").strip()
+            publish_date = str(item.get("publish_date", "") or "").strip()
+            publish_time = str(item.get("publish_time", "") or "").strip()
+            if not chapter_id and chapter_number <= 0:
+                continue
+            schedule_entries.append({
+                "chapter_id": chapter_id,
+                "chapter_number": chapter_number,
+                "publish_date": publish_date,
+                "publish_time": publish_time,
+            })
+    status = str(raw.get("status", "idle") or "idle").strip().lower()
     if status not in {"idle", "pending", "running", "paused", "failed", "stopped", "completed"}:
         status = "idle"
     return {
@@ -915,16 +947,26 @@ def _normalize_fanqie_upload_state(value):
         "platform_work_title": str(raw.get("platform_work_title", "") or "").strip(),
         "platform_work_url": str(raw.get("platform_work_url", "") or "").strip(),
         "mode": mode,
+        "work_type": work_type,
+        "publish_use_ai": bool(raw.get("publish_use_ai", False)),
+        "schedule_start_date": str(raw.get("schedule_start_date", "") or "").strip(),
+        "schedule_start_time": str(raw.get("schedule_start_time", "") or "").strip(),
+        "schedule_entries": schedule_entries,
+        "headless": bool(raw.get("headless", True)),
+        "resume": bool(raw.get("resume", True)),
         "start_chapter": start_chapter,
         "end_chapter": end_chapter,
         "current_chapter": current_chapter,
         "current_chapter_id": str(raw.get("current_chapter_id", "") or "").strip(),
+        "current_publish_time": str(raw.get("current_publish_time", "") or "").strip(),
         "completed_chapter_ids": completed,
         "failed_chapters": failed,
         "last_successful_chapter_id": str(raw.get("last_successful_chapter_id", "") or "").strip(),
         "last_successful_chapter_number": last_successful_chapter_number,
         "status": status,
         "error": str(raw.get("error", "") or "").strip(),
+        "error_kind": str(raw.get("error_kind", "") or "").strip(),
+        "daily_limit_scope": str(raw.get("daily_limit_scope", "") or "").strip(),
         "pause_reason": str(raw.get("pause_reason", "") or "").strip(),
         "updated_at": str(raw.get("updated_at", "") or "").strip(),
     }

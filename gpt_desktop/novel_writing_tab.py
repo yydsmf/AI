@@ -3464,7 +3464,7 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
             (2, 1, self._ghost_button(
                 "番茄批量上传",
                 self.open_fanqie_batch_upload,
-                "选择本地项目和番茄后台目标作品，按章节顺序保存为草稿；支持断点续传。",
+                "选择本地项目和番茄后台目标作品，可上传草稿、直接发布或定时发布；支持断点续传。",
             )),
         )
         for row, column, btn in chapter_action_buttons:
@@ -5067,17 +5067,10 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
         if self._fanqie_upload_worker_for_path(current_path) is not None:
             self.set_status_tip("当前项目已经有番茄批量上传任务在运行。")
             return
-        summaries = list_project_summaries()
-        if current_path and not any(
-            self._canonical_project_path(item.get("path", "")) == current_path
-            for item in summaries
-            if isinstance(item, dict)
-        ):
-            summaries.append({
-                "path": self.current_project_path,
-                "title": self._project_title(),
-            })
-        dialog = FanqieBatchUploadDialog(summaries, self.current_project_path, self)
+        dialog = FanqieBatchUploadDialog(
+            current_project_path=self.current_project_path,
+            parent=self,
+        )
         self._fanqie_upload_dialog = dialog
         try:
             if dialog.exec() != QDialog.Accepted:
@@ -5144,7 +5137,12 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
             if hasattr(self, "fanqie_upload_btn"):
                 self.fanqie_upload_btn.setText("中止番茄上传")
         title = str(config.get("platform_work_title", "") or "番茄目标作品").strip()
-        self.set_status_tip(f"已启动番茄批量上传：{title}，后台按顺序保存草稿。")
+        mode_label = {
+            "draft": "保存草稿",
+            "direct_publish": "直接发布",
+            "scheduled_publish": "定时发布",
+        }.get(str(config.get("mode", "draft") or "draft"), "上传")
+        self.set_status_tip(f"已启动番茄批量上传：{title}，后台按顺序{mode_label}。")
         worker.start()
 
     def _on_fanqie_upload_progress(self, project_path, message):
@@ -5162,22 +5160,57 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
         if self._canonical_project_path(self.current_project_path) != self._canonical_project_path(project_path):
             return
         number = item.get("chapter_number", "") if isinstance(item, dict) else ""
-        self.set_status_tip(f"番茄批量上传：第{number}章草稿已保存。")
+        mode = item.get("mode", "draft") if isinstance(item, dict) else "draft"
+        action = {
+            "draft": "草稿已保存",
+            "direct_publish": "已直接发布",
+            "scheduled_publish": "已设置定时发布",
+        }.get(mode, "已完成")
+        publish_time = item.get("publish_time", "") if isinstance(item, dict) else ""
+        suffix = f"（{publish_time}）" if publish_time and mode == "scheduled_publish" else ""
+        self.set_status_tip(f"番茄批量上传：第{number}章{action}{suffix}。")
 
     def _on_fanqie_upload_completed(self, project_path, state):
         status = str(state.get("status", "") or "") if isinstance(state, dict) else ""
         if self._canonical_project_path(self.current_project_path) != self._canonical_project_path(project_path):
             return
         if status == "completed":
-            self.set_status_tip("番茄批量上传完成，所有选定章节已保存为草稿。")
+            mode = str(state.get("mode", "draft") or "draft") if isinstance(state, dict) else "draft"
+            action = {
+                "draft": "保存为草稿",
+                "direct_publish": "直接发布",
+                "scheduled_publish": "设置定时发布",
+            }.get(mode, "上传")
+            self.set_status_tip(f"番茄批量上传完成，所有选定章节已{action}。")
         elif status == "paused":
             self.set_status_tip("番茄批量上传已暂停：请完成登录后重新启动并继续断点。")
         elif status == "stopped":
             self.set_status_tip("番茄批量上传已中止，已保存当前断点。")
+        elif status == "failed" and isinstance(state, dict):
+            if state.get("error_kind") == "daily_limit":
+                self.set_status_tip(
+                    "番茄批量上传已停止：平台返回每日更新字数上限，当前章节未记为成功。"
+                )
+            elif state.get("error_kind") == "publish_rejected":
+                self.set_status_tip(
+                    "番茄批量上传已停止：平台拒绝了本章发布，当前章节未记为成功。"
+                )
 
     def _on_fanqie_upload_failed(self, project_path, message):
         if self._canonical_project_path(self.current_project_path) == self._canonical_project_path(project_path):
-            self.set_status_tip(f"番茄批量上传失败：{clean_error_text(message)}")
+            state = self.current_project.get("fanqie_upload", {}) if isinstance(self.current_project, dict) else {}
+            if isinstance(state, dict) and state.get("error_kind") == "daily_limit":
+                self.set_status_tip(
+                    "番茄批量上传已停止：番茄后台提示每日更新字数上限；"
+                    f"当前章节未记为成功。{clean_error_text(message)}"
+                )
+            elif isinstance(state, dict) and state.get("error_kind") == "publish_rejected":
+                self.set_status_tip(
+                    "番茄批量上传已停止：平台拒绝了当前章节发布；"
+                    f"当前章节未记为成功。{clean_error_text(message)}"
+                )
+            else:
+                self.set_status_tip(f"番茄批量上传失败：{clean_error_text(message)}")
 
     def _cleanup_fanqie_upload_worker(self, project_path, worker):
         workers = getattr(self, "_fanqie_upload_workers", {})

@@ -8,8 +8,10 @@ import os
 import json
 import re
 import signal
+import shutil
 import threading
 import time
+import uuid
 from copy import deepcopy
 from datetime import datetime
 from html import unescape
@@ -25,23 +27,26 @@ from PySide6.QtWidgets import (
     QDateEdit,
     QFormLayout,
     QHBoxLayout,
+    QInputDialog,
     QLabel,
     QLineEdit,
     QMessageBox,
     QPushButton,
     QRadioButton,
+    QSizePolicy,
     QSpinBox,
     QTimeEdit,
     QVBoxLayout,
 )
 
-from .core import APP_DIR, clean_error_text, now_str
+from .core import APP_DIR, _atomic_write_json, clean_error_text, now_str
 from .novel_storage import load_json_file, save_project_file
 from .novel_utils import (
     _body_display_len,
     _normalize_fanqie_upload_state as normalize_fanqie_upload_state,
 )
 from .optional_components import OptionalComponentError, load_playwright_sync_api
+from .widgets import install_arrow_overlay
 
 
 FANQIE_WRITER_ZONE_URL = "https://fanqienovel.com/writer/zone/"
@@ -49,6 +54,9 @@ FANQIE_AUTHOR_HOME_URL = "https://fanqienovel.com/main/writer/?enter_from=author
 FANQIE_BOOK_MANAGE_URL = "https://fanqienovel.com/main/writer/book-manage"
 FANQIE_PUBLISH_URL_TEMPLATE = "https://fanqienovel.com/main/writer/{work_id}/publish/"
 FANQIE_PROFILE_DIR = os.path.join(APP_DIR, "fanqie_browser_profile")
+FANQIE_ACCOUNTS_FILE = os.path.join(APP_DIR, "fanqie_accounts.json")
+FANQIE_BROWSER_PROFILES_DIR = os.path.join(APP_DIR, "fanqie_browser_profiles")
+FANQIE_LEGACY_ACCOUNT_ID = "legacy"
 FANQIE_UPLOAD_SCHEMA_VERSION = 1
 FANQIE_UPLOAD_MODES = {"draft", "direct_publish", "scheduled_publish"}
 FANQIE_WORK_TYPES = {"unknown", "serial", "completed"}
@@ -68,6 +76,134 @@ _PROJECT_WRITE_LOCK = threading.RLock()
 # the same time.  Keep the login session shared while serializing browser
 # access across projects and the work-list reader.
 _BROWSER_PROFILE_LOCK = threading.Lock()
+_MANUAL_BROWSER_WORKERS = {}
+_MANUAL_BROWSER_WORKERS_LOCK = threading.RLock()
+
+
+def stop_fanqie_manual_browser_workers():
+    """Stop visible manual account browsers during application shutdown."""
+    with _MANUAL_BROWSER_WORKERS_LOCK:
+        workers = list(_MANUAL_BROWSER_WORKERS.values())
+    for worker in workers:
+        try:
+            worker.stop()
+            worker.requestInterruption()
+        except Exception:
+            pass
+    for worker in workers:
+        try:
+            worker.wait(3000)
+        except Exception:
+            pass
+
+
+def _fanqie_account_profile_dir(account_id):
+    account_id = re.sub(r"[^A-Za-z0-9_-]+", "", str(account_id or "").strip())
+    account_id = account_id or "account"
+    return os.path.join(FANQIE_BROWSER_PROFILES_DIR, account_id)
+
+
+def _normalize_fanqie_account(value, fallback_id=""):
+    raw = value if isinstance(value, dict) else {}
+    account_id = str(raw.get("id", fallback_id) or fallback_id).strip()
+    if not account_id:
+        return None
+    profile_dir = str(raw.get("profile_dir", "") or "").strip()
+    if not profile_dir:
+        profile_dir = (
+            FANQIE_PROFILE_DIR
+            if account_id == FANQIE_LEGACY_ACCOUNT_ID
+            else _fanqie_account_profile_dir(account_id)
+        )
+    return {
+        "id": account_id,
+        "label": str(raw.get("label", "") or "").strip() or "番茄账号",
+        "profile_dir": os.path.abspath(os.path.expanduser(profile_dir)),
+        "display_name": str(raw.get("display_name", "") or "").strip(),
+        "created_at": str(raw.get("created_at", "") or "").strip(),
+        "updated_at": str(raw.get("updated_at", "") or "").strip(),
+    }
+
+
+def normalize_fanqie_accounts(value):
+    """Normalize the application-level account registry."""
+    raw = value if isinstance(value, dict) else {}
+    accounts = []
+    seen = set()
+    raw_accounts = raw.get("accounts", [])
+    if isinstance(raw_accounts, list):
+        for item in raw_accounts:
+            account = _normalize_fanqie_account(item)
+            if account is None or account["id"] in seen:
+                continue
+            seen.add(account["id"])
+            accounts.append(account)
+    if not accounts:
+        accounts = [_normalize_fanqie_account({
+            "id": FANQIE_LEGACY_ACCOUNT_ID,
+            "label": "原有番茄账号",
+            "profile_dir": FANQIE_PROFILE_DIR,
+        })]
+        seen = {FANQIE_LEGACY_ACCOUNT_ID}
+    selected = str(raw.get("selected_account_id", "") or "").strip()
+    if selected not in seen:
+        selected = accounts[0]["id"]
+    return {"version": 1, "accounts": accounts, "selected_account_id": selected}
+
+
+def load_fanqie_accounts(path=None):
+    path = os.path.abspath(os.path.expanduser(str(path or FANQIE_ACCOUNTS_FILE)))
+    config = normalize_fanqie_accounts(load_json_file(path, {}))
+    if not os.path.exists(path):
+        save_fanqie_accounts(config, path)
+    return config
+
+
+def save_fanqie_accounts(config, path=None):
+    path = os.path.abspath(os.path.expanduser(str(path or FANQIE_ACCOUNTS_FILE)))
+    normalized = normalize_fanqie_accounts(config)
+    _atomic_write_json(path, normalized)
+    return normalized
+
+
+def create_fanqie_account(label="", config=None, path=None):
+    """Create an isolated account profile and persist it in the registry."""
+    config = normalize_fanqie_accounts(
+        config if isinstance(config, dict) else load_fanqie_accounts(path)
+    )
+    account_id = f"account_{uuid.uuid4().hex[:12]}"
+    timestamp = now_str()
+    account = _normalize_fanqie_account({
+        "id": account_id,
+        "label": str(label or "").strip() or f"番茄账号 {len(config['accounts']) + 1}",
+        "profile_dir": _fanqie_account_profile_dir(account_id),
+        "created_at": timestamp,
+        "updated_at": timestamp,
+    })
+    os.makedirs(account["profile_dir"], exist_ok=True)
+    config["accounts"].append(account)
+    config["selected_account_id"] = account_id
+    return save_fanqie_accounts(config, path), account
+
+
+def get_fanqie_account(config, account_id=""):
+    config = normalize_fanqie_accounts(config)
+    account_id = str(account_id or config.get("selected_account_id", "") or "").strip()
+    for account in config["accounts"]:
+        if account.get("id") == account_id:
+            return deepcopy(account)
+    return deepcopy(config["accounts"][0])
+
+
+def _project_fanqie_upload_state(project, account_id=FANQIE_LEGACY_ACCOUNT_ID):
+    project = project if isinstance(project, dict) else {}
+    account_id = str(account_id or FANQIE_LEGACY_ACCOUNT_ID).strip() or FANQIE_LEGACY_ACCOUNT_ID
+    states = project.get("fanqie_upload_accounts", {})
+    if isinstance(states, dict) and isinstance(states.get(account_id), dict):
+        return normalize_fanqie_upload_state(states.get(account_id))
+    if account_id == FANQIE_LEGACY_ACCOUNT_ID:
+        return normalize_fanqie_upload_state(project.get("fanqie_upload", {}))
+    return normalize_fanqie_upload_state({})
 
 
 def _playwright_launched_pid(error):
@@ -358,6 +494,14 @@ def build_fanqie_upload_task(project_path, config, project=None):
             schedule_start_time,
             selected,
         )
+    account_id = (
+        str(config.get("account_id", FANQIE_LEGACY_ACCOUNT_ID) or FANQIE_LEGACY_ACCOUNT_ID)
+        .strip()
+        or FANQIE_LEGACY_ACCOUNT_ID
+    )
+    profile_dir = str(config.get("profile_dir", "") or "").strip()
+    if not profile_dir:
+        profile_dir = FANQIE_PROFILE_DIR
     return {
         "project_path": os.path.abspath(os.path.realpath(str(project_path))),
         "platform_work_id": work_id,
@@ -373,6 +517,8 @@ def build_fanqie_upload_task(project_path, config, project=None):
         "schedule_start_date": schedule_start_date,
         "schedule_start_time": schedule_start_time,
         "schedule_entries": schedule_entries,
+        "account_id": account_id,
+        "profile_dir": os.path.abspath(os.path.expanduser(profile_dir)),
         "headless": bool(config.get("headless", True)),
         "resume": bool(config.get("resume", True)),
     }
@@ -476,9 +622,10 @@ def _load_playwright_sync_api(progress_callback=None):
 
 
 class _FanqieBrowserSession:
-    def __init__(self, headless=False, progress_callback=None):
+    def __init__(self, headless=False, progress_callback=None, profile_dir=None):
         self.headless = bool(headless)
         self.progress_callback = progress_callback
+        self.profile_dir = os.path.abspath(os.path.expanduser(str(profile_dir or FANQIE_PROFILE_DIR)))
         self._playwright = None
         self.context = None
         self.page = None
@@ -486,7 +633,7 @@ class _FanqieBrowserSession:
 
     def __enter__(self):
         sync_playwright = _load_playwright_sync_api(self.progress_callback)
-        os.makedirs(FANQIE_PROFILE_DIR, exist_ok=True)
+        os.makedirs(self.profile_dir, exist_ok=True)
         if callable(self.progress_callback):
             self.progress_callback("正在启动番茄独立浏览器...")
         if not _BROWSER_PROFILE_LOCK.acquire(
@@ -503,7 +650,7 @@ class _FanqieBrowserSession:
             self.close()
             raise
         launch_kwargs = {
-            "user_data_dir": FANQIE_PROFILE_DIR,
+            "user_data_dir": self.profile_dir,
             "headless": self.headless,
             "viewport": {"width": 1440, "height": 900},
         }
@@ -1899,11 +2046,13 @@ class _FanqieBrowserSession:
 
 class FanqieWorkListWorker(QThread):
     progress = Signal(str)
+    login_required = Signal(str)
     works_ready = Signal(list)
     failed = Signal(str)
 
-    def __init__(self, parent=None):
+    def __init__(self, parent=None, account=None):
         super().__init__(parent)
+        self.account = deepcopy(account if isinstance(account, dict) else {})
         self._stop_event = threading.Event()
 
     def stop(self):
@@ -1922,6 +2071,7 @@ class FanqieWorkListWorker(QThread):
             with _FanqieBrowserSession(
                 headless=True,
                 progress_callback=self.progress.emit,
+                profile_dir=self.account.get("profile_dir") or FANQIE_PROFILE_DIR,
             ) as browser:
                 try:
                     works = browser.list_works(
@@ -1934,10 +2084,13 @@ class FanqieWorkListWorker(QThread):
             if needs_interactive_login:
                 if self._is_stopped():
                     raise FanqieUploadCancelled("作品列表读取已取消。")
-                self.progress.emit("当前番茄登录状态不可用，正在打开浏览器等待登录...")
+                notice = "当前账号需要手动登录，接下来将打开可见番茄浏览器；请在窗口中完成登录。"
+                self.login_required.emit(notice)
+                self.progress.emit(notice)
                 with _FanqieBrowserSession(
                     headless=False,
                     progress_callback=self.progress.emit,
+                    profile_dir=self.account.get("profile_dir") or FANQIE_PROFILE_DIR,
                 ) as browser:
                     works = browser.list_works(
                         progress=self.progress.emit,
@@ -1949,6 +2102,51 @@ class FanqieWorkListWorker(QThread):
             return
         except Exception as exc:
             self.failed.emit(clean_error_text(exc))
+
+
+class FanqieManualBrowserWorker(QThread):
+    """Keep a visible browser open for manual work in one account profile."""
+
+    progress = Signal(str)
+    failed = Signal(str)
+
+    def __init__(self, account=None, parent=None):
+        super().__init__(parent)
+        self.account = deepcopy(account if isinstance(account, dict) else {})
+        self._stop_event = threading.Event()
+
+    def stop(self):
+        self._stop_event.set()
+
+    def _is_stopped(self):
+        return self._stop_event.is_set() or self.isInterruptionRequested()
+
+    def run(self):
+        try:
+            profile_dir = self.account.get("profile_dir") or FANQIE_PROFILE_DIR
+            self.progress.emit("正在打开当前番茄账号的独立浏览器...")
+            with _FanqieBrowserSession(
+                headless=False,
+                progress_callback=self.progress.emit,
+                profile_dir=profile_dir,
+            ) as browser:
+                browser._goto(FANQIE_WRITER_ZONE_URL, allow_login=True)
+                self.progress.emit(
+                    f"已打开“{self.account.get('label', '当前番茄账号')}”的番茄浏览器，可手动创建小说或管理作品。"
+                )
+                while not self._is_stopped():
+                    try:
+                        browser.page.wait_for_timeout(500)
+                    except Exception:
+                        break
+        except Exception as exc:
+            if not self._is_stopped():
+                self.failed.emit(clean_error_text(exc))
+        finally:
+            account_id = str(self.account.get("id", "") or "").strip()
+            with _MANUAL_BROWSER_WORKERS_LOCK:
+                if _MANUAL_BROWSER_WORKERS.get(account_id) is self:
+                    _MANUAL_BROWSER_WORKERS.pop(account_id, None)
 
 
 class FanqieBatchUploadWorker(QThread):
@@ -1978,12 +2176,23 @@ class FanqieBatchUploadWorker(QThread):
             data = load_json_file(path, {})
             if not isinstance(data, dict):
                 raise FanqieUploadError("保存上传断点失败：项目文件不是有效 JSON。")
-            data["fanqie_upload"] = normalize_fanqie_upload_state(state)
+            normalized = normalize_fanqie_upload_state(state)
+            account_id = str(self.task.get("account_id", FANQIE_LEGACY_ACCOUNT_ID) or FANQIE_LEGACY_ACCOUNT_ID).strip()
+            states = data.get("fanqie_upload_accounts", {})
+            if not isinstance(states, dict):
+                states = {}
+            normalized["account_id"] = account_id
+            states[account_id] = normalized
+            data["fanqie_upload_accounts"] = states
+            if account_id == FANQIE_LEGACY_ACCOUNT_ID:
+                data["fanqie_upload"] = normalized
             save_project_file(path, data)
-        self.state_changed.emit(deepcopy(data["fanqie_upload"]))
+        self.state_changed.emit(deepcopy(normalized))
 
     def _initial_state(self, project):
-        existing = normalize_fanqie_upload_state(project.get("fanqie_upload", {}))
+        account_id = str(self.task.get("account_id", FANQIE_LEGACY_ACCOUNT_ID) or FANQIE_LEGACY_ACCOUNT_ID).strip()
+        existing = _project_fanqie_upload_state(project, account_id)
+        existing["account_id"] = account_id
         target_id = str(self.task.get("platform_work_id", "") or "").strip()
         target_url = str(self.task.get("platform_work_url", "") or "").strip()
         target_mode = _normalize_upload_mode(self.task.get("mode", "draft"))
@@ -2024,6 +2233,7 @@ class FanqieBatchUploadWorker(QThread):
             existing["daily_limit_scope"] = ""
         configured = {
             **existing,
+            "account_id": account_id,
             "platform_work_id": target_id,
             "platform_work_title": str(self.task.get("platform_work_title", "") or "").strip(),
             "platform_work_url": str(self.task.get("platform_work_url", "") or "").strip(),
@@ -2081,6 +2291,7 @@ class FanqieBatchUploadWorker(QThread):
             with _FanqieBrowserSession(
                 headless=bool(self.task.get("headless", True)),
                 progress_callback=self.progress.emit,
+                profile_dir=self.task.get("profile_dir") or FANQIE_PROFILE_DIR,
             ) as browser:
                 schedule_by_id = {
                     str(item.get("chapter_id", "") or "").strip(): item
@@ -2229,6 +2440,11 @@ class FanqieBatchUploadWorker(QThread):
 class FanqieBatchUploadDialog(QDialog):
     """批量上传任务配置窗口。"""
 
+    PRIMARY_FIELD_MIN_WIDTH = 180
+    PRIMARY_FIELD_MAX_WIDTH = 560
+    PRIMARY_FIELD_HORIZONTAL_PADDING = 52
+    PRIMARY_COMBO_EXTRA_PADDING = 16
+
     def __init__(self, current_project_path="", parent=None):
         super().__init__(parent)
         self.setWindowTitle("番茄批量上传")
@@ -2239,12 +2455,22 @@ class FanqieBatchUploadDialog(QDialog):
         self._close_after_work_list = False
         self._works = []
         self._restoring_saved_work = False
+        self._account_login_notice_pending = False
+        self._accounts_config = load_fanqie_accounts()
+        self._manual_browser_worker = None
+        self._last_account_id = ""
         self._current_project_path = (
             os.path.abspath(os.path.realpath(str(current_project_path or "")))
             if current_project_path else ""
         )
         project = self._load_selected_project()
-        saved_state = project.get("fanqie_upload", {}) if isinstance(project, dict) else {}
+        self._selected_account = get_fanqie_account(
+            self._accounts_config,
+            self._accounts_config.get("selected_account_id", ""),
+        )
+        saved_state = _project_fanqie_upload_state(
+            project, self._selected_account.get("id", FANQIE_LEGACY_ACCOUNT_ID)
+        )
         self._saved_upload_state = saved_state if isinstance(saved_state, dict) else {}
         self._has_saved_upload = bool(
             self._saved_upload_state.get("platform_work_id")
@@ -2298,25 +2524,68 @@ class FanqieBatchUploadDialog(QDialog):
         self.project_name_edit = QLineEdit(project_title)
         self.project_name_edit.setReadOnly(True)
         self.project_name_edit.setToolTip(self._current_project_path or "当前项目尚未保存")
+        self.project_name_edit.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Preferred)
+
+        account_row = QHBoxLayout()
+        account_row.setSpacing(6)
+        self.account_combo = QComboBox()
+        self.account_combo.setMinimumWidth(0)
+        self.account_combo.setSizeAdjustPolicy(QComboBox.AdjustToContents)
+        self.account_combo.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Preferred)
+        for account in self._accounts_config.get("accounts", []):
+            self.account_combo.addItem(
+                str(account.get("label", "番茄账号") or "番茄账号"),
+                str(account.get("id", "") or ""),
+            )
+        self.account_combo.currentIndexChanged.connect(self._on_account_changed)
+        selected_index = self.account_combo.findData(self._selected_account.get("id", ""))
+        if selected_index >= 0:
+            self.account_combo.blockSignals(True)
+            self.account_combo.setCurrentIndex(selected_index)
+            self.account_combo.blockSignals(False)
+        self._last_account_id = self._selected_account.get("id", "")
+        account_row.addWidget(self.account_combo)
+        self.new_account_btn = QPushButton("新增账号")
+        self.new_account_btn.setObjectName("ghost")
+        self.new_account_btn.clicked.connect(self._create_account)
+        account_row.addWidget(self.new_account_btn)
+        self.relogin_btn = QPushButton("重新登录")
+        self.relogin_btn.setObjectName("ghost")
+        self.relogin_btn.clicked.connect(self._relogin_account)
+        account_row.addWidget(self.relogin_btn)
+        self.open_browser_btn = QPushButton("打开浏览器")
+        self.open_browser_btn.setObjectName("ghost")
+        self.open_browser_btn.clicked.connect(self._toggle_manual_browser)
+        account_row.addWidget(self.open_browser_btn)
+        self.edit_account_btn = QPushButton("修改备注")
+        self.edit_account_btn.setObjectName("ghost")
+        self.edit_account_btn.clicked.connect(self._edit_account_label)
+        account_row.addWidget(self.edit_account_btn)
 
         work_row = QHBoxLayout()
         work_row.setSpacing(6)
         self.work_combo = QComboBox()
+        self.work_combo.setSizeAdjustPolicy(QComboBox.AdjustToContents)
+        self.work_combo.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Preferred)
         self.work_combo.addItem("点击右侧读取番茄后台作品", {})
         self.work_combo.currentIndexChanged.connect(self._on_work_changed)
-        work_row.addWidget(self.work_combo, 1)
+        work_row.addWidget(self.work_combo)
         self.read_works_btn = QPushButton("读取作品列表")
         self.read_works_btn.setObjectName("ghost")
         self.read_works_btn.clicked.connect(self._read_works)
         work_row.addWidget(self.read_works_btn)
 
-        # Reserve the same width as the list button so the two editable fields
-        # line up while the dialog is resized.
+        install_arrow_overlay(self.account_combo, draw_combo_text=True)
+        install_arrow_overlay(self.work_combo, draw_combo_text=True)
+        account_row.addStretch(1)
+        work_row.addStretch(1)
+
         project_row = QHBoxLayout()
         project_row.setSpacing(0)
-        project_row.addWidget(self.project_name_edit, 1)
-        project_row.addSpacing(self.read_works_btn.sizeHint().width() + work_row.spacing())
+        project_row.addWidget(self.project_name_edit)
+        project_row.addStretch(1)
         form.addRow("本地小说项目", project_row)
+        form.addRow("番茄账号", account_row)
         form.addRow("番茄目标作品", work_row)
 
         self.start_spin = QSpinBox()
@@ -2410,6 +2679,8 @@ class FanqieBatchUploadDialog(QDialog):
         root.addWidget(buttons)
         self._refresh_chapter_range()
         self._on_mode_changed()
+        self._sync_manual_browser_button()
+        self._sync_primary_field_widths()
 
     def _make_radio_row(self, options, checked_value):
         row = QHBoxLayout()
@@ -2436,6 +2707,274 @@ class FanqieBatchUploadDialog(QDialog):
 
     def _selected_project_path(self):
         return self._current_project_path
+
+    def _primary_field_width(self, widget, texts):
+        text_width = max(
+            (widget.fontMetrics().horizontalAdvance(str(text or "")) for text in texts),
+            default=0,
+        )
+        padding = self.PRIMARY_FIELD_HORIZONTAL_PADDING
+        if isinstance(widget, QComboBox):
+            padding += self.PRIMARY_COMBO_EXTRA_PADDING
+        return max(
+            self.PRIMARY_FIELD_MIN_WIDTH,
+            min(
+                self.PRIMARY_FIELD_MAX_WIDTH,
+                text_width + padding,
+            ),
+        )
+
+    def _sync_primary_field_widths(self):
+        """Size each primary field from its own content instead of sharing a width."""
+        self.project_name_edit.setFixedWidth(
+            self._primary_field_width(self.project_name_edit, [self.project_name_edit.text()])
+        )
+        self.account_combo.setFixedWidth(
+            self._primary_field_width(
+                self.account_combo,
+                [self.account_combo.itemText(index) for index in range(self.account_combo.count())],
+            )
+        )
+        self.work_combo.setFixedWidth(
+            self._primary_field_width(
+                self.work_combo,
+                [self.work_combo.itemText(index) for index in range(self.work_combo.count())],
+            )
+        )
+
+    def _selected_account_id(self):
+        return str(self.account_combo.currentData() or "").strip() or FANQIE_LEGACY_ACCOUNT_ID
+
+    def _selected_account_record(self):
+        return get_fanqie_account(self._accounts_config, self._selected_account_id())
+
+    def _manual_browser_for_account(self, account_id):
+        with _MANUAL_BROWSER_WORKERS_LOCK:
+            worker = _MANUAL_BROWSER_WORKERS.get(str(account_id or "").strip())
+        if worker is not None and worker.isRunning():
+            return worker
+        return None
+
+    @staticmethod
+    def _any_manual_browser_open():
+        with _MANUAL_BROWSER_WORKERS_LOCK:
+            return any(worker.isRunning() for worker in _MANUAL_BROWSER_WORKERS.values())
+
+    def _sync_manual_browser_button(self):
+        account_id = self._selected_account_id()
+        worker = self._manual_browser_for_account(account_id)
+        self.open_browser_btn.setText("关闭浏览器" if worker is not None else "打开浏览器")
+        self.open_browser_btn.setEnabled(True)
+        if hasattr(self, "read_works_btn"):
+            self.read_works_btn.setEnabled(worker is None)
+
+    def _toggle_manual_browser(self):
+        if self._work_list_worker is not None and self._work_list_worker.isRunning():
+            self.preview_label.setText("正在读取番茄作品列表，请稍候再打开手动浏览器。")
+            return
+        account = self._selected_account_record()
+        account_id = str(account.get("id", "") or "").strip()
+        current_worker = self._manual_browser_for_account(account_id)
+        if current_worker is not None:
+            current_worker.stop()
+            current_worker.requestInterruption()
+            self.open_browser_btn.setEnabled(False)
+            self.open_browser_btn.setText("正在关闭...")
+            self.preview_label.setText("正在关闭当前账号的番茄浏览器...")
+            return
+        with _MANUAL_BROWSER_WORKERS_LOCK:
+            other_workers = [
+                (worker_account_id, worker)
+                for worker_account_id, worker in _MANUAL_BROWSER_WORKERS.items()
+                if worker_account_id != account_id and worker.isRunning()
+            ]
+        if other_workers:
+            QMessageBox.information(
+                self,
+                "番茄浏览器",
+                "已有另一个番茄账号的手动浏览器正在打开，请先关闭它再切换账号。",
+            )
+            return
+        worker = FanqieManualBrowserWorker(account=account)
+        with _MANUAL_BROWSER_WORKERS_LOCK:
+            _MANUAL_BROWSER_WORKERS[account_id] = worker
+        self._manual_browser_worker = worker
+        worker.progress.connect(self.preview_label.setText)
+        worker.failed.connect(self._on_manual_browser_failed)
+        worker.finished.connect(
+            lambda account_id=account_id, task_worker=worker: self._manual_browser_finished(
+                account_id, task_worker
+            )
+        )
+        self.open_browser_btn.setEnabled(False)
+        self.open_browser_btn.setText("正在打开...")
+        worker.start()
+
+    def _on_manual_browser_failed(self, message):
+        self.preview_label.setText(str(message or "打开番茄浏览器失败。"))
+
+    def _manual_browser_finished(self, account_id, worker):
+        with _MANUAL_BROWSER_WORKERS_LOCK:
+            if _MANUAL_BROWSER_WORKERS.get(account_id) is worker:
+                _MANUAL_BROWSER_WORKERS.pop(account_id, None)
+        if self._manual_browser_worker is worker:
+            self._manual_browser_worker = None
+        self._sync_manual_browser_button()
+
+    def _save_selected_account(self):
+        self._accounts_config["selected_account_id"] = self._selected_account_id()
+        self._accounts_config = save_fanqie_accounts(self._accounts_config)
+
+    def _on_account_changed(self, *_args):
+        if not hasattr(self, "mode_buttons"):
+            return
+        selected_account_id = self._selected_account_id()
+        if self._any_manual_browser_open():
+            QMessageBox.information(
+                self,
+                "番茄账号",
+                "当前有手动打开的番茄浏览器正在使用，请先关闭它再切换账号。",
+            )
+            previous_index = self.account_combo.findData(self._last_account_id)
+            if previous_index >= 0:
+                self.account_combo.blockSignals(True)
+                self.account_combo.setCurrentIndex(previous_index)
+                self.account_combo.blockSignals(False)
+            return
+        self._selected_account = self._selected_account_record()
+        self._last_account_id = selected_account_id
+        self._save_selected_account()
+        self._sync_manual_browser_button()
+        self._works = []
+        self.work_combo.clear()
+        self.work_combo.addItem("点击右侧读取番茄后台作品", {})
+        self._sync_primary_field_widths()
+        project = self._load_selected_project()
+        self._saved_upload_state = _project_fanqie_upload_state(
+            project, self._selected_account_id()
+        )
+        self._has_saved_upload = bool(
+            self._saved_upload_state.get("platform_work_id")
+            or self._saved_upload_state.get("platform_work_url")
+            or self._saved_upload_state.get("updated_at")
+            or str(self._saved_upload_state.get("status", "") or "").strip()
+            not in {"", "idle"}
+        )
+        self._apply_saved_upload_controls()
+        self._refresh_chapter_range()
+
+    def _apply_saved_upload_controls(self):
+        state = self._saved_upload_state if self._has_saved_upload else {}
+        self.mode_buttons[_normalize_upload_mode(state.get("mode", "draft"))].setChecked(True)
+        self.work_type_buttons[_normalize_work_type(state.get("work_type", "unknown"))].setChecked(True)
+        self.publish_ai_buttons["yes" if bool(state.get("publish_use_ai", True)) else "no"].setChecked(True)
+        saved_date = QDate.fromString(str(state.get("schedule_start_date", "") or ""), "yyyy-MM-dd")
+        if saved_date.isValid():
+            self.schedule_date_edit.setDate(saved_date)
+        saved_time = QTime.fromString(str(state.get("schedule_start_time", "") or ""), "HH:mm")
+        if saved_time.isValid():
+            self.schedule_time_edit.setTime(saved_time)
+        self.headless_check.setChecked(bool(state.get("headless", True)))
+        self.resume_check.setChecked(bool(state.get("resume", True)))
+        self._on_mode_changed()
+
+    def _create_account(self):
+        label, accepted = QInputDialog.getText(self, "新增番茄账号", "账号备注：")
+        if not accepted:
+            return
+        self._accounts_config, account = create_fanqie_account(
+            label, config=self._accounts_config
+        )
+        self.account_combo.addItem(account["label"], account["id"])
+        self.account_combo.setCurrentIndex(self.account_combo.count() - 1)
+        self._sync_primary_field_widths()
+        self._account_login_notice_pending = True
+        self.preview_label.setText(
+            f"已创建“{account['label']}”，点击“读取作品列表”后将打开该账号的独立浏览器登录。"
+        )
+
+    def _edit_account_label(self):
+        """Edit only the selected account's display label."""
+        account = self._selected_account_record()
+        account_id = str(account.get("id", "") or "").strip()
+        if not account_id:
+            return
+        current_label = str(account.get("label", "番茄账号") or "番茄账号").strip()
+        label, accepted = QInputDialog.getText(
+            self,
+            "修改番茄账号备注",
+            "账号备注：",
+            QLineEdit.Normal,
+            current_label,
+        )
+        if not accepted:
+            return
+        label = str(label or "").strip()
+        if not label:
+            QMessageBox.warning(self, "修改番茄账号备注", "账号备注不能为空。")
+            return
+
+        config = deepcopy(self._accounts_config)
+        updated = False
+        for item in config.get("accounts", []):
+            if str(item.get("id", "") or "").strip() != account_id:
+                continue
+            item["label"] = label
+            item["updated_at"] = now_str()
+            updated = True
+            break
+        if not updated:
+            return
+
+        self._accounts_config = save_fanqie_accounts(config)
+        index = self.account_combo.findData(account_id)
+        if index >= 0:
+            self.account_combo.setItemText(index, label)
+        self._selected_account = get_fanqie_account(self._accounts_config, account_id)
+        self._sync_primary_field_widths()
+        self.preview_label.setText(f"已将当前番茄账号备注修改为“{label}”。")
+
+    def _relogin_account(self):
+        if self._work_list_worker is not None and self._work_list_worker.isRunning():
+            return
+        account = self._selected_account_record()
+        profile_dir = str(account.get("profile_dir", "") or "").strip()
+        if not profile_dir:
+            return
+        if self._manual_browser_for_account(account.get("id", "")) is not None:
+            QMessageBox.information(
+                self,
+                "重新登录番茄账号",
+                "请先关闭当前账号的手动浏览器，再执行重新登录。",
+            )
+            return
+        ret = QMessageBox.question(
+            self,
+            "重新登录番茄账号",
+            (
+                "此功能适用于当前账号的浏览器 profile 错登成其他番茄账号，或出现以下情况：\n"
+                "1. Cookie 或登录状态异常；\n"
+                "2. 浏览器一直识别成错误账号；\n"
+                "3. 需要彻底切换当前账号身份。\n\n"
+                f"将清除“{account.get('label', '当前账号')}”专用浏览器中保存的 Cookie、登录会话等登录数据。\n\n"
+                "清除后，下次读取作品列表或打开该账号浏览器时需要重新登录。\n"
+                "此操作只影响当前选中的账号，不会影响其他账号，也不会删除小说项目、章节或上传记录。\n\n"
+                "确定要继续吗？"
+            ),
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if ret != QMessageBox.Yes:
+            return
+        try:
+            shutil.rmtree(profile_dir, ignore_errors=True)
+        except Exception as exc:
+            self.preview_label.setText(f"清理账号浏览器目录失败：{clean_error_text(exc)}")
+            return
+        self._account_login_notice_pending = True
+        self.preview_label.setText(
+            "当前账号登录状态已清除，点击“读取作品列表”后将打开可见浏览器，请完成登录。"
+        )
 
     def _load_selected_project(self):
         path = self._selected_project_path()
@@ -2499,7 +3038,7 @@ class FanqieBatchUploadDialog(QDialog):
             )
             ai_label = "是" if self._radio_value(self.publish_ai_buttons, "yes") == "yes" else "否"
             text += f"是否使用 AI：{ai_label}。"
-        state = project.get("fanqie_upload", {}) if isinstance(project, dict) else {}
+        state = _project_fanqie_upload_state(project, self._selected_account_id())
         if isinstance(state, dict) and str(state.get("platform_work_id", "") or "").strip():
             completed = state.get("completed_chapter_ids", [])
             failed = state.get("failed_chapters", [])
@@ -2538,18 +3077,33 @@ class FanqieBatchUploadDialog(QDialog):
     def _read_works(self):
         if self._work_list_worker is not None and self._work_list_worker.isRunning():
             return
+        if self._any_manual_browser_open():
+            self.preview_label.setText("请先关闭手动打开的番茄浏览器，再读取作品列表。")
+            return
         self.read_works_btn.setEnabled(False)
         self.read_works_btn.setText("读取中...")
+        account = self._selected_account_record()
+        if self._account_login_notice_pending:
+            QMessageBox.information(
+                self,
+                "需要登录新番茄账号",
+                "接下来会打开该账号专用的可见浏览器窗口，请在窗口中手动完成番茄登录；登录完成后程序会自动读取作品列表。",
+            )
+            self._account_login_notice_pending = False
         self.preview_label.setText(
-            "正在后台检查番茄登录状态；只有需要登录时才会打开浏览器窗口。"
+            "正在检查当前番茄账号登录状态；需要登录时会打开该账号的浏览器窗口。"
         )
-        worker = FanqieWorkListWorker(self)
+        worker = FanqieWorkListWorker(account=account, parent=self)
         self._work_list_worker = worker
         worker.progress.connect(self.preview_label.setText)
+        worker.login_required.connect(self._on_login_required)
         worker.works_ready.connect(self._on_works_ready)
         worker.failed.connect(self._on_works_failed)
         worker.finished.connect(self._cleanup_work_list_worker)
         worker.start()
+
+    def _on_login_required(self, message):
+        self.preview_label.setText(str(message or "请在番茄独立浏览器窗口中完成登录。"))
 
     def reject(self):
         worker = self._work_list_worker
@@ -2588,7 +3142,9 @@ class FanqieBatchUploadDialog(QDialog):
 
     def _on_works_ready(self, works):
         self._works = [item for item in works if isinstance(item, dict)]
-        state = self._load_selected_project().get("fanqie_upload", {})
+        state = _project_fanqie_upload_state(
+            self._load_selected_project(), self._selected_account_id()
+        )
         previous_id = (
             str(state.get("platform_work_id", "") or "").strip()
             if isinstance(state, dict) else ""
@@ -2610,6 +3166,7 @@ class FanqieBatchUploadDialog(QDialog):
                         break
         finally:
             self.work_combo.blockSignals(False)
+        self._sync_primary_field_widths()
         if self._works:
             self._restoring_saved_work = bool(restored_work)
             try:
@@ -2635,6 +3192,17 @@ class FanqieBatchUploadDialog(QDialog):
 
     def _accept(self):
         project = self._load_selected_project()
+        with _MANUAL_BROWSER_WORKERS_LOCK:
+            manual_browser_open = any(
+                worker.isRunning() for worker in _MANUAL_BROWSER_WORKERS.values()
+            )
+        if manual_browser_open:
+            QMessageBox.information(
+                self,
+                "番茄批量上传",
+                "请先关闭手动打开的番茄浏览器，再开始上传任务。",
+            )
+            return
         item = self.work_combo.currentData()
         if not isinstance(item, dict) or not str(item.get("id", "") or "").strip():
             QMessageBox.warning(self, "番茄批量上传", "请先读取并选择番茄后台目标作品。")
@@ -2656,6 +3224,8 @@ class FanqieBatchUploadDialog(QDialog):
             "platform_work_id": str(item.get("id", "") or "").strip(),
             "platform_work_title": str(item.get("title", "") or "").strip(),
             "platform_work_url": str(item.get("url", "") or "").strip(),
+            "account_id": self._selected_account_id(),
+            "profile_dir": str(self._selected_account_record().get("profile_dir", "") or "").strip(),
             "start_chapter": self.start_spin.value(),
             "end_chapter": self.end_spin.value(),
             "headless": self.headless_check.isChecked(),

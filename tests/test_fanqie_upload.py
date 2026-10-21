@@ -5,10 +5,14 @@ from unittest.mock import patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PySide6.QtWidgets import QApplication
+from PySide6.QtWidgets import QApplication, QMessageBox
 
 from gpt_desktop.fanqie_upload import (
     _FanqieBrowserSession,
+    FANQIE_LEGACY_ACCOUNT_ID,
+    create_fanqie_account,
+    get_fanqie_account,
+    load_fanqie_accounts,
     FANQIE_BROWSER_LAUNCH_TIMEOUT_MS,
     _extract_id_from_url,
     _interpret_publish_response,
@@ -17,9 +21,11 @@ from gpt_desktop.fanqie_upload import (
     FanqieLoginRequired,
     FanqieUploadError,
     FanqieBatchUploadDialog,
+    FanqieManualBrowserWorker,
     build_fanqie_schedule_entries,
     build_fanqie_upload_task,
     normalize_fanqie_upload_state,
+    save_fanqie_accounts,
     validate_chapter_upload_range,
 )
 from gpt_desktop.novel_storage import load_json_file, save_project_file
@@ -205,7 +211,159 @@ class FanqieUploadTests(unittest.TestCase):
             try:
                 dialog.show()
                 self._app.processEvents()
-                self.assertEqual(dialog.project_name_edit.width(), dialog.work_combo.width())
+                self.assertEqual(
+                    dialog.project_name_edit.width(),
+                    dialog._primary_field_width(
+                        dialog.project_name_edit, [dialog.project_name_edit.text()]
+                    ),
+                )
+                self.assertEqual(
+                    dialog.account_combo.width(),
+                    dialog._primary_field_width(
+                        dialog.account_combo,
+                        [
+                            dialog.account_combo.itemText(index)
+                            for index in range(dialog.account_combo.count())
+                        ],
+                    ),
+                )
+                self.assertEqual(
+                    dialog.work_combo.width(),
+                    dialog._primary_field_width(
+                        dialog.work_combo,
+                        [
+                            dialog.work_combo.itemText(index)
+                            for index in range(dialog.work_combo.count())
+                        ],
+                    ),
+                )
+                self.assertFalse(hasattr(dialog.project_name_edit, "_combo_arrow_overlay"))
+                self.assertEqual(dialog.open_browser_btn.text(), "打开浏览器")
+                self.assertEqual(dialog.edit_account_btn.text(), "修改备注")
+                self.assertTrue(dialog.account_combo._combo_arrow_overlay.isVisible())
+                self.assertTrue(dialog.work_combo._combo_arrow_overlay.isVisible())
+                self.assertTrue(dialog.account_combo._combo_arrow_overlay._draw_combo_text)
+                self.assertTrue(dialog.work_combo._combo_arrow_overlay._draw_combo_text)
+                self.assertIn("padding-right: 44px", dialog.account_combo.styleSheet())
+                self.assertIn("padding-right: 44px", dialog.work_combo.styleSheet())
+                initial_work_width = dialog.work_combo.width()
+                dialog._on_works_ready([{
+                    "id": "long-work",
+                    "title": "一个特别特别长的番茄目标作品名称用于测试自动宽度",
+                    "work_type": "serial",
+                }])
+                self._app.processEvents()
+                self.assertGreater(dialog.work_combo.width(), initial_work_width)
+                dialog.resize(760, 430)
+                self._app.processEvents()
+                self.assertLessEqual(
+                    dialog.project_name_edit.width(), dialog.PRIMARY_FIELD_MAX_WIDTH
+                )
+                self.assertLessEqual(
+                    dialog.account_combo.width(), dialog.PRIMARY_FIELD_MAX_WIDTH
+                )
+                self.assertLessEqual(
+                    dialog.work_combo.width(), dialog.PRIMARY_FIELD_MAX_WIDTH
+                )
+            finally:
+                dialog.close()
+
+    def test_edit_account_label_updates_only_account_remark(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "测试小说.json")
+            save_project_file(path, self._project())
+            dialog = FanqieBatchUploadDialog(current_project_path=path)
+            account_id = dialog._selected_account_id()
+            original_profile = dialog._selected_account_record()["profile_dir"]
+            try:
+                with patch(
+                    "gpt_desktop.fanqie_upload.QInputDialog.getText",
+                    return_value=("新的账号备注", True),
+                ) as get_text, patch(
+                    "gpt_desktop.fanqie_upload.save_fanqie_accounts",
+                    side_effect=lambda config: config,
+                ):
+                    dialog._edit_account_label()
+                get_text.assert_called_once()
+                self.assertEqual(dialog.account_combo.currentText(), "新的账号备注")
+                self.assertEqual(
+                    dialog._selected_account_record()["label"], "新的账号备注"
+                )
+                self.assertEqual(
+                    dialog._selected_account_record()["profile_dir"], original_profile
+                )
+                self.assertIn("新的账号备注", dialog.preview_label.text())
+                self.assertEqual(dialog.account_combo.findData(account_id), dialog.account_combo.currentIndex())
+            finally:
+                dialog.close()
+
+    def test_relogin_confirmation_cancel_keeps_current_account_login_data(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "测试小说.json")
+            profile_dir = os.path.join(tmp, "account-a")
+            marker = os.path.join(profile_dir, "login-state")
+            os.makedirs(profile_dir)
+            with open(marker, "w", encoding="utf-8") as handle:
+                handle.write("keep")
+            save_project_file(path, self._project())
+            dialog = FanqieBatchUploadDialog(current_project_path=path)
+            account = {
+                "id": "account-a",
+                "label": "账号 A",
+                "profile_dir": profile_dir,
+            }
+            dialog._selected_account_record = lambda: account
+            dialog._manual_browser_for_account = lambda _account_id: None
+            try:
+                with patch(
+                    "gpt_desktop.fanqie_upload.QMessageBox.question",
+                    return_value=QMessageBox.No,
+                ) as question:
+                    dialog._relogin_account()
+                self.assertTrue(os.path.exists(marker))
+                self.assertFalse(dialog._account_login_notice_pending)
+                prompt = question.call_args.args[2]
+                self.assertIn("profile 错登成其他番茄账号", prompt)
+                self.assertIn("Cookie、登录会话", prompt)
+                self.assertIn("浏览器一直识别成错误账号", prompt)
+                self.assertIn("彻底切换当前账号身份", prompt)
+                self.assertIn("其他账号", prompt)
+                self.assertIn("小说项目、章节或上传记录", prompt)
+            finally:
+                dialog.close()
+
+    def test_relogin_confirmation_clears_only_current_account_profile(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "测试小说.json")
+            current_profile = os.path.join(tmp, "account-a")
+            other_profile = os.path.join(tmp, "account-b")
+            os.makedirs(current_profile)
+            os.makedirs(other_profile)
+            current_marker = os.path.join(current_profile, "login-state")
+            other_marker = os.path.join(other_profile, "login-state")
+            with open(current_marker, "w", encoding="utf-8") as handle:
+                handle.write("clear")
+            with open(other_marker, "w", encoding="utf-8") as handle:
+                handle.write("keep")
+            save_project_file(path, self._project())
+            dialog = FanqieBatchUploadDialog(current_project_path=path)
+            account = {
+                "id": "account-a",
+                "label": "账号 A",
+                "profile_dir": current_profile,
+            }
+            dialog._selected_account_record = lambda: account
+            dialog._manual_browser_for_account = lambda _account_id: None
+            try:
+                with patch(
+                    "gpt_desktop.fanqie_upload.QMessageBox.question",
+                    return_value=QMessageBox.Yes,
+                ):
+                    dialog._relogin_account()
+                self.assertFalse(os.path.exists(current_profile))
+                self.assertTrue(os.path.exists(other_marker))
+                self.assertTrue(dialog._account_login_notice_pending)
+                self.assertIn("登录状态已清除", dialog.preview_label.text())
             finally:
                 dialog.close()
 
@@ -221,6 +379,86 @@ class FanqieUploadTests(unittest.TestCase):
         self.assertEqual(project["fanqie_upload"]["platform_work_id"], "book-1")
         self.assertEqual(project["fanqie_upload"]["completed_chapter_ids"], ["chapter-1"])
         self.assertEqual(project["fanqie_upload"]["status"], "running")
+
+    def test_legacy_upload_checkpoint_is_migrated_to_legacy_account(self):
+        project = _normalize_project({
+            "fanqie_upload": {
+                "platform_work_id": "book-legacy",
+                "completed_chapter_ids": ["chapter-1"],
+                "status": "running",
+            },
+        })
+        self.assertEqual(
+            project["fanqie_upload_accounts"][FANQIE_LEGACY_ACCOUNT_ID]["platform_work_id"],
+            "book-legacy",
+        )
+
+    def test_accounts_create_independent_profiles_and_persist_selection(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            accounts_path = os.path.join(tmp, "accounts.json")
+            profile_root = os.path.join(tmp, "profiles")
+            with patch("gpt_desktop.fanqie_upload.FANQIE_ACCOUNTS_FILE", accounts_path), patch(
+                "gpt_desktop.fanqie_upload.FANQIE_BROWSER_PROFILES_DIR", profile_root
+            ), patch(
+                "gpt_desktop.fanqie_upload.FANQIE_PROFILE_DIR", os.path.join(tmp, "legacy")
+            ):
+                config = load_fanqie_accounts(accounts_path)
+                config, first = create_fanqie_account("账号 A", config=config, path=accounts_path)
+                config, second = create_fanqie_account("账号 B", config=config, path=accounts_path)
+                self.assertNotEqual(first["id"], second["id"])
+                self.assertNotEqual(first["profile_dir"], second["profile_dir"])
+                self.assertTrue(os.path.isdir(first["profile_dir"]))
+                self.assertTrue(os.path.isdir(second["profile_dir"]))
+                loaded = load_fanqie_accounts(accounts_path)
+                self.assertEqual(loaded["selected_account_id"], second["id"])
+                self.assertEqual(get_fanqie_account(loaded, first["id"])["label"], "账号 A")
+
+    def test_build_task_carries_account_profile(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "测试小说.json")
+            save_project_file(path, self._project())
+            task = build_fanqie_upload_task(
+                path,
+                {
+                    "platform_work_id": "book-1",
+                    "account_id": "account-a",
+                    "profile_dir": os.path.join(tmp, "profile-a"),
+                    "start_chapter": 1,
+                    "end_chapter": 1,
+                },
+            )
+            self.assertEqual(task["account_id"], "account-a")
+            self.assertEqual(task["profile_dir"], os.path.abspath(os.path.join(tmp, "profile-a")))
+
+    def test_worker_checkpoints_are_isolated_by_account(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "测试小说.json")
+            save_project_file(path, self._project())
+            worker_a = FanqieBatchUploadWorker({
+                "project_path": path,
+                "platform_work_id": "book-a",
+                "account_id": "account-a",
+                "profile_dir": os.path.join(tmp, "profile-a"),
+                "start_chapter": 1,
+                "end_chapter": 1,
+            })
+            worker_b = FanqieBatchUploadWorker({
+                "project_path": path,
+                "platform_work_id": "book-b",
+                "account_id": "account-b",
+                "profile_dir": os.path.join(tmp, "profile-b"),
+                "start_chapter": 1,
+                "end_chapter": 1,
+            })
+            state_a = worker_a._initial_state(load_json_file(path, {}))
+            worker_a._persist_state(state_a)
+            state_b = worker_b._initial_state(load_json_file(path, {}))
+            worker_b._persist_state(state_b)
+            self.assertEqual(state_a["platform_work_id"], "book-a")
+            self.assertEqual(state_b["platform_work_id"], "book-b")
+            saved = load_json_file(path, {})
+            self.assertEqual(saved["fanqie_upload_accounts"]["account-a"]["platform_work_id"], "book-a")
+            self.assertEqual(saved["fanqie_upload_accounts"]["account-b"]["platform_work_id"], "book-b")
 
     def test_normalize_state_keeps_publish_modes(self):
         state = normalize_fanqie_upload_state({"mode": "publish", "status": "unknown"})
@@ -888,6 +1126,48 @@ class FanqieUploadTests(unittest.TestCase):
             with patch("gpt_desktop.fanqie_upload._FanqieBrowserSession", return_value=browser):
                 worker.run()
             self.assertEqual(browser.calls, [2, 3])
+
+    def test_manual_browser_worker_uses_selected_account_profile(self):
+        class FakePage:
+            def wait_for_timeout(self, _milliseconds):
+                raise RuntimeError("closed")
+
+        class FakeBrowser:
+            calls = []
+
+            def __init__(self, **kwargs):
+                self.page = FakePage()
+                self.kwargs = kwargs
+                self.goto_calls = []
+
+            def __enter__(self):
+                type(self).calls.append(self)
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def _goto(self, url, allow_login=False):
+                self.goto_calls.append((url, allow_login))
+
+        account = {
+            "id": "account-manual",
+            "label": "手动账号",
+            "profile_dir": "/tmp/account-manual-profile",
+        }
+        worker = FanqieManualBrowserWorker(account=account)
+        with patch(
+            "gpt_desktop.fanqie_upload._FanqieBrowserSession",
+            side_effect=lambda **kwargs: FakeBrowser(**kwargs),
+        ):
+            worker.run()
+        browser = FakeBrowser.calls[-1]
+        self.assertFalse(browser.kwargs["headless"])
+        self.assertEqual(browser.kwargs["profile_dir"], account["profile_dir"])
+        self.assertEqual(
+            browser.goto_calls,
+            [("https://fanqienovel.com/writer/zone/", True)],
+        )
 
 
 if __name__ == "__main__":

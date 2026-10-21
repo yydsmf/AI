@@ -4,7 +4,7 @@ import shutil
 import subprocess
 import sys
 
-from PySide6.QtCore import QEvent, QPoint, Qt, QTimer, Signal
+from PySide6.QtCore import QEvent, QPoint, QRect, Qt, QTimer, Signal
 from PySide6.QtGui import QColor, QGuiApplication, QPainter, QPixmap, QPolygon
 from PySide6.QtWidgets import (
     QComboBox,
@@ -54,42 +54,87 @@ def _paint_combo_arrows(painter, width, height, enabled=True):
     painter.drawPolygon(QPolygon([QPoint(a, b) for a, b in down]))
 
 
-class _ComboArrowOverlay(QWidget):
-    """在无法替换内部 QComboBox 子类的对话框中补充统一箭头。"""
+class _ArrowOverlay(QWidget):
+    """在输入控件右侧补充统一的上下三角列表提示。"""
 
-    def __init__(self, combo):
+    def __init__(self, combo, draw_combo_text=False):
         super().__init__(combo)
         self._combo = combo
+        self._draw_combo_text = bool(draw_combo_text and isinstance(combo, QComboBox))
         self.setAttribute(Qt.WA_TransparentForMouseEvents)
         self.setAttribute(Qt.WA_TranslucentBackground)
         combo.installEventFilter(self)
+        if self._draw_combo_text:
+            combo.currentIndexChanged.connect(lambda *_args: self.update())
+            combo.currentTextChanged.connect(lambda *_args: self.update())
         self._sync_geometry()
         self.show()
         self.raise_()
 
     def _sync_geometry(self):
-        self.setGeometry(max(0, self._combo.width() - 26), 0, 26, self._combo.height())
+        if self._draw_combo_text:
+            self.setGeometry(
+                1,
+                1,
+                max(0, self._combo.width() - 2),
+                max(0, self._combo.height() - 2),
+            )
+        else:
+            self.setGeometry(max(0, self._combo.width() - 26), 0, 26, self._combo.height())
 
     def eventFilter(self, watched, event):
         if watched is self._combo:
             if event.type() == QEvent.Resize:
                 self._sync_geometry()
                 self.raise_()
-            elif event.type() == QEvent.EnabledChange:
+            elif event.type() in {
+                QEvent.EnabledChange,
+                QEvent.FontChange,
+                QEvent.PaletteChange,
+                QEvent.StyleChange,
+            }:
                 self.update()
         return super().eventFilter(watched, event)
 
     def paintEvent(self, event):
         painter = QPainter(self)
+        if self._draw_combo_text:
+            palette = self._combo.palette()
+            painter.setPen(Qt.NoPen)
+            painter.setBrush(palette.base().color())
+            painter.drawRoundedRect(self.rect(), 5, 5)
+
+            text_color = palette.text().color()
+            if not self._combo.isEnabled():
+                text_color = palette.disabled().color()
+            painter.setPen(text_color)
+            painter.setFont(self._combo.font())
+            text_rect = QRect(7, 0, max(0, self.width() - 47), self.height())
+            text = self._combo.fontMetrics().elidedText(
+                self._combo.currentText(), Qt.ElideRight, text_rect.width()
+            )
+            painter.drawText(text_rect, Qt.AlignLeft | Qt.AlignVCenter, text)
+
         _paint_combo_arrows(painter, self.width(), self.height(), self._combo.isEnabled())
         painter.end()
 
 
-def install_combo_arrow_overlay(combo):
-    """给原生 QComboBox 添加与 WideComboBox 一致的上下箭头。"""
-    overlay = _ComboArrowOverlay(combo)
-    combo._combo_arrow_overlay = overlay
+def install_arrow_overlay(widget, draw_combo_text=False):
+    """给输入控件添加与 WideComboBox 一致的上下箭头。"""
+    if isinstance(widget, QComboBox):
+        # The overlay sits above the native combo text area. Reserve extra
+        # right padding so long labels stop before the arrow indicators.
+        widget.setStyleSheet(
+            f"{widget.styleSheet()}\nQComboBox {{ padding-right: 44px; }}"
+        )
+    overlay = _ArrowOverlay(widget, draw_combo_text=draw_combo_text)
+    widget._combo_arrow_overlay = overlay
     return overlay
+
+
+def install_combo_arrow_overlay(combo):
+    """兼容旧调用：给原生 QComboBox 添加上下箭头。"""
+    return install_arrow_overlay(combo)
 
 
 class WideComboBox(QComboBox):

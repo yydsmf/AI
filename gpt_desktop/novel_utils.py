@@ -944,6 +944,7 @@ def _normalize_fanqie_upload_state(value):
         status = "idle"
     return {
         "version": 1,
+        "account_id": str(raw.get("account_id", "") or "").strip(),
         "platform_work_id": str(raw.get("platform_work_id", "") or "").strip(),
         "platform_work_title": str(raw.get("platform_work_title", "") or "").strip(),
         "platform_work_url": str(raw.get("platform_work_url", "") or "").strip(),
@@ -973,6 +974,18 @@ def _normalize_fanqie_upload_state(value):
     }
 
 
+def _normalize_fanqie_upload_accounts(value):
+    """Normalize per-account Tomato upload checkpoints without dropping legacy data."""
+    raw = value if isinstance(value, dict) else {}
+    result = {}
+    for account_id, state in raw.items():
+        account_id = str(account_id or "").strip()
+        if not account_id or not isinstance(state, dict):
+            continue
+        result[account_id] = _normalize_fanqie_upload_state(state)
+    return result
+
+
 def _default_project():
     return {
         "meta": {
@@ -995,6 +1008,7 @@ def _default_project():
         "chapters": [],
         "foreshadow_items": [],
         "fanqie_upload": _normalize_fanqie_upload_state({}),
+        "fanqie_upload_accounts": {},
         "timeline": "",
         "foreshadows": "",
         "summary": "",
@@ -1905,6 +1919,17 @@ def _normalize_project(data):
     base["fanqie_upload"] = _normalize_fanqie_upload_state(
         data.get("fanqie_upload", {})
     )
+    base["fanqie_upload_accounts"] = _normalize_fanqie_upload_accounts(
+        data.get("fanqie_upload_accounts", {})
+    )
+    # ``fanqie_upload`` predates multi-account support. Keep its checkpoint
+    # under the legacy account so existing projects continue from the same
+    # position after normalization.
+    if (
+        base["fanqie_upload"] != _normalize_fanqie_upload_state({})
+        and "legacy" not in base["fanqie_upload_accounts"]
+    ):
+        base["fanqie_upload_accounts"]["legacy"] = deepcopy(base["fanqie_upload"])
     base["chapter_plan_foundation"] = _normalize_chapter_plan_foundation(
         data.get("chapter_plan_foundation", {})
     )

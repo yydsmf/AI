@@ -248,9 +248,11 @@ from .novel_creation_wizard import (
     story_requires_explicit_power_levels,
 )
 from .fanqie_upload import (
+    FANQIE_LEGACY_ACCOUNT_ID,
     FanqieBatchUploadDialog,
     FanqieBatchUploadWorker,
     build_fanqie_upload_task,
+    stop_fanqie_manual_browser_workers,
 )
 from .widgets import ProviderModelBar, WideComboBox, install_combo_arrow_overlay
 from .workers import EdgeTTSWorker, NovelAnalysisWorker, NovelCandidatePostprocessWorker, NovelChapterEventPlacementWorker, NovelChapterPlanWorker, NovelContextBuildWorker, NovelForeshadowReviewPostprocessWorker, NovelForeshadowReviewWorker, NovelFrameworkImportWorker, NovelVolumeFrameworkAlignmentWorker, NovelVolumeFrameworkWorker, NovelVolumeHandoffWorker, NovelVolumeIntentWorker, NovelWritingWorker
@@ -5154,7 +5156,14 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
         if self._canonical_project_path(self.current_project_path) != self._canonical_project_path(project_path):
             return
         if isinstance(state, dict):
-            self.current_project["fanqie_upload"] = deepcopy(state)
+            account_id = str(state.get("account_id", "") or "").strip() or FANQIE_LEGACY_ACCOUNT_ID
+            states = self.current_project.setdefault("fanqie_upload_accounts", {})
+            if not isinstance(states, dict):
+                states = {}
+                self.current_project["fanqie_upload_accounts"] = states
+            states[account_id] = deepcopy(state)
+            if account_id == FANQIE_LEGACY_ACCOUNT_ID:
+                self.current_project["fanqie_upload"] = deepcopy(state)
 
     def _on_fanqie_upload_chapter_succeeded(self, project_path, item):
         if self._canonical_project_path(self.current_project_path) != self._canonical_project_path(project_path):
@@ -5199,6 +5208,13 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
     def _on_fanqie_upload_failed(self, project_path, message):
         if self._canonical_project_path(self.current_project_path) == self._canonical_project_path(project_path):
             state = self.current_project.get("fanqie_upload", {}) if isinstance(self.current_project, dict) else {}
+            states = self.current_project.get("fanqie_upload_accounts", {}) if isinstance(self.current_project, dict) else {}
+            if isinstance(states, dict) and states:
+                state = max(
+                    (item for item in states.values() if isinstance(item, dict)),
+                    key=lambda item: str(item.get("updated_at", "") or ""),
+                    default=state,
+                )
             if isinstance(state, dict) and state.get("error_kind") == "daily_limit":
                 self.set_status_tip(
                     "番茄批量上传已停止：番茄后台提示每日更新字数上限；"
@@ -5229,6 +5245,7 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
         self._notify_project_store_changed()
 
     def stop_fanqie_upload_workers(self):
+        stop_fanqie_manual_browser_workers()
         workers = getattr(self, "_fanqie_upload_workers", {})
         if not isinstance(workers, dict):
             return

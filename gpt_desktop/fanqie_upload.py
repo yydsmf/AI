@@ -37,7 +37,10 @@ from PySide6.QtWidgets import (
 
 from .core import APP_DIR, clean_error_text, now_str
 from .novel_storage import load_json_file, save_project_file
-from .novel_utils import _normalize_fanqie_upload_state as normalize_fanqie_upload_state
+from .novel_utils import (
+    _body_display_len,
+    _normalize_fanqie_upload_state as normalize_fanqie_upload_state,
+)
 from .optional_components import OptionalComponentError, load_playwright_sync_api
 
 
@@ -276,7 +279,7 @@ def validate_chapter_upload_range(project, start_chapter, end_chapter):
     warnings = []
     if not chapters:
         errors.append("当前项目没有章节。")
-        return {"errors": errors, "warnings": warnings, "count": 0}
+        return {"errors": errors, "warnings": warnings, "count": 0, "word_count": 0}
     if end <= 0:
         end = len(chapters)
     if start > end:
@@ -284,8 +287,9 @@ def validate_chapter_upload_range(project, start_chapter, end_chapter):
     if start > len(chapters) or end > len(chapters):
         errors.append(f"章节范围超出当前项目，共有 {len(chapters)} 章。")
     if errors:
-        return {"errors": errors, "warnings": warnings, "count": 0}
+        return {"errors": errors, "warnings": warnings, "count": 0, "word_count": 0}
     seen_ids = set()
+    word_count = 0
     for number in range(start, end + 1):
         chapter = chapters[number - 1]
         if not isinstance(chapter, dict):
@@ -293,6 +297,7 @@ def validate_chapter_upload_range(project, start_chapter, end_chapter):
             continue
         title = str(chapter.get("title", "") or "").strip()
         text = str(chapter.get("text", "") or "").strip()
+        word_count += _body_display_len(text)
         if not title:
             errors.append(f"第{number}章缺少章节标题。")
         if not text:
@@ -303,7 +308,12 @@ def validate_chapter_upload_range(project, start_chapter, end_chapter):
         seen_ids.add(chapter_id)
         if len(text) < 80:
             warnings.append(f"第{number}章正文只有 {len(text)} 个字符，请确认不是空壳章节。")
-    return {"errors": errors, "warnings": warnings, "count": max(0, end - start + 1)}
+    return {
+        "errors": errors,
+        "warnings": warnings,
+        "count": max(0, end - start + 1),
+        "word_count": word_count,
+    }
 
 
 def build_fanqie_upload_task(project_path, config, project=None):
@@ -2322,6 +2332,10 @@ class FanqieBatchUploadDialog(QDialog):
         range_row.addWidget(self.start_spin)
         range_row.addWidget(QLabel("至"))
         range_row.addWidget(self.end_spin)
+        self.word_count_label = QLabel("总字数：0 字")
+        self.word_count_label.setObjectName("hint")
+        self.word_count_label.setMinimumWidth(120)
+        range_row.addWidget(self.word_count_label)
         range_row.addStretch(1)
         form.addRow("上传章节范围", range_row)
 
@@ -2455,6 +2469,8 @@ class FanqieBatchUploadDialog(QDialog):
         validation = validate_chapter_upload_range(
             project, self.start_spin.value(), self.end_spin.value()
         )
+        word_count = int(validation.get("word_count", 0) or 0)
+        self.word_count_label.setText(f"总字数：{word_count:,} 字")
         text = f"当前范围：{validation['count']} 章"
         mode = self._radio_value(self.mode_buttons, "draft")
         mode_label = {

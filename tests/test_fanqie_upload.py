@@ -47,8 +47,15 @@ class FanqieUploadTests(unittest.TestCase):
         project["chapters"][2]["text"] = ""
         result = validate_chapter_upload_range(project, 1, 3)
         self.assertEqual(result["count"], 3)
+        self.assertEqual(result["word_count"], 320)
         self.assertIn("第2章缺少章节标题。", result["errors"])
         self.assertIn("第3章没有正文，不能上传。", result["errors"])
+
+    def test_validation_counts_non_whitespace_body_characters(self):
+        project = self._project()
+        project["chapters"][0]["text"] = " 第一\n章 "
+        result = validate_chapter_upload_range(project, 1, 1)
+        self.assertEqual(result["word_count"], 3)
 
     def test_build_task_keeps_project_and_target(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -132,6 +139,10 @@ class FanqieUploadTests(unittest.TestCase):
                 self.assertTrue(dialog.project_name_edit.isReadOnly())
                 self.assertEqual(dialog._radio_value(dialog.mode_buttons, "draft"), "draft")
                 self.assertEqual(dialog._radio_value(dialog.work_type_buttons, "unknown"), "unknown")
+                self.assertEqual(dialog.word_count_label.text(), "总字数：480 字")
+                dialog.start_spin.setValue(2)
+                dialog.end_spin.setValue(3)
+                self.assertEqual(dialog.word_count_label.text(), "总字数：320 字")
                 self.assertFalse(dialog.publish_ai_buttons["yes"].isEnabled())
                 dialog.mode_buttons["direct_publish"].setChecked(True)
                 dialog._on_mode_changed()

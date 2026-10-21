@@ -9429,6 +9429,35 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
             if existing_count_override is not None else len(chapters)
         )
         batch_mode = context_mode == "batch"
+        # Titles are a small cross-batch identity index. Keep the complete list
+        # separate from detailed chapter context so compression never removes
+        # the information needed to avoid reusing an earlier title.
+        used_chapter_titles = []
+        used_title_indexes = set()
+
+        def add_used_title(index, title):
+            title = str(title or "").strip()
+            if not title:
+                return
+            try:
+                index = int(index or 0)
+            except (TypeError, ValueError):
+                index = 0
+            if index <= 0 or index in used_title_indexes:
+                return
+            used_title_indexes.add(index)
+            used_chapter_titles.append({"index": index, "title": title})
+
+        for index, chapter in enumerate(chapters, 1):
+            if isinstance(chapter, dict):
+                add_used_title(index, chapter.get("title", ""))
+        if batch_mode and isinstance(extra_payload, dict):
+            continuity = extra_payload.get("batch_continuity", {})
+            if isinstance(continuity, dict):
+                for item in continuity.get("planned_chapter_ledger", []):
+                    if isinstance(item, dict):
+                        add_used_title(item.get("index", 0), item.get("title", ""))
+        used_chapter_titles.sort(key=lambda item: item["index"])
         try:
             batch_is_final = bool(
                 batch_mode
@@ -9542,6 +9571,7 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
             "narrative_strategy_profile": planning_profile,
             "creative_intent_contract": batch_creative_intent_contract,
             "wizard_framework": wizard_framework,
+            "used_chapter_titles": used_chapter_titles,
             "project_materials": {
                 "bible": self._chapter_plan_clip_text(project.get("bible", ""), materials_limit),
                 "world_rules": self._chapter_plan_clip_text(project.get("world_rules", ""), max(2600, materials_limit - 400)),
@@ -9668,6 +9698,8 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
             "章节规划可以使用清楚、稳定、便于执行的结构化表达，不需要像发布简介，也不需要单独生成另一份自然语言版规划。"
             "outline直接写本章真正需要给正文继承的具体故事事实；人物、地点、行动、阻力、结果或章末变化按本章需要自然取用，"
             "不要求每章按同一顺序全部出现，也不要为了凑齐项目补写没有发生的内容。不得出现字段名、内部编号、JSON、代码字符、规划过程或工作流程。"
+            "used_chapter_titles列出已经使用过的章节标题；新章节标题不得与其中任何标题重复，也不得与本批次其他新章节标题重复。"
+            "生成前逐项核对标题，重复时必须改成能对应本章具体事件、人物行动或结果的新标题。\n\n"
             "不要像编辑解释本章功能，不要写‘推动剧情、关系推进、制造悬念、完成任务、阶段作用’等空泛任务词，"
             "不要解释本章意义、主题、节奏、主线、人物弧线或读者效果。"
             + _procedural_plot_guard_guidance()
@@ -9701,6 +9733,8 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
                 "伏笔资料只列当前章节范围内已经出现或即将出现的线索；后续阶段的伏笔等到对应阶段再自然展开。\n\n"
                 "本批次必须返回准确数量的章节，列表顺序就是章节顺序；不要返回章节号、阶段号、节点号或其它定位标签。"
                 "章节名和 outline 是读者与正文作者会看到的内容：章节名从本章具体发生的事情、人物行动、现场冲突、关系变化或结果中自然命名，且不超过15个汉字；"
+                "used_chapter_titles列出已经使用过的章节标题；新章节标题不得与其中任何标题重复，也不得与本批次其他新章节标题重复。"
+                "生成前逐项核对标题，重复时必须改成能对应本章具体事件、人物行动或结果的新标题。\n\n"
                 "outline 直接写本章真正需要给正文继承的具体故事事实；人物、地点、行动、阻力、结果或章末变化按本章需要自然取用，"
                 "不要求每章按同一顺序全部出现，也不要为了凑齐项目补写没有发生的内容。"
                 "outline 建议 250—380 字，保持事实密度，但不要写成字段说明、工作流程、编辑分析或另一份规划表。"
@@ -10840,6 +10874,7 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
                 "承接上一批末章状态，避免重复开局、重复冲突或提前进入后续阶段。",
                 "原框架阶段高于宏观节奏；不得在前10%/中70%边界处切换题材。",
                 "保持本项目主线；项目资料只作连续性参考，不能把背景资料自动变成章节任务。",
+                "used_chapter_titles是已经使用过的章节标题清单；新标题不得与其中任何标题重复，也不得与本批次其他新标题重复。",
                 "相邻章节应避免无意义重复，但不要求按固定轮换表更换开局、冲突或结尾；以当前人物处境和主线需要为准。",
                 "上一批末章结尾已经是已发布触发点，下一批第一章必须从新反应、新结果或新阻力开始，不能复播末句、声音、动作落点或结论。",
             ],

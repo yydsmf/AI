@@ -1032,6 +1032,87 @@ class FanqieUploadTests(unittest.TestCase):
         browser.page = FakePage()
         self.assertTrue(browser._wait_for_editor_ready("正文" * 80, timeout_ms=100))
 
+    def test_editor_ready_poll_interval_is_500ms(self):
+        class FakePage:
+            def __init__(self):
+                self.waits = []
+
+            def evaluate(self, _script):
+                return "正文"
+
+            def wait_for_timeout(self, milliseconds):
+                self.waits.append(milliseconds)
+
+            def locator(self, _selector):
+                class Body:
+                    def inner_text(self, timeout=None):
+                        return "正文字数\n0"
+
+                return Body()
+
+        browser = object.__new__(_FanqieBrowserSession)
+        browser.page = FakePage()
+        self.assertFalse(browser._wait_for_editor_ready("正文" * 80, timeout_ms=550))
+        self.assertTrue(browser.page.waits)
+        self.assertEqual(browser.page.waits[0], 500)
+
+    def test_ui_ready_poll_intervals_are_500ms(self):
+        class FakePage:
+            def __init__(self):
+                self.waits = []
+
+            def wait_for_timeout(self, milliseconds):
+                self.waits.append(milliseconds)
+
+            def get_by_text(self, _name, exact=False):
+                class EmptyLocator:
+                    def count(self):
+                        return 0
+
+                return EmptyLocator()
+
+            def locator(self, _selector):
+                class EmptyLocator:
+                    def count(self):
+                        return 0
+
+                return EmptyLocator()
+
+        browser = object.__new__(_FanqieBrowserSession)
+        browser.page = FakePage()
+        self.assertFalse(browser._wait_for_visible((".editor",), timeout_ms=550))
+        self.assertEqual(browser.page.waits[0], 500)
+        browser.page.waits.clear()
+        self.assertFalse(browser._wait_for_editor_action("draft", timeout_ms=550))
+        self.assertIn(500, browser.page.waits)
+        browser.page.waits.clear()
+        self.assertFalse(browser._wait_for_text(("保存",), exact=True, timeout_ms=550))
+        self.assertEqual(browser.page.waits[0], 500)
+
+    def test_controlled_input_sync_poll_interval_is_500ms(self):
+        class FakeItem:
+            def __init__(self):
+                self.reads = 0
+
+            def input_value(self, timeout=None):
+                self.reads += 1
+                return "" if self.reads == 1 else "标题"
+
+            def evaluate(self, _script):
+                return "标题"
+
+        class FakePage:
+            def __init__(self):
+                self.waits = []
+
+            def wait_for_timeout(self, milliseconds):
+                self.waits.append(milliseconds)
+
+        browser = object.__new__(_FanqieBrowserSession)
+        browser.page = FakePage()
+        self.assertTrue(browser._wait_for_input_value(FakeItem(), "标题", timeout_ms=1600))
+        self.assertEqual(browser.page.waits, [500])
+
     def test_read_transient_publish_feedback_reads_modal_text(self):
         class FakePage:
             def __init__(self):
@@ -1083,8 +1164,10 @@ class FanqieUploadTests(unittest.TestCase):
         class FakePage:
             def __init__(self):
                 self.index = 0
+                self.waits = []
 
-            def wait_for_timeout(self, _milliseconds):
+            def wait_for_timeout(self, milliseconds):
+                self.waits.append(milliseconds)
                 self.index += 1
 
         states = ["保存中", "保存中", "已保存到云端"]
@@ -1093,6 +1176,8 @@ class FanqieUploadTests(unittest.TestCase):
         browser._page_text = lambda: states[min(browser.page.index, len(states) - 1)]
         self.assertTrue(browser._wait_for_save_completion(timeout_ms=2000, settle_ms=200))
         self.assertGreaterEqual(browser.page.index, 2)
+        self.assertTrue(browser.page.waits)
+        self.assertEqual(browser.page.waits[0], 500)
 
     def test_worker_passes_absolute_chapter_numbers_to_browser(self):
         class FakeBrowser:

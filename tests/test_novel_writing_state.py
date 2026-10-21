@@ -8578,6 +8578,11 @@ class NovelWritingStateTests(unittest.TestCase):
             batch_payload["batch_continuity"]["required_absolute_range"],
             [9, 38],
         )
+        self.assertEqual(
+            batch_payload["used_chapter_titles"],
+            [{"index": index, "title": f"章节{index}"} for index in range(1, 9)],
+        )
+        self.assertIn("新章节标题不得与其中任何标题重复", context)
         self.assertIn('"existing_chapter_count": 8', context)
         self.assertIn('"title": "章节1"', context)
         self.assertNotIn("唯一详细提纲3", context)

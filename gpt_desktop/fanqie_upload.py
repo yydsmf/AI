@@ -63,6 +63,18 @@ FANQIE_WORK_TYPES = {"unknown", "serial", "completed"}
 FANQIE_BROWSER_LAUNCH_TIMEOUT_MS = 30000
 FANQIE_BROWSER_PROFILE_LOCK_TIMEOUT_SECONDS = 45
 FANQIE_BROWSER_LAUNCH_RETRIES = 2
+# The first editor-ready check is immediate; this interval only controls
+# retries while the platform is still asynchronously rendering the body.
+FANQIE_EDITOR_SYNC_POLL_MS = 500
+# These checks wait for stable controls, so a slower cadence reduces browser
+# queries without changing any success condition or timeout.
+FANQIE_UI_READY_POLL_MS = 500
+# Controlled input values can take a short time to reach React state.  Keep
+# the first check immediate and use a lower-cost retry cadence afterward.
+FANQIE_INPUT_SYNC_POLL_MS = 500
+# Save status and request capture are event-driven; polling the collected state
+# more often does not improve the request or the saved content.
+FANQIE_SAVE_STATE_POLL_MS = 500
 FANQIE_EDITOR_SAVE_SELECTORS = (
     "button.auto-editor-save-btn",
     "button[aria-label='存草稿']",
@@ -869,9 +881,9 @@ class _FanqieBrowserSession:
             if self._wait_for_text(names, exact=True, timeout_ms=150):
                 return True
             try:
-                self.page.wait_for_timeout(100)
+                self.page.wait_for_timeout(FANQIE_UI_READY_POLL_MS)
             except Exception:
-                time.sleep(0.1)
+                time.sleep(FANQIE_UI_READY_POLL_MS / 1000.0)
         return any(self._has_visible((selector,)) for selector in selectors) or self._wait_for_text(
             names, exact=True, timeout_ms=100
         )
@@ -892,9 +904,12 @@ class _FanqieBrowserSession:
                 except Exception:
                     continue
             try:
-                self.page.wait_for_timeout(150)
+                remaining_ms = max(1, int((deadline - time.monotonic()) * 1000))
+                poll_ms = min(FANQIE_UI_READY_POLL_MS, remaining_ms)
+                self.page.wait_for_timeout(poll_ms)
             except Exception:
-                time.sleep(0.15)
+                remaining_ms = max(1, int((deadline - time.monotonic()) * 1000))
+                time.sleep(min(FANQIE_UI_READY_POLL_MS, remaining_ms) / 1000.0)
         return False
 
     def _fill_first(self, selectors, value):
@@ -940,9 +955,9 @@ class _FanqieBrowserSession:
             if self._input_value_matches(item, expected):
                 return True
             try:
-                self.page.wait_for_timeout(80)
+                self.page.wait_for_timeout(FANQIE_INPUT_SYNC_POLL_MS)
             except Exception:
-                time.sleep(0.08)
+                time.sleep(FANQIE_INPUT_SYNC_POLL_MS / 1000.0)
         return self._input_value_matches(item, expected)
 
     def _fill_controlled_first(self, selectors, value):
@@ -1096,9 +1111,9 @@ class _FanqieBrowserSession:
             if self._has_visible(selectors):
                 return True
             try:
-                self.page.wait_for_timeout(100)
+                self.page.wait_for_timeout(FANQIE_UI_READY_POLL_MS)
             except Exception:
-                time.sleep(0.1)
+                time.sleep(FANQIE_UI_READY_POLL_MS / 1000.0)
         return self._has_visible(selectors)
 
     def _fill_editor_text(self, locator, text):
@@ -1158,9 +1173,9 @@ class _FanqieBrowserSession:
                 if word_count >= minimum_count:
                     return True
             try:
-                self.page.wait_for_timeout(100)
+                self.page.wait_for_timeout(FANQIE_EDITOR_SYNC_POLL_MS)
             except Exception:
-                time.sleep(0.1)
+                time.sleep(FANQIE_EDITOR_SYNC_POLL_MS / 1000.0)
         editor_length = self._read_editor_text_length()
         if editor_length is not None and editor_length >= max(1, int(expected_count * 0.98)):
             return True
@@ -1184,9 +1199,9 @@ class _FanqieBrowserSession:
                 # Some editor versions only expose the shorter success label.
                 return True
             try:
-                self.page.wait_for_timeout(180)
+                self.page.wait_for_timeout(FANQIE_SAVE_STATE_POLL_MS)
             except Exception:
-                time.sleep(0.18)
+                time.sleep(FANQIE_SAVE_STATE_POLL_MS / 1000.0)
         if any(token in last_body for token in ("已保存到云端", "已保存", "保存成功")):
             return True
         raise FanqieUploadError("番茄后台草稿保存状态未完成，已停止后续章节上传。")
@@ -1278,9 +1293,9 @@ class _FanqieBrowserSession:
                             self._wait_for_save_completion()
                             return True
                         try:
-                            self.page.wait_for_timeout(180)
+                            self.page.wait_for_timeout(FANQIE_SAVE_STATE_POLL_MS)
                         except Exception:
-                            time.sleep(0.18)
+                            time.sleep(FANQIE_SAVE_STATE_POLL_MS / 1000.0)
                 self._wait_for_save_completion()
                 if not request_listener_supported or not requests:
                     return True

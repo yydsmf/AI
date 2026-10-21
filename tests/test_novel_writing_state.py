@@ -515,6 +515,37 @@ class NovelWritingStateTests(unittest.TestCase):
 
         self.assertEqual(started, [True])
 
+    def test_single_chapter_runner_keeps_first_chapter_index_zero(self):
+        chapter = _new_chapter(0)
+        tab = NovelWritingTab.__new__(NovelWritingTab)
+        tab.current_project = {"chapters": [chapter]}
+        tab.current_project_path = "/tmp/test-project.json"
+        tab.current_chapter_index = 0
+        tab._flush_current_editors = lambda: None
+        tab._has_saved_project_path = lambda: True
+        tab._canonical_project_path = lambda path: path
+        tab._background_chapter_runner_for_path = lambda _path: None
+        tab._set_chapter_ai_actions_enabled = lambda _enabled: None
+        statuses = []
+        tab.set_status_tip = lambda text: statuses.append(text)
+        launched = []
+
+        with patch(
+            "gpt_desktop.novel_writing_tab.QTimer.singleShot",
+            side_effect=lambda _delay, callback: launched.append(callback),
+        ):
+            tab._start_detached_single_chapter_ai()
+
+        self.assertEqual(statuses, ["正在保存项目并启动后台单章扩写..."])
+        self.assertEqual(len(launched), 1)
+        with patch.object(tab, "_launch_detached_single_chapter_ai") as launch:
+            launched[0]()
+        launch.assert_called_once_with(
+            "/tmp/test-project.json",
+            0,
+            chapter["id"],
+        )
+
     def test_detached_single_runner_reselects_target_chapter_by_id(self):
         chapters = [_new_chapter(0), _new_chapter(1)]
         chapters[0]["id"] = "chapter-one"
@@ -5573,6 +5604,34 @@ class NovelWritingStateTests(unittest.TestCase):
 
         self.assertEqual(started, ["context:draft"])
         self.assertEqual(tab.current_project["chapters"][0]["ai_generation_checkpoint"], {})
+
+    def test_memory_finalize_checkpoint_keeps_first_chapter_index_zero(self):
+        chapter = _new_chapter(0)
+        chapter["outline"] = "第一章提纲"
+        chapter["memory_sync_status"] = "failed"
+        final_text = "第一章终稿。"
+        chapter["ai_generation_checkpoint"] = {
+            "version": 2,
+            "stage": "memory_finalize",
+            "status": "failed",
+            "project_path": "/tmp/project.json",
+            "chapter_id": chapter["id"],
+            "chapter_index": 0,
+            "final_text": final_text,
+            "final_text_sha256": NovelWritingTab._chapter_ai_checkpoint_hash(final_text),
+            "source_text_sha256": NovelWritingTab._chapter_ai_checkpoint_hash(""),
+            "outline_sha256": NovelWritingTab._chapter_ai_checkpoint_hash(chapter["outline"]),
+            "base_memory_revision": 0,
+        }
+        tab = NovelWritingTab.__new__(NovelWritingTab)
+        tab.current_project = {
+            "chapters": [chapter],
+            "long_form_memory": {"revision": 0},
+        }
+        tab.current_project_path = "/tmp/project.json"
+        tab.current_chapter_index = 0
+
+        self.assertEqual(tab._memory_finalize_checkpoint_text(chapter), final_text)
 
     def test_memory_finalize_valid_bundle_commits_body_and_state_atomically(self):
         chapter = _new_chapter(0)

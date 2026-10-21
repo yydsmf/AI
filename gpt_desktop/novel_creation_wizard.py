@@ -1595,6 +1595,57 @@ def _expand_character_transport(item):
     return {}
 
 
+def _split_mixed_bible_asset_transport(value):
+    """Separate asset rows when a model puts c/l/f rows in one c array.
+
+    The compact bible-assets contract uses three top-level arrays.  A model can
+    still return a valid JSON object with every row under ``c``; the row shapes
+    retain enough field markers to recover the intended groups without changing
+    any story content.
+    """
+    groups = {"characters": [], "lore": [], "foreshadows": []}
+    for item in _as_list(value):
+        if not isinstance(item, (dict, list, tuple)):
+            continue
+        if isinstance(item, (list, tuple)):
+            # Positional rows are unambiguous in the requested compact schema:
+            # characters have 7 slots, lore 4, and foreshadows 7.  Keep the
+            # code/stage shape ahead of the character shape because both
+            # characters and foreshadows use seven slots.
+            first = _as_text(item[0]) if item else ""
+            stage_slots = " ".join(
+                _as_text(item[index])
+                for index in (2, 3)
+                if index < len(item)
+            )
+            if re.fullmatch(r"[Ff]\d+", first) or stage_slots.count("阶段") >= 2:
+                groups["foreshadows"].append(item)
+            elif len(item) == 4:
+                groups["lore"].append(item)
+            else:
+                # Keep the longest character form as the default for legacy
+                # short rows.
+                groups["characters"].append(item)
+            continue
+
+        keys = {str(key) for key in item}
+        # f rows carry the stable id and the two stage positions.  These
+        # markers do not occur together in character or lore rows.
+        if (
+            {"i", "a", "b", "u"}.issubset(keys)
+            or {"code", "setup_stage", "payoff_stage", "remaining_secret"}.issubset(keys)
+        ):
+            groups["foreshadows"].append(item)
+            continue
+        # l rows carry the type and the amount of the story known by the
+        # characters.  The compact character row has neither marker.
+        if "t" in keys or "k" in keys or "type" in keys or "story_known" in keys:
+            groups["lore"].append(item)
+            continue
+        groups["characters"].append(item)
+    return groups
+
+
 def _normalize_character_record(value):
     if not isinstance(value, dict):
         return {}
@@ -2584,12 +2635,54 @@ def _expand_creation_transport(step, payload):
                     "g": "geography_and_life",
                 },
             )
-        if "characters" not in data and isinstance(data.get("c"), list):
-            data["characters"] = [
-                _expand_character_transport(item)
-                for item in data.get("c", [])
-                if isinstance(item, (list, dict))
-            ]
+        if isinstance(data.get("c"), list):
+            mixed_groups = _split_mixed_bible_asset_transport(data.get("c", []))
+            if "characters" not in data:
+                data["characters"] = [
+                    _expand_character_transport(item)
+                    for item in mixed_groups["characters"]
+                    if isinstance(item, (list, dict))
+                ]
+            if "lore" not in data and mixed_groups["lore"]:
+                data["lore"] = [
+                    _expand_transport_aliases(
+                        _compact_record(
+                            item,
+                            ("name", "type", "description", "story_known"),
+                        ),
+                        {
+                            "n": "name",
+                            "t": "type",
+                            "d": "description",
+                            "k": "story_known",
+                        },
+                    )
+                    for item in mixed_groups["lore"]
+                    if isinstance(item, (list, dict))
+                ]
+            if "foreshadows" not in data and mixed_groups["foreshadows"]:
+                data["foreshadows"] = [
+                    _expand_transport_aliases(
+                        _compact_record(
+                            item,
+                            (
+                                "code", "name", "setup_stage", "payoff_stage",
+                                "description", "revealed", "remaining_secret",
+                            ),
+                        ),
+                        {
+                            "i": "code",
+                            "n": "name",
+                            "a": "setup_stage",
+                            "b": "payoff_stage",
+                            "d": "description",
+                            "r": "revealed",
+                            "u": "remaining_secret",
+                        },
+                    )
+                    for item in mixed_groups["foreshadows"]
+                    if isinstance(item, (list, dict))
+                ]
         if "lore" not in data and isinstance(data.get("l"), list):
             data["lore"] = [
                 _expand_transport_aliases(
@@ -4033,6 +4126,22 @@ def _creation_scale_guidance(total_words):
 """.strip()
 
 
+def _creation_foreshadow_distribution_guidance(total_words):
+    """Make the per-stage foreshadow minimum explicit to the model."""
+    stage_count = _expected_stage_count(total_words)
+    stage_lines = "；".join(
+        f"第{stage_number}阶段的 setup_stage 至少填写3条"
+        for stage_number in range(1, stage_count + 1)
+    )
+    return (
+        "伏笔数量还要满足硬性分布："
+        f"f 至少返回 {stage_count * 3} 条，且必须按 setup_stage 分组覆盖全部{stage_count}个阶段；"
+        f"{stage_lines}。"
+        "每条伏笔的 setup_stage 只填写一个明确阶段，不能把后续阶段全部留空或把所有伏笔集中在前两个阶段；"
+        "输出前逐条检查 f 的 setup_stage 分布，确认每个阶段至少3条，再返回 JSON。"
+    )
+
+
 def _creation_foreshadow_stage_guidance(total_words):
     """给故事底盘安排阶段级伏笔位置，不提前锁死具体章节。"""
     try:
@@ -5013,8 +5122,9 @@ b 只能使用 c、r、t、m、p、e、h；w 只能使用 s、p、r、c、g。�
 {_creation_scale_guidance(total_words)}
 
 这是预计写到{_creation_scale_requirements(total_words)[0]}的长篇，按故事需要补足资料，不要把简介换个说法重复输出，也不要为了凑数量添加无根名词。伏笔位置此时只写第几阶段，不写具体章号。{_creation_foreshadow_stage_guidance(total_words)}
+{_creation_foreshadow_distribution_guidance(total_words)}
 
-只返回一个合法 JSON 对象，不能有 Markdown 或解释。为了避免字段名称混进内容，c、l、f 都使用短键对象，不使用定长内容数组：
+只返回一个合法 JSON 对象，不能有 Markdown 或解释。顶层必须同时返回 c、l、f 三个键：c 只能放人物，l 只能放设定，f 只能放伏笔；即使资料很多，也不能把 l 或 f 的记录追加到 c 数组。为了避免字段名称混进内容，c、l、f 都使用短键对象，不使用定长内容数组：
 {{"c":[{{"n":"姓名","r":"身份和故事位置","g":"当前目标","s":"秘密","p":"人物性格/特点","v":"语言风格","q":"害怕失去什么、与主角的长期关系底色和长期变化"}}],"l":[{{"n":"名称","t":"类型","d":"具体内容","k":"人物当前知道多少"}}],"f":[{{"i":"编号","n":"名称","a":"埋设阶段","b":"回收阶段","d":"读者能看到的线索及后续变化","r":"揭开后会改变什么","u":"仍未揭开的部分"}}]}}
 c 中每项只能使用 n、r、g、s、p、v、q；l 中每项只能使用 n、t、d、k；f 中每项只能使用 i、n、a、b、d、r、u。键名只是程序标记，不能把“姓名”“身份和故事位置”等示例文字原样返回；每个值必须直接写这本小说的实际内容。只输出 c、l、f，不要重复输出 b 或 w。人物、设定和伏笔数量要达到长篇规模要求。{("高武、玄幻、仙侠、修真、武道题材的 l 中必须包含一条按从低到高排列的实力体系条目；它要使用 l 的四个字段写完整境界内容，每个境界一到两句话。" if power_levels_guidance else "")}"""
             prompt += """
@@ -5133,6 +5243,16 @@ c 中每项只能使用 n、r、g、s、p、v、q；l 中每项只能使用 n、
 """
         if self.creation_step == "stage_plan":
             prompt = _compact_stage_plan_prompt(prompt)
+        retry_feedback = _as_text(
+            self.creation_context.get("generation_retry_feedback")
+        ).strip()
+        if retry_feedback:
+            prompt += (
+                "\n\n上一轮返回已经到达程序，但未通过结构或资料完整性校验。"
+                "本次只根据下面的错误反馈修正缺口，仍然返回完整的当前批次 JSON；"
+                "不要解释错误，也不要只返回缺失项：\n"
+                + retry_feedback[:2000]
+            )
         project_entity_guidance = _creation_entity_naming_guidance(self.creation_context)
         if project_entity_guidance:
             prompt += "\n\n" + project_entity_guidance
@@ -7037,7 +7157,7 @@ class NovelCreationWizardDialog(QDialog):
             return
         self._set_status_text(self._status_text)
 
-    def _context_for_step(self, step):
+    def _context_for_step(self, step, retry_feedback=""):
         inspiration = self.inspiration_edit.text().strip()
         requested_title = _creation_requested_title(
             inspiration,
@@ -7181,6 +7301,9 @@ class NovelCreationWizardDialog(QDialog):
                         )
                     ]
                 )
+        retry_feedback = _as_text(retry_feedback).strip()
+        if retry_feedback:
+            context["generation_retry_feedback"] = retry_feedback[:2000]
         return context
 
     def _current_premise(self):
@@ -7227,6 +7350,11 @@ class NovelCreationWizardDialog(QDialog):
         if self.worker is not None:
             return
         retrying_same_request = bool(self._retrying_same_request)
+        retry_feedback = (
+            self._last_worker_error
+            if retrying_same_request or self._generation_failed
+            else ""
+        )
         self._retrying_same_request = False
         if not retrying_same_request:
             self._generation_retry_count = 0
@@ -7272,7 +7400,7 @@ class NovelCreationWizardDialog(QDialog):
             editor = self.json_editors.get("stage_plan")
             if editor is not None:
                 editor.clear()
-        context = self._context_for_step(step)
+        context = self._context_for_step(step, retry_feedback=retry_feedback)
         self.worker = NovelCreationWorker(
             provider.get("base_url", ""),
             provider.get("api_key", ""),

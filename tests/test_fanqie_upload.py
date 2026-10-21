@@ -9,6 +9,7 @@ from PySide6.QtWidgets import QApplication
 
 from gpt_desktop.fanqie_upload import (
     _FanqieBrowserSession,
+    FANQIE_BROWSER_LAUNCH_TIMEOUT_MS,
     _extract_id_from_url,
     _interpret_publish_response,
     FanqieBatchUploadWorker,
@@ -257,6 +258,78 @@ class FanqieUploadTests(unittest.TestCase):
         self.assertTrue(browser._click_next_editor_button())
         self.assertEqual(browser.page.save.clicks, 1)
         self.assertEqual(browser.page.next.clicks, 1)
+
+    def test_browser_launch_has_bounded_timeout_and_retries_failed_process(self):
+        class FakeContext:
+            pages = []
+
+            def __init__(self):
+                self.closed = False
+
+            def new_page(self):
+                return object()
+
+            def close(self):
+                self.closed = True
+
+        class FakeChromium:
+            def __init__(self):
+                self.calls = []
+                self.context = FakeContext()
+
+            def launch_persistent_context(self, **kwargs):
+                self.calls.append(kwargs)
+                if len(self.calls) == 1:
+                    raise RuntimeError(
+                        "BrowserType.launch_persistent_context: Timeout 30000ms exceeded\n"
+                        "  - <launched> pid=999999"
+                    )
+                return self.context
+
+        class FakePlaywright:
+            def __init__(self):
+                self.chromium = FakeChromium()
+                self.stopped = False
+
+            def start(self):
+                return self
+
+            def stop(self):
+                self.stopped = True
+
+        playwright = FakePlaywright()
+        progress = []
+        browser = _FanqieBrowserSession(
+            headless=True,
+            progress_callback=progress.append,
+        )
+        with tempfile.TemporaryDirectory() as tmp, patch(
+            "gpt_desktop.fanqie_upload.FANQIE_PROFILE_DIR", tmp
+        ), patch(
+            "gpt_desktop.fanqie_upload._load_playwright_sync_api",
+            return_value=lambda: playwright,
+        ), patch(
+            "gpt_desktop.fanqie_upload._browser_executable_path",
+            return_value="/tmp/chrome",
+        ), patch(
+            "gpt_desktop.fanqie_upload._terminate_playwright_process"
+        ) as terminate, patch(
+            "gpt_desktop.fanqie_upload.time.sleep"
+        ):
+            with browser as active:
+                self.assertIs(active.context, playwright.chromium.context)
+
+        self.assertEqual(len(playwright.chromium.calls), 2)
+        self.assertTrue(all(
+            call.get("timeout") == FANQIE_BROWSER_LAUNCH_TIMEOUT_MS
+            for call in playwright.chromium.calls
+        ))
+        terminate.assert_called_once_with(999999)
+        self.assertTrue(any(
+            message.startswith("正在启动番茄独立浏览器")
+            for message in progress
+        ))
+        self.assertIn("番茄独立浏览器已启动", progress[-1])
 
     def test_draft_save_does_not_fall_back_to_next_step(self):
         browser = object.__new__(_FanqieBrowserSession)

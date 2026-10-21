@@ -67,6 +67,69 @@ class NovelCreationWizardPersistenceTests(unittest.TestCase):
         self.assertIn("每个阶段至少生成3条真正有长期回收价值的新增伏笔", guidance)
         self.assertNotIn("每个阶段至少准备5条", guidance)
 
+    def test_foreshadow_distribution_guidance_covers_every_stage(self):
+        guidance = wizard._creation_foreshadow_distribution_guidance(300000)
+        self.assertIn("f 至少返回 9 条", guidance)
+        self.assertIn("第1阶段的 setup_stage 至少填写3条", guidance)
+        self.assertIn("第2阶段的 setup_stage 至少填写3条", guidance)
+        self.assertIn("第3阶段的 setup_stage 至少填写3条", guidance)
+
+    def test_bible_assets_recovers_rows_mixed_under_compact_c_key(self):
+        result = wizard.normalize_creation_result(
+            "bible",
+            {
+                "c": [
+                    {
+                        "n": "人物甲",
+                        "r": "主角",
+                        "g": "目标",
+                        "s": "秘密",
+                        "p": "性格",
+                        "v": "口吻",
+                        "q": "长期变化",
+                    },
+                    {
+                        "n": "设定甲",
+                        "t": "规则",
+                        "d": "具体内容",
+                        "k": "人物已知",
+                    },
+                    {
+                        "i": "f1",
+                        "n": "伏笔甲",
+                        "a": "第1阶段",
+                        "b": "第2阶段",
+                        "d": "线索",
+                        "r": "揭示结果",
+                        "u": "未揭开",
+                    },
+                ],
+            },
+            foreshadow_stage_count=5,
+        )
+
+        self.assertEqual([item["name"] for item in result["characters"]], ["人物甲"])
+        self.assertEqual([item["name"] for item in result["lore"]], ["设定甲"])
+        self.assertEqual([item["code"] for item in result["foreshadows"]], ["F0001"])
+        self.assertEqual(result["foreshadows"][0]["setup_stage"], "第1阶段")
+
+    def test_bible_assets_recovers_positional_foreshadow_rows_mixed_under_c_key(self):
+        result = wizard.normalize_creation_result(
+            "bible",
+            {
+                "c": [
+                    ["人物甲", "主角", "目标", "秘密", "性格", "口吻", "备注"],
+                    ["设定甲", "规则", "具体内容", "人物已知"],
+                    ["F1", "伏笔甲", "第1阶段", "第2阶段", "线索", "揭示结果", "未揭开"],
+                ],
+            },
+            foreshadow_stage_count=5,
+        )
+
+        self.assertEqual(len(result["characters"]), 1)
+        self.assertEqual(len(result["lore"]), 1)
+        self.assertEqual(result["foreshadows"][0]["code"], "F0001")
+
     def test_character_style_choice_only_exposes_personality_and_voice(self):
         entry = {
             "id": "style-1",

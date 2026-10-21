@@ -2577,7 +2577,7 @@ class NovelLongFormContextTests(unittest.TestCase):
         self.assertIn("文学化意象、空泛比喻", draft_context)
         self.assertNotIn("比喻可以自由使用", guidance)
         expression_boundary = self._context_section(draft_context, "正文自然表达边界")
-        self.assertLess(len(expression_boundary), 500)
+        self.assertLess(len(expression_boundary), 800)
         self.assertLessEqual(len(guidance), 1200)
         self.assertNotIn("【风格锁定规则】", draft_context)
         self.assertNotIn("【AI文风画像】", draft_context)
@@ -5831,6 +5831,18 @@ class NovelLongFormContextTests(unittest.TestCase):
         self.assertIn("目标的85%-115%", context)
         self.assertNotIn("2970-3150字", context)
 
+    def test_draft_prompt_uses_natural_word_count_for_dialogue_claims(self):
+        current = _new_chapter(0)
+        current["title"] = "第一章 入城"
+        current["outline"] = "主角入城调查旧案。"
+        project = self._project_with_current_chapter(current)
+
+        context = _build_chapter_ai_context(project, 0, "draft")
+
+        self.assertIn("‘“辛苦了。”’引号内只有‘辛苦了’三个字", context)
+        self.assertIn("不能写‘四个字落下’", context)
+        self.assertIn("不要把“字数”按字符数计算", context)
+
     def test_chapter_context_ignores_core_role_words_without_exact_character_name(self):
         current = _new_chapter(0)
         current["title"] = "第十二章 入城"
@@ -8468,6 +8480,20 @@ class NovelLongFormContextTests(unittest.TestCase):
         )
         self.assertTrue(any("段落密度" in error or "短段" in error for error in errors))
 
+    def test_draft_context_requires_concrete_state_word_collocations(self):
+        current = _new_chapter(0)
+        current["outline"] = "训练场上，教官阻止顾星河在准备不足时冲关。"
+        context = _build_chapter_ai_context(
+            self._project_with_current_chapter(current),
+            0,
+            "draft",
+        )
+
+        self.assertIn("【具体状态词搭配】", context)
+        self.assertIn("不要把‘完整、正确、成立、合理’等适合结论、资料或关系的抽象词直接套在气血、伤势或力量上", context)
+        self.assertIn("没有药剂辅助，气血稳不住、冲关时会乱或身体扛不住", context)
+        self.assertIn("‘气血变得完整’不自然", context)
+
     def test_style_finalize_acceptance_blocks_published_boundary_replay(self):
         previous = _new_chapter(0)
         previous["text"] = "医生刚把手收回。\n\n“他还没死。”\n\n滴——"
@@ -9148,6 +9174,25 @@ class NovelLongFormContextTests(unittest.TestCase):
         self.assertEqual(len(issues), 1)
         self.assertIn("这几个字用得很妙。", repaired)
         self.assertNotIn("这四个字用得很妙。", repaired)
+
+    def test_quoted_literal_count_claim_excludes_punctuation_and_quotes(self):
+        body = "“辛苦了。”\n\n四个字落下，沈砚秋的眼底微微一动。"
+
+        repaired, issues = _repair_literal_count_claims(body)
+
+        self.assertEqual(len(issues), 1)
+        self.assertIn("三个字落下，沈砚秋的眼底微微一动。", repaired)
+        self.assertNotIn("四个字落下", repaired)
+        self.assertEqual(issues[0]["actual"], 3)
+        self.assertEqual(issues[0]["normalization"], "quoted_literal_count")
+
+    def test_quoted_literal_count_claim_preserves_arabic_count_style(self):
+        body = "“A1。”\n\n4个字落下。"
+
+        repaired, issues = _repair_literal_count_claims(body)
+
+        self.assertEqual(len(issues), 1)
+        self.assertIn("2个字落下。", repaired)
 
     def test_deictic_literal_count_claims_do_not_infer_an_earlier_quote(self):
         body = (

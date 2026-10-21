@@ -4,6 +4,7 @@ import uuid
 import hashlib
 import json
 import math
+import unicodedata
 from copy import deepcopy
 from collections import Counter
 from difflib import SequenceMatcher
@@ -8020,6 +8021,50 @@ _LITERAL_COUNT_CHINESE_DIGITS = {
 }
 
 
+def _literal_count_content_len(value):
+    """Count natural-language letters and numbers, excluding punctuation."""
+    return sum(
+        1
+        for char in str(value or "")
+        if unicodedata.category(char).startswith(("L", "N"))
+    )
+
+
+def _literal_count_int_to_chinese(value):
+    value = int(value or 0)
+    if value < 0 or value > 999:
+        return str(value)
+    digits = "零一二三四五六七八九"
+    if value < 10:
+        return digits[value]
+    if value < 20:
+        return "十" if value == 10 else "十" + digits[value % 10]
+    if value < 100:
+        tens, ones = divmod(value, 10)
+        return digits[tens] + "十" + ("" if not ones else digits[ones])
+    hundreds, remainder = divmod(value, 100)
+    result = digits[hundreds] + "百"
+    if not remainder:
+        return result
+    if remainder < 10:
+        return result + "零" + digits[remainder]
+    tens, ones = divmod(remainder, 10)
+    return result + digits[tens] + "十" + ("" if not ones else digits[ones])
+
+
+def _literal_count_number_text(value, source_text):
+    """Format a corrected count with the same Arabic/Chinese style as the claim."""
+    if str(source_text or "").strip().isdigit():
+        return str(int(value or 0))
+    return _literal_count_int_to_chinese(value)
+
+
+_LITERAL_COUNT_QUOTED_CLAIM_RE = re.compile(
+    r"(?P<open>[“「『\"])(?P<content>[^”」』\"\r\n]*)(?P<close>[”」』\"])(?P<space>\s*)"
+    r"(?P<deictic>[这那]?)(?P<num>\d{1,3}|[零〇一二两三四五六七八九十]{1,3})个字"
+)
+
+
 def _literal_count_number_to_int(value):
     text = str(value or "").strip()
     if not text:
@@ -8045,15 +8090,38 @@ def _literal_count_number_to_int(value):
 
 
 def _literal_count_claim_issues(final_text):
-    """Normalize deictic literal-count claims without guessing their referent."""
+    """Correct count claims tied directly to a quote and normalize ambiguous ones."""
     body = str(final_text or "")
     if not body.strip():
         return []
+    issues = []
+    exact_claim_ranges = []
+    for match in _LITERAL_COUNT_QUOTED_CLAIM_RE.finditer(body):
+        claimed = _literal_count_number_to_int(match.group("num"))
+        actual = _literal_count_content_len(match.group("content"))
+        if claimed is None or actual <= 0 or claimed == actual:
+            continue
+        start = match.start("deictic") if match.group("deictic") else match.start("num")
+        end = match.end("num")
+        replacement_num = _literal_count_number_text(actual, match.group("num"))
+        replacement = f"{match.group('deictic')}{replacement_num}"
+        exact_claim_ranges.append((start, end))
+        issues.append({
+            "claimed": claimed,
+            "actual": actual,
+            "claim_text": body[start:end] + "个字",
+            "num_text": match.group("num"),
+            "replacement_text": replacement,
+            "start": start,
+            "end": end,
+            "normalization": "quoted_literal_count",
+        })
     pattern = re.compile(
         r"(?P<deictic>[这那])(?P<num>\d{1,2}|[零〇一二两三四五六七八九十]{1,3})个字"
     )
-    issues = []
     for match in pattern.finditer(body):
+        if any(start <= match.start() < end for start, end in exact_claim_ranges):
+            continue
         claimed = _literal_count_number_to_int(match.group("num"))
         # "这一个字" remains natural and unambiguous. Any larger claimed
         # count is intentionally generalized instead of trying to infer which
@@ -10028,6 +10096,11 @@ def _grounded_prose_contract():
         "人物反感眼前的说法或安排时，直接落到具体对象、场面和自己是否配合上；允许用人物自己的口语吐槽或拒绝，"
         "不要把具体冲突写成抽象的权利、资格、归属、责任或关系宣言，也不要反复套用‘事实+反转总结’的口号式句型；"
         "正文尽量少用‘决定’‘选择’‘不代表’等抽象词，除非剧情确实离不开，优先写具体的人、物、动作、反应和结果。\n"
+        "【具体状态词搭配】\n"
+        "涉及气血、真气、灵力、内力、经脉、伤势、药剂等身体或力量状态时，先判断实际变化是稳定、恢复、运转、凝聚、消耗、紊乱、受损还是不足，使用与该状态匹配的动词和形容词；"
+        "不要把‘完整、正确、成立、合理’等适合结论、资料或关系的抽象词直接套在气血、伤势或力量上。"
+        "对白中的反驳必须回应对方眼前的动作或主张，写出具体后果；例如对方说‘不用药剂’，应落到‘没有药剂辅助，气血稳不住、冲关时会乱或身体扛不住’这类现场结果，"
+        "不要把‘嘴硬’和一个抽象结论拼成听着利落、实际不合语义的金句。\n"
     )
 
 
@@ -10039,6 +10112,9 @@ def _natural_expression_guidance():
         "情绪和气氛必须通过人物当下的动作、对白、心理和具体结果表现，不用漂亮形容替代剧情。"
         + _prose_scene_grounding_guidance(compact=True)
         + "对白按关系和现场情绪自然接话，心理变化随人物自然展开。"
+        "涉及气血、真气、灵力、内力、经脉、伤势、药剂等状态时，先核对变化，用稳定、恢复、运转、凝聚、消耗、紊乱、受损或不足等匹配表达；"
+        "不要把‘完整、正确、成立、合理’直接套上去；例如‘没有药剂辅助，气血稳不住’自然，‘气血变得完整’不自然。"
+        "对白回应眼前主张和后果，不把‘嘴硬’与抽象结论拼成金句。"
         "项目资料决定故事事实、人物和剧情；文风参考只决定表达方式，不把参考原文的人物、剧情、物件或句子带入当前正文。"
     )
 
@@ -22011,7 +22087,9 @@ def _build_chapter_ai_context(project, chapter_index, action):
     is_final_chapter = _is_project_final_chapter(project, chapter_index)
     final_chapter_guidance = _final_chapter_ending_guidance() if is_final_chapter else ""
     no_text_count_rule = (
-        "能不用“几个字/几个词/几个音节”就不用；真要写字数，标点符号、引号和空格都不计入字数。"
+        "能不用“几个字/几个词/几个音节”就不用；真要写字数，只按自然语言中的汉字、字母和数字计数，"
+        "标点符号、引号、括号、空格和换行都不计入。特别注意：‘“辛苦了。”’引号内只有‘辛苦了’三个字，"
+        "句号和引号是符号，所以后文必须写‘三个字落下’，不能写‘四个字落下’；不要把“字数”按字符数计算。"
     )
     draft_task = (
         "请根据当前章节的章节提纲和已有正文草稿续写正文。正文草稿已有内容时，只输出可以直接接在草稿末尾的新正文，"
@@ -22385,7 +22463,7 @@ def _build_chapter_ai_context(project, chapter_index, action):
         style_sections.append((
             "正文自然表达边界",
             _natural_expression_guidance(),
-            900,
+            800,
             False,
         ))
     memory_view = runtime_project

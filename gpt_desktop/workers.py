@@ -2242,6 +2242,7 @@ class NovelAnalysisWorker(QThread):
         sse_lines = 0
         invalid_sse_lines = 0
         received_done = False
+        parsed_stream_result = None
         try:
             r = session.post(
                 url,
@@ -2380,6 +2381,23 @@ class NovelAnalysisWorker(QThread):
                         self._emit_output_chars(len(content_piece))
                     elif not full:
                         self.last_partial_output = reasoning_full
+
+                # Some compatible gateways send the final content and then
+                # leave the HTTP connection open without a finish signal. Once
+                # the top-level JSON object is complete, there is no useful
+                # content left to wait for. If a finish reason was provided,
+                # keep reading so a following DONE marker remains observable.
+                if full.strip() and not finish_reason:
+                    candidate = self._extract_json_object_candidate(full)
+                    if candidate and candidate.rstrip().endswith("}"):
+                        try:
+                            parsed_candidate = json.loads(candidate)
+                        except Exception:
+                            parsed_candidate = None
+                        if isinstance(parsed_candidate, dict):
+                            parsed_stream_result = parsed_candidate
+                            break
+
             if not full.strip():
                 raise Exception("AI 没有返回有效候选内容。")
             if finish_reason in {"length", "max_tokens", "token_limit"}:
@@ -2387,7 +2405,11 @@ class NovelAnalysisWorker(QThread):
                     f"AI 返回在输出上限处被截断（finish_reason={finish_reason}）。"
                 )
             try:
-                parsed = self._parse_json_result(full)
+                parsed = (
+                    parsed_stream_result
+                    if parsed_stream_result is not None
+                    else self._parse_json_result(full)
+                )
             except Exception as parse_error:
                 if not received_done:
                     raise ValueError(

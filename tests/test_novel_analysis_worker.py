@@ -597,6 +597,54 @@ class NovelAnalysisWorkerTests(unittest.TestCase):
         self.assertEqual(worker.diagnostics["content_chars"], attempt["content_chars"])
         self.assertEqual(attempt["outcome"], "success")
 
+    def test_analysis_stream_accepts_finish_reason_without_done_marker(self):
+        worker = NovelAnalysisWorker("http://example.test", "key", "model", "项目资料")
+        content = json.dumps(
+            {
+                "characters": [],
+                "lore": [],
+                "foreshadows": [],
+                "project_materials": {},
+            },
+            ensure_ascii=False,
+        )
+        worker._new_session = lambda: _FakeStreamSession([
+            f'data: {json.dumps({"choices": [{"delta": {"content": content}, "finish_reason": "stop"}]}, ensure_ascii=False)}',
+        ])
+
+        parsed = worker._post_analysis_chunk_stream(
+            "系统提示词", "本次规划上下文", 1, 1, True
+        )
+
+        self.assertEqual(parsed["characters"], [])
+        self.assertEqual(worker.diagnostics["attempts"][0]["finish_reason"], "stop")
+        self.assertFalse(worker.diagnostics["attempts"][0]["received_done"])
+        self.assertEqual(worker.diagnostics["attempts"][0]["outcome"], "success")
+
+    def test_analysis_stream_stops_after_complete_json_without_finish_or_done(self):
+        worker = NovelAnalysisWorker("http://example.test", "key", "model", "项目资料")
+        content = json.dumps(
+            {
+                "characters": [{"name": "人物甲"}],
+                "lore": [],
+                "foreshadows": [],
+                "project_materials": {},
+            },
+            ensure_ascii=False,
+        )
+        worker._new_session = lambda: _FakeStreamSession([
+            f'data: {json.dumps({"choices": [{"delta": {"content": content}}]}, ensure_ascii=False)}',
+        ])
+
+        parsed = worker._post_analysis_chunk_stream(
+            "系统提示词", "本次规划上下文", 1, 1, True
+        )
+
+        self.assertEqual(parsed["characters"][0]["name"], "人物甲")
+        self.assertFalse(worker.diagnostics["attempts"][0]["finish_reason"])
+        self.assertFalse(worker.diagnostics["attempts"][0]["received_done"])
+        self.assertEqual(worker.diagnostics["attempts"][0]["outcome"], "success")
+
     def test_rate_limit_error_does_not_split_large_chunk(self):
         worker = NovelAnalysisWorker("http://example.test", "key", "model", "正文")
         worker._set_analysis_stream_supported(False)

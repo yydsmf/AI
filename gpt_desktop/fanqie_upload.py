@@ -7,6 +7,7 @@
 import os
 import json
 import re
+import signal
 import threading
 import time
 from copy import deepcopy
@@ -48,6 +49,9 @@ FANQIE_PROFILE_DIR = os.path.join(APP_DIR, "fanqie_browser_profile")
 FANQIE_UPLOAD_SCHEMA_VERSION = 1
 FANQIE_UPLOAD_MODES = {"draft", "direct_publish", "scheduled_publish"}
 FANQIE_WORK_TYPES = {"unknown", "serial", "completed"}
+FANQIE_BROWSER_LAUNCH_TIMEOUT_MS = 30000
+FANQIE_BROWSER_PROFILE_LOCK_TIMEOUT_SECONDS = 45
+FANQIE_BROWSER_LAUNCH_RETRIES = 2
 FANQIE_EDITOR_SAVE_SELECTORS = (
     "button.auto-editor-save-btn",
     "button[aria-label='存草稿']",
@@ -61,6 +65,48 @@ _PROJECT_WRITE_LOCK = threading.RLock()
 # the same time.  Keep the login session shared while serializing browser
 # access across projects and the work-list reader.
 _BROWSER_PROFILE_LOCK = threading.Lock()
+
+
+def _playwright_launched_pid(error):
+    matches = re.findall(r"<launched>\s+pid=(\d+)", str(error or ""))
+    if not matches:
+        return 0
+    try:
+        return int(matches[-1])
+    except (TypeError, ValueError):
+        return 0
+
+
+def _terminate_playwright_process(pid):
+    """Stop only the browser process reported by the failed Playwright launch."""
+    try:
+        pid = int(pid or 0)
+    except (TypeError, ValueError):
+        return False
+    if pid <= 0 or pid == os.getpid():
+        return False
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except ProcessLookupError:
+        return False
+    except Exception:
+        return False
+    deadline = time.monotonic() + 2.0
+    while time.monotonic() < deadline:
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return True
+        except Exception:
+            return True
+        time.sleep(0.05)
+    try:
+        os.kill(pid, getattr(signal, "SIGKILL", signal.SIGTERM))
+    except ProcessLookupError:
+        pass
+    except Exception:
+        return False
+    return True
 
 
 class FanqieUploadError(RuntimeError):
@@ -431,7 +477,15 @@ class _FanqieBrowserSession:
     def __enter__(self):
         sync_playwright = _load_playwright_sync_api(self.progress_callback)
         os.makedirs(FANQIE_PROFILE_DIR, exist_ok=True)
-        _BROWSER_PROFILE_LOCK.acquire()
+        if callable(self.progress_callback):
+            self.progress_callback("正在启动番茄独立浏览器...")
+        if not _BROWSER_PROFILE_LOCK.acquire(
+            timeout=FANQIE_BROWSER_PROFILE_LOCK_TIMEOUT_SECONDS
+        ):
+            raise FanqieUploadError(
+                "番茄独立浏览器正在被另一个上传任务占用，等待45秒后仍未释放；"
+                "请关闭其他番茄批量上传任务后重试。"
+            )
         self._profile_lock_acquired = True
         try:
             self._playwright = sync_playwright().start()
@@ -451,12 +505,39 @@ class _FanqieBrowserSession:
                 "请先安装其中一个浏览器后重试；程序不会自动下载浏览器本体。"
             )
         launch_kwargs["executable_path"] = executable
-        try:
-            self.context = self._playwright.chromium.launch_persistent_context(**launch_kwargs)
-        except Exception as exc:
+        launch_error = None
+        for attempt in range(1, FANQIE_BROWSER_LAUNCH_RETRIES + 1):
+            try:
+                self.context = self._playwright.chromium.launch_persistent_context(
+                    **launch_kwargs,
+                    timeout=FANQIE_BROWSER_LAUNCH_TIMEOUT_MS,
+                )
+                break
+            except Exception as exc:
+                launch_error = exc
+                launched_pid = _playwright_launched_pid(exc)
+                if launched_pid:
+                    _terminate_playwright_process(launched_pid)
+                if attempt >= FANQIE_BROWSER_LAUNCH_RETRIES:
+                    self.close()
+                    detail = clean_error_text(exc)
+                    raise FanqieUploadError(
+                        "无法启动番茄独立浏览器。已等待并清理本次启动的残留进程，"
+                        "但仍未成功；请关闭其他占用番茄独立浏览器配置的窗口后重试。"
+                        f"\n诊断信息：{detail}"
+                    ) from exc
+                if callable(self.progress_callback):
+                    self.progress_callback(
+                        f"番茄独立浏览器启动未完成，正在清理后第{attempt + 1}次重试..."
+                    )
+                time.sleep(0.8)
+        if self.context is None:
             self.close()
-            raise FanqieUploadError(f"无法启动番茄独立浏览器：{clean_error_text(exc)}") from exc
+            detail = clean_error_text(launch_error) if launch_error else "未知启动错误"
+            raise FanqieUploadError(f"无法启动番茄独立浏览器。\n诊断信息：{detail}")
         self.page = self.context.pages[0] if self.context.pages else self.context.new_page()
+        if callable(self.progress_callback):
+            self.progress_callback("番茄独立浏览器已启动，正在进入作品发布页...")
         return self
 
     def close(self):

@@ -12580,7 +12580,9 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
             )
             self.set_status_tip(f"《{title}》仍在{task_label}，可继续操作其他章节。")
             return
-        chapter_index = int(getattr(self, "current_chapter_index", -1) or -1)
+        # Chapter indexes are zero-based. Preserve index 0 instead of treating
+        # it as a missing value when the first chapter is selected.
+        chapter_index = int(getattr(self, "current_chapter_index", -1))
         chapter_id = self._current_chapter_id()
         if chapter_index < 0 or not chapter_id:
             self.set_status_tip("当前没有可扩写的章节。")
@@ -14431,10 +14433,22 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
             or bool(checkpoint_project_path and current_project_path)
             and checkpoint_project_path == current_project_path
         )
+        try:
+            raw_checkpoint_index = checkpoint.get("chapter_index", -1)
+            checkpoint_index = int(
+                raw_checkpoint_index
+                if raw_checkpoint_index is not None and str(raw_checkpoint_index).strip()
+                else -1
+            )
+        except (TypeError, ValueError):
+            checkpoint_index = -1
+        try:
+            current_chapter_index = int(getattr(self, "current_chapter_index", -1))
+        except (TypeError, ValueError):
+            current_chapter_index = -1
         chapter_index_matches = (
             checkpoint_version < 2
-            or int(checkpoint.get("chapter_index", -1) or -1)
-            == int(getattr(self, "current_chapter_index", -1) or -1)
+            or checkpoint_index == current_chapter_index
         )
         source_matches = checkpoint_source_hash == current_text_hash or current_text_hash == final_text_hash
         valid = (

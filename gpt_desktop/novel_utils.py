@@ -250,8 +250,12 @@ def _infer_foreshadow_status(item, preserve_manual=True):
         any(k in current for k in ("已埋", "已埋设", "埋设", "已铺垫", "待回收", "未回收", "待兑现"))
         or status_text in {
             "open", "active", "buried", "setup", "seeded", "advanced",
-            "progressed", "reinforced",
+            "progressed", "reinforced", "progress", "revealed",
         }
+        or any(k in current for k in (
+            "推进", "已推进", "部分揭示", "已揭示", "部分回收", "阶段性回收",
+            "推进但未回收", "仍未回收", "尚未回收",
+        ))
     ):
         return "已埋"
     if any(k in current for k in ("未埋", "未出现", "待埋")) or status_text in {"new", "planned", "unburied"}:
@@ -13461,7 +13465,7 @@ def _long_form_compact_update_contract_instructions(project, chapter_index):
         "foreshadow_updates只写本章实际埋设、推进、回收或废弃的伏笔；create使用NT临时key。"
         "伏笔原始说明、计划章节和历史运行观察只用于识别背景；历史运行观察是旧章节的观察记录，不能替代本章最终正文证据。"
         "本章伏笔是否更新必须以最终正文中的evidence_quote和当前正文语义为准；即使历史记录已经写过已埋，也不能据此把本章无关内容挂到该伏笔。"
-        "每条foreshadow_updates必须输出state、revealed、remaining_secret和evidence_quote；state填写本章运行态变化，revealed只写正文已公开内容，remaining_secret写仍未揭示边界；不得把operation或status当作state或revealed，evidence_quotes数组必须落实为一条正文中的连续evidence_quote。"
+        "每条foreshadow_updates必须输出status、state、revealed、remaining_secret和evidence_quote；status只能是未埋/已埋/已回收/无需回收/废弃：正文只是推进或仍有未揭示边界时写已埋，只有正文明确解释、揭晓或兑现该伏笔时才写已回收，并填写真实payoff_chapter；正文明确说明不需要继续牵引或已经作废时才写无需回收或废弃。state填写本章运行态变化，revealed只写正文已公开内容，remaining_secret写仍未揭示边界；不得把operation或status当作state或revealed，evidence_quotes数组必须落实为一条正文中的连续evidence_quote。"
         "state_patch只写本章结束时新增或变化的时间、地点、人物、关系、物件、冲突和任务；"
         "更新已有冲突或任务必须填写真实ID及previous_conflict/previous_task，新增使用NCF/NTASK临时key。"
         "所有非keep事实更新、人物/设定/伏笔更新以及state_patch变化都必须附最终正文中的8-60字连续逐字evidence_quote。"
@@ -22409,7 +22413,8 @@ def _build_chapter_ai_context(project, chapter_index, action):
         planned_route_guide = (
             "按伏笔计划章节提供本章相关伏笔：埋设章节前一章仅作可选的前置铺垫方向，"
             "不要求必须出现，也不能为了铺垫改写当前主线；埋设章节按正式埋设处理，"
-            "回收章节按正式回收处理。只有当前路由列出的伏笔才是本次正文扩写的主动参考，"
+            "回收章节按正式回收处理：正文必须在场景中回答该伏笔的单一核心问题，明确证据、责任或原因，并留下具体行动、对白、关系结果或局势结果；"
+            "仅有再次出现、部分揭示、冲突升级、确认事情不简单或留下新问题都不算回收。只有当前路由列出的伏笔才是本次正文扩写的主动参考，"
             "其他伏笔不主动传入。正式埋设或正式回收仍须结合本章提纲和人物行动自然落地，"
             "不得凭空新增无关场景，不提前写出回收章节之后的答案。"
         )

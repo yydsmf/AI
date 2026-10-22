@@ -119,6 +119,38 @@ class NovelLongFormContextTests(unittest.TestCase):
         self.assertIn("推进关系，但来源仍未知", cleaned)
         self.assertIn("正文证据：她没有把这件事当成答案。", cleaned)
 
+    def test_compact_memory_contract_requires_foreshadow_terminal_status(self):
+        project = self._project_with_current_chapter(_new_chapter(0))
+
+        contract = _long_form_update_contract_instructions(
+            project,
+            0,
+            compact=True,
+        )
+
+        self.assertIn("每条foreshadow_updates必须输出status、state、revealed、remaining_secret和evidence_quote", contract)
+        self.assertIn("只有正文明确解释、揭晓或兑现该伏笔时才写已回收", contract)
+        self.assertIn("填写真实payoff_chapter", contract)
+
+    def test_planned_payoff_guidance_requires_scene_level_closure(self):
+        project = self._project_with_current_chapter(_new_chapter(0))
+        project["foreshadow_items"] = [{
+            "code": "F0001",
+            "name": "账册缺页",
+            "status": "已埋",
+            "setup_chapter": "第1章",
+            "payoff_chapter": "第2章",
+            "description": "账册少了一页，主角认为只是装订问题。",
+            "revealed": "",
+            "remaining_secret": "缺页是谁撕走的。",
+        }]
+
+        project["chapters"].append(_new_chapter(1))
+        context = _build_chapter_ai_context(project, 1, "draft")
+
+        self.assertIn("回答该伏笔的单一核心问题", context)
+        self.assertIn("仅有再次出现、部分揭示、冲突升级", context)
+
     def test_narrative_strategy_profile_persists_but_is_excluded_from_runtime_chapter_context(self):
         male = self._project_with_current_chapter(_new_chapter(0))
         male["narrative_strategy_profile"] = {
@@ -7927,6 +7959,7 @@ class NovelLongFormContextTests(unittest.TestCase):
             "description": "密室钟声的真相揭晓，机关已经解开。",
         }
         explicit_buried = {"name": "虎符失踪", "status": "待回收", "description": "第十章待揭晓。"}
+        explicit_progress = {"name": "旧钟声", "status": "已揭示", "description": "来源仍未揭示。"}
         explicit_resolved = {"name": "旧钟声", "status": "已兑现", "description": "密室钟声的真相揭晓。"}
         explicit_no_need = {"name": "白兔挂件", "status": "不必回收", "description": "低价值道具线。"}
 
@@ -7934,6 +7967,7 @@ class NovelLongFormContextTests(unittest.TestCase):
         self.assertEqual(_infer_foreshadow_status(unburied), "未埋")
         self.assertEqual(_infer_foreshadow_status(resolved), "未埋")
         self.assertEqual(_infer_foreshadow_status(explicit_buried), "已埋")
+        self.assertEqual(_infer_foreshadow_status(explicit_progress), "已埋")
         self.assertEqual(_infer_foreshadow_status(explicit_resolved), "已回收")
         self.assertEqual(_infer_foreshadow_status(explicit_no_need), "无需回收")
 

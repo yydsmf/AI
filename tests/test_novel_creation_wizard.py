@@ -27,25 +27,24 @@ class NovelCreationWizardPersistenceTests(unittest.TestCase):
             "foreshadows": foreshadows,
         }
 
-    def test_creation_scale_requires_three_foreshadows_per_stage(self):
+    def test_creation_scale_does_not_hard_require_foreshadows_per_stage(self):
         _size_label, ranges = wizard._creation_scale_requirements(500000)
         self.assertEqual(ranges["characters"], (25, 25))
         self.assertEqual(ranges["lore"], (25, 25))
-        self.assertEqual(ranges["foreshadows"], (15, 15))
+        self.assertEqual(ranges["foreshadows"], (0, 0))
 
-        assets = self._scale_sized_assets([3, 3, 3, 3, 3])
+        assets = self._scale_sized_assets([1, 0, 2, 0, 1])
         self.assertEqual(
             wizard._creation_scale_shortfalls(assets, 500000),
             [],
         )
 
-    def test_creation_scale_rejects_total_enough_but_stage_shortfall(self):
+    def test_creation_scale_ignores_foreshadow_count_shortfall(self):
         assets = self._scale_sized_assets([2, 4, 3, 3, 3])
         shortfalls = wizard._creation_scale_shortfalls(assets, 500000)
-        self.assertIn("伏笔第1阶段 2/3", shortfalls)
-        self.assertNotIn("伏笔 15/15", shortfalls)
+        self.assertEqual(shortfalls, [])
 
-    def test_bible_confirmation_uses_stage_foreshadow_minimum(self):
+    def test_bible_confirmation_does_not_use_stage_foreshadow_minimum(self):
         dialog = wizard.NovelCreationWizardDialog.__new__(
             wizard.NovelCreationWizardDialog
         )
@@ -59,20 +58,25 @@ class NovelCreationWizardPersistenceTests(unittest.TestCase):
 
         error = dialog._bible_validation_error(result)
 
-        self.assertIn("资料数量未达到按阶段计算的最低要求", error)
-        self.assertIn("伏笔第1阶段 2/3", error)
+        self.assertEqual(error, "")
 
     def test_creation_scale_guidance_uses_positive_foreshadow_prompt(self):
         guidance = wizard._creation_scale_guidance(500000)
-        self.assertIn("每个阶段至少生成3条真正有长期回收价值的新增伏笔", guidance)
+        self.assertIn("伏笔数量只是建议参考，不是硬性配额", guidance)
+        self.assertIn("质量优先、数量不够时不硬凑", guidance)
         self.assertNotIn("每个阶段至少准备5条", guidance)
 
-    def test_foreshadow_distribution_guidance_covers_every_stage(self):
+    def test_foreshadow_distribution_guidance_prioritizes_quality(self):
         guidance = wizard._creation_foreshadow_distribution_guidance(300000)
-        self.assertIn("f 至少返回 9 条", guidance)
-        self.assertIn("第1阶段的 setup_stage 至少填写3条", guidance)
-        self.assertIn("第2阶段的 setup_stage 至少填写3条", guidance)
-        self.assertIn("第3阶段的 setup_stage 至少填写3条", guidance)
+        self.assertIn("不要求每个阶段必须有固定数量", guidance)
+        self.assertIn("质量优先，数量不足不补造宽泛线索", guidance)
+        self.assertIn("大多数应是普通可回收闭环", guidance)
+
+    def test_foreshadow_closure_guidance_requires_single_question_and_result(self):
+        guidance = wizard.CREATION_FORESHADOW_CLOSURE_GUIDANCE
+        self.assertIn("一个核心问题、一个核心承诺和一个可观察的回收结果", guidance)
+        self.assertIn("写不出这四点，就不要生成伏笔", guidance)
+        self.assertIn("真正贯穿全书核心矛盾", guidance)
 
     def test_bible_assets_recovers_rows_mixed_under_compact_c_key(self):
         result = wizard.normalize_creation_result(

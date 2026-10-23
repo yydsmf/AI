@@ -815,6 +815,9 @@ def _normalize_creative_intent_contract(value):
 
     aliases = {
         "primary_line": ("primary_line", "main_line", "core_line", "主线", "核心主线"),
+        "core_motive": (
+            "core_motive", "main_motive", "central_motive", "核心动机", "主角核心动机",
+        ),
         "core_relationships": (
             "core_relationships", "relationship_progression", "核心关系", "关系推进",
         ),
@@ -1045,6 +1048,7 @@ def _normalize_narrative_strategy_profile(value):
         "audience_direction",
         "genre_world",
         "core_reader_promise",
+        "core_motive",
         "primary_story_engine",
         "secondary_story_engine",
         "planning_grammar",
@@ -1172,7 +1176,7 @@ def _normalize_chapter_plan_foundation(value):
         return {}
     result = {}
     for key in (
-        "summary", "core_mainline", "ending_promise", "global_hard_boundaries",
+        "summary", "core_mainline", "core_motive", "ending_promise", "global_hard_boundaries",
         "source", "source_hash", "foundation_mode", "planning_schema_version",
     ):
         field_value = str(value.get(key, "") or "").strip()
@@ -1187,6 +1191,26 @@ def _normalize_chapter_plan_foundation(value):
             result[key] = max(0, int(value.get(key, 0) or 0))
         except Exception:
             result[key] = 0
+    terminal_window = value.get("terminal_window", {})
+    if isinstance(terminal_window, dict):
+        try:
+            terminal_start = int(terminal_window.get("start_chapter", 0) or 0)
+            terminal_end = int(terminal_window.get("end_chapter", 0) or 0)
+        except (TypeError, ValueError):
+            terminal_start, terminal_end = 0, 0
+        if terminal_start > 0 and terminal_end >= terminal_start:
+            result["terminal_window"] = {
+                "start_chapter": terminal_start,
+                "end_chapter": terminal_end,
+                "chapter_count": terminal_end - terminal_start + 1,
+                "source": str(terminal_window.get("source", "") or "").strip(),
+            }
+            if not result["terminal_window"]["source"]:
+                result["terminal_window"].pop("source", None)
+    if not result.get("core_motive") and result.get("core_mainline"):
+        result["core_motive"] = result["core_mainline"]
+    if not result.get("core_mainline") and result.get("core_motive"):
+        result["core_mainline"] = result["core_motive"]
     profile = _normalize_narrative_strategy_profile(value.get("narrative_strategy_profile", {}))
     if profile:
         result["narrative_strategy_profile"] = profile
@@ -4791,12 +4815,100 @@ def _is_project_final_chapter(project, chapter_index):
     return planned_count <= 0 or planned_count == len(chapters)
 
 
+TERMINAL_WINDOW_CHAPTER_COUNT = 5
+
+
+def _terminal_window_bounds(total_chapter_count, window_size=TERMINAL_WINDOW_CHAPTER_COUNT):
+    """Return the fixed final-chapter window without judging story completion."""
+    try:
+        total = int(total_chapter_count or 0)
+    except (TypeError, ValueError):
+        total = 0
+    try:
+        size = max(1, int(window_size or TERMINAL_WINDOW_CHAPTER_COUNT))
+    except (TypeError, ValueError):
+        size = TERMINAL_WINDOW_CHAPTER_COUNT
+    if total <= 0:
+        return None
+    return max(1, total - size + 1), total
+
+
+def _project_terminal_window_bounds(project, window_size=TERMINAL_WINDOW_CHAPTER_COUNT):
+    """Return the last five planned chapters, falling back to saved chapters."""
+    project = project if isinstance(project, dict) else {}
+    total = _project_planned_chapter_count(project)
+    if total > 0:
+        return _terminal_window_bounds(total, window_size)
+    foundation = project.get("chapter_plan_foundation", {})
+    if isinstance(foundation, dict):
+        saved_window = foundation.get("terminal_window", {})
+        if isinstance(saved_window, dict):
+            try:
+                saved_start = int(saved_window.get("start_chapter", 0) or 0)
+                saved_end = int(saved_window.get("end_chapter", 0) or 0)
+            except (TypeError, ValueError):
+                saved_start, saved_end = 0, 0
+            if saved_start > 0 and saved_end >= saved_start:
+                return saved_start, saved_end
+    if total <= 0:
+        chapters = project.get("chapters", [])
+        total = len(chapters) if isinstance(chapters, list) else 0
+    return _terminal_window_bounds(total, window_size)
+
+
+def _terminal_window_chapter_info(project, chapter_index):
+    """Return 1-based window information for a zero-based chapter index."""
+    bounds = _project_terminal_window_bounds(project)
+    if not bounds:
+        return None
+    try:
+        chapter_number = int(chapter_index) + 1
+    except (TypeError, ValueError):
+        return None
+    start, end = bounds
+    if not start <= chapter_number <= end:
+        return None
+    return {
+        "chapter_number": chapter_number,
+        "start_chapter": start,
+        "end_chapter": end,
+        "is_final": chapter_number == end,
+    }
+
+
+def _terminal_window_ending_guidance(info, final=False):
+    """Prompt guidance for the final five chapters, without an audit decision."""
+    info = info if isinstance(info, dict) else {}
+    chapter_number = int(info.get("chapter_number", 0) or 0)
+    start = int(info.get("start_chapter", 0) or 0)
+    end = int(info.get("end_chapter", 0) or 0)
+    if not chapter_number or not start or not end:
+        return ""
+    text = (
+        f"【全书最后5章收尾窗口｜第{start}-{end}章】\n"
+        f"当前是全书第{chapter_number}章，属于按总章节数计算的最后5章收尾窗口。"
+        "这只是内容规划范围，不改变全书总章节数、当前批次数量、十万字阶段边界或需要返回的章节数量。"
+        "本章仍然只写当前章节提纲已经安排的具体场景、行动和结果，不为了收尾要求另增章节，也不把未安排的事件硬塞进本章。"
+        "收尾窗口内不再开启新的主要任务、主要敌人、组织、力量体系、世界规则或下一卷主线；"
+        "不把新的未解释信息、未知对手、未知目的地或未来承诺写成等待后续章节回答的悬念。"
+        "如果当前章还需要承接下一章，只能承接本章已发生冲突的直接后果、行动或关系变化，"
+        "不能用新的任务、幕后黑手、远方召唤或‘以后再说’制造连载钩子。"
+    )
+    if final:
+        text += (
+            "这是全书最后一章。核心动机、核心矛盾、主要关系和主角本部最终处境必须在本章形成清楚的实际结果；"
+            "结尾不再留下必须依靠后续章节回答的主线问题或悬念。"
+            "最后落在具体动作、对白、关系结果或已经成立的生活状态上，不用作者总结、突然多年后概括、‘未完待续’或单独的‘全文完’代替结尾。"
+        )
+    return text
+
+
 def _final_chapter_ending_guidance():
     return (
         "【全书最后一章收束要求】\n"
         "当前章节是全书最后一章，也要让读者把这一部当成一个完整结局来读。正文要在具体场景里完成核心矛盾的最终选择和结果，"
         "让主要人物的关系、读者一直跟随的核心承诺、能够自然落地的关键线索和主角本部目标都有清楚结果。"
-        "即使故事保留续作可能，也只能留下不影响本部结局的余味、远景或新的选择；不能留下必须依靠后续章节解决的主线任务、重大反转、重要人物或新的世界规则。"
+        "即使故事保留续作可能，也只能保留不影响本部结局的背景余波；不能留下必须依靠后续章节解决的主线任务、重大反转、重要人物、新的世界规则或等待回答的悬念。"
         "最后的收束落在人物的动作、对白、关系结果或生活状态上，不用突然跳过多年的概括、作者总结、抽象结论、‘未完待续’或单独的‘全文完’代替结尾。"
         "不要为了回收而硬塞与本章无关的伏笔；只处理能从当前冲突和人物选择自然落地的线索，其余已经不再影响主线的内容，用清楚的结果或状态自然关上。"
     )
@@ -7115,10 +7227,22 @@ def _record_recent_context_map(project, records, before_index, name_key="name", 
     return out
 
 
-def _build_future_plan_text(chapters, chapter_index, window=4):
+def _build_future_plan_text(
+    chapters,
+    chapter_index,
+    window=4,
+    max_chapter=None,
+    terminal_window=False,
+):
     chapters = chapters if isinstance(chapters, list) else []
     start = max(0, int(chapter_index or 0) + 1)
-    end = min(len(chapters), start + max(1, int(window or 1)))
+    visible_end = len(chapters)
+    if max_chapter is not None:
+        try:
+            visible_end = min(visible_end, max(0, int(max_chapter or 0)))
+        except (TypeError, ValueError):
+            pass
+    end = min(visible_end, start + max(1, int(window or 1)))
     planned_lines = []
     for index, item in enumerate(chapters[start:end], start + 1):
         if not isinstance(item, dict):
@@ -7134,7 +7258,7 @@ def _build_future_plan_text(chapters, chapter_index, window=4):
             planned_lines.append(line)
 
     milestone_lines = []
-    for index, item in enumerate(chapters[end:], end + 1):
+    for index, item in enumerate(chapters[end:visible_end], end + 1):
         if not isinstance(item, dict):
             continue
         text = "\n".join(
@@ -7156,8 +7280,13 @@ def _build_future_plan_text(chapters, chapter_index, window=4):
 
     parts = []
     if planned_lines:
-        parts.append("后续近章规划（当前章只能铺垫，不要提前写完）：\n" + "\n".join(planned_lines))
-    if milestone_lines:
+        label = (
+            "收尾窗口内后续章节承接（只承接已发生结果，不新增任务）：\n"
+            if terminal_window else
+            "后续近章规划（当前章只能铺垫，不要提前写完）：\n"
+        )
+        parts.append(label + "\n".join(planned_lines))
+    if milestone_lines and not terminal_window:
         parts.append("远期回收/转折锚点（只用于避免越界）：\n" + _clip_lines_balanced(milestone_lines, 2600, head=4, tail=4))
     return "\n\n".join(parts) or "暂无"
 
@@ -10058,6 +10187,21 @@ def _story_conflict_pacing_guidance():
         "可以是人与人之间的冲突，也可以是欲望、利益、环境、秘密或突发后果造成的压力。"
         "碰撞的对象、场景和结果随故事变化，不按固定类型轮换，也不为了满足数量硬塞一段重复对抗。"
         "其他题材同样要在合适的节奏内让主角面对具体压力并作出选择，让处境继续改变。\n"
+    )
+
+
+def _core_motive_progression_guidance():
+    """Keep the protagonist's concrete motive as the story's causal spine."""
+    return (
+        "【核心动机与主线推进｜核心动机是唯一执行主线】\n"
+        "全书只认一条执行主线：核心动机（core_motive）。先锁定这条主线，再展开人物、设定、伏笔、阶段和章节。核心动机不是抽象主题、临时愿望、普通章节任务或‘读者想看什么’，而是主角为什么非行动不可，以及最终必须达成、守住、改变、证明、夺回或摧毁什么。\n"
+        "核心动机必须能落到可执行的主线契约：要能看出主角为什么非行动不可、要完成什么、达到什么结果、会被什么阻碍、失败会失去什么（失败代价），以及什么自然节点、时间限制或机会窗口会让机会改变或代价加重。这里是质量验收维度，不是固定字段、固定顺序、固定句式或每项各写一段；目标、对象、阻碍、代价和节点可以在同一个具体关系、秘密、选择、资源限制或现场后果中自然合并，也可以由题材通过行动和结果表现出来。不能只写‘赚钱、变强、复仇、逆天改命、守护家人’；要把抽象愿望落成可验收的任务，例如‘在妻子手术期限前凑够指定金额，否则错过救治机会’。题材没有钟表式期限时，用资源耗尽、关系破裂、对手行动、身份暴露、战局变化或机会关闭等硬节点替代，不要为了形式硬加倒计时。\n"
+        "核心动机要有足够强的反差，但反差不限定为主角弱、对手强。可以是身份、处境、能力、资源、认知、关系、外界评价、道德位置、表面成功与真实代价、开局无敌却无法完成某件事等落差；反差必须持续制造选择和阻碍，不能只作为简介开头的一次反转。\n"
+        "这些要求只负责检查主线是否具体、有压力、能持续推进，不规定小说必须使用倒计时、赚钱、升级、复仇、强敌、打脸或同一种阶段结构。言情、悬疑、现实、群像、日常、历史、科幻和其它题材，应从自己的关系、秘密、规则、生活压力、伦理选择或世界机制中长出目标和代价；不要为了凑齐检查项，给所有故事硬加金额、期限、幕后黑手或升级路线。\n"
+        "字段职责必须固定，不能抢任务：core_motive是唯一的具体执行主线；premise.main_line、bible.main_conflict、creative_intent_contract.primary_line、chapter_plan_foundation.core_mainline和narrative_strategy_profile.primary_story_engine在新项目中都只是这条主线的兼容别名或执行说明，不得另起一条目标。theme只提炼最终讨论的人性命题、价值冲突和情感认识，不写具体任务、金额、期限、对手或资源缺口。阶段的main_conflict/dominant_line只写本阶段阻碍核心动机的具体问题、代价或门槛，不得替换全书目标；supporting_lines、人物关系、伏笔和世界规则只能改变主线人物的选择、资源、信息、关系、位置或时间窗口。\n"
+        "剧情推进不是让主角不停遇到事情，而是主角为了完成核心目标不断遇到阻碍、作出选择、付出代价、解决当前障碍，并因此打开或加深下一阶段目标。阶段目标必须形成延伸链：当前危机解决后，结果明确带来下一道更具体的门槛、对手、资源缺口、关系选择、认知真相或更高代价，不能每个阶段重新换一条主线。\n"
+        "每个重要事件都要能回答：它为什么会因为核心动机发生，主角为目标采取了什么行动，遇到什么阻碍，解决或暂时解决后距离目标发生了什么可见变化。事件可以推进、阻碍、加压、转向、揭示代价或兑现阶段目标，但不能只是热闹、日常或支线；支线只有在改变主线人物的选择、关系、资源、信息、位置或时间窗口时才保留。\n"
+        "不要求每章机械重复‘核心动机’几个字，也不要求所有章节都直接完成目标；不要把章节机械写成‘目标—阻碍—解决—下阶段目标’的固定句式。每章必须让主线的进度、阻力、代价、路径、关系或下一步发生真实变化，变化可以通过行动、对话、关系转折、信息揭示、环境后果或人物选择自然呈现；阶段末再留下已经成立的结果和下一阶段继续追逐的具体目标。"
     )
 
 
@@ -22100,7 +22244,14 @@ def _build_chapter_ai_context(project, chapter_index, action):
     )
     continuation_text = _build_chapter_continuation_text(chapters, chapter_index)
     next_chapter_anchor_text = _build_next_chapter_anchor_text(chapters, chapter_index)
-    future_plan_text = _build_future_plan_text(chapters, chapter_index)
+    terminal_window_info = _terminal_window_chapter_info(project, chapter_index)
+    future_plan_text = _build_future_plan_text(
+        chapters,
+        chapter_index,
+        max_chapter=(terminal_window_info or {}).get("end_chapter")
+        if terminal_window_info else None,
+        terminal_window=bool(terminal_window_info),
+    )
     volume_opening_handoff = str(
         project.get("volume_opening_handoff_context", "") or ""
     ).strip()
@@ -22114,7 +22265,33 @@ def _build_chapter_ai_context(project, chapter_index, action):
     style_reference = str(project.get("style_reference", "") or "").strip()
     stage_boundary = (chapter_index + 1) % 10 == 0
     is_final_chapter = _is_project_final_chapter(project, chapter_index)
-    final_chapter_guidance = _final_chapter_ending_guidance() if is_final_chapter else ""
+    final_chapter_guidance = (
+        _final_chapter_ending_guidance()
+        if is_final_chapter and not terminal_window_info else ""
+    )
+    terminal_window_guidance = (
+        _terminal_window_ending_guidance(
+            terminal_window_info,
+            final=is_final_chapter,
+        )
+        if terminal_window_info else ""
+    )
+    chapter_ending_guidance = "\n\n".join(
+        item for item in (terminal_window_guidance, final_chapter_guidance) if item
+    )
+    ordinary_ending_text = "章节结尾优先用具体动作、对白、信息变化或悬念收住。"
+    terminal_ending_text = (
+        "章节结尾只落在本章已发生的具体动作、对白、信息结果或关系状态上；"
+        "不得用新的任务、未知对手、远方召唤、未解释信息或等待后续回答的悬念收尾。"
+        if terminal_window_info else
+        ordinary_ending_text
+    )
+    next_anchor_text = (
+        "如果有【后章衔接点】，只用于承接下一章已经安排的直接结果；"
+        "不得把新的主线任务、重大反转或等待后续回答的悬念写进本章结尾。"
+        if terminal_window_info else
+        "如果有【后章衔接点】，本章结尾必须自然接到下一章开头的时间、地点、人物状态、动作和悬念；"
+    )
     no_text_count_rule = (
         "能不用“几个字/几个词/几个音节”就不用；真要写字数，只按自然语言中的汉字、字母和数字计数，"
         "标点符号、引号、括号、空格和换行都不计入。特别注意：‘“辛苦了。”’引号内只有‘辛苦了’三个字，"
@@ -22138,7 +22315,7 @@ def _build_chapter_ai_context(project, chapter_index, action):
         "不得用“沉默、皱眉、冷意、压迫感、空气安静、所有人愣住、下一秒”等模板化表达替代具体剧情。"
         "场景描写优先用具体物件、动作和细节承载情绪，不要总用氛围词概括。"
         "心理描写贴着人物当下的动作、对白、反应和感受展开；需要时写出人物的判断、犹豫、后悔或心动，让心理变化推动下一步。"
-        "章节结尾优先用具体动作、对白、信息变化或悬念收住。"
+        + terminal_ending_text +
         "段落结构要有变化，不要连续使用“动作描写 + 心理解释 + 氛围总结”的固定结构。"
         "场景细节要克制：只在能强化冲突、人物状态或信息变化时，少量加入具体物件、声音、动作痕迹和环境反馈。"
         "不要写无意义生活噪声，不要让细节拖慢剧情。"
@@ -22154,7 +22331,7 @@ def _build_chapter_ai_context(project, chapter_index, action):
         "正文扩写只参考【本章相关伏笔】中的计划路由；前置铺垫是可选方向，正式埋设和正式回收要结合本章提纲自然落地，其他伏笔不要主动处理。"
         "必须继承上一章结尾的时间、天气、地点、人物位置、情绪和未完成动作；如果上一章写明雨已停或场景已变化，"
         "不要在本章开头改成仍在下雨或回到旧场景，除非本章提纲明确发生了新的天气/场景变化。"
-        "如果有【后章衔接点】，本章结尾必须自然接到下一章开头的时间、地点、人物状态、动作和悬念；"
+        + next_anchor_text +
         "后章衔接点只用于对齐当前章结尾，不要复述、改写或提前写完下一章正文。"
         "优先参考本章需继承的关键事实，其次参考本章摘要、前文摘要、人物目标、人物性格/特点、语言风格和世界规则。"
         "正文风格：口语化、自然、有网文阅读感，不要太工整、太书面、太像范文。"
@@ -22165,7 +22342,7 @@ def _build_chapter_ai_context(project, chapter_index, action):
         "不得用“沉默、皱眉、冷意、压迫感、空气安静、所有人愣住、下一秒”等模板化表达替代具体剧情。"
         "场景描写优先用具体物件、动作和细节承载情绪，不要总用氛围词概括。"
         "心理描写贴着人物当下的动作、对白、反应和感受展开；需要时写出人物的判断、犹豫、后悔或心动，让心理变化推动下一步。"
-        "章节结尾优先用具体动作、对白、信息变化或悬念收住。"
+        + terminal_ending_text +
         "段落结构要有变化，不要连续使用“动作描写 + 心理解释 + 氛围总结”的固定结构。"
         "场景细节要克制：只在能强化冲突、人物状态或信息变化时，少量加入具体物件、声音、动作痕迹和环境反馈。"
         "不要写无意义生活噪声，不要让细节拖慢剧情。"
@@ -22259,7 +22436,13 @@ def _build_chapter_ai_context(project, chapter_index, action):
             "后续章节提纲和人物名单来自初始框架规划，只是可调整的方向与边界，不是已发生事实或强制出场名单；"
             "当前章可以自然铺垫下一章，但不要提前兑现后续章节安排的真相、转折或结局。"
         )
-    if final_chapter_guidance and action in {"draft", "outline", "script_to_novel"}:
+    if terminal_window_guidance and action in {"draft", "outline", "script_to_novel"}:
+        inheritance_rule_lines.append(
+            "当前属于全书最后5章收尾窗口：后续章节资料只用于承接窗口内部已经安排的直接结果；"
+            "不得把窗口之外的远期任务、未知对手、未知目的地、新世界规则或新的未解释信息写成本章剧情。"
+            "本章结尾不得新增必须由后续章节回答的主线悬念。"
+        )
+    elif final_chapter_guidance and action in {"draft", "outline", "script_to_novel"}:
         inheritance_rule_lines.append(
             "当前是全书最后一章：本章不再给后续章节开主线；核心矛盾、主要关系和主角最终处境必须在本章形成真实结果，"
             "结尾落到具体场景、动作、对白或已经成立的生活状态。"
@@ -22450,10 +22633,10 @@ def _build_chapter_ai_context(project, chapter_index, action):
             f"项目总目标字数：{_target_words_label(meta.get('target_words', ''))}",
         ]), 500, False),
     ]
-    if final_chapter_guidance and action in {"draft", "outline", "script_to_novel"}:
+    if chapter_ending_guidance and action in {"draft", "outline", "script_to_novel"}:
         common_sections.insert(
             2,
-            ("终章收束要求", final_chapter_guidance, 1800, False),
+            ("收尾窗口要求", chapter_ending_guidance, 2600, False),
         )
     if action == "draft":
         common_sections.insert(

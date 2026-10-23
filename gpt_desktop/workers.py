@@ -65,8 +65,10 @@ from .novel_utils import (
     _normalize_chapter_plan_foundation,
     _normalize_framework_analysis,
     _normalize_volume_continuity_anchors,
+    _core_motive_progression_guidance,
     _procedural_plot_guard_guidance,
     _story_conflict_pacing_guidance,
+    _terminal_window_bounds,
     NOVEL_PROSE_END_MARKER,
     NOVEL_PROSE_START_MARKER,
 )
@@ -107,14 +109,26 @@ _OPENING_THREE_CHAPTER_GUIDANCE = (
 
 _FINAL_CHAPTER_PLAN_GUIDANCE = (
     "【全书最后一章收束要求】\n"
-    "本批包含全书最后一章时，只对对应的最后一项执行以下要求，前面的章节仍按正常节奏推进。"
+    "当前批次包含全书最后一章时，只对对应的最后一项执行以下最后收束要求；其它收尾窗口章节仍按各自已经安排的连续结果推进。"
     "最后一章要在具体场景里完成核心矛盾的最终选择和结果，让主要人物的关系、读者一直跟随的核心承诺、"
     "能够自然落地的关键线索和主角最终处境都有清楚的结果。需要保留余味的内容，要写成已经成立的结局状态，"
-    "不要留下必须靠后续章节才能解决的主线任务、重大反转、重要人物或新的世界规则。"
+    "不要留下必须靠后续章节才能解决的主线任务、重大反转、重要人物、新的世界规则或等待回答的悬念。"
     "最后一章的outline末尾要写实际发生的收束动作、关系结果或生活落点，不写作者总结、概念性结论、"
     "突然跳过过程的多年后概括、‘未完待续’或单独的‘全文完’。倒数第二章可以把冲突推到临界点，"
     "但不要提前讲完最后一章才应发生的结果。\n"
 )
+
+
+def _terminal_window_plan_guidance(start, end, overlap_start, overlap_end):
+    return (
+        f"【全书最后5章收尾窗口｜第{start}-{end}章】\n"
+        f"当前批次与收尾窗口的交集是第{overlap_start}-{overlap_end}章。"
+        "这只是内容约束，不改变当前阶段边界、批次数量、章节总数或本批必须返回的章节数量；不得因为收尾要求新增、拆分或合并章节。"
+        "交集内的每一章都必须承接前一章已经成立的结果，并在当前章节中完成明确的行动、代价、关系变化或局势落点。"
+        "收尾窗口内不再开启新的主要任务、主要敌人、组织、力量体系、世界规则或下一卷主线；"
+        "不把新的未解释信息、未知对手、未知目的地或未来承诺写成等待后续章节回答的悬念。"
+        "章节结尾只留下下一章已经安排的直接承接，不使用新的连载钩子。"
+    )
 
 
 _CHAPTER_PLAN_STORY_LANGUAGE_GUIDANCE = (
@@ -3268,7 +3282,7 @@ class NovelFrameworkImportWorker(NovelAnalysisWorker):
             "framework_analysis.foundation_mode由你读懂内容后判断："
             "已有故事走向、结局方向和可继续写作的内容时用reuse；有必要内容缺失时用supplement，指出具体缺少什么；"
             "几乎只有想法时才用generate。不要因为缺少固定栏目名、阶段或章名就要求重写。"
-            "foundation只整理原有故事的summary、core_mainline、ending_promise及narrative_strategy_profile，不新编故事。"
+            "foundation只整理原有故事的summary、core_motive、ending_promise及narrative_strategy_profile；core_mainline只作为旧字段兼容别名，不新编故事。"
             "已有阶段保留原顺序与明确章号范围；没有阶段则stages=[]，不编造阶段。"
             "planning_parameters填写整本字数、每章字数、全书章数的整数；优先原文明确值，可按两个明确值换算第三个，不把阶段字数当全书字数。\n"
             "原文前的L000001等仅是定位标记，不是故事内容。章节完整性只需给出整体判断和数量，不要逐章返回原文、outline_ref、章节事件或任何原文摘录；"
@@ -3289,7 +3303,7 @@ class NovelFrameworkImportWorker(NovelAnalysisWorker):
             '"foreshadows":[{"name":"","status":"未埋","setup_chapter":"","payoff_chapter":"","description":""}],'
             '"framework_analysis":{"foundation_mode":"reuse/supplement/generate","chapter_outline_mode":"reuse/supplement/generate","chapter_outline_count":0,"chapter_outline_missing":[],"missing_fields":[],"reason":"",'
             '"planning_parameters":{"target_words":0,"average_chapter_words":0,"total_chapter_count":0},'
-            '"foundation":{"summary":"","core_mainline":"","ending_promise":"","narrative_strategy_profile":{"genre_world":"","primary_story_engine":"","reader_promise":"","pacing_strategy":""}}},'
+            '"foundation":{"summary":"","core_motive":"","core_mainline":"","ending_promise":"","narrative_strategy_profile":{"genre_world":"","primary_story_engine":"","reader_promise":"","pacing_strategy":""}}},'
             '"chapter_plan":{"summary":"","stages":[{"id":"S01","name":"","summary":"","start_chapter":0,"end_chapter":0,"events":[]}]}}\n'
             "空字段用空字符串，空列表用[]。"
         )
@@ -5572,6 +5586,8 @@ class NovelWritingWorker(QThread):
         adaptation_actions = {"novel_to_script", "novel_to_storyboard", "script_to_storyboard"}
         if self.action not in fiction_actions | outline_actions | summary_actions | adaptation_actions:
             return ""
+        terminal_window = "【全书最后5章收尾窗口" in self.context
+        final_chapter = "这是全书最后一章" in self.context
 
         common = (
             "\n\n【统一创作与编辑标准】\n"
@@ -5586,6 +5602,17 @@ class NovelWritingWorker(QThread):
             "并检查人物、设定、时间线、伏笔、空间关系和因果链是否一致。"
         )
         if self.action in fiction_actions:
+            ending_sentence = (
+                "收尾窗口正文结尾必须落在本章已经发生的具体动作、对白、信息结果或关系状态上；"
+                "不得为了留下追读张力新增任务、未知对手、远方召唤或等待后续回答的悬念。"
+                if terminal_window else
+                "结尾要来自冲突本身，留下继续读下去的张力。"
+            )
+            if final_chapter:
+                ending_sentence = (
+                    "最后一章正文必须让核心矛盾、主要关系和主角最终处境形成清楚的实际结果；"
+                    "结尾落在具体动作、对白、关系结果或已经成立的生活状态上，不留下必须由后续章节回答的主线悬念。"
+                )
             return common + _grounded_prose_contract() + (
                 "\n正文写作要求：让人物的欲望、阻力、行动和后果自然形成推进与情绪变化；"
                 "需要时用具体动作、环境、感官或生活细节承接场景，不设细节数量配额。"
@@ -5593,16 +5620,21 @@ class NovelWritingWorker(QThread):
                 "人物的姓名、身份、职位、实力层级和称谓要按项目资料保持一致；实力等级或临时称呼不能自行变成正式职位，也不要把人物、家族、势力和婚约关系混为一谈。"
                 "不要写摘要式过场、百科式设定说明、空泛金句、重复句式、同义反复或模板化转折词堆叠。"
                 "网文阅读感随当前项目定位自然形成；具体落笔优先仿写文风档案中的人物声音、信息差、即时反应、关系变化和节奏起伏。"
-                "结尾要来自冲突本身，留下继续读下去的张力。"
-                "如果资料提供本章扩写字数，只把它当作节奏和详略参考；优先保证完整小场景、冲突收束和正文质量，"
+                + ending_sentence
+                + "如果资料提供本章扩写字数，只把它当作节奏和详略参考；优先保证完整小场景、冲突收束和正文质量，"
                 "不要为了贴字数截断或省略关键结尾。"
             )
         if self.action in outline_actions:
+            ending_rule = (
+                "只保留本章已经发生的冲突收束点、具体结果和关系变化，不新增等待后续回答的结尾悬念。"
+                if terminal_window else
+                "只保留本章核心事件、情绪曲线、角色动机、阻力、小变化、关键细节、冲突收束点和结尾张力。"
+            )
             return common + (
                 "\n提纲要求：输出短提纲，不写正文、不写对白、不写场景描写。"
                 "控制在 6-10 条以内，每条 1-2 句；总长度尽量控制在 600-1200 字。"
-                "只保留本章核心事件、情绪曲线、角色动机、阻力、小变化、关键细节、冲突收束点和结尾张力。"
-                "如果资料里已有正文草稿，只反向整理正文已经发生的内容；不要补写正文没有出现的结尾、下一步计划或伏笔兑现。"
+                + ending_rule
+                + "如果资料里已有正文草稿，只反向整理正文已经发生的内容；不要补写正文没有出现的结尾、下一步计划或伏笔兑现。"
                 "不要把资料复述成长篇分析，不要写空泛创作建议。"
             )
         if self.action in summary_actions:
@@ -5887,6 +5919,12 @@ class NovelWritingWorker(QThread):
             ),
         }
         prompt = prompts.get(self.action, prompts["outline"])
+        if "【全书最后5章收尾窗口" in self.context and self.action in {"draft", "script_to_novel"}:
+            prompt = prompt.replace(
+                "看到【续写承接点】时，优先从承接点的最后情绪、动作、场景和悬念自然接上；",
+                "看到【续写承接点】时，优先从承接点的最后情绪、动作、场景和已经发生的直接结果自然接上；"
+                "收尾窗口内不得用新的任务或悬念制造连载钩子；",
+            )
         return prompt + self._editorial_quality_prompt()
 
     def run(self):
@@ -6624,7 +6662,8 @@ class NovelChapterEventPlacementWorker(NovelAnalysisWorker):
             self.progress.emit("正在安排当前阶段剧情节点...")
             response_format_supported, _stream_supported = self._analysis_request_capabilities()
             last_error = None
-            for structure_attempt in range(2):
+            structure_attempts = max(1, int(self.retry_attempts or 1))
+            for structure_attempt in range(structure_attempts):
                 parsed, response_format_supported = self._analyze_chunk_with_retries(
                     self._analysis_prompt(),
                     self.text,
@@ -6642,10 +6681,12 @@ class NovelChapterEventPlacementWorker(NovelAnalysisWorker):
                     return
                 except ValueError as error:
                     last_error = error
-                    if structure_attempt == 0:
+                    if structure_attempt + 1 < structure_attempts:
                         self._increment_analysis_diagnostic("structure_regeneration_count")
                         self.diagnostics["first_structure_error"] = str(error)[:1000]
-                        self.progress.emit("节点安排结构不完整，正在自动重做当前安排...")
+                        self.progress.emit(
+                            f"节点安排结构不完整，正在自动重做当前安排（第{structure_attempt + 2}/{structure_attempts}次）..."
+                        )
             raise last_error or ValueError("当前阶段节点安排格式不完整。")
         except Exception as error:
             if not self._stop_requested and not self.isInterruptionRequested():
@@ -6702,8 +6743,28 @@ class NovelChapterPlanWorker(NovelAnalysisWorker):
     def _analysis_prompt(self):
         absolute_start = self.existing_chapter_count + 1
         absolute_end = self.existing_chapter_count + self.chapter_count
-        final_chapter_in_batch = absolute_end >= self.total_chapter_count
-        ending_guidance = _FINAL_CHAPTER_PLAN_GUIDANCE if final_chapter_in_batch else ""
+        final_chapter_in_batch = absolute_start <= self.total_chapter_count <= absolute_end
+        terminal_bounds = _terminal_window_bounds(self.total_chapter_count)
+        ending_guidance = ""
+        if terminal_bounds:
+            terminal_start, terminal_end = terminal_bounds
+            overlap_start = max(absolute_start, terminal_start)
+            overlap_end = min(absolute_end, terminal_end)
+            if overlap_start <= overlap_end:
+                ending_guidance = _terminal_window_plan_guidance(
+                    terminal_start,
+                    terminal_end,
+                    overlap_start,
+                    overlap_end,
+                )
+        if final_chapter_in_batch:
+            ending_guidance += _FINAL_CHAPTER_PLAN_GUIDANCE
+        core_motive_guidance = (
+            "【核心动机与收尾窗口】核心动机仍是本项目唯一执行主线；最后5章只把已经安排的目标、阻碍、"
+            "代价和关系变化落实为具体结果，不再打开下一道需要后续章节回答的主线目标。\n"
+            if ending_guidance else
+            _core_motive_progression_guidance()
+        )
         opening_guidance = ""
         if self.existing_chapter_count == 0 and absolute_start <= 3 <= absolute_end:
             opening_guidance = _OPENING_THREE_CHAPTER_GUIDANCE
@@ -6789,6 +6850,8 @@ class NovelChapterPlanWorker(NovelAnalysisWorker):
             f"{chapter_order_rule}\n"
             "每章应把人物、关系、处境或主线推进到一个读者可感知的新局面，章节之间保持场景、压力和结果的变化；"
             "小说圣经、世界规则和阶段规划提供长期事实，伏笔随着人物实际行动、关系变化和信息出现自然生长。\n"
+            + core_motive_guidance
+            + "\n"
             "章节规划重点写本章正在发生的事情、人物如何应对以及事情留下的变化；"
             "悬念通过现场信息、人物反应、关系裂缝和新的选择自然形成，后续正文再根据实际发生内容处理暗线。\n"
             "规划优先级固定为：已确认creative_intent_contract（若有） > 用户原始框架的具体章段 > 已确认的阶段规划 > 前 10%/中间 70%/后 20%的宏观节奏。"
@@ -6801,6 +6864,8 @@ class NovelChapterPlanWorker(NovelAnalysisWorker):
             "小说圣经和世界规则属于已经确认的故事底盘，章节规划不要擅自推翻小说圣经和世界规则。"
             "输入中的只读规划基础不得重新生成、改写、总结或返回；本次只沿用其中的事实和边界。"
             "输入中的creative_intent_contract同样只读且优先级最高；每章围绕primary_line展开，其他内容只在推动人物、关系或局势变化时进入。"
+            "如果creative_intent_contract或narrative_strategy_profile中存在core_motive，必须把它视为primary_line的具体执行契约，"
+            "优先保留其中的目标、失败代价、期限/机会窗口、主要反差和阶段延伸关系；不要把它改写成泛泛的‘成长、赚钱、复仇’。"
             "让本章形成符合当前题材的阅读期待，节奏和爽点随故事本身变化。"
             "故事底盘和阶段规划已经在前面的规划基础中确认，本次直接生成当前批次的章节故事。\n"
             "项目资料是连续性事实参考，不是本章待办清单；只在当下人物选择或关系结果确实需要时取用最少内容。"
@@ -6955,7 +7020,30 @@ class NovelChapterPlanWorker(NovelAnalysisWorker):
             title = self._clean_title(raw_title, f"章节 {index}")
             outline = self._outline_from_item(item)
             if not outline and self._normalize_outline_mode(item.get("outline_mode", "")) != "use_imported":
-                outline = f"围绕‘{title}’这一章，写清人物此刻身处的场景、遇到的具体麻烦，以及他们采取行动后局面出现的变化；章末留下一个能自然接住下一章的新信息或新阻力。"
+                absolute_index = self.existing_chapter_count + index
+                terminal_bounds = _terminal_window_bounds(self.total_chapter_count)
+                in_terminal_window = bool(
+                    terminal_bounds
+                    and terminal_bounds[0] <= absolute_index <= terminal_bounds[1]
+                )
+                if in_terminal_window:
+                    final_note = (
+                        "这是全书最后一章，必须让核心矛盾、主要关系和主角最终处境形成实际结果；"
+                        if terminal_bounds and absolute_index == terminal_bounds[1] else
+                        ""
+                    )
+                    outline = (
+                        f"围绕‘{title}’这一章，写清人物此刻身处的场景、遇到的具体麻烦，"
+                        "以及他们采取行动后已经发生的变化；"
+                        + final_note
+                        + "章末落在本章已经发生的具体动作、对白、信息结果或关系变化上，"
+                        "不新增必须由后续章节回答的任务或悬念。"
+                    )
+                else:
+                    outline = (
+                        f"围绕‘{title}’这一章，写清人物此刻身处的场景、遇到的具体麻烦，"
+                        "以及他们采取行动后局面出现的变化；章末留下一个能自然接住下一章的新信息或新阻力。"
+                    )
             narrative_stage = self._normalize_stage_text(item.get("narrative_stage", "") or item.get("stage", "") or item.get("所属阶段", ""), index)
             target_words = self._target_words_text(item.get("target_words", "")) or str(self.average_chapter_words)
             source_event_ids = [
@@ -7101,7 +7189,8 @@ class NovelChapterPlanWorker(NovelAnalysisWorker):
             self.progress.emit("正在生成章节规划...")
             response_format_supported, _stream_supported = self._analysis_request_capabilities()
             last_error = None
-            for structure_attempt in range(2):
+            structure_attempts = max(1, int(self.retry_attempts or 1))
+            for structure_attempt in range(structure_attempts):
                 parsed, response_format_supported = self._analyze_chunk_with_retries(
                     self._analysis_prompt(),
                     self.text,
@@ -7119,10 +7208,12 @@ class NovelChapterPlanWorker(NovelAnalysisWorker):
                     return
                 except ValueError as e:
                     last_error = e
-                    if structure_attempt == 0:
+                    if structure_attempt + 1 < structure_attempts:
                         self._increment_analysis_diagnostic("structure_regeneration_count")
                         self.diagnostics["first_structure_error"] = str(e)[:1000]
-                        self.progress.emit("当前批次章节数量或结构不完整，正在自动重做本批一次...")
+                        self.progress.emit(
+                            f"当前批次章节数量或结构不完整，正在自动重做本批（第{structure_attempt + 2}/{structure_attempts}次）..."
+                        )
             raise last_error or ValueError("当前批次章节规划格式不完整。")
         except Exception as e:
             if not self._stop_requested and not self.isInterruptionRequested():

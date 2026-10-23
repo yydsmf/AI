@@ -28,9 +28,11 @@ from PySide6.QtWidgets import (
 from .core import HISTORY_DIR, load_json_file, now_str, safe_remove_file, save_json_file
 from .novel_storage import load_character_style_library, remove_character_style
 from .novel_utils import (
+    _core_motive_progression_guidance,
     _entity_naming_guidance,
     _normalize_foreshadow_code,
     _procedural_plot_guard_guidance,
+    _terminal_window_bounds,
 )
 from .workers import NovelAnalysisWorker
 
@@ -306,6 +308,7 @@ CREATION_CUSTOM_PROTAGONIST_STYLE_GUIDANCE = """
 
 CREATION_PROCEDURAL_PLOT_GUARD = _procedural_plot_guard_guidance().strip()
 CREATION_ENTITY_NAMING_GUIDANCE = _entity_naming_guidance().strip()
+CREATION_CORE_MOTIVE_GUIDANCE = _core_motive_progression_guidance().strip()
 
 
 def _creation_entity_naming_guidance(context):
@@ -334,6 +337,12 @@ CREATION_FORESHADOW_CLOSURE_GUIDANCE = """
 """.strip()
 
 
+CREATION_ENDING_DIRECTION_GUIDANCE = """
+结尾方向不是“开放式结尾任务”，也不是下一卷预告，而是本部结局的方向性契约。先明确本部最后要落地的结果：核心动机的具体目标怎样完成、失败、转化或付出代价，核心矛盾最终形成什么可见结果，主要关系如何落定，主角最终处于什么位置。结局可以圆满、遗憾、代价胜利、关系暂未完全定型或留下适合题材的余味，结果形态由故事本身决定，不套固定模板；但不能让主角必须完成的事情、核心对手、核心真相或本部主要关系停在“以后再说”。
+允许保留的余味只能是不影响本部闭环的内容，例如人物之后的选择、世界仍有更大空间、关系中的情绪余波或读者可以自行想象的未来；不得把新敌人、新任务、新规则、新目的地、下一卷承诺或必须继续追问的重大真相写成最后阶段的待办事项。结尾方向应同时写清“本部已经得到的结果”和“结果之后仍可存在的余味”，前者优先于后者。
+""".strip()
+
+
 CREATION_INSPIRATION_FACT_GUIDANCE = """
 作者灵感中明确写出的事实都属于故事底盘的一部分，要完整吸收并保留事实含义。人物身份、人生阶段、职业或学业状态、关系状态、时间顺序、已经发生的事件、具体地点、关键限制、爽点和结局方向，都要在后续资料中继续体现；与主角处境、故事开场和主线直接相关的关键事实，要在每个故事方向的简介中自然写出来，不能只留在主角字段或资料字段里。人物字段、故事引子、简介、主线和关系线表达同一事实时，要保持同一时间、身份和因果关系。五个方向可以用不同的场景、人物选择、冲突形状和推进方式呈现这些事实，差异继续来自故事本身；作者没有明确的部分保留自由创作空间。
 """.strip()
@@ -347,15 +356,17 @@ COMMON_CREATION_RULES = f"""
 4. 小说圣经、世界规则、人物、设定和伏笔各自承担不同作用：圣经托住整本书，世界规则说明长期运转方式，人物承载选择和关系，设定提供反复使用的生活落点，伏笔保留线索和后续变化。
 5. 危险和代价优先落到躲避、交换、资源变化、身份暴露、关系破裂、空间变化和局势改变上；身体伤势随题材和现场需要自然出现。
 6. 实力体系跟随题材本身生长：明确需要修炼、境界或能力层次的故事，在设定库里展开来源、层次、边界和成长条件；普通都市、言情、悬疑、灵异、现实和没有明确力量体系的科幻，把重点放在人物处境、规则边界和具体事件上。
-7. {CREATION_CHARACTER_PROFILE_GUIDANCE}
-   8. {CREATION_FORESHADOW_CLOSURE_GUIDANCE}
-   9. {CREATION_CUSTOM_PROTAGONIST_STYLE_GUIDANCE}
-   10. 不使用“短促直接”“温和克制”“冷淡”“命令式”这几类语言风格，其它可以正常使用。
-   11. {CREATION_PROCEDURAL_PLOT_GUARD}
-   12. {CREATION_ENTITY_NAMING_GUIDANCE}
-   13. 字段值直接写具体内容，保持清楚、稳定、方便后续执行；内容呈现为作者自己的故事底稿，各资料类别各自承担作用，同一段剧情只放在最合适的位置。
-   14. JSON 只作为程序读取的容器：保持紧凑，不用 Markdown、缩进、空行或多余空格；压缩外壳，不压缩事实、人物数量、设定数量、伏笔数量或故事内容。
-   15. {CREATION_INSPIRATION_FACT_GUIDANCE}
+7. {CREATION_CORE_MOTIVE_GUIDANCE}
+8. {CREATION_ENDING_DIRECTION_GUIDANCE}
+9. {CREATION_CHARACTER_PROFILE_GUIDANCE}
+10. {CREATION_FORESHADOW_CLOSURE_GUIDANCE}
+11. {CREATION_CUSTOM_PROTAGONIST_STYLE_GUIDANCE}
+12. 不使用“短促直接”“温和克制”“冷淡”“命令式”这几类语言风格，其它可以正常使用。
+13. {CREATION_PROCEDURAL_PLOT_GUARD}
+14. {CREATION_ENTITY_NAMING_GUIDANCE}
+15. 字段值直接写具体内容，保持清楚、稳定、方便后续执行；内容呈现为作者自己的故事底稿，各资料类别各自承担作用，同一段剧情只放在最合适的位置。
+16. JSON 只作为程序读取的容器：保持紧凑，不用 Markdown、缩进、空行或多余空格；压缩外壳，不压缩事实、人物数量、设定数量、伏笔数量或故事内容。
+17. {CREATION_INSPIRATION_FACT_GUIDANCE}
 """.strip()
 
 
@@ -363,6 +374,8 @@ STEP_PROMPTS = {
     "premise": f"""{COMMON_CREATION_RULES}
 
 现在先从作者给出的灵感出发，写出 5 个彼此真正不同、可以直接开始连载的故事方向。每个方向的简介都从一个正在发生的强冲突切入：让主角在具体场面里立刻遇到会改变处境的压力、对抗、失控或突发事件，并让这次冲突留下清楚的现实后果，把故事推向后面。冲突的形状由题材、灵感、人物关系和风格自然决定，不套固定顺序，不把简介写成资料清单或策划说明。简介要求用自然的网络小说叙述语言风格，不要出现策划术语、抽象形容、办案式风格、编辑式说明、编辑式总结之类的词。简介字数软要求为 300 字左右。
+每个方向的 m“贯穿全书的矛盾”要让读者看懂主角为什么非行动不可、要到达什么具体结果、失败会失去什么、什么自然节点会让代价加重或机会改变，并体现主要反差轴；这些是核心动机的验收维度，不是固定句式、固定顺序或每项各写一段，可以根据题材合并在人物关系、秘密、选择、资源限制或现场后果里。不能只写“赚钱、变强、复仇、逆天改命”这类抽象愿望，也不要为了凑齐维度给所有故事硬加金额、倒计时、强敌或升级路线。核心动机要能被拆成连续阶段目标：解决当前阻碍后，结果打开下一道更具体的阻碍或更高代价，不能每个方向只剩一串互不相干的事件。
+这里的 m 是候选故事的核心动机主线契约，不是另起一条“主线矛盾”：下游会把它统一保存为 core_motive。关系线、主题和阶段冲突都只能围绕这条核心动机展开，不能各自提出另一项主角必须完成的总任务。
 
 先完整吸收作者灵感和全部选择，再开始写。五个方向都使用灵感中的核心内容，但各自从不同的人物选择、现实压力、关系变化或题材机制长出自己的故事；差异要来自故事本身，不靠只换名字、地点或几句设定。五个方向可以采用完全不同的剧情发动方式，不要求统一的冲突顺序、固定的网文结构或相同的推进节奏。
 
@@ -371,14 +384,19 @@ STEP_PROMPTS = {
 
 下面示例中的空对象只是为了避免重复占篇幅，实际返回时 1、2、3、4、5 五个槽位都必须各自完整填写十个字段，不能返回空对象，也不能把多个故事合并到一个槽位。
 
-只输出一个合法 JSON 对象。不要使用可变长度的候选数组，改用固定的五个编号对象：{{"c":{{"1":{{"t":"书名","g":"类型","a":"读者方向","y":"风格","h":"一句话故事引子","d":"故事简介，约300字","p":"主角初始处境、性格和最想得到的东西","m":"贯穿全书的矛盾","r":"人物关系长线变化","e":"开放式结尾方向"}},"2":{{}},"3":{{}},"4":{{}},"5":{{}}}},"s":0}}。c 只能有 1、2、3、4、5 五个键，不能增加第6个方向，也不能漏掉任何一个方向；每个方向都必须完整填写，不要输出 Markdown、解释或其它键。""",
+每个方向的 e“结尾方向”必须先写本部核心动机、核心矛盾、主要关系和主角最终处境的明确落点，再写可选的余味。余味可以是遗憾、代价、关系暂未完全定型或世界仍有空间，但不能把新敌人、新任务、下一卷承诺或必须由后续回答的重大问题当成本部结尾内容。
+
+只输出一个合法 JSON 对象。不要使用可变长度的候选数组，改用固定的五个编号对象：{{"c":{{"1":{{"t":"书名","g":"类型","a":"读者方向","y":"风格","h":"一句话故事引子","d":"故事简介，约300字","p":"主角初始处境、性格和最想得到的东西","m":"核心动机主线","r":"人物关系长线变化","e":"结尾方向（本部结果与余波）"}},"2":{{}},"3":{{}},"4":{{}},"5":{{}}}},"s":0}}。c 只能有 1、2、3、4、5 五个键，不能增加第6个方向，也不能漏掉任何一个方向；每个方向都必须完整填写，不要输出 Markdown、解释或其它键。""",
     "bible": f"""{COMMON_CREATION_RULES}
 
 现在和作者一起把已经选定的故事底盘搭好。下面的“已经选定的故事”是唯一的故事来源：稳住它的主角、处境、地点、核心悬念、主要关系和结尾方向，再补足长篇故事继续生长所需要的事实。新增人物、新势力和新秘密都要服务于原来的主线，并在后续事件中拥有具体作用。
 
 这一次要把小说圣经、世界规则、人物、设定和伏笔一起写出来，但五部分各自回答不同的问题：
 这一步只根据已经选定的故事和作者偏好搭建底盘，后面的阶段规划会读取这里的完整资料。这里写整本书的骨架和长期事实，让后面的场景自然长出来；剧情细节留到阶段和章节中由人物经历展开。
-小说圣经回答“这整本书最核心的东西是什么”。它写主角为什么非走下去、全书一直悬着的矛盾、整本书会反复逼近的问题、重要关系的底子、故事想留下的东西和结尾方向。这里的长期问题要写成随着人物一次次选择不断变深的具体事情，不写“读者会……”或编辑式的阅读说明，也不承担章节剧情复述。
+小说圣经回答“这整本书最核心的东西是什么”。其中的主线矛盾字段必须承担一条可执行的核心动机契约：主角为什么非走下去、要在什么期限或机会窗口内完成什么具体目标、失败会失去什么、谁或什么在阻挡，以及主角的开局处境与终局目标/对手/代价之间有什么大反差。再把这条大目标拆成会自然延伸的阶段目标，让每个阶段都是同一件事的下一道阻碍或更高代价。这里的长期问题要写成随着人物一次次选择不断变深的具体事情，不写“读者会……”或编辑式的阅读说明，也不承担章节剧情复述。
+结尾方向字段必须写成“本部结果与余波”：先说明核心动机的最终结果、核心矛盾的解决或代价、主要关系的落点和主角最终处境，再说明哪些内容可以作为不影响本部闭环的余味。可以保留情绪、关系或世界层面的开放感，但不得把新的敌人、任务、规则、目的地、下一卷承诺或必须继续回答的核心真相写成结尾依赖；结尾方向不是要求最后一章继续留悬念。
+这里不再把“主线矛盾”和“核心动机”当成两条并列主线：固定输出中的第4项 main_conflict 只是兼容字段，内容就是唯一的 core_motive 主线契约。它要同时包含主角必须完成的具体目标、阻碍目标的对手或结构、失败代价、期限/机会窗口和持续反差；后续系统会把它投影到 core_motive，不要再另写一条不同的总目标。
+其中的“主题”只回答这条故事最终要讨论或留下的人的命题、价值冲突和情感认识；主题字段只提炼意义，不能把核心动机换一种说法再写一遍。主题不要直接重复具体任务、金额、期限、对手、资源缺口或“主角必须完成某事”等执行信息；这些内容只写进主线矛盾。主题可以从核心动机中提炼意义，但不能替代核心动机，也不能反过来要求主角围绕抽象观点行动。
 
 世界规则回答“这个世界怎样运转”。它写日常生活、空间和社会关系、异常或力量从哪里来、什么条件会让它发生、人物要为触碰它付出什么，以及不同人物会怎样应对。它只写长期成立的运行方式；没有明确力量体系的题材，世界规则就围绕空间、社会、异常和代价展开；明确有修炼或境界的题材，再写力量来源和总边界，详细层次统一放进设定库里的“规则”条目。
 
@@ -388,7 +406,7 @@ STEP_PROMPTS = {
 
 选定故事尚未确定的部分，保留为人物正在面对的问题、线索和可能解释；从故事自然延伸出来、后面反复会用到的人物、地点、势力、物件、制度和暗线，都补足为可落地的故事资料。字段值以清楚、稳定、方便后续执行为先，简介字段保持可公开发布的自然网络小说语言，其余内容像作者自己的故事底稿一样具体易读。
 
-只输出一个合法 JSON 对象，使用短键和固定顺序数组：{{"b":["核心设定","读者承诺","主题","主线矛盾","人物关系底子","结尾方向","硬边界"],"w":["世界概况","力量或能力体系","长期规则数组","代价限制数组","地理与生活"],"c":[["姓名","身份和故事位置","当前目标","秘密","人物性格/特点","语言风格","害怕失去什么、与主角的长期关系底色和长期变化"]],"l":[["名称","类型","具体内容","人物当前知道多少"]],"f":[["编号","名称","埋设阶段","回收阶段","读者能看到的线索及后续变化","揭开后会改变什么","仍未揭开的部分"]]}}。实际输出时：b固定7项，w固定5项，c每项固定7项，l每项固定4项，f每项固定7项；人物字段只写长期资料，具体剧情动作留给阶段和章节；空内容保留空字符串占位，资料数量和文字事实完整保留。""",
+只输出一个合法 JSON 对象，使用短键和固定顺序数组：{{"b":["核心设定","读者承诺","主题","核心动机契约（主线矛盾）","人物关系底子","结尾方向","硬边界"],"w":["世界概况","力量或能力体系","长期规则数组","代价限制数组","地理与生活"],"c":[["姓名","身份和故事位置","当前目标","秘密","人物性格/特点","语言风格","害怕失去什么、与主角的长期关系底色和长期变化"]],"l":[["名称","类型","具体内容","人物当前知道多少"]],"f":[["编号","名称","埋设阶段","回收阶段","读者能看到的线索及后续变化","揭开后会改变什么","仍未揭开的部分"]]}}。实际输出时：b固定7项，其中第4项“核心动机契约（主线矛盾）”必须完整承载唯一的 core_motive 主线；w固定5项，c每项固定7项，l每项固定4项，f每项固定7项；人物字段只写长期资料，具体剧情动作留给阶段和章节；空内容保留空字符串占位，资料数量和文字事实完整保留。""",
     "story_assets": f"""{COMMON_CREATION_RULES}
 
 接着前面已经确定的故事，把后面真的会反复出现的人物、地方、势力、物件、规矩和暗线写出来。每一项都要落到人物看得见、摸得着的生活里，并且在某一次选择中起作用；线索的意义随着人物行动、关系变化和局势变化逐步显现。
@@ -413,7 +431,7 @@ STEP_PROMPTS = {
 
 STAGE_PLAN_OBJECT_OUTPUT_RULES = """
 这次使用对象协议，阶段和事件按字段名归位；只返回一个合法 JSON 对象。
-短键含义如下：k=全书底盘契约，s=当前阶段对象，f=当前阶段实际发生的伏笔端点。阶段对象中 i=阶段编号，n=阶段名称，r=章节范围，b=开始状态，e=按顺序发生的场景事件对象数组，x=结束状态，y=带入下一阶段的事实。状态对象中 t=时间，l=地点，c=人物状态，k=已经发生并被人物掌握的事实，q=仍会推动人物行动的问题。事件对象中 i=事件编号，r=允许章节范围，a=关联资料，p=前置条件，h=可直接扩写的场景事件，o=直接结果，d=实际状态变化。伏笔端点对象中 i=伏笔编号，k=setup或payoff，e=承载这个端点的事件编号，d=这一次在场景中发生的具体变化；一次只写一个端点。
+短键含义如下：k=全书底盘契约（其中的核心动机是唯一执行主线），s=当前阶段对象，f=当前阶段实际发生的伏笔端点。阶段对象中 i=阶段编号，n=阶段名称，r=章节范围，b=开始状态，e=按顺序发生的场景事件对象数组，x=结束状态，y=带入下一阶段的事实。状态对象中 t=时间，l=地点，c=人物状态，k=已经发生并被人物掌握的事实，q=仍会推动人物行动的问题。事件对象中 i=事件编号，r=允许章节范围，a=关联资料，p=前置条件，h=可直接扩写的场景事件，o=直接结果，d=实际状态变化。伏笔端点对象中 i=伏笔编号，k=setup或payoff，e=承载这个端点的事件编号，d=这一次在场景中发生的具体变化；一次只写一个端点。
 每个 h 都要像一段可以直接扩写的剧情节点：只写这件事真正需要的故事事实，必要时交代人物、场景、动作、阻力、选择或结果，尽量不用固定清单式要求，不为凑齐项目硬塞字段。剧情发动机由题材和人物处境决定，可以是正面碰撞、追逐逃避、关系变化、欲望争夺、环境失控、能力试探、秘密暴露或其它自然发生的压力；相邻事件要让人物处境产生新的变化，不把这些方式排成固定轮换。资料只有在人物正在做事、被迫应对或关系发生变化时进入场景。
 当前阶段发生的正式伏笔端点，都在承载事件的 a 中加入一次“F编号/setup”或“F编号/payoff”，并在 f 中用同一事件编号 e 关联。setup写线索第一次进入人物生活，payoff写线索在场景中产生决定性变化；同一条伏笔在其它事件中继续出现、深化、造成后果是正常的，这些事件只把它作为普通关联资料或写出“F编号”，不要重复标成正式 setup/payoff。程序以正式端点为准，再把后续事件中的具体变化交给章节规划继续使用；阶段之间允许继续铺开同一条暗线，程序会依据事件 r 的章节范围落下具体章号。
 实际返回的 f 使用单端点格式，例如 {"i":"F06","k":"payoff","e":"E04","d":"人物在现场做出选择后，线索改变了什么"}。全书契约保留长期事实、世界运行方式、人物底色和结尾方向；伏笔通过 setup 与 payoff 表达它在场景中的进入、变化和意义显现。
@@ -423,7 +441,8 @@ STAGE_PLAN_OBJECT_OUTPUT_RULES = """
 
 STEP_PROMPTS["stage_plan"] = f"""{COMMON_CREATION_RULES}
 
-现在根据已经选定的故事和完整故事底盘，制作唯一的十万字阶段规划。这里的内容是给后续章节规划和正文扩写读取的执行资料，不是发布简介，也不需要写成文学化段落。总字数和单章字数完全按照作者输入；章节总数按 total_words / average_chapter_words 向上取整，最后一章吸收余数。每约十万字为一个阶段，阶段从第1章连续覆盖到最后一章，事件范围按顺序衔接。
+现在根据已经选定的故事和完整故事底盘，制作唯一的十万字阶段规划。这里的内容是给后续章节规划和正文扩写读取的执行资料，不是发布简介，也不需要写成文学化段落。总字数和单章字数完全按照作者输入；章节总数按 total_words / average_chapter_words 向上取整，最后一章吸收余数。每约十万字为一个阶段，阶段从第1章连续覆盖到最后一章，事件范围按顺序衔接。全书始终围绕唯一的 core_motive 推进：主角为了完成具体目标主动采取行动，剧情阻碍这条行动链，主角付出代价解决当前问题，结果再打开下一道目标；不能把阶段写成主角被动不断遇到新事情。
+阶段字段不要抢全书主线：阶段的 main_conflict 只写本阶段阻碍核心动机的具体问题、门槛、对手动作或代价升级；阶段 summary/end_state 要说明本阶段目标如何推进，以及结果打开的下一阶段目标。不要在每个阶段重新发明一条“主角真正要做的事”，也不要把主题、人物关系或伏笔名称填成阶段主线。
 
 阶段规划固定事实、顺序、状态和阶段推进，但剧情推进以场景为单位。每个事件写清本次真正发生、会影响后续的故事事实；时间、地点、人物、动作、阻力、选择、关系变化和结果等内容，只在当前事件确实需要时补充。事件之间通过人物正在做的事和已经发生的变化自然衔接。先判断这一事件真正由什么推动，再选择最适合题材的场景：人物对抗、关系变化、现场危机、公开行动、利益争夺、环境压力或信息出现都可以成为主发动机。相邻事件主动更换主发动机、场景目标和压力来源，让人物、关系、空间和局势持续变化。
 同一事件如果覆盖数章，只承担一次明确的转折；前面的章节让事情发生，后面的章节写它造成的新反应、新选择、新损失、新关系变化或新阻力，不要把同一场谈话、同一份材料或同一个结论反复当成新的剧情。对都市灵异、惊悚、悬疑、情感等题材，声音、空间、物件、生活压力、人物之间的隐瞒和现场失控持续进入剧情；对其它题材，使用该题材自己的场景压力和人物对抗。故事的关键变化要发生在人物正在经历的场面里，而不是停在解释性结论上。
@@ -2829,7 +2848,10 @@ def normalize_creation_result(
                 "one_sentence": _as_text(_first_value(item, ("one_sentence", "hook", "一句话简介"))),
                 "synopsis": _as_text(_first_value(item, ("synopsis", "summary", "简介"))),
                 "protagonist": _as_text(_first_value(item, ("protagonist", "hero", "主角"))),
-                "main_line": _as_text(_first_value(item, ("main_line", "core_line", "主线"))),
+                "main_line": _as_text(_first_value(
+                    item,
+                    ("core_motive", "main_motive", "main_line", "core_line", "核心动机", "核心动机主线", "主线"),
+                )),
                 "relationship_engine": _as_text(_first_value(item, ("relationship_engine", "关系线"))),
                 "ending_direction": _as_text(_first_value(item, ("ending_direction", "ending", "结局方向"))),
             }
@@ -2847,10 +2869,21 @@ def normalize_creation_result(
             result["_candidate_protocol_error"] = protocol_error
         return result
     if step == "bible":
+        bible = _normalize_bible(
+            _first_value(payload, ("bible", "novel_bible", "小说圣经"), {})
+        )
+        if not bible.get("main_conflict"):
+            fallback_motive = _as_text(
+                _first_value(
+                    payload,
+                    ("core_motive", "main_motive", "核心动机", "主角核心动机"),
+                    "",
+                )
+            )
+            if fallback_motive:
+                bible["main_conflict"] = fallback_motive
         result = {
-            "bible": _normalize_bible(
-                _first_value(payload, ("bible", "novel_bible", "小说圣经"), {})
-            ),
+            "bible": bible,
             "world_rules": _normalize_world_rules(
                 _first_value(payload, ("world_rules", "world", "世界规则"), {})
             ),
@@ -3080,15 +3113,16 @@ def pretty_json(value):
     return json.dumps(value if value is not None else {}, ensure_ascii=False, indent=2)
 
 
-def _format_value(value, indent=0):
+def _format_value(value, indent=0, label_overrides=None):
     prefix = "  " * indent
+    label_overrides = label_overrides if isinstance(label_overrides, dict) else {}
     if isinstance(value, dict):
         lines = []
         for key, child in value.items():
-            label = _context_label(key)
+            label = label_overrides.get(key, _context_label(key))
             if isinstance(child, (dict, list)):
                 lines.append(f"{prefix}{label}：")
-                lines.extend(_format_value(child, indent + 1))
+                lines.extend(_format_value(child, indent + 1, label_overrides))
             else:
                 text = _as_text(child)
                 if text:
@@ -3099,17 +3133,36 @@ def _format_value(value, indent=0):
         for index, child in enumerate(value, 1):
             if isinstance(child, dict):
                 lines.append(f"{prefix}{index}.")
-                lines.extend(_format_value(child, indent + 1))
+                lines.extend(_format_value(child, indent + 1, label_overrides))
             else:
                 lines.append(f"{prefix}- {_as_text(child)}")
         return lines
     return [f"{prefix}{_as_text(value)}"] if _as_text(value) else []
 
 
-def format_creation_text(value, title=""):
+def format_creation_text(value, title="", label_overrides=None):
     lines = [title] if _as_text(title) else []
-    lines.extend(_format_value(value))
+    lines.extend(_format_value(value, label_overrides=label_overrides))
     return "\n".join(line for line in lines if line).strip()
+
+
+def migrate_creation_bible_display_text(value, has_core_motive=False):
+    """Rename the legacy Bible label without changing the stored story text."""
+    text = _as_text(value)
+    if not text or not has_core_motive:
+        return text
+    migrated = []
+    changed = False
+    for line in text.splitlines():
+        match = re.match(r"^(\s*)主线矛盾([：:])", line)
+        if match:
+            line = (
+                f"{match.group(1)}核心动机契约（主线矛盾）{match.group(2)}"
+                + line[match.end():]
+            )
+            changed = True
+        migrated.append(line)
+    return "\n".join(migrated) if changed else text
 
 
 def _flatten_preview_text(value):
@@ -3139,7 +3192,7 @@ def _format_bible_section_body(result):
     bible_lines = []
     bible_labels = {
         "core_setting": "核心设定",
-        "main_conflict": "主线矛盾",
+        "main_conflict": "核心动机契约（主线矛盾）",
         "relationship_foundation": "人物关系底子",
         "reader_promise": "持续悬念",
         "theme": "故事想留下的东西",
@@ -3391,7 +3444,7 @@ def _format_stage_plan_preview(result):
             block.append(f"开始时：{entry}")
         conflict = _as_text(item.get("main_conflict"))
         if conflict:
-            block.append(f"主要矛盾：{conflict}")
+            block.append(f"本阶段阻碍核心动机的问题：{conflict}")
         events = item.get("ordered_events", [])
         if isinstance(events, list) and events:
             block.append("按顺序发生：")
@@ -3755,7 +3808,16 @@ def build_chapter_plan_foundation(framework):
     total_words = int(framework.get("total_words", 500000) or 500000)
     average_words = int(framework.get("average_chapter_words", 3000) or 3000)
     bounds, total_chapters = _stage_chapter_bounds(stages, total_words, average_words)
-    core_mainline = _as_text(premise.get("main_line", "")) or _as_text(bible.get("main_conflict", ""))
+    terminal_bounds = _terminal_window_bounds(total_chapters)
+    framework_core_motive = _as_text(framework.get("core_motive", ""))
+    bible_main_conflict = _as_text(bible.get("main_conflict", ""))
+    premise_mainline = _as_text(premise.get("main_line", ""))
+    premise_core_motive = _as_text(premise.get("core_motive", "")) or premise_mainline
+    # Bible.main_conflict is the completed, user-confirmed core-motive
+    # contract.  The premise value is only a fallback for older or partial
+    # projects where the second step has not supplied it yet.
+    core_motive = framework_core_motive or bible_main_conflict or premise_core_motive
+    core_mainline = core_motive
     relationship_engine = _as_text(premise.get("relationship_engine", ""))
     reading_experience = _as_text(premise.get("one_sentence", "")) or _as_text(bible.get("reader_promise", ""))
     profile = {
@@ -3763,14 +3825,19 @@ def build_chapter_plan_foundation(framework):
         "audience_direction": _as_text(premise.get("audience", "")),
         "genre_world": _as_text(premise.get("genre", "")),
         "core_reader_promise": reading_experience,
-        "primary_story_engine": core_mainline or "让人物在具体事情里作出选择，并承担选择带来的变化。",
+        "core_motive": core_motive,
+        "primary_story_engine": (
+            "由核心动机驱动：主角为了完成具体目标主动行动，阻碍、代价和结果把故事推向下一阶段。"
+            if core_motive else
+            "让人物在具体事情里作出选择，并承担选择带来的变化。"
+        ),
         "secondary_story_engine": relationship_engine,
         "planning_grammar": "每一段都写人物正在经历的事情、当下的选择和事情留下的变化，不把后面的故事提前塞进当前内容。",
         "pacing_strategy": "按照题材本身的快慢推进，让悬念、情绪、行动和结果自然交替，不套固定场面。",
         "low_exposition_strategy": "只在人物看见、听见或需要作出选择时带出世界信息。",
-        "story_direction": "让人物在具体事情里持续作出选择，保持题材的核心读感，让伏笔随着人物行动和关系变化逐步显出意义，结尾留下有余波的问题。",
-        "satisfaction_currencies": ["具体事情带来的结果", "人物选择造成的变化", "身份或认知被揭开", "仍未说尽的余波"],
-        "emotional_resonance_axes": ["人物在现实压力下的选择", "靠近、疏远或反目", "知道一部分真相后仍然留下的未知"],
+        "story_direction": "让人物在具体事情里持续作出选择，保持题材的核心读感，让伏笔随着人物行动和关系变化逐步显出意义，结尾先形成本部明确结果，再保留不影响闭环的余波。",
+        "satisfaction_currencies": ["具体事情带来的结果", "人物选择造成的变化", "身份或认知被揭开", "本部结果落地后的余波"],
+        "emotional_resonance_axes": ["人物在现实压力下的选择", "靠近、疏远或反目", "核心结果落地后仍可保留的情绪或背景余波"],
         "chapter_variation_pool": ["现实阻力", "人物选择", "利益交换", "新信息出现", "关系发生变化"],
     }
     arcs = []
@@ -3803,6 +3870,7 @@ def build_chapter_plan_foundation(framework):
                     _as_text(stage.get("end_state", "")),
                 ) if value
             ),
+            "core_motive": core_motive,
         }
         arcs.append(arc)
     summary = _as_text(premise.get("synopsis", ""))
@@ -3814,15 +3882,23 @@ def build_chapter_plan_foundation(framework):
         "planning_schema_version": _as_text(framework.get("planning_schema_version", "2")) or "2",
         "summary": summary,
         "core_mainline": core_mainline,
+        "core_motive": core_motive,
         "ending_promise": ending,
         "global_hard_boundaries": boundaries,
         "target_words": total_words,
         "average_chapter_words": average_words,
         "total_chapter_count": total_chapters,
         "existing_chapter_count": 0,
+        "terminal_window": {
+            "start_chapter": terminal_bounds[0],
+            "end_chapter": terminal_bounds[1],
+            "chapter_count": terminal_bounds[1] - terminal_bounds[0] + 1,
+            "source": "creation_wizard",
+        } if terminal_bounds else {},
         "narrative_strategy_profile": profile,
         "creative_intent_contract": {
-            "primary_line": core_mainline,
+            "primary_line": core_motive,
+            "core_motive": core_motive,
             "core_relationships": _as_text(premise.get("relationship_engine", "")),
             "stage_progression": "；".join(_as_text(item.get("name", "")) for item in stages if isinstance(item, dict)),
             "reading_experience": _as_text(premise.get("one_sentence", "")),
@@ -3875,15 +3951,16 @@ _CONTEXT_LABELS = {
     "one_sentence": "故事钩子",
     "synopsis": "故事简介",
     "protagonist": "主角眼下的处境和想要的东西",
-    "main_line": "贯穿全书的矛盾",
+    "main_line": "核心动机主线（旧字段）",
+    "core_motive": "核心动机主线",
     "relationship_engine": "人物关系怎样变化",
-    "ending_direction": "结尾留下的方向",
+    "ending_direction": "本部结尾方向（结果与余波）",
     "bible": "故事的核心",
     "novel_bible": "故事的核心",
     "core_setting": "核心设定",
     "reader_promise": "持续悬念",
     "theme": "主题",
-    "main_conflict": "主线矛盾",
+    "main_conflict": "核心动机契约（主线矛盾）",
     "relationship_foundation": "人物关系底子",
     "hard_boundaries": "必须守住的边界",
     "world_rules": "世界里的规矩",
@@ -5075,6 +5152,8 @@ class NovelCreationWorker(NovelAnalysisWorker):
             average_chapter_words = max(1, int(average_chapter_words or 3000))
         except (TypeError, ValueError):
             average_chapter_words = 3000
+        total_chapters = _creation_total_chapters(total_words, average_chapter_words)
+        terminal_bounds = _terminal_window_bounds(total_chapters)
         power_levels_guidance = ""
         if story_requires_explicit_power_levels(
             author_input,
@@ -5088,7 +5167,7 @@ class NovelCreationWorker(NovelAnalysisWorker):
         if self.creation_batch == "bible_core":
             prompt = f"""{COMMON_CREATION_RULES}
 
-只根据作者已经选定的故事，生成小说圣经和世界规则。小说圣经写整本书的核心矛盾、人物关系底子、贯穿全书并会随着人物选择不断变深的问题、主题、结尾方向和长期事实，让后面的阶段和场景都有清楚的根。世界规则写世界长期怎样运转、日常生活、地点和社会关系、异常或能力的来源、触发条件、作用边界和代价；普通都市、灵异、悬疑、情感和现实题材，把规则落在空间、社会、异常与人物处境上；明确有修炼或境界的题材，再写力量来源和总边界，详细层次留给下一批的设定记录。
+只根据作者已经选定的故事，生成小说圣经和世界规则。小说圣经写整本书的核心矛盾、人物关系底子、贯穿全书并会随着人物选择不断变深的问题、主题、结尾方向和长期事实，让后面的阶段和场景都有清楚的根。主线矛盾字段必须完整承载核心动机契约：主角为什么非行动不可、要完成什么可验收的具体目标、期限或机会窗口是什么、失败会失去什么、阻碍来自谁或什么，以及开局与终局之间的主要反差；不能只写“赚钱、变强、复仇”这类抽象方向。主题字段只提炼这条故事要讨论的人性命题、价值冲突或情感认识，不重复具体任务、金额、期限、资源缺口、对手或执行步骤；不能用主题代替主线矛盾，也不能让主题变成另一条主线。还要写出解决当前目标后会自然打开的下一道具体阻碍或更高代价，保证后续阶段是在推进同一条主线，而不是不断换题。世界规则写世界长期怎样运转、日常生活、地点和社会关系、异常或能力的来源、触发条件、作用边界和代价；普通都市、灵异、悬疑、情感和现实题材，把规则落在空间、社会、异常与人物处境上；明确有修炼或境界的题材，再写力量来源和总边界，详细层次留给下一批的设定记录。
 
 世界规则的五个位置都要形成可执行的事实：世界概况交代长期环境，力量或能力体系交代来源与总边界，长期规则数组写会反复成立的运行方式，代价限制数组写人物触碰这些规则后会承担的现实后果，地理与生活写人物平常真正会走进的地方和生活压力。每条规则都能影响人物选择，数组写实际内容，不用空泛的分类名。
 
@@ -5102,7 +5181,7 @@ b 只能使用 c、r、t、m、p、e、h；w 只能使用 s、p、r、c、g。�
         elif self.creation_batch == "bible_assets":
             prompt = f"""{COMMON_CREATION_RULES}
 
-读取作者已经选定的故事，以及前一批已经生成的小说圣经和世界规则，补齐人物、设定和伏笔。人物要分别写身份、想得到或守住的东西、秘密、人物性格/特点、语言风格，以及害怕失去什么、与主角的长期关系底色和长期变化。人物性格/特点写长期稳定的性格底色，语言风格写可迁移的表达分类和习惯；人物性格、语言风格和 notes 都不要落到具体事件、食物、地点、道具、固定笑点、固定动作、固定口头禅、某一次剧情反应或固定触发模式上。具体怎样牵制、靠近、利用、误会或翻脸，留给后面的阶段和章节在场景中表现。设定库统一收录后面反复会用到的地点、物件、势力、制度、日常场景和能力边界。明确有修炼、境界或力量层次的题材，在设定的规则条目里写详细层次；其它题材把设定落在空间、生活、社会关系和异常边界上。伏笔围绕主线冲突、重要人物关系和关键设定展开，但每条只保留一个核心问题和一个可验收的回收结果：写清当前可见的具体线索、人物当前理解、回收时谁做了什么、读者确认了什么、当场产生什么后果，notes留空，状态统一为未埋。普通伏笔的 remaining_secret 填“无”或只写不影响本部闭环的余波；只有少量真正贯穿全书核心矛盾的长期主线谜团才允许保留核心未解部分。
+读取作者已经选定的故事，以及前一批已经生成的小说圣经和世界规则，补齐人物、设定和伏笔。所有人物目标、关键设定和伏笔都必须服务于已经确认的核心动机：它们要帮助主角完成目标、制造阻碍、抬高代价、改变资源/关系/信息/时间窗口，或在阶段转换时打开下一道具体目标；不能各自发展成脱离主线的独立故事。人物要分别写身份、想得到或守住的东西、秘密、人物性格/特点、语言风格，以及害怕失去什么、与主角的长期关系底色和长期变化。人物性格/特点写长期稳定的性格底色，语言风格写可迁移的表达分类和习惯；人物性格、语言风格和 notes 都不要落到具体事件、食物、地点、道具、固定笑点、固定动作、固定口头禅、某一次剧情反应或固定触发模式上。具体怎样牵制、靠近、利用、误会或翻脸，留给后面的阶段和章节在场景中表现。设定库统一收录后面反复会用到的地点、物件、势力、制度、日常场景和能力边界。明确有修炼、境界或力量层次的题材，在设定的规则条目里写详细层次；其它题材把设定落在空间、生活、社会关系和异常边界上。伏笔围绕主线冲突、重要人物关系和关键设定展开，但每条只保留一个核心问题和一个可验收的回收结果：写清当前可见的具体线索、人物当前理解、回收时谁做了什么、读者确认了什么、当场产生什么后果，notes留空，状态统一为未埋。普通伏笔的 remaining_secret 填“无”或只写不影响本部闭环的余波；只有少量真正贯穿全书核心矛盾的长期主线谜团才允许保留核心未解部分。
 
 {CREATION_LORE_TYPE_GUIDANCE}
 
@@ -5137,7 +5216,7 @@ c 中每项只能使用 n、r、g、s、p、v、q；l 中每项只能使用 n、
             )
             prompt = f"""{COMMON_CREATION_RULES}
 
-读取作者选定的故事和完整故事底盘，在正式生成十万字阶段规划前，先建立一份简短的全书阶段骨架。它只负责固定每个阶段的主线变化、关键转折和阶段结束状态，不写章节细纲，不写事件数组，不安排具体伏笔章位，也不重复小说圣经、世界规则和人物设定。先从本阶段故事真正会发生的变化出发，再确定阶段转折；转折方式由题材、人物关系、环境和事件自然决定，不要求各阶段使用同一种推进顺序。阶段数量和章节范围完全按照作者输入；每个阶段写一条清楚的主线变化、两到四个关键转折和一条结束状态，内容要能让后面的阶段规划沿着同一条故事发展，避免阶段之间方向漂移，尽量不用固定清单式要求。
+读取作者选定的故事和完整故事底盘，在正式生成十万字阶段规划前，先建立一份简短的全书阶段骨架。它只负责固定每个阶段的主线变化、关键转折和阶段结束状态，不写章节细纲，不写事件数组，不安排具体伏笔章位，也不重复小说圣经、世界规则和人物设定。每个阶段都必须回答同一条核心动机在本阶段推进了什么：主角当前要完成的具体目标是什么、为了目标主动做了什么、遇到的主要阻碍或代价是什么、阶段结束后得到或失去什么，以及这个结果如何打开下一阶段更具体的目标。阶段不是互不相干的事件集合，也不能每阶段重新换一条主线。先从本阶段故事真正会发生的变化出发，再确定阶段转折；转折方式由题材、人物关系、环境和事件自然决定，不要求各阶段使用同一种推进顺序。阶段数量和章节范围完全按照作者输入；每个阶段写一条清楚的主线变化、两到四个关键转折和一条结束状态，内容要能让后面的阶段规划沿着同一条故事发展，避免阶段之间方向漂移，尽量不用固定清单式要求。
 
 本书总字数为{total_words}字，按每十万字划分为{stage_count}个阶段。必须恰好返回{stage_count}项，不能少一项，也不能多出额外阶段；阶段编号和章节范围固定为：{stage_ranges}。即使某一阶段的故事暂时不如其它阶段集中，也必须为该阶段写出属于它的主线变化、关键转折和结束状态，不能把相邻阶段合并，也不能提前结束全书。
 
@@ -5212,17 +5291,45 @@ c 中每项只能使用 n、r、g、s、p、v、q；l 中每项只能使用 n、
                 is_final_stage = int(stage_number) == int(total_stages)
             except (TypeError, ValueError):
                 is_final_stage = False
-            if is_final_stage:
+            try:
+                stage_start_number = int(start_chapter or 0)
+                stage_end_number = int(end_chapter or 0)
+            except (TypeError, ValueError):
+                stage_start_number, stage_end_number = 0, 0
+            terminal_overlap = None
+            if terminal_bounds and stage_start_number and stage_end_number:
+                overlap_start = max(stage_start_number, terminal_bounds[0])
+                overlap_end = min(stage_end_number, terminal_bounds[1])
+                if overlap_start <= overlap_end:
+                    terminal_overlap = (overlap_start, overlap_end)
+            if terminal_overlap:
+                final_stage_guidance = (
+                    f"\n\n当前阶段范围为第{stage_start_number}-{stage_end_number}章，"
+                    f"其中第{terminal_overlap[0]}-{terminal_overlap[1]}章属于按全书总章节数计算的最后5章收尾窗口（全书共{total_chapters}章）。"
+                    "收尾窗口只是内容规划约束，不改变当前阶段的起止章节、全书阶段数量、后续章节规划批次或任何章节数量；"
+                    "不得为了收尾另增章节、另起过渡章或把当前阶段范围改写成其它章数。"
+                    "窗口内沿着已经发生的核心冲突、人物选择和关系变化完成实际结果，不再开启新的主要任务、主要敌人、组织、力量体系、世界规则或下一卷主线，"
+                    "也不要把新的未解释信息、未知对手、未知目的地或未来承诺写成等待后续章节回答的悬念。"
+                    "每个窗口章节都要有已经发生的行动和结果；最后一章落到具体动作、对白、关系结果或已经成立的生活状态。"
+                )
+            elif is_final_stage:
                 final_stage_guidance = (
                     "\n\n这是全书最后一个十万字阶段。阶段后部必须沿着已经发生的冲突、人物选择和关系变化完成收束："
                     "把核心矛盾推到最终选择并写出实际结果，让主要人物的关系、读者承诺、普通伏笔和主角最终处境有清楚落点。"
-                    "即使作者选择开放式结尾，也要让本部的主要目标、核心冲突和人物关系在本部内得到明确结果；续作只保留不影响当前结局的余味、远景或新的选择，不把本部必须解决的事情留给下一部。"
-                    "最后几章不要再开需要后续章节解决的主线、重大反转、重要人物或新的世界规则；要把结局写成具体场景中的行动、结果和已经成立的生活状态，"
+                    "续作只能保留不影响当前结局的背景余波，不把本部必须解决的事情留给下一部。"
+                    "最后几章不要再开需要后续章节解决的主线、重大反转、重要人物、新的世界规则或等待回答的悬念；要把结局写成具体场景中的行动、结果和已经成立的生活状态，"
                     "不要用突然跳过多年的概括、作者总结或一句抽象结论代替过程。倒数第二章可以把冲突推到临界点，最后一章再完成最后选择、结果和余味。"
                 )
+            stage_progression_guidance = (
+                "本阶段后部只沿着已经发生的冲突、人物选择和关系变化完成窗口内的直接结果；"
+                "收尾窗口内不再打开下一道需要后续章节回答的主线目标、主要敌人、未知信息或悬念，"
+                "最后一章在固定章节位置内形成核心矛盾、主要关系和主角最终处境的实际结果。"
+                if terminal_overlap else
+                "本阶段解决或暂时解决当前目标后，要在 x/y 或事件结果中留下下一阶段可执行的具体目标、缺口或更高代价，不能只写‘局势继续发展’。"
+            )
             prompt = f"""{COMMON_CREATION_RULES}
 
-读取作者选定的故事、完整故事底盘、全书阶段骨架和已经完成的前面阶段，只生成当前第{stage_number}/{total_stages or '?'}阶段，范围为第{start_chapter}章到第{end_chapter}章。全书阶段骨架只负责提供本阶段的方向和结束状态，不要把骨架中的摘要和转折原样重复成另一份总规划；当前阶段的具体内容以本次事件和人物处境为准。前面阶段的结束状态、带入内容和仍在推动人物的问题是连续性依据。当前阶段沿着这些事实继续发生新的场景，前后阶段各自保持清晰的重点。阶段规划使用结构化表达，写清人物真正正在经历的事情、事件顺序、直接结果和状态变化；字段服务于故事事实，尽量不用固定清单式要求，不把每个事件套成同一张检查表。
+读取作者选定的故事、完整故事底盘、全书阶段骨架和已经完成的前面阶段，只生成当前第{stage_number}/{total_stages or '?'}阶段，范围为第{start_chapter}章到第{end_chapter}章。全书阶段骨架只负责提供本阶段的方向和结束状态，不要把骨架中的摘要和转折原样重复成另一份总规划；当前阶段的具体内容以本次事件和人物处境为准。前面阶段的结束状态、带入内容和仍在推动人物的问题是连续性依据。当前阶段必须沿着核心动机继续：先明确主角本阶段要完成的具体目标，再让事件围绕主角的行动、阻碍、选择、代价和结果展开；{stage_progression_guidance}阶段规划使用结构化表达，写清人物真正正在经历的事情、事件顺序、直接结果和状态变化；字段服务于故事事实，尽量不用固定清单式要求，不把每个事件套成同一张检查表。
 
 输入资料中的 current_foreshadow_endpoints 是本阶段自然发生的正式暗线端点清单。每一项落到一个当前事件中；kind=setup 写线索怎样第一次进入人物生活，kind=payoff 写线索怎样在现场完成一个明确问题的回答，并产生可观察的直接结果。payoff不能只写推进、部分揭示、再次出现、冲突升级、确认“事情不简单”或留下新的问题；如果当前事件只能继续铺垫，就不能把它当成正式 payoff。清单为空时，场景仍然沿着人物和主线自然推进。同一条伏笔在其它事件里继续出现、深化或产生后果是正常的，但正式端点只在真正承担该变化的事件中标记一次；后续事件用普通关联资料或“F编号”继续承接，不重复写“F编号/setup”或“F编号/payoff”。承载正式端点的事件 references 加入对应标记，让程序可以把端点和事件稳定对应起来。
 
@@ -7169,7 +7276,7 @@ class NovelCreationWizardDialog(QDialog):
                 "total_words": self.target_words_spin.value(),
                 "average_chapter_words": self.average_words_spin.value(),
                 "no_injury": True,
-                "ending": "开放式、非圆满",
+                "ending": "本部结果明确，结局形态由故事本身决定，可保留不影响闭环的余味",
             },
         }
         custom_protagonist_style = self._selected_custom_protagonist_style()
@@ -8363,6 +8470,12 @@ class NovelCreationWizardDialog(QDialog):
             "average_chapter_words": self.average_words_spin.value(),
             "completed_at": now_str(),
         }
+        # Store one canonical project-level mainline.  The fixed premise/Bible
+        # field names remain readable for old drafts, but downstream planning no
+        # longer has to choose between several competing line fields.
+        framework["core_motive"] = _as_text(
+            build_chapter_plan_foundation(framework).get("core_motive", "")
+        )
         # Keep the confirmed book name as an explicit project-level value as
         # well as inside premise, so every later wizard step can reference it.
         framework["novel_name"] = _as_text(selected.get("title", ""))

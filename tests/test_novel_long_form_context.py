@@ -67,6 +67,9 @@ from gpt_desktop.novel_utils import (
     _merge_long_form_memory_reconciliation_patch,
     _normalize_long_form_reconciliation_patch,
     _normalize_foreshadow_code,
+    _project_terminal_window_bounds,
+    _terminal_window_bounds,
+    _terminal_window_chapter_info,
     _merge_long_form_state_patch,
     _memory_repair_patch_targets,
     _literalize_long_form_memory_evidence,
@@ -98,6 +101,47 @@ from gpt_desktop.novel_utils import (
 
 
 class NovelLongFormContextTests(unittest.TestCase):
+    def test_terminal_window_is_derived_from_total_chapter_count(self):
+        self.assertEqual(_terminal_window_bounds(167), (163, 167))
+        self.assertEqual(_terminal_window_bounds(4), (1, 4))
+        self.assertEqual(_terminal_window_bounds(0), None)
+
+        project = self._project_with_current_chapter(_new_chapter(0))
+        project["chapters"] = [_new_chapter(index) for index in range(10)]
+        project["chapter_plan_foundation"] = {"total_chapter_count": 10}
+        self.assertEqual(_project_terminal_window_bounds(project), (6, 10))
+        self.assertEqual(
+            _terminal_window_chapter_info(project, 5),
+            {
+                "chapter_number": 6,
+                "start_chapter": 6,
+                "end_chapter": 10,
+                "is_final": False,
+            },
+        )
+        self.assertIsNone(_terminal_window_chapter_info(project, 4))
+
+    def test_terminal_context_disables_serial_hooks_and_remote_future_plans(self):
+        chapters = [_new_chapter(index) for index in range(10)]
+        for index, chapter in enumerate(chapters, 1):
+            chapter["title"] = f"第{index}章"
+            chapter["outline"] = f"第{index}章推进当前主线并形成结果。"
+        project = self._project_with_current_chapter(chapters[0])
+        project["chapters"] = chapters
+        project["chapter_plan_foundation"] = {"total_chapter_count": 10}
+
+        ordinary_context = _build_chapter_ai_context(project, 4, "draft")
+        terminal_context = _build_chapter_ai_context(project, 5, "draft")
+        final_context = _build_chapter_ai_context(project, 9, "draft")
+
+        self.assertNotIn("全书最后5章收尾窗口", ordinary_context)
+        self.assertIn("全书最后5章收尾窗口", terminal_context)
+        self.assertIn("不得用新的任务、未知对手、远方召唤", terminal_context)
+        self.assertIn("收尾窗口内后续章节承接", terminal_context)
+        self.assertNotIn("远期回收/转折锚点", terminal_context)
+        self.assertIn("结尾不再留下必须依靠后续章节回答的主线问题或悬念", final_context)
+        self.assertNotIn("章节结尾优先用具体动作、对白、信息变化或悬念收住", terminal_context)
+
     def test_foreshadow_lifecycle_cleanup_removes_standalone_markers_only(self):
         value = (
             "未埋\n"
@@ -6571,7 +6615,13 @@ class NovelLongFormContextTests(unittest.TestCase):
         next_chapter["title"] = "第三章 校花刷好感"
         next_chapter["text"] = "清晨，校门口已经围满了人。校花林雪站在人群外，盯着赵明刚亮起的NPC任务窗口。"
         project = self._project_with_current_chapter(current)
-        project["chapters"] = [previous, current, next_chapter]
+        project["chapters"] = [
+            previous,
+            current,
+            next_chapter,
+            *[_new_chapter(index) for index in range(3, 10)],
+        ]
+        project["chapter_plan_foundation"] = {"total_chapter_count": 10}
 
         context = _build_chapter_ai_context(project, 1, "draft")
         anchor = self._context_section(context, "后章衔接点")

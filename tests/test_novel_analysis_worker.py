@@ -233,6 +233,73 @@ class NovelAnalysisWorkerTests(unittest.TestCase):
         self.assertIn("不要复述字段含义", prompt)
         self.assertIn("narrative_strategy_profile", prompt)
         self.assertIn("用户已确认的只读规划基础", prompt)
+
+    def test_missing_outline_uses_terminal_ending_guidance_only_in_last_five(self):
+        ordinary = NovelChapterPlanWorker(
+            "http://example.test", "key", "model", "context", 30000, 3000, 1,
+            total_chapter_count=10, existing_chapter_count=0,
+        )
+        ordinary_plan = ordinary._normalize_plan({
+            "chapters": [{"index": 1, "title": "开局冲突"}],
+        })
+        self.assertIn("新信息或新阻力", ordinary_plan["chapters"][0]["outline"])
+
+        terminal = NovelChapterPlanWorker(
+            "http://example.test", "key", "model", "context", 30000, 3000, 1,
+            total_chapter_count=10, existing_chapter_count=5,
+        )
+        terminal_plan = terminal._normalize_plan({
+            "chapters": [{"index": 1, "title": "结果落地"}],
+        })
+        terminal_outline = terminal_plan["chapters"][0]["outline"]
+        self.assertIn("不新增必须由后续章节回答的任务或悬念", terminal_outline)
+        self.assertNotIn("新信息或新阻力", terminal_outline)
+
+        final = NovelChapterPlanWorker(
+            "http://example.test", "key", "model", "context", 30000, 3000, 1,
+            total_chapter_count=10, existing_chapter_count=9,
+        )
+        final_outline = final._normalize_plan({
+            "chapters": [{"index": 1, "title": "终局落点"}],
+        })["chapters"][0]["outline"]
+        self.assertIn("这是全书最后一章", final_outline)
+        self.assertNotIn("新信息或新阻力", final_outline)
+
+    def test_chapter_plan_prompt_marks_only_the_last_five_chapter_window(self):
+        worker = NovelChapterPlanWorker(
+            "http://example.test",
+            "key",
+            "model",
+            "context",
+            500000,
+            3000,
+            5,
+            total_chapter_count=167,
+            existing_chapter_count=162,
+        )
+
+        prompt = worker._analysis_prompt()
+
+        self.assertIn("最后5章收尾窗口", prompt)
+        self.assertIn("第163-167章", prompt)
+        self.assertIn("不改变当前阶段边界、批次数量、章节总数", prompt)
+        self.assertIn("不得因为收尾要求新增、拆分或合并章节", prompt)
+        self.assertIn("不要留下必须靠后续章节才能解决的主线任务", prompt)
+        self.assertIn("等待回答的悬念", prompt)
+        self.assertIn("必须输出接下来的 5 章", prompt)
+
+        ordinary = NovelChapterPlanWorker(
+            "http://example.test",
+            "key",
+            "model",
+            "context",
+            500000,
+            3000,
+            5,
+            total_chapter_count=167,
+            existing_chapter_count=150,
+        )
+        self.assertNotIn("最后5章收尾窗口", ordinary._analysis_prompt())
         self.assertIn("不得重新生成、改写、总结或返回", prompt)
         self.assertNotIn('JSON 结构：{"summary"', prompt)
         self.assertNotIn('"narrative_strategy_profile":{}', prompt)
@@ -259,6 +326,9 @@ class NovelAnalysisWorkerTests(unittest.TestCase):
         self.assertIn("不得出现策划术语、抽象形容、办案式表达、编辑式说明或编辑式总结", prompt)
         self.assertIn("每两章至少要让主角", prompt)
         self.assertIn("和路人、配角、对手或反派发生一次有效碰撞", prompt)
+        self.assertIn("核心动机与收尾窗口", prompt)
+        self.assertIn("已经安排的目标、阻碍、代价和关系变化落实为具体结果", prompt)
+        self.assertNotIn("核心动机与主线推进", prompt)
         self.assertNotIn('"planning_method"', prompt)
         self.assertNotIn('"dynamic_modules"', prompt)
         self.assertNotIn('"satisfaction_payoff"', prompt)
@@ -738,6 +808,30 @@ class NovelAnalysisWorkerTests(unittest.TestCase):
         prompt = worker._action_prompt()
         self.assertIn("质量优先的参考目标", prompt)
         self.assertIn("不是硬性字数要求", prompt)
+
+    def test_terminal_fiction_prompt_overrides_generic_suspense_rule(self):
+        terminal_context = "【全书最后5章收尾窗口｜第163-167章】\n当前章节是第166章。"
+        worker = NovelWritingWorker(
+            "http://example.test", "key", "model", "draft", terminal_context
+        )
+        prompt = worker._action_prompt()
+
+        self.assertIn("收尾窗口正文结尾必须落在本章已经发生的具体动作", prompt)
+        self.assertIn("不得为了留下追读张力新增任务", prompt)
+        self.assertIn("已经发生的直接结果自然接上", prompt)
+        self.assertNotIn("结尾要来自冲突本身，留下继续读下去的张力", prompt)
+        self.assertNotIn("最后情绪、动作、场景和悬念自然接上", prompt)
+
+        final_worker = NovelWritingWorker(
+            "http://example.test",
+            "key",
+            "model",
+            "draft",
+            terminal_context + "\n这是全书最后一章。",
+        )
+        final_prompt = final_worker._action_prompt()
+        self.assertIn("最后一章正文必须让核心矛盾", final_prompt)
+        self.assertIn("不留下必须由后续章节回答的主线悬念", final_prompt)
 
     def test_draft_prompt_requires_continuity_from_previous_ending_state(self):
         worker = NovelWritingWorker("http://example.test", "key", "model", "draft", "context")

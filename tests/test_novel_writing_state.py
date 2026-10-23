@@ -233,6 +233,7 @@ class NovelWritingStateTests(unittest.TestCase):
                     "title": "向导项目",
                     "synopsis": "主角在旧城重新开始。",
                     "main_line": "他要把失去的生活一点点夺回来。",
+                    "core_motive": "妻子手术只剩一个月，主角必须凑够五万元。",
                 },
                 "stage_plan": [{
                     "name": "旧城开局",
@@ -246,6 +247,7 @@ class NovelWritingStateTests(unittest.TestCase):
                 "chapter_plan_foundation": {
                     "summary": "主角从旧城开局，逐步夺回生活。",
                     "core_mainline": "他要把失去的生活一点点夺回来。",
+                    "core_motive": "妻子手术只剩一个月，主角必须凑够五万元。",
                     "ending_promise": "旧城的人和事留下新的选择。",
                     "target_words": 40000,
                     "average_chapter_words": 2000,
@@ -302,6 +304,7 @@ class NovelWritingStateTests(unittest.TestCase):
         self.assertEqual(restored["master_plan"]["source"], "creation_wizard")
         context = tab._chapter_plan_batch_context(restored, 20)
         self.assertIn("旧城开局", context)
+        self.assertIn("妻子手术只剩一个月，主角必须凑够五万元。", context)
         self.assertIn("小说圣经：主角要夺回失去的生活。", context)
         self.assertIn("世界规则：现实城市", context)
         self.assertIn("旧钥匙", context)
@@ -8597,6 +8600,32 @@ class NovelWritingStateTests(unittest.TestCase):
         self.assertEqual(compact_arc["main_conflict"], "旧任务型冲突")
         self.assertEqual(compact_arc["investigation_scope"], "核验证据")
         self.assertEqual(compact_arc["forbidden"], "禁止自由发挥")
+
+    def test_chapter_plan_batch_context_changes_rules_for_terminal_window(self):
+        tab = NovelWritingTab.__new__(NovelWritingTab)
+        tab.current_project = {
+            "meta": {"title": "收尾规则测试", "target_words": "50"},
+            "chapters": [],
+            "characters": [],
+            "lore": [],
+        }
+        state = {
+            "target_words": 500000,
+            "average_chapter_words": 3000,
+            "total_chapter_count": 167,
+            "existing_chapter_count": 162,
+            "master_plan": {
+                "source": "creation_wizard",
+                "core_motive": "完成核心目标",
+            },
+            "chapters": [],
+        }
+
+        context = tab._chapter_plan_batch_context(state, 5)
+        self.assertIn("全书最后一章", context)
+        self.assertIn("不得另增章节", context)
+        self.assertIn("不得新增主要任务、主要敌人、未知信息或等待回答的悬念", context)
+        self.assertNotIn("不得把批次结尾写成全书结局", context)
 
     def test_chapter_plan_reference_keeps_250_items_and_filters_late_batch_range(self):
         tab = NovelWritingTab.__new__(NovelWritingTab)

@@ -231,6 +231,185 @@ class NovelCreationWizardPersistenceTests(unittest.TestCase):
         for step in ("premise", "bible"):
             self.assertIn("作者灵感中明确写出的事实", wizard.STEP_PROMPTS[step])
 
+    def test_core_motive_guidance_is_shared_and_carried_into_foundation(self):
+        guidance = wizard.CREATION_CORE_MOTIVE_GUIDANCE
+        for phrase in ("核心动机", "具体目标", "失败代价", "反差", "阶段目标"):
+            self.assertIn(phrase, guidance)
+        self.assertTrue(
+            "机会窗口" in guidance or "时间限制" in guidance
+        )
+        self.assertIn("核心动机契约", wizard.STEP_PROMPTS["bible"])
+        self.assertIn("主题字段只提炼", wizard.STEP_PROMPTS["bible"])
+        self.assertTrue(
+            "具体任务、金额、期限" in wizard.STEP_PROMPTS["bible"]
+            or "不重复具体任务、金额、期限" in wizard.STEP_PROMPTS["bible"]
+        )
+        self.assertTrue(
+            "下一阶段目标" in wizard.STEP_PROMPTS["stage_plan"]
+            or "下一道更具体的" in wizard.STEP_PROMPTS["stage_plan"]
+        )
+
+        foundation = wizard.build_chapter_plan_foundation({
+            "premise": {
+                "synopsis": "主角必须在期限前救回妻子。",
+                "main_line": "距离手术还有一个月，他必须凑够五万元。",
+                "relationship_engine": "夫妻关系从互相怀疑走向重新信任。",
+            },
+            "bible": {"main_conflict": "资金、时间和旧债同时逼近。"},
+            "stage_plan": [{
+                "name": "凑齐手术费",
+                "summary": "主角寻找第一笔资金并面对阻碍。",
+                "main_conflict": "旧债主截断了他的收入来源。",
+                "end_state": "拿到部分手术费，但必须夺回被扣押的货物。",
+            }],
+            "total_words": 100000,
+            "average_chapter_words": 3000,
+        })
+        self.assertEqual(
+            foundation["core_motive"],
+            "资金、时间和旧债同时逼近。",
+        )
+        self.assertEqual(
+            foundation["narrative_strategy_profile"]["core_motive"],
+            foundation["core_motive"],
+        )
+        self.assertEqual(
+            foundation["terminal_window"],
+            {
+                "start_chapter": 30,
+                "end_chapter": 34,
+                "chapter_count": 5,
+                "source": "creation_wizard",
+            },
+        )
+
+        fallback = wizard.build_chapter_plan_foundation({
+            "premise": {"main_line": "第一步的具体主线。"},
+            "bible": {},
+            "stage_plan": [],
+            "total_words": 100000,
+            "average_chapter_words": 3000,
+        })
+        self.assertEqual(fallback["core_motive"], "第一步的具体主线。")
+        self.assertEqual(
+            foundation["creative_intent_contract"]["core_motive"],
+            foundation["core_motive"],
+        )
+
+        premise_first = wizard.build_chapter_plan_foundation({
+            "premise": {
+                "core_motive": "第一步已经具体化的核心动机。",
+                "main_line": "旧字段里的候选主线。",
+            },
+            "bible": {},
+            "stage_plan": [],
+            "total_words": 100000,
+            "average_chapter_words": 3000,
+        })
+        self.assertEqual(
+            premise_first["core_motive"],
+            "第一步已经具体化的核心动机。",
+        )
+
+    def test_bible_display_exposes_core_motive_label(self):
+        bible = {
+            "core_setting": "工厂会在灾变中成为堡垒。",
+            "main_conflict": "主角必须在设施失效前完成改造。",
+        }
+        text = wizard.format_creation_text(
+            bible,
+            "小说圣经",
+            {"main_conflict": "核心动机契约（主线矛盾）"},
+        )
+        self.assertIn("核心动机契约（主线矛盾）：主角必须在设施失效前完成改造。", text)
+        self.assertNotIn("\n主线矛盾：", text)
+
+    def test_legacy_bible_label_is_migrated_without_changing_content(self):
+        text = "小说圣经\n主线矛盾：主角必须在设施失效前完成改造。"
+        migrated = wizard.migrate_creation_bible_display_text(text, True)
+        self.assertEqual(
+            migrated,
+            "小说圣经\n核心动机契约（主线矛盾）：主角必须在设施失效前完成改造。",
+        )
+
+    def test_ending_direction_requires_book_closure_before_open_ended_aftertaste(self):
+        guidance = wizard.CREATION_ENDING_DIRECTION_GUIDANCE
+        self.assertIn("本部结局的方向性契约", guidance)
+        self.assertIn("本部已经得到的结果", guidance)
+        self.assertIn("不影响本部闭环", guidance)
+        self.assertIn("不得把新敌人、新任务、新规则", guidance)
+        self.assertIn("结尾方向（本部结果与余波）", wizard.STEP_PROMPTS["premise"])
+        self.assertNotIn("开放式结尾方向", wizard.STEP_PROMPTS["premise"])
+        self.assertIn("结尾方向字段必须写成“本部结果与余波”", wizard.STEP_PROMPTS["bible"])
+
+        foundation = wizard.build_chapter_plan_foundation({
+            "premise": {"ending_direction": "本部主线完成，但关系留下余味。"},
+            "bible": {},
+            "stage_plan": [],
+            "total_words": 100000,
+            "average_chapter_words": 3000,
+        })
+        profile = foundation["narrative_strategy_profile"]
+        self.assertIn("本部明确结果", profile["story_direction"])
+        self.assertNotIn("结尾留下有余波的问题", profile["story_direction"])
+
+    def test_stage_plan_terminal_window_does_not_open_next_stage_task(self):
+        base_context = {
+            "author_input": {
+                "total_words": 500000,
+                "average_chapter_words": 3000,
+                "genre": "玄幻",
+            },
+            "selected_premise": {"genre": "玄幻"},
+            "current_stage": {
+                "number": 5,
+                "total_stages": 5,
+                "start_chapter": 135,
+                "end_chapter": 167,
+                "target_words": 100000,
+            },
+        }
+        terminal_worker = wizard.NovelCreationWorker(
+            "http://example.test",
+            "key",
+            "model",
+            "stage_plan",
+            base_context,
+            batch_kind="stage_plan_stage",
+            stage_index=4,
+        )
+        terminal_prompt = terminal_worker._analysis_prompt()
+        self.assertIn("最后5章收尾窗口", terminal_prompt)
+        self.assertIn("本阶段后部只沿着已经发生的冲突", terminal_prompt)
+        self.assertNotIn(
+            "本阶段解决或暂时解决当前目标后，要在 x/y 或事件结果中留下下一阶段可执行的具体目标",
+            terminal_prompt,
+        )
+
+        ordinary_context = dict(base_context)
+        ordinary_context["current_stage"] = {
+            "number": 4,
+            "total_stages": 5,
+            "start_chapter": 101,
+            "end_chapter": 134,
+            "target_words": 100000,
+        }
+        ordinary_worker = wizard.NovelCreationWorker(
+            "http://example.test",
+            "key",
+            "model",
+            "stage_plan",
+            ordinary_context,
+            batch_kind="stage_plan_stage",
+            stage_index=3,
+        )
+        ordinary_prompt = ordinary_worker._analysis_prompt()
+        self.assertNotIn("最后5章收尾窗口", ordinary_prompt)
+        self.assertIn(
+            "本阶段解决或暂时解决当前目标后，要在 x/y 或事件结果中留下下一阶段可执行的具体目标",
+            ordinary_prompt,
+        )
+
     def test_character_profile_guidance_blocks_adversarial_voice_labels(self):
         guidance = wizard.CREATION_CHARACTER_PROFILE_GUIDANCE
         self.assertIn("语言风格可以保留“话多”等正常表达特征", guidance)

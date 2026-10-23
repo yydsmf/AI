@@ -181,6 +181,8 @@ from .novel_utils import (
     _normalize_name_list,
     _normalize_narrative_strategy_profile,
     _normalize_creative_intent_contract,
+    _core_motive_progression_guidance,
+    _terminal_window_bounds,
     _procedural_plot_guard_guidance,
     _build_volume_handoff_source,
     _build_volume_handoff_record_catalog,
@@ -243,6 +245,7 @@ from .novel_creation_wizard import (
     creation_wizard_payload_from_project_draft,
     format_creation_preview,
     format_creation_text,
+    migrate_creation_bible_display_text,
     mark_creation_wizard_draft_completed,
     normalize_creation_result,
     story_requires_explicit_power_levels,
@@ -333,6 +336,7 @@ _CHAPTER_PLAN_BATCH_STATE_VERSION = 3
 
 _CREATIVE_INTENT_FIELDS = (
     ("primary_line", "本卷主线"),
+    ("core_motive", "核心动机"),
     ("supporting_lines", "辅助线"),
     ("core_relationships", "核心关系"),
     ("stage_progression", "阶段推进"),
@@ -350,6 +354,7 @@ _NARRATIVE_STRATEGY_DIALOG_FIELDS = (
     ("audience_direction", "受众方向"),
     ("genre_world", "题材与世界"),
     ("core_reader_promise", "核心读者承诺"),
+    ("core_motive", "核心动机"),
     ("primary_story_engine", "主叙事发动机"),
     ("secondary_story_engine", "副叙事发动机"),
     ("planning_grammar", "章节规划语法"),
@@ -362,7 +367,7 @@ _NARRATIVE_STRATEGY_DIALOG_FIELDS = (
 )
 _CHAPTER_PLAN_FOUNDATION_FIELDS = (
     ("summary", "故事简介"),
-    ("core_mainline", "核心主线"),
+    ("core_motive", "核心动机"),
     ("ending_promise", "结尾承诺"),
     ("global_hard_boundaries", "写作硬边界"),
 )
@@ -648,9 +653,13 @@ def _volume_handoff_display_text(handoff):
 def _creative_intent_display_text(contract):
     contract = _normalize_creative_intent_contract(contract)
     labels = dict(_CREATIVE_INTENT_FIELDS)
+    if contract.get("core_motive"):
+        labels["core_motive"] = "核心动机主线"
     lines = []
     for key, _label in _CREATIVE_INTENT_FIELDS:
         value = contract.get(key, []) if key == "supporting_lines" else contract.get(key, "")
+        if key == "primary_line" and contract.get("core_motive") == value:
+            continue
         if not value:
             continue
         if isinstance(value, list):
@@ -767,6 +776,13 @@ class VolumeCreativeIntentDialog(QDialog):
         self.resize(880, 700)
         self._contract = _normalize_creative_intent_contract(contract)
         self._editors = {}
+        self._dialog_fields = _CREATIVE_INTENT_FIELDS
+        if not volume_mode:
+            self._dialog_fields = tuple(
+                (key, "核心动机主线" if key == "core_motive" else label)
+                for key, label in _CREATIVE_INTENT_FIELDS
+                if key != "primary_line"
+            )
 
         root = QVBoxLayout(self)
         root.setContentsMargins(16, 14, 16, 14)
@@ -790,7 +806,7 @@ class VolumeCreativeIntentDialog(QDialog):
         form.setHorizontalSpacing(12)
         form.setVerticalSpacing(8)
         form.setFieldGrowthPolicy(QFormLayout.AllNonFixedFieldsGrow)
-        for key, label in _CREATIVE_INTENT_FIELDS:
+        for key, label in self._dialog_fields:
             editor = PlainTextEdit()
             editor.setMinimumHeight(62 if key != "supporting_lines" else 76)
             editor.setMaximumHeight(130)
@@ -798,7 +814,10 @@ class VolumeCreativeIntentDialog(QDialog):
                 editor.setPlaceholderText("每行一条辅助线；没有可留空")
                 editor.setPlainText("\n".join(self._contract.get(key, [])))
             else:
-                editor.setPlainText(str(self._contract.get(key, "") or ""))
+                value = self._contract.get(key, "")
+                if key == "core_motive" and not value:
+                    value = self._contract.get("primary_line", "")
+                editor.setPlainText(str(value or ""))
             self._editors[key] = editor
             form.addRow(label, editor)
         scroll.setWidget(content)
@@ -818,7 +837,7 @@ class VolumeCreativeIntentDialog(QDialog):
 
     def contract(self):
         result = {}
-        for key, _label in _CREATIVE_INTENT_FIELDS:
+        for key, _label in self._dialog_fields:
             text = self._editors[key].toPlainText().strip()
             if key == "supporting_lines":
                 values = _normalize_name_list(re.split(r"[\n\r、，,；;]+", text))
@@ -826,6 +845,8 @@ class VolumeCreativeIntentDialog(QDialog):
                     result[key] = values
             elif text:
                 result[key] = text
+        if result.get("core_motive") and not result.get("primary_line"):
+            result["primary_line"] = result["core_motive"]
         result["version"] = str(self._contract.get("version", "1") or "1")
         result["source"] = str(self._contract.get("source", "volume_user_requirements") or "volume_user_requirements")
         return _normalize_creative_intent_contract(result)
@@ -1416,9 +1437,13 @@ class ChapterPlanFoundationDialog(QDialog):
         contract = _normalize_creative_intent_contract(
             self._plan.get("creative_intent_contract", {})
         )
-        primary = str(contract.get("primary_line", "") or "").strip()
+        primary = str(
+            contract.get("core_motive", "")
+            or contract.get("primary_line", "")
+            or ""
+        ).strip()
         supporting = "、".join(contract.get("supporting_lines", []))
-        text = f"主线：{primary}" if primary else "尚未形成独立创作意图；请先确认章节规划基础和题材判断。"
+        text = f"核心动机主线：{primary}" if primary else "尚未形成独立创作意图；请先确认章节规划基础和题材判断。"
         if supporting:
             text += f"  ·  辅助线：{supporting}"
         label.setText(text)
@@ -1432,7 +1457,8 @@ class ChapterPlanFoundationDialog(QDialog):
                 self._plan.get("narrative_strategy_profile", {})
             )
             contract = _normalize_creative_intent_contract({
-                "primary_line": profile.get("primary_story_engine", ""),
+                "primary_line": profile.get("core_motive", "") or profile.get("primary_story_engine", ""),
+                "core_motive": profile.get("core_motive", "") or profile.get("primary_story_engine", ""),
                 "supporting_lines": [profile.get("secondary_story_engine", "")],
                 "reading_experience": profile.get("core_reader_promise", ""),
                 "ending_boundaries": profile.get("story_direction", ""),
@@ -3257,7 +3283,7 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
         bible_layout.setSpacing(6)
         self.bible_edit = PlainTextEdit()
         self.bible_edit.setMinimumHeight(120)
-        self.bible_edit.setPlaceholderText("核心设定、读者承诺、主题、主线矛盾、关系底盘、结局方向、禁用设定等。")
+        self.bible_edit.setPlaceholderText("核心设定、读者承诺、主题、核心动机契约、关系底盘、结局方向、禁用设定等。")
         self.bible_edit.textChanged.connect(self._mark_dirty)
         bible_layout.addWidget(QLabel("小说圣经"))
         bible_layout.addWidget(self.bible_edit, 1)
@@ -5405,6 +5431,21 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
             value = str(display.get(key, "") or "").strip()
             if value and value != str(meta.get(key, "") or "").strip():
                 meta[key] = value
+                changed = True
+        bible = framework.get("bible", {})
+        core_motive = (
+            str(framework.get("core_motive", "") or "").strip()
+            or str(bible.get("main_conflict", "") or "").strip()
+            if isinstance(bible, dict)
+            else str(framework.get("core_motive", "") or "").strip()
+        )
+        if core_motive:
+            migrated_bible = migrate_creation_bible_display_text(
+                project.get("bible", ""),
+                has_core_motive=True,
+            )
+            if migrated_bible != str(project.get("bible", "") or ""):
+                project["bible"] = migrated_bible
                 changed = True
         return changed
 
@@ -8251,7 +8292,7 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
                 compact_master = {}
                 for key, limit in (
                     ("summary", 2600),
-                    ("core_mainline", 1400),
+                    ("core_motive", 1400),
                     ("ending_promise", 1200),
                     ("global_hard_boundaries", 1200),
                 ):
@@ -8974,6 +9015,11 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
         premise = premise if isinstance(premise, dict) else {}
         premise_context = {}
         for key, value in premise.items():
+            # The project-level core_motive below is the only planning source
+            # of truth.  Do not send the legacy premise aliases beside it and
+            # make the model reconcile two copies of the mainline.
+            if str(key) in {"main_line", "core_motive"}:
+                continue
             if isinstance(value, (str, int, float, bool)):
                 text = self._chapter_plan_clip_text(value, 1800)
                 if text:
@@ -9080,10 +9126,24 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
             if row:
                 stage_plan.append(row)
 
+        foundation = framework.get("chapter_plan_foundation", {})
+        foundation = foundation if isinstance(foundation, dict) else {}
+        bible = framework.get("bible", {})
+        bible = bible if isinstance(bible, dict) else {}
+        core_motive = self._chapter_plan_clip_text(
+            foundation.get("core_motive", "")
+            or framework.get("core_motive", "")
+            or bible.get("main_conflict", "")
+            or premise.get("core_motive", "")
+            or premise.get("main_line", ""),
+            2200,
+        )
+
         result = {
             "source": "creation_wizard",
             "novel_name": self._chapter_plan_clip_text(framework.get("novel_name", ""), 300),
             "premise": premise_context,
+            "core_motive": core_motive,
             "bible": self._chapter_plan_clip_text(
                 json.dumps(framework.get("bible", {}), ensure_ascii=False, separators=(",", ":")), 6500
             ),
@@ -9466,8 +9526,18 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
             )
         except (TypeError, ValueError):
             batch_is_final = False
+        terminal_bounds = _terminal_window_bounds(total_chapter_count)
+        terminal_batch_overlap = None
+        if terminal_bounds and reference_start_index is not None and reference_end_index is not None:
+            try:
+                overlap_start = max(int(reference_start_index), terminal_bounds[0])
+                overlap_end = min(int(reference_end_index), terminal_bounds[1])
+            except (TypeError, ValueError):
+                overlap_start, overlap_end = 0, -1
+            if overlap_start <= overlap_end:
+                terminal_batch_overlap = (overlap_start, overlap_end)
         batch_creative_intent_contract = deepcopy(creative_intent_contract)
-        if batch_mode and not batch_is_final:
+        if batch_mode and not batch_is_final and not terminal_batch_overlap:
             # The concrete ending belongs to the final stage. Sending it to
             # an earlier batch makes a model close the whole novel as soon as
             # the current stage reaches its local climax.
@@ -9497,6 +9567,12 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
                 reference_start_index=reference_start_index,
                 reference_end_index=reference_end_index,
             )
+        wizard_core_motive = str(
+            wizard_framework.get("core_motive", "")
+            if isinstance(wizard_framework, dict) else ""
+        ).strip()
+        if wizard_core_motive and not str(batch_creative_intent_contract.get("core_motive", "") or "").strip():
+            batch_creative_intent_contract["core_motive"] = wizard_core_motive
         foreshadow_items = project.get("foreshadow_items", [])
         if creation_wizard_source:
             foreshadow_items = self._chapter_plan_scoped_foreshadows(
@@ -9508,12 +9584,14 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
         raw_profile = raw_profile if isinstance(raw_profile, dict) else {}
         planning_profile = {
             key: deepcopy(raw_profile.get(key))
-            for key in (
-                "version", "audience_direction", "genre_world", "core_reader_promise",
-                "primary_story_engine", "secondary_story_engine", "story_direction",
-            )
+                for key in (
+                    "version", "audience_direction", "genre_world", "core_reader_promise", "core_motive",
+                    "primary_story_engine", "secondary_story_engine", "story_direction",
+                )
             if raw_profile.get(key) not in (None, "", [], {})
         }
+        if wizard_core_motive and "core_motive" not in planning_profile:
+            planning_profile["core_motive"] = wizard_core_motive
         payload = {
             "task": (
                 "生成可以追加到当前项目章节列表的长篇章节规划。"
@@ -9527,6 +9605,14 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
                 ),
                 "stage_boundary_rule": "当前阶段的事件、人物、关系和后果在本阶段自然展开，下一阶段承接上一阶段留下的变化继续发展。",
                 "material_rule": "项目资料是只读事实底稿，不重新生成，不把背景资料自动变成章节任务。",
+                "core_motive_rule": (
+                    "核心动机必须作为具体因果主线执行：主角为了完成明确目标主动行动，遇到阻碍并付出代价，"
+                    "当前结果再打开下一道具体目标；不能只写主角被动不断遇到新事件。"
+                ),
+                "line_field_boundary": (
+                    "core_motive是唯一主线；primary_line、core_mainline和primary_story_engine只是兼容别名或执行说明，"
+                    "阶段main_conflict只写本阶段阻碍核心动机的问题，不得另起总目标。"
+                ),
             },
             "entity_naming_guidance": _entity_naming_guidance(project),
             "target": {
@@ -9535,6 +9621,13 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
                 "estimated_total_chapters": int(total_chapter_count or 0),
                 "existing_chapter_count": context_existing_count,
                 "requested_new_chapters": int(requested_chapter_count or 0),
+                "terminal_window": {
+                    "start_chapter": terminal_bounds[0],
+                    "end_chapter": terminal_bounds[1],
+                    "chapter_count": terminal_bounds[1] - terminal_bounds[0] + 1,
+                    "batch_overlap": list(terminal_batch_overlap)
+                    if terminal_batch_overlap else [],
+                } if terminal_bounds else {},
                 "macro_pacing_rules": [
                     {
                         "range": "前10%",
@@ -9672,9 +9765,44 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
                 payload["original_framework_text"] = source["text"]
         if isinstance(extra_payload, dict) and extra_payload:
             payload.update(deepcopy(extra_payload))
+        if terminal_batch_overlap:
+            terminal_batch_guidance = (
+                "当前批次与全书最后5章收尾窗口有交集：每章仍要留下可承接的具体结果，"
+                "但下一章只能继续落实窗口内已经安排的直接后果、行动或关系变化；"
+                "不得用新的主要任务、主要敌人、未知信息或等待回答的悬念制造连载钩子。\n"
+            )
+            terminal_transition_guidance = (
+                "跨章边界必须明确：上一章可以停在已经发生的触发或结果，下一章从它造成的新反应、"
+                "新结果或关系变化开始；收尾窗口内不得新增必须由后续章节回答的主线任务或悬念。"
+                "不得把同一句对白、同一声响、同一动作落点或同一结论同时写进前章结尾和后章开头。\n\n"
+            )
+            terminal_node_progression_guidance = (
+                "当前节点解决或暂时解决后，在收尾窗口内只落实已经安排的直接结果、关系变化或主角处境落点；"
+                "不另开下一道主线目标、主要敌人或必须由后续章节回答的任务。不能把章节写成主角不断被动遭遇事情的流水账。\n\n"
+            )
+        else:
+            terminal_batch_guidance = (
+                "每章都要留下可承接的具体结果，下一章从新反应、新结果或新阻力继续。\n"
+            )
+            terminal_transition_guidance = (
+                "跨章边界必须明确：上一章可以停在触发点，但下一章必须从触发后的新反应、新结果或新阻力开始；"
+                "不得把同一句对白、同一声响、同一动作落点或同一结论同时写进前章结尾钩子和后章开头。"
+                "前章ending_hook负责留下已发布的触发，后章outline只需写触发后可能出现的新增变量，不要重复前章落点。\n\n"
+            )
+            terminal_node_progression_guidance = (
+                "当前节点解决或暂时解决后，必须留下下一道可执行的具体目标、资源缺口、关系选择、"
+                "认知真相或更高代价。不能把章节写成主角不断被动遭遇事情的流水账。\n\n"
+            )
+        core_motive_guidance = (
+            "【核心动机与收尾窗口】核心动机仍是本项目唯一执行主线；收尾窗口内只把已经安排的目标、阻碍、"
+            "代价和关系变化落实为具体结果，不再打开下一道需要后续章节回答的主线目标。\n"
+            if terminal_batch_overlap else
+            _core_motive_progression_guidance()
+        )
         instruction_prefix = (
             "请根据以下 JSON 项目档案生成章节规划。只规划 requested_new_chapters 指定数量的新章节；"
             "不要重写已有章节，不要输出正文。"
+            "target.terminal_window只表示最后5章的内容收束范围，不改变requested_new_chapters、当前批次范围、阶段边界或返回对象数量。"
             "必须先按 creative_intent_contract、planning_contract 和 imported_chapter_plan_reference 决定内容方向；"
             "再参考 target.macro_pacing_rules 安排宏观节奏。宏观节奏不得覆盖原框架阶段。\n\n"
             "若存在 imported_chapter_plan_reference，chapters是按绝对章号执行的明确章节约束；"
@@ -9691,6 +9819,9 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
             "不得把它们展开成固定场景轮换表或逐章任务。\n\n"
             "若creative_intent_contract非空，它是用户已确认的最高优先级创作方向：主线和结局边界不得被交接资料、"
             "圣经中的旧剧情权重、原框架辅助线或AI重新推断的narrative_strategy_profile替换；辅助线只能推动主线发生变化。\n\n"
+            "core_motive是本项目唯一的具体执行主线：它回答主角最终必须完成什么。primary_line、core_mainline、"
+            "primary_story_engine和Bible.main_conflict在新项目中只是同一主线的兼容表达或执行说明；阶段main_conflict只表示"
+            "当前阶段阻碍核心动机的具体问题、门槛或代价，不能被当成另一条全书主线。theme只提供价值命题，不承担章节任务。\n\n"
             "如果存在wizard_framework，它与故事简介、小说圣经、世界规则、人物、设定和伏笔共同组成向导已经确认的完整底稿；"
             "故事底盘和十万字阶段规划已经在向导中完成，这里不要再次生成新的总规划，只写当前批次的具体章节。\n\n"
             "注意：结构字段负责守住本章主线、阶段、事件和结尾边界；outline负责用当前小说自己的口吻讲述这一章，"
@@ -9712,9 +9843,9 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
             "伏笔由扩写正文时根据当时的开放伏笔动态调度。\n\n"
             "如果存在cross_volume_continuity，其中的anchors只是上一卷事实参考：用于避免人物关系、生活分工和既有习惯被写反，"
             "不要逐条复述、不要把它们改写成章节任务，也不要在本章规划中强行安排它们。\n\n"
-            "跨章边界必须明确：上一章可以停在触发点，但下一章必须从触发后的新反应、新结果或新阻力开始；"
-            "不得把同一句对白、同一声响、同一动作落点或同一结论同时写进前章结尾钩子和后章开头。"
-            "前章ending_hook负责留下已发布的触发，后章outline只需写触发后可能出现的新增变量，不要重复前章落点。\n\n"
+            + terminal_transition_guidance
+            + core_motive_guidance
+            + "\n"
         )
         if creation_wizard_source:
             # 向导项目使用自己的章节协议。导入项目的通用提示会要求模型
@@ -9723,6 +9854,7 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
             instruction_prefix = (
                 "请根据以下 JSON 项目档案生成向导已经确认的当前阶段章节规划。"
                 "只生成 requested_new_chapters 指定数量的新章节，不重写已有章节，不输出正文。"
+                "target.terminal_window只表示最后5章的内容收束范围，不改变requested_new_chapters、当前阶段边界或返回对象数量。"
                 "故事简介、小说圣经、世界规则、人物、设定、伏笔和当前阶段资料共同构成只读底稿；"
                 "它们提供事实和边界，本次只把当前阶段继续落实到具体章节。\n\n"
                 "wizard_framework.stage_plan 只包含当前阶段的阶段事实和有序剧情节点；"
@@ -9730,7 +9862,10 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
                 "按节点的既定顺序安排故事，不改变当前阶段边界，不把下一阶段内容提前写入当前阶段。"
                 "节点编号和落点只供你理解，不要把它们写进返回内容，也不要为节点另造章节。"
                 "同一节点第一次发生时完成它的核心转折；如果一个节点覆盖数章，后续章节只写由它造成的新反应、新选择、新代价、新关系变化或新阻力，尽量不用固定清单式要求逐章重复节点。\n\n"
-                "伏笔资料只列当前章节范围内已经出现或即将出现的线索；后续阶段的伏笔等到对应阶段再自然展开。\n\n"
+                "当前阶段只是全书核心动机链的一段，不是独立短篇。每章都要写清主角为了当前具体目标采取的行动、"
+                "阻碍来自谁或什么、主角付出了什么代价、结果怎样改变主线；"
+                + terminal_node_progression_guidance
+                + "伏笔资料只列当前章节范围内已经出现或即将出现的线索；后续阶段的伏笔等到对应阶段再自然展开。\n\n"
                 "本批次必须返回准确数量的章节，列表顺序就是章节顺序；不要返回章节号、阶段号、节点号或其它定位标签。"
                 "章节名和 outline 是读者与正文作者会看到的内容：章节名从本章具体发生的事情、人物行动、现场冲突、关系变化或结果中自然命名，且不超过15个汉字；"
                 "used_chapter_titles列出已经使用过的章节标题；新章节标题不得与其中任何标题重复，也不得与本批次其他新章节标题重复。"
@@ -9742,10 +9877,11 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
                 "当前题材和人物关系决定冲突的形状，不能用固定场景轮换或固定拍点替代故事发展。\n\n"
                 "创作意图、阶段边界、人物关系和结尾方向已经确认，优先沿用它们；"
                 "宏观节奏只作参考，不新增全书总规划，不提前解释后续阶段。"
-                "每章都要留下可承接的具体结果，下一章从新反应、新结果或新阻力继续。\n"
-                "entity_naming_guidance 是当前项目的正式称谓和实体关系边界，优先于模型自行压缩出的简称；"
+                + terminal_batch_guidance
+                + "entity_naming_guidance 是当前项目的正式称谓和实体关系边界，优先于模型自行压缩出的简称；"
                 "涉及人物集合、组织集合和势力集合时，必须保留实体类型，不要把人数简称写成组织名称。\n"
                 + _story_conflict_pacing_guidance()
+                + core_motive_guidance
                 + _procedural_plot_guard_guidance()
                 + "状态变化要落到人物正在经历的场景、行动和后果，不把同一句状态连续复制到多章。"
                 "章节标题和提纲都使用具体、好读、能看见人物与现场的表达；不写策划术语、抽象形容、办案式说明或编辑式总结。\n"
@@ -10334,7 +10470,8 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
             str(profile.get("low_exposition_strategy", "") or "").strip(),
         ]
         return _normalize_creative_intent_contract({
-            "primary_line": profile.get("primary_story_engine", ""),
+            "primary_line": profile.get("core_motive", "") or profile.get("primary_story_engine", ""),
+            "core_motive": profile.get("core_motive", "") or profile.get("primary_story_engine", ""),
             "supporting_lines": [supporting] if supporting else [],
             "reading_experience": "；".join(part for part in reading_parts if part),
             "ending_boundaries": profile.get("story_direction", ""),
@@ -10804,6 +10941,18 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
         existing_count = int(state.get("existing_chapter_count", 0) or 0)
         batch_start = existing_count + len(generated) + 1
         batch_end = batch_start + int(batch_count or 0) - 1
+        try:
+            total_chapter_count = int(state.get("total_chapter_count", 0) or 0)
+        except (TypeError, ValueError):
+            total_chapter_count = 0
+        terminal_bounds = _terminal_window_bounds(total_chapter_count)
+        batch_terminal_overlap = None
+        if terminal_bounds:
+            overlap_start = max(batch_start, terminal_bounds[0])
+            overlap_end = min(batch_end, terminal_bounds[1])
+            if overlap_start <= overlap_end:
+                batch_terminal_overlap = (overlap_start, overlap_end)
+        batch_is_final = bool(total_chapter_count and batch_end >= total_chapter_count)
         ledger = []
         for item in generated:
             if not isinstance(item, dict):
@@ -10849,7 +10998,7 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
             # confirmed story-level anchors; sending the foundation object
             # again makes the model reconcile two copies of the same plan.
             master_keys = (
-                "source", "summary", "core_mainline", "ending_promise",
+                "source", "summary", "core_motive", "ending_promise",
                 "global_hard_boundaries",
             )
             try:
@@ -10863,21 +11012,36 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
                 for key in master_keys
                 if compact_master_plan.get(key) not in (None, "", [], {})
             }
+        continuity_rules = [
+            (
+                "本批包含全书最后一章：仍服从已确认的阶段规划，并在已有章节位置内完成核心矛盾、主要关系和主角最终处境的实际结果；"
+                "不得另增章节，但也不要把结尾继续写成等待后续章节回答的连载悬念。"
+                if batch_is_final else
+                "本批必须服从已确认的阶段规划，不得把批次结尾写成全书结局。"
+            ),
+            "第1章的相对index对应required_absolute_range起点，章节数量必须精确。",
+            "承接上一批末章状态，避免重复开局、重复冲突或提前进入后续阶段。",
+            "原框架阶段高于宏观节奏；不得在前10%/中70%边界处切换题材。",
+            "保持本项目主线；项目资料只作连续性参考，不能把背景资料自动变成章节任务。",
+            "used_chapter_titles是已经使用过的章节标题清单；新标题不得与其中任何标题重复，也不得与本批次其他新标题重复。",
+            "相邻章节应避免无意义重复，但不要求按固定轮换表更换开局、冲突或结尾；以当前人物处境和主线需要为准。",
+            (
+                "当前批次与全书最后5章收尾窗口有交集：窗口内只落实已经安排的直接后果、行动、关系变化或主角处境落点；"
+                "不得新增主要任务、主要敌人、未知信息或等待回答的悬念。"
+                if batch_terminal_overlap else
+                "上一批末章结尾已经是已发布触发点，下一批第一章必须从新反应、新结果或新阻力开始，不能复播末句、声音、动作落点或结论。"
+            ),
+        ]
+        if batch_terminal_overlap and batch_start > 1:
+            continuity_rules.append(
+                "收尾窗口批次的第一章承接上一章已经发生的结果，后续章节继续写窗口内部的直接后果，不另开新的连载主线。"
+            )
         continuity = {
             "required_absolute_range": [batch_start, batch_end],
             "master_plan": compact_master_plan,
             "planned_chapter_ledger": ledger,
             "previous_batch_tail": previous_tail,
-            "rules": [
-                "本批必须服从已确认的阶段规划，不得把批次结尾写成全书结局。",
-                "第1章的相对index对应required_absolute_range起点，章节数量必须精确。",
-                "承接上一批末章状态，避免重复开局、重复冲突或提前进入后续阶段。",
-                "原框架阶段高于宏观节奏；不得在前10%/中70%边界处切换题材。",
-                "保持本项目主线；项目资料只作连续性参考，不能把背景资料自动变成章节任务。",
-                "used_chapter_titles是已经使用过的章节标题清单；新标题不得与其中任何标题重复，也不得与本批次其他新标题重复。",
-                "相邻章节应避免无意义重复，但不要求按固定轮换表更换开局、冲突或结尾；以当前人物处境和主线需要为准。",
-                "上一批末章结尾已经是已发布触发点，下一批第一章必须从新反应、新结果或新阻力开始，不能复播末句、声音、动作落点或结论。",
-            ],
+            "rules": continuity_rules,
         }
         locked_node_schedule = self._chapter_plan_locked_node_schedule(
             state, batch_start, batch_end
@@ -11342,7 +11506,6 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
         if error:
             self.set_ai_settings_expanded(True)
             self.set_status_tip(f"章节规划生成失败：{error}")
-            QMessageBox.warning(self, "章节规划生成失败", error)
             return
         self._flush_current_editors()
         meta = self.current_project.get("meta", {}) if isinstance(self.current_project, dict) else {}
@@ -11651,8 +11814,6 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
             self.chapter_plan_apply_btn.setVisible(False)
             self.chapter_plan_apply_btn.setEnabled(False)
         self.set_status_tip(f"章节规划当前批次失败，进度已保存：{err_text[:100]}")
-        if not getattr(self, "_is_detached_auto_runner", False):
-            QMessageBox.warning(self, "章节规划生成失败", err_text)
 
     def _cleanup_chapter_plan_worker(self):
         if self._forward_chapter_task_signal("_cleanup_chapter_plan_worker"):
@@ -17921,7 +18082,11 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
             "status": "草稿",
             "premise": str(premise.get("synopsis", "") or "").strip(),
         })
-        data["bible"] = format_creation_text(bible, "小说圣经")
+        data["bible"] = format_creation_text(
+            bible,
+            "小说圣经",
+            {"main_conflict": "核心动机契约（主线矛盾）"},
+        )
         data["world_rules"] = format_creation_text(world_rules, "世界规则")
         data["summary"] = str(premise.get("synopsis", "") or "").strip()
         data["timeline"] = format_creation_preview(

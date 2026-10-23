@@ -92,6 +92,7 @@ from gpt_desktop.novel_utils import (
     _style_finalize_error_is_hard,
     _style_finalize_preflight_targets,
     _repair_literal_count_claims,
+    _sanitize_prose_internal_references,
     _style_cards_selected_by_plan,
     _style_candidate_rank,
     _style_candidate_needs_rescue,
@@ -194,6 +195,54 @@ class NovelLongFormContextTests(unittest.TestCase):
 
         self.assertIn("回答该伏笔的单一核心问题", context)
         self.assertIn("仅有再次出现、部分揭示、冲突升级", context)
+
+    def test_prose_context_hides_internal_record_aliases(self):
+        project = self._project_with_current_chapter(_new_chapter(0))
+        project["characters"] = [{"id": "c1", "name": "林见夏"}]
+        project["lore"] = [{"id": "l1", "name": "合租住处"}]
+        project["foreshadow_items"] = [{"id": "f1", "code": "F0001", "name": "缺失的照片"}]
+        project["long_form_memory"] = {
+            "schema_version": 2,
+            "state_snapshot": {
+                "character_states": [{"character_id": "c1", "name": "林见夏", "state": "在场"}],
+                "object_states": [],
+                "relationship_states": [],
+                "active_conflicts": [],
+                "unresolved_tasks": [],
+            },
+            "active_facts": [],
+            "stage_archives": [],
+        }
+        project["chapters"][0]["outline"] = "林见夏回到L001，继续追查F0001。"
+        context = _build_chapter_ai_context(project, 0, "draft")
+        self.assertNotIn("回到L001", context)
+        self.assertIn("回到合租住处", context)
+        self.assertNotIn("F0001", context)
+        self.assertIn("缺失的照片", context)
+        self.assertIn("Cxxx、Lxxx、Fxxx是程序内部", context)
+
+    def test_known_internal_references_are_replaced_only_in_prose(self):
+        project = self._project_with_current_chapter(_new_chapter(0))
+        project["lore"] = [{"id": "l1", "name": "贺知微的合租住处"}]
+        text, changes = _sanitize_prose_internal_references(
+            project,
+            "她在L001楼下等人，记录中的AF-001不应被处理。",
+        )
+        self.assertIn("贺知微的合租住处楼下", text)
+        self.assertIn("AF-001", text)
+        self.assertEqual(changes[0]["reference"], "L001")
+
+        cleaned, changes = _sanitize_prose_internal_references(
+            project,
+            "根据NF-162-01和NCF1更新state_reconciliation，AI推理：仍需保留正常剧情。",
+            strip_metadata=True,
+        )
+        self.assertNotIn("NF-162-01", cleaned)
+        self.assertNotIn("NCF1", cleaned)
+        self.assertNotIn("state_reconciliation", cleaned)
+        self.assertNotIn("AI推理", cleaned)
+        self.assertIn("仍需保留正常剧情。", cleaned)
+        self.assertTrue(any(item["reference"] == "NF-162-01" for item in changes))
 
     def test_narrative_strategy_profile_persists_but_is_excluded_from_runtime_chapter_context(self):
         male = self._project_with_current_chapter(_new_chapter(0))

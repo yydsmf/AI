@@ -10255,6 +10255,11 @@ def _grounded_prose_contract():
         "【正文语言要求】\n"
         "正文必须使用自然的网络小说叙述语言，直接写人物、场景、动作、对白和具体变化；"
         "不得出现策划术语、抽象形容、文学化意象、空泛比喻、办案式表达、编辑式说明或编辑式总结。"
+        "资料中的Cxxx、Lxxx、Fxxx是程序内部的人物、设定和伏笔引用，不是故事里的自然名称；"
+        "正文、对白、聊天消息、文件内容和人物内心都不得原样复制这些内部引用。需要写到对应内容时，必须使用资料中给出的正式名称或自然说法；"
+        "除非当前剧情明确要求人物看到或说出这个内部编号，否则不能把它当成地点、人物、物件或线索名称。"
+        "AF/NF/CF/NCF/TASK/NTASK/NOBJ以及state_reconciliation、long_form_memory、repair_patches、logic_audit、prose_review等字段名同样属于程序资料；"
+        "它们不能出现在小说正文里，也不能被改写成对白、聊天内容、旁白或人物内心。"
         "情绪和气氛必须通过人物当下的动作、对白、反应和具体结果表现，不要用漂亮形容替代剧情。\n"
         + _prose_scene_grounding_guidance()
         + "【对白自然衔接】\n"
@@ -12498,6 +12503,125 @@ def _long_form_record_reference_maps(project):
             "code_to_id": code_to_id,
         }
     return result
+
+
+_INTERNAL_PROSE_REFERENCE_RE = re.compile(
+    r"(?<![A-Za-z0-9])(?:C|L|F)\d{3,}(?![A-Za-z0-9])"
+)
+_INTERNAL_PROSE_METADATA_REFERENCE_RE = re.compile(
+    r"(?<![A-Za-z0-9_])(?:AF|NF|CF|NCF|TASK|NTASK|NOBJ|NC|NL|NT)"
+    r"(?:(?:[-_][A-Za-z0-9]+)+|\d{1,7})(?![A-Za-z0-9_])",
+    re.IGNORECASE,
+)
+_INTERNAL_PROSE_FIELD_RE = re.compile(
+    r"(?<![A-Za-z0-9_])(?:state_reconciliation|state_lifecycle_review|"
+    r"long_form_memory|active_facts|fact_updates|record_updates|"
+    r"next_chapter_memory|character_refs|lore_refs|foreshadow_refs|"
+    r"object_keys|conflict_refs|task_refs|reviewed_[a-z_]+|"
+    r"unchanged_[a-z_]+|repair_patches|logic_audit|prose_review|"
+    r"reasoning_content|system_prompt|user_prompt|"
+    r"output_requirements)(?![A-Za-z0-9_])",
+    re.IGNORECASE,
+)
+_INTERNAL_PROSE_LABEL_RE = re.compile(
+    r"(?<![A-Za-z0-9])(?:AI推理|AI分析|系统提示|用户要求|输出要求|生成说明|"
+    r"校验说明|工作流程说明|正文要求|JSON格式|JSON对象)\s*[：:]?",
+    re.IGNORECASE,
+)
+
+
+def _prose_internal_reference_map(project):
+    """Map structured record references to names safe for story prose."""
+    maps = _long_form_record_reference_maps(project)
+    replacements = {}
+    for kind in ("characters", "lore", "foreshadows"):
+        record_map = maps.get(kind, {})
+        records = record_map.get("id_to_record", {})
+        for alias, item_id in record_map.get("alias_to_id", {}).items():
+            record = records.get(item_id, {})
+            name = str(record.get("name", "") or "").strip()
+            if name and name != alias:
+                replacements[alias] = name
+        if kind == "foreshadows":
+            for code, item_id in record_map.get("code_to_id", {}).items():
+                record = records.get(item_id, {})
+                name = str(record.get("name", "") or "").strip()
+                if name and name != code:
+                    replacements[code] = name
+    return replacements
+
+
+def _sanitize_prose_internal_references(project, value, strip_metadata=False):
+    """Replace internal references before prose reaches the model or project.
+
+    Context preparation only replaces known record aliases with natural names.
+    Final prose preparation additionally removes state/AI metadata identifiers
+    that have no valid story meaning.  Structured project fields are never
+    passed through this function.
+    """
+    text = str(value or "")
+    replacements = _prose_internal_reference_map(project)
+    if not text:
+        return text, []
+    applied = {}
+
+    def replace(match):
+        reference = match.group(0)
+        replacement = replacements.get(reference, "")
+        if not replacement:
+            return reference
+        applied.setdefault(reference, {"reference": reference, "replacement": replacement, "count": 0})
+        applied[reference]["count"] += 1
+        return replacement
+
+    sanitized = _INTERNAL_PROSE_REFERENCE_RE.sub(replace, text)
+    if strip_metadata:
+        metadata_hits = []
+
+        def remove_metadata(match):
+            metadata_hits.append(match.group(0))
+            return ""
+
+        sanitized = _INTERNAL_PROSE_METADATA_REFERENCE_RE.sub(
+            remove_metadata,
+            sanitized,
+        )
+        field_hits = []
+
+        def remove_field(match):
+            field_hits.append(match.group(0))
+            return ""
+
+        sanitized = _INTERNAL_PROSE_FIELD_RE.sub(remove_field, sanitized)
+        label_hits = []
+
+        def remove_label(match):
+            label_hits.append(match.group(0).strip())
+            return ""
+
+        sanitized = _INTERNAL_PROSE_LABEL_RE.sub(remove_label, sanitized)
+        sanitized = re.sub(r"```(?:json|python|javascript|代码)?", "", sanitized, flags=re.IGNORECASE)
+        sanitized = re.sub(r"[ \t]{2,}", " ", sanitized)
+        sanitized = re.sub(r"[ \t]+([，。！？、；：])", r"\1", sanitized)
+        for token in set(metadata_hits):
+            applied[f"metadata:{token}"] = {
+                "reference": token,
+                "replacement": "",
+                "count": metadata_hits.count(token),
+            }
+        for token in set(field_hits):
+            applied[f"field:{token}"] = {
+                "reference": token,
+                "replacement": "",
+                "count": field_hits.count(token),
+            }
+        for token in set(label_hits):
+            applied[f"label:{token}"] = {
+                "reference": token,
+                "replacement": "",
+                "count": label_hits.count(token),
+            }
+    return sanitized, list(applied.values())
 
 
 def _resolve_long_form_record_ref(project, kind, value):
@@ -22774,6 +22898,11 @@ def _build_chapter_ai_context(project, chapter_index, action):
                 break
             continue
         section_content = content if title in raw_context_titles else _dedupe_text_lines(content)
+        if action in story_layer_actions:
+            section_content, _reference_replacements = _sanitize_prose_internal_references(
+                project,
+                section_content,
+            )
         if title not in raw_context_titles:
             unique_lines = []
             for line in str(section_content or "").splitlines():

@@ -217,6 +217,7 @@ from .novel_utils import (
     _chapter_logic_audit_blocking_issues,
     _chapter_logic_audit_validation_errors,
     _repair_literal_count_claims,
+    _sanitize_prose_internal_references,
     _literalize_long_form_memory_evidence,
     _normalize_long_form_structural_refs,
     _validate_long_form_memory_update,
@@ -12317,6 +12318,20 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
         if not candidate:
             self._fail_memory_sync("正文终稿为空，无法整理章节状态")
             return False
+        candidate, replacements = _sanitize_prose_internal_references(
+            self.current_project if isinstance(self.current_project, dict) else {},
+            candidate,
+            strip_metadata=True,
+        )
+        if replacements:
+            self._log_novel_diagnostic(
+                "chapter_prose_internal_reference_sanitized",
+                level="warning",
+                chapter_id=self._current_chapter_id(),
+                replacements=replacements,
+                before_chars=len(str(final_text or "")),
+                after_chars=len(candidate),
+            )
         self._chapter_ai_style_execution = ""
         self._chapter_ai_style_plan = ""
         self._chapter_ai_style_candidate = candidate
@@ -14738,6 +14753,21 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
                 ],
             )
             text = repaired_text
+        text, replacements = _sanitize_prose_internal_references(
+            self.current_project if isinstance(self.current_project, dict) else {},
+            text,
+            strip_metadata=True,
+        )
+        if replacements:
+            self._log_novel_diagnostic(
+                "chapter_prose_internal_reference_sanitized",
+                level="warning",
+                chapter_id=self._current_chapter_id(),
+                replacements=replacements,
+                before_chars=len(str(final_text or "")),
+                after_chars=len(text),
+                source="memory_finalize_resume",
+            )
         self._chapter_ai_memory_finalize_attempted = True
         chapters = self.current_project.get("chapters", []) if isinstance(self.current_project, dict) else []
         checkpoint = (

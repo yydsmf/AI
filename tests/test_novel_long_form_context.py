@@ -1229,6 +1229,90 @@ class NovelLongFormContextTests(unittest.TestCase):
         self.assertEqual(normalized["foreshadow_updates"][0]["operation"], "update")
         self.assertEqual(normalized["foreshadow_updates"][0]["state"], "线索仍指向旧码头。")
 
+    def test_state_aliases_accept_runtime_change_compatibility_field(self):
+        normalized = _normalize_long_form_state_aliases({
+            "record_updates": {
+                "characters": [{
+                    "ref": "C001",
+                    "runtime_change": "甲已经接过旁路监测，承担独立判断责任。",
+                    "evidence_quote": "承担独立判断责任",
+                }],
+                "lore": [{
+                    "ref": "L001",
+                    "runtime_change": "旁路只能维持低负载供电。",
+                    "evidence_quote": "只能维持低负载供电",
+                }],
+            },
+        })
+
+        character = normalized["record_updates"]["characters"][0]
+        lore = normalized["record_updates"]["lore"][0]
+        self.assertEqual(character["operation"], "update")
+        self.assertEqual(character["state"], "甲已经接过旁路监测，承担独立判断责任。")
+        self.assertEqual(character["changes"], ["甲已经接过旁路监测，承担独立判断责任。"])
+        self.assertEqual(lore["operation"], "update")
+        self.assertEqual(lore["state"], "旁路只能维持低负载供电。")
+        self.assertEqual(lore["changes"], ["旁路只能维持低负载供电。"])
+
+    def test_state_aliases_accept_runtime_addition_and_custom_patch_fields(self):
+        normalized = _normalize_long_form_state_aliases({
+            "record_updates": {
+                "characters": [{
+                    "ref": "C001",
+                    "current_dynamic_addition": "甲开始独立监视旁路读数。",
+                    "evidence_quote": "开始独立监视旁路读数",
+                }],
+                "lore": [{
+                    "ref": "L001",
+                    "patch": {"public_boundary": "维修区仍不得接入旁路。"},
+                    "evidence_quote": "维修区仍不得接入旁路",
+                }],
+            },
+        })
+
+        character = normalized["record_updates"]["characters"][0]
+        lore = normalized["record_updates"]["lore"][0]
+        self.assertEqual(character["operation"], "update")
+        self.assertEqual(character["state"], "甲开始独立监视旁路读数。")
+        self.assertEqual(lore["operation"], "update")
+        self.assertEqual(lore["state"], "维修区仍不得接入旁路。")
+
+    def test_state_aliases_accept_object_event_and_reference_aliases(self):
+        normalized = _normalize_long_form_state_aliases({
+            "state_patch": {
+                "object_states": [{
+                    "object": "手动发电机",
+                    "current_dynamic_addition": "已固定在货厢内，尚未试机。",
+                }, {
+                    "object_key": "black_supplier_folder",
+                    "holder": "C008",
+                    "location": "C008离开住处时持有",
+                    "condition": "未显示损毁。",
+                }],
+            },
+            "long_term_events": [{
+                "change": "手动发电机已固定并保持断电。",
+                "storage": {
+                    "object_refs": [{"object_name": "手动发电机"}],
+                },
+            }],
+            "next_chapter_memory": {
+                "object_ids": [{"object_name": "手动发电机"}],
+            },
+        })
+
+        object_state = normalized["state_patch"]["object_states"][0]
+        event = normalized["long_term_events"][0]
+        self.assertEqual(object_state["key"], "手动发电机")
+        self.assertEqual(object_state["state"], "已固定在货厢内，尚未试机。")
+        self.assertEqual(
+            normalized["state_patch"]["object_states"][1]["state"],
+            "C008；未显示损毁。",
+        )
+        self.assertEqual(event["event"], "手动发电机已固定并保持断电。")
+        self.assertEqual(event["storage"]["object_keys"], ["手动发电机"])
+        self.assertEqual(normalized["next_chapter_memory"]["object_keys"], [{"object_name": "手动发电机"}])
+
     def test_state_aliases_accept_current_dynamic_append(self):
         normalized = _normalize_long_form_state_aliases({
             "record_updates": {
@@ -5185,6 +5269,21 @@ class NovelLongFormContextTests(unittest.TestCase):
         fact_update = normalized["fact_updates"][0]
         self.assertEqual(fact_update["id"], "AF-0063")
         self.assertEqual(fact_update["key"], "NF-0040")
+
+    def test_supersede_previous_fact_id_alias_is_normalized_to_old_id(self):
+        chapter = _new_chapter(0)
+        project = self._project_with_current_chapter(chapter)
+        normalized = _normalize_long_form_update_payload(project, 0, {
+            "fact_updates": [{
+                "operation": "supersede",
+                "key": "NF-5901",
+                "previous_fact_id": "AF-0131",
+                "scope": "current_chapter",
+                "fact": "已完成受限拆取并带离关键部件。",
+            }],
+        })
+
+        self.assertEqual(normalized["fact_updates"][0]["id"], "AF-0131")
 
     def test_new_object_is_available_to_lifecycle_review(self):
         chapter = _new_chapter(0)
@@ -10145,8 +10244,115 @@ class NovelLongFormContextTests(unittest.TestCase):
         self.assertIn("只审查第十章边界的状态语义", context)
         self.assertIn("只返回能由最终正文逐字证实", context)
         self.assertIn('每项必须填写operation:"update"、ref和evidence_quote', context)
+        self.assertIn('"long_term_events":[]', context)
+        self.assertIn("必须同步写入long_term_events中的storage对应数组", context)
         self.assertTrue(parsed["parsed"])
         self.assertEqual(parsed["corrections"]["fact_updates"], [])
+
+    def test_boundary_reconciliation_normalizes_retirement_objects_and_uses_body_backed_selection(self):
+        previous = _new_chapter(0)
+        previous["memory_sync_status"] = "complete"
+        previous["memory_revision"] = 1
+        current = _new_chapter(1)
+        current["memory_selection"] = {"character_ids": ["legacy-character"]}
+        project = self._project_with_current_chapter(current)
+        project["chapters"] = [previous, current]
+        project["long_form_memory"] = {
+            "schema_version": "2",
+            "revision": 1,
+            "state_snapshot": {
+                "object_states": [{
+                    "key": "NO-0037-01",
+                    "name": "旧物",
+                    "state": "仍在旧宅柜中",
+                }],
+                "active_conflicts": [],
+                "unresolved_tasks": [{
+                    "id": "TASK-0009",
+                    "task": "取回被锁在旧宅柜中的旧物",
+                }],
+            },
+            "active_facts": [],
+            "stage_archives": [],
+        }
+        body = "她把首饰盒和纪念品放进旧拉杆箱，又把旧电脑用衣服裹好，塞到最上面。"
+        update = self._strict_update(project, 1)
+        update["state_patch"] = {
+            "object_states": [{
+                "key": "NO-0037-01",
+                "state": "旧物已经取回并带离旧宅。",
+                "evidence_quote": body,
+            }],
+        }
+        update["state_retirements"] = {
+            "task_ids": [{
+                "id": "TASK-0009",
+                "previous_task": "取回被锁在旧宅柜中的旧物",
+                "reason": "任务已完成",
+                "evidence_quote": body,
+            }],
+        }
+        update["state_lifecycle_review"] = {
+            "scope": "current_chapter",
+            "reviewed_object_keys": ["NO-0037-01"],
+            "reviewed_conflict_refs": [],
+            "reviewed_task_refs": ["TASK-0009"],
+            "notes": "已复核",
+        }
+        update["state_reconciliation"]["object_keys"] = ["NO-0037-01"]
+        update["state_reconciliation"]["task_refs"] = ["TASK-0009"]
+        update["long_term_events"] = [{
+            "event": "旧物已取回",
+            "category": "task",
+            "evidence_quote": body,
+            "storage": {
+                "object_keys": [{"key": "NO-0037-01"}],
+                "task_refs": [{"id": "TASK-0009"}],
+            },
+        }]
+
+        normalized = _normalize_long_form_update_payload(project, 1, update)
+
+        self.assertEqual(normalized["state_retirements"]["task_ids"], ["TASK-0009"])
+        self.assertEqual(
+            normalized["_state_retirement_evidence"]["task_ids:TASK-0009"],
+            body,
+        )
+        self.assertEqual(
+            normalized["long_term_events"][0]["storage"]["task_refs"],
+            ["TASK-0009"],
+        )
+        errors = _validate_long_form_memory_update(
+            project,
+            1,
+            normalized,
+            final_text=body,
+            require_revision=True,
+            require_evidence=True,
+        )
+        self.assertEqual(errors, [])
+
+    def test_reconciliation_patch_normalizes_task_object_before_merge(self):
+        project = self._project_with_current_chapter(_new_chapter(0))
+        patch = {
+            "state_retirements": {
+                "task_ids": [{
+                    "id": "TASK-0009",
+                    "evidence_quote": "任务已经完成并带走旧物",
+                }],
+            },
+        }
+
+        normalized = _normalize_long_form_reconciliation_patch(project, patch)
+        self.assertEqual(normalized["state_retirements"]["task_ids"], ["TASK-0009"])
+        merged = _merge_long_form_memory_reconciliation_patch(
+            {"state_retirements": {"task_ids": []}}, patch, project=project
+        )
+        self.assertEqual(merged["state_retirements"]["task_ids"], ["TASK-0009"])
+        self.assertEqual(
+            merged["_state_retirement_evidence"]["task_ids:TASK-0009"],
+            "任务已经完成并带走旧物",
+        )
 
     def test_reconciliation_patch_preserves_original_delta_and_replaces_same_fact(self):
         original = {

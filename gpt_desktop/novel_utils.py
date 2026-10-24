@@ -12660,6 +12660,41 @@ def _long_form_ref_values(value):
     return result
 
 
+def _long_form_state_reference_values(value, kind):
+    """Read scalar state references from both legacy strings and model objects."""
+    aliases = {
+        "object_keys": (
+            "key", "object_key", "object_id", "object_ref", "object_name",
+            "item_key", "item_name", "ref", "id", "name", "label", "object",
+        ),
+        "conflict_ids": ("id", "conflict_id", "conflict_ref", "ref", "key", "stable_id"),
+        "task_ids": ("id", "task_id", "task_ref", "ref", "key", "stable_id"),
+        "character_refs": ("id", "character_id", "character_ref", "ref", "key", "stable_id"),
+        "relationship_refs": ("refs", "characters", "character_refs", "relationship_ref", "relationship_id", "ref", "key"),
+        "fact_refs": ("id", "fact_id", "fact_ref", "ref", "key", "stable_id"),
+        "lore_refs": ("id", "lore_id", "lore_ref", "ref", "key", "stable_id"),
+        "foreshadow_refs": ("id", "foreshadow_id", "foreshadow_ref", "ref", "key", "stable_id"),
+    }
+    if isinstance(value, dict):
+        for alias in aliases.get(kind, ("id", "ref", "key")):
+            if alias in value and value.get(alias) not in (None, "", [], {}):
+                return _long_form_state_reference_values(value.get(alias), kind)
+        return []
+    if isinstance(value, (list, tuple, set)):
+        result = []
+        for item in value:
+            for ref in _long_form_state_reference_values(item, kind):
+                if ref not in result:
+                    result.append(ref)
+        return result
+    return _long_form_ref_values(value)
+
+
+def _long_form_state_reference_scalar(value, kind):
+    values = _long_form_state_reference_values(value, kind)
+    return values[0] if values else ""
+
+
 def _long_form_relationship_ref_values(value):
     """Read a character pair from the compact relationship spellings models use."""
     if isinstance(value, (list, tuple, set)):
@@ -14368,6 +14403,57 @@ def _normalize_long_form_state_aliases(update):
                 return value
         return ""
 
+    def text_value(value):
+        """Turn a scalar or small model patch object into runtime prose."""
+        if isinstance(value, dict):
+            parts = []
+            for key, nested in value.items():
+                if key in {
+                    "evidence_quote", "evidence", "quote", "evidence_quotes",
+                    "operation", "ref", "record_ref", "id", "key", "scope",
+                }:
+                    continue
+                text = text_value(nested)
+                if text:
+                    parts.append(text)
+            return "；".join(parts)
+        if isinstance(value, (list, tuple, set)):
+            parts = [text_value(item) for item in value]
+            return "；".join(item for item in parts if item)
+        return str(value or "").strip()
+
+    def first_text(item, keys):
+        for key in keys:
+            if key not in item:
+                continue
+            text = text_value(item.get(key))
+            if text:
+                return text
+        return ""
+
+    def normalize_reference_aliases(item):
+        if not isinstance(item, dict):
+            return
+        aliases = {
+            "fact_refs": ("fact_ids", "fact_keys", "facts"),
+            "character_refs": ("character_ids", "characters"),
+            "lore_refs": ("lore_ids", "lore_keys", "settings", "lore"),
+            "foreshadow_refs": ("foreshadow_ids", "foreshadows"),
+            "object_keys": (
+                "object_refs", "object_ids", "objects", "item_keys", "item_refs", "items",
+            ),
+            "conflict_refs": ("conflict_ids", "conflicts"),
+            "task_refs": ("task_ids", "tasks"),
+        }
+        for target, source_keys in aliases.items():
+            current = item.get(target)
+            if isinstance(current, list) and current:
+                continue
+            source = first_value(item, source_keys)
+            if source in (None, "", [], {}):
+                continue
+            item[target] = source if isinstance(source, list) else [source]
+
     def ref_list(value):
         return _long_form_ref_values(value)
 
@@ -14414,8 +14500,9 @@ def _normalize_long_form_state_aliases(update):
                         item["state"] = first_value(
                             source_item,
                             (
-                                "status", "dynamic", "runtime", "runtime_update", "runtime_patch",
+                                "status", "dynamic", "runtime", "runtime_update", "runtime_change", "runtime_patch",
                                 "operational_state", "spatial_state", "current_dynamic_append",
+                                "current_dynamic_addition", "current_dynamic_additions",
                                 "change", "description",
                             ),
                         )
@@ -14453,8 +14540,9 @@ def _normalize_long_form_state_aliases(update):
                     item["state"] = first_value(
                         source_item,
                         (
-                            "status", "dynamic", "runtime", "runtime_update", "runtime_patch",
+                            "status", "dynamic", "runtime", "runtime_update", "runtime_change", "runtime_patch",
                             "operational_state", "spatial_state", "current_dynamic_append",
+                            "current_dynamic_addition", "current_dynamic_additions",
                             "change", "description",
                         ),
                     )
@@ -14469,7 +14557,10 @@ def _normalize_long_form_state_aliases(update):
             if not str(item.get("key", "") or "").strip():
                 item["key"] = first_value(
                     item,
-                    ("object_key", "object_id", "stable_ref", "temp_key", "ref", "id", "name"),
+                    (
+                        "object_key", "object_id", "object_ref", "object_name", "item_key", "item_name",
+                        "stable_ref", "temp_key", "ref", "id", "name", "label", "object",
+                    ),
                 )
             if not str(item.get("lore_ref", "") or "").strip():
                 item["lore_ref"] = first_value(
@@ -14480,11 +14571,18 @@ def _normalize_long_form_state_aliases(update):
                 item["state"] = first_value(
                     item,
                     (
-                        "status", "dynamic", "runtime", "runtime_update", "runtime_patch",
+                        "status", "dynamic", "runtime", "runtime_update", "runtime_change", "runtime_patch",
                         "operational_state", "spatial_state", "current_dynamic_append",
-                        "change", "description",
+                        "current_dynamic_addition", "current_dynamic_additions",
+                        "current_state", "state_update", "update", "changes", "change", "description",
                     ),
                 )
+            if not str(item.get("state", "") or "").strip():
+                state_parts = [
+                    first_text(item, ("holder", "owner", "owner_ref", "location", "position")),
+                    first_text(item, ("condition", "item_condition", "physical_state")),
+                ]
+                item["state"] = "；".join(value for value in state_parts if value)
             if not str(item.get("evidence_quote", "") or "").strip():
                 item["evidence_quote"] = first_value(item, ("evidence", "quote"))
         for item in state_patch.get("active_conflicts", []) if isinstance(state_patch.get("active_conflicts"), list) else []:
@@ -14508,9 +14606,12 @@ def _normalize_long_form_state_aliases(update):
             elif not str(item.get("id", "") or "").strip():
                 item["id"] = conflict_ref
             if not str(item.get("conflict", "") or "").strip():
-                item["conflict"] = first_value(
+                item["conflict"] = first_text(
                     item,
-                    ("status", "state", "change", "description", "title", "name"),
+                    (
+                        "status", "state", "runtime_change", "current_dynamic_addition",
+                        "change", "description", "title", "name",
+                    ),
                 )
             if not str(item.get("evidence_quote", "") or "").strip():
                 item["evidence_quote"] = first_value(item, ("evidence", "quote"))
@@ -14535,9 +14636,12 @@ def _normalize_long_form_state_aliases(update):
             elif not str(item.get("id", "") or "").strip():
                 item["id"] = task_ref
             if not str(item.get("task", "") or "").strip():
-                item["task"] = first_value(
+                item["task"] = first_text(
                     item,
-                    ("status", "state", "change", "description", "title", "name"),
+                    (
+                        "status", "state", "runtime_change", "current_dynamic_addition",
+                        "change", "description", "title", "name",
+                    ),
                 )
             if not str(item.get("evidence_quote", "") or "").strip():
                 item["evidence_quote"] = first_value(item, ("evidence", "quote"))
@@ -14551,6 +14655,7 @@ def _normalize_long_form_state_aliases(update):
     reconciliation = payload.get("state_reconciliation", {})
     if isinstance(reconciliation, dict):
         reconciliation = deepcopy(reconciliation)
+        normalize_reference_aliases(reconciliation)
         runtime_review = reconciliation.get("record_runtime_review", {})
         if isinstance(runtime_review, dict):
             runtime_review = deepcopy(runtime_review)
@@ -14668,11 +14773,25 @@ def _normalize_long_form_state_aliases(update):
                         seen.add(value)
                 runtime_review[reviewed_key] = reviewed
             reconciliation["record_runtime_review"] = runtime_review
+        for key in (
+            "fact_refs", "character_refs", "lore_refs", "foreshadow_refs",
+            "object_keys", "conflict_refs", "task_refs",
+        ):
+            if isinstance(reconciliation.get(key), list):
+                reconciliation[key] = _long_form_state_reference_values(
+                    reconciliation[key], key
+                )
         payload["state_reconciliation"] = reconciliation
 
     retirements = payload.get("state_retirements", {})
     if isinstance(retirements, dict):
         retirements = deepcopy(retirements)
+        normalize_reference_aliases(retirements)
+        retirement_evidence = payload.get("_state_retirement_evidence", {})
+        retirement_evidence = (
+            deepcopy(retirement_evidence)
+            if isinstance(retirement_evidence, dict) else {}
+        )
         for target, aliases in (
             ("character_refs", ("character_ids", "characters")),
             ("relationship_refs", ("relationship_ids", "relationships")),
@@ -14680,11 +14799,61 @@ def _normalize_long_form_state_aliases(update):
             ("conflict_ids", ("conflict_refs", "conflicts")),
             ("task_ids", ("task_refs", "tasks")),
         ):
-            if not retirements.get(target):
+            had_target = target in retirements
+            raw_values = retirements.get(target)
+            if not isinstance(raw_values, list) or not raw_values:
                 value = first_value(retirements, aliases)
-                if value:
-                    retirements[target] = ref_list(value)
+                raw_values = value if isinstance(value, list) else ([value] if value else [])
+            if not raw_values and not had_target:
+                continue
+            normalized = []
+            for raw_value in raw_values:
+                if target == "relationship_refs" and isinstance(raw_value, dict):
+                    relationship_values = _long_form_relationship_ref_values(
+                        raw_value.get(
+                            "refs",
+                            raw_value.get(
+                                "characters",
+                                raw_value.get("relationship_refs", raw_value.get("ref", "")),
+                            ),
+                        )
+                    )
+                    refs = ["|".join(sorted(relationship_values))] if len(relationship_values) >= 2 else []
+                else:
+                    refs = _long_form_state_reference_values(raw_value, target)
+                evidence = (
+                    str(raw_value.get("evidence_quote", raw_value.get("evidence", "")) or "").strip()
+                    if isinstance(raw_value, dict) else ""
+                )
+                for ref in refs:
+                    if ref and ref not in normalized:
+                        normalized.append(ref)
+                    if evidence and ref:
+                        retirement_evidence[f"{target}:{ref}"] = evidence
+            retirements[target] = normalized
+        if retirement_evidence:
+            payload["_state_retirement_evidence"] = retirement_evidence
+        else:
+            payload.pop("_state_retirement_evidence", None)
         payload["state_retirements"] = retirements
+
+    next_chapter_memory = payload.get("next_chapter_memory")
+    if isinstance(next_chapter_memory, dict):
+        next_chapter_memory = deepcopy(next_chapter_memory)
+        normalize_reference_aliases(next_chapter_memory)
+        payload["next_chapter_memory"] = next_chapter_memory
+
+    for event in payload.get("long_term_events", []) if isinstance(payload.get("long_term_events"), list) else []:
+        if not isinstance(event, dict) or not isinstance(event.get("storage"), dict):
+            continue
+        storage = event["storage"]
+        normalize_reference_aliases(storage)
+        for key in (
+            "fact_refs", "character_refs", "lore_refs", "foreshadow_refs",
+            "object_keys", "conflict_refs", "task_refs",
+        ):
+            if isinstance(storage.get(key), list):
+                storage[key] = _long_form_state_reference_values(storage[key], key)
 
     record_updates = payload.get("record_updates", {})
     if isinstance(record_updates, dict):
@@ -14724,10 +14893,12 @@ def _normalize_long_form_state_aliases(update):
                 has_delta = any(
                     bool(item.get(key))
                     for key in (
-                        "state", "dynamic", "runtime", "runtime_update", "runtime_patch",
+                        "state", "dynamic", "dynamic_update", "runtime", "runtime_update", "runtime_change", "runtime_patch",
                         "operational_state", "spatial_state", "current_dynamic",
-                        "current_dynamic_append", "change", "changes", "patch",
-                        "updates", "update", "identity_patch", "fields", "description", "content",
+                        "current_dynamic_append", "current_dynamic_addition", "current_dynamic_additions",
+                        "current_state", "state_change", "state_update", "change", "changes", "patch",
+                        "updates", "update", "identity_patch", "fields", "public_accountability", "rule",
+                        "description", "content", "current_content",
                     )
                 )
                 if not operation and explicit_ref and has_delta:
@@ -14790,23 +14961,23 @@ def _normalize_long_form_state_aliases(update):
                             "title", "label",
                         ),
                     )
-                dynamic = first_value(item, (
-                    "state", "dynamic", "runtime", "runtime_update", "runtime_patch",
+                dynamic = first_text(item, (
+                    "state", "dynamic", "dynamic_update", "runtime", "runtime_update", "runtime_change", "runtime_patch",
                     "operational_state", "spatial_state", "current_dynamic",
-                    "current_dynamic_append", "change",
-                    "latest_state", "new_state", "current_state", "state_update",
+                    "current_dynamic_append", "current_dynamic_addition", "current_dynamic_additions", "change",
+                    "latest_state", "new_state", "current_state", "state_change", "state_update",
                     "new_status", "status_update", "update", "content", "status",
-                    "description", "development", "note",
+                    "public_accountability", "rule", "description", "development", "note", "current_content",
                 ))
                 nested_fields = item.get("fields")
                 if not dynamic and isinstance(nested_fields, dict):
-                    dynamic = first_value(nested_fields, (
-                        "state", "dynamic", "runtime", "runtime_update", "runtime_patch",
+                    dynamic = first_text(nested_fields, (
+                        "state", "dynamic", "dynamic_update", "runtime", "runtime_update", "runtime_change", "runtime_patch",
                         "operational_state", "spatial_state", "current_dynamic",
-                        "current_dynamic_append", "change",
-                        "latest_state", "new_state", "current_state", "state_update",
+                        "current_dynamic_append", "current_dynamic_addition", "current_dynamic_additions", "change",
+                        "latest_state", "new_state", "current_state", "state_change", "state_update",
                         "new_status", "status_update", "update", "content", "status",
-                        "public_state", "description", "notes", "development", "note",
+                        "public_state", "public_accountability", "rule", "description", "notes", "development", "note",
                     ))
                     if not dynamic:
                         field_changes = nested_fields.get("changes", [])
@@ -14824,37 +14995,34 @@ def _normalize_long_form_state_aliases(update):
                 # invent a state or relax the evidence checks.
                 nested_patch = item.get("patch")
                 if not dynamic and isinstance(nested_patch, dict):
-                    dynamic = first_value(nested_patch, (
-                        "state", "dynamic", "runtime", "runtime_update", "runtime_patch",
+                    dynamic = first_text(nested_patch, (
+                        "state", "dynamic", "dynamic_update", "runtime", "runtime_update", "runtime_change", "runtime_patch",
                         "operational_state", "spatial_state", "current_dynamic",
-                        "current_dynamic_append", "change", "latest_state", "new_state",
-                        "current_state", "state_update",
+                        "current_dynamic_append", "current_dynamic_addition", "current_dynamic_additions", "change", "latest_state", "new_state",
+                        "current_state", "state_change", "state_update",
                         "new_status", "status_update", "update", "content", "status", "public_state",
-                        "description", "development", "note",
+                        "public_accountability", "rule", "description", "development", "note", "current_content",
                     ))
+                    if not dynamic:
+                        dynamic = text_value(nested_patch)
                 elif not dynamic and isinstance(nested_patch, str):
                     dynamic = nested_patch.strip()
                 if not dynamic and isinstance(nested_updates, dict):
-                    dynamic = first_value(nested_updates, (
-                        "state", "dynamic", "runtime", "runtime_update", "runtime_patch",
+                    dynamic = first_text(nested_updates, (
+                        "state", "dynamic", "dynamic_update", "runtime", "runtime_update", "runtime_change", "runtime_patch",
                         "operational_state", "spatial_state", "current_dynamic",
-                        "current_dynamic_append", "change", "latest_state", "new_state",
-                        "current_state", "state_update",
+                        "current_dynamic_append", "current_dynamic_addition", "current_dynamic_additions", "change", "latest_state", "new_state",
+                        "current_state", "state_change", "state_update",
                         "new_status", "status_update", "update", "content", "status", "public_state",
-                        "description", "development", "note",
+                        "public_accountability", "rule", "description", "development", "note", "current_content",
                     ))
+                    if not dynamic:
+                        dynamic = text_value(nested_updates)
                 elif not dynamic and isinstance(nested_updates, str):
-                    dynamic = nested_updates.strip()
+                        dynamic = nested_updates.strip()
                 if not dynamic:
                     changes = item.get("changes", [])
-                    if isinstance(changes, str):
-                        dynamic = changes
-                    elif isinstance(changes, list):
-                        dynamic = "；".join(
-                            str(value or "").strip()
-                            for value in changes
-                            if str(value or "").strip()
-                        )
+                    dynamic = text_value(changes)
                 if not str(item.get("state", "") or "").strip():
                     item["state"] = dynamic
                 if not item.get("changes") and dynamic:
@@ -14888,7 +15056,8 @@ def _normalize_long_form_state_aliases(update):
                         item,
                         (
                             "fact_ref", "fact_id", "stable_ref", "stable_id", "ref_id", "ref",
-                            "supersedes", "supersedes_fact_id", "replaces", "replaced_fact_id",
+                            "previous_fact_id", "previous_id", "supersedes", "supersedes_fact_id",
+                            "replaces", "replaced_fact_id",
                         ),
                     )
                 # A supersede has two different references: id points to the
@@ -14920,7 +15089,7 @@ def _normalize_long_form_state_aliases(update):
                         item,
                         (
                             "fact_ref", "fact_id", "stable_ref", "stable_id", "ref_id",
-                            "temp_key", "ref", "key",
+                            "previous_fact_id", "previous_id", "temp_key", "ref", "key",
                         ),
                     )
             if not str(item.get("fact", "") or "").strip():
@@ -14960,7 +15129,7 @@ def _normalize_long_form_state_aliases(update):
         has_delta = any(
             bool(item.get(key))
             for key in (
-                "state", "dynamic", "runtime", "runtime_update", "runtime_patch",
+                "state", "dynamic", "runtime", "runtime_update", "runtime_change", "runtime_patch",
                 "operational_state", "spatial_state", "change", "changes", "patch",
                 "updates", "update", "progress", "content", "description", "revealed",
                 "remaining_secret", "status",
@@ -15018,7 +15187,7 @@ def _normalize_long_form_state_aliases(update):
         dynamic = first_value(
             item,
             (
-                "state", "dynamic", "runtime", "runtime_update", "runtime_patch",
+                "state", "dynamic", "runtime", "runtime_update", "runtime_change", "runtime_patch",
                 "operational_state", "spatial_state", "current_dynamic", "change",
                 "progress", "content", "description", "development", "note",
             ),
@@ -15030,7 +15199,7 @@ def _normalize_long_form_state_aliases(update):
                 dynamic = first_value(
                     nested,
                     (
-                        "state", "dynamic", "runtime", "runtime_update", "runtime_patch",
+                        "state", "dynamic", "runtime", "runtime_update", "runtime_change", "runtime_patch",
                         "operational_state", "spatial_state", "change", "progress",
                         "content", "description", "development", "note",
                     ),
@@ -15095,9 +15264,12 @@ def _normalize_long_form_state_aliases(update):
         if not isinstance(item, dict):
             continue
         if not str(item.get("event", "") or "").strip():
-            item["event"] = first_value(
+            item["event"] = first_text(
                 item,
-                ("summary", "content", "description", "title"),
+                (
+                    "summary", "content", "description", "title", "change", "result",
+                    "outcome", "update", "detail", "state",
+                ),
             )
         category = str(
             item.get("category", "")
@@ -15745,7 +15917,7 @@ def _normalize_long_form_event_storage_refs(project, chapter_index, update):
                 valid_refs.add(ref)
 
     def normalize_ref(storage_key, raw_ref):
-        ref = str(raw_ref or "").strip()
+        ref = _long_form_state_reference_scalar(raw_ref, storage_key)
         if not ref:
             return "", ""
         kind_by_key = {
@@ -15837,6 +16009,25 @@ def _normalize_long_form_event_storage_refs(project, chapter_index, update):
         for item in state_patch.get(source_key, []) if isinstance(state_patch.get(source_key), list) else []:
             if isinstance(item, dict):
                 request_link(storage_key, item.get("id", "") or item.get("key", ""), item)
+    retirement_evidence = payload.get("_state_retirement_evidence", {})
+    retirement_evidence = retirement_evidence if isinstance(retirement_evidence, dict) else {}
+    retirements = payload.get("state_retirements", {})
+    if isinstance(retirements, dict):
+        for source_key, storage_key in (
+            ("object_keys", "object_keys"),
+            ("conflict_ids", "conflict_refs"),
+            ("task_ids", "task_refs"),
+        ):
+            for ref in retirements.get(source_key, []) if isinstance(retirements.get(source_key), list) else []:
+                evidence = str(
+                    retirement_evidence.get(f"{source_key}:{ref}", "") or ""
+                ).strip()
+                if evidence:
+                    request_link(
+                        storage_key,
+                        ref,
+                        {"evidence_quote": evidence},
+                    )
 
     evidence_anchors = {}
     for storage_key, raw_ref, item in link_requests:
@@ -16812,6 +17003,67 @@ def _validate_long_form_memory_update(
         selected_conflict_ids = set(existing_state_refs["conflict_ids"])
         selected_task_ids = set(existing_state_refs["task_ids"])
 
+    # Imported or older chapters can omit a state reference from
+    # memory_selection even though the current transaction explicitly updates
+    # that same state.  Treat only literal, final-body-backed references as an
+    # effective selection; an unsubstantiated retirement still fails closed.
+    def add_evidenced_state_ref(kind, raw_ref, item):
+        evidence = (
+            item.get("evidence_quote", item.get("evidence", item.get("quote", "")))
+            if isinstance(item, dict) else ""
+        )
+        if not _long_form_evidence_present(evidence, final_text):
+            return
+        if kind == "object_keys":
+            compact = _compact_text(raw_ref)
+            if compact in existing_state_refs["object_key_by_compact"]:
+                selected_object_compacts.add(compact)
+        elif kind == "conflict_ids":
+            ref = str(raw_ref or "").strip()
+            if ref in existing_state_refs["conflict_ids"]:
+                selected_conflict_ids.add(ref)
+        elif kind == "task_ids":
+            ref = str(raw_ref or "").strip()
+            if ref in existing_state_refs["task_ids"]:
+                selected_task_ids.add(ref)
+
+    for item in state_patch.get("object_states", []) if isinstance(state_patch.get("object_states"), list) else []:
+        if isinstance(item, dict):
+            add_evidenced_state_ref(
+                "object_keys", item.get("key", item.get("name", "")), item
+            )
+    for source_key, ref_kind, ref_key in (
+        ("active_conflicts", "conflict_ids", "id"),
+        ("unresolved_tasks", "task_ids", "id"),
+    ):
+        for item in state_patch.get(source_key, []) if isinstance(state_patch.get(source_key), list) else []:
+            if isinstance(item, dict):
+                add_evidenced_state_ref(
+                    ref_kind,
+                    item.get(ref_key, "") or item.get("key", ""),
+                    item,
+                )
+    retirement_evidence = payload.get("_state_retirement_evidence", {})
+    if isinstance(retirement_evidence, dict):
+        for ref in state_retirements.get("object_keys", []) if isinstance(state_retirements.get("object_keys"), list) else []:
+            add_evidenced_state_ref(
+                "object_keys",
+                ref,
+                {"evidence_quote": retirement_evidence.get(f"object_keys:{ref}", "")},
+            )
+        for ref in state_retirements.get("conflict_ids", []) if isinstance(state_retirements.get("conflict_ids"), list) else []:
+            add_evidenced_state_ref(
+                "conflict_ids",
+                ref,
+                {"evidence_quote": retirement_evidence.get(f"conflict_ids:{ref}", "")},
+            )
+        for ref in state_retirements.get("task_ids", []) if isinstance(state_retirements.get("task_ids"), list) else []:
+            add_evidenced_state_ref(
+                "task_ids",
+                ref,
+                {"evidence_quote": retirement_evidence.get(f"task_ids:{ref}", "")},
+            )
+
     proposed_record_keys = {"characters": set(), "lore": set(), "foreshadows": set()}
     proposed_state_keys = {"conflicts": set(), "tasks": set()}
     proposed_record_updates = payload.get("record_updates", {})
@@ -17301,6 +17553,9 @@ def _validate_long_form_memory_update(
                     bool(str(changes or "").strip())
                     if not isinstance(changes, list)
                     else any(str(value or "").strip() for value in changes)
+                )
+                has_changes = has_changes or bool(
+                    str(item.get("runtime_change", "") or "").strip()
                 )
                 has_identity_patch = bool(
                     kind == "characters"
@@ -19660,6 +19915,17 @@ def _normalize_long_form_reconciliation_patch(project, patch):
         target["state_patch"] = state_payload.get(
             "state_patch", target.get("state_patch", {})
         )
+    if isinstance(target.get("state_retirements"), dict):
+        retirement_payload = _normalize_long_form_state_aliases({
+            "state_retirements": target.get("state_retirements", {}),
+        })
+        target["state_retirements"] = retirement_payload.get(
+            "state_retirements", target.get("state_retirements", {})
+        )
+        if retirement_payload.get("_state_retirement_evidence"):
+            target["_state_retirement_evidence"] = deepcopy(
+                retirement_payload["_state_retirement_evidence"]
+            )
 
     def first_value(item, keys):
         for key in keys:
@@ -19705,7 +19971,7 @@ def _normalize_long_form_reconciliation_patch(project, patch):
                 has_correction = any(
                     str(item.get(key, "") or "").strip()
                     for key in (
-                        "update", "dynamic", "runtime", "runtime_update", "state",
+                        "update", "dynamic", "runtime", "runtime_update", "runtime_change", "state",
                         "current_dynamic", "current_dynamic_append", "change", "progress",
                         "description", "previous", "previous_fact",
                         "previous_conflict", "previous_task", "evidence_quote", "evidence",
@@ -19719,7 +19985,7 @@ def _normalize_long_form_reconciliation_patch(project, patch):
                 update_text = first_value(
                     item,
                     (
-                        "dynamic", "runtime_update", "runtime", "current_dynamic",
+                        "dynamic", "runtime_update", "runtime_change", "runtime", "current_dynamic",
                         "current_dynamic_append", "change", "progress", "update", "description",
                     ),
                 )
@@ -19968,6 +20234,15 @@ def _merge_long_form_memory_reconciliation_patch(memory_update, patch, project=N
                 if value and value not in values:
                     values.append(value)
             current_retirements[key] = values
+    incoming_retirement_evidence = corrections.get("_state_retirement_evidence", {})
+    if isinstance(incoming_retirement_evidence, dict) and incoming_retirement_evidence:
+        merged_retirement_evidence = merged.setdefault("_state_retirement_evidence", {})
+        if not isinstance(merged_retirement_evidence, dict):
+            merged_retirement_evidence = {}
+            merged["_state_retirement_evidence"] = merged_retirement_evidence
+        for key, value in incoming_retirement_evidence.items():
+            if str(value or "").strip():
+                merged_retirement_evidence[str(key)] = str(value).strip()
 
     reconciliation = merged.setdefault("state_reconciliation", {})
     if not isinstance(reconciliation, dict):
@@ -20164,7 +20439,7 @@ def _build_long_form_memory_reconcile_context(
         '{"base_revision":当前修订号,"corrections":{"fact_updates":[],"state_patch":{},'
         '"state_retirements":{},"state_lifecycle_review":{"reviewed_object_keys":[],"reviewed_conflict_refs":[],"reviewed_task_refs":[]},'
         '"record_updates":{"characters":[],"lore":[]},'
-        '"foreshadow_updates":[],"state_reconciliation":{}}}。'
+        '"foreshadow_updates":[],"long_term_events":[],"state_reconciliation":{}}}。'
         "只返回能由最终正文逐字证实、且能修正原增量语义的最小纠错项；没有错误就返回空数组和空对象。"
         "不要返回完整状态，不要重写未出错的更新，不要新建人物/设定/伏笔，不要凭空增加事实。"
         "证据来源有严格分区：evidence_quote只能从【最终正文】逐字连续复制；"
@@ -20182,7 +20457,9 @@ def _build_long_form_memory_reconcile_context(
         "正文只写比喻、感官相似或来源未知时，纠错结果必须删除状态增量自行补出的机制名词、因果、共鸣或能力来源，"
         "改回可观察现象和原确定性；不能因为项目设定中存在某机制就认定本章已经证实。"
         "同时核对long_term_events.storage引用的设定和伏笔是否已经在record_updates/foreshadow_updates同步动态变化；"
-        "若确有变化而原增量漏写，必须在本次最小纠错补丁中补齐。"
+        "若确有变化而原增量漏写，必须在本次最小纠错补丁中补齐；"
+        "凡本次补入或修正的fact、人物、设定、伏笔、物件、冲突、任务引用，必须同步写入"
+        "long_term_events中的storage对应数组，不能只写state_patch或state_retirements。"
     )
     source_sections = [
         ("任务", "只审查第十章边界的状态语义，不审正文文风，不改正文。", 900, False),

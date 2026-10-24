@@ -181,6 +181,8 @@ from .novel_utils import (
     _normalize_name_list,
     _normalize_narrative_strategy_profile,
     _normalize_creative_intent_contract,
+    _normalize_terminal_contract,
+    _merge_terminal_contracts,
     _core_motive_progression_guidance,
     _terminal_window_bounds,
     _procedural_plot_guard_guidance,
@@ -2486,7 +2488,10 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
         if not reference:
             return ""
         reference_hash = hashlib.sha256(reference.encode("utf-8")).hexdigest()
-        return reference_hash if get_style_profile(reference_hash) else ""
+        for profile in load_style_profile_library():
+            if profile.get("reference_hash") == reference_hash:
+                return str(profile.get("id", "") or "").strip().lower()
+        return ""
 
     def _refresh_style_profile_combo(self):
         if not hasattr(self, "style_profile_combo"):
@@ -9155,6 +9160,10 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
 
         foundation = framework.get("chapter_plan_foundation", {})
         foundation = foundation if isinstance(foundation, dict) else {}
+        terminal_contract = _merge_terminal_contracts(
+            foundation.get("terminal_contract", {}),
+            framework.get("terminal_contract", {}),
+        )
         bible = framework.get("bible", {})
         bible = bible if isinstance(bible, dict) else {}
         core_motive = self._chapter_plan_clip_text(
@@ -9196,6 +9205,7 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
                 total_limit=9000,
             ),
             "book_contract": deepcopy(framework.get("book_contract", {})),
+            "terminal_contract": terminal_contract,
             "chapter_plan_note": self._chapter_plan_clip_text(
                 framework.get("chapter_plan_note", ""), 2400
             ),
@@ -9598,6 +9608,13 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
             wizard_framework.get("core_motive", "")
             if isinstance(wizard_framework, dict) else ""
         ).strip()
+        foundation = project.get("chapter_plan_foundation", {})
+        foundation = foundation if isinstance(foundation, dict) else {}
+        terminal_contract = _merge_terminal_contracts(
+            foundation.get("terminal_contract", {}),
+            wizard_framework.get("terminal_contract", {})
+            if isinstance(wizard_framework, dict) else {},
+        )
         if wizard_core_motive and not str(batch_creative_intent_contract.get("core_motive", "") or "").strip():
             batch_creative_intent_contract["core_motive"] = wizard_core_motive
         foreshadow_items = project.get("foreshadow_items", [])
@@ -9640,8 +9657,15 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
                     "core_motive是唯一主线；primary_line、core_mainline和primary_story_engine只是兼容别名或执行说明，"
                     "阶段main_conflict只写本阶段阻碍核心动机的问题，不得另起总目标。"
                 ),
+                "terminal_contract_rule": (
+                    "terminal_contract是本部结果职责，不是固定题材模板。最后5章必须把契约中的核心主线结果、"
+                    "核心冲突结果、主要关系结果、主角最终处境和现实落点安排在已有章节内，并在最后一章写成已经发生且被验证的事实。"
+                    "不能用准备、等待、试验、复测、刚刚接手或下一步行动代替结果；允许保留的只是不会影响本部闭环的背景余波。"
+                    "closure_mode只选择适合本书的即时、短期、远期、镜像或混合方式；若使用时间落点或开头呼应，必须先完成当前结果，再用具体场景证明成果持续存在，不能套统一模板。"
+                ),
             },
             "entity_naming_guidance": _entity_naming_guidance(project),
+            "terminal_contract": terminal_contract,
             "target": {
                 "target_words": int(target_words or 0),
                 "average_chapter_words": int(average_chapter_words or 0),
@@ -9820,6 +9844,20 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
                 "当前节点解决或暂时解决后，必须留下下一道可执行的具体目标、资源缺口、关系选择、"
                 "认知真相或更高代价。不能把章节写成主角不断被动遭遇事情的流水账。\n\n"
             )
+        terminal_contract_guidance = (
+            "terminal_contract是本部收尾的结果职责：收尾窗口内按已有章节位置分别落实契约中的核心主线结果、"
+            "冲突结果、关系结果、主角处境和现实落点；最后一章必须写出已经发生并被验证的结果，"
+            "不能把准备、等待、试验、复测、刚刚接手或下一步行动当作结尾。"
+            "它只约束结果是否落地，不规定题材必须使用哪种场景或表达方式。\n\n"
+            if terminal_batch_overlap and terminal_contract else
+            ""
+        )
+        terminal_title_guidance = (
+            "最后一章的标题也要有收尾语义：优先从已经完成的结果、稳定状态、可信时间落点、开头呼应的地点/物件/动作或关系变化中自然命名；"
+            "不要只写‘大结局’‘尘埃落定’‘新的开始’等空泛词，也不要为了体现完结强行添加固定尾词。标题必须对应本章真正出现的画面或结果，且不能引入新的任务和悬念。\n\n"
+            if terminal_batch_overlap and terminal_contract else
+            ""
+        )
         core_motive_guidance = (
             "【核心动机与收尾窗口】核心动机仍是本项目唯一执行主线；收尾窗口内只把已经安排的目标、阻碍、"
             "代价和关系变化落实为具体结果，不再打开下一道需要后续章节回答的主线目标。\n"
@@ -9871,6 +9909,7 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
             "如果存在cross_volume_continuity，其中的anchors只是上一卷事实参考：用于避免人物关系、生活分工和既有习惯被写反，"
             "不要逐条复述、不要把它们改写成章节任务，也不要在本章规划中强行安排它们。\n\n"
             + terminal_transition_guidance
+            + terminal_contract_guidance
             + core_motive_guidance
             + "\n"
         )
@@ -9905,6 +9944,8 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
                 "创作意图、阶段边界、人物关系和结尾方向已经确认，优先沿用它们；"
                 "宏观节奏只作参考，不新增全书总规划，不提前解释后续阶段。"
                 + terminal_batch_guidance
+                + terminal_contract_guidance
+                + terminal_title_guidance
                 + "entity_naming_guidance 是当前项目的正式称谓和实体关系边界，优先于模型自行压缩出的简称；"
                 "涉及人物集合、组织集合和势力集合时，必须保留实体类型，不要把人数简称写成组织名称。\n"
                 + _story_conflict_pacing_guidance()

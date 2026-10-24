@@ -67,6 +67,8 @@ from gpt_desktop.novel_utils import (
     _merge_long_form_memory_reconciliation_patch,
     _normalize_long_form_reconciliation_patch,
     _normalize_foreshadow_code,
+    _merge_terminal_contracts,
+    _project_terminal_contract,
     _project_terminal_window_bounds,
     _terminal_window_bounds,
     _terminal_window_chapter_info,
@@ -142,6 +144,65 @@ class NovelLongFormContextTests(unittest.TestCase):
         self.assertNotIn("远期回收/转折锚点", terminal_context)
         self.assertIn("结尾不再留下必须依靠后续章节回答的主线问题或悬念", final_context)
         self.assertNotIn("章节结尾优先用具体动作、对白、信息变化或悬念收住", terminal_context)
+
+    def test_terminal_contract_is_included_in_prose_context(self):
+        chapters = [_new_chapter(index) for index in range(5)]
+        for index, chapter in enumerate(chapters, 1):
+            chapter["title"] = f"第{index}章"
+            chapter["outline"] = f"第{index}章完成当前主线的具体结果。"
+        project = self._project_with_current_chapter(chapters[-1])
+        project["chapters"] = chapters
+        project["chapter_plan_foundation"] = {
+            "total_chapter_count": 5,
+            "terminal_contract": {
+                "mainline_result": "小镇恢复供水。",
+                "conflict_result": "灾潮威胁被处理。",
+                "relationship_results": ["搭档决定共同留下。"],
+                "protagonist_final_state": "主角交出指挥权。",
+                "world_final_state": "供水系统稳定运行。",
+                "closure_mode": "long_term_epilogue",
+                "closure_horizon": "三年后",
+                "long_term_result": "小镇重新恢复稳定生活。",
+                "final_image": "孩子们在修好的水渠边打水。",
+                "title_closure_intent": "标题体现水渠已经重新流动。",
+                "forbidden_pending_items": ["未完成的主要任务"],
+            },
+        }
+
+        context = _build_chapter_ai_context(project, 4, "draft")
+
+        self.assertIn("本部终局结果契约", context)
+        self.assertIn("小镇恢复供水", context)
+        self.assertIn("搭档决定共同留下", context)
+        self.assertIn("不能让准备开始、等待确认", context)
+        self.assertIn("远期成果型", context)
+        self.assertIn("三年后", context)
+        self.assertIn("孩子们在修好的水渠边打水", context)
+
+    def test_terminal_contract_merges_newer_fallback_fields(self):
+        legacy = {
+            "mainline_result": "核心结果已经发生。",
+            "conflict_result": "核心冲突已经解决。",
+        }
+        current = {
+            "closure_mode": "mixed",
+            "closure_horizon": "半年后",
+            "final_image": "厂门内外的灯同时亮起。",
+            "time_jump_allowed": True,
+        }
+        merged = _merge_terminal_contracts(legacy, current)
+        self.assertEqual(merged["mainline_result"], "核心结果已经发生。")
+        self.assertEqual(merged["closure_mode"], "mixed")
+        self.assertEqual(merged["closure_horizon"], "半年后")
+        self.assertTrue(merged["time_jump_allowed"])
+
+        project = {
+            "chapter_plan_foundation": {"terminal_contract": legacy},
+            "creation_framework": {"terminal_contract": current},
+        }
+        contract = _project_terminal_contract(project)
+        self.assertEqual(contract["closure_mode"], "mixed")
+        self.assertEqual(contract["final_image"], "厂门内外的灯同时亮起。")
 
     def test_foreshadow_lifecycle_cleanup_removes_standalone_markers_only(self):
         value = (
@@ -2746,8 +2807,9 @@ class NovelLongFormContextTests(unittest.TestCase):
         self.assertIn("段落结构要有变化", context)
         self.assertNotIn("对白要有真人说话的不完整感", context)
         self.assertNotIn("对白不要每句都完整、漂亮、逻辑闭合", context)
-        self.assertIn("场景细节要克制", context)
-        self.assertIn("少量加入具体物件、声音、动作痕迹和环境反馈", context)
+        self.assertIn("场景细节用具体物件、声音、动作痕迹和环境反馈承载冲突、人物状态和信息变化", context)
+        self.assertNotIn("场景细节要克制", context)
+        self.assertNotIn("少量加入具体物件、声音、动作痕迹和环境反馈", context)
         self.assertIn("不要写无意义生活噪声", context)
         self.assertIn("优先让人物在具体环境里做事、被打断、受阻、临时反应", context)
         self.assertIn("完整收束确有必要时可以略微超出", context)

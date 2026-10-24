@@ -66,6 +66,23 @@ _STYLE_PROFILE_LIBRARY_CACHE_LOCK = threading.Lock()
 _STYLE_PROFILE_LIBRARY_CACHE_SIGNATURE = None
 _STYLE_PROFILE_LIBRARY_CACHE = None
 
+# Semantic V4 archives take precedence in the main writing interface.
+_STYLE_PROFILE_V4_SCHEMA = "semantic_voice_v4"
+
+
+def _is_v4_style_profile_record(item):
+    if not isinstance(item, dict):
+        return False
+    cache_entry = item.get("cache_entry", {})
+    if not isinstance(cache_entry, dict):
+        return False
+    return (
+        str(cache_entry.get("style_archive_schema", "") or "").strip()
+        == _STYLE_PROFILE_V4_SCHEMA
+        and str(cache_entry.get("version", "") or "").strip() == "4"
+        and str(cache_entry.get("semantic_archive_version", "") or "").strip() == "4"
+    )
+
 
 def _redact_novel_diagnostic_text(value, limit=4000, strip=True):
     text = str(value or "")
@@ -739,10 +756,24 @@ def load_style_profile_library():
             and isinstance(_STYLE_PROFILE_LIBRARY_CACHE, list)
         ):
             return deepcopy(_STYLE_PROFILE_LIBRARY_CACHE)
-    profiles = {}
+    loaded_profiles = []
     for path in (NOVEL_BUILTIN_STYLE_LIBRARY_FILE, NOVEL_STYLE_LIBRARY_FILE):
         for record in _load_style_profile_library_file(path):
-            profiles[record["id"]] = record
+            loaded_profiles.append(record)
+
+    # A V4 archive supersedes any stale duplicate with the same source sample.
+    v4_by_reference = {
+        item.get("reference_hash"): item
+        for item in loaded_profiles
+        if _is_v4_style_profile_record(item) and item.get("reference_hash")
+    }
+    profiles = {}
+    for record in loaded_profiles:
+        reference_hash = record.get("reference_hash")
+        v4_record = v4_by_reference.get(reference_hash)
+        if v4_record and not _is_v4_style_profile_record(record):
+            continue
+        profiles[record["id"]] = record
     result = sorted(
         profiles.values(),
         key=lambda item: (item.get("name", ""), item.get("id", "")),
@@ -840,12 +871,25 @@ def sync_style_profile_library_from_projects():
         title = str(data.get("meta", {}).get("title", "") or "").strip() if isinstance(data.get("meta"), dict) else ""
         selected_id = str(data.get("style_profile_id", "") or "").strip().lower()
         selected_record = profiles.get(selected_id, {}) if selected_id else {}
+        reference_record = next(
+            (
+                item for item in profiles.values()
+                if item.get("reference_hash") == reference_hash
+            ),
+            {},
+        )
+        # Keep a shipped V4 archive authoritative instead of downgrading it
+        # when a stale duplicate is found during startup.
+        if reference_record and _is_v4_style_profile_record(reference_record) and not _is_v4_style_profile_record({"cache_entry": entry}):
+            continue
+        if reference_record and _is_v4_style_profile_record(reference_record):
+            selected_record = reference_record
         selected_matches_reference = (
             isinstance(selected_record, dict)
             and selected_record.get("reference_hash") == reference_hash
         )
         record = _stored_style_profile_record({
-            "id": selected_id if selected_matches_reference else "",
+            "id": selected_record.get("id", "") if selected_matches_reference else "",
             "name": title,
             "reference_hash": reference_hash,
             "style_reference": reference,

@@ -5,11 +5,13 @@ from unittest.mock import patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
+from PySide6.QtCore import QPoint
 from PySide6.QtWidgets import QApplication, QMessageBox
 
 from gpt_desktop.fanqie_upload import (
     _FanqieBrowserSession,
     FANQIE_LEGACY_ACCOUNT_ID,
+    FANQIE_VISIBLE_BROWSER_ARGS,
     create_fanqie_account,
     get_fanqie_account,
     load_fanqie_accounts,
@@ -179,29 +181,41 @@ class FanqieUploadTests(unittest.TestCase):
                 "updated_at": "2026-10-20 12:00:00",
             }
             save_project_file(path, project)
-            dialog = FanqieBatchUploadDialog(current_project_path=path)
-            try:
-                self.assertEqual(dialog._radio_value(dialog.mode_buttons, "draft"), "scheduled_publish")
-                self.assertEqual(dialog._radio_value(dialog.work_type_buttons, "unknown"), "completed")
-                self.assertEqual(dialog._radio_value(dialog.publish_ai_buttons, "yes"), "no")
-                self.assertEqual(dialog.schedule_date_edit.date().toString("yyyy-MM-dd"), "2026-11-03")
-                self.assertEqual(dialog.schedule_time_edit.time().toString("HH:mm"), "21:15")
-                self.assertEqual(dialog.start_spin.value(), 2)
-                self.assertEqual(dialog.end_spin.value(), 3)
-                self.assertFalse(dialog.headless_check.isChecked())
-                self.assertFalse(dialog.resume_check.isChecked())
-                dialog._on_works_ready([{
-                    "id": "book-2",
-                    "title": "目标作品",
-                    "url": "https://example.test/book-2",
-                    "work_type": "serial",
-                }])
-                self.assertEqual(
-                    dialog._radio_value(dialog.work_type_buttons, "unknown"),
-                    "completed",
-                )
-            finally:
-                dialog.close()
+            accounts_path = os.path.join(tmp, "fanqie_accounts.json")
+            save_fanqie_accounts({
+                "accounts": [{
+                    "id": FANQIE_LEGACY_ACCOUNT_ID,
+                    "label": "测试番茄账号",
+                }],
+                "selected_account_id": FANQIE_LEGACY_ACCOUNT_ID,
+            }, accounts_path)
+            with patch(
+                "gpt_desktop.fanqie_upload.FANQIE_ACCOUNTS_FILE",
+                accounts_path,
+            ):
+                dialog = FanqieBatchUploadDialog(current_project_path=path)
+                try:
+                    self.assertEqual(dialog._radio_value(dialog.mode_buttons, "draft"), "scheduled_publish")
+                    self.assertEqual(dialog._radio_value(dialog.work_type_buttons, "unknown"), "completed")
+                    self.assertEqual(dialog._radio_value(dialog.publish_ai_buttons, "yes"), "no")
+                    self.assertEqual(dialog.schedule_date_edit.date().toString("yyyy-MM-dd"), "2026-11-03")
+                    self.assertEqual(dialog.schedule_time_edit.time().toString("HH:mm"), "21:15")
+                    self.assertEqual(dialog.start_spin.value(), 2)
+                    self.assertEqual(dialog.end_spin.value(), 3)
+                    self.assertFalse(dialog.headless_check.isChecked())
+                    self.assertFalse(dialog.resume_check.isChecked())
+                    dialog._on_works_ready([{
+                        "id": "book-2",
+                        "title": "目标作品",
+                        "url": "https://example.test/book-2",
+                        "work_type": "serial",
+                    }])
+                    self.assertEqual(
+                        dialog._radio_value(dialog.work_type_buttons, "unknown"),
+                        "completed",
+                    )
+                finally:
+                    dialog.close()
 
     def test_dialog_fields_match_width_after_layout(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -265,6 +279,30 @@ class FanqieUploadTests(unittest.TestCase):
                 self.assertLessEqual(
                     dialog.work_combo.width(), dialog.PRIMARY_FIELD_MAX_WIDTH
                 )
+            finally:
+                dialog.close()
+
+    def test_dialog_preview_height_does_not_move_upload_controls(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "测试小说.json")
+            save_project_file(path, self._project())
+            dialog = FanqieBatchUploadDialog(current_project_path=path)
+            try:
+                dialog.show()
+                self._app.processEvents()
+                start_y = dialog.start_spin.mapTo(dialog, QPoint(0, 0)).y()
+                dialog.preview_label.setText("一行提示")
+                self._app.processEvents()
+                one_line_y = dialog.start_spin.mapTo(dialog, QPoint(0, 0)).y()
+                one_line_height = dialog.preview_label.height()
+                dialog.preview_label.setText("一\n二\n三\n四\n五\n六")
+                self._app.processEvents()
+                multi_line_y = dialog.start_spin.mapTo(dialog, QPoint(0, 0)).y()
+
+                self.assertEqual(start_y, one_line_y)
+                self.assertEqual(one_line_y, multi_line_y)
+                self.assertEqual(dialog.preview_label.height(), one_line_height)
+                self.assertIn("六", dialog.preview_label.toolTip())
             finally:
                 dialog.close()
 
@@ -579,6 +617,50 @@ class FanqieUploadTests(unittest.TestCase):
             for message in progress
         ))
         self.assertIn("番茄独立浏览器已启动", progress[-1])
+
+    def test_visible_browser_uses_actual_maximized_viewport(self):
+        class FakeContext:
+            pages = []
+
+            def new_page(self):
+                return object()
+
+            def close(self):
+                pass
+
+        class FakeChromium:
+            def __init__(self):
+                self.calls = []
+
+            def launch_persistent_context(self, **kwargs):
+                self.calls.append(kwargs)
+                return FakeContext()
+
+        class FakePlaywright:
+            def __init__(self):
+                self.chromium = FakeChromium()
+
+            def start(self):
+                return self
+
+            def stop(self):
+                pass
+
+        playwright = FakePlaywright()
+        browser = _FanqieBrowserSession(headless=False)
+        with tempfile.TemporaryDirectory() as tmp, patch(
+            "gpt_desktop.fanqie_upload._load_playwright_sync_api",
+            return_value=lambda: playwright,
+        ), patch(
+            "gpt_desktop.fanqie_upload._browser_executable_path",
+            return_value="/tmp/chrome",
+        ):
+            with browser:
+                pass
+
+        launch = playwright.chromium.calls[0]
+        self.assertIsNone(launch["viewport"])
+        self.assertEqual(launch["args"], list(FANQIE_VISIBLE_BROWSER_ARGS))
 
     def test_draft_save_does_not_fall_back_to_next_step(self):
         browser = object.__new__(_FanqieBrowserSession)

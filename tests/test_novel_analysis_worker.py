@@ -1631,6 +1631,8 @@ class NovelAnalysisWorkerTests(unittest.TestCase):
         self.assertIn("直白准确", prompt)
         self.assertIn("相邻章节不要使用同一语法模板", prompt)
         self.assertIn("previous_titles", prompt)
+        self.assertIn("is_final_chapter=true", prompt)
+        self.assertIn("已经完成的结果、稳定状态、可信时间落点", prompt)
 
     def test_chapter_title_keeps_sentence_comma_inside_title(self):
         worker = NovelChapterTitleWorker(

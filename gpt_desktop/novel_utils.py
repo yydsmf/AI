@@ -1102,6 +1102,130 @@ def _clean_chapter_plan_story_boundary(value):
     return cleaned
 
 
+_TERMINAL_CLOSURE_MODE_ALIASES = {
+    "immediate": "immediate_verified",
+    "immediate_verified": "immediate_verified",
+    "即时": "immediate_verified",
+    "即时结果": "immediate_verified",
+    "即时验证": "immediate_verified",
+    "short_term": "short_term_verified",
+    "short_term_verified": "short_term_verified",
+    "短期": "short_term_verified",
+    "短期验证": "short_term_verified",
+    "long_term": "long_term_epilogue",
+    "long_term_epilogue": "long_term_epilogue",
+    "远期": "long_term_epilogue",
+    "远期成果": "long_term_epilogue",
+    "mirror": "mirror_scene",
+    "mirror_scene": "mirror_scene",
+    "镜像": "mirror_scene",
+    "镜像回响": "mirror_scene",
+    "mixed": "mixed",
+    "hybrid": "mixed",
+    "混合": "mixed",
+    "混合型": "mixed",
+}
+
+
+def _normalize_terminal_closure_plan(value):
+    """Normalize the adaptive ending strategy chosen for the final chapter."""
+    if not isinstance(value, dict):
+        return {}
+    result = {}
+    raw_mode = str(
+        value.get("closure_mode", value.get("mode", "")) or ""
+    ).strip().lower()
+    mode = _TERMINAL_CLOSURE_MODE_ALIASES.get(raw_mode, raw_mode)
+    if mode in {
+        "immediate_verified",
+        "short_term_verified",
+        "long_term_epilogue",
+        "mirror_scene",
+        "mixed",
+    }:
+        result["closure_mode"] = mode
+    for key in (
+        "closure_horizon", "long_term_result", "final_image", "opening_echo",
+        "title_closure_intent",
+    ):
+        text = str(value.get(key, "") or "").strip()
+        if text:
+            result[key] = text
+    raw_jump = value.get("time_jump_allowed")
+    if isinstance(raw_jump, bool):
+        result["time_jump_allowed"] = raw_jump
+    elif raw_jump is not None:
+        jump_text = str(raw_jump).strip().lower()
+        if jump_text in {"true", "1", "yes", "y", "是", "允许"}:
+            result["time_jump_allowed"] = True
+        elif jump_text in {"false", "0", "no", "n", "否", "不允许"}:
+            result["time_jump_allowed"] = False
+    if result:
+        result.setdefault("closure_mode", "short_term_verified")
+    return result
+
+
+def _normalize_terminal_contract(value):
+    """Normalize the result obligations shared by planning and prose stages."""
+    if not isinstance(value, dict):
+        return {}
+    result = {}
+    for key in (
+        "version", "source", "mainline_result", "conflict_result",
+        "protagonist_final_state", "world_final_state", "allowed_epilogue",
+        "last_chapter_landing", "closure_horizon", "long_term_result",
+        "final_image", "opening_echo", "title_closure_intent",
+    ):
+        text = str(value.get(key, "") or "").strip()
+        if text:
+            result[key] = text
+    for key in (
+        "required_results", "relationship_results", "evidence_requirements",
+        "forbidden_pending_items",
+    ):
+        items = _normalize_name_list(value.get(key, []))
+        if items:
+            result[key] = items[:24]
+    roles = []
+    raw_roles = value.get("chapter_roles", [])
+    if isinstance(raw_roles, list):
+        for item in raw_roles[:5]:
+            if not isinstance(item, dict):
+                continue
+            try:
+                position = int(item.get("position", 0) or 0)
+            except (TypeError, ValueError):
+                position = 0
+            role = str(item.get("role", "") or "").strip()
+            result_text = str(item.get("required_result", "") or "").strip()
+            if position <= 0 or not role:
+                continue
+            row = {"position": position, "role": role}
+            if result_text:
+                row["required_result"] = result_text
+            roles.append(row)
+    if roles:
+        roles.sort(key=lambda item: item["position"])
+        result["chapter_roles"] = roles
+    closure_plan = _normalize_terminal_closure_plan(value)
+    for key, child in closure_plan.items():
+        result[key] = child
+    if result:
+        result.setdefault("version", "1")
+    return result
+
+
+def _merge_terminal_contracts(*values):
+    """Fill newer contract fields from fallback copies kept by older projects."""
+    merged = {}
+    for value in values:
+        normalized = _normalize_terminal_contract(value)
+        for key, child in normalized.items():
+            if key not in merged or merged[key] in ("", [], {}):
+                merged[key] = deepcopy(child)
+    return _normalize_terminal_contract(merged)
+
+
 def _normalize_structured_stage_plan(value):
     """Keep the wizard's ordered event graph available to chapter planning."""
     if not isinstance(value, list):
@@ -1141,6 +1265,14 @@ def _normalize_structured_stage_plan(value):
             state = stage.get(key, {})
             if isinstance(state, dict):
                 row[key] = deepcopy(state)
+        closure_plan = _normalize_terminal_closure_plan(
+            stage.get("closure_plan", stage.get("terminal_closure_plan", {}))
+        )
+        if closure_plan:
+            row["closure_plan"] = closure_plan
+        terminal_contract = _normalize_terminal_contract(stage.get("terminal_contract", {}))
+        if terminal_contract:
+            row["terminal_contract"] = terminal_contract
         events = []
         for event in stage.get("ordered_events", []) if isinstance(stage.get("ordered_events"), list) else []:
             if not isinstance(event, dict):
@@ -1159,6 +1291,15 @@ def _normalize_structured_stage_plan(value):
             delta = event.get("state_delta", {})
             if isinstance(delta, dict):
                 event_row["state_delta"] = deepcopy(delta)
+            for key in ("terminal_role", "closure_evidence", "pending_items"):
+                if key == "pending_items":
+                    values = _normalize_name_list(event.get(key, []))
+                    if values:
+                        event_row[key] = values[:12]
+                    continue
+                text = str(event.get(key, "") or "").strip()
+                if text:
+                    event_row[key] = text
             event_row = {
                 key: child for key, child in event_row.items()
                 if child not in ("", [], {})
@@ -1217,6 +1358,9 @@ def _normalize_chapter_plan_foundation(value):
     contract = _normalize_creative_intent_contract(value.get("creative_intent_contract", {}))
     if contract:
         result["creative_intent_contract"] = contract
+    terminal_contract = _normalize_terminal_contract(value.get("terminal_contract", {}))
+    if terminal_contract:
+        result["terminal_contract"] = terminal_contract
     book_contract = value.get("book_contract", {})
     if isinstance(book_contract, dict):
         normalized_contract = {}
@@ -4910,6 +5054,22 @@ def _project_terminal_window_bounds(project, window_size=TERMINAL_WINDOW_CHAPTER
     return _terminal_window_bounds(total, window_size)
 
 
+def _project_terminal_contract(project):
+    """Read the saved terminal result contract from either current project shape."""
+    project = project if isinstance(project, dict) else {}
+    candidates = []
+    foundation = project.get("chapter_plan_foundation", {})
+    if isinstance(foundation, dict):
+        candidates.append(foundation.get("terminal_contract", {}))
+    framework = project.get("creation_framework", {})
+    if isinstance(framework, dict):
+        candidates.append(framework.get("terminal_contract", {}))
+        nested = framework.get("chapter_plan_foundation", {})
+        if isinstance(nested, dict):
+            candidates.append(nested.get("terminal_contract", {}))
+    return _merge_terminal_contracts(*candidates)
+
+
 def _terminal_window_chapter_info(project, chapter_index):
     """Return 1-based window information for a zero-based chapter index."""
     bounds = _project_terminal_window_bounds(project)
@@ -4952,7 +5112,7 @@ def _terminal_window_ending_guidance(info, final=False):
         text += (
             "这是全书最后一章。核心动机、核心矛盾、主要关系和主角本部最终处境必须在本章形成清楚的实际结果；"
             "结尾不再留下必须依靠后续章节回答的主线问题或悬念。"
-            "最后落在具体动作、对白、关系结果或已经成立的生活状态上，不用作者总结、突然多年后概括、‘未完待续’或单独的‘全文完’代替结尾。"
+            "最后落在具体动作、对白、关系结果或已经成立的生活状态上；如果终局契约允许时间跳跃，只能用一个有时间标记、有具体人物和可观察成果的场景来验证结果，不能用空泛的多年后概括、‘未完待续’或单独的‘全文完’代替结尾。"
         )
     return text
 
@@ -4963,9 +5123,93 @@ def _final_chapter_ending_guidance():
         "当前章节是全书最后一章，也要让读者把这一部当成一个完整结局来读。正文要在具体场景里完成核心矛盾的最终选择和结果，"
         "让主要人物的关系、读者一直跟随的核心承诺、能够自然落地的关键线索和主角本部目标都有清楚结果。"
         "即使故事保留续作可能，也只能保留不影响本部结局的背景余波；不能留下必须依靠后续章节解决的主线任务、重大反转、重要人物、新的世界规则或等待回答的悬念。"
-        "最后的收束落在人物的动作、对白、关系结果或生活状态上，不用突然跳过多年的概括、作者总结、抽象结论、‘未完待续’或单独的‘全文完’代替结尾。"
+        "最后的收束落在人物的动作、对白、关系结果或生活状态上；若契约选择了短期、远期或镜像收尾，可以把时间落点或开头呼应写成具体场景，但不能用突然跳过多年的概括、作者总结、抽象结论、‘未完待续’或单独的‘全文完’代替结尾。"
         "不要为了回收而硬塞与本章无关的伏笔；只处理能从当前冲突和人物选择自然落地的线索，其余已经不再影响主线的内容，用清楚的结果或状态自然关上。"
     )
+
+
+def _terminal_contract_guidance(contract, info):
+    """Turn a result contract into short, semantic prose-writing guidance."""
+    contract = _normalize_terminal_contract(contract)
+    info = info if isinstance(info, dict) else {}
+    if not contract or not info:
+        return ""
+    chapter_number = int(info.get("chapter_number", 0) or 0)
+    start = int(info.get("start_chapter", 0) or 0)
+    end = int(info.get("end_chapter", 0) or 0)
+    position = max(1, chapter_number - start + 1)
+    lines = [
+        f"【本部终局结果契约｜收尾窗口第{position}/5章】",
+        "下面是本部必须落地的结果，不是固定场景模板；请按当前题材、人物和本章提纲自然呈现。",
+    ]
+    labels = (
+        ("核心主线结果", "mainline_result"),
+        ("核心冲突结果", "conflict_result"),
+        ("主角最终处境", "protagonist_final_state"),
+        ("世界/生活落点", "world_final_state"),
+    )
+    for label, key in labels:
+        text = contract.get(key, "")
+        if text:
+            lines.append(f"{label}：{text}")
+    for label, key in (
+        ("主要关系结果", "relationship_results"),
+        ("必须看见的结果", "required_results"),
+        ("结果验证方式", "evidence_requirements"),
+    ):
+        values = contract.get(key, [])
+        if values:
+            lines.append(f"{label}：" + "；".join(values))
+    closure_mode = contract.get("closure_mode", "short_term_verified")
+    time_jump_allowed = contract.get("time_jump_allowed")
+    closure_labels = {
+        "immediate_verified": "即时结果型",
+        "short_term_verified": "短期验证型",
+        "long_term_epilogue": "远期成果型",
+        "mirror_scene": "镜像回响型",
+        "mixed": "混合型",
+    }
+    lines.append(f"终局收尾方式：{closure_labels.get(closure_mode, closure_mode)}")
+    for label, key in (
+        ("时间落点", "closure_horizon"),
+        ("远期成果", "long_term_result"),
+        ("最终画面", "final_image"),
+        ("开头呼应", "opening_echo"),
+        ("终章标题意图", "title_closure_intent"),
+    ):
+        text = contract.get(key, "")
+        if text:
+            lines.append(f"{label}：{text}")
+    if position == 5 or info.get("is_final"):
+        lines.append(
+            "本章必须把契约中的本部结果写成已经发生、被人物或环境验证的事实；"
+            "不能让准备开始、等待确认、试车复测、刚刚接手、下一趟再做等未完成动作成为最后落点。"
+        )
+        lines.append(
+            "最后只允许保留不影响本部闭环的背景余波；不得留下需要下一部回答的核心任务、重大对手或关键关系问题。"
+        )
+        if (
+            closure_mode in {"short_term_verified", "long_term_epilogue", "mixed"}
+            and time_jump_allowed is not False
+        ):
+            lines.append(
+                "时间落点只能用于证明已经完成的结果持续存在：先让当前冲突和核心动机结果成立，再在时间落点后的具体人物场景中展示成果；"
+                "不能把时间跳跃写成新一轮剧情，也不能只用旁白概括‘一切变好了’。"
+            )
+        elif closure_mode == "mirror_scene":
+            lines.append(
+                "镜像收尾必须回到契约指定的开头地点、物件、动作或关系场景，并让人物状态产生清楚变化；"
+                "不能只重复开头画面而没有结果证明。"
+            )
+    else:
+        lines.append(
+            f"本章只完成收尾窗口中的直接变化，并为第{chapter_number + 1}章留下已安排的可验证后果；"
+            f"不能跳出第{start}-{end}章窗口另开主线。"
+        )
+    forbidden = contract.get("forbidden_pending_items", [])
+    if forbidden:
+        lines.append("不要把以下类型的未完成事项作为结尾替代结果：" + "；".join(forbidden))
+    return "\n".join(lines)
 
 
 def _project_list_text(data, fallback_title="未命名小说"):
@@ -10303,8 +10547,35 @@ def _prose_scene_grounding_guidance(compact=False):
     )
 
 
-def _grounded_prose_contract():
+def _style_voice_priority_guidance():
+    """Give a loaded style archive priority over generic prose defaults."""
+    return (
+        "【仿写优先级｜已加载文风档案】\n"
+        "在不改变当前项目事实、人物身份、剧情顺序和事件结果的前提下，完整文风正文样本是正文表达的最高标准。"
+        "正文表达优先顺序是：当前项目事实与人物身份，其次是完整样本中真实出现的"
+        "叙述声纹、对白声纹、习惯词、语气词、连接词、停顿和句式，最后才是通用自然表达。"
+        "通用表达只负责保证事实准确、人物归属和语境自然，不得把样本中真实反复出现的文风特征主动抹平。"
+        "如果上下文另有作者原生用词池或声纹卡，也与完整样本共同作为证据；没有这些分区时，直接从完整样本提取。"
+        "争执、惊讶、委屈、紧张、暧昧、得意、恐惧或失控等情绪明显的场景，优先调用完整样本中"
+        "适合当前人物的语气词、习惯短语、称呼、反问、停顿、重复、改口和接话方式；情绪平稳时也不要因此改成脱离样本的普通书面句。"
+        "同一处自然对白或叙述可以同时体现多个匹配的文风特征；但不能把不属于人物、"
+        "语境或样本使用层级的词硬塞，不能为了展示文风新增对白、剧情或重复口头禅。"
+        "通用语言约束与文风样本发生冲突时，只保留会影响事实、人物归属、内部字段泄露或明显重复的修正，其余以文风样本为准。\n"
+    )
+
+
+def _grounded_prose_contract(style_active=False):
     """Keep generated prose direct, concrete, and story-focused."""
+    emotion_guidance = (
+        _style_voice_priority_guidance()
+        if style_active else
+        (
+            "【自然语气与情绪】\n"
+            "情绪明确时，不要把人物台词全部改成平直的完整陈述句；可以按人物、关系和现场自然使用语气词、"
+            "口语接话、停顿、改口、称呼变化、反问或短句。语气词、动作、心理、对白内容和现场结果共同完成情绪表达，"
+            "不能用语气词替代人物反应。\n"
+        )
+    )
     return (
         "【正文语言要求】\n"
         "正文必须使用自然的网络小说叙述语言，直接写人物、场景、动作、对白和具体变化；"
@@ -10319,7 +10590,10 @@ def _grounded_prose_contract():
         + "【对白自然衔接】\n"
         "对白要像人物当面说话。人物回答时，按当下的关系和语境自然接住对方；需要说明来由、指代或态度时，把意思说清楚，让前一句与下一句接得上。"
         "人物可以顺着对方的话解释、补充、反问、改口、调侃、试探、施压、让步或转开话题，这些表达由人物目的、关系和现场情绪决定。"
-        "句式长短、语气词、称呼变化和说话后的动作随人物身份、关系和情绪自然变化，不要机械添加语气词，也不要让所有人物采用同一种接话方式。"
+        "句式长短、语气词、称呼变化和说话后的动作随人物身份、关系和情绪自然变化；"
+        "没有文风档案时，也要让语气词、停顿和接话方式从人物、关系和现场情绪中自然长出；"
+        "已加载文风档案时，应优先沿用档案中适合当前人物和场景的表达，不要主动抹平；"
+        "也不要让所有人物采用同一种接话方式。"
         "对白要推动关系、现场压力或人物行动继续变化，不让角色互相解释已经知道的事。\n"
         "人物受到冲突、误解、意外、吸引或关系变化影响时，要写出会改变下一步行为的当下念头、判断或身体感受；"
         "心理、动作和对白可以按场景需要交错、穿插或由其中一种承担推进，具体比例随人物、情绪和文风自然变化，不要求固定交替顺序。"
@@ -10328,7 +10602,8 @@ def _grounded_prose_contract():
         "人物反感眼前的说法或安排时，直接落到具体对象、场面和自己是否配合上；允许用人物自己的口语吐槽或拒绝，"
         "不要把具体冲突写成抽象的权利、资格、归属、责任或关系宣言，也不要反复套用‘事实+反转总结’的口号式句型；"
         "正文尽量少用‘决定’‘选择’‘不代表’等抽象词，除非剧情确实离不开，优先写具体的人、物、动作、反应和结果。\n"
-        "【具体状态词搭配】\n"
+        + emotion_guidance
+        + "【具体状态词搭配】\n"
         "涉及气血、真气、灵力、内力、经脉、伤势、药剂等身体或力量状态时，先判断实际变化是稳定、恢复、运转、凝聚、消耗、紊乱、受损还是不足，使用与该状态匹配的动词和形容词；"
         "不要把‘完整、正确、成立、合理’等适合结论、资料或关系的抽象词直接套在气血、伤势或力量上。"
         "对白中的反驳必须回应对方眼前的动作或主张，写出具体后果；例如对方说‘不用药剂’，应落到‘没有药剂辅助，气血稳不住、冲关时会乱或身体扛不住’这类现场结果，"
@@ -10336,7 +10611,7 @@ def _grounded_prose_contract():
     )
 
 
-def _natural_expression_guidance():
+def _natural_expression_guidance(style_active=False):
     """Keep prose direct while separating story facts from style imitation."""
     return (
         "【正文语言要求】正文必须使用自然的网络小说叙述语言，直接写人物、场景、动作、对白和具体变化；"
@@ -10344,7 +10619,13 @@ def _natural_expression_guidance():
         "情绪和气氛必须通过人物当下的动作、对白、心理和具体结果表现，不用漂亮形容替代剧情。"
         + _prose_scene_grounding_guidance(compact=True)
         + "对白按关系和现场情绪自然接话，心理变化随人物自然展开。"
-        "涉及气血、真气、灵力、内力、经脉、伤势、药剂等状态时，先核对变化，用稳定、恢复、运转、凝聚、消耗、紊乱、受损或不足等匹配表达；"
+        + (
+            _style_voice_priority_guidance()
+            if style_active else
+            "情绪明确时，不要把对白全压成平直陈述句；可以按人物和语境使用语气词、口语接话、停顿、改口、称呼变化或短句。"
+            "语气词、动作、身体反应、心理判断和现场后果共同完成情绪表达。"
+        )
+        + "涉及气血、真气、灵力、内力、经脉、伤势、药剂等状态时，先核对变化，用稳定、恢复、运转、凝聚、消耗、紊乱、受损或不足等匹配表达；"
         "不要把‘完整、正确、成立、合理’直接套上去；例如‘没有药剂辅助，气血稳不住’自然，‘气血变得完整’不自然。"
         "对白回应眼前主张和后果，不把‘嘴硬’与抽象结论拼成金句。"
         "项目资料决定故事事实、人物和剧情；文风参考只决定表达方式，不把参考原文的人物、剧情、物件或句子带入当前正文。"
@@ -10370,8 +10651,8 @@ def _build_full_style_imitation_guidance(style_reference):
         "轻松、尴尬、紧张、难过、关系拉扯和情节推进都可以从完整样本里寻找相应的写法，让当前人物按照自己的身份、"
         "关系与处境自然说话、行动和感受。样本的特色词、口头习惯、接话方式和叙述温度随着人物和场景自然出现，"
         "形成一篇属于当前故事、同时读起来像同一位作者写出的正文。\n"
-        + _natural_expression_guidance()
-        + "不得把参考原文的人物、剧情、物件或句子带入当前正文。"
+        "不得把参考原文的人物、剧情、物件或句子带入当前正文。\n"
+        + _natural_expression_guidance(style_active=True)
     )
 
 
@@ -10425,7 +10706,7 @@ def _build_style_execution_context(
         f"输出必须严格使用{NOVEL_PROSE_START_MARKER}和{NOVEL_PROSE_END_MARKER}包住正文；"
         "包络外不输出任何说明，包络内不写‘我会’‘接下来’‘本章将’等规划、分析或执行稿内容，"
         "只写可以直接进入小说的正文。\n"
-        + _grounded_prose_contract()
+        + _grounded_prose_contract(style_active=bool(reference))
     )
     budget = max(0, effective_limit - len(instruction) - 2)
     if len(original) > budget:
@@ -11362,7 +11643,7 @@ def _build_style_finalize_context(
     ]
     trailing_blocks = [
         instruction,
-        "【自然表达边界】\n" + _natural_expression_guidance(),
+        "【自然表达边界】\n" + _natural_expression_guidance(style_active=bool(style_reference)),
     ]
     index_text = str(memory_selection_index or "").strip() if include_memory else ""
     if index_text:
@@ -22376,6 +22657,7 @@ def _apply_long_form_memory_update(project, chapter_index, update, final_text=""
 
 
 def _build_chapter_ai_context(project, chapter_index, action):
+    terminal_contract = _project_terminal_contract(project)
     project = _project_without_private_notes(project)
     _ensure_foreshadow_codes(project)
     chapters = project.get("chapters", [])
@@ -22731,8 +23013,16 @@ def _build_chapter_ai_context(project, chapter_index, action):
         )
         if terminal_window_info else ""
     )
+    terminal_contract_guidance = _terminal_contract_guidance(
+        terminal_contract,
+        terminal_window_info,
+    )
     chapter_ending_guidance = "\n\n".join(
-        item for item in (terminal_window_guidance, final_chapter_guidance) if item
+        item for item in (
+            terminal_window_guidance,
+            terminal_contract_guidance,
+            final_chapter_guidance,
+        ) if item
     )
     ordinary_ending_text = "章节结尾优先用具体动作、对白、信息变化或悬念收住。"
     terminal_ending_text = (
@@ -22772,7 +23062,7 @@ def _build_chapter_ai_context(project, chapter_index, action):
         "心理描写贴着人物当下的动作、对白、反应和感受展开；需要时写出人物的判断、犹豫、后悔或心动，让心理变化推动下一步。"
         + terminal_ending_text +
         "段落结构要有变化，不要连续使用“动作描写 + 心理解释 + 氛围总结”的固定结构。"
-        "场景细节要克制：只在能强化冲突、人物状态或信息变化时，少量加入具体物件、声音、动作痕迹和环境反馈。"
+        "场景细节用具体物件、声音、动作痕迹和环境反馈承载冲突、人物状态和信息变化，让细节与人物行动、情绪和现场结果相互照应。"
         "不要写无意义生活噪声，不要让细节拖慢剧情。"
         "写每一场时优先让人物在具体环境里做事、被打断、受阻、临时反应，不要只用旁白解释情绪和局势。"
         "参考【本章写作长度】安排详略，但不要为了贴字数牺牲完整场景、冲突收束和正文质量；只输出正文内容。"
@@ -22799,7 +23089,7 @@ def _build_chapter_ai_context(project, chapter_index, action):
         "心理描写贴着人物当下的动作、对白、反应和感受展开；需要时写出人物的判断、犹豫、后悔或心动，让心理变化推动下一步。"
         + terminal_ending_text +
         "段落结构要有变化，不要连续使用“动作描写 + 心理解释 + 氛围总结”的固定结构。"
-        "场景细节要克制：只在能强化冲突、人物状态或信息变化时，少量加入具体物件、声音、动作痕迹和环境反馈。"
+        "场景细节用具体物件、声音、动作痕迹和环境反馈承载冲突、人物状态和信息变化，让细节与人物行动、情绪和现场结果相互照应。"
         "不要写无意义生活噪声，不要让细节拖慢剧情。"
         "写每一场时优先让人物在具体环境里做事、被打断、受阻、临时反应，不要只用旁白解释情绪和局势。"
         "参考【本章写作长度】安排详略，但不要为了贴字数牺牲完整场景、冲突收束和正文质量；只输出正文内容。"
@@ -22818,7 +23108,7 @@ def _build_chapter_ai_context(project, chapter_index, action):
             "参考【本章写作长度】安排内容总量，输出可直接进入小说的正文。"
         )
     draft_task += no_text_count_rule
-    draft_task += _grounded_prose_contract()
+    draft_task += _grounded_prose_contract(style_active=bool(style_reference))
     task_map = {
         "outline": (
             "请为当前章节生成章节提纲。当前章节已有正文草稿时，必须以正文草稿为唯一事实来源，"
@@ -23130,7 +23420,7 @@ def _build_chapter_ai_context(project, chapter_index, action):
         # when the style-finalize pass is intentionally skipped.
         style_sections.append((
             "正文自然表达边界",
-            _natural_expression_guidance(),
+            _natural_expression_guidance(style_active=bool(style_reference)),
             800,
             False,
         ))

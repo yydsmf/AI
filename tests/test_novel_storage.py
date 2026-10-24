@@ -469,16 +469,21 @@ class NovelStorageTests(unittest.TestCase):
                 profiles = novel_storage.load_style_profile_library()
                 by_name = {item.get("name"): item for item in profiles}
 
-                self.assertIn("男频、穿越、都市高武", by_name)
-                self.assertIn("女频、穿越现代言情、沙雕搞笑", by_name)
+                self.assertEqual(len(profiles), 2)
+                self.assertIn("男频、穿越、都市高武 V4", by_name)
+                self.assertIn("女频、穿越现代言情、沙雕搞笑 V4", by_name)
                 for item in by_name.values():
                     if item.get("name") not in {
-                        "男频、穿越、都市高武",
-                        "女频、穿越现代言情、沙雕搞笑",
+                        "男频、穿越、都市高武 V4",
+                        "女频、穿越现代言情、沙雕搞笑 V4",
                     }:
                         continue
                     self.assertGreater(len(item.get("style_reference", "")), 20000)
                     self.assertEqual(item.get("cache_entry", {}).get("status"), "complete")
+                    self.assertEqual(
+                        item.get("cache_entry", {}).get("style_archive_schema"),
+                        "semantic_voice_v4",
+                    )
             finally:
                 novel_storage.NOVEL_STYLE_LIBRARY_FILE = old_library
 

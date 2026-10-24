@@ -17,7 +17,7 @@ from datetime import datetime
 from html import unescape
 from urllib.parse import parse_qs, urlsplit
 
-from PySide6.QtCore import QDate, QTime, QThread, Signal
+from PySide6.QtCore import QDate, QTime, QThread, Qt, Signal
 from PySide6.QtWidgets import (
     QButtonGroup,
     QCheckBox,
@@ -63,6 +63,10 @@ FANQIE_WORK_TYPES = {"unknown", "serial", "completed"}
 FANQIE_BROWSER_LAUNCH_TIMEOUT_MS = 30000
 FANQIE_BROWSER_PROFILE_LOCK_TIMEOUT_SECONDS = 45
 FANQIE_BROWSER_LAUNCH_RETRIES = 2
+# Visible manual browsers must follow the real desktop viewport.  A fixed
+# 900px viewport can extend below the macOS menu bar/Dock and hide modal
+# actions such as the cover-upload confirmation button.
+FANQIE_VISIBLE_BROWSER_ARGS = ("--start-maximized",)
 # The first editor-ready check is immediate; this interval only controls
 # retries while the platform is still asynchronously rendering the body.
 FANQIE_EDITOR_SYNC_POLL_MS = 500
@@ -90,6 +94,15 @@ _PROJECT_WRITE_LOCK = threading.RLock()
 _BROWSER_PROFILE_LOCK = threading.Lock()
 _MANUAL_BROWSER_WORKERS = {}
 _MANUAL_BROWSER_WORKERS_LOCK = threading.RLock()
+
+
+class _FanqiePreviewLabel(QLabel):
+    """Keep the upload dialog status slot stable while retaining full details."""
+
+    def setText(self, text):
+        value = str(text or "")
+        super().setText(value)
+        self.setToolTip(value)
 
 
 def stop_fanqie_manual_browser_workers():
@@ -664,8 +677,15 @@ class _FanqieBrowserSession:
         launch_kwargs = {
             "user_data_dir": self.profile_dir,
             "headless": self.headless,
-            "viewport": {"width": 1440, "height": 900},
         }
+        if self.headless:
+            # Keep the stable viewport used by the automated upload flow.
+            launch_kwargs["viewport"] = {"width": 1440, "height": 900}
+        else:
+            # Let Chromium report the actual usable window size so responsive
+            # dialogs can lay out and scroll within the visible screen.
+            launch_kwargs["viewport"] = None
+            launch_kwargs["args"] = list(FANQIE_VISIBLE_BROWSER_ARGS)
         executable = _browser_executable_path()
         if not executable:
             self.close()
@@ -2679,9 +2699,14 @@ class FanqieBatchUploadDialog(QDialog):
         form.addRow("任务选项", options)
         root.addLayout(form)
 
-        self.preview_label = QLabel()
+        self.preview_label = _FanqiePreviewLabel()
         self.preview_label.setWordWrap(True)
         self.preview_label.setObjectName("hint")
+        self.preview_label.setAlignment(Qt.AlignTop | Qt.AlignLeft)
+        self.preview_label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        self.preview_label.setFixedHeight(
+            self.preview_label.fontMetrics().lineSpacing() * 3 + 4
+        )
         root.addWidget(self.preview_label)
 
         buttons = QDialogButtonBox()

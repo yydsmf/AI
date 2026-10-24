@@ -113,9 +113,11 @@ _FINAL_CHAPTER_PLAN_GUIDANCE = (
     "最后一章要在具体场景里完成核心矛盾的最终选择和结果，让主要人物的关系、读者一直跟随的核心承诺、"
     "能够自然落地的关键线索和主角最终处境都有清楚的结果。需要保留余味的内容，要写成已经成立的结局状态，"
     "不要留下必须靠后续章节才能解决的主线任务、重大反转、重要人物、新的世界规则或等待回答的悬念。"
-    "最后一章的outline末尾要写实际发生的收束动作、关系结果或生活落点，不写作者总结、概念性结论、"
-    "突然跳过过程的多年后概括、‘未完待续’或单独的‘全文完’。倒数第二章可以把冲突推到临界点，"
-    "但不要提前讲完最后一章才应发生的结果。\n"
+    "最后一章的outline末尾要写实际发生的收束动作、关系结果或生活落点；如果terminal_contract指定了短期、远期或镜像收尾，"
+    "可以写可信时间落点后的具体成果场景或开头呼应场景，但不能用突然跳过过程的多年后概括、‘未完待续’或单独的‘全文完’。倒数第二章可以把冲突推到临界点，"
+    "但不要提前讲完最后一章才应发生的结果。"
+    "如果输入包含terminal_contract，必须把其中的核心主线结果、冲突结果、关系结果和主角最终处境安排进已有章节；"
+    "最后一章只能写已经发生并被验证的结果，不能用准备、等待、试验、复测、刚刚接手或下一步行动代替结尾；标题要从已完成结果、稳定状态、时间落点或开头呼应中自然命名，不要只写‘大结局’。\n"
 )
 
 
@@ -128,6 +130,7 @@ def _terminal_window_plan_guidance(start, end, overlap_start, overlap_end):
         "收尾窗口内不再开启新的主要任务、主要敌人、组织、力量体系、世界规则或下一卷主线；"
         "不把新的未解释信息、未知对手、未知目的地或未来承诺写成等待后续章节回答的悬念。"
         "章节结尾只留下下一章已经安排的直接承接，不使用新的连载钩子。"
+        "如果输入包含terminal_contract，收尾事件要按契约完成结果，而不是把未完成的现实动作顺延到窗口外。"
     )
 
 
@@ -4994,6 +4997,8 @@ class NovelChapterTitleWorker(NovelAnalysisWorker):
             "相邻章节不要使用同一语法模板、同一尾词或同一意象；如果正文适合直白标题，就优先直白准确。\n"
             "如果用户内容提供了 previous_titles，请避免与这些标题同词、同结构、同节奏，尤其不要让跨批次相邻标题像同一模板改词。\n"
             "title 字段只写标题正文，不要带“第几章”和序号。\n"
+            "输入章节中如果 is_final_chapter=true，这是全书最后一章：标题必须从已经完成的结果、稳定状态、可信时间落点、开头呼应的地点/物件/动作或关系变化中自然命名，让读者能感到故事已经收束；"
+            "不要只写“大结局”“终章”“尘埃落定”“新的开始”等空泛词，也不要用标题制造新的任务、未知对手或悬念。\n"
             '输出结构：{"titles":[{"index":1,"title":"会议室里的选择"}]}\n'
             "titles 数量必须与输入章节数量完全一致，index 必须与输入一致。"
         )
@@ -5017,6 +5022,7 @@ class NovelChapterTitleWorker(NovelAnalysisWorker):
                 "index": index,
                 "current_title": str(chap.get("title", "") or f"第 {index} 章").strip(),
                 "excerpt": self._chapter_excerpt(text),
+                "is_final_chapter": index == len(self.chapters),
             }
             items.append(item)
         batches = []
@@ -5051,6 +5057,7 @@ class NovelChapterTitleWorker(NovelAnalysisWorker):
                 "优先让标题来自本章正文独有内容，不要套固定标题模板。",
                 "相邻标题不要使用同一结构、同一尾词、同一意象或同一语气。",
                 "不要为了统一风格把每章都写成押韵、对仗、同字数或同款文学化标题。",
+                "如果某章标记为 is_final_chapter，优先使用能看见结果落地、时间成果、镜像场景或稳定生活状态的标题语义。",
             ],
             "待命名章节": batch,
         }
@@ -5587,6 +5594,7 @@ class NovelWritingWorker(QThread):
         if self.action not in fiction_actions | outline_actions | summary_actions | adaptation_actions:
             return ""
         terminal_window = "【全书最后5章收尾窗口" in self.context
+        terminal_contract = "【本部终局结果契约" in self.context
         final_chapter = "这是全书最后一章" in self.context
 
         common = (
@@ -5605,13 +5613,23 @@ class NovelWritingWorker(QThread):
             ending_sentence = (
                 "收尾窗口正文结尾必须落在本章已经发生的具体动作、对白、信息结果或关系状态上；"
                 "不得为了留下追读张力新增任务、未知对手、远方召唤或等待后续回答的悬念。"
+                + (
+                    "本章还必须服从本部终局结果契约：把契约要求的结果写成已经发生并被验证的事实；"
+                    "若契约指定了短期、远期或镜像收尾，先完成当前结果，再用具体场景展示成果持续存在或人物状态已经改变；"
+                    "不要让准备、等待、试验、复测或刚刚接手成为收尾替代品。"
+                    if terminal_contract else ""
+                )
                 if terminal_window else
                 "结尾要来自冲突本身，留下继续读下去的张力。"
             )
             if final_chapter:
                 ending_sentence = (
-                    "最后一章正文必须让核心矛盾、主要关系和主角最终处境形成清楚的实际结果；"
-                    "结尾落在具体动作、对白、关系结果或已经成立的生活状态上，不留下必须由后续章节回答的主线悬念。"
+                        "最后一章正文必须让核心矛盾、主要关系和主角最终处境形成清楚的实际结果；"
+                    "结尾落在具体动作、对白、关系结果或已经成立的生活状态上；若契约允许时间落点或镜像场景，必须把它写成有具体人物和可观察成果的场景，不留下必须由后续章节回答的主线悬念。"
+                    + (
+                        "本部终局结果契约中的要求必须在本章得到现场验证；不把未完成任务顺延到下一部。"
+                        if terminal_contract else ""
+                    )
                 )
             return common + _grounded_prose_contract() + (
                 "\n正文写作要求：让人物的欲望、阻力、行动和后果自然形成推进与情绪变化；"

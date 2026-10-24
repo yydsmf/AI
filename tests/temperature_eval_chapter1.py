@@ -70,7 +70,7 @@ def load_provider() -> tuple[str, str, str]:
 def load_male_style_archive() -> dict[str, Any]:
     defaults = json.loads(STYLE_LIBRARY.read_text(encoding="utf-8"))
     default = next(
-        (item for item in defaults.get("profiles", []) if item.get("name") == "男频、穿越、都市高武"),
+        (item for item in defaults.get("profiles", []) if item.get("name") == "男频、穿越、都市高武 V4"),
         None,
     )
     history = json.loads(STYLE_HISTORY.read_text(encoding="utf-8"))

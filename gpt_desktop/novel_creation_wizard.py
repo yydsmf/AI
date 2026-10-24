@@ -31,6 +31,8 @@ from .novel_utils import (
     _core_motive_progression_guidance,
     _entity_naming_guidance,
     _normalize_foreshadow_code,
+    _normalize_terminal_closure_plan,
+    _normalize_terminal_contract,
     _procedural_plot_guard_guidance,
     _terminal_window_bounds,
 )
@@ -431,8 +433,9 @@ STEP_PROMPTS = {
 
 STAGE_PLAN_OBJECT_OUTPUT_RULES = """
 这次使用对象协议，阶段和事件按字段名归位；只返回一个合法 JSON 对象。
-短键含义如下：k=全书底盘契约（其中的核心动机是唯一执行主线），s=当前阶段对象，f=当前阶段实际发生的伏笔端点。阶段对象中 i=阶段编号，n=阶段名称，r=章节范围，b=开始状态，e=按顺序发生的场景事件对象数组，x=结束状态，y=带入下一阶段的事实。状态对象中 t=时间，l=地点，c=人物状态，k=已经发生并被人物掌握的事实，q=仍会推动人物行动的问题。事件对象中 i=事件编号，r=允许章节范围，a=关联资料，p=前置条件，h=可直接扩写的场景事件，o=直接结果，d=实际状态变化。伏笔端点对象中 i=伏笔编号，k=setup或payoff，e=承载这个端点的事件编号，d=这一次在场景中发生的具体变化；一次只写一个端点。
+短键含义如下：k=全书底盘契约（其中的核心动机是唯一执行主线），s=当前阶段对象，f=当前阶段实际发生的伏笔端点。阶段对象中 i=阶段编号，n=阶段名称，r=章节范围，b=开始状态，e=按顺序发生的场景事件对象数组，x=结束状态，y=带入下一阶段的事实，m=可选的终局收尾方案。状态对象中 t=时间，l=地点，c=人物状态，k=已经发生并被人物掌握的事实，q=仍会推动人物行动的问题。事件对象中 i=事件编号，r=允许章节范围，a=关联资料，p=前置条件，h=可直接扩写的场景事件，o=直接结果，d=实际状态变化。伏笔端点对象中 i=伏笔编号，k=setup或payoff，e=承载这个端点的事件编号，d=这一次在场景中发生的具体变化；一次只写一个端点。
 每个 h 都要像一段可以直接扩写的剧情节点：只写这件事真正需要的故事事实，必要时交代人物、场景、动作、阻力、选择或结果，尽量不用固定清单式要求，不为凑齐项目硬塞字段。剧情发动机由题材和人物处境决定，可以是正面碰撞、追逐逃避、关系变化、欲望争夺、环境失控、能力试探、秘密暴露或其它自然发生的压力；相邻事件要让人物处境产生新的变化，不把这些方式排成固定轮换。资料只有在人物正在做事、被迫应对或关系发生变化时进入场景。
+ m 只在全书最后阶段返回，结构为 closure_mode、closure_horizon、long_term_result、final_image、opening_echo、title_closure_intent、time_jump_allowed。closure_mode 从 immediate_verified、short_term_verified、long_term_epilogue、mirror_scene、mixed 中选择最适合本书的一种；不能为了统一格式强行使用远期跳跃。long_term_epilogue 或 mixed 必须给出可信的时间跨度和具体成果，mirror_scene 必须说明要呼应的开头地点、物件、动作或关系；所有模式都必须先让本部核心结果落地，再用最后画面收束。
 当前阶段发生的正式伏笔端点，都在承载事件的 a 中加入一次“F编号/setup”或“F编号/payoff”，并在 f 中用同一事件编号 e 关联。setup写线索第一次进入人物生活，payoff写线索在场景中产生决定性变化；同一条伏笔在其它事件中继续出现、深化、造成后果是正常的，这些事件只把它作为普通关联资料或写出“F编号”，不要重复标成正式 setup/payoff。程序以正式端点为准，再把后续事件中的具体变化交给章节规划继续使用；阶段之间允许继续铺开同一条暗线，程序会依据事件 r 的章节范围落下具体章号。
 实际返回的 f 使用单端点格式，例如 {"i":"F06","k":"payoff","e":"E04","d":"人物在现场做出选择后，线索改变了什么"}。全书契约保留长期事实、世界运行方式、人物底色和结尾方向；伏笔通过 setup 与 payoff 表达它在场景中的进入、变化和意义显现。
 
@@ -443,6 +446,8 @@ STEP_PROMPTS["stage_plan"] = f"""{COMMON_CREATION_RULES}
 
 现在根据已经选定的故事和完整故事底盘，制作唯一的十万字阶段规划。这里的内容是给后续章节规划和正文扩写读取的执行资料，不是发布简介，也不需要写成文学化段落。总字数和单章字数完全按照作者输入；章节总数按 total_words / average_chapter_words 向上取整，最后一章吸收余数。每约十万字为一个阶段，阶段从第1章连续覆盖到最后一章，事件范围按顺序衔接。全书始终围绕唯一的 core_motive 推进：主角为了完成具体目标主动采取行动，剧情阻碍这条行动链，主角付出代价解决当前问题，结果再打开下一道目标；不能把阶段写成主角被动不断遇到新事情。
 阶段字段不要抢全书主线：阶段的 main_conflict 只写本阶段阻碍核心动机的具体问题、门槛、对手动作或代价升级；阶段 summary/end_state 要说明本阶段目标如何推进，以及结果打开的下一阶段目标。不要在每个阶段重新发明一条“主角真正要做的事”，也不要把主题、人物关系或伏笔名称填成阶段主线。
+
+全书最后阶段必须额外规划“终局收尾方案”：根据题材、核心动机和故事规模，在即时结果型 immediate_verified、短期验证型 short_term_verified、远期成果型 long_term_epilogue、镜像回响型 mirror_scene、混合型 mixed 中选择一种，不要为了格式统一强行使用时间跳跃。若选择短期或远期验证，必须写出可信的时间跨度、已经持续存在的成果和一个能在场景中看见的验证；若选择镜像回响，必须写清呼应开头的地点、物件、动作或关系变化；若选择 mixed，先完成当前主线，再用时间落点或镜像画面确认成果。终局方案不是另开剧情，也不能用“多年后一切都变好了”的摘要替代具体场景。
 
 阶段规划固定事实、顺序、状态和阶段推进，但剧情推进以场景为单位。每个事件写清本次真正发生、会影响后续的故事事实；时间、地点、人物、动作、阻力、选择、关系变化和结果等内容，只在当前事件确实需要时补充。事件之间通过人物正在做的事和已经发生的变化自然衔接。先判断这一事件真正由什么推动，再选择最适合题材的场景：人物对抗、关系变化、现场危机、公开行动、利益争夺、环境压力或信息出现都可以成为主发动机。相邻事件主动更换主发动机、场景目标和压力来源，让人物、关系、空间和局势持续变化。
 同一事件如果覆盖数章，只承担一次明确的转折；前面的章节让事情发生，后面的章节写它造成的新反应、新选择、新损失、新关系变化或新阻力，不要把同一场谈话、同一份材料或同一个结论反复当成新的剧情。对都市灵异、惊悚、悬疑、情感等题材，声音、空间、物件、生活压力、人物之间的隐瞒和现场失控持续进入剧情；对其它题材，使用该题材自己的场景压力和人物对抗。故事的关键变化要发生在人物正在经历的场面里，而不是停在解释性结论上。
@@ -2458,6 +2463,7 @@ def _expand_stage_object_transport(value):
             "e": "ordered_events",
             "x": "exit_state",
             "y": "carry_over",
+            "m": "closure_plan",
         },
     )
     chapter_range = value.get("r", stage.get("chapter_range"))
@@ -2488,7 +2494,7 @@ def _expand_stage_object_transport(value):
     # The short keys are transport-only.  Leaving them beside the expanded
     # fields duplicates every stage in the next continuity handoff and lets
     # later normalizers read two versions of the same fact.
-    for key in ("i", "n", "b", "e", "x", "y", "r"):
+    for key in ("i", "n", "b", "e", "x", "y", "r", "m"):
         stage.pop(key, None)
     return stage
 
@@ -3567,6 +3573,11 @@ def normalize_stage_plan_ranges(
         item["exit_state"] = _normalize_stage_state(
             _first_value(item, ("exit_state", "end_state_detail", "离开状态"), {})
         )
+        closure_plan = _normalize_terminal_closure_plan(
+            _first_value(item, ("closure_plan", "terminal_closure_plan", "终局收尾方案"), {})
+        )
+        if closure_plan:
+            item["closure_plan"] = closure_plan
         raw_events = _first_value(
             item,
             ("ordered_events", "events", "event_nodes", "事件节点"),
@@ -3732,7 +3743,7 @@ def _compact_stage_plan_handoff(stage_plan):
             value = stage.get(key)
             if value not in (None, "", [], {}):
                 row[key] = deepcopy(value)
-        for key in ("entry_state", "exit_state", "carry_over"):
+        for key in ("entry_state", "exit_state", "carry_over", "closure_plan"):
             value = stage.get(key)
             if value not in (None, "", [], {}):
                 row[key] = deepcopy(value)
@@ -3878,6 +3889,112 @@ def build_chapter_plan_foundation(framework):
     boundaries = _as_text(bible.get("hard_boundaries", "")) or (
         "本部核心矛盾和主角当前目标在结尾形成明确结果；可以保留不影响本部结局的续作余味。"
     )
+    terminal_stage = max(
+        (item for item in stages if isinstance(item, dict)),
+        key=lambda item: int(item.get("end_chapter", 0) or 0),
+        default={},
+    )
+    terminal_exit_state = terminal_stage.get("exit_state", {})
+    terminal_exit_state = terminal_exit_state if isinstance(terminal_exit_state, dict) else {}
+
+    def state_values(key):
+        value = terminal_exit_state.get(key, [])
+        if isinstance(value, list):
+            return [_as_text(item) for item in value if _as_text(item)]
+        text = _as_text(value)
+        return [text] if text else []
+
+    terminal_events = terminal_stage.get("ordered_events", [])
+    terminal_events = terminal_events if isinstance(terminal_events, list) else []
+    final_event = next(
+        (
+            item for item in reversed(terminal_events)
+            if isinstance(item, dict) and _as_text(item.get("result", ""))
+        ),
+        {},
+    )
+    required_results = []
+    for value in (
+        ending,
+        _as_text(terminal_stage.get("end_state", "")),
+        _as_text(final_event.get("result", "")),
+        *state_values("k"),
+    ):
+        if value and value not in required_results:
+            required_results.append(value)
+    relationship_results = []
+    for key in ("relationship_changes", "character_changes"):
+        for value in terminal_stage.get(key, []) if isinstance(terminal_stage.get(key), list) else []:
+            value = _as_text(value)
+            if value and value not in relationship_results:
+                relationship_results.append(value)
+    closure_plan = _normalize_terminal_closure_plan(
+        terminal_stage.get("closure_plan", terminal_stage.get("terminal_closure_plan", {}))
+    )
+    closure_plan.setdefault("closure_mode", "short_term_verified")
+    closure_plan.setdefault("time_jump_allowed", False)
+    terminal_contract = _normalize_terminal_contract({
+        "version": "1",
+        "source": "creation_wizard",
+        "mainline_result": ending or _as_text(terminal_stage.get("end_state", "")),
+        "conflict_result": _as_text(final_event.get("result", "")) or _as_text(terminal_stage.get("end_state", "")),
+        "relationship_results": relationship_results,
+        "protagonist_final_state": "；".join(state_values("c")) or _as_text(terminal_stage.get("end_state", "")),
+        "world_final_state": "；".join(state_values("k")) or _as_text(terminal_stage.get("end_state", "")),
+        "allowed_epilogue": ending,
+        "required_results": required_results,
+        "evidence_requirements": [
+            "核心结果必须在具体场景中已经发生，并由人物行动、证据、关系变化或稳定生活状态验证。",
+            "主要人物的关系和主角最终处境必须出现可观察的落点。",
+            "最后一章只能留下不影响本部闭环的背景余波。",
+        ],
+        "forbidden_pending_items": [
+            "把尚未完成的主要任务写成终章落点",
+            "用准备、等待、试验、复测或刚刚接手代替已验证结果",
+            "新增必须由下一部回答的主线任务、重大对手或关键关系问题",
+        ],
+        "last_chapter_landing": "最后一章在已经成立的结果、关系状态或生活落点上结束，不用抽象总结代替收束。",
+        "chapter_roles": [
+            {"position": 1, "role": "处理收尾窗口内尚未完成的最后阻碍", "required_result": "阻碍出现明确解决或承担代价的结果"},
+            {"position": 2, "role": "让前一结果造成的直接后果和人物选择落地", "required_result": "行动带来可观察的新状态"},
+            {"position": 3, "role": "让核心结果在人物关系、对抗或现实生活中被验证", "required_result": "读者能看见结果已经成立"},
+            {"position": 4, "role": "稳定主要人物、资源和生活秩序的最终位置", "required_result": "本部承诺不再依赖下一章才能成立"},
+            {"position": 5, "role": "完成最后结果、关系落点和余味", "required_result": "不再留下必须续写才能回答的核心问题"},
+        ],
+        **closure_plan,
+    })
+    structured_stages = deepcopy(stages)
+    if terminal_contract and structured_stages:
+        final_stage_id = _as_text(terminal_stage.get("id", ""))
+        for stage in structured_stages:
+            if not isinstance(stage, dict) or _as_text(stage.get("id", "")) != final_stage_id:
+                continue
+            stage["terminal_contract"] = deepcopy(terminal_contract)
+            stage["closure_plan"] = deepcopy(closure_plan)
+            events = stage.get("ordered_events", [])
+            if isinstance(events, list):
+                for event in events:
+                    if not isinstance(event, dict):
+                        continue
+                    if not terminal_bounds:
+                        continue
+                    allowed = event.get("allowed_chapters", [])
+                    if not isinstance(allowed, list) or len(allowed) < 2:
+                        continue
+                    try:
+                        overlaps = int(allowed[1]) >= terminal_bounds[0]
+                    except (TypeError, ValueError, IndexError):
+                        overlaps = False
+                    if overlaps:
+                        event.setdefault("terminal_role", "收尾窗口内完成直接结果")
+                        event.setdefault("closure_evidence", "在场景中写出结果已经发生并被验证")
+                        event.setdefault("pending_items", [])
+                if events:
+                    last = events[-1]
+                    if isinstance(last, dict):
+                        last["terminal_role"] = "最终结果与稳定落点"
+                        last["closure_evidence"] = terminal_contract.get("last_chapter_landing", "")
+            break
     return {
         "planning_schema_version": _as_text(framework.get("planning_schema_version", "2")) or "2",
         "summary": summary,
@@ -3908,7 +4025,8 @@ def build_chapter_plan_foundation(framework):
         },
         "book_contract": book_contract,
         "stage_skeleton": deepcopy(framework.get("stage_skeleton", [])),
-        "structured_stages": deepcopy(stages),
+        "structured_stages": structured_stages,
+        "terminal_contract": terminal_contract,
         "arcs": arcs,
     }
 
@@ -5311,6 +5429,9 @@ c 中每项只能使用 n、r、g、s、p、v、q；l 中每项只能使用 n、
                     "窗口内沿着已经发生的核心冲突、人物选择和关系变化完成实际结果，不再开启新的主要任务、主要敌人、组织、力量体系、世界规则或下一卷主线，"
                     "也不要把新的未解释信息、未知对手、未知目的地或未来承诺写成等待后续章节回答的悬念。"
                     "每个窗口章节都要有已经发生的行动和结果；最后一章落到具体动作、对白、关系结果或已经成立的生活状态。"
+                    "最终阶段事件的 result 必须写已经完成并被验证的结果，不要写准备、等待、试车、复测、刚刚接手或下一步再做；"
+                    "最后一个事件要承担核心动机结果、主要关系落点和主角最终处境的稳定落点。"
+                    "请在当前阶段对象中补充 closure_plan：只选择最适合本书的收尾方式；允许时间跳跃或开头呼应，但必须先完成当前结果，再用一个具体场景展示成果持续存在，不能写成空泛的多年后总结。"
                 )
             elif is_final_stage:
                 final_stage_guidance = (
@@ -5318,7 +5439,9 @@ c 中每项只能使用 n、r、g、s、p、v、q；l 中每项只能使用 n、
                     "把核心矛盾推到最终选择并写出实际结果，让主要人物的关系、读者承诺、普通伏笔和主角最终处境有清楚落点。"
                     "续作只能保留不影响当前结局的背景余波，不把本部必须解决的事情留给下一部。"
                     "最后几章不要再开需要后续章节解决的主线、重大反转、重要人物、新的世界规则或等待回答的悬念；要把结局写成具体场景中的行动、结果和已经成立的生活状态，"
-                    "不要用突然跳过多年的概括、作者总结或一句抽象结论代替过程。倒数第二章可以把冲突推到临界点，最后一章再完成最后选择、结果和余味。"
+                    "如果本书适合短期或远期验证，可以在 closure_plan 指定的时间落点后写一个具体的成果场景，但不能用空泛的多年后概括、作者总结或一句抽象结论代替过程。倒数第二章可以把冲突推到临界点，最后一章再完成最后选择、结果和余味。"
+                    "阶段最后事件的 result 必须是已经发生、当场可验证的结果，不能把准备开始、等待确认、试验复测、刚刚接手或下一轮行动当作结尾；"
+                    "如果还存在未完成的核心任务，必须在当前固定章节范围内写出完成、失败代价或明确转化；最后阶段对象还要给出 closure_plan，供章节规划和正文保持同一收尾方式。"
                 )
             stage_progression_guidance = (
                 "本阶段后部只沿着已经发生的冲突、人物选择和关系变化完成窗口内的直接结果；"

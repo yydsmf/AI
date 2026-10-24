@@ -296,6 +296,59 @@ class NovelCreationWizardPersistenceTests(unittest.TestCase):
             foundation["core_motive"],
         )
 
+    def test_terminal_contract_projects_final_stage_results_and_roles(self):
+        foundation = wizard.build_chapter_plan_foundation({
+            "premise": {
+                "ending_direction": "主角完成救援并让小镇恢复日常秩序。",
+                "relationship_engine": "搭档从互相猜疑变成共同守护。",
+            },
+            "bible": {"main_conflict": "主角必须在灾潮到来前守住小镇。"},
+            "stage_plan": [{
+                "id": "S01",
+                "name": "终局",
+                "start_chapter": 1,
+                "end_chapter": 4,
+                "end_state": "小镇恢复供水，主角交出指挥权。",
+                "relationship_changes": ["搭档愿意共同留下"],
+                "exit_state": {
+                    "c": ["主角不再独自承担守护责任"],
+                    "k": ["供水系统稳定运行"],
+                },
+                "ordered_events": [{
+                    "id": "S01-E01",
+                    "allowed_chapters": [4, 4],
+                    "result": "供水系统完成修复并连续运行。",
+                }],
+                "closure_plan": {
+                    "closure_mode": "mirror_scene",
+                    "closure_horizon": "一年后",
+                    "final_image": "主角和搭档回到第一次取水的水井旁。",
+                    "opening_echo": "开头两人在断水的水井前争执。",
+                    "title_closure_intent": "标题体现供水已经稳定和关系已经改变。",
+                    "time_jump_allowed": True,
+                },
+            }],
+            "total_words": 10000,
+            "average_chapter_words": 3000,
+        })
+
+        contract = foundation["terminal_contract"]
+        self.assertIn("供水系统完成修复并连续运行。", contract["required_results"])
+        self.assertIn("搭档愿意共同留下", contract["relationship_results"])
+        self.assertEqual(contract["chapter_roles"][-1]["position"], 5)
+        self.assertEqual(contract["closure_mode"], "mirror_scene")
+        self.assertEqual(contract["closure_horizon"], "一年后")
+        self.assertTrue(contract["time_jump_allowed"])
+        self.assertEqual(
+            contract["final_image"],
+            "主角和搭档回到第一次取水的水井旁。",
+        )
+        terminal_stage = foundation["structured_stages"][-1]
+        terminal_event = terminal_stage["ordered_events"][-1]
+        self.assertEqual(terminal_event["terminal_role"], "最终结果与稳定落点")
+        self.assertEqual(terminal_stage["terminal_contract"]["version"], "1")
+        self.assertEqual(terminal_stage["closure_plan"]["closure_mode"], "mirror_scene")
+
         premise_first = wizard.build_chapter_plan_foundation({
             "premise": {
                 "core_motive": "第一步已经具体化的核心动机。",

@@ -306,6 +306,9 @@ class NovelAnalysisWorkerTests(unittest.TestCase):
         self.assertIn("符合当前题材的阅读期待", prompt)
         self.assertIn("长期状态推进", prompt)
         self.assertIn("不能让同一句状态原样跨多个章节", prompt)
+        self.assertIn("每章outline末尾的‘本章境界推进：’一行", prompt)
+        self.assertIn("章前状态、章末状态和变化依据", prompt)
+        self.assertIn("普通题材不要臆造境界字段", prompt)
         self.assertIn("恢复或解决必须有资料中已有或剧情自然建立的时间、资源、事件依据", prompt)
         self.assertIn("不写固定伏笔任务", prompt)
         self.assertIn("source_location", prompt)
@@ -1157,7 +1160,7 @@ class NovelAnalysisWorkerTests(unittest.TestCase):
         self.assertEqual(worker.diagnostics["ignored_reasoning_chars"], 11)
 
     def test_writing_worker_sends_up_to_shared_novel_context_limit(self):
-        context = "长篇上下文" * 30000
+        context = "长篇上下文" * 36000
         worker = NovelWritingWorker("http://example.test", "key", "model", "outline", context)
         session = _FakeStreamSession([
             'data: {"choices":[{"delta":{"content":"1. 提纲"},"finish_reason":"stop"}]}',

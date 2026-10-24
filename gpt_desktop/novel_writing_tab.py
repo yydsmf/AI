@@ -333,7 +333,7 @@ class QInputDialog(_QtInputDialog):
 _SORT_MISSING_ORDER = 10 ** 9
 _CHAPTER_PLAN_BATCH_SIZE = 50
 # Leave room for the chapter-planning system prompt and request envelope.
-# The returned context itself remains below the application's 128,000-char
+# The returned context itself remains below the application's 160,000-char
 # limit even for large existing projects and imported frameworks.
 _CHAPTER_PLAN_CONTEXT_CHAR_BUDGET = NOVEL_AI_CONTEXT_LIMIT - 10000
 _CHAPTER_PLAN_BATCH_STATE_VERSION = 3
@@ -9210,12 +9210,16 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
                 framework.get("chapter_plan_note", ""), 2400
             ),
             "stage_plan": stage_plan,
+            "author_inspiration": self._chapter_plan_clip_text(
+                framework.get("author_inspiration", ""), 12000
+            ),
             "total_words": framework.get("total_words", 0),
             "average_chapter_words": framework.get("average_chapter_words", 0),
         }
         if not (
             result["novel_name"]
             or result["premise"]
+            or result["author_inspiration"]
             or result["chapter_plan_note"]
             or result["stage_plan"]
         ):
@@ -9313,6 +9317,9 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
                         "event": event_text,
                         "result": result_text,
                     }
+                    state_delta = event.get("state_delta", {})
+                    if state_delta not in (None, "", [], {}):
+                        event_row["state_delta"] = deepcopy(state_delta)
                     # Keep the event's original chapter window beside its
                     # text. The batch schedule is authoritative, but carrying
                     # this small range here avoids making the model join two
@@ -9420,6 +9427,10 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
             source.get("chapter_plan_note", ""),
             max(240, min(2400, total_limit // 8)),
         )
+        source["author_inspiration"] = self._chapter_plan_clip_text(
+            source.get("author_inspiration", ""),
+            max(800, min(12000, total_limit // 2)),
+        )
         for key, limit in (
             ("story_synopsis", 2600),
             ("bible", 3200),
@@ -9476,6 +9487,7 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
                 events.append({
                     "n": event.get("n", event_index),
                     "allowed_chapters": event.get("allowed_chapters", []),
+                    "state_delta": deepcopy(event.get("state_delta", {})),
                     "event": event_text,
                     "result": result_text,
                 })

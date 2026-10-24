@@ -346,7 +346,7 @@ CREATION_ENDING_DIRECTION_GUIDANCE = """
 
 
 CREATION_INSPIRATION_FACT_GUIDANCE = """
-作者灵感中明确写出的事实都属于故事底盘的一部分，要完整吸收并保留事实含义。人物身份、人生阶段、职业或学业状态、关系状态、时间顺序、已经发生的事件、具体地点、关键限制、爽点和结局方向，都要在后续资料中继续体现；与主角处境、故事开场和主线直接相关的关键事实，要在每个故事方向的简介中自然写出来，不能只留在主角字段或资料字段里。人物字段、故事引子、简介、主线和关系线表达同一事实时，要保持同一时间、身份和因果关系。五个方向可以用不同的场景、人物选择、冲突形状和推进方式呈现这些事实，差异继续来自故事本身；作者没有明确的部分保留自由创作空间。
+作者灵感中明确写出的事实都属于故事底盘的一部分，要完整吸收并保留事实含义。人物身份、人生阶段、职业或学业状态、关系状态、时间顺序、已经发生的事件、具体地点、关键限制、爽点和结局方向，都要在后续资料中继续体现；与主角处境、故事开场和主线直接相关的关键事实，要在每个故事方向的简介中自然写出来，不能只留在主角字段或资料字段里。人物字段、故事引子、简介、主线和关系线表达同一事实时，要保持同一时间、身份和因果关系。若灵感明确写了按阶段或按章节安排的境界、修为、等级、能力或其它连续状态，这不是可以被一句话概括的背景，而是后续阶段规划和章节规划的执行约束，要尽量保留对应节点和人物状态；作者没有明确的部分保留自由创作空间。五个方向可以用不同的场景、人物选择、冲突形状和推进方式呈现这些事实，差异继续来自故事本身。
 """.strip()
 
 
@@ -3103,9 +3103,9 @@ def creation_wizard_draft_from_project_draft(project):
             "length": length_choice(total_words),
             "chapter_words": chapter_choice,
         },
-        # The selected synopsis is generated story material, not the author's
-        # original inspiration.  Do not put it back into the editable input.
-        "inspiration": "",
+        # Restore only the author's original inspiration, never a generated
+        # synopsis, when reopening a completed project as a wizard draft.
+        "inspiration": _as_text(framework.get("author_inspiration")),
         "target_words": total_words,
         "average_words": average_words,
         "premise_candidates": candidates,
@@ -8570,6 +8570,7 @@ class NovelCreationWizardDialog(QDialog):
         framework = {
             "schema_version": 2,
             "source": "creation_wizard",
+            "author_inspiration": _as_text(self.inspiration_edit.text()),
             "premise": deepcopy(selected),
             "premise_candidates": deepcopy(premise_result.get("candidates", [])),
             "bible": deepcopy(bible_result.get("bible", {})),

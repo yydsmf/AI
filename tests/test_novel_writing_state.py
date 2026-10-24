@@ -315,6 +315,7 @@ class NovelWritingStateTests(unittest.TestCase):
                     "summary": "主角回到旧城，先面对生活和人情上的阻力。",
                     "main_conflict": "旧关系和现实压力逼他作出选择。",
                 }],
+                "author_inspiration": "每阶段和每章都要记录男主与吕师妹的境界推进。",
                 "total_words": 40000,
                 "average_chapter_words": 2000,
                 "chapter_plan_foundation": {
@@ -381,6 +382,38 @@ class NovelWritingStateTests(unittest.TestCase):
         self.assertIn("小说圣经：主角要夺回失去的生活。", context)
         self.assertIn("世界规则：现实城市", context)
         self.assertIn("旧钥匙", context)
+        self.assertIn("每阶段和每章都要记录男主与吕师妹的境界推进。", context)
+
+    def test_creation_framework_compaction_keeps_event_state_delta(self):
+        tab = NovelWritingTab.__new__(NovelWritingTab)
+        framework = {
+            "source": "creation_wizard",
+            "author_inspiration": "按章节维护男主境界。",
+            "stage_plan": [{
+                "name": "灵台初成",
+                "start_chapter": 1,
+                "end_chapter": 2,
+                "ordered_events": [{
+                    "event": "男主在灵台中完成引灵。",
+                    "result": "从淬体进入引灵。",
+                    "allowed_chapters": [1, 1],
+                    "state_delta": {
+                        "characters": [{
+                            "name": "男主",
+                            "before": "淬体九重",
+                            "after": "引灵一重",
+                        }],
+                    },
+                }],
+            }],
+        }
+
+        compacted = tab._chapter_plan_compact_creation_framework_context(
+            framework, total_limit=1200
+        )
+
+        event = compacted["stage_plan"][0]["ordered_events"][0]
+        self.assertEqual(event["state_delta"]["characters"][0]["after"], "引灵一重")
 
     def test_imported_foundation_and_reference_survive_storage_roundtrip(self):
         tab = self._imported_planning_tab()

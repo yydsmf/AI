@@ -10,6 +10,7 @@ from gpt_desktop.novel_utils import (
     LONG_FORM_MEMORY_IDENTITY_INDEX_LIMIT,
     LONG_FORM_RECONCILIATION_CONTEXT_LIMIT,
     LONG_FORM_SELECTION_INDEX_LIMIT,
+    LONG_FORM_STATE_DIRECTORY_LIMIT,
     LONG_FORM_STAGE_REVIEW_SCOPE,
     NOVEL_AI_CONTEXT_LIMIT,
     STYLE_CARD_CACHE_VERSION,
@@ -1961,7 +1962,7 @@ class NovelLongFormContextTests(unittest.TestCase):
         ):
             self.assertIn(marker, compacted)
         self.assertNotIn("重复规划资料标记", compacted)
-        self.assertLessEqual(len(compacted), 60000)
+        self.assertLessEqual(len(compacted), 80000)
         self.assertLess(len(compacted), len(original) * 0.7)
 
     def test_style_finalize_preflight_reports_concrete_short_paragraph_merges(self):
@@ -2513,7 +2514,8 @@ class NovelLongFormContextTests(unittest.TestCase):
         state_directory = _build_long_form_state_directory(project)
 
         self.assertLessEqual(len(index_text), LONG_FORM_SELECTION_INDEX_LIMIT)
-        self.assertLessEqual(len(state_directory), 18000)
+        self.assertLessEqual(len(state_directory), LONG_FORM_STATE_DIRECTORY_LIMIT)
+        self.assertGreater(len(state_directory), 18000)
         self.assertIn(
             "活跃事实935项，阶段档案24项，人物状态80项，关系状态60项，"
             "物件状态250项，活跃冲突100项，未决任务130项",
@@ -2839,6 +2841,8 @@ class NovelLongFormContextTests(unittest.TestCase):
         self.assertIn("正文必须使用自然的网络小说叙述语言", draft_context)
         self.assertIn("不得出现策划术语、抽象形容", draft_context)
         self.assertIn("情绪和气氛必须通过人物当下的动作", draft_context)
+        self.assertIn("能力或条件有差别时落到动作、卡点和后果", draft_context)
+        self.assertIn("不是固定句式", draft_context)
         self.assertIn("不要用‘第一步、第二步、第三步’或同类清单概括人物接下来要做什么", draft_context)
         self.assertIn("连续对白不要求统一节拍或每句配动作", draft_context)
         self.assertIn("不得把参考原文的人物、剧情、物件或句子带入当前正文", guidance)
@@ -2848,7 +2852,7 @@ class NovelLongFormContextTests(unittest.TestCase):
         self.assertIn("文学化意象、空泛比喻", draft_context)
         self.assertNotIn("比喻可以自由使用", guidance)
         expression_boundary = self._context_section(draft_context, "正文自然表达边界")
-        self.assertLess(len(expression_boundary), 800)
+        self.assertLess(len(expression_boundary), 1200)
         self.assertLessEqual(len(guidance), 1200)
         self.assertNotIn("【风格锁定规则】", draft_context)
         self.assertNotIn("【AI文风画像】", draft_context)
@@ -3492,6 +3496,8 @@ class NovelLongFormContextTests(unittest.TestCase):
         self.assertIn("只写1至2名核心人物的口吻", context)
         self.assertNotIn("完整样本结构软参考", context)
         self.assertIn("人物对白、冲突声纹、日常口语与喜剧习惯常驻执行", context)
+        self.assertIn("有文风时只在样本和人物都自然时保留", context)
+        self.assertIn("不是固定句式", context)
         self.assertIn("不设置段落、短句或对白数量配额", context)
         self.assertIn("未决任务只用于防止连续性错误，不是本章待办清单", context)
         self.assertIn("当前章节提纲明确安排执行时", context)
@@ -7035,6 +7041,23 @@ class NovelLongFormContextTests(unittest.TestCase):
         self.assertIn("第120章摘要", previous_section)
         self.assertNotIn("第1章摘要", previous_section)
 
+    def test_draft_context_keeps_long_current_body_head_and_tail_after_budget_increase(self):
+        chapter = _new_chapter(0)
+        chapter["title"] = "第一章 长正文"
+        chapter["outline"] = "主角依据现场证据继续推进。"
+        chapter["text"] = "".join(
+            f"正文首尾保留测试第{index}段，人物动作和现场结果继续变化。\n"
+            for index in range(900)
+        )
+        project = self._project_with_current_chapter(chapter)
+
+        context = _build_chapter_ai_context(project, 0, "draft")
+        current_section = self._context_section(context, "当前章节")
+
+        self.assertIn("正文首尾保留测试第0段", current_section)
+        self.assertIn("正文首尾保留测试第899段", current_section)
+        self.assertLessEqual(len(context), NOVEL_AI_CONTEXT_LIMIT)
+
     def test_chapter_context_includes_long_form_progress_rhythm(self):
         chapters = []
         for index in range(40):
@@ -8787,6 +8810,8 @@ class NovelLongFormContextTests(unittest.TestCase):
         self.assertIn("不要把‘完整、正确、成立、合理’等适合结论、资料或关系的抽象词直接套在气血、伤势或力量上", context)
         self.assertIn("没有药剂辅助，气血稳不住、冲关时会乱或身体扛不住", context)
         self.assertIn("‘气血变得完整’不自然", context)
+        self.assertIn("能力或条件有差别时落到动作、卡点和后果", context)
+        self.assertIn("不是固定句式", context)
 
     def test_style_finalize_acceptance_blocks_published_boundary_replay(self):
         previous = _new_chapter(0)
@@ -9109,6 +9134,9 @@ class NovelLongFormContextTests(unittest.TestCase):
         self.assertIn("正文必须使用自然的网络小说叙述语言", finalize_context)
         self.assertIn("不得出现策划术语、抽象形容", finalize_context)
         self.assertIn("情绪和气氛必须通过人物当下的动作", finalize_context)
+        self.assertIn("不要把‘能力有限、条件不足、结果受限’写成旁白金句", finalize_context)
+        self.assertIn("有文风时也不把对照句当模板", finalize_context)
+        self.assertIn("样本和人物都自然时才保留", finalize_context)
         self.assertNotIn("空得很有存在感", finalize_context)
 
     def test_direct_style_context_uses_source_cards_without_procedural_routing(self):

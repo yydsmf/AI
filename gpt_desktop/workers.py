@@ -48,6 +48,7 @@ from .novel_utils import (
     NOVEL_AI_CONTEXT_LIMIT,
     VOLUME_CONTINUATION_REQUEST_CHAR_BUDGET,
     VOLUME_FRAMEWORK_HANDOFF_CHAR_BUDGET,
+    VOLUME_HANDOFF_SOURCE_CHAR_BUDGET,
     _compact_volume_continuity_anchors,
     _compact_volume_handoff_for_framework,
     _compact_volume_handoff_source_for_request,
@@ -95,6 +96,13 @@ _CHAPTER_PLAN_STATE_PROGRESSION_GUIDANCE = (
     "暂时悬而未决的状态也要在本阶段留下真实的新后果或下一推进窗口，让同一状态随着人物选择持续变化；"
     "同一状态在连续章节中要呈现新的后果、压力或推进；不能让同一句状态原样跨多个章节。"
     "恢复或解决必须有资料中已有或剧情自然建立的时间、资源、事件依据，状态推进融入人物正在经历的场景。"
+    "如果项目资料明确存在境界、修为、等级、能力层次或功法进度，必须把它当作连续状态维护："
+    "阶段入口、事件差分、阶段出口和前一批末章是硬连续性依据。每章outline都要交代主要推进人物的当前状态，"
+    "本章有提升就写清从什么状态到什么状态以及依据，本章没有提升也要写明状态保持不变和原因。"
+    "请把这一项直接写进每章outline末尾的‘本章境界推进：’一行；涉及多个主要人物时分别写明，"
+    "至少包含人物、章前状态、章末状态和变化依据。没有突破的章节也必须写‘保持不变’及本章原因，"
+    "不能只在阶段结束或少数突破章写一次，也不能跳过中间状态、凭空新增境界、提前突破或让后文倒退。"
+    "只有输入资料明确存在这类实力体系时才执行本条；普通题材不要臆造境界字段或套用这行格式。"
 )
 
 
@@ -3927,7 +3935,7 @@ class NovelVolumeHandoffWorker(NovelAnalysisWorker):
             "以下是上一卷交接资料。请逐项核对来源，只输出有依据的交接信息。\n\n"
         )
         source_budget = min(
-            105000,
+            VOLUME_HANDOFF_SOURCE_CHAR_BUDGET,
             max(
                 12000,
                 VOLUME_CONTINUATION_REQUEST_CHAR_BUDGET
@@ -6879,6 +6887,8 @@ class NovelChapterPlanWorker(NovelAnalysisWorker):
             "source_stage、narrative_stage和dominant_line由程序根据阶段资料补齐。\n"
             "输入中的narrative_strategy_profile和master_plan是用户已确认的只读规划基础，本次输出直接承接其中的事实、"
             "阶段边界和题材方向；不同题材使用各自的冲突入口、状态变化与兑现方式。"
+            "author_inspiration是作者第一步留下的原始灵感，只读且优先于模型自行概括；如果其中写了阶段或章节级的"
+            "境界、修为、等级、能力推进，必须映射到对应章节，不能只保留成一句总目标。"
             "小说圣经和世界规则属于已经确认的故事底盘，章节规划不要擅自推翻小说圣经和世界规则。"
             "输入中的只读规划基础不得重新生成、改写、总结或返回；本次只沿用其中的事实和边界。"
             "输入中的creative_intent_contract同样只读且优先级最高；每章围绕primary_line展开，其他内容只在推动人物、关系或局势变化时进入。"

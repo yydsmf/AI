@@ -20,8 +20,9 @@ CHAPTER_ANALYSIS_STATUS_PENDING = "pending"
 CHAPTER_ANALYSIS_STATUS_UNWRITTEN = "unwritten"
 CHAPTER_ANALYSIS_QUICK_SIMILARITY_LOCAL_RATIO_LIMIT = 0.50
 # Shared character ceiling for chapter context construction and API transport.
-# Keep a modest reserve for the system prompt and model output budget.
-NOVEL_AI_CONTEXT_LIMIT = 128000
+# Keep a reserve for the system prompt and model output while allowing long
+# chapters and loaded style references to retain more quality-critical context.
+NOVEL_AI_CONTEXT_LIMIT = 160000
 
 
 def _canonical_chapter_plan_stage_id(value, fallback=""):
@@ -75,26 +76,26 @@ VOLUME_TWO_FRAMEWORK_TEMPLATE = (
 # Volume handoff is a planning request, not a manuscript request. Keep a
 # reserve for prompts and the model response instead of filling the whole
 # application context window with raw project records.
-VOLUME_HANDOFF_SOURCE_CHAR_BUDGET = 105000
-VOLUME_FRAMEWORK_HANDOFF_CHAR_BUDGET = 90000
+VOLUME_HANDOFF_SOURCE_CHAR_BUDGET = 120000
+VOLUME_FRAMEWORK_HANDOFF_CHAR_BUDGET = 110000
 VOLUME_HANDOFF_LAST_CHAPTER_CHAR_LIMIT = 24000
 # A volume handoff is sent as a system prompt plus a structured user payload.
 # Keep a fixed reserve so either request remains below the application's
-# 128,000-character context ceiling even when its prompt changes slightly.
+# 160,000-character context ceiling even when its prompt changes slightly.
 VOLUME_CONTINUATION_REQUEST_CHAR_BUDGET = NOVEL_AI_CONTEXT_LIMIT - 8000
 VOLUME_HANDOFF_RECENT_CHAPTER_COUNT = 8
 # The compact index normally stays close to 15k, but quality-critical reference
-# coverage may grow beyond that. The overall 128k context builder remains the
+# coverage may grow beyond that. The overall 160k context builder remains the
 # final safety boundary.
-LONG_FORM_SELECTION_INDEX_LIMIT = 48000
-LONG_FORM_STATE_DIRECTORY_LIMIT = 18000
-LONG_FORM_MEMORY_FINALIZE_INDEX_LIMIT = 24000
-LONG_FORM_MEMORY_IDENTITY_INDEX_LIMIT = 6000
+LONG_FORM_SELECTION_INDEX_LIMIT = 56000
+LONG_FORM_STATE_DIRECTORY_LIMIT = 24000
+LONG_FORM_MEMORY_FINALIZE_INDEX_LIMIT = 30000
+LONG_FORM_MEMORY_IDENTITY_INDEX_LIMIT = 8000
 LONG_FORM_CONTEXT_SAFETY_MARGIN = 2048
 LONG_FORM_CONTEXT_HARD_RESERVE = 20000
 LONG_FORM_CONTEXT_SOFT_LIMIT = NOVEL_AI_CONTEXT_LIMIT - LONG_FORM_CONTEXT_HARD_RESERVE
 LONG_FORM_STAGE_REVIEW_SCOPE = "stage_boundary_delta"
-LONG_FORM_RECONCILIATION_CONTEXT_LIMIT = 90000
+LONG_FORM_RECONCILIATION_CONTEXT_LIMIT = 110000
 LONG_FORM_MAX_FACT_UPDATES = 12
 LONG_FORM_MAX_LONG_TERM_EVENTS = 8
 LONG_FORM_MAX_RECORD_UPDATES = 6
@@ -104,7 +105,7 @@ LONG_FORM_FACT_CONTINUITY_DETAIL_LIMIT = 1200
 # The model may return the semantic state delta once and let the client expand
 # deterministic review/index fields. Existing version-2 payloads remain valid.
 LONG_FORM_COMPACT_DELTA_VERSION = 1
-STYLE_FINALIZE_SOURCE_CONTEXT_LIMIT = 60000
+STYLE_FINALIZE_SOURCE_CONTEXT_LIMIT = 80000
 CHAPTER_ANALYSIS_STATUS_LABELS = {
     CHAPTER_ANALYSIS_STATUS_CURRENT: "已AI分析",
     CHAPTER_ANALYSIS_STATUS_SMALL_CHANGE: "小改",
@@ -10444,7 +10445,10 @@ def _build_legacy_style_execution_context(
         "同一事实的证明边界只完整交代一次；后续角色或专业人员只给新增结果、决定或阻力，不能换一种说法再次解释。"
         "本章主线不是调查推理时，关于‘能证明什么/不能证明什么’、隐私规则或查询范围最多完整出现一处；机构人物只承担一个改变结果的动作，不能形成流程辩论。"
         "备用正文必须完整执行剧情拍点，正文写法以作者样本为最高标准；避免重复解释、同义对白、流程复述和替人物讲道理。"
-        "严格只输出以下三个分区，不输出其他标题、分析、状态JSON或Markdown代码块：\n"
+        + _concrete_prose_expression_guidance(
+            style_active=bool(style_reference), compact=True
+        )
+        + "严格只输出以下三个分区，不输出其他标题、分析、状态JSON或Markdown代码块：\n"
         "【剧情执行清单】\n按发生顺序列出自然数量的唯一剧情拍点\n\n"
         "【本章声纹执行表】\n核心人物口吻、自然适用的原生词与说话方式、叙述衔接和具体章末落点\n\n"
         "【备用正文草稿】\n完整正文草稿"
@@ -10564,6 +10568,35 @@ def _style_voice_priority_guidance():
     )
 
 
+def _concrete_prose_expression_guidance(style_active=False, compact=False):
+    """Prefer scene facts over stock contrast sentences in generated prose."""
+    if compact:
+        style_rule = (
+            "有文风时只在样本和人物都自然时保留。"
+            if style_active else
+            "无文风时不能用它代替具体描写。"
+        )
+        return (
+            "【具体表达边界】\n"
+            "能力或条件有差别时落到动作、卡点和后果，避免‘A不等于B’等旁白金句；不是固定句式。"
+            + style_rule
+            + "\n"
+        )
+    style_rule = (
+        "有文风时也不把对照句当模板；样本和人物都自然时才保留。"
+        if style_active else
+        "没有文风档案时，更不能用这类句式代替具体描写。"
+    )
+    return (
+        "【具体表达边界】\n"
+        "不要把‘能力有限、条件不足、结果受限’写成旁白金句，尤其避免‘A不等于B’、‘A不是B而是C’、‘这不代表……’。"
+        "需要表达能力或条件差别时，才落到‘已做到什么、卡在哪里、实际结果’；这是检查方向，不是固定三句或每段套用，让动作、缺口和后果自己说明。"
+        "对白只有确需比较或反驳时才这样说；写完静默检查，非必要对白中的公式对照句改成具体场面。"
+        + style_rule
+        + "\n"
+    )
+
+
 def _grounded_prose_contract(style_active=False):
     """Keep generated prose direct, concrete, and story-focused."""
     emotion_guidance = (
@@ -10600,8 +10633,9 @@ def _grounded_prose_contract(style_active=False):
         "不得用解释式、观点式和“金句式”抽象表达；"
         "人物表达拒绝、讥讽或不满时，落到眼前的具体对象、安排和后果上，让台词像人物当场说给对方听的话。"
         "人物反感眼前的说法或安排时，直接落到具体对象、场面和自己是否配合上；允许用人物自己的口语吐槽或拒绝，"
-        "不要把具体冲突写成抽象的权利、资格、归属、责任或关系宣言，也不要反复套用‘事实+反转总结’的口号式句型；"
+        "不要把具体冲突写成抽象的权利、资格、归属、责任或关系宣言，也不要反复套用‘事实+反转总结’的口号式句型。"
         "正文尽量少用‘决定’‘选择’‘不代表’等抽象词，除非剧情确实离不开，优先写具体的人、物、动作、反应和结果。\n"
+        + _concrete_prose_expression_guidance(style_active=style_active, compact=True)
         + emotion_guidance
         + "【具体状态词搭配】\n"
         "涉及气血、真气、灵力、内力、经脉、伤势、药剂等身体或力量状态时，先判断实际变化是稳定、恢复、运转、凝聚、消耗、紊乱、受损还是不足，使用与该状态匹配的动词和形容词；"
@@ -10618,6 +10652,7 @@ def _natural_expression_guidance(style_active=False):
         "不得出现策划术语、抽象形容、办案式表达、编辑式说明或编辑式总结。"
         "情绪和气氛必须通过人物当下的动作、对白、心理和具体结果表现，不用漂亮形容替代剧情。"
         + _prose_scene_grounding_guidance(compact=True)
+        + _concrete_prose_expression_guidance(style_active=style_active)
         + "对白按关系和现场情绪自然接话，心理变化随人物自然展开。"
         + (
             _style_voice_priority_guidance()
@@ -19846,7 +19881,7 @@ def _build_long_form_memory_patch_context(
             False,
         ),
         ("实体称谓与关系边界", _entity_naming_guidance(project), 2600, False),
-        ("最终正文", final_text, 34000, True),
+        ("最终正文", final_text, 40000, True),
         (
             "待修复的原正文字段",
             json.dumps(original_bundle, ensure_ascii=False, separators=(",", ":")),
@@ -19970,21 +20005,21 @@ def _build_long_form_memory_repair_context(
             False,
         ),
         ("实体称谓与关系边界", _entity_naming_guidance(project), 2600, False),
-        ("最终正文", final_text, 32000, True),
+        ("最终正文", final_text, 40000, True),
         (
             "原长篇记忆增量",
             json.dumps(compact_memory_update, ensure_ascii=False, separators=(",", ":")),
             16000,
             False,
         ),
-        ("当前状态快照", memory_sections["当前状态快照"], 18000, False),
+        ("当前状态快照", memory_sections["当前状态快照"], 24000, False),
         (
             "AI资料更新与下一章选择索引",
             _build_long_form_selection_index(project, chapter_index, repair_selection),
-            30000,
+            40000,
             False,
         ),
-        ("当前活跃事实", memory_sections["活跃连续性事实"], 40000, False),
+        ("当前活跃事实", memory_sections["活跃连续性事实"], 48000, False),
         (
             "下一章边界",
             f"标题：{next_chapter.get('title', '')}\n提纲：{next_chapter.get('outline', '')}",
@@ -19994,7 +20029,7 @@ def _build_long_form_memory_repair_context(
         ("已有实际提纲", outline, 5000, False),
         ("已有摘要", summary, 3000, False),
         ("已有关键事实", key_facts, 6000, False),
-        ("近期阶段档案", memory_sections["近期阶段档案"], 12000, True),
+        ("近期阶段档案", memory_sections["近期阶段档案"], 16000, True),
     ]
     return _assemble_bounded_long_form_context(source_sections, output_requirements)
 
@@ -20035,7 +20070,7 @@ def _build_chapter_logic_repair_context(project, chapter_index, final_text, issu
             False,
         ),
         ("实体称谓与关系边界", _entity_naming_guidance(project), 2600, False),
-        ("最终正文", final_text, 34000, True),
+        ("最终正文", final_text, 40000, True),
     ]
     return _assemble_bounded_long_form_context(sections, requirements)
 
@@ -20179,14 +20214,14 @@ def _build_long_form_memory_finalize_context(project, chapter_index, final_text)
             7000,
             False,
         ),
-        ("最终正文", final_text, 34000, True),
+        ("最终正文", final_text, 40000, True),
         (
             "AI资料更新与下一章选择索引",
             selection_index,
             LONG_FORM_MEMORY_FINALIZE_INDEX_LIMIT + LONG_FORM_MEMORY_IDENTITY_INDEX_LIMIT,
             False,
         ),
-        ("本章已选活跃事实详情", selected_memory["活跃连续性事实"], 24000, False),
+        ("本章已选活跃事实详情", selected_memory["活跃连续性事实"], 30000, False),
         (
             "下一章边界（只用于选择需继承资料）",
             f"标题：{next_chapter.get('title', '')}\n"
@@ -20196,7 +20231,7 @@ def _build_long_form_memory_finalize_context(project, chapter_index, final_text)
             6000,
             False,
         ),
-        ("近期阶段档案", selected_memory["近期阶段档案"], 12000, True),
+        ("近期阶段档案", selected_memory["近期阶段档案"], 16000, True),
     ]
     return _assemble_bounded_long_form_context(source_sections, output_requirements)
 
@@ -20798,20 +20833,20 @@ def _build_long_form_memory_reconcile_context(
     )
     source_sections = [
         ("任务", "只审查第十章边界的状态语义，不审正文文风，不改正文。", 900, False),
-        ("最终正文", final_text, 36000, True),
-        ("原本已通过校验的状态增量", json.dumps(proposed, ensure_ascii=False, separators=(",", ":")), 22000, False),
-        ("调用前状态快照", memory_sections["当前状态快照"], 18000, False),
+        ("最终正文", final_text, 40000, True),
+        ("原本已通过校验的状态增量", json.dumps(proposed, ensure_ascii=False, separators=(",", ":")), 26000, False),
+        ("调用前状态快照", memory_sections["当前状态快照"], 24000, False),
         (
             "状态引用索引",
             "\n\n".join(part for part in (
                 _build_long_form_record_identity_index(project, limit=5000),
-                _build_long_form_selection_index(project, chapter_index, limit=18000),
+                _build_long_form_selection_index(project, chapter_index, limit=26000),
             ) if part),
-            24000,
+            34000,
             False,
         ),
-        ("最近十章正文、摘要与关键事实（仅供比对，禁止作为证据）", recent_ten_text, 56000, True),
-        ("已选活跃事实", memory_sections["活跃连续性事实"], 12000, False),
+        ("最近十章正文、摘要与关键事实（仅供比对，禁止作为证据）", recent_ten_text, 64000, True),
+        ("已选活跃事实", memory_sections["活跃连续性事实"], 16000, False),
         (
             "章节边界",
             f"第{chapter_index + 1}章《{chapter.get('title', '')}》\n当前修订号：{memory.get('revision', 0)}",
@@ -23194,7 +23229,7 @@ def _build_chapter_ai_context(project, chapter_index, action):
         )
     inheritance_rules = "\n".join(inheritance_rule_lines)
 
-    current_text_limit = 30000 if action in {"outline", "summary"} else 18000
+    current_text_limit = 30000 if action in {"outline", "summary"} else 24000
     draft_words_line = draft_words_label if draft_words_label else "未填写"
     current_lines = [
         f"章节标题：{chap.get('title', '')}",
@@ -23421,7 +23456,7 @@ def _build_chapter_ai_context(project, chapter_index, action):
         style_sections.append((
             "正文自然表达边界",
             _natural_expression_guidance(style_active=bool(style_reference)),
-            800,
+            1200,
             False,
         ))
     memory_view = runtime_project
@@ -23455,9 +23490,9 @@ def _build_chapter_ai_context(project, chapter_index, action):
             ("前文继承摘要", previous_summary, 5000 if action == "draft" else 15000, True),
             ("近几章连续性", recent_context_section, 5000, True),
             ("历史连续性依据", continuity_context, 2600, False),
-            ("本章相关人物", "\n".join(character_lines) or "暂无", 10000, False),
-            ("本章相关设定", "\n".join(lore_lines) or "暂无", 8000, False),
-            ("本章相关伏笔", foreshadow_context, 7000, True),
+            ("本章相关人物", "\n".join(character_lines) or "暂无", 12000, False),
+            ("本章相关设定", "\n".join(lore_lines) or "暂无", 10000, False),
+            ("本章相关伏笔", foreshadow_context, 9000, True),
         ]
     if action == "summary":
         knowledge_sections.insert(
@@ -23465,7 +23500,7 @@ def _build_chapter_ai_context(project, chapter_index, action):
             (
                 "AI资料更新与下一章选择索引",
                 _build_long_form_selection_index(project, chapter_index),
-                40000,
+                52000,
                 False,
             ),
         )
@@ -23481,7 +23516,7 @@ def _build_chapter_ai_context(project, chapter_index, action):
     current_section_item = (
         "当前章节",
         current_section,
-        34000 if action == "summary" else 24000,
+        34000 if action == "summary" else 32000,
         True,
     )
     current_first_actions = {

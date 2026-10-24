@@ -4815,6 +4815,60 @@ def _is_project_final_chapter(project, chapter_index):
     return planned_count <= 0 or planned_count == len(chapters)
 
 
+def _project_ready_for_completion(project):
+    """Return whether every planned chapter has a committed final draft."""
+    project = project if isinstance(project, dict) else {}
+    chapters = project.get("chapters", [])
+    if not isinstance(chapters, list) or not chapters:
+        return False
+    planned_count = _project_planned_chapter_count(project)
+    if planned_count <= 0 or planned_count != len(chapters):
+        return False
+    memory = project.get("long_form_memory", {})
+    if not isinstance(memory, dict):
+        return False
+    try:
+        memory_revision = int(memory.get("revision", 0) or 0)
+    except (TypeError, ValueError):
+        memory_revision = 0
+    if memory_revision <= 0:
+        return False
+    for chapter in chapters:
+        if not isinstance(chapter, dict):
+            return False
+        if not all(
+            str(chapter.get(key, "") or "").strip()
+            for key in ("text", "summary", "key_facts")
+        ):
+            return False
+        if _infer_chapter_status(chapter, preserve_manual=False) != "已完成":
+            return False
+        analysis_status = str(chapter.get("analysis_status", "") or "").strip()
+        if analysis_status and analysis_status != CHAPTER_ANALYSIS_STATUS_CURRENT:
+            return False
+        if str(chapter.get("memory_sync_status", "") or "").strip() != "complete":
+            return False
+        if str(chapter.get("memory_sync_error", "") or "").strip():
+            return False
+        if str(chapter.get("memory_reconciliation_status", "") or "").strip() in {
+            "pending", "failed"
+        }:
+            return False
+        if bool(chapter.get("auto_expand_resume_required", False)):
+            return False
+        try:
+            chapter_revision = int(chapter.get("memory_revision", 0) or 0)
+        except (TypeError, ValueError):
+            chapter_revision = 0
+        if (
+            chapter_revision <= 0
+            or chapter_revision > memory_revision
+            or not str(chapter.get("memory_update_hash", "") or "").strip()
+        ):
+            return False
+    return True
+
+
 TERMINAL_WINDOW_CHAPTER_COUNT = 5
 
 

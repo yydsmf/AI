@@ -35,6 +35,7 @@ from gpt_desktop.novel_utils import (
     _new_foreshadow,
     _normalize_project,
     _project_without_private_notes,
+    _project_ready_for_completion,
     _project_list_text,
     _project_meta_text,
     _local_split_chapter_title,
@@ -49,6 +50,78 @@ from gpt_desktop.workers import EdgeTTSWorker, _parse_edge_tts_server_date
 
 
 class NovelWritingStateTests(unittest.TestCase):
+    @staticmethod
+    def _completion_project(chapter_count=2):
+        chapters = []
+        for index in range(chapter_count):
+            chapter = _new_chapter(index)
+            chapter.update({
+                "status": "已完成",
+                "text": f"第{index + 1}章正文",
+                "summary": f"第{index + 1}章摘要",
+                "key_facts": f"第{index + 1}章事实",
+                "analysis_status": "current",
+                "memory_sync_status": "complete",
+                "memory_revision": index + 1,
+                "memory_update_hash": f"hash-{index + 1}",
+            })
+            chapters.append(chapter)
+        return {
+            "meta": {"status": "连载中"},
+            "chapter_plan_foundation": {
+                "total_chapter_count": chapter_count,
+            },
+            "chapters": chapters,
+            "long_form_memory": {"revision": chapter_count},
+        }
+
+    def test_project_is_ready_for_completion_only_when_every_chapter_is_committed(self):
+        project = self._completion_project()
+
+        self.assertTrue(_project_ready_for_completion(project))
+
+        project["chapters"][1]["text"] = ""
+        self.assertFalse(_project_ready_for_completion(project))
+
+    def test_project_completion_requires_planned_count_and_memory_sync(self):
+        project = self._completion_project()
+
+        project["chapter_plan_foundation"]["total_chapter_count"] = 3
+        self.assertFalse(_project_ready_for_completion(project))
+
+        project = self._completion_project()
+        project["chapters"][0]["memory_sync_status"] = "pending"
+        self.assertFalse(_project_ready_for_completion(project))
+
+        project = self._completion_project()
+        project["chapters"][0]["analysis_status"] = "small_change"
+        self.assertFalse(_project_ready_for_completion(project))
+
+    def test_project_completion_blocks_pending_boundary_reconciliation(self):
+        project = self._completion_project()
+        project["chapters"][-1]["memory_reconciliation_status"] = "pending"
+
+        self.assertFalse(_project_ready_for_completion(project))
+
+    def test_project_status_advances_after_plan_apply_and_final_save(self):
+        tab = NovelWritingTab.__new__(NovelWritingTab)
+        tab.current_project = {
+            "meta": {"status": "草稿"},
+            "chapters": [],
+        }
+        tab.status_combo = _FakeComboBox(["草稿", "连载中", "已完结", "修订中"], "草稿")
+        tab._refresh_current_project_list_item_from_memory = lambda: None
+
+        self.assertTrue(tab._auto_update_project_status(chapter_plan_applied=True))
+        self.assertEqual(tab.current_project["meta"]["status"], "连载中")
+        self.assertEqual(tab.status_combo.currentText(), "连载中")
+
+        tab.current_project = self._completion_project()
+        tab.status_combo = _FakeComboBox(["草稿", "连载中", "已完结", "修订中"], "连载中")
+        self.assertTrue(tab._auto_update_project_status())
+        self.assertEqual(tab.current_project["meta"]["status"], "已完结")
+        self.assertEqual(tab.status_combo.currentText(), "已完结")
+
     def test_first_character_can_use_style_favorite_button(self):
         tab = NovelWritingTab.__new__(NovelWritingTab)
         tab.current_project = {

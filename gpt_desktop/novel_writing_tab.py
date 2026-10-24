@@ -199,6 +199,7 @@ from .novel_utils import (
     _strip_volume_handoff_outline_metadata,
     _project_without_private_notes,
     _project_list_text,
+    _project_ready_for_completion,
     _project_summary_record_text,
     _project_meta_text,
     _project_summary_text,
@@ -4085,6 +4086,27 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
         self._mark_helper_pages_stale()
         self._schedule_autosave_only()
 
+    def _auto_update_project_status(self, chapter_plan_applied=False):
+        """Advance project status only at explicit planning or save milestones."""
+        if not isinstance(getattr(self, "current_project", None), dict):
+            return False
+        meta = self.current_project.setdefault("meta", {})
+        current_status = str(meta.get("status", "") or "").strip() or "草稿"
+        next_status = ""
+        if chapter_plan_applied and current_status == "草稿":
+            next_status = "连载中"
+        elif current_status in {"草稿", "连载中"} and _project_ready_for_completion(
+            self.current_project
+        ):
+            next_status = "已完结"
+        if not next_status or next_status == current_status:
+            return False
+        meta["status"] = next_status
+        if hasattr(self, "status_combo"):
+            self._set_combo_text_without_signals(self.status_combo, next_status)
+        self._refresh_current_project_list_item_from_memory()
+        return True
+
     def _save_current_work(
         self,
         reason="自动保存",
@@ -4100,6 +4122,7 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
         summary = self._novel_perf_summary()
         try:
             self._flush_current_editors()
+            self._auto_update_project_status()
             self._sync_candidate_analysis_state()
             self._sync_import_candidates_to_project()
             data = deepcopy(self.current_project)
@@ -4171,6 +4194,7 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
     def _save_after_import(self):
         try:
             self._flush_current_editors()
+            self._auto_update_project_status()
             self._sync_candidate_analysis_state()
             self._sync_import_candidates_to_project()
             if self._has_saved_project_path():
@@ -5936,10 +5960,12 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
                 path=source_name,
                 **self._novel_perf_summary(),
             )
+            project_status_changed = self._auto_update_project_status()
             self._dirty = (
                 any(status_changes.values())
                 or bool(framework_reconciled)
                 or bool(creation_meta_reconciled)
+                or project_status_changed
             )
             self._project_file_dirty = self._dirty
         finally:
@@ -11924,6 +11950,7 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
             self.chapter_plan_apply_btn.setVisible(False)
             self.chapter_plan_apply_btn.setEnabled(False)
         self.chapter_ai_preview.clear()
+        self._auto_update_project_status(chapter_plan_applied=True)
         self._note_project_dirty()
         self._reload_chapter_list(first_new_index)
         self._schedule_refresh(include_manuscript=True)
@@ -17814,6 +17841,7 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
         summary = self._novel_perf_summary()
         try:
             self._flush_current_editors()
+            self._auto_update_project_status()
             self._sync_candidate_analysis_state()
             self._sync_import_candidates_to_project()
             self.current_project["updated_at"] = now_str()
@@ -17862,6 +17890,7 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
         path = str(self.current_project_path or "").strip()
         if not path or path == NOVEL_DRAFT_FILE:
             return
+        self._auto_update_project_status()
         if self._handle_external_project_change_before_save(
             deepcopy(self.current_project), "项目快照保存", False
         ):
@@ -17900,6 +17929,7 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
             self.set_status_tip("当前项目正在番茄批量上传，任务结束前不允许从界面覆盖保存。")
             return True
         self._flush_current_editors()
+        self._auto_update_project_status()
         self._sync_candidate_analysis_state()
         self._sync_import_candidates_to_project()
         if not self.current_project_path or self.current_project_path == NOVEL_DRAFT_FILE:
@@ -17931,6 +17961,7 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
 
     def save_project_as_named(self):
         self._flush_current_editors()
+        self._auto_update_project_status()
         self._sync_candidate_analysis_state()
         self._sync_import_candidates_to_project()
         title = self.title_edit.text().strip() or "未命名小说"

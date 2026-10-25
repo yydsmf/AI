@@ -187,7 +187,6 @@ class FanqieUploadTests(unittest.TestCase):
                     "id": FANQIE_LEGACY_ACCOUNT_ID,
                     "label": "测试番茄账号",
                 }],
-                "selected_account_id": FANQIE_LEGACY_ACCOUNT_ID,
             }, accounts_path)
             with patch(
                 "gpt_desktop.fanqie_upload.FANQIE_ACCOUNTS_FILE",
@@ -214,6 +213,85 @@ class FanqieUploadTests(unittest.TestCase):
                         dialog._radio_value(dialog.work_type_buttons, "unknown"),
                         "completed",
                     )
+                finally:
+                    dialog.close()
+
+    def test_dialog_restores_project_selected_account_and_keeps_projects_isolated(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            accounts_path = os.path.join(tmp, "fanqie_accounts.json")
+            project_a_path = os.path.join(tmp, "项目A.json")
+            project_b_path = os.path.join(tmp, "项目B.json")
+            save_project_file(project_a_path, self._project())
+            save_project_file(project_b_path, self._project())
+            save_fanqie_accounts({
+                "accounts": [
+                    {"id": "account-a", "label": "账号 A"},
+                    {"id": "account-b", "label": "账号 B"},
+                ],
+            }, accounts_path)
+            with patch(
+                "gpt_desktop.fanqie_upload.FANQIE_ACCOUNTS_FILE",
+                accounts_path,
+            ):
+                dialog_a = FanqieBatchUploadDialog(current_project_path=project_a_path)
+                try:
+                    index_b = dialog_a.account_combo.findData("account-b")
+                    self.assertGreaterEqual(index_b, 0)
+                    dialog_a.account_combo.setCurrentIndex(index_b)
+                    self._app.processEvents()
+                    self.assertEqual(
+                        load_json_file(project_a_path, {}).get(
+                            "fanqie_upload_selected_account_id",
+                            "",
+                        ),
+                        "",
+                    )
+                    dialog_a._on_works_ready([{
+                        "id": "book-a",
+                        "title": "作品 A",
+                        "url": "https://example.test/book-a",
+                        "work_type": "serial",
+                    }])
+                    dialog_a._accept()
+                finally:
+                    dialog_a.close()
+
+                saved_a = load_json_file(project_a_path, {})
+                self.assertEqual(
+                    saved_a["fanqie_upload_selected_account_id"],
+                    "account-b",
+                )
+
+                dialog_b = FanqieBatchUploadDialog(current_project_path=project_b_path)
+                try:
+                    self.assertEqual(dialog_b._selected_account_id(), "account-a")
+                finally:
+                    dialog_b.close()
+
+                dialog_a_reopened = FanqieBatchUploadDialog(current_project_path=project_a_path)
+                try:
+                    self.assertEqual(dialog_a_reopened._selected_account_id(), "account-b")
+                finally:
+                    dialog_a_reopened.close()
+
+    def test_dialog_uses_first_account_when_project_has_no_binding(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "测试小说.json")
+            accounts_path = os.path.join(tmp, "fanqie_accounts.json")
+            save_project_file(path, self._project())
+            save_fanqie_accounts({
+                "accounts": [
+                    {"id": "account-a", "label": "账号 A"},
+                    {"id": "account-b", "label": "账号 B"},
+                ],
+            }, accounts_path)
+            with patch(
+                "gpt_desktop.fanqie_upload.FANQIE_ACCOUNTS_FILE",
+                accounts_path,
+            ):
+                dialog = FanqieBatchUploadDialog(current_project_path=path)
+                try:
+                    self.assertEqual(dialog._selected_account_id(), "account-a")
                 finally:
                     dialog.close()
 
@@ -431,7 +509,7 @@ class FanqieUploadTests(unittest.TestCase):
             "book-legacy",
         )
 
-    def test_accounts_create_independent_profiles_and_persist_selection(self):
+    def test_accounts_create_independent_profiles_without_global_selection(self):
         with tempfile.TemporaryDirectory() as tmp:
             accounts_path = os.path.join(tmp, "accounts.json")
             profile_root = os.path.join(tmp, "profiles")
@@ -448,7 +526,7 @@ class FanqieUploadTests(unittest.TestCase):
                 self.assertTrue(os.path.isdir(first["profile_dir"]))
                 self.assertTrue(os.path.isdir(second["profile_dir"]))
                 loaded = load_fanqie_accounts(accounts_path)
-                self.assertEqual(loaded["selected_account_id"], second["id"])
+                self.assertNotIn("selected_account_id", loaded)
                 self.assertEqual(get_fanqie_account(loaded, first["id"])["label"], "账号 A")
 
     def test_build_task_carries_account_profile(self):

@@ -44,6 +44,7 @@ from .novel_storage import load_json_file, save_project_file
 from .novel_utils import (
     _body_display_len,
     _normalize_fanqie_upload_state as normalize_fanqie_upload_state,
+    FANQIE_UPLOAD_SELECTED_ACCOUNT_FIELD,
 )
 from .optional_components import OptionalComponentError, load_playwright_sync_api
 from .widgets import install_arrow_overlay
@@ -170,16 +171,14 @@ def normalize_fanqie_accounts(value):
             "profile_dir": FANQIE_PROFILE_DIR,
         })]
         seen = {FANQIE_LEGACY_ACCOUNT_ID}
-    selected = str(raw.get("selected_account_id", "") or "").strip()
-    if selected not in seen:
-        selected = accounts[0]["id"]
-    return {"version": 1, "accounts": accounts, "selected_account_id": selected}
+    return {"version": 1, "accounts": accounts}
 
 
 def load_fanqie_accounts(path=None):
     path = os.path.abspath(os.path.expanduser(str(path or FANQIE_ACCOUNTS_FILE)))
-    config = normalize_fanqie_accounts(load_json_file(path, {}))
-    if not os.path.exists(path):
+    raw = load_json_file(path, {})
+    config = normalize_fanqie_accounts(raw)
+    if not os.path.exists(path) or raw != config:
         save_fanqie_accounts(config, path)
     return config
 
@@ -207,13 +206,12 @@ def create_fanqie_account(label="", config=None, path=None):
     })
     os.makedirs(account["profile_dir"], exist_ok=True)
     config["accounts"].append(account)
-    config["selected_account_id"] = account_id
     return save_fanqie_accounts(config, path), account
 
 
 def get_fanqie_account(config, account_id=""):
     config = normalize_fanqie_accounts(config)
-    account_id = str(account_id or config.get("selected_account_id", "") or "").strip()
+    account_id = str(account_id or "").strip()
     for account in config["accounts"]:
         if account.get("id") == account_id:
             return deepcopy(account)
@@ -2499,9 +2497,12 @@ class FanqieBatchUploadDialog(QDialog):
             if current_project_path else ""
         )
         project = self._load_selected_project()
+        project_account_id = str(
+            project.get(FANQIE_UPLOAD_SELECTED_ACCOUNT_FIELD, "") or ""
+        ).strip()
         self._selected_account = get_fanqie_account(
             self._accounts_config,
-            self._accounts_config.get("selected_account_id", ""),
+            project_account_id,
         )
         saved_state = _project_fanqie_upload_state(
             project, self._selected_account.get("id", FANQIE_LEGACY_ACCOUNT_ID)
@@ -2862,8 +2863,20 @@ class FanqieBatchUploadDialog(QDialog):
         self._sync_manual_browser_button()
 
     def _save_selected_account(self):
-        self._accounts_config["selected_account_id"] = self._selected_account_id()
-        self._accounts_config = save_fanqie_accounts(self._accounts_config)
+        account_id = self._selected_account_id()
+        path = self._current_project_path
+        if not path or not os.path.isfile(path):
+            return False
+        try:
+            project = deepcopy(self._load_selected_project())
+            project[FANQIE_UPLOAD_SELECTED_ACCOUNT_FIELD] = account_id
+            save_project_file(path, project)
+            self._project_data_cache[path] = load_json_file(path, {})
+            return True
+        except Exception as exc:
+            if hasattr(self, "preview_label"):
+                self.preview_label.setText(f"当前项目帐号绑定保存失败：{clean_error_text(exc)}")
+            return False
 
     def _on_account_changed(self, *_args):
         if not hasattr(self, "mode_buttons"):
@@ -2883,7 +2896,6 @@ class FanqieBatchUploadDialog(QDialog):
             return
         self._selected_account = self._selected_account_record()
         self._last_account_id = selected_account_id
-        self._save_selected_account()
         self._sync_manual_browser_button()
         self._works = []
         self.work_combo.clear()
@@ -3282,6 +3294,13 @@ class FanqieBatchUploadDialog(QDialog):
             )
         except Exception as exc:
             QMessageBox.warning(self, "番茄批量上传", clean_error_text(exc))
+            return
+        if not self._save_selected_account():
+            QMessageBox.warning(
+                self,
+                "番茄批量上传",
+                "当前帐号绑定保存失败，已取消本次上传。",
+            )
             return
         self.accept()
 

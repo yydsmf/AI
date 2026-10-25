@@ -23,6 +23,7 @@ CHAPTER_ANALYSIS_QUICK_SIMILARITY_LOCAL_RATIO_LIMIT = 0.50
 # Keep a reserve for the system prompt and model output while allowing long
 # chapters and loaded style references to retain more quality-critical context.
 NOVEL_AI_CONTEXT_LIMIT = 160000
+FANQIE_UPLOAD_SELECTED_ACCOUNT_FIELD = "fanqie_upload_selected_account_id"
 
 
 def _canonical_chapter_plan_stage_id(value, fallback=""):
@@ -1017,6 +1018,7 @@ def _default_project():
         "foreshadow_items": [],
         "fanqie_upload": _normalize_fanqie_upload_state({}),
         "fanqie_upload_accounts": {},
+        "fanqie_upload_selected_account_id": "",
         "timeline": "",
         "foreshadows": "",
         "summary": "",
@@ -2095,6 +2097,9 @@ def _normalize_project(data):
     base["fanqie_upload_accounts"] = _normalize_fanqie_upload_accounts(
         data.get("fanqie_upload_accounts", {})
     )
+    base["fanqie_upload_selected_account_id"] = str(
+        data.get(FANQIE_UPLOAD_SELECTED_ACCOUNT_FIELD, "") or ""
+    ).strip()
     # ``fanqie_upload`` predates multi-account support. Keep its checkpoint
     # under the legacy account so existing projects continue from the same
     # position after normalization.

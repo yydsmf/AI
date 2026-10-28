@@ -48,6 +48,10 @@ from gpt_desktop.novel_utils import (
     _build_style_persona_context,
     _build_project_timeline_draft,
     _build_writing_check_text,
+    _concrete_prose_expression_guidance,
+    _ensure_final_chapter_completion_marker,
+    _ensure_final_chapter_title_suffix,
+    _is_confirmed_project_final_chapter,
     _infer_foreshadow_status,
     _new_chapter,
     _promote_character_identity,
@@ -62,6 +66,7 @@ from gpt_desktop.novel_utils import (
     _parse_memory_reconciliation_result,
     _parse_style_technique_cards_result,
     _parse_style_voice_cards_result,
+    _procedural_plot_guard_guidance,
     _resolve_long_form_record_ref,
     _merge_long_form_memory_repair_patch,
     _merge_long_form_memory_repair_full,
@@ -105,6 +110,48 @@ from gpt_desktop.novel_utils import (
 
 
 class NovelLongFormContextTests(unittest.TestCase):
+    def test_final_chapter_markers_are_exact_and_idempotent(self):
+        self.assertEqual(
+            _ensure_final_chapter_title_suffix("厂内厂外的灯一起亮"),
+            "厂内厂外的灯一起亮（大结局）",
+        )
+        self.assertEqual(
+            _ensure_final_chapter_title_suffix("厂内厂外的灯一起亮(大结局)"),
+            "厂内厂外的灯一起亮（大结局）",
+        )
+        body = "结局场面完成。"
+        marked = _ensure_final_chapter_completion_marker(body)
+        self.assertEqual(marked.splitlines()[-1], "全书完。")
+        self.assertEqual(_ensure_final_chapter_completion_marker(marked), marked)
+        self.assertEqual(
+            _ensure_final_chapter_completion_marker("结局场面。\n已完结！").splitlines()[-1],
+            "全书完。",
+        )
+        project = {"chapters": [{"title": "终章"}], "meta": {"total_chapter_count": 1}}
+        self.assertTrue(_is_confirmed_project_final_chapter(project, 0))
+        self.assertFalse(_is_confirmed_project_final_chapter({"chapters": [{"title": "草稿"}]}, 0))
+
+    def test_procedural_plot_guard_is_positive_and_applies_to_prose_context(self):
+        guidance = _procedural_plot_guard_guidance()
+        self.assertIn("这不是简单禁词表", guidance)
+        self.assertIn("非法律、非职场、非商业题材", guidance)
+        self.assertIn("合同冲突、公司冲突", guidance)
+        self.assertIn("不要用‘记录、责任线、复核、封存、归档’之类的办案式、案卷式叙事结构去推动剧情", guidance)
+
+        project = self._project_with_current_chapter(_new_chapter(0))
+        context = _build_chapter_ai_context(project, 0, "draft")
+        self.assertIn("这不是简单禁词表", context)
+        self.assertIn("记录本身成为连续事件的发动机", context)
+        self.assertIn("不要用‘记录、责任线、复核、封存、归档’之类的办案式、案卷式叙事结构去推动剧情", context)
+
+    def test_concrete_prose_guidance_rejects_both_stock_contrast_forms(self):
+        for prompt in (
+            _concrete_prose_expression_guidance(),
+            _concrete_prose_expression_guidance(compact=True),
+        ):
+            self.assertIn("A不等于B", prompt)
+            self.assertIn("A不代表B", prompt)
+
     def test_terminal_window_is_derived_from_total_chapter_count(self):
         self.assertEqual(_terminal_window_bounds(167), (163, 167))
         self.assertEqual(_terminal_window_bounds(4), (1, 4))
@@ -2801,11 +2848,9 @@ class NovelLongFormContextTests(unittest.TestCase):
         self.assertIn("不要连续堆姓名、身份、职位或性格标签代替人物表现", context)
         self.assertIn("连续对白不要变成每句都反驳、质问、解释或下结论的对抗式问答", context)
         self.assertIn("不设固定句数、动作频率或统一段落结构", context)
-        self.assertIn("不要求固定交替顺序", context)
         self.assertIn("【对白自然衔接】", context)
         self.assertIn("需要说明来由、指代或态度时，把意思说清楚", context)
         self.assertIn("场景描写优先用具体物件、动作和细节承载情绪", context)
-        self.assertIn("不得用解释式、观点式和“金句式”抽象表达", context)
         self.assertIn("段落结构要有变化", context)
         self.assertNotIn("对白要有真人说话的不完整感", context)
         self.assertNotIn("对白不要每句都完整、漂亮、逻辑闭合", context)
@@ -6102,8 +6147,9 @@ class NovelLongFormContextTests(unittest.TestCase):
 
         context = _build_chapter_ai_context(project, 0, "draft")
 
-        self.assertIn("本章扩写字数：未填写", context)
-        self.assertIn("不要根据项目总目标字数一次性写满", context)
+        self.assertIn("本章扩写字数：1000字", context)
+        self.assertIn("本次新增正文参考目标：约1000字", context)
+        self.assertIn("项目总目标字数只用于整本小说规模规划", context)
         self.assertIn("项目总目标字数：1万字", context)
 
     def test_chapter_draft_words_uses_remaining_words_after_existing_body(self):
@@ -8796,22 +8842,6 @@ class NovelLongFormContextTests(unittest.TestCase):
             execution, fragmented, acceptance, reference, len(fragmented)
         )
         self.assertTrue(any("段落密度" in error or "短段" in error for error in errors))
-
-    def test_draft_context_requires_concrete_state_word_collocations(self):
-        current = _new_chapter(0)
-        current["outline"] = "训练场上，教官阻止顾星河在准备不足时冲关。"
-        context = _build_chapter_ai_context(
-            self._project_with_current_chapter(current),
-            0,
-            "draft",
-        )
-
-        self.assertIn("【具体状态词搭配】", context)
-        self.assertIn("不要把‘完整、正确、成立、合理’等适合结论、资料或关系的抽象词直接套在气血、伤势或力量上", context)
-        self.assertIn("没有药剂辅助，气血稳不住、冲关时会乱或身体扛不住", context)
-        self.assertIn("‘气血变得完整’不自然", context)
-        self.assertIn("能力或条件有差别时落到动作、卡点和后果", context)
-        self.assertIn("不是固定句式", context)
 
     def test_style_finalize_acceptance_blocks_published_boundary_replay(self):
         previous = _new_chapter(0)

@@ -213,6 +213,21 @@ class NovelAnalysisWorkerTests(unittest.TestCase):
                     "chapters": [{"index": 1, "title": title, "outline": "推进主线。"}],
                 })
 
+    def test_chapter_plan_worker_keeps_natural_title_until_apply(self):
+        worker = NovelChapterPlanWorker(
+            "http://example.test", "key", "model", "context", 500000, 2000, 2, 5
+        )
+
+        plan = worker._normalize_plan({
+            "chapters": [
+                {"index": 4, "title": "灯火接上了", "outline": "结果继续成立。"},
+                {"index": 5, "title": "厂内厂外的灯一起亮", "outline": "本部结果落地。"},
+            ],
+        })
+
+        self.assertEqual(plan["chapters"][0]["title"], "灯火接上了")
+        self.assertEqual(plan["chapters"][1]["title"], "厂内厂外的灯一起亮")
+
     def test_chapter_plan_prompt_requires_json_and_chapter_count(self):
         worker = NovelChapterPlanWorker("http://example.test", "key", "model", "context", 200000, 3000, 67, 67)
 
@@ -807,6 +822,7 @@ class NovelAnalysisWorkerTests(unittest.TestCase):
                 self.assertNotIn("每两章至少要让主角", prompt)
                 self.assertIn("不得出现策划术语、抽象形容", prompt)
                 self.assertIn("不要把具体冲突写成抽象的权利、资格、归属、责任或关系宣言", prompt)
+                self.assertIn("不要用‘记录、责任线、复核、封存、归档’之类的办案式、案卷式叙事结构去推动剧情", prompt)
                 self.assertIn("正文尽量少用‘决定’‘选择’‘不代表’等抽象词", prompt)
                 self.assertIn("不要用‘第一步、第二步、第三步’或同类清单概括人物接下来要做什么", prompt)
                 self.assertIn("不设固定句数、动作频率或统一段落结构", prompt)
@@ -1613,7 +1629,7 @@ class NovelAnalysisWorkerTests(unittest.TestCase):
             [1, 2],
         )
 
-        self.assertEqual(titles, ["会议室里的选择", "沉默的副创始人"])
+        self.assertEqual(titles, ["会议室里的选择", "沉默的副创始人（大结局）"])
 
     def test_chapter_title_prompt_avoids_overstyled_templates(self):
         worker = NovelChapterTitleWorker(
@@ -1636,6 +1652,7 @@ class NovelAnalysisWorkerTests(unittest.TestCase):
         self.assertIn("previous_titles", prompt)
         self.assertIn("is_final_chapter=true", prompt)
         self.assertIn("已经完成的结果、稳定状态、可信时间落点", prompt)
+        self.assertIn("程序会统一追加“（大结局）”", prompt)
 
     def test_chapter_title_keeps_sentence_comma_inside_title(self):
         worker = NovelChapterTitleWorker(
@@ -1653,7 +1670,7 @@ class NovelAnalysisWorkerTests(unittest.TestCase):
             [1],
         )
 
-        self.assertEqual(titles, ["他要进山，先过这一关"])
+        self.assertEqual(titles, ["他要进山，先过这一关（大结局）"])
 
     def test_chapter_title_batch_omits_style_hints_and_includes_previous_titles(self):
         worker = NovelChapterTitleWorker(
@@ -1702,14 +1719,14 @@ class NovelAnalysisWorkerTests(unittest.TestCase):
             [1, 2],
         )
 
-        self.assertEqual(titles, ["选择", "非常非常非常非常非常非常长的标题"])
+        self.assertEqual(titles, ["选择", "非常非常非常非常非常非常长的标题（大结局）"])
 
         titles = worker._normalize_titles_response(
             {"titles": [{"index": 1, "title": "会议室里的选择"}, {"index": 2, "title": "会议室里的选择"}]},
             [1, 2],
         )
 
-        self.assertEqual(titles, ["会议室里的选择", "会议室里的选择"])
+        self.assertEqual(titles, ["会议室里的选择", "会议室里的选择（大结局）"])
 
     def test_chapter_title_worker_retries_only_missing_items_in_batch(self):
         worker = NovelChapterTitleWorker(
@@ -1740,7 +1757,7 @@ class NovelAnalysisWorkerTests(unittest.TestCase):
             1,
         )
 
-        self.assertEqual(titles, ["会议室里的选择", "沉默的副创始人"])
+        self.assertEqual(titles, ["会议室里的选择", "沉默的副创始人（大结局）"])
         self.assertEqual(calls[0][0], [1, 2])
         self.assertEqual(calls[1][0], [2])
         self.assertEqual(calls[1][1], "1.补缺")
@@ -1813,7 +1830,7 @@ class NovelAnalysisWorkerTests(unittest.TestCase):
         worker.run()
 
         self.assertEqual(errors, [])
-        self.assertEqual(results, [["会议室里的选择", "沉默的副创始人", "第三次转身"]])
+        self.assertEqual(results, [["会议室里的选择", "沉默的副创始人", "第三次转身（大结局）"]])
 
     def test_chapter_title_worker_batches_long_chapters(self):
         worker = NovelChapterTitleWorker(
@@ -1857,7 +1874,7 @@ class NovelAnalysisWorkerTests(unittest.TestCase):
             1,
         )
 
-        self.assertEqual(titles, ["会议室里的选择"])
+        self.assertEqual(titles, ["会议室里的选择（大结局）"])
         self.assertEqual(len(calls), 2)
         self.assertFalse(calls[-1][2][1])
 

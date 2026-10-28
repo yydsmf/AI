@@ -335,7 +335,7 @@ class NovelCreationWizardPersistenceTests(unittest.TestCase):
         contract = foundation["terminal_contract"]
         self.assertIn("供水系统完成修复并连续运行。", contract["required_results"])
         self.assertIn("搭档愿意共同留下", contract["relationship_results"])
-        self.assertEqual(contract["chapter_roles"][-1]["position"], 5)
+        self.assertNotIn("chapter_roles", contract)
         self.assertEqual(contract["closure_mode"], "mirror_scene")
         self.assertEqual(contract["closure_horizon"], "一年后")
         self.assertTrue(contract["time_jump_allowed"])
@@ -345,7 +345,7 @@ class NovelCreationWizardPersistenceTests(unittest.TestCase):
         )
         terminal_stage = foundation["structured_stages"][-1]
         terminal_event = terminal_stage["ordered_events"][-1]
-        self.assertEqual(terminal_event["terminal_role"], "最终结果与稳定落点")
+        self.assertNotIn("terminal_role", terminal_event)
         self.assertEqual(terminal_stage["terminal_contract"]["version"], "1")
         self.assertEqual(terminal_stage["closure_plan"]["closure_mode"], "mirror_scene")
 

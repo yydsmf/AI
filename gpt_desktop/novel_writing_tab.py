@@ -186,6 +186,9 @@ from .novel_utils import (
     _core_motive_progression_guidance,
     _terminal_window_bounds,
     _procedural_plot_guard_guidance,
+    _ensure_final_chapter_title_suffix,
+    _ensure_final_chapter_completion_marker,
+    _is_confirmed_project_final_chapter,
     _build_volume_handoff_source,
     _build_volume_handoff_record_catalog,
     _compact_volume_continuity_anchors,
@@ -5195,6 +5198,14 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
             if hasattr(self, "fanqie_upload_btn"):
                 self.fanqie_upload_btn.setText("中止番茄上传")
         title = str(config.get("platform_work_title", "") or "番茄目标作品").strip()
+        task_kind = str(config.get("task_kind", "upload") or "upload").strip().lower()
+        if task_kind == "revise_existing":
+            selected_count = len(config.get("selected_chapter_numbers", []) or [])
+            self.set_status_tip(
+                f"已启动番茄批量修订：{title}，将按章节号覆盖 {selected_count} 个已有章节。"
+            )
+            worker.start()
+            return
         mode_label = {
             "draft": "保存草稿",
             "direct_publish": "直接发布",
@@ -5213,12 +5224,18 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
             return
         if isinstance(state, dict):
             account_id = str(state.get("account_id", "") or "").strip() or FANQIE_LEGACY_ACCOUNT_ID
-            states = self.current_project.setdefault("fanqie_upload_accounts", {})
+            task_kind = str(state.get("task_kind", "upload") or "upload").strip().lower()
+            state_key = (
+                "fanqie_revision_accounts"
+                if task_kind == "revise_existing"
+                else "fanqie_upload_accounts"
+            )
+            states = self.current_project.setdefault(state_key, {})
             if not isinstance(states, dict):
                 states = {}
-                self.current_project["fanqie_upload_accounts"] = states
+                self.current_project[state_key] = states
             states[account_id] = deepcopy(state)
-            if account_id == FANQIE_LEGACY_ACCOUNT_ID:
+            if state_key == "fanqie_upload_accounts" and account_id == FANQIE_LEGACY_ACCOUNT_ID:
                 self.current_project["fanqie_upload"] = deepcopy(state)
 
     def _on_fanqie_upload_chapter_succeeded(self, project_path, item):
@@ -5226,6 +5243,10 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
             return
         number = item.get("chapter_number", "") if isinstance(item, dict) else ""
         mode = item.get("mode", "draft") if isinstance(item, dict) else "draft"
+        task_kind = item.get("task_kind", "upload") if isinstance(item, dict) else "upload"
+        if task_kind == "revise_existing":
+            self.set_status_tip(f"番茄批量修订：第{number}章标题和正文已覆盖保存。")
+            return
         action = {
             "draft": "草稿已保存",
             "direct_publish": "已直接发布",
@@ -5240,6 +5261,11 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
         if self._canonical_project_path(self.current_project_path) != self._canonical_project_path(project_path):
             return
         if status == "completed":
+            task_kind = str(state.get("task_kind", "upload") or "upload") if isinstance(state, dict) else "upload"
+            if task_kind == "revise_existing":
+                count = len(state.get("selected_chapter_numbers", []) or []) if isinstance(state, dict) else 0
+                self.set_status_tip(f"番茄批量修订完成，已覆盖保存 {count} 个章节。")
+                return
             mode = str(state.get("mode", "draft") or "draft") if isinstance(state, dict) else "draft"
             action = {
                 "draft": "保存为草稿",
@@ -5264,10 +5290,17 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
     def _on_fanqie_upload_failed(self, project_path, message):
         if self._canonical_project_path(self.current_project_path) == self._canonical_project_path(project_path):
             state = self.current_project.get("fanqie_upload", {}) if isinstance(self.current_project, dict) else {}
-            states = self.current_project.get("fanqie_upload_accounts", {}) if isinstance(self.current_project, dict) else {}
-            if isinstance(states, dict) and states:
+            candidate_states = []
+            if isinstance(self.current_project, dict):
+                for state_key in ("fanqie_upload_accounts", "fanqie_revision_accounts"):
+                    states = self.current_project.get(state_key, {})
+                    if isinstance(states, dict):
+                        candidate_states.extend(
+                            item for item in states.values() if isinstance(item, dict)
+                        )
+            if candidate_states:
                 state = max(
-                    (item for item in states.values() if isinstance(item, dict)),
+                    candidate_states,
                     key=lambda item: str(item.get("updated_at", "") or ""),
                     default=state,
                 )
@@ -9661,6 +9694,10 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
                 ),
                 "stage_boundary_rule": "当前阶段的事件、人物、关系和后果在本阶段自然展开，下一阶段承接上一阶段留下的变化继续发展。",
                 "material_rule": "项目资料是只读事实底稿，不重新生成，不把背景资料自动变成章节任务。",
+                "story_scene_rule": (
+                    "遵循系统提示中的共享程序性事项边界；每章优先由当前题材的具体场景和人物行动推进，"
+                    "程序性事项不替代人物冲突。"
+                ),
                 "core_motive_rule": (
                     "核心动机必须作为具体因果主线执行：主角为了完成明确目标主动行动，遇到阻碍并付出代价，"
                     "当前结果再打开下一道具体目标；不能只写主角被动不断遇到新事件。"
@@ -9865,9 +9902,10 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
             ""
         )
         terminal_title_guidance = (
-            "最后一章的标题也要有收尾语义：优先从已经完成的结果、稳定状态、可信时间落点、开头呼应的地点/物件/动作或关系变化中自然命名；"
-            "不要只写‘大结局’‘尘埃落定’‘新的开始’等空泛词，也不要为了体现完结强行添加固定尾词。标题必须对应本章真正出现的画面或结果，且不能引入新的任务和悬念。\n\n"
-            if terminal_batch_overlap and terminal_contract else
+            "最后一章先从已经完成的结果、稳定状态、可信时间落点、开头呼应的地点/物件/动作或关系变化中自然命名标题主体；"
+            "不要只写‘大结局’‘尘埃落定’‘新的开始’等空泛词，也不要为了体现完结自行添加固定尾词。标题必须对应本章真正出现的画面或结果，且不能引入新的任务和悬念；"
+            "程序会在最终标题落盘时统一追加‘（大结局）’，模型只输出自然标题主体。\n\n"
+            if terminal_batch_overlap else
             ""
         )
         core_motive_guidance = (
@@ -9910,8 +9948,8 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
             "生成前逐项核对标题，重复时必须改成能对应本章具体事件、人物行动或结果的新标题。\n\n"
             "不要像编辑解释本章功能，不要写‘推动剧情、关系推进、制造悬念、完成任务、阶段作用’等空泛任务词，"
             "不要解释本章意义、主题、节奏、主线、人物弧线或读者效果。"
-            + _procedural_plot_guard_guidance()
-            + "章节不能写成案卷、办案报告、审查流程或资料处理；不得让抽象说明、流程往来或结论宣告代替人物在现场的行动和冲突。"
+            "以上共享叙事边界适用于全书章节规划，不只适用于最后5章。每章优先写当前题材里的具体场面和人物正在做的事："
+            "谁在什么处境中采取行动，遇到什么现场阻力，作出什么选择，带来什么关系或局势后果。"
             "输入资料里的抽象总结只作为事实参考，要改写成具体人物、地点、动作、阻力、结果和状态变化；"
             "人物认知变化必须落到看见、听见、当场反应、决定和现实后果。不要写‘章末留下悬念’或‘读者会继续追问’，直接写章末发生的具体事情。"
             "每章都要让人物在具体场景中遇到阻力并采取行动；随着章节推进，优先安排人物对抗、关系变化、利益争夺、环境压力、能力试探或突发后果，让读者看到事情正在发生，而不是看到一份事情说明。"
@@ -9923,6 +9961,7 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
             + terminal_transition_guidance
             + terminal_contract_guidance
             + core_motive_guidance
+            + _procedural_plot_guard_guidance()
             + "\n"
         )
         if creation_wizard_source:
@@ -11989,6 +12028,11 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
             }
             chapter["status"] = "大纲"
             chapters.append(chapter)
+        if chapters and _is_confirmed_project_final_chapter(self.current_project, len(chapters) - 1):
+            final_chapter = chapters[-1]
+            final_title = _ensure_final_chapter_title_suffix(final_chapter.get("title", ""))
+            if final_title:
+                final_chapter["title"] = final_title
         plan_summary = str(plan.get("summary", "") or "").strip()
         if plan_summary:
             note_block = f"阶段规划摘要：\n{plan_summary}"
@@ -15744,6 +15788,8 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
         )
         if not memory_changed:
             return None, False, "", "", "", ""
+        if _is_confirmed_project_final_chapter(self.current_project, chapter_index):
+            new_text = _ensure_final_chapter_completion_marker(new_text)
         staged_chapter["text"] = new_text
         bundle = bundle if isinstance(bundle, dict) else {}
         outline = str(bundle.get("outline", "") or "").strip()
@@ -20281,6 +20327,11 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
             ]
             chapter["status"] = "大纲"
             chapters.append(chapter)
+        if chapters and _is_confirmed_project_final_chapter(self.current_project, len(chapters) - 1):
+            final_chapter = chapters[-1]
+            final_title = _ensure_final_chapter_title_suffix(final_chapter.get("title", ""))
+            if final_title:
+                final_chapter["title"] = final_title
         self.current_project.pop("chapter_plan_generation_state", None)
         self.current_project.pop("chapter_plan_foundation", None)
         self._last_framework_direct_import_count = len(chapters_plan)

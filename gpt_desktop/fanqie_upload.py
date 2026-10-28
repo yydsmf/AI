@@ -15,10 +15,11 @@ import uuid
 from copy import deepcopy
 from datetime import datetime
 from html import unescape
-from urllib.parse import parse_qs, urlsplit
+from urllib.parse import parse_qs, urljoin, urlsplit
 
 from PySide6.QtCore import QDate, QTime, QThread, Qt, Signal
 from PySide6.QtWidgets import (
+    QAbstractItemView,
     QButtonGroup,
     QCheckBox,
     QComboBox,
@@ -26,6 +27,7 @@ from PySide6.QtWidgets import (
     QDialogButtonBox,
     QDateEdit,
     QFormLayout,
+    QHeaderView,
     QHBoxLayout,
     QInputDialog,
     QLabel,
@@ -35,6 +37,8 @@ from PySide6.QtWidgets import (
     QRadioButton,
     QSizePolicy,
     QSpinBox,
+    QTableWidget,
+    QTableWidgetItem,
     QTimeEdit,
     QVBoxLayout,
 )
@@ -54,6 +58,7 @@ FANQIE_WRITER_ZONE_URL = "https://fanqienovel.com/writer/zone/"
 FANQIE_AUTHOR_HOME_URL = "https://fanqienovel.com/main/writer/?enter_from=author_zone"
 FANQIE_BOOK_MANAGE_URL = "https://fanqienovel.com/main/writer/book-manage"
 FANQIE_PUBLISH_URL_TEMPLATE = "https://fanqienovel.com/main/writer/{work_id}/publish/"
+FANQIE_CHAPTER_MANAGE_URL_TEMPLATE = "https://fanqienovel.com/main/writer/chapter-manage/{work_id}"
 FANQIE_PROFILE_DIR = os.path.join(APP_DIR, "fanqie_browser_profile")
 FANQIE_ACCOUNTS_FILE = os.path.join(APP_DIR, "fanqie_accounts.json")
 FANQIE_BROWSER_PROFILES_DIR = os.path.join(APP_DIR, "fanqie_browser_profiles")
@@ -61,6 +66,7 @@ FANQIE_LEGACY_ACCOUNT_ID = "legacy"
 FANQIE_UPLOAD_SCHEMA_VERSION = 1
 FANQIE_UPLOAD_MODES = {"draft", "direct_publish", "scheduled_publish"}
 FANQIE_WORK_TYPES = {"unknown", "serial", "completed"}
+FANQIE_TASK_TYPES = {"upload", "revise_existing"}
 FANQIE_BROWSER_LAUNCH_TIMEOUT_MS = 30000
 FANQIE_BROWSER_PROFILE_LOCK_TIMEOUT_SECONDS = 45
 FANQIE_BROWSER_LAUNCH_RETRIES = 2
@@ -227,6 +233,37 @@ def _project_fanqie_upload_state(project, account_id=FANQIE_LEGACY_ACCOUNT_ID):
     if account_id == FANQIE_LEGACY_ACCOUNT_ID:
         return normalize_fanqie_upload_state(project.get("fanqie_upload", {}))
     return normalize_fanqie_upload_state({})
+
+
+def _project_fanqie_revision_state(project, account_id=FANQIE_LEGACY_ACCOUNT_ID):
+    """Return the checkpoint for a batch revision task only.
+
+    Revision still receives its target work and options from the ordinary
+    upload state in the dialog.  Its progress is stored separately so a
+    revision can never turn the ordinary upload checkpoint into a revision
+    checkpoint.
+    """
+    project = project if isinstance(project, dict) else {}
+    account_id = str(account_id or FANQIE_LEGACY_ACCOUNT_ID).strip() or FANQIE_LEGACY_ACCOUNT_ID
+    states = project.get("fanqie_revision_accounts", {})
+    if isinstance(states, dict) and isinstance(states.get(account_id), dict):
+        return normalize_fanqie_upload_state(states.get(account_id))
+    return normalize_fanqie_upload_state({})
+
+
+def _fanqie_project_title(project, project_path=""):
+    """Return the local project title used to match a platform work safely."""
+    project = project if isinstance(project, dict) else {}
+    meta = project.get("meta", {})
+    title = str(meta.get("title", "") or "").strip() if isinstance(meta, dict) else ""
+    if title:
+        return title
+    return os.path.splitext(os.path.basename(str(project_path or "")))[0].strip()
+
+
+def _fanqie_title_key(value):
+    """Normalize harmless wrapper/spacing differences for work-title matching."""
+    return re.sub(r"[\s\u3000]+", "", str(value or "")).strip("《》").casefold()
 
 
 def _playwright_launched_pid(error):
@@ -427,6 +464,112 @@ def _chapter_id(chapter, index):
     return f"chapter-{index + 1}"
 
 
+def parse_fanqie_chapter_numbers(value, max_chapter=None):
+    """Parse comma-like chapter selections such as ``4、12、33-38``."""
+    text = str(value or "").strip()
+    numbers = set()
+    errors = []
+    if not text:
+        return {"numbers": [], "errors": []}
+    try:
+        max_number = int(max_chapter) if max_chapter is not None else None
+    except (TypeError, ValueError):
+        max_number = None
+    tokens = [item.strip() for item in re.split(r"[、,，;；\n\r]+", text) if item.strip()]
+    for token in tokens:
+        range_match = re.fullmatch(r"(\d+)\s*[-－—~～]\s*(\d+)", token)
+        if range_match:
+            start = int(range_match.group(1))
+            end = int(range_match.group(2))
+            if start <= 0 or end <= 0:
+                errors.append(f"章节号必须大于0：{token}")
+                continue
+            if start > end:
+                errors.append(f"章节范围顺序无效：{token}")
+                continue
+            if max_number is not None and end > max_number:
+                errors.append(f"{token}超出当前项目章节数（共{max_number}章）")
+                end = max_number
+            numbers.update(range(start, end + 1))
+            continue
+        if re.fullmatch(r"\d+", token):
+            number = int(token)
+            if number <= 0:
+                errors.append(f"章节号必须大于0：{token}")
+                continue
+            if max_number is not None and number > max_number:
+                errors.append(f"第{number}章超出当前项目章节数（共{max_number}章）")
+                continue
+            numbers.add(number)
+            continue
+        errors.append(f"无法识别的章节号：{token}")
+    return {"numbers": sorted(numbers), "errors": errors}
+
+
+def _validate_chapter_numbers(project, numbers):
+    project = project if isinstance(project, dict) else {}
+    chapters = project.get("chapters", [])
+    chapters = chapters if isinstance(chapters, list) else []
+    normalized_numbers = []
+    for value in numbers if isinstance(numbers, (list, tuple, set)) else []:
+        try:
+            number = int(value)
+        except (TypeError, ValueError):
+            continue
+        if number > 0 and number not in normalized_numbers:
+            normalized_numbers.append(number)
+    numbers = sorted(normalized_numbers)
+    errors = []
+    warnings = []
+    if not chapters:
+        return {"errors": ["当前项目没有章节。"], "warnings": [], "count": 0, "word_count": 0}
+    if not numbers:
+        return {"errors": ["请至少选择一个章节。"], "warnings": [], "count": 0, "word_count": 0}
+    if any(number > len(chapters) for number in numbers):
+        errors.append(f"章节号超出当前项目，共有 {len(chapters)} 章。")
+    if errors:
+        return {"errors": errors, "warnings": warnings, "count": 0, "word_count": 0}
+    seen_ids = set()
+    word_count = 0
+    for number in numbers:
+        chapter = chapters[number - 1]
+        if not isinstance(chapter, dict):
+            errors.append(f"第{number}章数据不是有效章节记录。")
+            continue
+        title = str(chapter.get("title", "") or "").strip()
+        text = str(chapter.get("text", "") or "").strip()
+        word_count += _body_display_len(text)
+        if not title:
+            errors.append(f"第{number}章缺少章节标题。")
+        if not text:
+            errors.append(f"第{number}章没有正文，不能上传。")
+        chapter_id = _chapter_id(chapter, number - 1)
+        if chapter_id in seen_ids:
+            errors.append(f"第{number}章与选择范围内其他章节使用了重复章节 ID。")
+        seen_ids.add(chapter_id)
+        if len(text) < 80:
+            warnings.append(f"第{number}章正文只有 {len(text)} 个字符，请确认不是空壳章节。")
+    return {
+        "errors": errors,
+        "warnings": warnings,
+        "count": len(numbers),
+        "word_count": word_count,
+    }
+
+
+def validate_selected_chapter_numbers(project, chapter_numbers):
+    """Validate a possibly non-contiguous list used by batch revision."""
+    normalized = []
+    for value in chapter_numbers if isinstance(chapter_numbers, (list, tuple, set)) else []:
+        try:
+            number = int(value)
+        except (TypeError, ValueError):
+            continue
+        if number > 0 and number not in normalized:
+            normalized.append(number)
+    return _validate_chapter_numbers(project, sorted(normalized))
+
+
 def validate_chapter_upload_range(project, start_chapter, end_chapter):
     """Return errors/warnings for the selected local chapter range."""
     project = project if isinstance(project, dict) else {}
@@ -447,32 +590,10 @@ def validate_chapter_upload_range(project, start_chapter, end_chapter):
         errors.append(f"章节范围超出当前项目，共有 {len(chapters)} 章。")
     if errors:
         return {"errors": errors, "warnings": warnings, "count": 0, "word_count": 0}
-    seen_ids = set()
-    word_count = 0
-    for number in range(start, end + 1):
-        chapter = chapters[number - 1]
-        if not isinstance(chapter, dict):
-            errors.append(f"第{number}章数据不是有效章节记录。")
-            continue
-        title = str(chapter.get("title", "") or "").strip()
-        text = str(chapter.get("text", "") or "").strip()
-        word_count += _body_display_len(text)
-        if not title:
-            errors.append(f"第{number}章缺少章节标题。")
-        if not text:
-            errors.append(f"第{number}章没有正文，不能上传。")
-        chapter_id = _chapter_id(chapter, number - 1)
-        if chapter_id in seen_ids:
-            errors.append(f"第{number}章与范围内其他章节使用了重复章节 ID。")
-        seen_ids.add(chapter_id)
-        if len(text) < 80:
-            warnings.append(f"第{number}章正文只有 {len(text)} 个字符，请确认不是空壳章节。")
-    return {
-        "errors": errors,
-        "warnings": warnings,
-        "count": max(0, end - start + 1),
-        "word_count": word_count,
-    }
+    result = _validate_chapter_numbers(project, list(range(start, end + 1)))
+    result["errors"] = errors + result["errors"]
+    result["warnings"] = warnings + result["warnings"]
+    return result
 
 
 def build_fanqie_upload_task(project_path, config, project=None):
@@ -482,9 +603,30 @@ def build_fanqie_upload_task(project_path, config, project=None):
     if not isinstance(project, dict):
         raise FanqieUploadError("无法读取要上传的本地项目。")
     chapters = project.get("chapters", []) if isinstance(project.get("chapters"), list) else []
-    start = _as_int(config.get("start_chapter", 1), 1, 1)
-    end = _as_int(config.get("end_chapter", len(chapters)), len(chapters), 0)
-    validation = validate_chapter_upload_range(project, start, end)
+    task_kind = str(config.get("task_kind", "upload") or "upload").strip().lower()
+    if task_kind not in FANQIE_TASK_TYPES:
+        raise FanqieUploadError(f"不支持的番茄任务类型：{task_kind}")
+    selected_chapter_numbers = []
+    if task_kind == "revise_existing":
+        raw_numbers = config.get("selected_chapter_numbers", [])
+        for value in raw_numbers if isinstance(raw_numbers, (list, tuple, set)) else []:
+            try:
+                number = int(value)
+            except (TypeError, ValueError):
+                continue
+            if number > 0 and number not in selected_chapter_numbers:
+                selected_chapter_numbers.append(number)
+        selected_chapter_numbers.sort()
+        validation = validate_selected_chapter_numbers(project, selected_chapter_numbers)
+        if validation["errors"]:
+            raise FanqieUploadError("\n".join(validation["errors"]))
+        start = min(selected_chapter_numbers)
+        end = max(selected_chapter_numbers)
+    else:
+        start = _as_int(config.get("start_chapter", 1), 1, 1)
+        end = _as_int(config.get("end_chapter", len(chapters)), len(chapters), 0)
+        validation = validate_chapter_upload_range(project, start, end)
+        selected_chapter_numbers = []
     if validation["errors"]:
         raise FanqieUploadError("\n".join(validation["errors"]))
     work_id = str(config.get("platform_work_id", "") or "").strip()
@@ -492,6 +634,15 @@ def build_fanqie_upload_task(project_path, config, project=None):
     work_url = str(config.get("platform_work_url", "") or "").strip()
     if not work_id and not work_url:
         raise FanqieUploadError("请选择番茄后台的目标作品。")
+    local_title = _fanqie_project_title(project, project_path)
+    if work_title and (
+        not local_title or _fanqie_title_key(local_title) != _fanqie_title_key(work_title)
+    ):
+        raise FanqieUploadError(
+            "本地项目名称与番茄目标作品名称不一致，已拒绝任务。\n"
+            f"本地项目：{local_title or '未命名项目'}\n"
+            f"番茄作品：{work_title or '未命名作品'}"
+        )
     if not work_title:
         work_title = work_id or "番茄目标作品"
     mode = _normalize_upload_mode(config.get("mode", "draft"))
@@ -504,7 +655,7 @@ def build_fanqie_upload_task(project_path, config, project=None):
     schedule_entries = []
     schedule_start_date = str(config.get("schedule_start_date", "") or "").strip()
     schedule_start_time = str(config.get("schedule_start_time", "") or "").strip()
-    if mode == "scheduled_publish":
+    if mode == "scheduled_publish" and task_kind == "upload":
         selected = []
         for number in range(start, end + 1):
             chapter = chapters[number - 1]
@@ -530,6 +681,8 @@ def build_fanqie_upload_task(project_path, config, project=None):
         "platform_work_id": work_id,
         "platform_work_title": work_title,
         "platform_work_url": work_url,
+        "task_kind": task_kind,
+        "selected_chapter_numbers": selected_chapter_numbers,
         "start_chapter": start,
         "end_chapter": end,
         "mode": mode,
@@ -863,6 +1016,11 @@ class _FanqieBrowserSession:
                         item = locator.nth(index)
                         if not item.is_visible():
                             continue
+                        try:
+                            if not item.is_enabled():
+                                continue
+                        except Exception:
+                            pass
                         item.click(timeout=7000)
                         return True
                 except Exception:
@@ -873,6 +1031,11 @@ class _FanqieBrowserSession:
                 item = locator.nth(index)
                 if not item.is_visible():
                     continue
+                try:
+                    if not item.is_enabled():
+                        continue
+                except Exception:
+                    pass
                 label = str(item.inner_text(timeout=1000) or "").strip()
                 if label not in names:
                     continue
@@ -894,17 +1057,42 @@ class _FanqieBrowserSession:
         deadline = time.monotonic() + max(0.1, float(timeout_ms) / 1000.0)
         while time.monotonic() < deadline:
             for selector in selectors:
-                if self._has_visible((selector,)):
-                    return True
+                try:
+                    locator = self.page.locator(selector)
+                    for index in range(min(locator.count(), 8)):
+                        item = locator.nth(index)
+                        if not item.is_visible():
+                            continue
+                        try:
+                            if not item.is_enabled():
+                                continue
+                        except Exception:
+                            pass
+                        return True
+                except Exception:
+                    continue
             if self._wait_for_text(names, exact=True, timeout_ms=150):
                 return True
             try:
                 self.page.wait_for_timeout(FANQIE_UI_READY_POLL_MS)
             except Exception:
                 time.sleep(FANQIE_UI_READY_POLL_MS / 1000.0)
-        return any(self._has_visible((selector,)) for selector in selectors) or self._wait_for_text(
-            names, exact=True, timeout_ms=100
-        )
+        for selector in selectors:
+            try:
+                locator = self.page.locator(selector)
+                for index in range(min(locator.count(), 8)):
+                    item = locator.nth(index)
+                    if not item.is_visible():
+                        continue
+                    try:
+                        if not item.is_enabled():
+                            continue
+                    except Exception:
+                        pass
+                    return True
+            except Exception:
+                continue
+        return self._wait_for_text(names, exact=True, timeout_ms=100)
 
     def _wait_for_text(self, names, exact=False, timeout_ms=10000):
         """Wait for one of the visible text controls used by the editor."""
@@ -917,8 +1105,20 @@ class _FanqieBrowserSession:
                 try:
                     locator = get_by_text(name, exact=exact)
                     for index in range(min(locator.count(), 8)):
-                        if locator.nth(index).is_visible():
-                            return True
+                        item = locator.nth(index)
+                        if not item.is_visible():
+                            continue
+                        try:
+                            tag_name = str(item.evaluate("element => element.tagName") or "").upper()
+                        except Exception:
+                            tag_name = ""
+                        if tag_name == "BUTTON":
+                            try:
+                                if not item.is_enabled():
+                                    continue
+                            except Exception:
+                                pass
+                        return True
                 except Exception:
                     continue
             try:
@@ -1597,12 +1797,24 @@ class _FanqieBrowserSession:
         detail = last_feedback or "未收到发布接口成功响应或页面成功提示"
         raise FanqieUploadError(f"番茄{('定时' if mode == 'scheduled_publish' else '直接')}发布结果未确认：{detail}")
 
-    def _publish_chapter(self, title, text, mode, scheduled_at, use_ai, progress):
+    def _publish_chapter(
+        self,
+        title,
+        text,
+        mode,
+        scheduled_at,
+        use_ai,
+        progress,
+        revise_existing=False,
+    ):
         if mode not in {"direct_publish", "scheduled_publish"}:
             raise FanqieUploadError(f"不支持的发布模式：{mode}")
-        progress(
-            f"正在{('定时' if mode == 'scheduled_publish' else '直接')}发布《{title}》..."
-        )
+        if revise_existing:
+            progress(f"正在提交《{title}》修订...")
+        else:
+            progress(
+                f"正在{('定时' if mode == 'scheduled_publish' else '直接')}发布《{title}》..."
+            )
         verdict_holder = {}
         listener = self._publish_response_handler(verdict_holder)
         listener_supported = callable(getattr(self.page, "on", None))
@@ -1717,6 +1929,163 @@ class _FanqieBrowserSession:
                         continue
         except Exception:
             pass
+        return False
+
+    def _click_existing_chapter(
+        self,
+        chapter_number,
+        number_selectors,
+        title_selectors=None,
+        body_selectors=None,
+        work_url="",
+    ):
+        """Open an existing chapter by number and wait for the normal editor."""
+        chapter_number = str(chapter_number or "").strip()
+        if not chapter_number:
+            return False
+        title_selectors = tuple(title_selectors or ())
+        body_selectors = tuple(
+            body_selectors
+            or (".serial-editor .ProseMirror", ".ProseMirror", "[contenteditable='true']")
+        )
+
+        def editor_ready():
+            current_number = self._read_first_input_value(number_selectors)
+            if current_number != chapter_number:
+                return False
+            if title_selectors and not self._has_visible(title_selectors):
+                return False
+            return self._has_visible(body_selectors)
+
+        def wait_for_editor(timeout_ms=8000):
+            deadline = time.monotonic() + max(0.1, float(timeout_ms) / 1000.0)
+            while time.monotonic() < deadline:
+                if editor_ready():
+                    return True
+                try:
+                    self.page.wait_for_timeout(FANQIE_UI_READY_POLL_MS)
+                except Exception:
+                    time.sleep(FANQIE_UI_READY_POLL_MS / 1000.0)
+            return editor_ready()
+
+        if editor_ready():
+            return True
+
+        work_id = _extract_id_from_url(work_url)
+        if not work_id:
+            work_id = _extract_id_from_url(str(getattr(self.page, "url", "") or ""))
+        if work_id:
+            try:
+                self._goto(FANQIE_CHAPTER_MANAGE_URL_TEMPLATE.format(work_id=work_id))
+            except Exception:
+                return False
+
+        number_pattern = re.compile(
+            rf"(?:第\s*){re.escape(chapter_number)}\s*章(?:\D|$)"
+        )
+
+        def click_editor_link_in_rows(timeout_ms=0):
+            """Click the edit link in the row whose chapter number matches.
+
+            The management page renders only 15 rows initially.  Search
+            results are also loaded asynchronously, so a single immediate
+            scan can miss a real chapter and incorrectly report that it does
+            not exist.  Poll the rendered rows for the requested number while
+            keeping the chapter number as the only matching key.
+            """
+            deadline = time.monotonic() + max(0.0, float(timeout_ms) / 1000.0)
+            attempted_hrefs = set()
+            while True:
+                try:
+                    rows = self.page.locator("tr")
+                    for index in range(min(rows.count(), 400)):
+                        row = rows.nth(index)
+                        try:
+                            if not row.is_visible():
+                                continue
+                            text = str(row.inner_text(timeout=1000) or "").strip()
+                        except Exception:
+                            continue
+                        if not number_pattern.search(text):
+                            continue
+                        links = row.locator("a[href*='/publish/'][href*='modifychapter']")
+                        for link_index in range(min(links.count(), 4)):
+                            link = links.nth(link_index)
+                            if not link.is_visible():
+                                continue
+                            href = str(link.get_attribute("href") or "").strip()
+                            if href and href in attempted_hrefs:
+                                continue
+                            if href:
+                                attempted_hrefs.add(href)
+                            absolute_href = urljoin(
+                                str(getattr(self.page, "url", "") or ""),
+                                href,
+                            ) if href else ""
+                            if absolute_href:
+                                try:
+                                    # The chapter row already exposes the
+                                    # exact edit route. Navigate to it
+                                    # directly instead of relying on a click
+                                    # inside a virtualized/search table.
+                                    self._goto(absolute_href)
+                                    if wait_for_editor(timeout_ms=12000):
+                                        return True
+                                except Exception:
+                                    pass
+                            try:
+                                link.click(timeout=7000)
+                            except Exception:
+                                continue
+                            if wait_for_editor(timeout_ms=12000):
+                                return True
+                except Exception:
+                    pass
+                if time.monotonic() >= deadline:
+                    return False
+                try:
+                    remaining_ms = max(1, int((deadline - time.monotonic()) * 1000))
+                    self.page.wait_for_timeout(min(FANQIE_UI_READY_POLL_MS, remaining_ms))
+                except Exception:
+                    time.sleep(min(FANQIE_UI_READY_POLL_MS, max(1, int((deadline - time.monotonic()) * 1000))) / 1000.0)
+
+        if click_editor_link_in_rows():
+            return True
+
+        # The chapter-management page exposes a search trigger instead of
+        # loading all chapters at once.  Search by the absolute number and
+        # then click only the edit link in the matching result row.
+        if self._click_text(("搜索章节",), exact=True):
+            search_selectors = (
+                "input[placeholder='输入章节名称或章节号']",
+                "input[placeholder*='章节名称']",
+                "input[placeholder*='章节号']",
+            )
+            if self._wait_for_visible(search_selectors, timeout_ms=5000) and self._fill_controlled_first(
+                search_selectors, chapter_number
+            ):
+                # Current versions search on blur.  Enter also triggers the
+                # query on versions that use a form submit instead, and is a
+                # harmless no-op when the result has already appeared.
+                for selector in search_selectors:
+                    try:
+                        locator = self.page.locator(selector)
+                        for index in range(min(locator.count(), 8)):
+                            item = locator.nth(index)
+                            if item.is_visible():
+                                item.press("Enter", timeout=3000)
+                                raise StopIteration
+                    except StopIteration:
+                        break
+                    except Exception:
+                        continue
+                try:
+                    self.page.wait_for_timeout(300)
+                except Exception:
+                    time.sleep(0.3)
+                if click_editor_link_in_rows(timeout_ms=15000):
+                    return True
+
         return False
 
     def list_works(
@@ -1905,6 +2274,7 @@ class _FanqieBrowserSession:
         mode="draft",
         scheduled_at=None,
         publish_use_ai=True,
+        revise_existing=False,
     ):
         progress = progress or (lambda _text: None)
         mode = _normalize_upload_mode(mode)
@@ -1954,7 +2324,16 @@ class _FanqieBrowserSession:
             "textarea[placeholder*='正文']",
             "textarea",
         )
-        if not self._wait_for_visible(title_selectors, timeout_ms=15000):
+        if revise_existing:
+            if not self._click_existing_chapter(
+                chapter_number,
+                number_selectors,
+                title_selectors=title_selectors,
+                body_selectors=body_selectors,
+                work_url=work_url,
+            ):
+                raise FanqieUploadError(f"未找到番茄后台第{chapter_number}章，已停止批量修订。")
+        elif not self._wait_for_visible(title_selectors, timeout_ms=15000):
             if not self._click_text(("新建章节", "创建章节", "新增章节", "写新章节", "章节管理")):
                 # Directly opening the publish route can take several seconds
                 # to create and redirect to a fresh draft, especially after
@@ -1975,7 +2354,10 @@ class _FanqieBrowserSession:
 
         if not self._wait_for_visible(body_selectors, timeout_ms=15000):
             raise FanqieUploadError("没有找到章节正文编辑区。")
-        if not self._wait_for_editor_action(mode, timeout_ms=10000):
+        # Existing chapters use the same confirmation flow as direct publish:
+        # the editor exposes “下一步”, while a fresh draft exposes “存草稿”.
+        editor_action_mode = "direct_publish" if revise_existing else mode
+        if not self._wait_for_editor_action(editor_action_mode, timeout_ms=10000):
             raise FanqieUploadError("番茄后台章节编辑页面尚未完成加载，已停止保存。")
         # Set the controlled metadata before typing the body.  This prevents
         # the editor's first autosave from creating a draft with "第 章".
@@ -2041,7 +2423,21 @@ class _FanqieBrowserSession:
             self.page.wait_for_timeout(1200)
         except Exception:
             time.sleep(1.2)
-        if mode == "draft":
+        if revise_existing:
+            # Fanqie routes an existing-chapter modification through the same
+            # publish_article confirmation endpoint used by direct publishing.
+            # Reuse that tested flow so AI selection, confirmation, response
+            # handling, and success detection stay consistent.
+            self._publish_chapter(
+                title,
+                text,
+                "direct_publish",
+                None,
+                bool(publish_use_ai),
+                progress,
+                revise_existing=True,
+            )
+        elif mode == "draft":
             progress(f"正在保存《{title}》草稿...")
             self._save_draft_with_metadata_retry(
                 title,
@@ -2211,21 +2607,38 @@ class FanqieBatchUploadWorker(QThread):
                 raise FanqieUploadError("保存上传断点失败：项目文件不是有效 JSON。")
             normalized = normalize_fanqie_upload_state(state)
             account_id = str(self.task.get("account_id", FANQIE_LEGACY_ACCOUNT_ID) or FANQIE_LEGACY_ACCOUNT_ID).strip()
-            states = data.get("fanqie_upload_accounts", {})
+            task_kind = str(self.task.get("task_kind", normalized.get("task_kind", "upload")) or "upload").strip().lower()
+            state_key = (
+                "fanqie_revision_accounts"
+                if task_kind == "revise_existing"
+                else "fanqie_upload_accounts"
+            )
+            states = data.get(state_key, {})
             if not isinstance(states, dict):
                 states = {}
             normalized["account_id"] = account_id
             states[account_id] = normalized
-            data["fanqie_upload_accounts"] = states
-            if account_id == FANQIE_LEGACY_ACCOUNT_ID:
+            data[state_key] = states
+            if state_key == "fanqie_upload_accounts" and account_id == FANQIE_LEGACY_ACCOUNT_ID:
                 data["fanqie_upload"] = normalized
             save_project_file(path, data)
         self.state_changed.emit(deepcopy(normalized))
 
     def _initial_state(self, project):
         account_id = str(self.task.get("account_id", FANQIE_LEGACY_ACCOUNT_ID) or FANQIE_LEGACY_ACCOUNT_ID).strip()
-        existing = _project_fanqie_upload_state(project, account_id)
+        task_kind = str(self.task.get("task_kind", "upload") or "upload").strip().lower()
+        existing = (
+            _project_fanqie_revision_state(project, account_id)
+            if task_kind == "revise_existing"
+            else _project_fanqie_upload_state(project, account_id)
+        )
         existing["account_id"] = account_id
+        selected_chapter_numbers = [
+            int(number)
+            for number in self.task.get("selected_chapter_numbers", [])
+            if str(number).isdigit() and int(number) > 0
+        ]
+        selected_chapter_numbers = sorted(set(selected_chapter_numbers))
         target_id = str(self.task.get("platform_work_id", "") or "").strip()
         target_url = str(self.task.get("platform_work_url", "") or "").strip()
         target_mode = _normalize_upload_mode(self.task.get("mode", "draft"))
@@ -2249,6 +2662,8 @@ class FanqieBatchUploadWorker(QThread):
             )
         should_reset = (
             (any(previous_target) and not same_target)
+            or existing.get("task_kind", "upload") != task_kind
+            or existing.get("selected_chapter_numbers", []) != selected_chapter_numbers
             or existing.get("mode") != target_mode
             or existing.get("work_type") != target_work_type
             or not same_schedule
@@ -2267,6 +2682,8 @@ class FanqieBatchUploadWorker(QThread):
         configured = {
             **existing,
             "account_id": account_id,
+            "task_kind": task_kind,
+            "selected_chapter_numbers": selected_chapter_numbers,
             "platform_work_id": target_id,
             "platform_work_title": str(self.task.get("platform_work_title", "") or "").strip(),
             "platform_work_url": str(self.task.get("platform_work_url", "") or "").strip(),
@@ -2311,8 +2728,18 @@ class FanqieBatchUploadWorker(QThread):
             state = self._initial_state(project)
             self._persist_state(state)
             chapters = project.get("chapters", []) if isinstance(project.get("chapters"), list) else []
-            validation = validate_chapter_upload_range(
-                project, state["start_chapter"], state["end_chapter"]
+            task_kind = str(self.task.get("task_kind", "upload") or "upload").strip().lower()
+            chapter_numbers = (
+                list(self.task.get("selected_chapter_numbers", []))
+                if task_kind == "revise_existing"
+                else list(range(state["start_chapter"], state["end_chapter"] + 1))
+            )
+            validation = (
+                validate_selected_chapter_numbers(project, chapter_numbers)
+                if task_kind == "revise_existing"
+                else validate_chapter_upload_range(
+                    project, state["start_chapter"], state["end_chapter"]
+                )
             )
             if validation["warnings"]:
                 self.progress.emit("；".join(validation["warnings"][:2]))
@@ -2331,7 +2758,7 @@ class FanqieBatchUploadWorker(QThread):
                     for item in state.get("schedule_entries", [])
                     if isinstance(item, dict) and str(item.get("chapter_id", "") or "").strip()
                 }
-                for number in range(state["start_chapter"], state["end_chapter"] + 1):
+                for number in chapter_numbers:
                     self._check_stopped()
                     chapter = chapters[number - 1]
                     chapter_id = _chapter_id(chapter, number - 1)
@@ -2349,12 +2776,18 @@ class FanqieBatchUploadWorker(QThread):
                     )
                     state["updated_at"] = now_str()
                     self._persist_state(state)
-                    action = {
-                        "draft": "保存草稿",
-                        "direct_publish": "直接发布",
-                        "scheduled_publish": "定时发布",
-                    }.get(state.get("mode"), "上传")
-                    self.progress.emit(f"正在{action}第{number}章：{chapter.get('title', '')}")
+                    action = (
+                        "修订"
+                        if task_kind == "revise_existing"
+                        else {
+                            "draft": "保存草稿",
+                            "direct_publish": "直接发布",
+                            "scheduled_publish": "定时发布",
+                        }.get(state.get("mode"), "上传")
+                    )
+                    self.progress.emit(
+                        f"正在{action}第{number}章：{chapter.get('title', '')}"
+                    )
                     try:
                         browser.upload_chapter(
                             work,
@@ -2364,6 +2797,7 @@ class FanqieBatchUploadWorker(QThread):
                             mode=state.get("mode", "draft"),
                             scheduled_at=schedule_entry,
                             publish_use_ai=bool(state.get("publish_use_ai", False)),
+                            revise_existing=task_kind == "revise_existing",
                         )
                     except FanqieLoginRequired:
                         raise
@@ -2408,6 +2842,7 @@ class FanqieBatchUploadWorker(QThread):
                         "chapter_number": number,
                         "title": str(chapter.get("title", "") or "").strip(),
                         "mode": state.get("mode", "draft"),
+                        "task_kind": task_kind,
                         "publish_time": state.get("current_publish_time", ""),
                     })
                 state["status"] = "completed"
@@ -2468,6 +2903,193 @@ class FanqieBatchUploadWorker(QThread):
                 except Exception:
                     pass
             self.failed.emit(message)
+
+
+class FanqieChapterSelectionDialog(QDialog):
+    """Select non-contiguous local chapters for an existing-work revision."""
+
+    def __init__(self, project, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("选择批量修订章节")
+        self.setMinimumSize(760, 620)
+        self.resize(900, 720)
+        self._project = project if isinstance(project, dict) else {}
+        self._syncing_selection = False
+        chapters = self._project.get("chapters", [])
+        chapters = chapters if isinstance(chapters, list) else []
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(14, 14, 14, 14)
+        root.setSpacing(8)
+        project_row = QHBoxLayout()
+        project_row.setSpacing(8)
+        project_row.addWidget(QLabel("项目名称"))
+        self.project_name_edit = QLineEdit(
+            _fanqie_project_title(self._project) or "未命名项目"
+        )
+        self.project_name_edit.setReadOnly(True)
+        self.project_name_edit.setToolTip("当前批量修订使用的本地项目")
+        project_row.addWidget(self.project_name_edit, 1)
+        root.addLayout(project_row)
+
+        hint = QLabel(
+            "输入章节号可自动勾选，支持“、”或逗号分隔，也支持连续范围，例如："
+            "4、12、20、33-38、79-97。番茄后台按章节号匹配，标题和正文都会使用本地项目内容覆盖。"
+        )
+        hint.setWordWrap(True)
+        hint.setObjectName("hint")
+        root.addWidget(hint)
+
+        input_row = QHBoxLayout()
+        input_row.addWidget(QLabel("章节号"))
+        self.chapter_input = QLineEdit()
+        self.chapter_input.setPlaceholderText("例如：4、12、20、26、33-38、79-97")
+        self.chapter_input.textChanged.connect(self._apply_input_selection)
+        input_row.addWidget(self.chapter_input, 1)
+        root.addLayout(input_row)
+
+        action_row = QHBoxLayout()
+        self.select_all_btn = QPushButton("全选")
+        self.select_all_btn.setObjectName("ghost")
+        self.select_all_btn.clicked.connect(self._select_all)
+        action_row.addWidget(self.select_all_btn)
+        self.clear_btn = QPushButton("清空")
+        self.clear_btn.setObjectName("ghost")
+        self.clear_btn.clicked.connect(self._clear_selection)
+        action_row.addWidget(self.clear_btn)
+        self.selection_status = QLabel("已选中章节数 0")
+        self.selection_status.setObjectName("hint")
+        action_row.addWidget(self.selection_status)
+        self.input_error_label = QLabel()
+        self.input_error_label.setObjectName("hint")
+        action_row.addWidget(self.input_error_label, 1)
+        root.addLayout(action_row)
+
+        self.chapter_table = QTableWidget(len(chapters), 4)
+        self.chapter_table.setHorizontalHeaderLabels(("选择", "章节号", "本地标题", "正文字符数"))
+        self.chapter_table.setSelectionMode(QAbstractItemView.NoSelection)
+        self.chapter_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.chapter_table.verticalHeader().setVisible(False)
+        header = self.chapter_table.horizontalHeader()
+        header.setSectionResizeMode(0, QHeaderView.Fixed)
+        header.setSectionResizeMode(1, QHeaderView.Fixed)
+        header.setSectionResizeMode(2, QHeaderView.Interactive)
+        header.setSectionResizeMode(3, QHeaderView.Stretch)
+        header.resizeSection(0, 52)
+        header.resizeSection(1, 64)
+        for row, chapter in enumerate(chapters):
+            number_item = QTableWidgetItem(str(row + 1))
+            number_item.setTextAlignment(Qt.AlignCenter)
+            title = str(chapter.get("title", "") or "").strip() if isinstance(chapter, dict) else ""
+            text = str(chapter.get("text", "") or "") if isinstance(chapter, dict) else ""
+            check_item = QTableWidgetItem()
+            check_item.setFlags(check_item.flags() | Qt.ItemIsUserCheckable)
+            check_item.setCheckState(Qt.Unchecked)
+            self.chapter_table.setItem(row, 0, check_item)
+            self.chapter_table.setItem(row, 1, number_item)
+            title_item = QTableWidgetItem(title)
+            title_item.setTextAlignment(Qt.AlignCenter)
+            title_item.setToolTip(title)
+            self.chapter_table.setItem(row, 2, title_item)
+            count_item = QTableWidgetItem(f"{_body_display_len(text):,}")
+            count_item.setTextAlignment(Qt.AlignCenter)
+            self.chapter_table.setItem(row, 3, count_item)
+        header.setDefaultAlignment(Qt.AlignCenter)
+        # Keep the title and character-count columns at a stable 1:1 width so
+        # the two related values stay visually grouped as the dialog resizes.
+        header.setSectionResizeMode(2, QHeaderView.Stretch)
+        header.setSectionResizeMode(3, QHeaderView.Stretch)
+        self.chapter_table.itemChanged.connect(self._on_table_item_changed)
+        root.addWidget(self.chapter_table, 1)
+
+        buttons = QDialogButtonBox()
+        cancel_btn = buttons.addButton("取消", QDialogButtonBox.RejectRole)
+        cancel_btn.setObjectName("ghost")
+        confirm_btn = buttons.addButton("开始批量修订", QDialogButtonBox.AcceptRole)
+        confirm_btn.setObjectName("primary")
+        buttons.accepted.connect(self._accept)
+        buttons.rejected.connect(self.reject)
+        root.addWidget(buttons)
+
+    def _checked_numbers(self):
+        result = []
+        for row in range(self.chapter_table.rowCount()):
+            item = self.chapter_table.item(row, 0)
+            if item is not None and item.checkState() == Qt.Checked:
+                result.append(row + 1)
+        return result
+
+    @staticmethod
+    def _format_numbers(numbers):
+        numbers = sorted(set(int(number) for number in numbers if int(number) > 0))
+        if not numbers:
+            return ""
+        result = []
+        start = previous = numbers[0]
+        for number in numbers[1:]:
+            if number == previous + 1:
+                previous = number
+                continue
+            result.append(str(start) if start == previous else f"{start}-{previous}")
+            start = previous = number
+        result.append(str(start) if start == previous else f"{start}-{previous}")
+        return "、".join(result)
+
+    def _set_checked_numbers(self, numbers):
+        wanted = set(int(number) for number in numbers if int(number) > 0)
+        self._syncing_selection = True
+        self.chapter_table.blockSignals(True)
+        try:
+            for row in range(self.chapter_table.rowCount()):
+                item = self.chapter_table.item(row, 0)
+                if item is not None:
+                    item.setCheckState(Qt.Checked if row + 1 in wanted else Qt.Unchecked)
+        finally:
+            self.chapter_table.blockSignals(False)
+            self._syncing_selection = False
+        self._refresh_selection_status()
+
+    def _refresh_selection_status(self):
+        selected = self._checked_numbers()
+        self.selection_status.setText(f"已选中章节数 {len(selected)}")
+
+    def _apply_input_selection(self, text):
+        if self._syncing_selection:
+            return
+        parsed = parse_fanqie_chapter_numbers(text, self.chapter_table.rowCount())
+        self._set_checked_numbers(parsed["numbers"])
+        error_text = "；".join(parsed["errors"][:3])
+        if len(parsed["errors"]) > 3:
+            error_text += "；还有其他格式错误"
+        self.input_error_label.setText(error_text)
+
+    def _on_table_item_changed(self, item):
+        if self._syncing_selection or item.column() != 0:
+            return
+        self._syncing_selection = True
+        try:
+            self.chapter_input.setText(self._format_numbers(self._checked_numbers()))
+        finally:
+            self._syncing_selection = False
+        self._refresh_selection_status()
+
+    def _select_all(self):
+        self._set_checked_numbers(range(1, self.chapter_table.rowCount() + 1))
+        self.chapter_input.setText(self._format_numbers(self._checked_numbers()))
+
+    def _clear_selection(self):
+        self._set_checked_numbers([])
+        self.chapter_input.clear()
+        self.input_error_label.clear()
+
+    def _accept(self):
+        if not self._checked_numbers():
+            QMessageBox.warning(self, "番茄批量修订", "请至少选择一个需要修订的章节。")
+            return
+        self.accept()
+
+    def selected_chapter_numbers(self):
+        return self._checked_numbers()
 
 
 class FanqieBatchUploadDialog(QDialog):
@@ -2553,10 +3175,7 @@ class FanqieBatchUploadDialog(QDialog):
 
         form = QFormLayout()
         meta = project.get("meta", {}) if isinstance(project, dict) else {}
-        project_title = str(meta.get("title", "") or "").strip() if isinstance(meta, dict) else ""
-        project_title = project_title or os.path.splitext(
-            os.path.basename(self._current_project_path)
-        )[0] or "未命名小说"
+        project_title = _fanqie_project_title(project, self._current_project_path) or "未命名小说"
         self.project_name_edit = QLineEdit(project_title)
         self.project_name_edit.setReadOnly(True)
         self.project_name_edit.setToolTip(self._current_project_path or "当前项目尚未保存")
@@ -2710,14 +3329,25 @@ class FanqieBatchUploadDialog(QDialog):
         )
         root.addWidget(self.preview_label)
 
-        buttons = QDialogButtonBox()
-        self.start_btn = buttons.addButton("开始上传草稿", QDialogButtonBox.AcceptRole)
+        buttons = QHBoxLayout()
+        buttons.setSpacing(24)
+        buttons.addStretch(1)
+        self.upload_cancel_btn = QPushButton("取消")
+        self.upload_cancel_btn.setObjectName("ghost")
+        self.upload_cancel_btn.clicked.connect(self.reject)
+        buttons.addWidget(self.upload_cancel_btn)
+        buttons.addSpacing(12)
+        self.batch_revision_btn = QPushButton("批量修订")
+        self.batch_revision_btn.setObjectName("ghost")
+        self.batch_revision_btn.setToolTip("选择多个章节，把本地项目中的标题和正文覆盖到番茄后台已有章节")
+        self.batch_revision_btn.clicked.connect(self._open_batch_revision)
+        buttons.addWidget(self.batch_revision_btn)
+        buttons.addSpacing(12)
+        self.start_btn = QPushButton("开始上传草稿")
         self.start_btn.setObjectName("primary")
-        cancel_btn = buttons.addButton("取消", QDialogButtonBox.RejectRole)
-        cancel_btn.setObjectName("ghost")
-        buttons.accepted.connect(self._accept)
-        buttons.rejected.connect(self.reject)
-        root.addWidget(buttons)
+        self.start_btn.clicked.connect(self._accept)
+        buttons.addWidget(self.start_btn)
+        root.addLayout(buttons)
         self._refresh_chapter_range()
         self._on_mode_changed()
         self._sync_manual_browser_button()
@@ -3126,6 +3756,79 @@ class FanqieBatchUploadDialog(QDialog):
         }.get(mode, "开始上传"))
         self._refresh_preview()
 
+    def _open_batch_revision(self):
+        item = self.work_combo.currentData()
+        if not self._works or not isinstance(item, dict) or not str(item.get("id", "") or "").strip():
+            QMessageBox.information(
+                self,
+                "番茄批量修订",
+                "请先点击“读取作品列表”，并选中需要批量修订的番茄作品。",
+            )
+            return
+        with _MANUAL_BROWSER_WORKERS_LOCK:
+            manual_browser_open = any(
+                worker.isRunning() for worker in _MANUAL_BROWSER_WORKERS.values()
+            )
+        if manual_browser_open:
+            QMessageBox.information(
+                self,
+                "番茄批量修订",
+                "请先关闭手动打开的番茄浏览器，再开始批量修订。",
+            )
+            return
+        project = self._load_selected_project()
+        chapters = project.get("chapters", []) if isinstance(project.get("chapters"), list) else []
+        if not chapters:
+            QMessageBox.warning(self, "番茄批量修订", "当前本地项目没有可修订的章节。")
+            return
+        selection_dialog = FanqieChapterSelectionDialog(project, parent=self)
+        if selection_dialog.exec() != QDialog.Accepted:
+            selection_dialog.deleteLater()
+            return
+        selected_numbers = selection_dialog.selected_chapter_numbers()
+        selection_dialog.deleteLater()
+        validation = validate_selected_chapter_numbers(project, selected_numbers)
+        if validation["errors"]:
+            QMessageBox.warning(self, "番茄批量修订", "\n".join(validation["errors"]))
+            return
+        saved_upload_state = _project_fanqie_upload_state(
+            project,
+            self._selected_account_id(),
+        )
+        saved_publish_use_ai = bool(
+            saved_upload_state.get(
+                "publish_use_ai",
+                self._radio_value(self.publish_ai_buttons, "yes") == "yes",
+            )
+        )
+        self._config = {
+            "project_path": self._selected_project_path(),
+            "platform_work_id": str(item.get("id", "") or "").strip(),
+            "platform_work_title": str(item.get("title", "") or "").strip(),
+            "platform_work_url": str(item.get("url", "") or "").strip(),
+            "account_id": self._selected_account_id(),
+            "profile_dir": str(self._selected_account_record().get("profile_dir", "") or "").strip(),
+            "task_kind": "revise_existing",
+            "selected_chapter_numbers": selected_numbers,
+            "start_chapter": min(selected_numbers),
+            "end_chapter": max(selected_numbers),
+            "headless": self.headless_check.isChecked(),
+            "resume": False,
+            "mode": "draft",
+            "work_type": self._radio_value(self.work_type_buttons, "unknown"),
+            "publish_use_ai": saved_publish_use_ai,
+            "schedule_start_date": "",
+            "schedule_start_time": "",
+        }
+        try:
+            build_fanqie_upload_task(
+                self._config["project_path"], self._config, project=project
+            )
+        except Exception as exc:
+            QMessageBox.warning(self, "番茄批量修订", clean_error_text(exc))
+            return
+        self.accept()
+
     def _read_works(self):
         if self._work_list_worker is not None and self._work_list_worker.isRunning():
             return
@@ -3194,8 +3897,10 @@ class FanqieBatchUploadDialog(QDialog):
 
     def _on_works_ready(self, works):
         self._works = [item for item in works if isinstance(item, dict)]
-        state = _project_fanqie_upload_state(
-            self._load_selected_project(), self._selected_account_id()
+        project = self._load_selected_project()
+        state = _project_fanqie_upload_state(project, self._selected_account_id())
+        project_title_key = _fanqie_title_key(
+            _fanqie_project_title(project, self._current_project_path)
         )
         previous_id = (
             str(state.get("platform_work_id", "") or "").strip()
@@ -3210,7 +3915,32 @@ class FanqieBatchUploadDialog(QDialog):
                     deepcopy(item),
                 )
             restored_work = False
-            if previous_id:
+            matched_project_work = False
+            if project_title_key:
+                matching_indexes = [
+                    index
+                    for index, item in enumerate(self._works)
+                    if _fanqie_title_key(item.get("title", "")) == project_title_key
+                ]
+                if matching_indexes:
+                    selected_index = matching_indexes[0]
+                    if previous_id:
+                        selected_index = next(
+                            (
+                                index for index in matching_indexes
+                                if str(self._works[index].get("id", "") or "").strip()
+                                == previous_id
+                            ),
+                            selected_index,
+                        )
+                    self.work_combo.setCurrentIndex(selected_index)
+                    matched_project_work = True
+                    restored_work = bool(
+                        previous_id
+                        and str(self._works[selected_index].get("id", "") or "").strip()
+                        == previous_id
+                    )
+            if not matched_project_work and previous_id:
                 for index, item in enumerate(self._works):
                     if str(item.get("id", "") or "").strip() == previous_id:
                         self.work_combo.setCurrentIndex(index)

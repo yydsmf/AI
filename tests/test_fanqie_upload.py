@@ -5,7 +5,7 @@ from unittest.mock import patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PySide6.QtCore import QPoint
+from PySide6.QtCore import QPoint, Qt
 from PySide6.QtWidgets import QApplication, QMessageBox
 
 from gpt_desktop.fanqie_upload import (
@@ -19,6 +19,7 @@ from gpt_desktop.fanqie_upload import (
     _extract_id_from_url,
     _interpret_publish_response,
     FanqieBatchUploadWorker,
+    FanqieChapterSelectionDialog,
     FanqieDailyLimitError,
     FanqieLoginRequired,
     FanqieUploadError,
@@ -27,8 +28,10 @@ from gpt_desktop.fanqie_upload import (
     build_fanqie_schedule_entries,
     build_fanqie_upload_task,
     normalize_fanqie_upload_state,
+    parse_fanqie_chapter_numbers,
     save_fanqie_accounts,
     validate_chapter_upload_range,
+    validate_selected_chapter_numbers,
 )
 from gpt_desktop.novel_storage import load_json_file, save_project_file
 from gpt_desktop.novel_utils import _normalize_project
@@ -65,6 +68,174 @@ class FanqieUploadTests(unittest.TestCase):
         result = validate_chapter_upload_range(project, 1, 1)
         self.assertEqual(result["word_count"], 3)
 
+    def test_parse_chapter_selection_supports_ranges_and_dunhao(self):
+        value = (
+            "4、12、20、26、28、33-38、40-43、47-50、52、54-57、62、64、66-69、"
+            "73-75、79-97、99-103、105-107、109-115、117、119-120、127-128、"
+            "130-132、136-144、147-151、153-161、163-167"
+        )
+        result = parse_fanqie_chapter_numbers(value, 200)
+        self.assertEqual(len(result["numbers"]), 103)
+        self.assertEqual(result["numbers"][:4], [4, 12, 20, 26])
+        self.assertEqual(result["numbers"][-4:], [164, 165, 166, 167])
+        self.assertEqual(result["errors"], [])
+
+    def test_selected_chapter_validation_counts_non_contiguous_chapters(self):
+        result = validate_selected_chapter_numbers(self._project(), [3, 1, 3])
+        self.assertEqual(result["count"], 2)
+        self.assertEqual(result["word_count"], 320)
+        self.assertEqual(result["errors"], [])
+
+    def test_revision_task_keeps_selected_chapter_numbers(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "测试小说.json")
+            project = self._project()
+            save_project_file(path, project)
+            task = build_fanqie_upload_task(
+                path,
+                {
+                    "task_kind": "revise_existing",
+                    "selected_chapter_numbers": [3, 1, 3],
+                    "platform_work_id": "book-1",
+                    "platform_work_title": "测试小说",
+                    "platform_work_url": "https://example.test/work/book-1",
+                },
+                project=project,
+            )
+            self.assertEqual(task["task_kind"], "revise_existing")
+            self.assertEqual(task["selected_chapter_numbers"], [1, 3])
+            self.assertEqual(task["start_chapter"], 1)
+            self.assertEqual(task["end_chapter"], 3)
+            self.assertEqual(task["mode"], "draft")
+
+    def test_build_task_rejects_mismatched_project_and_platform_titles(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "测试小说.json")
+            project = self._project()
+            save_project_file(path, project)
+            with self.assertRaisesRegex(FanqieUploadError, "名称不一致"):
+                build_fanqie_upload_task(
+                    path,
+                    {
+                        "platform_work_id": "book-1",
+                        "platform_work_title": "另一部作品",
+                        "platform_work_url": "https://example.test/work/book-1",
+                        "start_chapter": 1,
+                        "end_chapter": 1,
+                    },
+                    project=project,
+                )
+
+    def test_build_task_accepts_title_spacing_and_bookmark_variations(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "测试小说.json")
+            project = self._project()
+            project["meta"]["title"] = "测试小说"
+            save_project_file(path, project)
+            task = build_fanqie_upload_task(
+                path,
+                {
+                    "platform_work_id": "book-1",
+                    "platform_work_title": "《 测试 小说 》",
+                    "platform_work_url": "https://example.test/work/book-1",
+                    "start_chapter": 1,
+                    "end_chapter": 1,
+                },
+                project=project,
+            )
+            self.assertEqual(task["platform_work_title"], "《 测试 小说 》")
+
+    def test_revision_task_also_rejects_mismatched_titles(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "测试小说.json")
+            project = self._project()
+            save_project_file(path, project)
+            with self.assertRaisesRegex(FanqieUploadError, "名称不一致"):
+                build_fanqie_upload_task(
+                    path,
+                    {
+                        "task_kind": "revise_existing",
+                        "selected_chapter_numbers": [1],
+                        "platform_work_id": "book-1",
+                        "platform_work_title": "另一部作品",
+                        "platform_work_url": "https://example.test/work/book-1",
+                    },
+                    project=project,
+                )
+
+    def test_revision_selection_dialog_auto_checks_input_numbers(self):
+        dialog = FanqieChapterSelectionDialog(self._project())
+        dialog.chapter_input.setText("1、3")
+        self._app.processEvents()
+        self.assertEqual(dialog.project_name_edit.text(), "测试小说")
+        self.assertTrue(dialog.project_name_edit.isReadOnly())
+        self.assertEqual(dialog.selected_chapter_numbers(), [1, 3])
+        self.assertEqual(dialog.selection_status.text(), "已选中章节数 2")
+        self.assertGreaterEqual(dialog.chapter_table.columnWidth(2), 220)
+        self.assertLessEqual(
+            abs(dialog.chapter_table.columnWidth(2) - dialog.chapter_table.columnWidth(3)),
+            1,
+        )
+        self.assertEqual(
+            dialog.chapter_table.item(0, 2).textAlignment(),
+            int(Qt.AlignCenter),
+        )
+        self.assertEqual(
+            dialog.chapter_table.item(0, 3).textAlignment(),
+            int(Qt.AlignCenter),
+        )
+        dialog.close()
+
+    def test_revision_config_uses_saved_project_ai_choice(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "测试小说.json")
+            project = self._project()
+            project["fanqie_upload_accounts"] = {
+                FANQIE_LEGACY_ACCOUNT_ID: {
+                    "publish_use_ai": True,
+                    "platform_work_id": "book-1",
+                },
+            }
+            save_project_file(path, project)
+            dialog = FanqieBatchUploadDialog(current_project_path=path)
+            try:
+                action_layout = dialog.layout().itemAt(dialog.layout().count() - 1).layout()
+                action_widgets = [
+                    action_layout.itemAt(index).widget().text()
+                    for index in range(action_layout.count())
+                    if action_layout.itemAt(index).widget() is not None
+                ]
+                self.assertEqual(
+                    action_widgets,
+                    ["取消", "批量修订", "开始上传草稿"],
+                )
+                dialog._works = [{
+                    "id": "book-1",
+                    "title": "测试小说",
+                    "url": "https://example.test/book-1",
+                }]
+                dialog.work_combo.clear()
+                dialog.work_combo.addItem("测试小说", dialog._works[0])
+                dialog.work_combo.setCurrentIndex(0)
+                with patch.object(
+                    FanqieChapterSelectionDialog,
+                    "exec",
+                    return_value=QMessageBox.Accepted,
+                ), patch.object(
+                    FanqieChapterSelectionDialog,
+                    "selected_chapter_numbers",
+                    return_value=[1],
+                ), patch.object(
+                    dialog,
+                    "_save_selected_account",
+                    return_value=True,
+                ) as save_account:
+                    dialog._open_batch_revision()
+                self.assertTrue(dialog.config()["publish_use_ai"])
+                save_account.assert_not_called()
+            finally:
+                dialog.close()
+
     def test_build_task_keeps_project_and_target(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = os.path.join(tmp, "测试小说.json")
@@ -74,7 +245,7 @@ class FanqieUploadTests(unittest.TestCase):
                 path,
                 {
                     "platform_work_id": "book-1",
-                    "platform_work_title": "番茄作品",
+                    "platform_work_title": "测试小说",
                     "platform_work_url": "https://example.test/work/book-1",
                     "start_chapter": 2,
                     "end_chapter": 3,
@@ -95,7 +266,7 @@ class FanqieUploadTests(unittest.TestCase):
                 path,
                 {
                     "platform_work_id": "book-1",
-                    "platform_work_title": "番茄作品",
+                    "platform_work_title": "测试小说",
                     "start_chapter": 2,
                     "end_chapter": 3,
                     "mode": "scheduled_publish",
@@ -248,7 +419,7 @@ class FanqieUploadTests(unittest.TestCase):
                     )
                     dialog_a._on_works_ready([{
                         "id": "book-a",
-                        "title": "作品 A",
+                        "title": "测试小说",
                         "url": "https://example.test/book-a",
                         "work_type": "serial",
                     }])
@@ -294,6 +465,39 @@ class FanqieUploadTests(unittest.TestCase):
                     self.assertEqual(dialog._selected_account_id(), "account-a")
                 finally:
                     dialog.close()
+
+    def test_read_works_prefers_local_project_title_over_stale_saved_work(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "测试小说.json")
+            project = self._project()
+            project["meta"]["title"] = "本地目标作品"
+            project["fanqie_upload_accounts"] = {
+                FANQIE_LEGACY_ACCOUNT_ID: {
+                    "platform_work_id": "old-work",
+                    "platform_work_title": "旧作品",
+                    "publish_use_ai": True,
+                },
+            }
+            save_project_file(path, project)
+            dialog = FanqieBatchUploadDialog(current_project_path=path)
+            try:
+                dialog._on_works_ready([
+                    {
+                        "id": "old-work",
+                        "title": "旧作品",
+                        "url": "https://example.test/old-work",
+                    },
+                    {
+                        "id": "local-work",
+                        "title": "本地目标作品",
+                        "url": "https://example.test/local-work",
+                    },
+                ])
+                selected = dialog.work_combo.currentData()
+                self.assertEqual(selected.get("id"), "local-work")
+                self.assertTrue(dialog.publish_ai_buttons["yes"].isChecked())
+            finally:
+                dialog.close()
 
     def test_dialog_fields_match_width_after_layout(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -496,6 +700,37 @@ class FanqieUploadTests(unittest.TestCase):
         self.assertEqual(project["fanqie_upload"]["completed_chapter_ids"], ["chapter-1"])
         self.assertEqual(project["fanqie_upload"]["status"], "running")
 
+    def test_normalize_project_preserves_revision_checkpoints_separately(self):
+        project = _normalize_project({
+            "meta": {"title": "测试小说"},
+            "fanqie_upload_accounts": {
+                FANQIE_LEGACY_ACCOUNT_ID: {
+                    "platform_work_id": "ordinary-book",
+                    "status": "completed",
+                },
+            },
+            "fanqie_revision_accounts": {
+                FANQIE_LEGACY_ACCOUNT_ID: {
+                    "task_kind": "revise_existing",
+                    "platform_work_id": "revision-book",
+                    "selected_chapter_numbers": [2, 4],
+                    "status": "failed",
+                },
+            },
+        })
+        self.assertEqual(
+            project["fanqie_upload_accounts"][FANQIE_LEGACY_ACCOUNT_ID]["platform_work_id"],
+            "ordinary-book",
+        )
+        self.assertEqual(
+            project["fanqie_revision_accounts"][FANQIE_LEGACY_ACCOUNT_ID]["platform_work_id"],
+            "revision-book",
+        )
+        self.assertEqual(
+            project["fanqie_revision_accounts"][FANQIE_LEGACY_ACCOUNT_ID]["task_kind"],
+            "revise_existing",
+        )
+
     def test_legacy_upload_checkpoint_is_migrated_to_legacy_account(self):
         project = _normalize_project({
             "fanqie_upload": {
@@ -575,6 +810,88 @@ class FanqieUploadTests(unittest.TestCase):
             saved = load_json_file(path, {})
             self.assertEqual(saved["fanqie_upload_accounts"]["account-a"]["platform_work_id"], "book-a")
             self.assertEqual(saved["fanqie_upload_accounts"]["account-b"]["platform_work_id"], "book-b")
+
+    def test_revision_checkpoint_does_not_overwrite_ordinary_upload_checkpoint(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "测试小说.json")
+            project = self._project()
+            project["fanqie_upload"] = {
+                "platform_work_id": "ordinary-book",
+                "platform_work_title": "普通上传作品",
+                "task_kind": "upload",
+                "publish_use_ai": True,
+                "status": "completed",
+            }
+            project["fanqie_upload_accounts"] = {
+                FANQIE_LEGACY_ACCOUNT_ID: project["fanqie_upload"],
+            }
+            save_project_file(path, project)
+            before = load_json_file(path, {})
+            ordinary_before = before["fanqie_upload"]
+            ordinary_accounts_before = before["fanqie_upload_accounts"]
+
+            worker = FanqieBatchUploadWorker({
+                "project_path": path,
+                "platform_work_id": "revision-book",
+                "platform_work_title": "修订目标作品",
+                "platform_work_url": "https://example.test/revision-book",
+                "task_kind": "revise_existing",
+                "selected_chapter_numbers": [1, 3],
+                "account_id": FANQIE_LEGACY_ACCOUNT_ID,
+                "resume": False,
+                "mode": "draft",
+            })
+            state = worker._initial_state(before)
+            worker._persist_state(state)
+
+            saved = load_json_file(path, {})
+            self.assertEqual(saved["fanqie_upload"], ordinary_before)
+            self.assertEqual(saved["fanqie_upload_accounts"], ordinary_accounts_before)
+            self.assertEqual(
+                saved["fanqie_revision_accounts"][FANQIE_LEGACY_ACCOUNT_ID]["platform_work_id"],
+                "revision-book",
+            )
+            self.assertEqual(
+                saved["fanqie_revision_accounts"][FANQIE_LEGACY_ACCOUNT_ID]["task_kind"],
+                "revise_existing",
+            )
+
+    def test_revision_initial_state_resumes_only_revision_checkpoint(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "测试小说.json")
+            project = self._project()
+            project["fanqie_upload_accounts"] = {
+                FANQIE_LEGACY_ACCOUNT_ID: {
+                    "platform_work_id": "ordinary-book",
+                    "task_kind": "upload",
+                    "publish_use_ai": True,
+                },
+            }
+            project["fanqie_revision_accounts"] = {
+                FANQIE_LEGACY_ACCOUNT_ID: {
+                    "platform_work_id": "revision-book",
+                    "task_kind": "revise_existing",
+                    "selected_chapter_numbers": [1, 3],
+                    "completed_chapter_ids": ["chapter-1"],
+                    "last_successful_chapter_number": 1,
+                    "status": "failed",
+                },
+            }
+            save_project_file(path, project)
+            worker = FanqieBatchUploadWorker({
+                "project_path": path,
+                "platform_work_id": "revision-book",
+                "task_kind": "revise_existing",
+                "selected_chapter_numbers": [1, 3],
+                "account_id": FANQIE_LEGACY_ACCOUNT_ID,
+                "resume": True,
+                "mode": "draft",
+            })
+            state = worker._initial_state(load_json_file(path, {}))
+            self.assertEqual(state["platform_work_id"], "revision-book")
+            self.assertEqual(state["completed_chapter_ids"], ["chapter-1"])
+            self.assertEqual(state["last_successful_chapter_number"], 1)
+            self.assertEqual(state["task_kind"], "revise_existing")
 
     def test_normalize_state_keeps_publish_modes(self):
         state = normalize_fanqie_upload_state({"mode": "publish", "status": "unknown"})
@@ -847,7 +1164,7 @@ class FanqieUploadTests(unittest.TestCase):
             worker = FanqieBatchUploadWorker({
                 "project_path": path,
                 "platform_work_id": "book-1",
-                "platform_work_title": "番茄作品",
+                "platform_work_title": "测试小说",
                 "start_chapter": 1,
                 "end_chapter": 2,
                 "headless": True,
@@ -1173,6 +1490,319 @@ class FanqieUploadTests(unittest.TestCase):
                 chapter_number=9,
             )
 
+    def test_revision_opens_existing_chapter_by_number_and_reuses_editor_flow(self):
+        class FakeField:
+            def __init__(self, class_name="", placeholder="", on_fill=None):
+                self.value = ""
+                self.class_name = class_name
+                self.placeholder = placeholder
+                self.on_fill = on_fill
+
+            def is_visible(self):
+                return True
+
+            def click(self, timeout=None):
+                return None
+
+            def press(self, key, timeout=None):
+                return None
+
+            def fill(self, value, timeout=None):
+                self.value = str(value)
+                if self.on_fill:
+                    self.on_fill()
+
+            def input_value(self, timeout=None):
+                return self.value
+
+            def inner_text(self, timeout=None):
+                return ""
+
+            def get_attribute(self, name):
+                return {
+                    "class": self.class_name,
+                    "placeholder": self.placeholder,
+                }.get(name, "")
+
+        class FakeChapterLink:
+            def __init__(self, on_click):
+                self.on_click = on_click
+
+            def is_visible(self):
+                return True
+
+            def inner_text(self, timeout=None):
+                return "第9章 旧标题"
+
+            def get_attribute(self, name):
+                if name == "data-chapter-number":
+                    return "9"
+                return ""
+
+            def click(self, timeout=None, force=False):
+                self.on_click()
+
+        class FakeRow:
+            def __init__(self, link):
+                self.link = link
+
+            def is_visible(self):
+                return True
+
+            def inner_text(self, timeout=None):
+                return "第9章 旧标题"
+
+            def locator(self, selector):
+                if "href*='/publish/'" in selector:
+                    return FakeLocator([self.link])
+                return FakeLocator([])
+
+        class FakeLocator:
+            def __init__(self, items):
+                self.items = items
+
+            def count(self):
+                return len(self.items)
+
+            def nth(self, index):
+                return self.items[index]
+
+        class FakePage:
+            def __init__(self):
+                self.chapter_open = False
+                self.serial = FakeField("serial-input byte-input")
+                self.title = FakeField(placeholder="请输入标题")
+                self.editor = FakeField(
+                    on_fill=lambda: setattr(self.serial, "value", "")
+                    or setattr(self.title, "value", "")
+                )
+                self.chapter_link = FakeChapterLink(self._open_chapter)
+                self.chapter_row = FakeRow(self.chapter_link)
+                self.keyboard = type(
+                    "FakeKeyboard",
+                    (),
+                    {"type": lambda _self, value, delay=0: (
+                        setattr(self.editor, "value", str(value)) or self.editor.on_fill()
+                    )},
+                )()
+
+            def _open_chapter(self):
+                self.chapter_open = True
+                self.serial.value = "9"
+                self.title.value = "第9章 旧标题"
+
+            def locator(self, selector):
+                if selector == "tr":
+                    return FakeLocator([self.chapter_row])
+                if "serial-input" in selector:
+                    return FakeLocator([self.serial]) if self.chapter_open else FakeLocator([])
+                if "请输入标题" in selector:
+                    return FakeLocator([self.title]) if self.chapter_open else FakeLocator([])
+                if "serial-editor .ProseMirror" in selector:
+                    return FakeLocator([self.editor]) if self.chapter_open else FakeLocator([])
+                if "button.auto-editor-save-btn" in selector:
+                    return FakeLocator([])
+                return FakeLocator([])
+
+            def wait_for_timeout(self, _milliseconds):
+                return None
+
+        browser = object.__new__(_FanqieBrowserSession)
+        browser.page = FakePage()
+        browser._goto = lambda _url: None
+        browser._dismiss_resume_prompt = lambda: None
+        browser._click_text = lambda _names, exact=False: self.fail(
+            "修订已有章节不应通过新建章节入口"
+        )
+        browser._page_text = lambda: "正文字数\n160\n已保存到云端"
+        browser._wait_for_save_completion = lambda **_kwargs: True
+        browser._save_draft_with_metadata_retry = lambda *args, **kwargs: True
+        browser._verify_saved_draft = lambda *args, **kwargs: None
+        browser._wait_for_editor_action = lambda *_args, **_kwargs: True
+        submitted = []
+        browser._publish_chapter = lambda *args, **kwargs: submitted.append(
+            (args[2], kwargs.get("revise_existing"), args[4])
+        ) or True
+
+        browser.upload_chapter(
+            {"id": "book-1", "url": "https://example.test/book-1"},
+            {"title": "礼物已经改名", "text": "正文" * 80},
+            chapter_number=9,
+            publish_use_ai=False,
+            revise_existing=True,
+        )
+        self.assertTrue(browser.page.chapter_open)
+        self.assertEqual(browser.page.serial.value, "9")
+        self.assertEqual(browser.page.title.value, "礼物已经改名")
+        self.assertEqual(browser.page.editor.value, "正文" * 80)
+        self.assertEqual(submitted, [("direct_publish", True, False)])
+
+    def test_revision_waits_for_delayed_search_result_before_reporting_missing(self):
+        class FakeField:
+            def __init__(self, placeholder=""):
+                self.value = ""
+                self.placeholder = placeholder
+
+            def is_visible(self):
+                return True
+
+            def click(self, timeout=None):
+                return None
+
+            def press(self, key, timeout=None):
+                return None
+
+            def fill(self, value, timeout=None):
+                self.value = str(value)
+
+            def input_value(self, timeout=None):
+                return self.value
+
+            def get_attribute(self, name):
+                return self.placeholder if name == "placeholder" else ""
+
+        class FakeChapterLink:
+            def __init__(self):
+                self.opened = False
+
+            def is_visible(self):
+                return True
+
+            def get_attribute(self, name):
+                return "/main/writer/book-1/publish/chapter-132/?enter_from=modifychapter" if name == "href" else ""
+
+            def click(self, timeout=None, force=False):
+                self.opened = True
+
+        class FakeRow:
+            def __init__(self, link):
+                self.link = link
+
+            def is_visible(self):
+                return True
+
+            def inner_text(self, timeout=None):
+                return "第132章 后台标题" if self.link.page.result_ready else "第167章 其他章节"
+
+            def locator(self, selector):
+                if "href*='/publish/'" in selector and self.link.page.result_ready:
+                    return FakeLocator([self.link])
+                return FakeLocator([])
+
+        class FakeLocator:
+            def __init__(self, items):
+                self.items = items
+
+            def count(self):
+                return len(self.items)
+
+            def nth(self, index):
+                return self.items[index]
+
+        class FakePage:
+            def __init__(self):
+                self.result_ready = False
+                self.waits = 0
+                self.search = FakeField("输入章节名称或章节号")
+                self.link = FakeChapterLink()
+                self.link.page = self
+                self.row = FakeRow(self.link)
+
+            def get_by_text(self, name, exact=False):
+                if name == "搜索章节":
+                    return FakeLocator([FakeSearchTrigger(self)])
+                return FakeLocator([])
+
+            def locator(self, selector):
+                if selector == "tr":
+                    return FakeLocator([self.row])
+                if "输入章节名称或章节号" in selector:
+                    return FakeLocator([self.search])
+                if "serial-input" in selector:
+                    return FakeLocator([])
+                if "contenteditable='true'" in selector and self.link.opened:
+                    return FakeLocator([self.link])
+                return FakeLocator([])
+
+            def wait_for_timeout(self, _milliseconds):
+                self.waits += 1
+                if self.waits >= 2:
+                    self.result_ready = True
+
+        class FakeSearchTrigger:
+            def __init__(self, page):
+                self.page = page
+
+            def is_visible(self):
+                return True
+
+            def click(self, timeout=None):
+                return None
+
+        browser = object.__new__(_FanqieBrowserSession)
+        browser.page = FakePage()
+        browser._goto = lambda _url: setattr(browser.page.link, "opened", True)
+        browser._read_first_input_value = lambda _selectors: (
+            "132" if browser.page.link.opened else ""
+        )
+        self.assertTrue(
+            browser._click_existing_chapter(
+                132,
+                ("input.serial-input",),
+                title_selectors=(),
+                body_selectors=(),
+                work_url="https://example.test/main/writer/book-1/publish/",
+            )
+        )
+        self.assertGreaterEqual(browser.page.waits, 2)
+        self.assertTrue(browser.page.link.opened)
+
+    def test_revision_waits_for_enabled_next_button(self):
+        class FakeButton:
+            def __init__(self):
+                self.enabled = False
+
+            def is_visible(self):
+                return True
+
+            def is_enabled(self):
+                return self.enabled
+
+            def evaluate(self, _script):
+                return "BUTTON"
+
+        class FakeLocator:
+            def __init__(self, item):
+                self.item = item
+
+            def count(self):
+                return 1
+
+            def nth(self, _index):
+                return self.item
+
+        class FakePage:
+            def __init__(self):
+                self.button = FakeButton()
+                self.waits = 0
+
+            def locator(self, selector):
+                if selector == "button.auto-editor-next":
+                    return FakeLocator(self.button)
+                return FakeLocator(self.button)
+
+            def wait_for_timeout(self, _milliseconds):
+                self.waits += 1
+                self.button.enabled = True
+
+            def get_by_text(self, _name, exact=False):
+                return FakeLocator(self.button)
+
+        browser = object.__new__(_FanqieBrowserSession)
+        browser.page = FakePage()
+        self.assertTrue(browser._wait_for_editor_action("direct_publish", timeout_ms=1000))
+        self.assertGreaterEqual(browser.page.waits, 1)
+
     def test_editor_ready_uses_internal_editor_text_when_visible_count_lags(self):
         class FakePage:
             def evaluate(self, _script):
@@ -1360,7 +1990,7 @@ class FanqieUploadTests(unittest.TestCase):
             worker = FanqieBatchUploadWorker({
                 "project_path": path,
                 "platform_work_id": "book-1",
-                "platform_work_title": "番茄作品",
+                "platform_work_title": "测试小说",
                 "platform_work_url": "https://example.test/book-1",
                 "start_chapter": 2,
                 "end_chapter": 3,
@@ -1371,6 +2001,39 @@ class FanqieUploadTests(unittest.TestCase):
             with patch("gpt_desktop.fanqie_upload._FanqieBrowserSession", return_value=browser):
                 worker.run()
             self.assertEqual(browser.calls, [2, 3])
+
+    def test_revision_worker_processes_only_selected_chapters(self):
+        class FakeBrowser:
+            calls = []
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def upload_chapter(self, _work, _chapter, chapter_number=None, **kwargs):
+                self.calls.append((chapter_number, kwargs.get("revise_existing")))
+                return True
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "测试小说.json")
+            save_project_file(path, self._project())
+            browser = FakeBrowser()
+            worker = FanqieBatchUploadWorker({
+                "project_path": path,
+                "platform_work_id": "book-1",
+                "platform_work_title": "测试小说",
+                "platform_work_url": "https://example.test/book-1",
+                "task_kind": "revise_existing",
+                "selected_chapter_numbers": [3, 1],
+                "headless": True,
+                "resume": False,
+                "mode": "draft",
+            })
+            with patch("gpt_desktop.fanqie_upload._FanqieBrowserSession", return_value=browser):
+                worker.run()
+            self.assertEqual(browser.calls, [(1, True), (3, True)])
 
     def test_manual_browser_worker_uses_selected_account_profile(self):
         class FakePage:

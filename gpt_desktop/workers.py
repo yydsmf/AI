@@ -68,6 +68,7 @@ from .novel_utils import (
     _normalize_volume_continuity_anchors,
     _core_motive_progression_guidance,
     _procedural_plot_guard_guidance,
+    _ensure_final_chapter_title_suffix,
     _story_conflict_pacing_guidance,
     _terminal_window_bounds,
     NOVEL_PROSE_END_MARKER,
@@ -125,7 +126,7 @@ _FINAL_CHAPTER_PLAN_GUIDANCE = (
     "可以写可信时间落点后的具体成果场景或开头呼应场景，但不能用突然跳过过程的多年后概括、‘未完待续’或单独的‘全文完’。倒数第二章可以把冲突推到临界点，"
     "但不要提前讲完最后一章才应发生的结果。"
     "如果输入包含terminal_contract，必须把其中的核心主线结果、冲突结果、关系结果和主角最终处境安排进已有章节；"
-    "最后一章只能写已经发生并被验证的结果，不能用准备、等待、试验、复测、刚刚接手或下一步行动代替结尾；标题要从已完成结果、稳定状态、时间落点或开头呼应中自然命名，不要只写‘大结局’。\n"
+    "最后一章只能写已经发生并被验证的结果，不能用准备、等待、试验、复测、刚刚接手或下一步行动代替结尾；先从已完成结果、稳定状态、时间落点或开头呼应中自然命名标题主体，不要只写‘大结局’，程序会在最终标题落盘时统一追加‘（大结局）’，模型不要自行输出这个后缀。\n"
 )
 
 
@@ -145,7 +146,7 @@ def _terminal_window_plan_guidance(start, end, overlap_start, overlap_end):
 _CHAPTER_PLAN_STORY_LANGUAGE_GUIDANCE = (
     "【章节规划表达】\n"
     "章节规划是给后续正文扩写使用的结构化事实底稿，不是发布简介，也不是最终小说正文。"
-    "章节标题会直接展示给读者，也属于可以公开发布的内容；标题必须使用自然的网络小说叙述语言风格，具体、好读，长度不超过15个汉字（不含章节序号和空白），"
+    "章节标题主体会直接展示给读者，也属于可以公开发布的内容；标题主体必须使用自然的网络小说叙述语言风格，具体、好读，长度不超过15个汉字（不含章节序号和空白），"
     "落到本章真实发生的人物、场景、动作、冲突、结果或变化上，和本章outline保持一致，不另造剧情。"
     "标题不要写成策划标签、抽象概念、空泛情绪、案件名称、报告名称、编辑摘要或工作说明。"
     "每章先抓住正文真正需要的故事事实；人物、地点、前置状态、具体行动、现实阻力、结果和章末变化按本章实际需要自然取用，尽量不用固定清单式要求。"
@@ -157,6 +158,7 @@ _CHAPTER_PLAN_STORY_LANGUAGE_GUIDANCE = (
     "本章人物怎么说、怎么做，要根据当下场景、关系、压力、选择和结果自然变化，同一人物不必为了体现人物卡而重复同一种表现。"
     + _procedural_plot_guard_guidance()
     + "剧情仍然要由当前题材自己的场景压力、人物行动、关系碰撞、情绪变化或具体后果推进；人物和环境如何推动故事由题材自然决定。"
+    "这是全书各阶段、各批次都适用的叙事边界，不只适用于最后5章：规划事件时优先写人物正在经历的场面、行动、阻力、选择、关系变化和可观察结果。"
     "章节规划使用清楚、具体、便于执行的故事事实和人物行动表达，不得出现策划术语、抽象形容、办案式表达、编辑式说明或编辑式总结。"
     "人物认知、关系和局势的变化都落到具体看见、听见、决定、行动和结果；阶段事件按自然的场景长度组合，让相邻章节有变化并共同完成节点。"
     "伏笔随着人物实际行动、关系变化和局势发展自然生长，不写固定伏笔任务；线索可以在合适的时机转化为新的选择、代价、误会、帮助或冲突。"
@@ -5005,8 +5007,8 @@ class NovelChapterTitleWorker(NovelAnalysisWorker):
             "相邻章节不要使用同一语法模板、同一尾词或同一意象；如果正文适合直白标题，就优先直白准确。\n"
             "如果用户内容提供了 previous_titles，请避免与这些标题同词、同结构、同节奏，尤其不要让跨批次相邻标题像同一模板改词。\n"
             "title 字段只写标题正文，不要带“第几章”和序号。\n"
-            "输入章节中如果 is_final_chapter=true，这是全书最后一章：标题必须从已经完成的结果、稳定状态、可信时间落点、开头呼应的地点/物件/动作或关系变化中自然命名，让读者能感到故事已经收束；"
-            "不要只写“大结局”“终章”“尘埃落定”“新的开始”等空泛词，也不要用标题制造新的任务、未知对手或悬念。\n"
+            "输入章节中如果 is_final_chapter=true，这是全书最后一章：先从已经完成的结果、稳定状态、可信时间落点、开头呼应的地点/物件/动作或关系变化中自然命名标题主体，让读者能感到故事已经收束；"
+            "不要只写“大结局”“终章”“尘埃落定”“新的开始”等空泛词，也不要用标题制造新的任务、未知对手或悬念；程序会统一追加“（大结局）”，模型不要自行输出后缀。\n"
             '输出结构：{"titles":[{"index":1,"title":"会议室里的选择"}]}\n'
             "titles 数量必须与输入章节数量完全一致，index 必须与输入一致。"
         )
@@ -5130,6 +5132,8 @@ class NovelChapterTitleWorker(NovelAnalysisWorker):
             if index not in expected:
                 continue
             title = self._clean_generated_title(item.get("title", ""))
+            if title and index == len(self.chapters):
+                title = _ensure_final_chapter_title_suffix(title)
             if title:
                 by_index[index] = title
         return by_index
@@ -5185,7 +5189,12 @@ class NovelChapterTitleWorker(NovelAnalysisWorker):
                     else:
                         missing_items = [item for item in batch if not titles_by_index.get(item["index"])]
                         titles_by_index.update(self._retry_missing_title_items(missing_items, label, total))
-                        return [titles_by_index[item["index"]] for item in batch]
+                        return [
+                            _ensure_final_chapter_title_suffix(titles_by_index[item["index"]])
+                            if item["index"] == len(self.chapters)
+                            else titles_by_index[item["index"]]
+                            for item in batch
+                        ]
                 if attempt < 2:
                     self.progress.emit(f"第 {label}/{total} 批章节标题生成失败，正在自动重试 2/2...")
                     continue
@@ -5193,7 +5202,12 @@ class NovelChapterTitleWorker(NovelAnalysisWorker):
             else:
                 missing_items = [item for item in batch if not titles_by_index.get(item["index"])]
                 titles_by_index.update(self._retry_missing_title_items(missing_items, label, total))
-                return [titles_by_index[item["index"]] for item in batch]
+                return [
+                    _ensure_final_chapter_title_suffix(titles_by_index[item["index"]])
+                    if item["index"] == len(self.chapters)
+                    else titles_by_index[item["index"]]
+                    for item in batch
+                ]
         raise last_error or Exception("章节标题生成失败。")
 
     def run(self):
@@ -5763,7 +5777,6 @@ class NovelWritingWorker(QThread):
                 "文风画像、原生词池和原文片段卡是本章唯一的写法标准：优先模仿其中真实可观察的口语、"
                 "动作反应、句法松紧、说话标签、接话方式、段落衔接和收束节奏。"
                 "不得复制样本的人物、剧情、物件或原句；也不得为了展示文风硬塞口语、笑点、对白、短段或特殊词。"
-                "专业流程只保留会直接改变人物选择、关系或结果的部分，避免核验、记录、交接和责任说明堆成办案式流程。"
                 "同一事实不要换词重复解释，不要替人物讲道理，不要写报告式推理或机械分镜。"
                 "只输出正文，不输出标题、前言、分区标签、审校说明、JSON或Markdown代码块。"
                 + _grounded_prose_contract()

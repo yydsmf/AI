@@ -872,6 +872,20 @@ def _volume_two_framework_template_text():
 def _normalize_fanqie_upload_state(value):
     """Keep the platform upload checkpoint when projects are normalized."""
     raw = value if isinstance(value, dict) else {}
+    task_kind = str(raw.get("task_kind", "upload") or "upload").strip().lower()
+    if task_kind not in {"upload", "revise_existing"}:
+        task_kind = "upload"
+    selected_chapter_numbers = []
+    raw_selected_numbers = raw.get("selected_chapter_numbers", [])
+    if isinstance(raw_selected_numbers, (list, tuple, set)):
+        for item in raw_selected_numbers:
+            try:
+                number = int(item)
+            except (TypeError, ValueError):
+                continue
+            if number > 0 and number not in selected_chapter_numbers:
+                selected_chapter_numbers.append(number)
+    selected_chapter_numbers.sort()
     completed = []
     for item in raw.get("completed_chapter_ids", []):
         item = str(item or "").strip()
@@ -953,6 +967,8 @@ def _normalize_fanqie_upload_state(value):
         status = "idle"
     return {
         "version": 1,
+        "task_kind": task_kind,
+        "selected_chapter_numbers": selected_chapter_numbers,
         "account_id": str(raw.get("account_id", "") or "").strip(),
         "platform_work_id": str(raw.get("platform_work_id", "") or "").strip(),
         "platform_work_title": str(raw.get("platform_work_title", "") or "").strip(),
@@ -1018,6 +1034,7 @@ def _default_project():
         "foreshadow_items": [],
         "fanqie_upload": _normalize_fanqie_upload_state({}),
         "fanqie_upload_accounts": {},
+        "fanqie_revision_accounts": {},
         "fanqie_upload_selected_account_id": "",
         "timeline": "",
         "foreshadows": "",
@@ -1189,27 +1206,10 @@ def _normalize_terminal_contract(value):
         items = _normalize_name_list(value.get(key, []))
         if items:
             result[key] = items[:24]
-    roles = []
-    raw_roles = value.get("chapter_roles", [])
-    if isinstance(raw_roles, list):
-        for item in raw_roles[:5]:
-            if not isinstance(item, dict):
-                continue
-            try:
-                position = int(item.get("position", 0) or 0)
-            except (TypeError, ValueError):
-                position = 0
-            role = str(item.get("role", "") or "").strip()
-            result_text = str(item.get("required_result", "") or "").strip()
-            if position <= 0 or not role:
-                continue
-            row = {"position": position, "role": role}
-            if result_text:
-                row["required_result"] = result_text
-            roles.append(row)
-    if roles:
-        roles.sort(key=lambda item: item["position"])
-        result["chapter_roles"] = roles
+    # Older projects may still contain a per-chapter role list.  Do not carry
+    # it into the active contract: assigning one fixed role to each of the
+    # final five chapters creates a reusable ending template and makes the
+    # planner treat the window as five checklist slots.
     closure_plan = _normalize_terminal_closure_plan(value)
     for key, child in closure_plan.items():
         result[key] = child
@@ -1294,15 +1294,6 @@ def _normalize_structured_stage_plan(value):
             delta = event.get("state_delta", {})
             if isinstance(delta, dict):
                 event_row["state_delta"] = deepcopy(delta)
-            for key in ("terminal_role", "closure_evidence", "pending_items"):
-                if key == "pending_items":
-                    values = _normalize_name_list(event.get(key, []))
-                    if values:
-                        event_row[key] = values[:12]
-                    continue
-                text = str(event.get(key, "") or "").strip()
-                if text:
-                    event_row[key] = text
             event_row = {
                 key: child for key, child in event_row.items()
                 if child not in ("", [], {})
@@ -1322,6 +1313,7 @@ def _normalize_chapter_plan_foundation(value):
     for key in (
         "summary", "core_mainline", "core_motive", "ending_promise", "global_hard_boundaries",
         "source", "source_hash", "foundation_mode", "planning_schema_version",
+        "planning_guardrails",
     ):
         field_value = str(value.get(key, "") or "").strip()
         if key == "global_hard_boundaries":
@@ -2096,6 +2088,12 @@ def _normalize_project(data):
     )
     base["fanqie_upload_accounts"] = _normalize_fanqie_upload_accounts(
         data.get("fanqie_upload_accounts", {})
+    )
+    # Batch revision checkpoints are independent from ordinary upload
+    # checkpoints.  Revision may read ordinary upload settings, but its
+    # progress must never replace the saved upload target or options.
+    base["fanqie_revision_accounts"] = _normalize_fanqie_upload_accounts(
+        data.get("fanqie_revision_accounts", {})
     )
     base["fanqie_upload_selected_account_id"] = str(
         data.get(FANQIE_UPLOAD_SELECTED_ACCOUNT_FIELD, "") or ""
@@ -4965,6 +4963,51 @@ def _is_project_final_chapter(project, chapter_index):
     return planned_count <= 0 or planned_count == len(chapters)
 
 
+def _is_confirmed_project_final_chapter(project, chapter_index):
+    """Return true only when planning data confirms this is the whole-book final chapter."""
+    project = project if isinstance(project, dict) else {}
+    chapters = project.get("chapters", [])
+    if not isinstance(chapters, list) or not chapters:
+        return False
+    try:
+        chapter_index = int(chapter_index)
+    except (TypeError, ValueError):
+        return False
+    planned_count = _project_planned_chapter_count(project)
+    return planned_count > 0 and chapter_index == len(chapters) - 1 and planned_count == len(chapters)
+
+
+def _ensure_final_chapter_title_suffix(title):
+    """Keep a natural final title body and add one canonical ending suffix."""
+    text = str(title or "").strip()
+    if not text:
+        return ""
+    text = re.sub(r"\s*[\(（]\s*大结局\s*[\)）]?\s*$", "", text).strip()
+    text = text.strip(" \t\r\n\"'“”‘’《》「」『』【】[]()（）：:，,。；;、")
+    if not text:
+        return ""
+    return f"{text}（大结局）"
+
+
+def _ensure_final_chapter_completion_marker(text):
+    """Append the exact completion marker as the final line, idempotently."""
+    normalized = str(text or "").strip()
+    if not normalized:
+        return ""
+    lines = normalized.splitlines()
+    while lines and not lines[-1].strip():
+        lines.pop()
+    if not lines:
+        return ""
+    if re.fullmatch(
+        r"[\"'“”‘’「」『』【】]?\s*(?:全书完|已完结)\s*[。.!！]?\s*[\"'“”‘’「」『』【】]?",
+        lines[-1].strip(),
+    ):
+        lines[-1] = "全书完。"
+        return "\n".join(lines).rstrip()
+    return "\n".join(lines).rstrip() + "\n\n全书完。"
+
+
 def _project_ready_for_completion(project):
     """Return whether every planned chapter has a committed final draft."""
     project = project if isinstance(project, dict) else {}
@@ -5113,12 +5156,13 @@ def _terminal_window_ending_guidance(info, final=False):
         "不把新的未解释信息、未知对手、未知目的地或未来承诺写成等待后续章节回答的悬念。"
         "如果当前章还需要承接下一章，只能承接本章已发生冲突的直接后果、行动或关系变化，"
         "不能用新的任务、幕后黑手、远方召唤或‘以后再说’制造连载钩子。"
+        "最后5章不是固定的五段分工，也不要为每一章指定一个通用收尾角色；每章从本题材当前已经发生的事情、人物处境和上一章结果自然长出自己的场面。"
     )
     if final:
         text += (
             "这是全书最后一章。核心动机、核心矛盾、主要关系和主角本部最终处境必须在本章形成清楚的实际结果；"
             "结尾不再留下必须依靠后续章节回答的主线问题或悬念。"
-            "最后落在具体动作、对白、关系结果或已经成立的生活状态上；如果终局契约允许时间跳跃，只能用一个有时间标记、有具体人物和可观察成果的场景来验证结果，不能用空泛的多年后概括、‘未完待续’或单独的‘全文完’代替结尾。"
+            "最后落在具体动作、对白、关系结果或已经成立的生活状态上；如果终局契约允许时间跳跃，只能用一个有时间标记、有具体人物和可观察成果的场景来验证结果，不能用空泛的多年后概括或‘未完待续’代替结尾。结局场面完成后，不要自行添加‘全书完’或‘已完结’，程序只会在全书最后一章状态整理成功并最终提交时把最后一行统一整理为‘全书完。’。"
         )
     return text
 
@@ -5129,7 +5173,7 @@ def _final_chapter_ending_guidance():
         "当前章节是全书最后一章，也要让读者把这一部当成一个完整结局来读。正文要在具体场景里完成核心矛盾的最终选择和结果，"
         "让主要人物的关系、读者一直跟随的核心承诺、能够自然落地的关键线索和主角本部目标都有清楚结果。"
         "即使故事保留续作可能，也只能保留不影响本部结局的背景余波；不能留下必须依靠后续章节解决的主线任务、重大反转、重要人物、新的世界规则或等待回答的悬念。"
-        "最后的收束落在人物的动作、对白、关系结果或生活状态上；若契约选择了短期、远期或镜像收尾，可以把时间落点或开头呼应写成具体场景，但不能用突然跳过多年的概括、作者总结、抽象结论、‘未完待续’或单独的‘全文完’代替结尾。"
+        "最后的收束落在人物的动作、对白、关系结果或生活状态上；若契约选择了短期、远期或镜像收尾，可以把时间落点或开头呼应写成具体场景，但不能用突然跳过多年的概括、作者总结、抽象结论或‘未完待续’代替结尾。不要自行写‘全书完’或‘已完结’，程序只在全书最后一章状态整理成功并最终提交时统一追加最后一行‘全书完。’，它不能代替结局场面。"
         "不要为了回收而硬塞与本章无关的伏笔；只处理能从当前冲突和人物选择自然落地的线索，其余已经不再影响主线的内容，用清楚的结果或状态自然关上。"
     )
 
@@ -5143,10 +5187,9 @@ def _terminal_contract_guidance(contract, info):
     chapter_number = int(info.get("chapter_number", 0) or 0)
     start = int(info.get("start_chapter", 0) or 0)
     end = int(info.get("end_chapter", 0) or 0)
-    position = max(1, chapter_number - start + 1)
     lines = [
-        f"【本部终局结果契约｜收尾窗口第{position}/5章】",
-        "下面是本部必须落地的结果，不是固定场景模板；请按当前题材、人物和本章提纲自然呈现。",
+        "【本部终局结果契约】",
+        "下面是本部必须落地的事实，不是按章节分配的角色表，也不是固定场景模板；请从当前章节提纲、人物处境和前后章结果自然呈现。",
     ]
     labels = (
         ("核心主线结果", "mainline_result"),
@@ -5186,7 +5229,7 @@ def _terminal_contract_guidance(contract, info):
         text = contract.get(key, "")
         if text:
             lines.append(f"{label}：{text}")
-    if position == 5 or info.get("is_final"):
+    if info.get("is_final") or chapter_number == end:
         lines.append(
             "本章必须把契约中的本部结果写成已经发生、被人物或环境验证的事实；"
             "不能让准备开始、等待确认、试车复测、刚刚接手、下一趟再做等未完成动作成为最后落点。"
@@ -10512,15 +10555,34 @@ def _core_motive_progression_guidance():
     )
 
 
-def _procedural_plot_guard_guidance():
+def _procedural_plot_guard_guidance(compact=False):
     """Keep procedural background from becoming a universal plot engine."""
+    if compact:
+        return (
+            "【正文剧情推进边界】\n"
+            "正文把阶段规划和章节规划里的事实转换成当前题材的具体场景：先写人物在哪里、正在做什么、受到什么现场压力，"
+            "再让人物通过行动、对白、关系变化或临时选择带来可观察的结果。记录、责任线、复核、封存、归档、审批、回执、"
+            "档案、流程、合同、公司往来和同类事项，只在它们确实改变人物选择、关系或局势时作为短结果出现；"
+            "不要用‘记录、责任线、复核、封存、归档’之类的办案式、案卷式叙事结构去推动剧情。"
+            "它们不能成为连续事件的发动机、段落骨架、场景转折、悬念反转或章末落点。"
+            "这不是简单禁词表：普通工程、物资、武道、生活或制度信息，要先落到人物眼前的动作、阻力、选择和后果；"
+            "确需交代时，用一两句结果带过，随后回到人物正在经历的场面。"
+            "非法律、非职场、非商业题材，不要从‘边界、条件、资源、责任、结果’自行推导合同冲突、公司冲突、责任追究或案卷结构；"
+            "即使题材确实需要相关内容，也要写人物利益、欲望、现场对抗和直接后果，不把查找、比对、确认、签字、复核、封存、归档铺成剧情流程。"
+            "‘记录’可以在具体物件、工程数据或人物对白中自然出现，但不能让记录本身成为连续事件的发动机，也不要反复用同类资料词推动相邻段落。\n"
+        )
     return (
         "【程序性事项边界】\n"
-        "调查材料、核对记录、确认责任、责任追溯、合同或协议谈判、签字盖章、审批验收、交接归档、清算对账，"
-        "以及同类的资料往来和程序步骤，不得充当故事主线、阶段主线、章节主线、主要冲突、连续事件链、悬念反转或伏笔回收方式。"
-        "这些内容无论在小说底盘、人物设定、世界规则、伏笔、阶段规划还是章节提纲中，都不能被拆成一串剧情任务。"
-        "确实需要出现时，只用一两句交代已经发生的流程结果或现实影响，随后回到人物正在经历的场景、行动、关系变化和具体后果；"
-        "不展开查找、比对、确认、谈判、签字等过程，不把同一事项拆成多个剧情节点或章节。\n"
+        "调查材料、核对记录、确认责任、责任线、责任追溯、合同或协议谈判、公司治理、签字盖章、审批验收、复核、"
+        "交接、封存、归档、清算对账、备案、留痕、审查、流程、台账和同类资料往来，"
+        "不得在作者没有明确要求时充当故事主线、阶段主线、章节主线、主要冲突、连续事件链、悬念反转或伏笔回收方式。"
+        "不要用‘记录、责任线、复核、封存、归档’之类的办案式、案卷式叙事结构去推动剧情。"
+        "尤其不要把非法律、非职场、非商业题材改写成合同冲突、公司冲突、责任追究、资料争议或办案式推进；"
+        "不要因为输入里出现‘边界、条件、资源、责任、结果’等普通词，就自行补出合同、公司、审查或案卷结构。"
+        "这不是简单禁词表：题材底盘明确需要合同、公司或调查时，仍然要把冲突写成人物利益、欲望、选择和现场后果，"
+        "不能把查找、比对、确认、谈判、签字、复核、封存、归档本身拆成剧情任务。"
+        "‘记录’等词可以作为已经发生的普通事实偶尔出现，但不能让记录本身成为连续事件的发动机、五章收尾分工或正文段落骨架。"
+        "确实需要交代流程结果时，只用极短的结果信息，随后回到人物正在经历的场景、行动、关系变化和具体后果。\n"
     )
 
 
@@ -10583,7 +10645,7 @@ def _concrete_prose_expression_guidance(style_active=False, compact=False):
         )
         return (
             "【具体表达边界】\n"
-            "能力或条件有差别时落到动作、卡点和后果，避免‘A不等于B’等旁白金句；不是固定句式。"
+            "能力或条件有差别时落到动作、卡点和后果，避免‘A不等于B’、‘A不代表B’等旁白金句；不是固定句式。"
             + style_rule
             + "\n"
         )
@@ -10594,7 +10656,7 @@ def _concrete_prose_expression_guidance(style_active=False, compact=False):
     )
     return (
         "【具体表达边界】\n"
-        "不要把‘能力有限、条件不足、结果受限’写成旁白金句，尤其避免‘A不等于B’、‘A不是B而是C’、‘这不代表……’。"
+        "不要把‘能力有限、条件不足、结果受限’写成旁白金句，尤其避免‘A不等于B’、‘A不代表B’、‘A不是B而是C’等公式化对照句。"
         "需要表达能力或条件差别时，才落到‘已做到什么、卡在哪里、实际结果’；这是检查方向，不是固定三句或每段套用，让动作、缺口和后果自己说明。"
         "对白只有确需比较或反驳时才这样说；写完静默检查，非必要对白中的公式对照句改成具体场面。"
         + style_rule
@@ -10617,13 +10679,14 @@ def _grounded_prose_contract(style_active=False):
     return (
         "【正文语言要求】\n"
         "正文必须使用自然的网络小说叙述语言，直接写人物、场景、动作、对白和具体变化；"
-        "不得出现策划术语、抽象形容、文学化意象、空泛比喻、办案式表达、编辑式说明或编辑式总结。"
+        "不得出现策划术语、抽象形容、文学化意象、空泛比喻、编辑式说明或编辑式总结。"
         "资料中的Cxxx、Lxxx、Fxxx是程序内部的人物、设定和伏笔引用，不是故事里的自然名称；"
         "正文、对白、聊天消息、文件内容和人物内心都不得原样复制这些内部引用。需要写到对应内容时，必须使用资料中给出的正式名称或自然说法；"
         "除非当前剧情明确要求人物看到或说出这个内部编号，否则不能把它当成地点、人物、物件或线索名称。"
         "AF/NF/CF/NCF/TASK/NTASK/NOBJ以及state_reconciliation、long_form_memory、repair_patches、logic_audit、prose_review等字段名同样属于程序资料；"
         "它们不能出现在小说正文里，也不能被改写成对白、聊天内容、旁白或人物内心。"
         "情绪和气氛必须通过人物当下的动作、对白、反应和具体结果表现，不要用漂亮形容替代剧情。\n"
+        + _procedural_plot_guard_guidance(compact=True)
         + _prose_scene_grounding_guidance()
         + "【对白自然衔接】\n"
         "对白要像人物当面说话。人物回答时，按当下的关系和语境自然接住对方；需要说明来由、指代或态度时，把意思说清楚，让前一句与下一句接得上。"
@@ -10654,8 +10717,9 @@ def _natural_expression_guidance(style_active=False):
     """Keep prose direct while separating story facts from style imitation."""
     return (
         "【正文语言要求】正文必须使用自然的网络小说叙述语言，直接写人物、场景、动作、对白和具体变化；"
-        "不得出现策划术语、抽象形容、办案式表达、编辑式说明或编辑式总结。"
+        "不得出现策划术语、抽象形容、编辑式说明或编辑式总结。"
         "情绪和气氛必须通过人物当下的动作、对白、心理和具体结果表现，不用漂亮形容替代剧情。"
+        + _procedural_plot_guard_guidance(compact=True)
         + _prose_scene_grounding_guidance(compact=True)
         + _concrete_prose_expression_guidance(style_active=style_active)
         + "对白按关系和现场情绪自然接话，心理变化随人物自然展开。"
@@ -23034,10 +23098,20 @@ def _build_chapter_ai_context(project, chapter_index, action):
     ).strip()
     has_current_text = bool(_compact_text(chap.get("text", "")))
     reverse_from_body = action in {"outline", "summary"} and has_current_text
-    draft_words_label = _draft_words_label(chap.get("draft_words", ""))
-    draft_words_target = _draft_words_value(chap.get("draft_words", ""))
+    raw_draft_words = chap.get("draft_words", "")
+    draft_words_target = _draft_words_value(raw_draft_words)
+    # Fanqie ending review is sensitive to an under-length final chapter.
+    # Keep the project-provided target when it is sufficient, but never pass a
+    # sub-1000-word target to the prose model inside the final five chapters.
+    if terminal_window_info:
+        draft_words_target = max(1000, draft_words_target or 1000)
+        raw_draft_words = str(draft_words_target)
+    draft_words_label = _draft_words_label(raw_draft_words)
     current_body_len = _text_len(chap.get("text", ""))
-    draft_words_remaining = _draft_words_remaining(chap.get("draft_words", ""), chap.get("text", ""))
+    draft_words_remaining = max(
+        0,
+        draft_words_target - current_body_len,
+    ) if draft_words_target else _draft_words_remaining(raw_draft_words, chap.get("text", ""))
     draft_words_remaining_label = f"{draft_words_remaining}字" if draft_words_remaining else ""
     style_reference = str(project.get("style_reference", "") or "").strip()
     stage_boundary = (chapter_index + 1) % 10 == 0
@@ -23214,6 +23288,8 @@ def _build_chapter_ai_context(project, chapter_index, action):
         "伏笔只在合适章节推进；已回收/无需回收/废弃伏笔不要重复当新线索。缺资料时保持克制，不要补出会影响后文的新设定。",
         "人物秘密、伏笔完整答案和未解锁的设定属于作者层；正文只能使用本上下文已显示的故事内已知内容和当章允许推进的边界。",
     ]
+    if action != "draft":
+        inheritance_rule_lines.append(_procedural_plot_guard_guidance().strip())
     if reverse_from_body:
         inheritance_rule_lines.append("本次是正文后的资料回填：提纲、摘要和关键事实都只能记录正文草稿中已经发生的内容，不要补写后续规划。")
     else:

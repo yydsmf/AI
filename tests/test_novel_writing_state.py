@@ -8498,6 +8498,33 @@ class NovelWritingStateTests(unittest.TestCase):
         self.assertEqual(tab.chapter_ai_preview.toPlainText(), "")
         self.assertTrue(statuses[-1].startswith("已追加 1 章章节规划"))
 
+    def test_apply_chapter_plan_adds_final_suffix_after_user_confirmation(self):
+        existing = _new_chapter(0)
+        tab = NovelWritingTab.__new__(NovelWritingTab)
+        tab.current_project = {
+            "chapters": [existing],
+            "meta": {"total_chapter_count": 2},
+        }
+        tab._pending_chapter_plan = {
+            "chapters": [{"title": "厂内厂外的灯一起亮", "outline": "本部结果落地。"}],
+        }
+        tab.chapter_plan_apply_btn = _FakeButton()
+        tab.chapter_ai_preview = _FakePlainTextEdit("规划预览")
+        tab._flush_current_editors = lambda: None
+        tab._reload_chapter_list = lambda _index=None: None
+        tab._schedule_refresh = lambda include_manuscript=False: None
+        tab._auto_update_project_status = lambda **_kwargs: None
+        tab._note_project_dirty = lambda: None
+        tab.set_status_tip = lambda _text: None
+
+        with patch("gpt_desktop.novel_writing_tab.QMessageBox.question", return_value=QMessageBox.Yes):
+            tab.apply_chapter_plan()
+
+        self.assertEqual(
+            tab.current_project["chapters"][-1]["title"],
+            "厂内厂外的灯一起亮（大结局）",
+        )
+
     def test_chapter_plan_direct_use_keeps_imported_outline_when_model_decides_use_imported(self):
         tab = NovelWritingTab.__new__(NovelWritingTab)
         tab.current_project = {

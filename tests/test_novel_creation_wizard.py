@@ -8,6 +8,158 @@ import gpt_desktop.novel_creation_wizard as wizard
 
 
 class NovelCreationWizardPersistenceTests(unittest.TestCase):
+    def test_length_choices_are_grouped_into_short_and_long_options(self):
+        self.assertEqual(
+            wizard.CREATION_CHOICE_GROUPS["length"],
+            {
+                "短篇": ("1万字", "3万字", "5万字", "10万字"),
+                "长篇": ("15万字", "30万字", "50万字", "100万字+"),
+            },
+        )
+
+        dialog = wizard.NovelCreationWizardDialog.__new__(
+            wizard.NovelCreationWizardDialog
+        )
+        dialog.choice_values = {}
+        dialog._save_draft = lambda: None
+        values = {}
+        dialog.target_words_spin = SimpleNamespace(
+            setValue=lambda value: values.__setitem__("target_words", value),
+        )
+        for label, expected in (
+            ("1万字", 10000),
+            ("3万字", 30000),
+            ("5万字", 50000),
+            ("10万字", 100000),
+            ("15万字", 150000),
+            ("30万字", 300000),
+            ("50万字", 500000),
+            ("100万字+", 1000000),
+        ):
+            dialog.choice_values["length"] = label
+            dialog._on_choice_changed("length")
+            self.assertEqual(values["target_words"], expected)
+
+    @staticmethod
+    def _choice_dialog():
+        dialog = wizard.NovelCreationWizardDialog.__new__(
+            wizard.NovelCreationWizardDialog
+        )
+        dialog.choice_values = {}
+        dialog.choice_display_values = {}
+        dialog.choice_summary_buttons = {}
+        dialog.choice_arrow_buttons = {}
+        dialog.premise_candidates = []
+        dialog._save_draft = lambda: None
+        return dialog
+
+    def test_gender_choice_groups_keep_the_requested_order_and_separation(self):
+        self.assertEqual(
+            wizard.CREATION_CHOICE_GROUPS["audience"]["读者方向"],
+            ("男频", "女频"),
+        )
+        male = wizard.CREATION_GENDER_CHOICE_GROUPS["男频"]
+        female = wizard.CREATION_GENDER_CHOICE_GROUPS["女频"]
+        self.assertEqual(
+            male["genre"]["主分类"][:4],
+            ("西方奇幻", "东方仙侠", "科幻末世", "男频衍生"),
+        )
+        self.assertEqual(
+            male["genre"]["主分类"][-4:],
+            ("动漫衍生", "游戏体育", "传统玄幻", "都市修真"),
+        )
+        self.assertEqual(
+            female["genre"]["主分类"][:4],
+            ("女频悬疑", "古风世情", "科幻末世", "女频衍生"),
+        )
+        self.assertEqual(female["genre"]["主分类"][-3:], ("年代", "种田", "快穿"))
+        self.assertEqual(male["theme"]["主题"][0], "衍生")
+        self.assertEqual(female["theme"]["主题"][0], "古言权谋")
+        self.assertEqual(male["role"]["角色"][0], "多女主")
+        self.assertEqual(female["role"]["角色"][0], "位尊权重")
+        self.assertEqual(male["plot"]["情节"][0], "都市江湖")
+        self.assertEqual(female["plot"]["情节"][0], "男二上位")
+
+    def test_choice_groups_switch_with_reader_direction(self):
+        dialog = self._choice_dialog()
+        dialog.choice_values["audience"] = "男频"
+        self.assertEqual(
+            dialog._choice_groups("genre")["主分类"][0],
+            "西方奇幻",
+        )
+        self.assertEqual(
+            dialog._choice_groups("role")["角色"][0],
+            "多女主",
+        )
+
+        dialog.choice_values["audience"] = "女频"
+        self.assertEqual(
+            dialog._choice_groups("genre")["主分类"][0],
+            "女频悬疑",
+        )
+        self.assertEqual(
+            dialog._choice_groups("plot")["情节"][0],
+            "男二上位",
+        )
+        self.assertNotIn("男频衍生", dialog._choice_options("genre"))
+        self.assertNotIn("多女主", dialog._choice_options("role"))
+
+    def test_switching_reader_direction_drops_invalid_selected_categories(self):
+        dialog = self._choice_dialog()
+        dialog.choice_values.update({
+            "audience": "男频",
+            "genre": "都市脑洞",
+            "theme": "衍生、开局",
+            "role": "多女主、天才",
+            "plot": "废土、末世",
+        })
+        dialog.choice_values["audience"] = "女频"
+        dialog._on_choice_changed("audience")
+
+        self.assertNotIn("genre", dialog.choice_values)
+        self.assertEqual(dialog.choice_values["theme"], "衍生")
+        self.assertEqual(dialog.choice_values["role"], "天才")
+        self.assertEqual(dialog.choice_values["plot"], "末世")
+
+    def test_theme_role_and_plot_are_limited_to_two_choices(self):
+        dialog = self._choice_dialog()
+        for key in ("theme", "role", "plot"):
+            dialog._set_choice(key, "甲、乙、丙")
+            self.assertEqual(dialog.choice_values[key], "甲、乙")
+            self.assertEqual(dialog.choice_display_values[key], "甲、乙")
+
+    def test_role_and_plot_are_passed_to_ai_and_saved_in_selected_premise(self):
+        dialog = self._choice_dialog()
+        dialog.choice_values.update({
+            "audience": "女频",
+            "genre": "古言脑洞",
+            "theme": "古代、悬疑",
+            "role": "公主、腹黑",
+            "plot": "追夫、破镜重圆",
+            "style": "细腻情感",
+            "protagonist_route": "身份反转",
+        })
+        dialog.inspiration_edit = SimpleNamespace(text=lambda: "故事灵感")
+        dialog.project_name_hint = ""
+        dialog.premise_candidates = []
+        dialog.target_words_spin = SimpleNamespace(value=lambda: 500000)
+        dialog.average_words_spin = SimpleNamespace(value=lambda: 3000)
+        dialog._selected_custom_protagonist_style = lambda: {}
+
+        context = dialog._context_for_step("premise")
+        self.assertEqual(context["author_input"]["role"], "公主、腹黑")
+        self.assertEqual(context["author_input"]["plot"], "追夫、破镜重圆")
+
+        dialog.current_step_index = 0
+        dialog.premise_candidates = [{"title": "标题", "synopsis": "简介"}]
+        dialog.premise_selected_index = 0
+        dialog.step_results = {}
+        dialog._read_current_step()
+        selected = dialog.step_results["premise"]["selected"]
+        self.assertEqual(selected["audience"], "女频")
+        self.assertEqual(selected["role"], "公主、腹黑")
+        self.assertEqual(selected["plot"], "追夫、破镜重圆")
+
     @staticmethod
     def _scale_sized_assets(stage_counts):
         characters = [{"name": f"人物{i}"} for i in range(25)]

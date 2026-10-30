@@ -536,6 +536,31 @@ def _record_text_for_sort(item, fields):
     return "\n".join(str(item.get(field, "") or "") for field in fields)
 
 
+def _format_chapter_outline_display(value):
+    """Put the realm-progress marker and its explanation on their own line."""
+    text = str(value or "")
+    marker = "本章境界推进："
+    if marker not in text:
+        return text
+
+    formatted = []
+    cursor = 0
+    while True:
+        marker_start = text.find(marker, cursor)
+        if marker_start < 0:
+            formatted.append(text[cursor:])
+            break
+
+        prefix = text[cursor:marker_start]
+        if prefix and not prefix.endswith(("\r\n", "\r", "\n")):
+            formatted.append(prefix.rstrip(" \t\u3000") + "\n")
+        else:
+            formatted.append(prefix)
+        formatted.append(marker)
+        cursor = marker_start + len(marker)
+    return "".join(formatted)
+
+
 def _volume_handoff_display_text(handoff):
     """Render the structured handoff as readable notes instead of raw JSON."""
     handoff = handoff if isinstance(handoff, dict) else {}
@@ -4849,7 +4874,7 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
             self.chapter_status.setCurrentIndex(idx if idx >= 0 else 0)
             if hasattr(self, "chapter_draft_words"):
                 self.chapter_draft_words.setText(chap.get("draft_words", ""))
-            self.chapter_outline.setPlainText(chap.get("outline", ""))
+            self.chapter_outline.setPlainText(_format_chapter_outline_display(chap.get("outline", "")))
             self.chapter_text.setPlainText(chap.get("text", ""))
             self.chapter_summary.setPlainText(chap.get("summary", ""))
             self.chapter_key_facts.setPlainText(chap.get("key_facts", ""))
@@ -9978,9 +10003,14 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
                 "batch_continuity.locked_node_schedule 已由程序锁定节点可以落入的章节范围。"
                 "按节点的既定顺序安排故事，不改变当前阶段边界，不把下一阶段内容提前写入当前阶段。"
                 "节点编号和落点只供你理解，不要把它们写进返回内容，也不要为节点另造章节。"
-                "同一节点第一次发生时完成它的核心转折；如果一个节点覆盖数章，后续章节只写由它造成的新反应、新选择、新代价、新关系变化或新阻力，尽量不用固定清单式要求逐章重复节点。\n\n"
-                "当前阶段只是全书核心动机链的一段，不是独立短篇。每章都要写清主角为了当前具体目标采取的行动、"
-                "阻碍来自谁或什么、主角付出了什么代价、结果怎样改变主线；"
+                "阶段节点是本章故事的事实来源，不是章节任务清单；同一节点第一次发生时完成它的核心转折，"
+                "如果一个节点覆盖数章，后续章节按共享剧情推进要求改变主动人物、目标、压力、代价、关系结果或公开后果，"
+                "只补解释、讨论、等待或同一地点的重复说明不算推进。"
+                "安排每章时，先确定主角本章正在争取、保护、摆脱或确认什么，再把节点嵌入这次行动。"
+                "规则、权限、设备、资源和组织运行只在人物当前行动确实需要时作为阻力、资源、代价或结果出现；"
+                "如果某节点只是说明状态已经建立，应并入造成该结果的冲突，并写清它怎样迫使人物作出下一次选择。"
+                "涉及记录、复核、责任、封存、归档、审批或其它流程时，只保留改变人物选择、关系、资源、位置、信息或时间窗口的结果，"
+                "不要把查找、比对、确认和整理过程扩成连续章节目标。\n\n"
                 + terminal_node_progression_guidance
                 + "伏笔资料只列当前章节范围内已经出现或即将出现的线索；后续阶段的伏笔等到对应阶段再自然展开。\n\n"
                 "本批次必须返回准确数量的章节，列表顺序就是章节顺序；不要返回章节号、阶段号、节点号或其它定位标签。"
@@ -10000,8 +10030,7 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
                 + "entity_naming_guidance 是当前项目的正式称谓和实体关系边界，优先于模型自行压缩出的简称；"
                 "涉及人物集合、组织集合和势力集合时，必须保留实体类型，不要把人数简称写成组织名称。\n"
                 + _story_conflict_pacing_guidance()
-                + core_motive_guidance
-                + _procedural_plot_guard_guidance()
+                + (core_motive_guidance if terminal_batch_overlap else "")
                 + "状态变化要落到人物正在经历的场景、行动和后果，不把同一句状态连续复制到多章。"
                 "章节标题和提纲都使用具体、好读、能看见人物与现场的表达；不写策划术语、抽象形容、办案式说明或编辑式总结。\n"
                 + "只输出一个合法 JSON 对象，结构为 {\"c\":[{\"t\":\"章节名\",\"o\":\"本章具体故事提纲\",\"p\":[]}]}；"
@@ -10044,8 +10073,10 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
                 value = str(item.get(key, "") or "").strip()
                 if value:
                     lines.append(f"{label}：{value}")
-            outline = _strip_volume_handoff_outline_metadata(
-                _strip_static_foreshadow_outline_fields(item.get("outline", ""))
+            outline = _format_chapter_outline_display(
+                _strip_volume_handoff_outline_metadata(
+                    _strip_static_foreshadow_outline_fields(item.get("outline", ""))
+                )
             )
             if outline:
                 lines.append(outline)
@@ -16683,7 +16714,7 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
         )
         self.chapter_text.setPlainText(new_text)
         if outline and not str(getattr(self, "_chapter_ai_sequence_started_outline", "") or "").strip():
-            self.chapter_outline.setPlainText(outline)
+            self.chapter_outline.setPlainText(_format_chapter_outline_display(outline))
         if summary:
             self.chapter_summary.setPlainText(summary)
         if key_facts:
@@ -17235,7 +17266,7 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
             self.set_status_tip("没有可应用的 AI 结果。")
             return
         if target == "outline":
-            self.chapter_outline.setPlainText(text)
+            self.chapter_outline.setPlainText(_format_chapter_outline_display(text))
             inferred_names = self._infer_current_chapter_linked_names(extra_text=text)
             self._merge_chapter_linked_names(inferred_names)
         elif target == "summary":

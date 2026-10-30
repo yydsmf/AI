@@ -34,6 +34,7 @@ from .novel_utils import (
     _normalize_terminal_closure_plan,
     _normalize_terminal_contract,
     _procedural_plot_guard_guidance,
+    _story_conflict_pacing_guidance,
     _terminal_window_bounds,
 )
 from .workers import NovelAnalysisWorker
@@ -128,7 +129,7 @@ CREATION_WIZARD_STEPS = (
 
 CREATION_CHOICE_GROUPS = {
     "audience": {
-        "读者方向": ("男频", "女频", "男女皆宜"),
+        "读者方向": ("男频", "女频"),
     },
     "genre": {
         "奇幻仙侠": (
@@ -194,17 +195,110 @@ CREATION_CHOICE_GROUPS = {
         ),
     },
     "length": {
-        "作品长度": ("30万字", "50万字", "100万字+"),
+        "短篇": ("1万字", "3万字", "5万字", "10万字"),
+        "长篇": ("15万字", "30万字", "50万字", "100万字+"),
     },
     "chapter_words": {
         "单章字数": ("1000字", "2000字", "3000字", "5000字", "8000字", "10000字"),
     },
 }
 
+CREATION_GENDER_CHOICE_GROUPS = {
+    "男频": {
+        "genre": {
+            "主分类": (
+                "西方奇幻", "东方仙侠", "科幻末世", "男频衍生", "都市高武",
+                "悬疑灵异", "悬疑脑洞", "抗战谍战", "历史古代", "历史脑洞",
+                "都市种田", "都市脑洞", "都市日常", "玄幻脑洞", "战神赘婿",
+                "动漫衍生", "游戏体育", "传统玄幻", "都市修真",
+            ),
+        },
+        "theme": {
+            "主题": (
+                "衍生", "仕途", "综影视", "天灾", "第一人称", "赛博朋克", "第四天灾",
+                "规则怪谈", "搞笑轻松", "古代", "悬疑", "克苏鲁", "都市异能", "末日求生",
+                "灵气复苏", "高武世界", "异世大陆", "东方玄幻", "谍战", "清朝", "宋朝",
+                "断层", "武将", "国运", "综漫", "开局", "架空", "奇幻仙侠", "都市",
+                "玄幻", "历史", "体育", "武侠",
+            ),
+        },
+        "role": {
+            "角色": (
+                "多女主", "赘婿", "全能", "大佬", "大小姐", "特工", "游戏主播", "神探",
+                "贵族", "皇帝", "单女主", "校花", "无女主", "女帝", "特种兵", "反派",
+                "神医", "奶爸", "学霸", "天才", "腹黑", "扮猪吃虎",
+            ),
+        },
+        "plot": {
+            "情节": (
+                "都市江湖", "风水秘术", "斩神衍生", "十日衍生", "西游衍生", "公版衍生",
+                "红楼衍生", "甄嬛衍生", "如懿衍生", "惊悚游戏", "卡牌", "山海经", "捉鬼",
+                "剑修", "废土", "副本", "黑科技", "无脑爽", "魂穿", "高手下山", "黑化",
+                "迪化", "发家致富", "无后宫", "争霸", "1v1", "升级流", "灵魂互换", "科举",
+                "封神", "四合院", "电竞", "双重生", "乡村", "同人", "打脸", "破案",
+                "囤物资", "钓鱼", "网游", "奥特同人", "求生", "无敌", "民国", "九叔",
+                "穿书", "聊天群", "大秦", "龙珠", "漫威", "神奇宝贝", "海贼", "火影",
+                "职场", "明朝", "家庭", "三国", "末世", "直播", "无限流", "诸天万界",
+                "大唐", "宠物", "外卖", "星际", "美食", "剑道", "盗墓", "灵异", "鉴宝",
+                "系统", "神豪", "重生", "穿越", "二次元", "海岛", "娱乐圈", "空间", "推理",
+                "洪荒",
+            ),
+        },
+    },
+    "女频": {
+        "genre": {
+            "主分类": (
+                "女频悬疑", "古风世情", "科幻末世", "女频衍生", "民国言情", "悬疑脑洞",
+                "青春甜宠", "双男主", "古言脑洞", "现言脑洞", "玄幻言情", "宫斗宅斗",
+                "豪门总裁", "动漫衍生", "星光璀璨", "游戏体育", "职场婚恋", "双女主",
+                "年代", "种田", "快穿",
+            ),
+        },
+        "theme": {
+            "主题": (
+                "古言权谋", "悬疑恋爱", "纯爱", "衍生", "仕途", "综影视", "天灾", "第一人称",
+                "赛博朋克", "规则怪谈", "搞笑轻松", "古代", "悬疑", "谍战", "职场商战",
+                "虐恋情深", "日久生情", "豪门世家", "综漫", "异世穿越", "独宠", "现代言情",
+                "古代言情", "武侠", "幻想言情",
+            ),
+        },
+        "role": {
+            "角色": (
+                "位尊权重", "总裁", "忠犬", "全能", "白切黑", "双学霸", "作精", "大佬",
+                "大小姐", "游戏主播", "神探", "贵族", "将军", "毒医", "厨娘", "律师",
+                "医生", "明星", "替身", "双面", "冰山", "古灵精怪", "天作之合", "可盐可甜",
+                "无CP", "病娇", "反派", "萌宝", "宠妻", "学霸", "公主", "皇后", "王妃", "女强",
+                "皇叔", "嫡女", "精灵", "天才", "腹黑", "扮猪吃虎", "团宠",
+            ),
+        },
+        "plot": {
+            "情节": (
+                "男二上位", "代嫁代娶", "攻略反派", "风水秘术", "斩神衍生", "十日衍生",
+                "西游衍生", "公版衍生", "红楼衍生", "甄嬛衍生", "如懿衍生", "惊悚游戏",
+                "追夫", "山海经", "胎穿", "捉鬼", "剑修", "相互救赎", "宠夫", "无脑爽",
+                "魂穿", "黑化", "养崽", "年龄差", "真假千金", "久别重逢", "发家致富", "养成",
+                "互宠", "1v1", "灵魂互换", "科举", "年下", "婚恋", "封神", "四合院", "电竞",
+                "双重生", "前世今生", "双洁", "追妻火葬场", "乡村", "逃荒", "同人", "打脸",
+                "破案", "囤物资", "钓鱼", "HE", "相爱相杀", "暗恋", "逃婚", "带球跑", "强强",
+                "一见钟情", "双向奔赴", "破镜重圆", "契约婚姻", "隐婚", "闪婚", "今穿古", "古穿今",
+                "群穿", "护短", "虐渣", "情有独钟", "马甲", "先婚后爱", "医术", "女扮男装",
+                "青梅竹马", "无敌", "民国", "穿书", "职场", "家庭", "末世", "直播", "无限流",
+                "兽世", "清穿", "星际", "美食", "盗墓", "虐文", "甜宠", "灵异", "校园", "系统",
+                "重生", "穿越", "二次元", "娱乐圈", "空间", "推理",
+            ),
+        },
+    },
+}
+
+CREATION_GENDER_DEPENDENT_KEYS = frozenset(("genre", "theme", "role", "plot"))
+CREATION_MULTI_CHOICE_KEYS = frozenset(("theme", "role", "plot"))
+
 CREATION_CHOICE_DEFAULTS = {
     "audience": "男频",
     "genre": "都市脑洞",
     "theme": "",
+    "role": "",
+    "plot": "",
     "protagonist_route": "觉醒金手指",
     "protagonist_style": "",
     "style": "热血升级",
@@ -216,6 +310,8 @@ CREATION_CHOICE_TITLES = {
     "audience": "读者方向",
     "genre": "主分类",
     "theme": "主题（最多选2项）",
+    "role": "角色（最多选2项）",
+    "plot": "情节（最多选2项）",
     "protagonist_route": "主角起点",
     "protagonist_style": "自定义主角风格",
     "style": "风格与节奏",
@@ -227,10 +323,12 @@ CREATION_CHOICE_HINTS = {
     "audience": "先选读者方向，AI会据此调整人物关系和推进节奏。",
     "genre": "主分类只能选择一项，分类详情会在弹窗内滚动查看。",
     "theme": "主题最多选择两项，用来补充世界背景、叙事视角或阅读感觉。",
+    "role": "角色最多选择两项，用来确定主要人物类型和关系张力。",
+    "plot": "情节最多选择两项，用来确定故事常用的推进方式和爽点来源。",
     "protagonist_route": "主角从什么状态开始，会决定第一章的抓力。",
     "protagonist_style": "从人物卡收藏中选择主角的性格/特点和语言风格，只继承表达底色。",
     "style": "分类很多，选一个最想保留的主感觉即可。",
-    "length": "只是规划参考，后续可以继续调整。",
+    "length": "短篇和长篇分开选择；这里只是规划参考，后续可以继续调整。",
     "chapter_words": "章节总数和阶段边界会按这个字数计算，后面仍可调整。",
 }
 
@@ -352,7 +450,7 @@ CREATION_INSPIRATION_FACT_GUIDANCE = """
 
 COMMON_CREATION_RULES = f"""
 你正在和作者一起搭建一部长篇网络小说。外层 JSON 只是程序读取用的容器，不能在 JSON 之外添加解释、Markdown 或注释。
-1. 沿着作者已经说过和已经确认的故事继续写，稳住题材、主角、核心悬念、人物关系和结尾方向。作者灵感中的题材组合、人物身份、关系状态、具体情节、场景、爽点和节奏要求都要进入故事；第一步的主分类、主题、读者方向、主角起点和风格选择是创作底色。
+1. 沿着作者已经说过和已经确认的故事继续写，稳住题材、主角、核心悬念、人物关系和结尾方向。作者灵感中的题材组合、人物身份、关系状态、具体情节、场景、爽点和节奏要求都要进入故事；第一步的主分类、主题、角色、情节、读者方向、主角起点和风格选择是创作底色。
 2. 资料具体而有根，人物、地点、物件、选择、结果和长期成立的事实彼此照应；剧情节点只写当前故事真正需要的细节，让重要变化能够被看见、听见或感受到。
 3. 人物的愿望、顾虑、秘密和关系变化随着事情自然显现；故事可以由人物、关系、环境、事件、欲望、秘密或题材规则推动，不要求所有题材使用同一套冲突顺序。
 4. 小说圣经、世界规则、人物、设定和伏笔各自承担不同作用：圣经托住整本书，世界规则说明长期运转方式，人物承载选择和关系，设定提供反复使用的生活落点，伏笔保留线索和后续变化。
@@ -3057,11 +3155,20 @@ def creation_wizard_draft_from_project_draft(project):
         average_words = 3000
 
     def length_choice(value):
-        if value >= 1000000:
-            return "100万字+"
-        if value >= 500000:
-            return "50万字"
-        return "30万字"
+        choices = (
+            (1000000, "100万字+"),
+            (500000, "50万字"),
+            (300000, "30万字"),
+            (150000, "15万字"),
+            (100000, "10万字"),
+            (50000, "5万字"),
+            (30000, "3万字"),
+            (10000, "1万字"),
+        )
+        for minimum, label in choices:
+            if value >= minimum:
+                return label
+        return "1万字"
 
     chapter_choice = f"{average_words}字"
     if chapter_choice not in CREATION_CHOICE_GROUPS["chapter_words"]["单章字数"]:
@@ -3094,6 +3201,8 @@ def creation_wizard_draft_from_project_draft(project):
             "audience": _as_text(selected.get("audience")) or CREATION_CHOICE_DEFAULTS["audience"],
             "genre": _as_text(selected.get("genre")) or CREATION_CHOICE_DEFAULTS["genre"],
             "theme": _as_text(selected.get("theme")),
+            "role": _as_text(selected.get("role")),
+            "plot": _as_text(selected.get("plot")),
             "protagonist_route": (
                 _as_text(selected.get("protagonist_route"))
                 or CREATION_CHOICE_DEFAULTS["protagonist_route"]
@@ -4219,7 +4328,7 @@ def format_creation_context(context):
         "s=当前阶段，h=前面阶段，f=暗线位置，n=命名参考；其余字段按原名读取。"
         "a.inspiration 是作者亲自写下的完整灵感原文，里面的书名、标签、简介、人物、关系、情节、场景、爽点和节奏要求都要逐项吸收；"
         "a.requested_title 是作者已经明确确定的书名；只要它非空，后续返回中的书名必须原样保留，不能改写、缩写或另起书名；"
-        "a 里的主分类、主题、读者方向、风格和主角起点是硬要求，不要只在标签里提到，也不要用相似题材替换。"
+        "a 里的主分类、主题、角色、情节、读者方向、风格和主角起点是硬要求，不要只在标签里提到，也不要用相似题材替换。"
         "不要逐条复述资料，直接写出人物和事情。\n"
         + json.dumps(transport, ensure_ascii=False, separators=(",", ": "))
     )
@@ -5425,13 +5534,17 @@ c 中每项只能使用 n、r、g、s、p、v、q；l 中每项只能使用 n、
             )
             prompt = f"""{COMMON_CREATION_RULES}
 
+{_story_conflict_pacing_guidance()}
+
+本阶段所有事件都服务于同一条核心动机。先从主角正在争取、保护、摆脱或确认的具体结果出发，再让世界观、组织运行、设备状态、规则和责任分工作为人物行动的阻力、资源、代价或结果出现。若某个事件只是说明权限已分配、记录已完成、规则已建立或设备已稳定，应并入造成该结果的冲突事件，并继续表现这个结果如何迫使人物作出下一次选择。
+
 读取作者选定的故事、完整故事底盘、全书阶段骨架和已经完成的前面阶段，只生成当前第{stage_number}/{total_stages or '?'}阶段，范围为第{start_chapter}章到第{end_chapter}章。全书阶段骨架只负责提供本阶段的方向和结束状态，不要把骨架中的摘要和转折原样重复成另一份总规划；当前阶段的具体内容以本次事件和人物处境为准。前面阶段的结束状态、带入内容和仍在推动人物的问题是连续性依据。当前阶段必须沿着核心动机继续：先明确主角本阶段要完成的具体目标，再让事件围绕主角的行动、阻碍、选择、代价和结果展开；{stage_progression_guidance}阶段规划使用结构化表达，写清人物真正正在经历的事情、事件顺序、直接结果和状态变化；字段服务于故事事实，尽量不用固定清单式要求，不把每个事件套成同一张检查表。
 
-本阶段不要把“记录、责任线、责任追溯、复核、封存、归档、合同、协议、公司、审批、验收、对账、审查、流程”等程序性事项写成连续事件链、主要冲突或阶段任务；普通的“边界、条件、资源、责任、结果”也不能自动推导出合同冲突、公司冲突、责任追究或案卷结构。事件要优先写人物所在场景、正在进行的行动、现场阻力、人物选择、关系变化和可观察后果。确需交代流程时，只写已经发生的结果，不展开查找、比对、确认、谈判、签字、复核、封存或归档过程；如果作者明确要求法律、职场、商业或调查题材，也要把相关内容落到人物利益、欲望和现场后果上，不把流程本身当成叙事骨架。
+程序性事项沿用上面的共享边界：维护、生产、资源、权限和规则只有在具体人物的使坏、失误、隐瞒、争夺、误判或重大纰漏造成现场后果时才形成事件；公司、合同或调查题材也必须落到直接利益者的行动和对抗，不把流程步骤本身当成叙事骨架。
 
 输入资料中的 current_foreshadow_endpoints 是本阶段自然发生的正式暗线端点清单。每一项落到一个当前事件中；kind=setup 写线索怎样第一次进入人物生活，kind=payoff 写线索怎样在现场完成一个明确问题的回答，并产生可观察的直接结果。payoff不能只写推进、部分揭示、再次出现、冲突升级、确认“事情不简单”或留下新的问题；如果当前事件只能继续铺垫，就不能把它当成正式 payoff。清单为空时，场景仍然沿着人物和主线自然推进。同一条伏笔在其它事件里继续出现、深化或产生后果是正常的，但正式端点只在真正承担该变化的事件中标记一次；后续事件用普通关联资料或“F编号”继续承接，不重复写“F编号/setup”或“F编号/payoff”。承载正式端点的事件 references 加入对应标记，让程序可以把端点和事件稳定对应起来。
 
-阶段内的事件以场景为核心：在需要的地方写清本次真正发生的事实，尽量不用固定清单式要求，不为凑齐项目逐项重复。每个事件的 allowed_chapters 是这个事件可以使用的章节容量：一章范围写一个主要场面和直接结果，跨数章的范围写同一条连续冲突在这些章节里的升级、选择和后果。事件正文必须与自己的章节容量相称，不要把多个独立地点、多个独立对手、多个完整高潮或下一阶段内容塞进一个短范围；事件里有多个动作时，要把它们组织成同一条连续事情，不能靠扩大 allowed_chapters 之外的范围来容纳。相邻事件从人物目标和现场结果自然长出新的推进方式，让人物行动、关系变化、空间压力、利益变化、能力试探、秘密暴露或突发后果带来变化，不套固定轮换。伏笔只在实际发生的阶段返回，一次只返回一个当前正式端点；f中的每项写 i、k、e、d，其中 k 为 setup 或 payoff，e 是承载它的事件编号，d 是这一次在场景中发生的具体变化。后续事件可以继续写同一条线索的新增影响，但不重复返回同一种正式端点。程序会依据事件范围落下具体章号。{("同时返回全书长期事实 k。" if first_stage else "本阶段沿用前面已经确认的长期事实。")}
+阶段内的事件以场景为核心：在需要的地方写清本次真正发生的事实，尽量不用固定清单式要求，不为凑齐项目逐项重复。allowed_chapters 是事件容量：一章写一个主要场面和直接结果；最多连续两章写同一冲突的升级、选择和后果。每个事件的章节范围必须满足 b-a+1<=2；如果一个事件想覆盖三章或四章，必须先拆成至少两个事件，每个事件各自绑定具体人物关系、独立阻力、选择和结果，再由结果衔接下一事件。不能把同一段家庭谈话、资源讨论或权限说明换一种说法继续占满多章。生成事件数组前逐项确认范围长度，超过两章就拆分，不要把超长范围交给程序再落位。相邻事件从人物目标和现场结果自然长出新的推进方式。伏笔只在实际发生的阶段返回，一次只返回一个当前正式端点；f中的每项写 i、k、e、d，其中 k 为 setup 或 payoff，e 是承载它的事件编号，d 是这一次在场景中发生的具体变化。后续事件可以继续写同一条线索的新增影响，但不重复返回同一种正式端点。程序会依据事件范围落下具体章号。{("同时返回全书长期事实 k。" if first_stage else "本阶段沿用前面已经确认的长期事实。")}
 
             {opening_guidance}{subject_guidance}{final_stage_guidance}
 
@@ -6253,6 +6366,8 @@ class NovelCreationWizardDialog(QDialog):
                 if value:
                     self._set_choice(key, value)
 
+            self._sync_gender_dependent_choices()
+
             if "inspiration" in draft:
                 self.inspiration_edit.setText(_as_text(draft.get("inspiration")))
 
@@ -6480,7 +6595,38 @@ class NovelCreationWizardDialog(QDialog):
     def _choice_groups(self, key):
         if key == "protagonist_style":
             return _character_style_choice_groups()
+        if key in CREATION_GENDER_DEPENDENT_KEYS:
+            audience = self._selected_choice("audience")
+            gender = "女频" if audience == "女频" else "男频"
+            return CREATION_GENDER_CHOICE_GROUPS[gender].get(key, {})
         return CREATION_CHOICE_GROUPS.get(key, {})
+
+    def _sync_gender_dependent_choices(self):
+        """Drop selections that do not belong to the currently selected frequency."""
+        for key in CREATION_GENDER_DEPENDENT_KEYS:
+            current = self._selected_choice(key)
+            if not current:
+                continue
+            options = set(self._choice_options(key))
+            values = [
+                item for item in re.split(r"[、,，]", current)
+                if item.strip() in options
+            ]
+            if key in CREATION_MULTI_CHOICE_KEYS:
+                next_value = "、".join(values[:2])
+            else:
+                next_value = values[0] if values else ""
+            if next_value == current:
+                continue
+            if next_value:
+                self.choice_values[key] = next_value
+                self.choice_display_values[key] = next_value
+            else:
+                self.choice_values.pop(key, None)
+                self.choice_display_values.pop(key, None)
+            button = self.choice_summary_buttons.get(key)
+            if button is not None:
+                button.setText(next_value or "点击选择")
 
     def _allow_power_levels(self):
         premise = self._current_premise()
@@ -6809,13 +6955,26 @@ class NovelCreationWizardDialog(QDialog):
                     button.setText("点击选择")
                 self._save_draft()
                 return
-        if key == "theme":
-            theme_values = []
+        if key in CREATION_MULTI_CHOICE_KEYS:
+            selected_values = []
             for item in re.split(r"[、,，]", value):
                 item = item.strip()
-                if item and item not in theme_values:
-                    theme_values.append(item)
-            value = "、".join(theme_values[:2])
+                if item and item not in selected_values:
+                    selected_values.append(item)
+            value = "、".join(selected_values[:2])
+            display_value = value
+            if not value:
+                previous = self._selected_choice(key)
+                self.choice_values.pop(key, None)
+                self.choice_display_values.pop(key, None)
+                button = self.choice_summary_buttons.get(key)
+                if button is not None:
+                    button.setText("点击选择")
+                if previous and previous != value and self.premise_candidates:
+                    self._invalidate_steps_from("stage_plan")
+                self._on_choice_changed(key)
+                self._save_draft()
+                return
         elif not value:
             return
         previous = self._selected_choice(key)
@@ -6826,7 +6985,7 @@ class NovelCreationWizardDialog(QDialog):
             button.setText(display_value or "点击选择")
         arrows = self.choice_arrow_buttons.get(key, ())
         if arrows:
-            if key == "theme":
+            if key in CREATION_MULTI_CHOICE_KEYS:
                 tooltip = f"{CREATION_CHOICE_TITLES.get(key, key)}：打开多选窗口"
                 arrows[0].setToolTip(tooltip)
                 arrows[1].setToolTip(tooltip)
@@ -6852,7 +7011,7 @@ class NovelCreationWizardDialog(QDialog):
         return options
 
     def _step_choice(self, key, delta):
-        if key == "theme":
+        if key in CREATION_MULTI_CHOICE_KEYS:
             self._open_choice_picker(key)
             return
         options = self._choice_options(key)
@@ -6982,14 +7141,14 @@ class NovelCreationWizardDialog(QDialog):
             CREATION_CHOICE_TITLES.get(key, key),
             self._choice_groups(key),
             current_value=self._selected_choice_picker_value(key),
-            max_selections=2 if key == "theme" else 1,
+            max_selections=2 if key in CREATION_MULTI_CHOICE_KEYS else 1,
             parent=self,
             removable_options=removable_options,
         )
         if key == "protagonist_style":
             dialog.style_removed.connect(self._on_character_style_removed)
         if dialog.exec() == QDialog.Accepted:
-            if key == "theme" or dialog.selected_value:
+            if key in CREATION_MULTI_CHOICE_KEYS or dialog.selected_value:
                 self._set_choice(key, dialog.selected_value)
 
     def _on_character_style_removed(self, style_id):
@@ -6997,8 +7156,15 @@ class NovelCreationWizardDialog(QDialog):
             self._set_choice("protagonist_style", "")
 
     def _on_choice_changed(self, key):
-        if key == "length":
+        if key == "audience":
+            self._sync_gender_dependent_choices()
+        elif key == "length":
             values = {
+                "1万字": 10000,
+                "3万字": 30000,
+                "5万字": 50000,
+                "10万字": 100000,
+                "15万字": 150000,
                 "30万字": 300000,
                 "50万字": 500000,
                 "100万字+": 1000000,
@@ -7050,15 +7216,16 @@ class NovelCreationWizardDialog(QDialog):
         choice_grid.setContentsMargins(0, 0, 0, 0)
         choice_grid.setHorizontalSpacing(7)
         choice_grid.setVerticalSpacing(7)
-        for column in range(3):
+        for column in range(4):
             choice_grid.setColumnStretch(column, 1)
         for index, key in enumerate(
             (
-                "audience", "genre", "theme", "protagonist_route",
-                "protagonist_style", "style", "length", "chapter_words",
+                "audience", "genre", "theme", "role", "plot",
+                "protagonist_route", "protagonist_style", "style",
+                "length", "chapter_words",
             )
         ):
-            row_index, column_index = divmod(index, 3)
+            row_index, column_index = divmod(index, 4)
             self._add_choice_selector(choice_grid, key, row_index, column_index)
         preferences_layout.addLayout(choice_grid)
 
@@ -7367,6 +7534,8 @@ class NovelCreationWizardDialog(QDialog):
                 "temporary_title": requested_title or self.project_name_hint,
                 "genre": genre,
                 "theme": self._selected_choice("theme"),
+                "role": self._selected_choice("role"),
+                "plot": self._selected_choice("plot"),
                 "audience": self._selected_choice("audience"),
                 "style": self._selected_choice("style"),
                 "protagonist_route": self._selected_choice("protagonist_route"),
@@ -7523,6 +7692,8 @@ class NovelCreationWizardDialog(QDialog):
                 _as_text(item.get("audience")),
                 _as_text(item.get("genre")) or self._selected_choice("genre"),
                 self._selected_choice("theme"),
+                self._selected_choice("role"),
+                self._selected_choice("plot"),
                 _as_text(item.get("style")) or self._selected_choice("style"),
             ) if part
         )
@@ -8355,10 +8526,12 @@ class NovelCreationWizardDialog(QDialog):
             if not self.premise_candidates:
                 raise ValueError("请先生成至少一份故事方向。")
             candidate = self._current_premise()
+            candidate["audience"] = self._selected_choice("audience")
             candidate["genre"] = self._selected_choice("genre")
             candidate["theme"] = self._selected_choice("theme")
+            candidate["role"] = self._selected_choice("role")
+            candidate["plot"] = self._selected_choice("plot")
             candidate["style"] = candidate.get("style") or self._selected_choice("style")
-            candidate["audience"] = candidate.get("audience") or self._selected_choice("audience")
             candidate["protagonist_route"] = (
                 candidate.get("protagonist_route")
                 or self._selected_choice("protagonist_route")
@@ -8487,10 +8660,12 @@ class NovelCreationWizardDialog(QDialog):
                 if isinstance(candidate, dict):
                     selected = deepcopy(candidate)
         if selected:
+            selected["audience"] = self._selected_choice("audience")
             selected["genre"] = self._selected_choice("genre")
             selected["theme"] = self._selected_choice("theme")
+            selected["role"] = self._selected_choice("role")
+            selected["plot"] = self._selected_choice("plot")
             selected["style"] = selected.get("style") or self._selected_choice("style")
-            selected["audience"] = selected.get("audience") or self._selected_choice("audience")
             selected["protagonist_route"] = (
                 selected.get("protagonist_route")
                 or self._selected_choice("protagonist_route")

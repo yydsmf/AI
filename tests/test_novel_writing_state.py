@@ -44,12 +44,42 @@ from gpt_desktop.novel_utils import (
 from gpt_desktop.novel_writing_tab import (
     ChapterPlanFoundationDialog,
     NovelWritingTab,
+    _format_chapter_outline_display,
     _numbered_export_chapter_title,
 )
 from gpt_desktop.workers import EdgeTTSWorker, _parse_edge_tts_server_date
 
 
 class NovelWritingStateTests(unittest.TestCase):
+    def test_chapter_outline_display_separates_realm_progress_marker(self):
+        compact = "主角突破瓶颈，本章境界推进：从炼气三层升到四层。"
+        self.assertEqual(
+            _format_chapter_outline_display(compact),
+            "主角突破瓶颈，\n本章境界推进：从炼气三层升到四层。",
+        )
+        self.assertEqual(
+            _format_chapter_outline_display("主角突破瓶颈。\n本章境界推进：从炼气三层升到四层。"),
+            "主角突破瓶颈。\n本章境界推进：从炼气三层升到四层。",
+        )
+        self.assertEqual(
+            _format_chapter_outline_display("主角突破瓶颈。  本章境界推进：从炼气三层升到四层。"),
+            "主角突破瓶颈。\n本章境界推进：从炼气三层升到四层。",
+        )
+
+    def test_chapter_plan_preview_formats_realm_progress_marker(self):
+        tab = NovelWritingTab.__new__(NovelWritingTab)
+        preview = tab._format_chapter_plan_preview({
+            "target_words": 5000,
+            "average_chapter_words": 5000,
+            "chapters": [{
+                "index": 1,
+                "title": "破境",
+                "outline": "主角迎战强敌，本章境界推进：完成一次小境界突破。",
+            }],
+        })
+
+        self.assertIn("本章境界推进：完成一次小境界突破。", preview)
+
     @staticmethod
     def _completion_project(chapter_count=2):
         chapters = []
@@ -4577,6 +4607,34 @@ class NovelWritingStateTests(unittest.TestCase):
         self.assertEqual(saved["outline"], "主角进入王城，迟到主角交出旧卷。")
         self.assertEqual(tab.chapter_linked.text(), "迟到主角")
         self.assertEqual(saved["linked_characters"], ["迟到主角"])
+
+    def test_apply_outline_preview_separates_realm_progress_marker(self):
+        chapter = _new_chapter(0)
+        tab = NovelWritingTab.__new__(NovelWritingTab)
+        tab.current_project = {"characters": [], "chapters": [chapter]}
+        tab.current_chapter_index = 0
+        tab.chapter_ai_preview = _FakePlainTextEdit(
+            "主角迎战强敌，本章境界推进：完成一次小境界突破。"
+        )
+        tab.chapter_title = _FakeLineEdit("第一章")
+        tab.chapter_status = _FakeComboBox(["大纲", "写作中", "已完成", "待重写"], "大纲")
+        tab.chapter_linked = _FakeLineEdit("")
+        tab.chapter_outline = _FakePlainTextEdit("")
+        tab.chapter_text = _FakePlainTextEdit("")
+        tab.chapter_summary = _FakePlainTextEdit("")
+        tab.chapter_key_facts = _FakePlainTextEdit("")
+        tab._dirty = False
+        tab._loading = False
+        tab._refresh_chapter_item = lambda _index: None
+        tab._schedule_refresh = lambda include_manuscript=False: None
+        tab.set_chapter_ai_panel_expanded = lambda _expanded: None
+        tab.set_status_tip = lambda _text: None
+
+        tab.apply_chapter_ai_preview("outline")
+
+        expected = "主角迎战强敌，\n本章境界推进：完成一次小境界突破。"
+        self.assertEqual(tab.chapter_outline.toPlainText(), expected)
+        self.assertEqual(tab.current_project["chapters"][0]["outline"], expected)
 
     def test_apply_text_preview_infers_linked_characters(self):
         chapter = _new_chapter(0)

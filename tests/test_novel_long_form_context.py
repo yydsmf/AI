@@ -67,6 +67,8 @@ from gpt_desktop.novel_utils import (
     _parse_style_technique_cards_result,
     _parse_style_voice_cards_result,
     _procedural_plot_guard_guidance,
+    _story_conflict_pacing_guidance,
+    _project_core_motive_text,
     _resolve_long_form_record_ref,
     _merge_long_form_memory_repair_patch,
     _merge_long_form_memory_repair_full,
@@ -143,6 +145,19 @@ class NovelLongFormContextTests(unittest.TestCase):
         self.assertIn("这不是简单禁词表", context)
         self.assertIn("记录本身成为连续事件的发动机", context)
         self.assertIn("不要用‘记录、责任线、复核、封存、归档’之类的办案式、案卷式叙事结构去推动剧情", context)
+
+    def test_story_conflict_guidance_binds_events_to_people_and_varies_cross_chapter_pressure(self):
+        guidance = _story_conflict_pacing_guidance()
+        for phrase in ("具体人物或人物关系", "直接利益者", "使坏、失误、隐瞒", "不得连续超过两章", "至少改变下列两项"):
+            self.assertIn(phrase, guidance)
+        compact = _story_conflict_pacing_guidance(compact=True)
+        self.assertIn("具体人物的目标、关系和眼前压力", compact)
+        self.assertIn("维护、分配、记录或状态说明单独写成剧情", compact)
+
+        project = self._project_with_current_chapter(_new_chapter(0))
+        context = _build_chapter_ai_context(project, 0, "draft")
+        self.assertIn("人物冲突落地", context)
+        self.assertIn("同一冲突跨章时", context)
 
     def test_concrete_prose_guidance_rejects_both_stock_contrast_forms(self):
         for prompt in (
@@ -419,6 +434,31 @@ class NovelLongFormContextTests(unittest.TestCase):
             "foreshadow_items": [],
             "chapters": [current],
         }
+
+    def test_runtime_mainline_uses_one_existing_source_in_fixed_priority_order(self):
+        project = self._project_with_current_chapter(_new_chapter(0))
+        project["creative_intent_contract"] = {
+            "core_motive": "用户确认的核心动机。",
+        }
+        project["chapter_plan_foundation"] = {
+            "core_motive": "阶段规划里的兼容主线。",
+        }
+        project["creation_framework"] = {
+            "bible": {"main_conflict": "故事圣经里的兼容主线。"},
+            "premise": {"main_line": "简介里的兼容主线。"},
+        }
+
+        self.assertEqual(
+            _project_core_motive_text(project),
+            "用户确认的核心动机。",
+        )
+        project["chapters"][0]["outline"] = "主角为拿到药物进入仓库，守门人要求他交出旧信。"
+        context = _build_chapter_ai_context(project, 0, "draft")
+        focus = self._context_section(context, "本章写作重心")
+        self.assertIn("用户确认的核心动机。", focus)
+        self.assertIn("主角为拿到药物进入仓库", focus)
+        self.assertNotIn("阶段规划里的兼容主线", focus)
+        self.assertIn("现实阻力和直接后果", focus)
 
     def _context_section(self, context, title):
         marker = f"【{title}】\n"
@@ -4436,6 +4476,28 @@ class NovelLongFormContextTests(unittest.TestCase):
         quote = normalized["fact_updates"][0]["evidence_quote"]
         self.assertEqual(quote, "像是把所有人的心口都拴在了屏幕上")
         self.assertIn(quote, body)
+
+    def test_noncontiguous_memory_evidence_salvages_unique_body_fragment(self):
+        body = (
+            "她想起宴会厅碎裂的玻璃，想起花房外那道看不清的影子，"
+            "也想起江白每次都在她说不清危险之前把她拽开。"
+        )
+        source_quote = "她想起江白每次都在她说不清危险之前把她拽开。"
+        normalized = _literalize_long_form_memory_evidence({
+            "record_updates": {
+                "characters": [{
+                    "operation": "update",
+                    "ref": "C002",
+                    "evidence_quote": source_quote,
+                }],
+                "lore": [],
+            },
+        }, body)
+
+        quote = normalized["record_updates"]["characters"][0]["evidence_quote"]
+        self.assertIn(quote, body)
+        self.assertNotEqual(quote, source_quote)
+        self.assertIn("江白每次都在她说不清危险之前把她拽开", quote)
 
     def test_strict_validation_rejects_unknown_snapshot_and_retirement_references(self):
         chapter = _new_chapter(0)

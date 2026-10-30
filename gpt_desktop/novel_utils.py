@@ -10528,15 +10528,29 @@ def _build_legacy_style_execution_context(
     )[:int(limit or NOVEL_AI_CONTEXT_LIMIT)]
 
 
-def _story_conflict_pacing_guidance():
-    """Keep chapter-plan rhythm lively without forcing every genre into a fight scene."""
+def _story_conflict_pacing_guidance(compact=False):
+    """Keep every story unit character-led and prevent one event from becoming filler."""
+    if compact:
+        return (
+            "【人物冲突落地】\n"
+            "正文每个场景都要落到具体人物的目标、关系和眼前压力：谁在争取、阻止、利用、隐瞒或承担什么，"
+            "人物采取了什么行动，行动怎样改变关系、处境或局势。设备、生产、资源、权限和规则只能作为人物冲突的载体；"
+            "使坏、失误、隐瞒、争夺或重大纰漏必须由具体人物造成并产生现场后果，不能把维护、分配、记录或状态说明单独写成剧情。"
+            "同一冲突跨章时，后续场景必须出现新的行动、压力、代价、关系结果或不可逆后果，不能只换一种说法重复解释。\n"
+        )
     return (
-        "【剧情推进要求】\n"
+        "【剧情推进与人物冲突落地】\n"
+        "每个阶段事件、章节提纲和正文场面都要绑定具体人物或人物关系，先能回答‘谁想得到或守住什么、谁在阻止或利用他、主角做了什么选择、结果迫使谁改变下一步’。"
+        "事件可以由对抗、关系变化、利益争夺、环境压力、秘密暴露或突发后果推动，但不能只有设备状态、生产安排、资源分配、权限变化、规则说明或资料往来。"
+        "公司利益、合同和治理事项必须落到股东、管理者、合作方、员工或其它直接利益者的欲望、行动和对抗；设备维护、生产、资源和权限问题必须落到人物使坏、失误、隐瞒、争夺、误判或重大纰漏，并留下现场可见的后果。"
+        "如果没有具体行动者、受影响的人物关系和当场后果，就把它并入真正造成该结果的冲突，不要单独生成事件。\n"
         "连续章节都由正在发生的事情推动。对于爽文、逆袭、升级、都市、高武、玄幻等强调外部结果的题材，"
-        "对于以人物对抗为主的题材，通常每两章至少要让主角和路人、配角、对手或反派发生一次有效碰撞，并改变其下一步行动、关系状态或现实处境；它从人物当前目标和现场压力中自然长出，"
-        "可以是人与人之间的冲突，也可以是欲望、利益、环境、秘密或突发后果造成的压力。"
-        "碰撞的对象、场景和结果随故事变化，不按固定类型轮换，也不为了满足数量硬塞一段重复对抗。"
-        "其他题材同样要在合适的节奏内让主角面对具体压力并作出选择，让处境继续改变。\n"
+        "对于以人物对抗为主的题材，通常每两章至少要让主角和路人、配角、对手或反派发生一次有效碰撞，并改变其下一步行动、关系状态或现实处境；"
+        "碰撞从人物当前目标和现场压力中自然长出，不按固定类型轮换，也不为了满足数量硬塞重复对抗。其他题材同样要在合适节奏内让人物面对具体压力并作出选择。\n"
+        "同一治理、谈话或资源事件的 allowed_chapters 不得连续超过两章；如果阶段需要覆盖四章或更长，必须拆成至少两个事件，每个事件各自完成一轮人物冲突、选择和结果，再由结果衔接下一事件。"
+        "同一主线可以连续，但不能用一个事件包住四章，也不能把同一段家庭谈话、资源讨论或权限说明拆成换说法后继续占满多章。"
+        "跨两章的后续场景至少改变下列两项：主动人物、眼前目标、场景或对象、压力来源、代价、关系结果或公开后果；"
+        "只增加解释、讨论、复核、等待或同一地点的换说法不算推进。同一地点可以继续使用，但必须有新的外部行动、人物进入或退出、信息暴露、选择或不可逆结果改变下一步。\n"
     )
 
 
@@ -10584,6 +10598,95 @@ def _procedural_plot_guard_guidance(compact=False):
         "‘记录’等词可以作为已经发生的普通事实偶尔出现，但不能让记录本身成为连续事件的发动机、五章收尾分工或正文段落骨架。"
         "确实需要交代流程结果时，只用极短的结果信息，随后回到人物正在经历的场景、行动、关系变化和具体后果。\n"
     )
+
+
+def _project_core_motive_text(project, limit=2200):
+    """Choose one existing mainline source for runtime writing context."""
+    project = project if isinstance(project, dict) else {}
+    contract = project.get("creative_intent_contract", {})
+    contract = contract if isinstance(contract, dict) else {}
+    foundation = project.get("chapter_plan_foundation", {})
+    foundation = foundation if isinstance(foundation, dict) else {}
+    framework = project.get("creation_framework", {})
+    framework = framework if isinstance(framework, dict) else {}
+    bible = framework.get("bible", {})
+    bible = bible if isinstance(bible, dict) else {}
+    premise = framework.get("premise", {})
+    premise = premise if isinstance(premise, dict) else {}
+    meta = project.get("meta", {})
+    meta = meta if isinstance(meta, dict) else {}
+
+    candidates = (
+        contract.get("core_motive") or contract.get("primary_line"),
+        foundation.get("core_motive") or foundation.get("core_mainline"),
+        bible.get("main_conflict"),
+        premise.get("core_motive"),
+        premise.get("main_line"),
+        meta.get("premise"),
+    )
+    for value in candidates:
+        text = _dedupe_text_lines(str(value or "").strip())
+        if text:
+            return _clip_complete_text(text, int(limit or 2200))
+    return ""
+
+
+def _chapter_mainline_focus(project, chapter_index, limit=1400):
+    """Summarize only the current chapter's existing mainline handoff."""
+    project = project if isinstance(project, dict) else {}
+    chapters = project.get("chapters", [])
+    chapter = (
+        chapters[chapter_index]
+        if isinstance(chapters, list)
+        and 0 <= chapter_index < len(chapters)
+        and isinstance(chapters[chapter_index], dict)
+        else {}
+    )
+    parts = []
+    outline = _strip_volume_handoff_outline_metadata(
+        _strip_static_foreshadow_outline_fields(chapter.get("outline", ""))
+    )
+    if outline:
+        parts.append("章节提纲：" + outline)
+    structured = chapter.get("chapter_plan_structured", {})
+    if isinstance(structured, dict):
+        for label, key in (
+            ("本章目标", "goal"),
+            ("主导线", "dominant_line"),
+            ("本章冲突", "main_conflict"),
+            ("章末变化", "ending_change"),
+        ):
+            value = structured.get(key, "")
+            if isinstance(value, dict):
+                value = "；".join(
+                    str(item or "").strip()
+                    for item in (value.get("type", ""), value.get("fact", ""))
+                    if str(item or "").strip()
+                )
+            elif isinstance(value, list):
+                value = "；".join(str(item or "").strip() for item in value)
+            value = str(value or "").strip()
+            if value:
+                parts.append(f"{label}：{value}")
+        delta = structured.get("continuity_delta", {})
+        if isinstance(delta, dict):
+            changes = []
+            for label, key in (
+                ("关系", "relationship_changes"),
+                ("认知", "knowledge_changes"),
+                ("物件", "object_changes"),
+                ("新问题", "new_open_threads"),
+                ("关闭问题", "closed_threads"),
+            ):
+                value = delta.get(key, "")
+                if isinstance(value, list):
+                    value = "；".join(str(item or "").strip() for item in value)
+                value = str(value or "").strip()
+                if value:
+                    changes.append(f"{label}：{value}")
+            if changes:
+                parts.append("已有连续性变化：" + "；".join(changes))
+    return _clip_complete_text("\n".join(parts), int(limit or 1400))
 
 
 def _entity_naming_guidance(project=None, limit=2600):
@@ -10686,6 +10789,7 @@ def _grounded_prose_contract(style_active=False):
         "AF/NF/CF/NCF/TASK/NTASK/NOBJ以及state_reconciliation、long_form_memory、repair_patches、logic_audit、prose_review等字段名同样属于程序资料；"
         "它们不能出现在小说正文里，也不能被改写成对白、聊天内容、旁白或人物内心。"
         "情绪和气氛必须通过人物当下的动作、对白、反应和具体结果表现，不要用漂亮形容替代剧情。\n"
+        + _story_conflict_pacing_guidance(compact=True)
         + _procedural_plot_guard_guidance(compact=True)
         + _prose_scene_grounding_guidance()
         + "【对白自然衔接】\n"
@@ -17150,6 +17254,38 @@ def _literalize_long_form_evidence_quote(quote, final_text):
         if _long_form_evidence_present(literal, body):
             return literal
 
+    # A model may omit an intervening phrase without punctuation, for example
+    # by joining two parts of a character's recollection into one evidence
+    # string.  Salvage only the longest unique contiguous fragment that is
+    # already present in the body, then expand it with the existing literal
+    # body-span logic.  This keeps the evidence grounded in the manuscript
+    # while avoiding a hard failure caused by model-side paraphrase joining.
+    if len(projected_quote) >= _EVIDENCE_MIN_UNIQUE_CLAUSE_CHARS:
+        matching_blocks = SequenceMatcher(
+            None, projected_quote, projected_body, autojunk=False
+        ).get_matching_blocks()
+        matching_blocks.sort(key=lambda block: block.size, reverse=True)
+        for block in matching_blocks:
+            if block.size < _EVIDENCE_MIN_UNIQUE_CLAUSE_CHARS:
+                break
+            fragment = projected_quote[block.a:block.a + block.size]
+            body_start = projected_body.find(fragment)
+            if body_start < 0 or projected_body.find(fragment, body_start + 1) >= 0:
+                continue
+            body_end = body_start + len(fragment) - 1
+            if body_end >= len(positions):
+                continue
+            literal_fragment = body[positions[body_start]:positions[body_end] + 1].strip()
+            expanded = _expand_unique_short_long_form_evidence(
+                literal_fragment, body
+            )
+            if (
+                expanded != literal_fragment
+                and len(_compact_text(expanded)) >= _EVIDENCE_MIN_LITERAL_CHARS
+                and _long_form_evidence_present(expanded, body)
+            ):
+                return expanded
+
     # A model may concatenate two non-adjacent dialogue fragments in one
     # evidence field. If no 8-character clause survives, expand a unique
     # 4-7 character literal fragment to its containing body sentence.
@@ -20200,12 +20336,14 @@ def _build_long_form_memory_finalize_context(project, chapter_index, final_text)
         "只有前文已经建立一个确定状态、后文又在没有任何过渡的情况下使用互斥状态，才列为问题；"
         "不得把人物判断失误、行为不够聪明、现实流程不完整、表达可优化、可能存在但没有证据的风险或单纯文风问题列为矛盾。"
         "最多列3项critical或major问题，每项必须分别逐字引用较早和较晚的正文证据；没有明确硬矛盾时issues必须为空。\n"
-        "输出前在内部逐段检查人物实际出场和带来的新信息，以及伤势、能力、关系、位置、关键物、未决任务、"
-        "伏笔和章末持续风险是否真的发生变化。只记录后续章节若不知道就会写错的结果，不记录正文的办理过程。\n"
+        "长篇记忆优先保存人物行动造成的最终结果，以及后文确实需要知道的状态变化。"
+        "输出前逐段检查人物实际出场和带来的新信息，以及伤势、能力、关系、位置、关键物、未决任务、"
+        "伏笔和章末持续风险是否真的发生变化；只记录后续章节若不知道就会写错的结果，不记录正文的办理过程。\n"
+        "只有正文明确尚未完成，并且后文需要继续处理的人物行动、关系问题、资源缺口、危险或选择，"
+        "才保留为未决任务或活跃冲突。已经完成的记录、分工、确认、验证、交接和归档，优先合并为当前状态或阶段结果；"
+        "除非它们仍然直接改变主角下一步的选择，否则不要把它们继续生成新的任务。"
         "会影响后文判断的线索、异常以及记录缺失/覆盖/删除/清空必须保留其结果和未决状态，"
         "但不要保存发现它们时的逐步核验流程。\n"
-        "核对、封存、编号、取样、审批、交接、见证、记录固定和责任说明等一次性步骤，除非后文必须继续使用同一批次、"
-        "持有人、权限、未完成任务或伏笔，否则只能并入最终结果，不能分别进入关键事实、事件、物件和任务。\n"
         "正文明确出现且会影响后文的每一项，都必须进入摘要或关键事实，并至少落入active fact、人物/设定运行态、"
         "伏笔、对象、冲突、任务或阶段档案中的一个真实存储位置；不能只出现在long_term_events清单里。\n"
         "正文中实际行动、说话、来电或提供关键信息的已有命名人物，必须进入current_chapter_character_refs和"
@@ -22762,6 +22900,7 @@ def _apply_long_form_memory_update(project, chapter_index, update, final_text=""
 
 def _build_chapter_ai_context(project, chapter_index, action):
     terminal_contract = _project_terminal_contract(project)
+    core_motive = _project_core_motive_text(project, limit=2200)
     project = _project_without_private_notes(project)
     _ensure_foreshadow_codes(project)
     chapters = project.get("chapters", [])
@@ -23479,9 +23618,18 @@ def _build_chapter_ai_context(project, chapter_index, action):
         f"叙事人称：{meta.get('pov', '')}",
         f"故事核心：{clean_context_text(meta.get('premise', ''), 2200)}",
     ])
+    chapter_mainline_focus = _chapter_mainline_focus(project, chapter_index, limit=1400)
+    mainline_focus = "\n".join([
+        f"本书当前核心方向：{core_motive or '沿用当前项目已确认的故事核心，不另起总目标。'}",
+        f"本章承接的主线问题：{chapter_mainline_focus or '从当前章节提纲中的具体处境和行动开始。'}",
+        "本章通过人物正在采取的行动、现实阻力和直接后果，让主线发生一次具体变化。",
+        "规则、资源、权限、设备和组织运行只在人物当前行动确实需要时作为阻力、资源、代价或结果出现。",
+        "本章结束时优先留下人物的新选择、新后果、新关系变化或新处境。",
+    ])
     style_sections = []
     common_sections = [
         ("项目核心信息", core_project_info, 1200, False),
+        ("本章写作重心", mainline_focus, 3600, False),
         ("长篇进度 / 节奏", long_form_progress, 1200, False),
         ("长篇继承规则", inheritance_rules, 1500, False),
         (

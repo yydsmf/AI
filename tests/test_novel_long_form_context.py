@@ -49,6 +49,7 @@ from gpt_desktop.novel_utils import (
     _build_project_timeline_draft,
     _build_writing_check_text,
     _concrete_prose_expression_guidance,
+    _derive_mainline_pressure_curve,
     _ensure_final_chapter_completion_marker,
     _ensure_final_chapter_title_suffix,
     _is_confirmed_project_final_chapter,
@@ -148,11 +149,12 @@ class NovelLongFormContextTests(unittest.TestCase):
 
     def test_story_conflict_guidance_binds_events_to_people_and_varies_cross_chapter_pressure(self):
         guidance = _story_conflict_pacing_guidance()
-        for phrase in ("具体人物或人物关系", "直接利益者", "使坏、失误、隐瞒", "不得连续超过两章", "至少改变下列两项"):
+        for phrase in ("具体人物或人物关系", "直接利益者", "使坏、失误、隐瞒", "不得连续超过两章", "至少改变下列两项", "同一类直接压力源"):
             self.assertIn(phrase, guidance)
         compact = _story_conflict_pacing_guidance(compact=True)
         self.assertIn("具体人物的目标、关系和眼前压力", compact)
         self.assertIn("维护、分配、记录或状态说明单独写成剧情", compact)
+        self.assertIn("同一类压力连续支撑两个相邻场面后", compact)
 
         project = self._project_with_current_chapter(_new_chapter(0))
         context = _build_chapter_ai_context(project, 0, "draft")
@@ -459,6 +461,39 @@ class NovelLongFormContextTests(unittest.TestCase):
         self.assertIn("主角为拿到药物进入仓库", focus)
         self.assertNotIn("阶段规划里的兼容主线", focus)
         self.assertIn("现实阻力和直接后果", focus)
+
+    def test_legacy_stage_fields_are_recovered_into_pressure_curve(self):
+        curve = _derive_mainline_pressure_curve(
+            [
+                {
+                    "id": "S01",
+                    "name": "灾变封厂与堡垒起步",
+                    "start_chapter": 1,
+                    "end_chapter": 34,
+                    "entry_state": {
+                        "open_threads": ["唐骁带人逼近厂门"],
+                        "character_states": ["宁朔独自守着尚未完成的工厂"],
+                    },
+                    "ordered_events": [
+                        {
+                            "result": "厂门暂时守住，但西侧材料被抢走。",
+                        },
+                    ],
+                    "exit_state": {
+                        "known_facts": ["下一阶段必须进入物流园取件"],
+                        "character_states": ["程绛获得有限的探索位置"],
+                    },
+                    "carry_over": ["宁朔必须把现场决策逐步交给队友。"],
+                }
+            ],
+            core_result="守住工厂并恢复持续生产。",
+        )
+        row = curve["stage_ladder"][0]
+        self.assertEqual(row["conflict_scope"], "灾变封厂与堡垒起步")
+        self.assertIn("厂门暂时守住", row["pressure_step"])
+        self.assertIn("唐骁带人逼近厂门", row["direct_opponents"])
+        self.assertIn("西侧材料被抢走", row["irreversible_cost"])
+        self.assertIn("逐步交给队友", row["exit_change"])
 
     def _context_section(self, context, title):
         marker = f"【{title}】\n"

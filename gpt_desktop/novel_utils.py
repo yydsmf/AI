@@ -810,6 +810,303 @@ def _normalize_series_continuation(value):
     return result
 
 
+def _normalize_mainline_pressure_curve(value):
+    """Normalize the optional causal pressure handoff used by planning stages."""
+    if not isinstance(value, dict):
+        return {}
+    result = {}
+    for key in ("core_result", "failure_cost", "terminal_result", "source"):
+        text = _as_text(value.get(key, ""))
+        if text:
+            result[key] = text
+    raw_ladder = value.get("stage_ladder", value.get("stages", []))
+    ladder = []
+    for index, item in enumerate(raw_ladder if isinstance(raw_ladder, list) else [], 1):
+        if not isinstance(item, dict):
+            continue
+        row = {}
+        aliases = {
+            "stage_id": ("stage_id", "id", "stage", "阶段编号"),
+            "conflict_scope": ("conflict_scope", "scope", "冲突范围"),
+            "pressure_step": ("pressure_step", "step", "压力变化"),
+            "direct_opponents": ("direct_opponents", "opponents", "直接对手"),
+            "irreversible_cost": ("irreversible_cost", "cost", "不可逆代价"),
+            "exit_change": ("exit_change", "change", "阶段出口变化"),
+        }
+        for target, source_keys in aliases.items():
+            text = ""
+            for source_key in source_keys:
+                text = _as_text(item.get(source_key, ""))
+                if text:
+                    break
+            if text:
+                row[target] = text
+        for target, source_keys in (
+            ("start_chapter", ("start_chapter", "start", "开始章节")),
+            ("end_chapter", ("end_chapter", "end", "结束章节")),
+        ):
+            for source_key in source_keys:
+                try:
+                    number = int(item.get(source_key, 0) or 0)
+                except (TypeError, ValueError):
+                    number = 0
+                if number > 0:
+                    row[target] = number
+                    break
+        if row:
+            row.setdefault("stage_id", f"S{index:02d}")
+            ladder.append(row)
+    if ladder:
+        result["stage_ladder"] = ladder
+    return result
+
+
+def _derive_mainline_pressure_curve(stages, core_result="", terminal_result=""):
+    """Build a compact fallback curve from existing stage fields.
+
+    This is deliberately descriptive rather than prescriptive. It gives older
+    projects a causal handoff without forcing every genre through one ladder.
+    """
+    rows = []
+    for index, stage in enumerate(stages if isinstance(stages, list) else [], 1):
+        if not isinstance(stage, dict):
+            continue
+        pressure = _normalize_mainline_pressure_curve(
+            stage.get("mainline_pressure", stage.get("pressure", {}))
+        )
+        pressure_rows = pressure.get("stage_ladder", []) if isinstance(pressure, dict) else []
+        explicit = pressure_rows[0] if pressure_rows else {}
+        stage_id = _as_text(stage.get("id", "")) or f"S{index:02d}"
+        stage_name = _as_text(stage.get("name", stage.get("title", "")))
+        main_conflict = _as_text(
+            stage.get("main_conflict", stage.get("dominant_line", ""))
+        )
+        summary = _as_text(stage.get("summary", stage.get("goal", "")))
+        end_state = _as_text(
+            stage.get("end_state", stage.get("exit_change", ""))
+        )
+        next_hook = _as_text(stage.get("next_stage_hook", ""))
+
+        # Older wizard results store the same causal information in state
+        # snapshots and ordered events instead of named pressure fields.
+        # Recover a short description from those fields so old projects get
+        # useful continuity without changing their saved schema.
+        entry_state = stage.get("entry_state", {})
+        entry_state = entry_state if isinstance(entry_state, dict) else {}
+        exit_state = stage.get("exit_state", {})
+        exit_state = exit_state if isinstance(exit_state, dict) else {}
+
+        def state_text(state, keys, item_limit=2, text_limit=900):
+            parts = []
+            for key in keys:
+                value = state.get(key, "")
+                values = value if isinstance(value, list) else [value]
+                for item in values:
+                    text = _as_text(item).strip()
+                    if text and text not in parts:
+                        parts.append(text)
+                    if len(parts) >= item_limit:
+                        break
+                if len(parts) >= item_limit:
+                    break
+            return _clip_context_text("；".join(parts), text_limit)
+
+        event_results = []
+        for event in stage.get("ordered_events", []) if isinstance(stage.get("ordered_events"), list) else []:
+            if not isinstance(event, dict):
+                continue
+            result = _as_text(event.get("result", "")).strip()
+            state_delta = event.get("state_delta", {})
+            if not result and isinstance(state_delta, dict):
+                result = _as_text(state_delta.get("summary", "")).strip()
+            if result and result not in event_results:
+                event_results.append(result)
+        event_pressure = _clip_context_text(
+            event_results[-1] if event_results else "", 700, preserve_lines=False
+        )
+        event_cost = _clip_context_text(
+            event_results[0] if event_results else "", 700, preserve_lines=False
+        )
+        carry_over = stage.get("carry_over", [])
+        carry_over_text = _clip_context_text(
+            "；".join(_as_text(item).strip() for item in carry_over if _as_text(item).strip())
+            if isinstance(carry_over, list) else _as_text(carry_over),
+            800,
+        )
+        legacy_scope = stage_name or state_text(entry_state, ("location", "open_threads"), 1)
+        legacy_opponents = state_text(
+            entry_state, ("open_threads", "character_states"), item_limit=2, text_limit=650
+        )
+        legacy_cost = _clip_context_text(
+            event_cost or state_text(exit_state, ("known_facts", "open_threads"), 2, 700),
+            700,
+        )
+        legacy_exit = _clip_context_text(
+            "；".join(
+                text for text in (
+                    state_text(exit_state, ("character_states", "known_facts"), 2, 700),
+                    carry_over_text,
+                ) if text
+            ),
+            900,
+        )
+        row = {
+            "stage_id": _as_text(explicit.get("stage_id")) or stage_id,
+            "conflict_scope": _as_text(explicit.get("conflict_scope")) or main_conflict or legacy_scope,
+            "pressure_step": _as_text(explicit.get("pressure_step")) or summary or event_pressure or stage_name,
+            "direct_opponents": _as_text(explicit.get("direct_opponents")) or main_conflict or legacy_opponents,
+            "irreversible_cost": _as_text(explicit.get("irreversible_cost")) or end_state or legacy_cost,
+            "exit_change": _as_text(explicit.get("exit_change")) or end_state or legacy_exit or next_hook,
+        }
+        for target, source_key in (("start_chapter", "start_chapter"), ("end_chapter", "end_chapter")):
+            try:
+                number = int(stage.get(source_key, 0) or 0)
+            except (TypeError, ValueError):
+                number = 0
+            if number > 0:
+                row[target] = number
+        row = {key: value for key, value in row.items() if value not in ("", 0)}
+        if row:
+            rows.append(row)
+    result = _normalize_mainline_pressure_curve({
+        "core_result": core_result,
+        "terminal_result": terminal_result,
+        "stage_ladder": rows,
+        "source": "derived_from_existing_stage_data",
+    })
+    return result
+
+
+def _mainline_pressure_context(project, chapter_index=None, limit=3600):
+    """Render the current causal pressure without imposing a genre template."""
+    project = project if isinstance(project, dict) else {}
+    foundation = project.get("chapter_plan_foundation", {})
+    foundation = foundation if isinstance(foundation, dict) else {}
+    contract = project.get("creative_intent_contract", {})
+    contract = contract if isinstance(contract, dict) else {}
+    framework = project.get("creation_framework", {})
+    framework = framework if isinstance(framework, dict) else {}
+    curve = _normalize_mainline_pressure_curve(
+        foundation.get("mainline_pressure_curve")
+        or contract.get("mainline_pressure_curve")
+        or framework.get("mainline_pressure_curve")
+        or project.get("mainline_pressure_curve", {})
+    )
+    stage_sources = (
+        foundation.get("structured_stages"),
+        foundation.get("arcs"),
+        framework.get("stage_plan"),
+        project.get("stage_plan"),
+    )
+    stages = next((items for items in stage_sources if isinstance(items, list) and items), [])
+    if not curve.get("stage_ladder") and stages:
+        curve = _derive_mainline_pressure_curve(
+            stages,
+            core_result=(
+                _as_text(curve.get("core_result"))
+                or _project_core_motive_text(project, limit=1200)
+            ),
+            terminal_result=_as_text(curve.get("terminal_result"))
+            or _as_text(foundation.get("ending_promise", "")),
+        )
+    ladder = curve.get("stage_ladder", []) if isinstance(curve, dict) else []
+    if not ladder and not curve.get("core_result"):
+        return ""
+    current_index = None
+    if chapter_index is not None:
+        try:
+            chapter_number = int(chapter_index) + 1
+        except (TypeError, ValueError):
+            chapter_number = 0
+        for index, row in enumerate(ladder):
+            try:
+                start = int(row.get("start_chapter", 0) or 0)
+                end = int(row.get("end_chapter", 0) or 0)
+            except (TypeError, ValueError):
+                start, end = 0, 0
+            if start > 0 and end >= start and start <= chapter_number <= end:
+                current_index = index
+                break
+        if current_index is None:
+            chapter = (
+                project.get("chapters", [])[int(chapter_index)]
+                if isinstance(project.get("chapters"), list)
+                and 0 <= int(chapter_index) < len(project.get("chapters", []))
+                and isinstance(project.get("chapters", [])[int(chapter_index)], dict)
+                else {}
+            )
+            stage_id = _as_text(
+                (chapter.get("chapter_plan_structured", {}) or {}).get("stage_id", "")
+                if isinstance(chapter.get("chapter_plan_structured", {}), dict) else ""
+            )
+            for index, row in enumerate(ladder):
+                if stage_id and stage_id == _as_text(row.get("stage_id")):
+                    current_index = index
+                    break
+    rows = []
+    if current_index is None:
+        selected = list(enumerate(ladder))
+    else:
+        selected = []
+        for index in range(max(0, current_index - 1), min(len(ladder), current_index + 2)):
+            selected.append((index, ladder[index]))
+    for index, row in selected:
+        label = (
+            "当前阶段" if index == current_index else
+            "前一阶段" if current_index is not None and index == current_index - 1 else
+            "下一阶段" if current_index is not None and index == current_index + 1 else
+            "阶段"
+        )
+        range_text = ""
+        if row.get("start_chapter") and row.get("end_chapter"):
+            range_text = f"（第{row['start_chapter']}-{row['end_chapter']}章）"
+        parts = [f"{label}{row.get('stage_id', f'S{index + 1:02d}')}{range_text}"]
+        for display, key in (
+            ("冲突范围", "conflict_scope"),
+            ("压力变化", "pressure_step"),
+            ("直接对手", "direct_opponents"),
+            ("不可逆代价", "irreversible_cost"),
+            ("阶段出口", "exit_change"),
+        ):
+            text = _clip_context_text(_as_text(row.get(key, "")), 520)
+            if text:
+                parts.append(f"{display}：{text}")
+        rows.append("；".join(parts))
+    header = ["【主线压力递进底稿】"]
+    core_result = _as_text(curve.get("core_result"))
+    failure_cost = _as_text(curve.get("failure_cost"))
+    terminal_result = _as_text(curve.get("terminal_result"))
+    if core_result:
+        header.append("核心结果：" + core_result)
+    if failure_cost:
+        header.append("总失败代价：" + failure_cost)
+    if terminal_result:
+        header.append("终局结果：" + terminal_result)
+    header.extend(rows)
+    header.append(
+        "递进只要求当前阶段相较前阶段在冲突牵连范围、直接对手、失败代价、公开后果或主角选择难度中自然提高至少两项；"
+        "不强制所有题材采用同一层级顺序，也不为提高压力凭空添加家族、地方势力、区域或跨界设定。"
+    )
+    header.append(
+        "本章或本事件必须把压力落到当前题材已有的人物、关系、场景和行动上，形成新的选择与结果；"
+        "不能靠重复处理同一对象的说明、维护、分配、确认或等待制造推进。"
+    )
+    return _clip_context_text("\n".join(header), int(limit or 3600), preserve_lines=True)
+
+
+def _mainline_pressure_memory_guidance(project, chapter_index):
+    context = _mainline_pressure_context(project, chapter_index, limit=2200)
+    return (
+        "【主线因果记忆】\n"
+        "资料整理、更新和修复只保存正文已经发生的主线因果：当前目标、正在施压的人物或关系、"
+        "已经付出的不可逆代价、已经成立的结果，以及结果打开的下一道压力。"
+        "不要把单纯的操作、说明、数量、确认、维护、分配、权限或记录过程写成主线推进；"
+        "如果它确实影响后文，保存造成它的人物行动和人物后果。压力层级只能根据正文证据更新，"
+        "不能把规划中的未来对手、未来事件或推测写成已发生事实。"
+        + ("\n" + context if context else "")
+    )
+
+
 def _normalize_creative_intent_contract(value):
     """Normalize the user-confirmed story priority used by planning only."""
     if not isinstance(value, dict):
@@ -851,6 +1148,12 @@ def _normalize_creative_intent_contract(value):
     supporting_lines = _normalize_name_list(supporting_value)
     if supporting_lines:
         result["supporting_lines"] = supporting_lines[:16]
+
+    pressure_curve = _normalize_mainline_pressure_curve(
+        value.get("mainline_pressure_curve", value.get("pressure_curve", {}))
+    )
+    if pressure_curve:
+        result["mainline_pressure_curve"] = pressure_curve
 
     version = str(value.get("version", value.get("schema_version", "")) or "").strip()
     if version:
@@ -1257,6 +1560,12 @@ def _normalize_structured_stage_plan(value):
             text = str(stage.get(key, "") or "").strip()
             if text:
                 row[key] = text
+        pressure = _normalize_mainline_pressure_curve(
+            stage.get("mainline_pressure", stage.get("pressure", {}))
+        )
+        pressure_rows = pressure.get("stage_ladder", []) if pressure else []
+        if pressure_rows:
+            row["mainline_pressure"] = deepcopy(pressure_rows[0])
         for key in (
             "relationship_changes", "character_changes", "world_reveals",
             "turning_points", "foreshadow_actions", "carry_over",
@@ -1320,6 +1629,11 @@ def _normalize_chapter_plan_foundation(value):
             field_value = _clean_chapter_plan_story_boundary(field_value)
         if field_value:
             result[key] = field_value
+    pressure_curve = _normalize_mainline_pressure_curve(
+        value.get("mainline_pressure_curve", value.get("pressure_curve", {}))
+    )
+    if pressure_curve:
+        result["mainline_pressure_curve"] = pressure_curve
     for key in (
         "target_words", "average_chapter_words", "total_chapter_count", "existing_chapter_count",
     ):
@@ -10536,7 +10850,9 @@ def _story_conflict_pacing_guidance(compact=False):
             "正文每个场景都要落到具体人物的目标、关系和眼前压力：谁在争取、阻止、利用、隐瞒或承担什么，"
             "人物采取了什么行动，行动怎样改变关系、处境或局势。设备、生产、资源、权限和规则只能作为人物冲突的载体；"
             "使坏、失误、隐瞒、争夺或重大纰漏必须由具体人物造成并产生现场后果，不能把维护、分配、记录或状态说明单独写成剧情。"
-            "同一冲突跨章时，后续场景必须出现新的行动、压力、代价、关系结果或不可逆后果，不能只换一种说法重复解释。\n"
+            "同一冲突跨章时，后续场景必须出现新的行动、压力、代价、关系结果或不可逆后果，不能只换一种说法重复解释。"
+            "同一类压力连续支撑两个相邻场面后，下一场要由前面结果引出新的具体目标、对手行动、关系裂痕、现场损失、公开后果或更高代价；"
+            "不能只换地点、人物或说法继续处理同一资源缺口、权限争夺、设备故障或说明事项。\n"
         )
     return (
         "【剧情推进与人物冲突落地】\n"
@@ -10550,7 +10866,9 @@ def _story_conflict_pacing_guidance(compact=False):
         "同一治理、谈话或资源事件的 allowed_chapters 不得连续超过两章；如果阶段需要覆盖四章或更长，必须拆成至少两个事件，每个事件各自完成一轮人物冲突、选择和结果，再由结果衔接下一事件。"
         "同一主线可以连续，但不能用一个事件包住四章，也不能把同一段家庭谈话、资源讨论或权限说明拆成换说法后继续占满多章。"
         "跨两章的后续场景至少改变下列两项：主动人物、眼前目标、场景或对象、压力来源、代价、关系结果或公开后果；"
-        "只增加解释、讨论、复核、等待或同一地点的换说法不算推进。同一地点可以继续使用，但必须有新的外部行动、人物进入或退出、信息暴露、选择或不可逆结果改变下一步。\n"
+        "只增加解释、讨论、复核、等待或同一地点的换说法不算推进。同一地点可以继续使用，但必须有新的外部行动、人物进入或退出、信息暴露、选择或不可逆结果改变下一步。"
+        "当同一类直接压力源已经连续支撑两个相邻事件后，下一事件要让前面结果自然引出新的具体目标、对手行动、关系裂痕、现场损失、公开后果或更高代价；"
+        "不要只把同一资源缺口、权限争夺、设备故障、谈判条件或说明事项换地点、换人物、换说法继续延长。压力转化必须从已经发生的选择和后果中长出来，不凭空换题，也不要求所有题材采用同一种升级顺序。\n"
     )
 
 
@@ -10564,6 +10882,7 @@ def _core_motive_progression_guidance():
         "这些要求只负责检查主线是否具体、有压力、能持续推进，不规定小说必须使用倒计时、赚钱、升级、复仇、强敌、打脸或同一种阶段结构。言情、悬疑、现实、群像、日常、历史、科幻和其它题材，应从自己的关系、秘密、规则、生活压力、伦理选择或世界机制中长出目标和代价；不要为了凑齐检查项，给所有故事硬加金额、期限、幕后黑手或升级路线。\n"
         "字段职责必须固定，不能抢任务：core_motive是唯一的具体执行主线；premise.main_line、bible.main_conflict、creative_intent_contract.primary_line、chapter_plan_foundation.core_mainline和narrative_strategy_profile.primary_story_engine在新项目中都只是这条主线的兼容别名或执行说明，不得另起一条目标。theme只提炼最终讨论的人性命题、价值冲突和情感认识，不写具体任务、金额、期限、对手或资源缺口。阶段的main_conflict/dominant_line只写本阶段阻碍核心动机的具体问题、代价或门槛，不得替换全书目标；supporting_lines、人物关系、伏笔和世界规则只能改变主线人物的选择、资源、信息、关系、位置或时间窗口。\n"
         "剧情推进不是让主角不停遇到事情，而是主角为了完成核心目标不断遇到阻碍、作出选择、付出代价、解决当前障碍，并因此打开或加深下一阶段目标。阶段目标必须形成延伸链：当前危机解决后，结果明确带来下一道更具体的门槛、对手、资源缺口、关系选择、认知真相或更高代价，不能每个阶段重新换一条主线。\n"
+        "阶段压力要逐步提高，但提高方式由题材决定：相邻阶段至少自然增加冲突牵连范围、直接对手、失败代价、公开后果或主角选择难度中的两项。可以在同一地点、同一关系或同一类事件中升级，不要求固定经过家族、地方、区域或跨界，也不得为了升级凭空添加新地图、新势力或第二条总目标。阶段出口必须说明已成立的变化怎样逼出下一阶段更高压力；最后阶段把峰值压力转化为核心动机的实际结果。\n"
         "每个重要事件都要能回答：它为什么会因为核心动机发生，主角为目标采取了什么行动，遇到什么阻碍，解决或暂时解决后距离目标发生了什么可见变化。事件可以推进、阻碍、加压、转向、揭示代价或兑现阶段目标，但不能只是热闹、日常或支线；支线只有在改变主线人物的选择、关系、资源、信息、位置或时间窗口时才保留。\n"
         "不要求每章机械重复‘核心动机’几个字，也不要求所有章节都直接完成目标；不要把章节机械写成‘目标—阻碍—解决—下阶段目标’的固定句式。每章必须让主线的进度、阻力、代价、路径、关系或下一步发生真实变化，变化可以通过行动、对话、关系转折、信息揭示、环境后果或人物选择自然呈现；阶段末再留下已经成立的结果和下一阶段继续追逐的具体目标。"
     )
@@ -14346,7 +14665,11 @@ def _long_form_compact_update_contract_instructions(project, chapter_index):
 
 def _long_form_update_contract_instructions(project, chapter_index, compact=False):
     if compact:
-        return _long_form_compact_update_contract_instructions(project, chapter_index)
+        return (
+            _long_form_compact_update_contract_instructions(project, chapter_index)
+            + "\n"
+            + _mainline_pressure_memory_guidance(project, chapter_index)
+        )
     project = project if isinstance(project, dict) else {}
     memory = _normalize_long_form_memory(project.get("long_form_memory", {}))
     stage_boundary = (int(chapter_index) + 1) % 10 == 0
@@ -14553,6 +14876,8 @@ def _long_form_update_contract_instructions(project, chapter_index, compact=Fals
         + f"当前全量集合只供程序核验，不得复制到输出：{catalog_summary}。"
         + "base_revision必须原样填写索引中的当前长篇记忆修订号。严格输出一个合法JSON对象："
         + example
+        + "\n"
+        + _mainline_pressure_memory_guidance(project, chapter_index)
     )
 
 
@@ -20209,6 +20534,7 @@ def _build_long_form_memory_repair_context(
             7000,
             False,
         ),
+        ("主线压力递进", _mainline_pressure_context(project, chapter_index, limit=2600), 2600, False),
         ("实体称谓与关系边界", _entity_naming_guidance(project), 2600, False),
         ("最终正文", final_text, 40000, True),
         (
@@ -20421,6 +20747,7 @@ def _build_long_form_memory_finalize_context(project, chapter_index, final_text)
             7000,
             False,
         ),
+        ("主线压力递进", _mainline_pressure_context(project, chapter_index, limit=2600), 2600, False),
         ("最终正文", final_text, 40000, True),
         (
             "AI资料更新与下一章选择索引",
@@ -23385,6 +23712,7 @@ def _build_chapter_ai_context(project, chapter_index, action):
             '{"summary":"本章摘要","key_facts":["后续必须继承的事实"],'
             '"linked_characters":["实际出现或被直接推动的具体人物名"],"long_form_memory":{...}}。'
             "long_form_memory严格执行以下版本2契约："
+            "本章不是十章边界时stage_archive必须为null；只有固定十章边界才填写阶段档案。"
             + _long_form_update_contract_instructions(project, chapter_index, compact=True)
         ),
         "script_to_novel": (
@@ -23619,6 +23947,7 @@ def _build_chapter_ai_context(project, chapter_index, action):
         f"故事核心：{clean_context_text(meta.get('premise', ''), 2200)}",
     ])
     chapter_mainline_focus = _chapter_mainline_focus(project, chapter_index, limit=1400)
+    pressure_context = _mainline_pressure_context(project, chapter_index, limit=3200)
     mainline_focus = "\n".join([
         f"本书当前核心方向：{core_motive or '沿用当前项目已确认的故事核心，不另起总目标。'}",
         f"本章承接的主线问题：{chapter_mainline_focus or '从当前章节提纲中的具体处境和行动开始。'}",
@@ -23635,13 +23964,15 @@ def _build_chapter_ai_context(project, chapter_index, action):
         (
             "本次任务",
             task_text,
-            6000 if action == "summary" else 3200 if action == "draft" else 2200,
+            6000 if action == "summary" else 4000 if action == "draft" else 2200,
             False,
         ),
         ("项目基础", "\n".join([
             f"项目总目标字数：{_target_words_label(meta.get('target_words', ''))}",
         ]), 500, False),
     ]
+    if pressure_context:
+        common_sections.insert(2, ("主线压力递进", pressure_context, 3200, False))
     if chapter_ending_guidance and action in {"draft", "outline", "script_to_novel"}:
         common_sections.insert(
             2,
@@ -23798,7 +24129,12 @@ def _build_chapter_ai_context(project, chapter_index, action):
                 if len(key) >= 30:
                     seen_context_lines.add(key)
             section_content = "\n".join(unique_lines).strip()
-        preserve_lines = title not in raw_context_titles
+        # The summary task places a long JSON contract after its short
+        # fact-grounding rules. Keep the task head when this section is clipped
+        # so the source-of-truth and chapter-ending requirements stay visible.
+        preserve_lines = title not in raw_context_titles and not (
+            title == "本次任务" and action == "summary"
+        )
         clipped = _clip_context_text(
             section_content,
             min(limit, remaining - 64),

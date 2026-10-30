@@ -29,8 +29,10 @@ from .core import HISTORY_DIR, load_json_file, now_str, safe_remove_file, save_j
 from .novel_storage import load_character_style_library, remove_character_style
 from .novel_utils import (
     _core_motive_progression_guidance,
+    _derive_mainline_pressure_curve,
     _entity_naming_guidance,
     _normalize_foreshadow_code,
+    _normalize_mainline_pressure_curve,
     _normalize_terminal_closure_plan,
     _normalize_terminal_contract,
     _procedural_plot_guard_guidance,
@@ -531,7 +533,7 @@ STEP_PROMPTS = {
 
 STAGE_PLAN_OBJECT_OUTPUT_RULES = """
 这次使用对象协议，阶段和事件按字段名归位；只返回一个合法 JSON 对象。
-短键含义如下：k=全书底盘契约（其中的核心动机是唯一执行主线），s=当前阶段对象，f=当前阶段实际发生的伏笔端点。阶段对象中 i=阶段编号，n=阶段名称，r=章节范围，b=开始状态，e=按顺序发生的场景事件对象数组，x=结束状态，y=带入下一阶段的事实，m=可选的终局收尾方案。状态对象中 t=时间，l=地点，c=人物状态，k=已经发生并被人物掌握的事实，q=仍会推动人物行动的问题。事件对象中 i=事件编号，r=允许章节范围，a=关联资料，p=前置条件，h=可直接扩写的场景事件，o=直接结果，d=实际状态变化。伏笔端点对象中 i=伏笔编号，k=setup或payoff，e=承载这个端点的事件编号，d=这一次在场景中发生的具体变化；一次只写一个端点。
+短键含义如下：k=全书底盘契约（其中的核心动机是唯一执行主线），s=当前阶段对象，f=当前阶段实际发生的伏笔端点。阶段对象中 i=阶段编号，n=阶段名称，r=章节范围，b=开始状态，e=按顺序发生的场景事件对象数组，x=结束状态，y=带入下一阶段的事实，u=可选的本阶段主线压力递进摘要，m=可选的终局收尾方案。u使用scope、step、opponents、cost、exit_change五个字段，分别写冲突牵连范围、相较前阶段新增的压力、直接阻止主角的人物或人物集团、必须付出的不可逆代价、阶段结束后改变的处境或关系。状态对象中 t=时间，l=地点，c=人物状态，k=已经发生并被人物掌握的事实，q=仍会推动人物行动的问题。事件对象中 i=事件编号，r=允许章节范围，a=关联资料，p=前置条件，h=可直接扩写的场景事件，o=直接结果，d=实际状态变化。伏笔端点对象中 i=伏笔编号，k=setup或payoff，e=承载这个端点的事件编号，d=这一次在场景中发生的具体变化；一次只写一个端点。
 每个 h 都要像一段可以直接扩写的剧情节点：只写这件事真正需要的故事事实，必要时交代人物、场景、动作、阻力、选择或结果，尽量不用固定清单式要求，不为凑齐项目硬塞字段。剧情发动机由题材和人物处境决定，可以是正面碰撞、追逐逃避、关系变化、欲望争夺、环境失控、能力试探、秘密暴露或其它自然发生的压力；相邻事件要让人物处境产生新的变化，不把这些方式排成固定轮换。资料只有在人物正在做事、被迫应对或关系发生变化时进入场景。
  m 只在全书最后阶段返回，结构为 closure_mode、closure_horizon、long_term_result、final_image、opening_echo、title_closure_intent、time_jump_allowed。closure_mode 从 immediate_verified、short_term_verified、long_term_epilogue、mirror_scene、mixed 中选择最适合本书的一种；不能为了统一格式强行使用远期跳跃。long_term_epilogue 或 mixed 必须给出可信的时间跨度和具体成果，mirror_scene 必须说明要呼应的开头地点、物件、动作或关系；所有模式都必须先让本部核心结果落地，再用最后画面收束。
 当前阶段发生的正式伏笔端点，都在承载事件的 a 中加入一次“F编号/setup”或“F编号/payoff”，并在 f 中用同一事件编号 e 关联。setup写线索第一次进入人物生活，payoff写线索在场景中产生决定性变化；同一条伏笔在其它事件中继续出现、深化、造成后果是正常的，这些事件只把它作为普通关联资料或写出“F编号”，不要重复标成正式 setup/payoff。程序以正式端点为准，再把后续事件中的具体变化交给章节规划继续使用；阶段之间允许继续铺开同一条暗线，程序会依据事件 r 的章节范围落下具体章号。
@@ -543,13 +545,13 @@ STAGE_PLAN_OBJECT_OUTPUT_RULES = """
 STEP_PROMPTS["stage_plan"] = f"""{COMMON_CREATION_RULES}
 
 现在根据已经选定的故事和完整故事底盘，制作唯一的十万字阶段规划。这里的内容是给后续章节规划和正文扩写读取的执行资料，不是发布简介，也不需要写成文学化段落。总字数和单章字数完全按照作者输入；章节总数按 total_words / average_chapter_words 向上取整，最后一章吸收余数。每约十万字为一个阶段，阶段从第1章连续覆盖到最后一章，事件范围按顺序衔接。全书始终围绕唯一的 core_motive 推进：主角为了完成具体目标主动采取行动，剧情阻碍这条行动链，主角付出代价解决当前问题，结果再打开下一道目标；不能把阶段写成主角被动不断遇到新事情。
-阶段字段不要抢全书主线：阶段的 main_conflict 只写本阶段阻碍核心动机的具体问题、门槛、对手动作或代价升级；阶段 summary/end_state 要说明本阶段目标如何推进，以及结果打开的下一阶段目标。不要在每个阶段重新发明一条“主角真正要做的事”，也不要把主题、人物关系或伏笔名称填成阶段主线。
+阶段字段不要抢全书主线：阶段的 main_conflict 只写本阶段阻碍核心动机的具体问题、门槛、对手动作或代价升级；阶段 summary/end_state 要说明本阶段目标如何推进，以及结果打开的下一阶段目标。不要在每个阶段重新发明一条“主角真正要做的事”，也不要把主题、人物关系或伏笔名称填成阶段主线。阶段对象可选返回 u（mainline_pressure），只写本阶段相较前阶段自然增加的压力：scope、step、opponents、cost、exit_change。它是后续章节的因果底稿，不是审核清单；如果某题材的压力在同一地点、同一关系或同一事件类型内升级，也要写清新增牵连、代价或选择，不要凭空换地图、换势力或套固定层级。
 
 全书最后阶段必须额外规划“终局收尾方案”：根据题材、核心动机和故事规模，在即时结果型 immediate_verified、短期验证型 short_term_verified、远期成果型 long_term_epilogue、镜像回响型 mirror_scene、混合型 mixed 中选择一种，不要为了格式统一强行使用时间跳跃。若选择短期或远期验证，必须写出可信的时间跨度、已经持续存在的成果和一个能在场景中看见的验证；若选择镜像回响，必须写清呼应开头的地点、物件、动作或关系变化；若选择 mixed，先完成当前主线，再用时间落点或镜像画面确认成果。终局方案不是另开剧情，也不能用“多年后一切都变好了”的摘要替代具体场景。
 
 阶段规划固定事实、顺序、状态和阶段推进，但剧情推进以场景为单位。每个事件写清本次真正发生、会影响后续的故事事实；时间、地点、人物、动作、阻力、选择、关系变化和结果等内容，只在当前事件确实需要时补充。事件之间通过人物正在做的事和已经发生的变化自然衔接。先判断这一事件真正由什么推动，再选择最适合题材的场景：人物对抗、关系变化、现场危机、公开行动、利益争夺、环境压力或信息出现都可以成为主发动机。相邻事件主动更换主发动机、场景目标和压力来源，让人物、关系、空间和局势持续变化。
 同一事件如果覆盖数章，只承担一次明确的转折；前面的章节让事情发生，后面的章节写它造成的新反应、新选择、新损失、新关系变化或新阻力，不要把同一场谈话、同一份材料或同一个结论反复当成新的剧情。对都市灵异、惊悚、悬疑、情感等题材，声音、空间、物件、生活压力、人物之间的隐瞒和现场失控持续进入剧情；对其它题材，使用该题材自己的场景压力和人物对抗。故事的关键变化要发生在人物正在经历的场面里，而不是停在解释性结论上。
-阶段事件继续由当前题材里的具体场景和人物行动推进；上面的共享程序性事项边界同样适用于阶段事件，不要把流程本身拆成连续事件或阶段主线。每个事件都要让人看见人物在哪里、正在做什么、遇到什么阻力、作出什么选择以及选择造成的可观察结果。
+阶段事件继续由当前题材里的具体场景和人物行动推进；上面的共享程序性事项边界同样适用于阶段事件，不要把流程本身拆成连续事件或阶段主线。每个事件都要让人看见人物在哪里、正在做什么、遇到什么阻力、作出什么选择以及选择造成的可观察结果。当前阶段必须沿着上一阶段已经成立的压力继续提高，至少让冲突牵连范围、直接对手、失败代价、公开后果或主角选择难度中的两项发生自然变化；不得为了“升级”凭空添加固定类型的势力或地图。阶段内仍允许用一章或两章的小事件完成过渡，已有的 b-a+1<=2 只限制单个事件容量，不代替阶段压力递进。
 伏笔端点使用底盘已有编号或名称，关联到本阶段实际发生的事件；setup写线索第一次进入人物生活，payoff写线索在场景中完成单一核心问题的回答，并留下具体行动、对白、证据、关系结果或局势结果。payoff不能只写“进一步揭示”“冲突升级”“确认重要”“出现新线索”或“人物意识到事情不简单”，这些只是推进，不是回收。同一条伏笔可以在多个事件中继续出现、深化或影响人物选择，但正式 setup/payoff 只各自标记一次；后续事件用普通关联资料或“F编号”承接，不把每次提及都写成新的正式端点。阶段之间允许继续铺开同一条暗线，程序会依据事件的允许章节范围落下具体章号，模型只负责事件顺序和端点归属，不写具体章号。
 
 {STAGE_PLAN_OBJECT_OUTPUT_RULES}
@@ -2561,6 +2563,7 @@ def _expand_stage_object_transport(value):
             "e": "ordered_events",
             "x": "exit_state",
             "y": "carry_over",
+                "u": "mainline_pressure",
             "m": "closure_plan",
         },
     )
@@ -2592,7 +2595,7 @@ def _expand_stage_object_transport(value):
     # The short keys are transport-only.  Leaving them beside the expanded
     # fields duplicates every stage in the next continuity handoff and lets
     # later normalizers read two versions of the same fact.
-    for key in ("i", "n", "b", "e", "x", "y", "r", "m"):
+    for key in ("i", "n", "b", "e", "x", "y", "u", "r", "m"):
         stage.pop(key, None)
     return stage
 
@@ -2886,6 +2889,7 @@ def _expand_creation_transport(step, payload):
             stage_fields = (
                 "id", "name", "start_chapter", "end_chapter", "target_words",
                 "entry_state", "ordered_events", "exit_state", "carry_over",
+                "mainline_pressure",
             )
             stages = []
             for raw_stage in data.get("s", []):
@@ -3682,6 +3686,14 @@ def normalize_stage_plan_ranges(
         item["exit_state"] = _normalize_stage_state(
             _first_value(item, ("exit_state", "end_state_detail", "离开状态"), {})
         )
+        pressure = _normalize_mainline_pressure_curve(
+            _first_value(item, ("mainline_pressure", "pressure", "主线压力"), {})
+        )
+        pressure_rows = pressure.get("stage_ladder", []) if pressure else []
+        if pressure_rows:
+            item["mainline_pressure"] = deepcopy(pressure_rows[0])
+        else:
+            item.pop("mainline_pressure", None)
         closure_plan = _normalize_terminal_closure_plan(
             _first_value(item, ("closure_plan", "terminal_closure_plan", "终局收尾方案"), {})
         )
@@ -3852,7 +3864,10 @@ def _compact_stage_plan_handoff(stage_plan):
             value = stage.get(key)
             if value not in (None, "", [], {}):
                 row[key] = deepcopy(value)
-        for key in ("entry_state", "exit_state", "carry_over", "closure_plan"):
+        for key in (
+            "entry_state", "exit_state", "carry_over", "closure_plan",
+            "mainline_pressure",
+        ):
             value = stage.get(key)
             if value not in (None, "", [], {}):
                 row[key] = deepcopy(value)
@@ -4066,6 +4081,21 @@ def build_chapter_plan_foundation(framework):
         **closure_plan,
     })
     structured_stages = deepcopy(stages)
+    pressure_curve = _normalize_mainline_pressure_curve(
+        framework.get("mainline_pressure_curve", {})
+    )
+    if not pressure_curve:
+        pressure_curve = _derive_mainline_pressure_curve(
+            structured_stages,
+            core_result=core_motive,
+            terminal_result=ending or _as_text(terminal_stage.get("end_state", "")),
+        )
+    else:
+        pressure_curve.setdefault("core_result", core_motive)
+        pressure_curve.setdefault(
+            "terminal_result",
+            ending or _as_text(terminal_stage.get("end_state", "")),
+        )
     if terminal_contract and structured_stages:
         final_stage_id = _as_text(terminal_stage.get("id", ""))
         for stage in structured_stages:
@@ -4079,6 +4109,7 @@ def build_chapter_plan_foundation(framework):
         "summary": summary,
         "core_mainline": core_mainline,
         "core_motive": core_motive,
+        "mainline_pressure_curve": pressure_curve,
         "ending_promise": ending,
         "global_hard_boundaries": boundaries,
         "target_words": total_words,
@@ -4100,6 +4131,7 @@ def build_chapter_plan_foundation(framework):
             "stage_progression": "；".join(_as_text(item.get("name", "")) for item in stages if isinstance(item, dict)),
             "reading_experience": _as_text(premise.get("one_sentence", "")),
             "ending_boundaries": ending,
+            "mainline_pressure_curve": pressure_curve,
             "source": "creation_wizard",
             "version": "1",
         },
@@ -5414,7 +5446,7 @@ c 中每项只能使用 n、r、g、s、p、v、q；l 中每项只能使用 n、
             )
             prompt = f"""{COMMON_CREATION_RULES}
 
-读取作者选定的故事和完整故事底盘，在正式生成十万字阶段规划前，先建立一份简短的全书阶段骨架。它只负责固定每个阶段的主线变化、关键转折和阶段结束状态，不写章节细纲，不写事件数组，不安排具体伏笔章位，也不重复小说圣经、世界规则和人物设定。每个阶段都必须回答同一条核心动机在本阶段推进了什么：主角当前要完成的具体目标是什么、为了目标主动做了什么、遇到的主要阻碍或代价是什么、阶段结束后得到或失去什么，以及这个结果如何打开下一阶段更具体的目标。阶段不是互不相干的事件集合，也不能每阶段重新换一条主线。先从本阶段故事真正会发生的变化出发，再确定阶段转折；转折方式由题材、人物关系、环境和事件自然决定，不要求各阶段使用同一种推进顺序。阶段数量和章节范围完全按照作者输入；每个阶段写一条清楚的主线变化、两到四个关键转折和一条结束状态，内容要能让后面的阶段规划沿着同一条故事发展，避免阶段之间方向漂移，尽量不用固定清单式要求。
+读取作者选定的故事和完整故事底盘，在正式生成十万字阶段规划前，先建立一份简短的全书阶段骨架。它只负责固定每个阶段的主线变化、关键转折和阶段结束状态，不写章节细纲，不写事件数组，不安排具体伏笔章位，也不重复小说圣经、世界规则和人物设定。每个阶段都必须回答同一条核心动机在本阶段推进了什么：主角当前要完成的具体目标是什么、为了目标主动做了什么、遇到的主要阻碍或代价是什么、阶段结束后得到或失去什么，以及这个结果如何打开下一阶段更具体的目标。阶段不是互不相干的事件集合，也不能每阶段重新换一条主线。先从本阶段故事真正会发生的变化出发，再确定阶段转折；转折方式由题材、人物关系、环境和事件自然决定，不要求各阶段使用同一种推进顺序。阶段之间还要自然提高至少两项：冲突牵连范围、直接对手、失败代价、公开后果或主角选择难度；不要求所有题材采用家族、地方、区域或跨界的固定顺序，也不为形式凭空添加势力。阶段数量和章节范围完全按照作者输入；每个阶段写一条清楚的主线变化、两到四个关键转折和一条结束状态，内容要能让后面的阶段规划沿着同一条故事发展，避免阶段之间方向漂移，尽量不用固定清单式要求。
 
 阶段骨架同样不能把记录、复核、责任追溯、合同、公司治理、审批、归档或案卷式资料往来当成阶段变化；除非作者明确指定相关题材，否则不得从“边界、资源、条件、责任”等普通词推导出合同冲突或公司冲突。阶段变化要写人物在具体处境中的行动、阻力、选择和结果，先守住题材自己的事件发动机，再概括阶段走向。
 

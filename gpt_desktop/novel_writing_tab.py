@@ -181,6 +181,9 @@ from .novel_utils import (
     _normalize_name_list,
     _normalize_narrative_strategy_profile,
     _normalize_creative_intent_contract,
+    _derive_mainline_pressure_curve,
+    _mainline_pressure_context,
+    _normalize_mainline_pressure_curve,
     _normalize_terminal_contract,
     _merge_terminal_contracts,
     _core_motive_progression_guidance,
@@ -9169,6 +9172,7 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
             "id", "name", "start_chapter", "end_chapter", "summary", "main_conflict",
             "relationship_changes", "world_reveals", "turning_points",
             "end_state", "entry_state", "exit_state", "carry_over", "ordered_events",
+            "mainline_pressure",
         )
         stage_plan = []
         for item in framework.get("stage_plan", []) if isinstance(framework.get("stage_plan"), list) else []:
@@ -9201,6 +9205,14 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
                     if events:
                         row[key] = events
                     continue
+                if isinstance(value, dict):
+                    text = self._chapter_plan_clip_text(
+                        json.dumps(value, ensure_ascii=False, separators=(",", ":")),
+                        1600,
+                    )
+                    if text:
+                        row[key] = value if key == "mainline_pressure" else text
+                    continue
                 if isinstance(value, list):
                     values = [
                         self._chapter_plan_clip_text(entry, 700)
@@ -9232,12 +9244,27 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
             or premise.get("main_line", ""),
             2200,
         )
+        mainline_pressure_curve = _normalize_mainline_pressure_curve(
+            foundation.get("mainline_pressure_curve")
+            or framework.get("mainline_pressure_curve", {})
+        )
+        if not mainline_pressure_curve:
+            mainline_pressure_curve = _derive_mainline_pressure_curve(
+                stage_plan,
+                core_result=core_motive,
+                terminal_result=self._chapter_plan_clip_text(
+                    foundation.get("ending_promise", "")
+                    or framework.get("ending_promise", ""),
+                    1600,
+                ),
+            )
 
         result = {
             "source": "creation_wizard",
             "novel_name": self._chapter_plan_clip_text(framework.get("novel_name", ""), 300),
             "premise": premise_context,
             "core_motive": core_motive,
+            "mainline_pressure_curve": mainline_pressure_curve,
             "bible": self._chapter_plan_clip_text(
                 json.dumps(framework.get("bible", {}), ensure_ascii=False, separators=(",", ":")), 6500
             ),
@@ -9353,7 +9380,7 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
                 compact_stage = {}
                 for key in (
                     "id", "name", "start_chapter", "end_chapter", "summary",
-                    "end_state", "entry_state", "exit_state",
+                    "end_state", "entry_state", "exit_state", "mainline_pressure",
                 ):
                     value = stage.get(key, "")
                     if value not in (None, "", [], {}):
@@ -9687,6 +9714,20 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
         )
         if wizard_core_motive and not str(batch_creative_intent_contract.get("core_motive", "") or "").strip():
             batch_creative_intent_contract["core_motive"] = wizard_core_motive
+        mainline_pressure_curve = _normalize_mainline_pressure_curve(
+            (wizard_framework.get("mainline_pressure_curve", {})
+             if isinstance(wizard_framework, dict) else {})
+            or foundation.get("mainline_pressure_curve", {})
+            or batch_creative_intent_contract.get("mainline_pressure_curve", {})
+        )
+        if not mainline_pressure_curve:
+            mainline_pressure_curve = _derive_mainline_pressure_curve(
+                (wizard_framework.get("stage_plan", [])
+                 if isinstance(wizard_framework, dict) else []),
+                core_result=wizard_core_motive or str(
+                    batch_creative_intent_contract.get("core_motive", "") or ""
+                ),
+            )
         foreshadow_items = project.get("foreshadow_items", [])
         if creation_wizard_source:
             foreshadow_items = self._chapter_plan_scoped_foreshadows(
@@ -9726,6 +9767,11 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
                 "core_motive_rule": (
                     "核心动机必须作为具体因果主线执行：主角为了完成明确目标主动行动，遇到阻碍并付出代价，"
                     "当前结果再打开下一道具体目标；不能只写主角被动不断遇到新事件。"
+                ),
+                "pressure_progression_rule": (
+                    "mainline_pressure_curve是可选的阶段因果底稿。当前阶段相较前阶段要自然提高冲突牵连范围、"
+                    "直接对手、失败代价、公开后果或主角选择难度中的至少两项；不强制题材采用固定势力层级，"
+                    "也不能为了升级凭空添加地图、组织或新主线。章节必须把压力落到已有人物、关系、场景和选择的结果上。"
                 ),
                 "line_field_boundary": (
                     "core_motive是唯一主线；primary_line、core_mainline和primary_story_engine只是兼容别名或执行说明，"
@@ -9788,6 +9834,13 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
             },
             "narrative_strategy_profile": planning_profile,
             "creative_intent_contract": batch_creative_intent_contract,
+            "mainline_pressure_curve": deepcopy(mainline_pressure_curve),
+            "mainline_pressure_context": _mainline_pressure_context(
+                project,
+                max(0, int(reference_start_index or 1) - 1)
+                if reference_start_index is not None else None,
+                limit=3600,
+            ),
             "wizard_framework": wizard_framework,
             "used_chapter_titles": used_chapter_titles,
             "project_materials": {

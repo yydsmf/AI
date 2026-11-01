@@ -5,6 +5,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 import gpt_desktop.novel_creation_wizard as wizard
+from gpt_desktop.novel_utils import _normalize_mainline_pressure_curve
 
 
 class NovelCreationWizardPersistenceTests(unittest.TestCase):
@@ -285,6 +286,238 @@ class NovelCreationWizardPersistenceTests(unittest.TestCase):
         self.assertEqual(len(result["characters"]), 1)
         self.assertEqual(len(result["lore"]), 1)
         self.assertEqual(result["foreshadows"][0]["code"], "F0001")
+
+    def test_stage_directions_normalize_and_keep_scene_character_result_fields(self):
+        result = wizard.normalize_creation_result(
+            "bible",
+            {
+                "stage_directions": [
+                    {
+                        "i": "R01",
+                        "n": "废材开局",
+                        "w": [0, 100000],
+                        "s": "主角在宗族擂台觉醒并完成逆袭。",
+                        "l": "家族大厅与宗族擂台",
+                        "c": "退婚者和族内天才",
+                        "x": "主角拿回修炼资格",
+                        "q": "必须进入更大的修炼场",
+                    },
+                ],
+            },
+            total_words=100000,
+            creation_batch="stage_directions",
+        )
+
+        direction = result["stage_directions"][0]
+        self.assertEqual(direction["id"], "R01")
+        self.assertEqual(direction["start_word"], 0)
+        self.assertEqual(direction["end_word"], 100000)
+        self.assertEqual(direction["scene_change"], "家族大厅与宗族擂台")
+        self.assertEqual(direction["character_change"], "退婚者和族内天才")
+        self.assertEqual(direction["result"], "主角拿回修炼资格")
+
+    def test_stage_direction_batch_waits_for_confirmation_before_bible(self):
+        dialog = wizard.NovelCreationWizardDialog.__new__(
+            wizard.NovelCreationWizardDialog
+        )
+        dialog.step_results = {}
+        self.assertEqual(dialog._next_generation_batch("bible")[0], "stage_directions")
+        dialog.step_results["bible"] = {
+            "stage_directions": [{"summary": "阶段方向"}],
+            "_generation_state": {
+                "status": "partial",
+                "completed_batches": ["stage_directions"],
+                "stage_directions_confirmed": False,
+            },
+        }
+        self.assertEqual(dialog._next_generation_batch("bible")[0], "")
+        dialog.step_results["bible"]["_generation_state"]["stage_directions_confirmed"] = True
+        self.assertEqual(dialog._next_generation_batch("bible")[0], "bible_core")
+
+    def test_confirmed_stage_directions_skip_the_legacy_skeleton_batch(self):
+        dialog = wizard.NovelCreationWizardDialog.__new__(
+            wizard.NovelCreationWizardDialog
+        )
+        dialog.target_words_spin = SimpleNamespace(value=lambda: 200000)
+        dialog.average_words_spin = SimpleNamespace(value=lambda: 3000)
+        dialog.step_results = {
+            "bible": {
+                "stage_directions": [
+                    {
+                        "name": "家族逆袭",
+                        "summary": "主角在家族擂台觉醒并完成逆袭。",
+                        "scene_change": "家族大厅与宗族擂台",
+                        "character_change": "退婚者成为直接对手",
+                        "result": "主角拿回修炼资格",
+                    },
+                    {
+                        "name": "都城入宗",
+                        "summary": "主角进入都城宗门，在外门大比中站稳脚跟。",
+                        "scene_change": "都城与宗门外门",
+                        "character_change": "宗门师兄和权贵长公子进入主线",
+                        "result": "主角进入内门",
+                    },
+                ],
+            },
+            "stage_plan": {},
+        }
+        self.assertTrue(dialog._has_stage_directions())
+        self.assertEqual(
+            dialog._next_generation_batch("stage_plan"),
+            ("stage_plan_stage", 0),
+        )
+        self.assertEqual(dialog.step_results["stage_plan"].get("stage_skeleton"), None)
+
+    def test_stage_direction_prompt_requires_new_scene_and_character_changes(self):
+        worker = wizard.NovelCreationWorker(
+            "http://example.test",
+            "key",
+            "model",
+            "bible",
+            {
+                "author_input": {"total_words": 200000, "average_chapter_words": 3000},
+                "selected_premise": {"genre": "传统玄幻"},
+            },
+            batch_kind="stage_directions",
+        )
+        prompt = worker._analysis_prompt()
+        self.assertIn("阶段方向", prompt)
+        self.assertIn("场景和人物变化", prompt)
+        self.assertIn("不能只是继续在同一家庭、公司、工厂、宗门", prompt)
+        self.assertIn('"stage_directions"', prompt)
+
+    def test_generation_batch_labels_are_specific_to_the_current_batch(self):
+        self.assertEqual(
+            wizard._creation_batch_display_name("stage_directions"),
+            "阶段方向",
+        )
+        self.assertEqual(
+            wizard._creation_batch_action_text("stage_directions"),
+            "AI 生成阶段方向",
+        )
+        self.assertEqual(
+            wizard._creation_batch_action_text("bible_assets"),
+            "AI 生成人物、设定、伏笔",
+        )
+        self.assertEqual(
+            wizard._creation_batch_action_text("stage_plan_stage", 1, 5),
+            "AI 生成第2阶段（共5个阶段）",
+        )
+        self.assertEqual(
+            wizard._creation_batch_action_text("stage_endpoint_repair", 0, 5),
+            "AI 补齐第1阶段伏笔定位",
+        )
+
+    def test_stage_direction_worker_progress_does_not_fall_back_to_bible_assets(self):
+        worker = wizard.NovelCreationWorker(
+            "http://example.test",
+            "key",
+            "model",
+            "bible",
+            {"author_input": {"total_words": 200000}},
+            batch_kind="stage_directions",
+        )
+        self.assertEqual(worker._analysis_progress_label(), "全书阶段方向")
+        self.assertEqual(worker._generation_progress_text(200000), "正在生成：全书阶段方向")
+
+    def test_direct_stage_pressure_row_is_preserved_as_pressure_curve(self):
+        curve = _normalize_mainline_pressure_curve({
+            "scope": "从厂区扩大到跨城区路线",
+            "step": "必须同时承受守厂与外出风险",
+            "opponents": ["掠夺者", "车队利益方"],
+            "cost": "放弃一批关键配件救人",
+            "exit_change": "补给路线与车队绑定",
+        })
+        self.assertEqual(len(curve.get("stage_ladder", [])), 1)
+        row = curve["stage_ladder"][0]
+        self.assertEqual(row["stage_id"], "S01")
+        self.assertEqual(row["direct_opponents"], "掠夺者；车队利益方")
+        self.assertEqual(row["exit_change"], "补给路线与车队绑定")
+
+    def test_stage_pressure_row_uses_the_surrounding_stage_id(self):
+        result = wizard.normalize_creation_result(
+            "stage_plan",
+            {
+                "s": {
+                    "i": "S03",
+                    "n": "电站阶段",
+                    "r": [69, 100],
+                    "b": {},
+                    "e": [{
+                        "i": "E01",
+                        "r": [69, 69],
+                        "h": "人物在电站入口发生冲突并作出选择。",
+                        "o": "设备取得代价落地。",
+                        "d": "供能范围改变。",
+                    }],
+                    "x": {},
+                    "y": [],
+                    "u": {
+                        "scope": "冲突扩大到电站",
+                        "step": "压力提高",
+                        "opponents": "控制者",
+                        "cost": "交出独占权",
+                        "exit_change": "区域供能建立",
+                    },
+                },
+            },
+            total_words=300000,
+            average_chapter_words=3000,
+            pad_stage_plan=False,
+        )
+        self.assertEqual(
+            result["stage_plan"][0]["mainline_pressure"]["stage_id"],
+            "S03",
+        )
+
+    def test_normalization_can_use_the_active_batch_instead_of_recomputing_next_batch(self):
+        dialog = wizard.NovelCreationWizardDialog.__new__(
+            wizard.NovelCreationWizardDialog
+        )
+        dialog.target_words_spin = SimpleNamespace(value=lambda: 200000)
+        dialog.average_words_spin = SimpleNamespace(value=lambda: 3000)
+        dialog.premise_candidates = []
+        dialog.choice_values = {}
+        dialog.step_results = {
+            "bible": {
+                "_generation_state": {
+                    "status": "partial",
+                    "completed_batches": ["stage_directions"],
+                    "stage_directions_confirmed": False,
+                },
+            },
+        }
+        result = dialog._normalize_step_result(
+            "bible",
+            {"stage_directions": [{"summary": "当前请求的方向"}]},
+            creation_batch="stage_directions",
+        )
+        self.assertEqual(result["stage_directions"][0]["summary"], "当前请求的方向")
+
+    def test_confirmed_stage_directions_remove_stale_stage_skeleton_from_state(self):
+        dialog = wizard.NovelCreationWizardDialog.__new__(
+            wizard.NovelCreationWizardDialog
+        )
+        dialog.target_words_spin = SimpleNamespace(value=lambda: 200000)
+        dialog.average_words_spin = SimpleNamespace(value=lambda: 3000)
+        dialog.step_results = {
+            "bible": {
+                "stage_directions": [
+                    {"summary": "第一阶段方向"},
+                    {"summary": "第二阶段方向"},
+                ],
+            },
+            "stage_plan": {
+                "stage_skeleton": [{"id": "S01"}, {"id": "S02"}],
+                "stage_plan": [],
+            },
+        }
+        dialog._sync_stage_generation_state(dialog.step_results["stage_plan"])
+        self.assertNotIn("stage_skeleton", dialog.step_results["stage_plan"])
+        self.assertEqual(
+            dialog._next_generation_batch("stage_plan"),
+            ("stage_plan_stage", 0),
+        )
 
     def test_character_style_choice_only_exposes_personality_and_voice(self):
         entry = {

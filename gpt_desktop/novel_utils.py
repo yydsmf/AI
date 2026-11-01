@@ -47,6 +47,88 @@ def _canonical_chapter_plan_event_id(value):
     return normalized
 
 
+def _creation_event_fingerprint(event):
+    """Return an advisory identity for a wizard event.
+
+    This is deliberately only a handoff/index key.  It must never be used as
+    a hard content rejection because different genres can legitimately reuse
+    the same words for different conflicts.
+    """
+    event = event if isinstance(event, dict) else {}
+    parts = [
+        event.get("event", event.get("h", event.get("text", ""))),
+        event.get("result", event.get("o", "")),
+        event.get("state_delta", event.get("d", "")),
+    ]
+    compact = re.sub(r"[^0-9A-Za-z\u4e00-\u9fff]+", "", "".join(_as_text(item) for item in parts)).lower()
+    if not compact:
+        return ""
+    return hashlib.sha1(compact.encode("utf-8", errors="replace")).hexdigest()[:16]
+
+
+def _creation_event_catalog(framework):
+    """Normalize wizard stage events into one stable, read-only catalog."""
+    framework = framework if isinstance(framework, dict) else {}
+    stages = framework.get("stage_plan", [])
+    stages = stages if isinstance(stages, list) else []
+    catalog = []
+    for stage_index, stage in enumerate(stages, 1):
+        if not isinstance(stage, dict):
+            continue
+        stage_id = _canonical_chapter_plan_stage_id(
+            stage.get("id", ""), f"S{stage_index:02d}"
+        )
+        if not stage_id:
+            continue
+        try:
+            stage_start = int(stage.get("start_chapter", 0) or 0)
+            stage_end = int(stage.get("end_chapter", 0) or 0)
+        except (TypeError, ValueError):
+            stage_start = stage_end = 0
+        raw_events = stage.get("ordered_events", stage.get("events", []))
+        raw_events = raw_events if isinstance(raw_events, list) else []
+        for event_index, raw_event in enumerate(raw_events, 1):
+            if not isinstance(raw_event, dict):
+                continue
+            event_id = _canonical_chapter_plan_event_id(
+                raw_event.get("id", raw_event.get("i", ""))
+            )
+            if not re.fullmatch(rf"{re.escape(stage_id)}-E\d{{2,4}}", event_id):
+                event_id = f"{stage_id}-E{event_index:02d}"
+            allowed = raw_event.get("allowed_chapters", raw_event.get("r", []))
+            if not isinstance(allowed, (list, tuple)) or len(allowed) < 2:
+                allowed = [stage_start, stage_end]
+            try:
+                allowed_start = int(allowed[0] or stage_start)
+                allowed_end = int(allowed[1] or stage_end)
+            except (TypeError, ValueError):
+                allowed_start, allowed_end = stage_start, stage_end
+            event = {
+                "id": event_id,
+                "stage_id": stage_id,
+                "order": event_index,
+                "allowed_chapters": [allowed_start, allowed_end],
+                "event": _as_text(raw_event.get("event", raw_event.get("h", raw_event.get("text", "")))).strip(),
+                "result": _as_text(raw_event.get("result", raw_event.get("o", ""))).strip(),
+                "state_delta": deepcopy(raw_event.get("state_delta", raw_event.get("d", {}))),
+                "references": deepcopy(raw_event.get("references", raw_event.get("a", []))),
+            }
+            event["fingerprint"] = _creation_event_fingerprint(event)
+            catalog.append(event)
+    return catalog
+
+
+CHAPTER_EVENT_HANDOFF_GUIDANCE = (
+    "阶段事件是当前阶段的唯一剧情事实来源，程序已经为当前批次确定事件顺序和章节槽位；"
+    "模型只把当前槽位中的事件转化为人物正在经历的具体故事，不自行重排事件或创建第二套事件顺序。"
+    "batch_continuity.event_handoff中的completed_events是已经发生的事实，只能作为当前压力、关系变化和人物新选择的起点；"
+    "active_events才是当前批次可以展开的阶段事件，do_not_replay中的内容不能重新写成主事件。"
+    "同一物件、故障、证据或技术结论再次出现时，必须转化为新人物、新目标、新对手、新代价、新关系结果或新的公开后果；"
+    "只增加解释、讨论、等待、记录、复核、确认、整理或同一地点的换说法，不算剧情推进。"
+    "source_event_ids由程序根据固定章节槽位回填，模型不需要返回事件编号；历史返回的索引也不能改变程序归属。"
+).strip()
+
+
 # Continuation data is kept separate from ordinary writing state so a new
 # volume can inherit continuity without importing the previous manuscript.
 VOLUME_CONTINUATION_SCHEMA_VERSION = "1"
@@ -820,6 +902,21 @@ def _normalize_mainline_pressure_curve(value):
         if text:
             result[key] = text
     raw_ladder = value.get("stage_ladder", value.get("stages", []))
+    # The creation-wizard stage protocol uses ``u`` as one direct pressure
+    # row (scope/step/opponents/cost/exit_change). Older callers use the
+    # wrapped ``stage_ladder`` shape. Accept both shapes so the new pressure
+    # curve is not silently discarded during stage normalization.
+    if (not isinstance(raw_ladder, list) or not raw_ladder) and any(
+        key in value
+        for key in (
+            "conflict_scope", "scope", "冲突范围",
+            "pressure_step", "step", "压力变化",
+            "direct_opponents", "opponents", "直接对手",
+            "irreversible_cost", "cost", "不可逆代价",
+            "exit_change", "change", "阶段出口变化",
+        )
+    ):
+        raw_ladder = [value]
     ladder = []
     for index, item in enumerate(raw_ladder if isinstance(raw_ladder, list) else [], 1):
         if not isinstance(item, dict):
@@ -836,7 +933,15 @@ def _normalize_mainline_pressure_curve(value):
         for target, source_keys in aliases.items():
             text = ""
             for source_key in source_keys:
-                text = _as_text(item.get(source_key, ""))
+                raw_text = item.get(source_key, "")
+                if isinstance(raw_text, (list, tuple)):
+                    text = "；".join(
+                        _as_text(part).strip()
+                        for part in raw_text
+                        if _as_text(part).strip()
+                    )
+                else:
+                    text = _as_text(raw_text)
                 if text:
                     break
             if text:
@@ -23549,6 +23654,49 @@ def _build_chapter_ai_context(project, chapter_index, action):
         chapter_index,
         compact_for_draft=action == "draft",
     )
+    event_context = {}
+    framework = project.get("creation_framework", {})
+    if isinstance(framework, dict) and framework.get("source") == "creation_wizard":
+        event_catalog = {
+            item.get("id"): item
+            for item in _creation_event_catalog(framework)
+            if isinstance(item, dict) and item.get("id")
+        }
+        current_event_ids = [
+            _canonical_chapter_plan_event_id(value)
+            for value in chap.get("source_event_ids", [])
+            if _canonical_chapter_plan_event_id(value)
+        ]
+        current_events = []
+        for event_id in current_event_ids:
+            event = event_catalog.get(event_id)
+            if not event:
+                continue
+            current_events.append({
+                "id": event_id,
+                "event": str(event.get("event", "") or "")[:700],
+                "result": str(event.get("result", "") or "")[:500],
+                "state_delta": deepcopy(event.get("state_delta", {})),
+            })
+        previous_events = []
+        for previous in chapters[max(0, chapter_index - 6):chapter_index]:
+            if not isinstance(previous, dict):
+                continue
+            for raw_id in previous.get("source_event_ids", []):
+                event_id = _canonical_chapter_plan_event_id(raw_id)
+                event = event_catalog.get(event_id)
+                if event and event_id not in {item.get("id") for item in previous_events}:
+                    previous_events.append({
+                        "id": event_id,
+                        "event": str(event.get("event", "") or "")[:500],
+                        "result": str(event.get("result", "") or "")[:500],
+                    })
+        if current_events or previous_events:
+            event_context = {
+                "current_events": current_events,
+                "previous_events": previous_events[-6:],
+                "rule": CHAPTER_EVENT_HANDOFF_GUIDANCE,
+            }
     continuation_text = _build_chapter_continuation_text(chapters, chapter_index)
     next_chapter_anchor_text = _build_next_chapter_anchor_text(chapters, chapter_index)
     terminal_window_info = _terminal_window_chapter_info(project, chapter_index)
@@ -23755,6 +23903,12 @@ def _build_chapter_ai_context(project, chapter_index, action):
         "伏笔只在合适章节推进；已回收/无需回收/废弃伏笔不要重复当新线索。缺资料时保持克制，不要补出会影响后文的新设定。",
         "人物秘密、伏笔完整答案和未解锁的设定属于作者层；正文只能使用本上下文已显示的故事内已知内容和当章允许推进的边界。",
     ]
+    if event_context:
+        inheritance_rule_lines.append(
+            "当前章节的阶段事件和前一事件结果是连续性依据：已完成事件只能作为当前人物的新压力和选择起点；"
+            "同一故障、设备、资源或规则再次出现时，必须写出新的直接利益者、人物行动、代价、关系后果或公开后果，"
+            "不能重新完整写一遍诊断、维修、确认或验证。"
+        )
     if action != "draft":
         inheritance_rule_lines.append(_procedural_plot_guard_guidance().strip())
     if reverse_from_body:
@@ -23857,6 +24011,11 @@ def _build_chapter_ai_context(project, chapter_index, action):
                 structured_lines.append(f"章末变化：{ending_text}")
         if structured_lines:
             current_lines.append("结构化章节事实（只用于确认顺序和连续性，不要把字段名或规划过程写进正文）：\n" + "\n".join(structured_lines))
+    if event_context:
+        current_lines.append(
+            "阶段事件交接（程序本地确定，只用于继承事件结果，不要把事件编号写进正文）：\n"
+            + json.dumps(event_context, ensure_ascii=False, separators=(",", ":"))
+        )
     if selected_character_ids and planned_linked_characters:
         current_lines.append(
             "初始章节规划人物（仅弱参考，不要求全部出场，也不得覆盖AI按实写状态生成的本章人物清单）："

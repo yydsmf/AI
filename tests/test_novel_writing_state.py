@@ -51,6 +51,65 @@ from gpt_desktop.workers import EdgeTTSWorker, _parse_edge_tts_server_date
 
 
 class NovelWritingStateTests(unittest.TestCase):
+    @staticmethod
+    def _wizard_event_project():
+        return {
+            "creation_framework": {
+                "source": "creation_wizard",
+                "stage_plan": [{
+                    "id": "S01",
+                    "name": "开局阶段",
+                    "start_chapter": 1,
+                    "end_chapter": 4,
+                    "ordered_events": [
+                        {
+                            "id": "S01-E01",
+                            "allowed_chapters": [1, 1],
+                            "event": "家族人物当众扣下主角的关键物件",
+                            "result": "主角失去原有依靠，被迫主动反击",
+                            "state_delta": {"relationship": "决裂"},
+                        },
+                        {
+                            "id": "S01-E02",
+                            "allowed_chapters": [2, 2],
+                            "event": "对手利用主角的失误发动追责",
+                            "result": "主角承担现实损失并暴露新的弱点",
+                            "state_delta": {"cost": "失去住处"},
+                        },
+                        {
+                            "id": "S01-E03",
+                            "allowed_chapters": [3, 4],
+                            "event": "主角带人夺回被扣物件并逼对手表态",
+                            "result": "关系冲突公开化，主角取得有限主动权",
+                            "state_delta": {"pressure": "公开对抗"},
+                        },
+                    ],
+                }],
+            },
+        }
+
+    def test_wizard_event_handoff_tracks_consumed_events_and_local_slots(self):
+        tab = NovelWritingTab.__new__(NovelWritingTab)
+        tab.current_project = self._wizard_event_project()
+        state = {
+            "chapters": [
+                {"index": 1, "source_event_ids": ["S01-E01"]},
+                {"index": 2, "source_event_ids": ["S01-E02"]},
+            ]
+        }
+
+        handoff = tab._chapter_plan_event_handoff(state, 3, 4)
+
+        self.assertEqual(state["event_progress"]["S01-E01"]["status"], "consumed")
+        self.assertEqual(state["event_progress"]["S01-E02"]["status"], "consumed")
+        self.assertEqual([item["id"] for item in handoff["completed_events"]], ["S01-E01", "S01-E02"])
+        self.assertEqual([item["id"] for item in handoff["active_events"]], ["S01-E03"])
+        self.assertTrue(handoff["do_not_replay"])
+        self.assertEqual(
+            tab._chapter_plan_local_event_ids_for_chapter(state, 3, 3, 4),
+            ["S01-E03"],
+        )
+
     def test_chapter_outline_display_separates_realm_progress_marker(self):
         compact = "主角突破瓶颈，本章境界推进：从炼气三层升到四层。"
         self.assertEqual(

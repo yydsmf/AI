@@ -129,6 +129,46 @@ CREATION_WIZARD_STEPS = (
     ("stage_plan", "十万字阶段规划"),
 )
 
+
+def _creation_batch_display_name(batch_kind, stage_index=-1, total_stages=0):
+    """Return the user-facing name for one exact generation batch."""
+    batch_kind = _as_text(batch_kind)
+    if batch_kind == "stage_directions":
+        return "阶段方向"
+    if batch_kind == "bible_core":
+        return "小说圣经、世界规则"
+    if batch_kind == "bible_assets":
+        return "人物、设定、伏笔"
+    if batch_kind == "stage_skeleton":
+        return "全书阶段骨架"
+    if batch_kind == "stage_plan_stage":
+        try:
+            stage_number = max(1, int(stage_index) + 1)
+        except (TypeError, ValueError):
+            stage_number = 1
+        try:
+            total = max(stage_number, int(total_stages or 0))
+        except (TypeError, ValueError):
+            total = stage_number
+        return f"第{stage_number}阶段（共{total}个阶段）"
+    if batch_kind == "stage_endpoint_repair":
+        try:
+            stage_number = max(1, int(stage_index) + 1)
+        except (TypeError, ValueError):
+            stage_number = 1
+        return f"第{stage_number}阶段伏笔定位"
+    if batch_kind == "premise":
+        return "5个故事方向"
+    return "当前步骤"
+
+
+def _creation_batch_action_text(batch_kind, stage_index=-1, total_stages=0):
+    """Return the action-button text for one exact generation batch."""
+    name = _creation_batch_display_name(batch_kind, stage_index, total_stages)
+    if batch_kind == "stage_endpoint_repair":
+        return f"AI 补齐{name}"
+    return f"AI 生成{name}"
+
 CREATION_CHOICE_GROUPS = {
     "audience": {
         "读者方向": ("男频", "女频"),
@@ -436,6 +476,7 @@ CREATION_FORESHADOW_CLOSURE_GUIDANCE = """
 伏笔必须是能够在正文中验收的单一闭环，不是世界观百科、人物成长方向或整本书的抽象主题。每条伏笔只保留一个核心问题、一个核心承诺和一个可观察的回收结果：现在出现的具体线索是什么，人物当前怎样误解或理解，后面哪一次具体行动/对话/对抗会给出答案，以及答案会让谁的判断、关系、资源、身份或局势发生什么可见变化。不要把“身份真相、幕后势力、三年前往事、力量来源、未来世界”捆成一条伏笔，也不要用“完整真相仍未知”“后续影响仍未知”“来源和机制仍未揭示”把多条问题塞进同一条记录；这些内容应拆成独立伏笔，或留在小说圣经/世界规则/人物长期资料中。
 普通伏笔的揭示结果必须能直接回答这条线索提出的核心问题，并在场景中留下明确结果；普通伏笔的 remaining_secret 填“无”或只写不影响本部闭环的余波。只有真正贯穿全书核心矛盾、结尾仍需要保留余味的少量主线谜团，才允许 payoff_stage 写“结尾保留”，且不能把普通伏笔批量标成长期伏笔。普通伏笔优先安排在 setup_stage 之后的后续阶段完成回收；同阶段回收只适用于短线且能在一个连续场景内完整闭合的线索。
 判断一条候选是否合格时，必须能够用一句话写出“回收章发生什么、谁做了什么、读者确认了什么、当场产生什么结果”。写不出这四点，就不要生成伏笔，应改放到主线、人物、设定或阶段事件中。伏笔数量服从故事需要，宁可少一条，也不要为了达到数量要求生成宽泛、重复或无法验收的线索。
+不同伏笔之间还要主动区分职责：分别写清各自的核心问题、决定性证据、回收场景动作和回收后的关系或局势变化。不同伏笔不能重复使用同一人物、同一物件、同一故障因果、同一证据和同一关系结论来完成正式回收；如果后一条伏笔只能再次完整证明前一条伏笔已经得到的事实，应把它并入前一条，或改写成新的具体人物选择、责任承担、关系变化或现场代价。后一条伏笔可以继续使用已经成立的事实，但只能把它转化为新的行动和后果，不能重新安排一遍原来的诊断、取证或结论确认。
 """.strip()
 
 
@@ -533,7 +574,7 @@ STEP_PROMPTS = {
 
 STAGE_PLAN_OBJECT_OUTPUT_RULES = """
 这次使用对象协议，阶段和事件按字段名归位；只返回一个合法 JSON 对象。
-短键含义如下：k=全书底盘契约（其中的核心动机是唯一执行主线），s=当前阶段对象，f=当前阶段实际发生的伏笔端点。阶段对象中 i=阶段编号，n=阶段名称，r=章节范围，b=开始状态，e=按顺序发生的场景事件对象数组，x=结束状态，y=带入下一阶段的事实，u=可选的本阶段主线压力递进摘要，m=可选的终局收尾方案。u使用scope、step、opponents、cost、exit_change五个字段，分别写冲突牵连范围、相较前阶段新增的压力、直接阻止主角的人物或人物集团、必须付出的不可逆代价、阶段结束后改变的处境或关系。状态对象中 t=时间，l=地点，c=人物状态，k=已经发生并被人物掌握的事实，q=仍会推动人物行动的问题。事件对象中 i=事件编号，r=允许章节范围，a=关联资料，p=前置条件，h=可直接扩写的场景事件，o=直接结果，d=实际状态变化。伏笔端点对象中 i=伏笔编号，k=setup或payoff，e=承载这个端点的事件编号，d=这一次在场景中发生的具体变化；一次只写一个端点。
+短键含义如下：k=全书底盘契约（其中的核心动机是唯一执行主线），s=当前阶段对象，f=当前阶段实际发生的伏笔端点。阶段对象中 i=阶段编号，n=阶段名称，r=章节范围，b=开始状态，e=按顺序发生的场景事件对象数组，x=结束状态，y=带入下一阶段的事实，u=本阶段主线压力递进摘要，m=可选的终局收尾方案。u使用scope、step、opponents、cost、exit_change五个字段，分别写冲突牵连范围、相较前阶段新增的压力、直接阻止主角的人物或人物集团、必须付出的不可逆代价、阶段结束后改变的处境或关系。状态对象中 t=时间，l=地点，c=人物状态，k=已经发生并被人物掌握的事实，q=仍会推动人物行动的问题。事件对象中 i=事件编号，r=允许章节范围，a=关联资料，p=前置条件，h=可直接扩写的场景事件，o=直接结果，d=实际状态变化。伏笔端点对象中 i=伏笔编号，k=setup或payoff，e=承载这个端点的事件编号，d=这一次在场景中发生的具体变化；一次只写一个端点。
 每个 h 都要像一段可以直接扩写的剧情节点：只写这件事真正需要的故事事实，必要时交代人物、场景、动作、阻力、选择或结果，尽量不用固定清单式要求，不为凑齐项目硬塞字段。剧情发动机由题材和人物处境决定，可以是正面碰撞、追逐逃避、关系变化、欲望争夺、环境失控、能力试探、秘密暴露或其它自然发生的压力；相邻事件要让人物处境产生新的变化，不把这些方式排成固定轮换。资料只有在人物正在做事、被迫应对或关系发生变化时进入场景。
  m 只在全书最后阶段返回，结构为 closure_mode、closure_horizon、long_term_result、final_image、opening_echo、title_closure_intent、time_jump_allowed。closure_mode 从 immediate_verified、short_term_verified、long_term_epilogue、mirror_scene、mixed 中选择最适合本书的一种；不能为了统一格式强行使用远期跳跃。long_term_epilogue 或 mixed 必须给出可信的时间跨度和具体成果，mirror_scene 必须说明要呼应的开头地点、物件、动作或关系；所有模式都必须先让本部核心结果落地，再用最后画面收束。
 当前阶段发生的正式伏笔端点，都在承载事件的 a 中加入一次“F编号/setup”或“F编号/payoff”，并在 f 中用同一事件编号 e 关联。setup写线索第一次进入人物生活，payoff写线索在场景中产生决定性变化；同一条伏笔在其它事件中继续出现、深化、造成后果是正常的，这些事件只把它作为普通关联资料或写出“F编号”，不要重复标成正式 setup/payoff。程序以正式端点为准，再把后续事件中的具体变化交给章节规划继续使用；阶段之间允许继续铺开同一条暗线，程序会依据事件 r 的章节范围落下具体章号。
@@ -544,15 +585,15 @@ STAGE_PLAN_OBJECT_OUTPUT_RULES = """
 
 STEP_PROMPTS["stage_plan"] = f"""{COMMON_CREATION_RULES}
 
-现在根据已经选定的故事和完整故事底盘，制作唯一的十万字阶段规划。这里的内容是给后续章节规划和正文扩写读取的执行资料，不是发布简介，也不需要写成文学化段落。总字数和单章字数完全按照作者输入；章节总数按 total_words / average_chapter_words 向上取整，最后一章吸收余数。每约十万字为一个阶段，阶段从第1章连续覆盖到最后一章，事件范围按顺序衔接。全书始终围绕唯一的 core_motive 推进：主角为了完成具体目标主动采取行动，剧情阻碍这条行动链，主角付出代价解决当前问题，结果再打开下一道目标；不能把阶段写成主角被动不断遇到新事情。
-阶段字段不要抢全书主线：阶段的 main_conflict 只写本阶段阻碍核心动机的具体问题、门槛、对手动作或代价升级；阶段 summary/end_state 要说明本阶段目标如何推进，以及结果打开的下一阶段目标。不要在每个阶段重新发明一条“主角真正要做的事”，也不要把主题、人物关系或伏笔名称填成阶段主线。阶段对象可选返回 u（mainline_pressure），只写本阶段相较前阶段自然增加的压力：scope、step、opponents、cost、exit_change。它是后续章节的因果底稿，不是审核清单；如果某题材的压力在同一地点、同一关系或同一事件类型内升级，也要写清新增牵连、代价或选择，不要凭空换地图、换势力或套固定层级。
+现在根据已经选定的故事、用户确认的阶段方向和完整故事底盘，制作唯一的十万字阶段规划。阶段方向是每个十万字阶段的宏观卖点和转场底稿，阶段规划必须把它落成具体人物、场景、冲突和结果，不能把阶段方向改成抽象口号，也不能让多个阶段继续围绕同一家庭、公司、工厂、宗门、资源或生产事务循环。这里的内容是给后续章节规划和正文扩写读取的执行资料，不是发布简介，也不需要写成文学化段落。总字数和单章字数完全按照作者输入；章节总数按 total_words / average_chapter_words 向上取整，最后一章吸收余数。每约十万字为一个阶段，阶段从第1章连续覆盖到最后一章，事件范围按顺序衔接。全书始终围绕唯一的 core_motive 推进：主角为了完成具体目标主动采取行动，剧情阻碍这条行动链，主角付出代价解决当前问题，结果再打开下一道目标；不能把阶段写成主角被动不断遇到新事情。
+阶段字段不要抢全书主线：阶段的 main_conflict 只写本阶段阻碍核心动机的具体问题、门槛、对手动作或代价升级；阶段 summary/end_state 要说明本阶段目标如何推进，以及结果打开的下一阶段目标。不要在每个阶段重新发明一条“主角真正要做的事”，也不要把主题、人物关系或伏笔名称填成阶段主线。阶段对象应优先返回 u（mainline_pressure），只写本阶段相较前阶段自然增加的压力：scope、step、opponents、cost、exit_change。u 要在本阶段事件生成前先确定，并作为事件差异化和主线推进的因果底稿，不是事后总结或审核清单；如果某题材的压力在同一地点、同一关系或同一事件类型内升级，也要写清新增牵连、代价或选择，不要凭空换地图、换势力或套固定层级。
 
 全书最后阶段必须额外规划“终局收尾方案”：根据题材、核心动机和故事规模，在即时结果型 immediate_verified、短期验证型 short_term_verified、远期成果型 long_term_epilogue、镜像回响型 mirror_scene、混合型 mixed 中选择一种，不要为了格式统一强行使用时间跳跃。若选择短期或远期验证，必须写出可信的时间跨度、已经持续存在的成果和一个能在场景中看见的验证；若选择镜像回响，必须写清呼应开头的地点、物件、动作或关系变化；若选择 mixed，先完成当前主线，再用时间落点或镜像画面确认成果。终局方案不是另开剧情，也不能用“多年后一切都变好了”的摘要替代具体场景。
 
-阶段规划固定事实、顺序、状态和阶段推进，但剧情推进以场景为单位。每个事件写清本次真正发生、会影响后续的故事事实；时间、地点、人物、动作、阻力、选择、关系变化和结果等内容，只在当前事件确实需要时补充。事件之间通过人物正在做的事和已经发生的变化自然衔接。先判断这一事件真正由什么推动，再选择最适合题材的场景：人物对抗、关系变化、现场危机、公开行动、利益争夺、环境压力或信息出现都可以成为主发动机。相邻事件主动更换主发动机、场景目标和压力来源，让人物、关系、空间和局势持续变化。
+阶段规划固定事实、顺序、状态和阶段推进，但剧情推进以场景为单位。每个阶段先回应对应的阶段方向，再拆成事件；阶段方向中的场景变化、人物变化和阶段结果不能只停留在阶段对象里，至少要在本阶段的关键事件中落地。每个事件写清本次真正发生、会影响后续的故事事实；时间、地点、人物、动作、阻力、选择、关系变化和结果等内容，只在当前事件确实需要时补充。事件之间通过人物正在做的事和已经发生的变化自然衔接。先判断这一事件真正由什么推动，再选择最适合题材的场景：人物对抗、关系变化、现场危机、公开行动、利益争夺、环境压力或信息出现都可以成为主发动机。相邻事件主动更换主发动机、场景目标和压力来源，让人物、关系、空间和局势持续变化。
 同一事件如果覆盖数章，只承担一次明确的转折；前面的章节让事情发生，后面的章节写它造成的新反应、新选择、新损失、新关系变化或新阻力，不要把同一场谈话、同一份材料或同一个结论反复当成新的剧情。对都市灵异、惊悚、悬疑、情感等题材，声音、空间、物件、生活压力、人物之间的隐瞒和现场失控持续进入剧情；对其它题材，使用该题材自己的场景压力和人物对抗。故事的关键变化要发生在人物正在经历的场面里，而不是停在解释性结论上。
-阶段事件继续由当前题材里的具体场景和人物行动推进；上面的共享程序性事项边界同样适用于阶段事件，不要把流程本身拆成连续事件或阶段主线。每个事件都要让人看见人物在哪里、正在做什么、遇到什么阻力、作出什么选择以及选择造成的可观察结果。当前阶段必须沿着上一阶段已经成立的压力继续提高，至少让冲突牵连范围、直接对手、失败代价、公开后果或主角选择难度中的两项发生自然变化；不得为了“升级”凭空添加固定类型的势力或地图。阶段内仍允许用一章或两章的小事件完成过渡，已有的 b-a+1<=2 只限制单个事件容量，不代替阶段压力递进。
-伏笔端点使用底盘已有编号或名称，关联到本阶段实际发生的事件；setup写线索第一次进入人物生活，payoff写线索在场景中完成单一核心问题的回答，并留下具体行动、对白、证据、关系结果或局势结果。payoff不能只写“进一步揭示”“冲突升级”“确认重要”“出现新线索”或“人物意识到事情不简单”，这些只是推进，不是回收。同一条伏笔可以在多个事件中继续出现、深化或影响人物选择，但正式 setup/payoff 只各自标记一次；后续事件用普通关联资料或“F编号”承接，不把每次提及都写成新的正式端点。阶段之间允许继续铺开同一条暗线，程序会依据事件的允许章节范围落下具体章号，模型只负责事件顺序和端点归属，不写具体章号。
+阶段事件继续由当前题材里的具体场景和人物行动推进；上面的共享程序性事项边界同样适用于阶段事件，不要把流程本身拆成连续事件或阶段主线。每个事件都要让人看见人物在哪里、正在做什么、遇到什么阻力、作出什么选择以及选择造成的可观察结果。当前阶段必须沿着上一阶段已经成立的压力继续提高，至少让冲突牵连范围、直接对手、失败代价、公开后果或主角选择难度中的两项发生自然变化；不得为了“升级”凭空添加固定类型的势力或地图。相邻事件主动更换主发动机、场景目标和压力来源；如果连续两个事件仍使用同一地点、同一对象或同一技术目标，下一事件必须把前面结果转化为新的具体人物、对手行动、关系裂痕、路线变化、公开后果或更高代价，不能继续完整处理同一个物件或重复同一种诊断。阶段内仍允许用一章或两章的小事件完成过渡，已有的 b-a+1<=2 只限制单个事件容量，不代替阶段压力递进。
+伏笔端点使用底盘已有编号或名称，关联到本阶段实际发生的事件；setup写线索第一次进入人物生活，payoff写线索在场景中完成单一核心问题的回答，并留下具体行动、对白、证据、关系结果或局势结果。payoff不能只写“进一步揭示”“冲突升级”“确认重要”“出现新线索”或“人物意识到事情不简单”，这些只是推进，不是回收。同一条伏笔可以在多个事件中继续出现、深化或影响人物选择，但正式 setup/payoff 只各自标记一次；后续事件用普通关联资料或“F编号”承接，不把每次提及都写成新的正式端点。不同伏笔的正式回收必须使用不同的决定性证据和回收动作；已经被前一条伏笔确认的技术事实、故障因果或人物责任，后续伏笔只能作为既定事实转化成新的关系选择、公开承担、对手行动或现场代价，不能再次完整验证一遍。阶段之间允许继续铺开同一条暗线，程序会依据事件的允许章节范围落下具体章号，模型只负责事件顺序和端点归属，不写具体章号。
 
 {STAGE_PLAN_OBJECT_OUTPUT_RULES}
 """
@@ -1306,6 +1347,10 @@ def _validate_stage_batch_events(stage, stage_index, spec):
                 f"{label}超出本阶段第{start_chapter}—{end_chapter}章范围"
             )
         else:
+            if allowed_end - allowed_start + 1 > 2:
+                problems.append(
+                    f"{label}的章节范围超过两章，必须拆成连续事件"
+                )
             if event_index == 1 and allowed_start != start_chapter:
                 problems.append(
                     f"{label}没有从本阶段第{start_chapter}章开始"
@@ -2670,6 +2715,96 @@ _PREMISE_CANDIDATE_ALIASES = {
 }
 
 
+_STAGE_DIRECTION_ALIASES = {
+    "i": "id",
+    "n": "name",
+    "w": "word_range",
+    "s": "summary",
+    "l": "scene_change",
+    "c": "character_change",
+    "x": "result",
+    "q": "next_pressure",
+}
+
+
+def _stage_direction_specs(total_words):
+    try:
+        total_words = max(1, int(total_words or 500000))
+    except (TypeError, ValueError):
+        total_words = 500000
+    stage_count = max(1, int(math.ceil(total_words / 100000)))
+    rows = []
+    for index in range(stage_count):
+        start = index * 100000
+        end = min(total_words, (index + 1) * 100000)
+        rows.append({
+            "id": f"R{index + 1:02d}",
+            "number": index + 1,
+            "start_word": start,
+            "end_word": end,
+        })
+    return rows
+
+
+def _expand_stage_direction_transport(value):
+    if isinstance(value, dict):
+        return _expand_transport_aliases(value, _STAGE_DIRECTION_ALIASES)
+    if isinstance(value, (list, tuple)):
+        return _compact_record(
+            value,
+            (
+                "id", "name", "word_range", "summary", "scene_change",
+                "character_change", "result", "next_pressure",
+            ),
+        )
+    return {}
+
+
+def _normalize_stage_direction(value, total_words=500000):
+    raw = value
+    if isinstance(raw, dict):
+        raw = _first_value(
+            raw,
+            ("stage_directions", "stage_direction", "directions", "stages", "route", "阶段方向"),
+            [],
+        )
+    rows = []
+    specs = _stage_direction_specs(total_words)
+    for index, item in enumerate(_as_list(raw)):
+        if not isinstance(item, (dict, list, tuple)) or index >= len(specs):
+            continue
+        item = _expand_stage_direction_transport(item)
+        spec = specs[index]
+        word_range = item.get("word_range", item.get("range", []))
+        if isinstance(word_range, dict):
+            word_range = [
+                word_range.get("start", word_range.get("a", spec["start_word"])),
+                word_range.get("end", word_range.get("b", spec["end_word"])),
+            ]
+        if not isinstance(word_range, (list, tuple)) or len(word_range) < 2:
+            word_range = [spec["start_word"], spec["end_word"]]
+        try:
+            start_word = max(0, int(word_range[0]))
+        except (TypeError, ValueError):
+            start_word = spec["start_word"]
+        try:
+            end_word = max(start_word, int(word_range[1]))
+        except (TypeError, ValueError):
+            end_word = spec["end_word"]
+        rows.append({
+            "id": _as_text(item.get("id")).upper() or spec["id"],
+            "name": _as_text(item.get("name")),
+            "start_word": start_word,
+            "end_word": end_word,
+            "summary": _as_text(item.get("summary")),
+            "scene_change": _as_text(item.get("scene_change")),
+            "character_change": _as_text(item.get("character_change")),
+            "result": _as_text(item.get("result")),
+            "next_pressure": _as_text(item.get("next_pressure")),
+        })
+    return rows
+
+
 def _expand_premise_candidate_transport(value):
     if isinstance(value, dict):
         return _expand_transport_aliases(value, _PREMISE_CANDIDATE_ALIASES)
@@ -2934,6 +3069,7 @@ def normalize_creation_result(
     foreshadow_stage_count=None,
     total_words=500000,
     average_chapter_words=3000,
+    creation_batch="",
 ):
     """Normalize model aliases into the fixed wizard schema."""
     payload = _expand_creation_transport(step, payload)
@@ -2976,6 +3112,25 @@ def normalize_creation_result(
         if protocol_error:
             result["_candidate_protocol_error"] = protocol_error
         return result
+    route_only = (
+        any(key in payload for key in ("stage_directions", "stage_direction", "阶段方向"))
+        and not any(
+            key in payload
+            for key in (
+                "bible", "novel_bible", "小说圣经", "world_rules", "world", "世界规则",
+                "characters", "c", "lore", "l", "foreshadows", "f",
+            )
+        )
+    )
+    if step == "bible" and (creation_batch == "stage_directions" or route_only):
+        raw = _first_value(
+            payload,
+            ("stage_directions", "stage_direction", "directions", "route", "阶段方向"),
+            [],
+        )
+        return {
+            "stage_directions": _normalize_stage_direction(raw, total_words),
+        }
     if step == "bible":
         bible = _normalize_bible(
             _first_value(payload, ("bible", "novel_bible", "小说圣经"), {})
@@ -3190,6 +3345,7 @@ def creation_wizard_draft_from_project_draft(project):
             "chapter_plan_note": _as_text(framework.get("chapter_plan_note")),
         },
         "bible": {
+            "stage_directions": deepcopy(framework.get("stage_directions", [])),
             "bible": deepcopy(framework.get("bible", {})),
             "world_rules": deepcopy(framework.get("world_rules", {})),
             "characters": deepcopy(framework.get("characters", [])),
@@ -3333,6 +3489,32 @@ def _format_bible_section_body(result):
     return "\n\n".join(bible_lines).strip() or "这部分还没有生成有效内容。"
 
 
+def _format_stage_directions_section_body(result):
+    result = result if isinstance(result, dict) else {}
+    directions = result.get("stage_directions", [])
+    if not isinstance(directions, list) or not directions:
+        return "这部分还没有生成有效内容。"
+    lines = []
+    for index, item in enumerate(directions, 1):
+        if not isinstance(item, dict):
+            continue
+        name = _as_text(item.get("name")) or f"阶段{index}"
+        start = item.get("start_word", (index - 1) * 100000)
+        end = item.get("end_word", index * 100000)
+        lines.append(f"第{index}阶段 · {name}（约{start}—{end}字）")
+        for label, key in (
+            ("阶段方向", "summary"),
+            ("场景变化", "scene_change"),
+            ("人物变化", "character_change"),
+            ("阶段结果", "result"),
+            ("下一阶段压力", "next_pressure"),
+        ):
+            value = _as_text(item.get(key))
+            if value:
+                lines.append(f"  {label}：{value}")
+    return "\n".join(lines).strip() or "这部分还没有生成有效内容。"
+
+
 def _format_world_rules_section_body(result):
     result = result if isinstance(result, dict) else {}
     world_rules = result.get("world_rules", {})
@@ -3460,6 +3642,10 @@ def _format_foreshadows_section_body(result):
 def _format_bible_sections(result):
     result = result if isinstance(result, dict) else {}
     return {
+        "stage_directions": (
+            "阶段方向",
+            _format_stage_directions_section_body(result),
+        ),
         "bible": ("小说圣经", _format_bible_section_body(result)),
         "world_rules": ("世界规则", _format_world_rules_section_body(result)),
         "characters": ("人物", _format_characters_section_body(result)),
@@ -3481,7 +3667,7 @@ def _format_bible_preview(result):
     sections = _format_bible_sections(result)
     return "\n\n".join(
         f"{title}\n\n{body}"
-        for key in ("bible", "world_rules", "characters", "lore", "foreshadows")
+        for key in ("stage_directions", "bible", "world_rules", "characters", "lore", "foreshadows")
         for title, body in (sections[key],)
     ).strip()
 
@@ -3691,7 +3877,13 @@ def normalize_stage_plan_ranges(
         )
         pressure_rows = pressure.get("stage_ladder", []) if pressure else []
         if pressure_rows:
-            item["mainline_pressure"] = deepcopy(pressure_rows[0])
+            pressure_row = deepcopy(pressure_rows[0])
+            # A direct ``u`` row does not need to repeat its stage id. The
+            # surrounding stage is authoritative; otherwise the normalizer's
+            # S01 fallback can silently bind every later pressure row to the
+            # first stage.
+            pressure_row["stage_id"] = item["id"]
+            item["mainline_pressure"] = pressure_row
         else:
             item.pop("mainline_pressure", None)
         closure_plan = _normalize_terminal_closure_plan(
@@ -3939,6 +4131,10 @@ def build_chapter_plan_foundation(framework):
     bible = framework.get("bible", {}) if isinstance(framework.get("bible"), dict) else {}
     world_rules = framework.get("world_rules", {}) if isinstance(framework.get("world_rules"), dict) else {}
     stages = framework.get("stage_plan", []) if isinstance(framework.get("stage_plan"), list) else []
+    stage_directions = (
+        framework.get("stage_directions", [])
+        if isinstance(framework.get("stage_directions"), list) else []
+    )
     book_contract = _normalize_stage_book_contract(framework.get("book_contract", {}))
     total_words = int(framework.get("total_words", 500000) or 500000)
     average_words = int(framework.get("average_chapter_words", 3000) or 3000)
@@ -3974,6 +4170,7 @@ def build_chapter_plan_foundation(framework):
         "satisfaction_currencies": ["具体事情带来的结果", "人物选择造成的变化", "身份或认知被揭开", "本部结果落地后的余波"],
         "emotional_resonance_axes": ["人物在现实压力下的选择", "靠近、疏远或反目", "核心结果落地后仍可保留的情绪或背景余波"],
         "chapter_variation_pool": ["现实阻力", "人物选择", "利益交换", "新信息出现", "关系发生变化"],
+        "stage_directions": deepcopy(stage_directions),
     }
     arcs = []
     for index, stage in enumerate(stages, 1):
@@ -4007,6 +4204,8 @@ def build_chapter_plan_foundation(framework):
             ),
             "core_motive": core_motive,
         }
+        if index - 1 < len(stage_directions) and isinstance(stage_directions[index - 1], dict):
+            arc["stage_direction"] = deepcopy(stage_directions[index - 1])
         arcs.append(arc)
     summary = _as_text(premise.get("synopsis", ""))
     ending = _as_text(premise.get("ending_direction", "")) or _as_text(bible.get("ending_direction", ""))
@@ -4255,6 +4454,11 @@ _CONTEXT_LABELS = {
     "revealed": "以后揭开的事实",
     "remaining_secret": "还藏着的部分",
     "stage_plan": "全书分段故事",
+    "stage_directions": "全书阶段方向",
+    "stage_direction": "本阶段方向",
+    "scene_change": "场景变化",
+    "character_change": "人物变化",
+    "next_pressure": "下一阶段压力",
     "stages": "全书分段故事",
     "arcs": "全书分段故事",
     "id": "编号",
@@ -5394,10 +5598,27 @@ class NovelCreationWorker(NovelAnalysisWorker):
 具体内容按从低到高写出一套清楚、够用的境界顺序，每个境界只用一到两句话，说明这一层主要能做到什么、边界在哪里，以及通常靠什么提升。境界数量按故事需要安排，不要把同一层拆成大量重复小级别；主角当前大致处在哪一层、普通武者、武帝和更高层次与主角的差距，也要在这条条目里说清楚。每个境界的描述要成为后面阶段和正文可以反复使用的事实，不要只写“存在境界划分”或“力量来自气血真元”，不要把境界体系留给阶段规划。
 如果使用嵌套数组表达境界，也必须把最终完整内容同时写入这条 l 条目的“具体内容”，这样程序会按主程序现有 lore 字段保存。
 """.strip()
-        if self.creation_batch == "bible_core":
+        if self.creation_batch == "stage_directions":
+            specs = _stage_direction_specs(total_words)
+            ranges = "；".join(
+                f"R{item['number']:02d}（{item['start_word']}—{item['end_word']}字）"
+                for item in specs
+            )
             prompt = f"""{COMMON_CREATION_RULES}
 
-只根据作者已经选定的故事，生成小说圣经和世界规则。小说圣经写整本书的核心矛盾、人物关系底子、贯穿全书并会随着人物选择不断变深的问题、主题、结尾方向和长期事实，让后面的阶段和场景都有清楚的根。主线矛盾字段必须完整承载核心动机契约：主角为什么非行动不可、要完成什么可验收的具体目标、期限或机会窗口是什么、失败会失去什么、阻碍来自谁或什么，以及开局与终局之间的主要反差；不能只写“赚钱、变强、复仇”这类抽象方向。主题字段只提炼这条故事要讨论的人性命题、价值冲突或情感认识，不重复具体任务、金额、期限、资源缺口、对手或执行步骤；不能用主题代替主线矛盾，也不能让主题变成另一条主线。还要写出解决当前目标后会自然打开的下一道具体阻碍或更高代价，保证后续阶段是在推进同一条主线，而不是不断换题。世界规则写世界长期怎样运转、日常生活、地点和社会关系、异常或能力的来源、触发条件、作用边界和代价；普通都市、灵异、悬疑、情感和现实题材，把规则落在空间、社会、异常与人物处境上；明确有修炼或境界的题材，再写力量来源和总边界，详细层次留给下一批的设定记录。
+现在只为已经选定的故事生成全书的“阶段方向”，暂时不要生成小说圣经、世界规则、人物、设定库或伏笔。阶段方向是给后续资料和第三步阶段规划使用的轻量主线路线图，也是用户在生成故事底盘前要先确认的内容。
+
+本书总字数为{total_words}字，严格按每十万字划分为{len(specs)}个阶段，范围固定为：{ranges}。必须恰好返回这些阶段，不能合并、拆分或增加阶段。每个阶段只写一个具有主线卖点的大跨度推进，用两到三句话的自然网络小说语言说清：主角处在什么新的场景或地方、与哪些具体人物或势力发生什么核心冲突、主角主动做出什么关键选择、阶段结束留下什么不可逆结果，以及结果怎样把主线推向下一阶段。
+
+阶段方向必须有可见的场景和人物变化。相邻阶段不能只是继续在同一家庭、公司、工厂、宗门、训练场或同一资源问题上加码，也不能只换地点、换对手名字、增加资源数量、扩大管理范围或重复“寻找—维护—生产—分配—复核”一类动作。每个阶段至少自然改变以下两项：主要场景或活动范围、直接对手或利益关系、参与并改变局势的关键人物、冲突发动方式、主角承担的代价、人物关系结果。变化方式必须服从题材自己的卖点：升级流可以进入新的城市、宗门、秘境和强敌关系，末日题材可以从据点生存转入远行、势力冲突、灾变现场或新的生存选择，情感题材可以从家庭关系转入公开选择、身份变化和人生方向；不要把这些例子当成所有题材的固定顺序。
+
+阶段方向不是逐章大纲，不写事件编号、章节号、伏笔编号、工作流程、资料清单或抽象的“实力提升、压力增加、主线升级”。要写读者能感到的核心卖点和转场：人物到了哪里、谁被卷进来、什么关系或局势被改变。阶段末可以回到前面埋下的线索兑现，但兑现必须带来新的场景结果或人物选择；不要让全书长期围绕同一类日常事务循环。
+
+只返回一个合法 JSON 对象，不要 Markdown 或解释：{{"stage_directions":[{{"id":"R01","name":"阶段名","word_range":[0,100000],"summary":"两到三句话的阶段方向，必须包含具体场景、人物冲突、主角选择和阶段结果","scene_change":"这一阶段主要进入或改变的具体场景/地方","character_change":"新增或发生实质关系变化的关键人物","result":"阶段结束时已经落地的不可逆结果","next_pressure":"由这个结果自然打开的下一阶段压力"}}]}}。字段名必须保持不变，数组顺序必须与阶段范围一致。"""
+        elif self.creation_batch == "bible_core":
+            prompt = f"""{COMMON_CREATION_RULES}
+
+只根据作者已经选定的故事和用户确认的阶段方向，生成小说圣经和世界规则。阶段方向是全书大跨度推进的上游路线：圣经要为每个阶段提供人物动机、关系变化、场景落点和世界事实，但不能把阶段方向改写成另一条主线，也不能把所有阶段压缩成同一地点、同一类人物或同一类资源问题。小说圣经写整本书的核心矛盾、人物关系底子、贯穿全书并会随着人物选择不断变深的问题、主题、结尾方向和长期事实，让后面的阶段和场景都有清楚的根。主线矛盾字段必须完整承载核心动机契约：主角为什么非行动不可、要完成什么可验收的具体目标、期限或机会窗口是什么、失败会失去什么、阻碍来自谁或什么，以及开局与终局之间的主要反差；不能只写“赚钱、变强、复仇”这类抽象方向。主题字段只提炼这条故事要讨论的人性命题、价值冲突或情感认识，不重复具体任务、金额、期限、资源缺口、对手或执行步骤；不能用主题代替主线矛盾，也不能让主题变成另一条主线。还要写出解决当前目标后会自然打开的下一道具体阻碍或更高代价，保证后续阶段是在推进同一条主线，而不是不断换题。世界规则写世界长期怎样运转、日常生活、地点和社会关系、异常或能力的来源、触发条件、作用边界和代价；普通都市、灵异、悬疑、情感和现实题材，把规则落在空间、社会、异常与人物处境上；明确有修炼或境界的题材，再写力量来源和总边界，详细层次留给下一批的设定记录。
 
 世界规则的五个位置都要形成可执行的事实：世界概况交代长期环境，力量或能力体系交代来源与总边界，长期规则数组写会反复成立的运行方式，代价限制数组写人物触碰这些规则后会承担的现实后果，地理与生活写人物平常真正会走进的地方和生活压力。每条规则都能影响人物选择，数组写实际内容，不用空泛的分类名。
 
@@ -5411,7 +5632,7 @@ b 只能使用 c、r、t、m、p、e、h；w 只能使用 s、p、r、c、g。�
         elif self.creation_batch == "bible_assets":
             prompt = f"""{COMMON_CREATION_RULES}
 
-读取作者已经选定的故事，以及前一批已经生成的小说圣经和世界规则，补齐人物、设定和伏笔。所有人物目标、关键设定和伏笔都必须服务于已经确认的核心动机：它们要帮助主角完成目标、制造阻碍、抬高代价、改变资源/关系/信息/时间窗口，或在阶段转换时打开下一道具体目标；不能各自发展成脱离主线的独立故事。人物要分别写身份、想得到或守住的东西、秘密、人物性格/特点、语言风格，以及害怕失去什么、与主角的长期关系底色和长期变化。人物性格/特点写长期稳定的性格底色，语言风格写可迁移的表达分类和习惯；人物性格、语言风格和 notes 都不要落到具体事件、食物、地点、道具、固定笑点、固定动作、固定口头禅、某一次剧情反应或固定触发模式上。具体怎样牵制、靠近、利用、误会或翻脸，留给后面的阶段和章节在场景中表现。设定库统一收录后面反复会用到的地点、物件、势力、制度、日常场景和能力边界。明确有修炼、境界或力量层次的题材，在设定的规则条目里写详细层次；其它题材把设定落在空间、生活、社会关系和异常边界上。伏笔围绕主线冲突、重要人物关系和关键设定展开，但每条只保留一个核心问题和一个可验收的回收结果：写清当前可见的具体线索、人物当前理解、回收时谁做了什么、读者确认了什么、当场产生什么后果，notes留空，状态统一为未埋。普通伏笔的 remaining_secret 填“无”或只写不影响本部闭环的余波；只有少量真正贯穿全书核心矛盾的长期主线谜团才允许保留核心未解部分。
+读取作者已经选定的故事、用户确认的阶段方向，以及前一批已经生成的小说圣经和世界规则，补齐人物、设定和伏笔。阶段方向中的场景跨度、关键人物变化和阶段结果必须被具体资料支撑，但不要把阶段方向改写成资料说明，更不要让所有阶段共用一组人物、地点或资源循环。所有人物目标、关键设定和伏笔都必须服务于已经确认的核心动机：它们要帮助主角完成目标、制造阻碍、抬高代价、改变资源/关系/信息/时间窗口，或在阶段转换时打开下一道具体目标；不能各自发展成脱离主线的独立故事。人物要分别写身份、想得到或守住的东西、秘密、人物性格/特点、语言风格，以及害怕失去什么、与主角的长期关系底色和长期变化。人物性格/特点写长期稳定的性格底色，语言风格写可迁移的表达分类和习惯；人物性格、语言风格和 notes 都不要落到具体事件、食物、地点、道具、固定笑点、固定动作、固定口头禅、某一次剧情反应或固定触发模式上。具体怎样牵制、靠近、利用、误会或翻脸，留给后面的阶段和章节在场景中表现。设定库统一收录后面反复会用到的地点、物件、势力、制度、日常场景和能力边界。明确有修炼、境界或力量层次的题材，在设定的规则条目里写详细层次；其它题材把设定落在空间、生活、社会关系和异常边界上。伏笔围绕主线冲突、重要人物关系和关键设定展开，但每条只保留一个核心问题和一个可验收的回收结果：写清当前可见的具体线索、人物当前理解、回收时谁做了什么、读者确认了什么、当场产生什么后果，notes留空，状态统一为未埋。普通伏笔的 remaining_secret 填“无”或只写不影响本部闭环的余波；只有少量真正贯穿全书核心矛盾的长期主线谜团才允许保留核心未解部分。
 
 {CREATION_LORE_TYPE_GUIDANCE}
 
@@ -5446,9 +5667,9 @@ c 中每项只能使用 n、r、g、s、p、v、q；l 中每项只能使用 n、
             )
             prompt = f"""{COMMON_CREATION_RULES}
 
-读取作者选定的故事和完整故事底盘，在正式生成十万字阶段规划前，先建立一份简短的全书阶段骨架。它只负责固定每个阶段的主线变化、关键转折和阶段结束状态，不写章节细纲，不写事件数组，不安排具体伏笔章位，也不重复小说圣经、世界规则和人物设定。每个阶段都必须回答同一条核心动机在本阶段推进了什么：主角当前要完成的具体目标是什么、为了目标主动做了什么、遇到的主要阻碍或代价是什么、阶段结束后得到或失去什么，以及这个结果如何打开下一阶段更具体的目标。阶段不是互不相干的事件集合，也不能每阶段重新换一条主线。先从本阶段故事真正会发生的变化出发，再确定阶段转折；转折方式由题材、人物关系、环境和事件自然决定，不要求各阶段使用同一种推进顺序。阶段之间还要自然提高至少两项：冲突牵连范围、直接对手、失败代价、公开后果或主角选择难度；不要求所有题材采用家族、地方、区域或跨界的固定顺序，也不为形式凭空添加势力。阶段数量和章节范围完全按照作者输入；每个阶段写一条清楚的主线变化、两到四个关键转折和一条结束状态，内容要能让后面的阶段规划沿着同一条故事发展，避免阶段之间方向漂移，尽量不用固定清单式要求。
+读取作者选定的故事、用户确认的全书阶段方向和完整故事底盘，在正式生成十万字阶段规划前，先建立一份简短的全书阶段骨架。阶段方向是每十万字阶段的宏观卖点、场景转场、关键人物变化和不可逆结果；骨架必须逐阶段承接这些方向，不能只写抽象的“升级、扩大、加压”，也不能把多个阶段压回同一地点或同一类日常事务。它只负责固定每个阶段的主线变化、关键转折和阶段结束状态，不写章节细纲，不写事件数组，不安排具体伏笔章位，也不重复小说圣经、世界规则和人物设定。每个阶段都必须回答同一条核心动机在本阶段推进了什么：主角当前要完成的具体目标是什么、为了目标主动做了什么、遇到的主要阻碍或代价是什么、阶段结束后得到或失去什么，以及这个结果如何打开下一阶段更具体的目标。阶段不是互不相干的事件集合，也不能每阶段重新换一条主线。先从本阶段故事真正会发生的变化出发，再确定阶段转折；转折方式由题材、人物关系、环境和事件自然决定，不要求各阶段使用同一种推进顺序。阶段之间还要自然提高至少两项：冲突牵连范围、直接对手、失败代价、公开后果或主角选择难度；不要求所有题材采用家族、地方、区域或跨界的固定顺序，也不为形式凭空添加势力。阶段数量和章节范围完全按照作者输入；每个阶段写一条清楚的主线变化、两到四个关键转折和一条结束状态，内容要能让后面的阶段规划沿着同一条故事发展，避免阶段之间方向漂移，尽量不用固定清单式要求。
 
-阶段骨架同样不能把记录、复核、责任追溯、合同、公司治理、审批、归档或案卷式资料往来当成阶段变化；除非作者明确指定相关题材，否则不得从“边界、资源、条件、责任”等普通词推导出合同冲突或公司冲突。阶段变化要写人物在具体处境中的行动、阻力、选择和结果，先守住题材自己的事件发动机，再概括阶段走向。
+阶段骨架同样不能把记录、复核、责任追溯、合同、公司治理、审批、归档或案卷式资料往来当成阶段变化；除非作者明确指定相关题材，否则不得从“边界、资源、条件、责任”等普通词推导出合同冲突或公司冲突。阶段变化要写人物在具体处境中的行动、阻力、选择和结果，先守住题材自己的事件发动机，再概括阶段走向。相邻阶段不能只把同一任务扩大范围、增加参与者或改成更复杂的分工；必须由上一阶段已经发生的结果逼出新的主问题或关系冲突，变化方式随题材自然产生。
 
 本书总字数为{total_words}字，按每十万字划分为{stage_count}个阶段。必须恰好返回{stage_count}项，不能少一项，也不能多出额外阶段；阶段编号和章节范围固定为：{stage_ranges}。即使某一阶段的故事暂时不如其它阶段集中，也必须为该阶段写出属于它的主线变化、关键转折和结束状态，不能把相邻阶段合并，也不能提前结束全书。
 
@@ -5576,7 +5797,7 @@ c 中每项只能使用 n、r、g、s、p、v、q；l 中每项只能使用 n、
 
 输入资料中的 current_foreshadow_endpoints 是本阶段自然发生的正式暗线端点清单。每一项落到一个当前事件中；kind=setup 写线索怎样第一次进入人物生活，kind=payoff 写线索怎样在现场完成一个明确问题的回答，并产生可观察的直接结果。payoff不能只写推进、部分揭示、再次出现、冲突升级、确认“事情不简单”或留下新的问题；如果当前事件只能继续铺垫，就不能把它当成正式 payoff。清单为空时，场景仍然沿着人物和主线自然推进。同一条伏笔在其它事件里继续出现、深化或产生后果是正常的，但正式端点只在真正承担该变化的事件中标记一次；后续事件用普通关联资料或“F编号”继续承接，不重复写“F编号/setup”或“F编号/payoff”。承载正式端点的事件 references 加入对应标记，让程序可以把端点和事件稳定对应起来。
 
-阶段内的事件以场景为核心：在需要的地方写清本次真正发生的事实，尽量不用固定清单式要求，不为凑齐项目逐项重复。allowed_chapters 是事件容量：一章写一个主要场面和直接结果；最多连续两章写同一冲突的升级、选择和后果。每个事件的章节范围必须满足 b-a+1<=2；如果一个事件想覆盖三章或四章，必须先拆成至少两个事件，每个事件各自绑定具体人物关系、独立阻力、选择和结果，再由结果衔接下一事件。不能把同一段家庭谈话、资源讨论或权限说明换一种说法继续占满多章。生成事件数组前逐项确认范围长度，超过两章就拆分，不要把超长范围交给程序再落位。相邻事件从人物目标和现场结果自然长出新的推进方式。伏笔只在实际发生的阶段返回，一次只返回一个当前正式端点；f中的每项写 i、k、e、d，其中 k 为 setup 或 payoff，e 是承载它的事件编号，d 是这一次在场景中发生的具体变化。后续事件可以继续写同一条线索的新增影响，但不重复返回同一种正式端点。程序会依据事件范围落下具体章号。{("同时返回全书长期事实 k。" if first_stage else "本阶段沿用前面已经确认的长期事实。")}
+阶段内的事件以场景为核心：在需要的地方写清本次真正发生的事实，尽量不用固定清单式要求，不为凑齐项目逐项重复。allowed_chapters 是事件容量：一章写一个主要场面和直接结果；最多连续两章写同一冲突的升级、选择和后果。每个事件的章节范围必须满足 b-a+1<=2；如果一个事件想覆盖三章或四章，必须先拆成至少两个事件，每个事件各自绑定具体人物关系、独立阻力、选择和结果，再由结果衔接下一事件。事件长度由冲突本身决定，不要为了填满阶段章节数把多数事件都写成两章，也不要让整阶段只由两章事件串联；当阶段超过20章时，尤其不能机械用连续两章事件填满范围，能在单章完成的人物选择、关系转折、信息落地、对手出手或结果验证要自然独立成单章事件。只有同一冲突确实需要升级时才使用两章，且第二章必须出现新的行动和结果。不能把同一段家庭谈话、资源讨论或权限说明换一种说法继续占满多章。生成事件数组前逐项确认范围长度，超过两章就拆分，不要把超长范围交给程序再落位。相邻事件从人物目标和现场结果自然长出新的推进方式。伏笔只在实际发生的阶段返回，一次只返回一个当前正式端点；f中的每项写 i、k、e、d，其中 k 为 setup 或 payoff，e 是承载它的事件编号，d 是这一次在场景中发生的具体变化。后续事件可以继续写同一条线索的新增影响，但不重复返回同一种正式端点。程序会依据事件范围落下具体章号。{("同时返回全书长期事实 k。" if first_stage else "本阶段沿用前面已经确认的长期事实。")}
 
             {opening_guidance}{subject_guidance}{final_stage_guidance}
 
@@ -5614,6 +5835,8 @@ c 中每项只能使用 n、r、g、s、p、v、q；l 中每项只能使用 n、
             return "小说圣经、世界规则"
         if self.creation_batch == "bible_assets":
             return "人物、设定、伏笔"
+        if self.creation_batch == "stage_directions":
+            return "全书阶段方向"
         if self.creation_step == "premise":
             return "5个故事方向"
         return "当前步骤"
@@ -5627,6 +5850,8 @@ c 中每项只能使用 n、r、g、s、p、v、q；l 中每项只能使用 n、
             return 16000
         if self.creation_batch == "bible_assets":
             return 22000
+        if self.creation_batch == "stage_directions":
+            return 14000
         if self.creation_batch == "stage_plan_stage":
             return 16000
         return {
@@ -5652,6 +5877,8 @@ c 中每项只能使用 n、r、g、s、p、v、q；l 中每项只能使用 n、
     def _generation_progress_text(self, total_words):
         if self.creation_step == "premise":
             return "正在生成：5个故事方向"
+        if self.creation_batch == "stage_directions":
+            return "正在生成：全书阶段方向"
         if self.creation_batch == "stage_skeleton":
             return "正在生成：全书阶段骨架"
         if self.creation_batch == "stage_endpoint_repair":
@@ -5718,6 +5945,7 @@ c 中每项只能使用 n、r、g、s、p、v、q；l 中每项只能使用 n、
                     author_input.get("average_chapter_words", 3000)
                     if isinstance(author_input, dict) else 3000
                 ),
+                creation_batch=self.creation_batch,
             )
             if self.creation_step == "premise":
                 _bind_requested_title(
@@ -6011,9 +6239,10 @@ class CreationChoicePickerDialog(QDialog):
 
 
 class CreationSectionedPreview(QWidget):
-    """第三步的五类资料预览，按主程序栏目分开显示。"""
+    """故事底盘和阶段方向的分栏预览。"""
 
     _SECTION_SPECS = (
+        "stage_directions",
         "bible",
         "world_rules",
         "characters",
@@ -6098,7 +6327,7 @@ class CreationSectionedPreview(QWidget):
             return
         base_height = max(112, min(320, int(available_height * 0.30)))
         compact_height = max(96, int(base_height * 0.86))
-        for key in ("bible", "world_rules"):
+        for key in ("stage_directions", "bible", "world_rules"):
             editor = self.editors.get(key)
             if editor is not None:
                 editor.setMinimumHeight(compact_height)
@@ -6129,7 +6358,7 @@ class CreationSectionedPreview(QWidget):
             for key in self._SECTION_SPECS
             if key in {"characters", "lore", "foreshadows"}
         }
-        empty.update({"bible": {}, "world_rules": {}})
+        empty.update({"stage_directions": [], "bible": {}, "world_rules": {}})
         self.set_result(empty)
 
 
@@ -6669,14 +6898,18 @@ class NovelCreationWizardDialog(QDialog):
             premise.get("main_line", "") if isinstance(premise, dict) else "",
         )
 
-    def _normalize_step_result(self, step, payload):
+    def _normalize_step_result(self, step, payload, creation_batch=""):
         payload = payload if isinstance(payload, dict) else {}
+        creation_batch = _as_text(creation_batch)
         generation_state = deepcopy(payload.get("_generation_state", {}))
         is_partial_stage = (
             step == "stage_plan"
             and isinstance(generation_state, dict)
             and _as_text(generation_state.get("status")).lower() == "partial"
         )
+        batch_for_normalization = ""
+        if step == "bible":
+            batch_for_normalization = creation_batch or self._next_generation_batch(step)[0]
         result = normalize_creation_result(
             step,
             payload,
@@ -6688,6 +6921,7 @@ class NovelCreationWizardDialog(QDialog):
             ),
             total_words=self.target_words_spin.value(),
             average_chapter_words=self.average_words_spin.value(),
+            creation_batch=batch_for_normalization,
         )
         # AI 返回的阶段范围可能沿用了默认篇幅；向导的用户选择才是最终边界。
         if step == "stage_plan" and isinstance(result, dict):
@@ -6789,11 +7023,17 @@ class NovelCreationWizardDialog(QDialog):
         if not isinstance(result, dict):
             return None
         specs = self._stage_specs()
-        skeleton = _normalize_stage_skeleton(
+        has_stage_directions = self._has_stage_directions()
+        skeleton = [] if has_stage_directions else _normalize_stage_skeleton(
             result.get("stage_skeleton", []),
             self.target_words_spin.value(),
             self.average_words_spin.value(),
         )
+        if has_stage_directions:
+            # The confirmed second-step route is the third-step anchor. A
+            # stale legacy skeleton must not continue to affect state text,
+            # button labels, prompts, or the saved framework.
+            result.pop("stage_skeleton", None)
         if skeleton:
             result["stage_skeleton"] = skeleton
         skeleton_complete = len(skeleton) == len(specs)
@@ -6890,13 +7130,50 @@ class NovelCreationWizardDialog(QDialog):
             self.average_words_spin.value(),
         )
 
+    def _has_stage_directions(self):
+        bible_result = self.step_results.get("bible", {})
+        directions = (
+            bible_result.get("stage_directions", [])
+            if isinstance(bible_result, dict) else []
+        )
+        specs = self._stage_specs()
+        return isinstance(directions, list) and len(directions) == len(specs)
+
     def _next_generation_batch(self, step):
         state = self._generation_state(step)
         if step == "premise":
             return "premise", -1
         if step == "bible":
             if not state:
-                return "bible_core", -1
+                # New second-step runs begin with the compact stage direction.
+                # Existing drafts that already contain Bible data keep the old
+                # continuation path and do not get blocked by the new field.
+                existing = self.step_results.get("bible", {})
+                if isinstance(existing, dict) and any(
+                    _has_creation_content(existing.get(key))
+                    for key in ("bible", "world_rules", "characters", "lore", "foreshadows")
+                ):
+                    return "bible_core", -1
+                return "stage_directions", -1
+            completed = [str(item) for item in state.get("completed_batches", []) if str(item)]
+            if "stage_directions" not in completed:
+                # Drafts created before stage directions existed may already
+                # contain a valid Bible batch. Preserve their old continuation
+                # path instead of forcing a new route generation.
+                existing = self.step_results.get("bible", {})
+                if "bible_core" in completed or (
+                    isinstance(existing, dict)
+                    and any(
+                        _has_creation_content(existing.get(key))
+                        for key in ("bible", "world_rules", "characters", "lore", "foreshadows")
+                    )
+                ):
+                    if "bible_core" not in completed:
+                        return "bible_core", -1
+                    return "bible_assets", -1
+                return "stage_directions", -1
+            if not bool(state.get("stage_directions_confirmed")):
+                return "", -1
             if _as_text(state.get("status")).lower() == "complete":
                 result = self.step_results.get("bible", {})
                 if isinstance(result, dict) and _creation_scale_shortfalls(
@@ -6905,7 +7182,6 @@ class NovelCreationWizardDialog(QDialog):
                 ):
                     return "bible_assets", -1
                 return "bible_core", -1
-            completed = state.get("completed_batches", [])
             if "bible_core" not in completed:
                 return "bible_core", -1
             return "bible_assets", -1
@@ -6915,7 +7191,11 @@ class NovelCreationWizardDialog(QDialog):
             if isinstance(result, dict):
                 self._sync_stage_generation_state(result)
                 state = self._generation_state(step)
-                if not result.get("stage_skeleton"):
+                if self._has_stage_directions():
+                    # Stage directions now replace the third-step skeleton.
+                    # Keep any stale legacy skeleton out of new requests.
+                    result.pop("stage_skeleton", None)
+                elif not result.get("stage_skeleton"):
                     return "stage_skeleton", -1
                 if _as_text(state.get("status")).lower() == "partial":
                     first_missing, stages_by_index = _stage_plan_progress(
@@ -7342,18 +7622,28 @@ class NovelCreationWizardDialog(QDialog):
     def _build_json_page(self, step, title):
         page = QWidget()
         layout = QVBoxLayout(page)
-        header_text = (
-            "生成后会按小说圣经、世界规则、人物、设定库、伏笔分别显示，"
-            "每一栏都对应主程序里的资料栏目。确认后才会写入新项目。"
-            if step == "bible"
-            else f"AI 会根据前面已经确认的灵感和选择自动生成{title}。这里展示可读摘要，确认后才会写入新项目。"
-        )
+        if step == "bible":
+            header_text = (
+                "先生成按每十万字划分的阶段方向。确认阶段方向后，才会继续生成小说圣经、世界规则、人物、设定库和伏笔。"
+            )
+        else:
+            header_text = (
+                f"AI 会根据前面已经确认的灵感和选择自动生成{title}。这里展示可读摘要，确认后才会写入新项目。"
+            )
         self._add_page_header(
             layout,
             header_text,
         )
-        generate_btn = QPushButton(f"AI 生成{title}")
+        generate_btn = QPushButton(
+            "AI 生成阶段方向" if step == "bible" else f"AI 生成{title}"
+        )
         generate_btn.clicked.connect(self._generate_current)
+        confirm_route_btn = None
+        if step == "bible":
+            confirm_route_btn = QPushButton("确认阶段方向并继续生成小说圣经")
+            confirm_route_btn.setEnabled(False)
+            confirm_route_btn.setVisible(False)
+            confirm_route_btn.clicked.connect(self._confirm_stage_directions)
         clear_btn = QPushButton("清空本步内容")
         clear_btn.clicked.connect(
             lambda _checked=False, current_step=step: self._clear_step_content(current_step)
@@ -7361,6 +7651,8 @@ class NovelCreationWizardDialog(QDialog):
         action_layout = QHBoxLayout()
         action_layout.setSpacing(8)
         action_layout.addWidget(generate_btn, 1)
+        if confirm_route_btn is not None:
+            action_layout.addWidget(confirm_route_btn, 1)
         action_layout.addWidget(clear_btn)
         layout.addLayout(action_layout)
         if step == "bible":
@@ -7378,6 +7670,8 @@ class NovelCreationWizardDialog(QDialog):
         self.json_editors[step] = editor
         self.json_generate_buttons[step] = generate_btn
         self.json_clear_buttons[step] = clear_btn
+        if confirm_route_btn is not None:
+            self.stage_direction_confirm_btn = confirm_route_btn
         self.stack.addWidget(page)
 
     def _update_responsive_controls(self):
@@ -7403,6 +7697,37 @@ class NovelCreationWizardDialog(QDialog):
         else:
             editor.setPlainText(format_creation_preview(step, result))
 
+    def _sync_generation_button_text(self):
+        """Keep the visible action tied to the exact next or active batch."""
+        step = CREATION_WIZARD_STEPS[self.current_step_index][0]
+        button = self.json_generate_buttons.get(step)
+        if button is None:
+            return
+
+        if self.worker is not None and self._active_batch_kind:
+            batch_kind = self._active_batch_kind
+            stage_index = self._active_stage_index
+        elif step == "bible" and self._stage_direction_pending_confirmation():
+            button.setText("阶段方向已生成，请先确认")
+            return
+        else:
+            batch_kind, stage_index = self._next_generation_batch(step)
+
+        if not batch_kind:
+            button.setText("确认阶段方向后继续" if step == "bible" else f"AI 生成{dict(CREATION_WIZARD_STEPS).get(step, step)}")
+            return
+        if (
+            step == "stage_plan"
+            and self.worker is None
+            and _as_text(self._generation_state(step).get("status")).lower() == "complete"
+        ):
+            button.setText("AI 重新生成阶段规划")
+            return
+        total_stages = len(self._stage_specs()) if step == "stage_plan" else 0
+        button.setText(
+            _creation_batch_action_text(batch_kind, stage_index, total_stages)
+        )
+
     def _refresh_step_ui(self):
         # 接收字符数属于当前步骤和当前请求的临时状态。切换步骤时不能把
         # 上一步的数字拼到新的状态提示后面；同一步刷新则保留实时进度。
@@ -7415,6 +7740,17 @@ class NovelCreationWizardDialog(QDialog):
         self.back_btn.setEnabled(self.current_step_index > 0 and self.worker is None)
         self.next_btn.setEnabled(self.worker is None and self._current_step_ready())
         self.next_btn.setText("确认并创建项目" if self.current_step_index == len(CREATION_WIZARD_STEPS) - 1 else "确认并下一步")
+        route_button = getattr(self, "stage_direction_confirm_btn", None)
+        route_pending = step == "bible" and self._stage_direction_pending_confirmation()
+        generate_button = self.json_generate_buttons.get("bible") if step == "bible" else None
+        self._sync_generation_button_text()
+        if generate_button is not None:
+            generate_button.setEnabled(
+                self.worker is None and not route_pending
+            )
+        if route_button is not None:
+            route_button.setVisible(route_pending)
+            route_button.setEnabled(route_pending and self.worker is None)
         if self.current_step_index == 0:
             self._set_status_text("先输入一点灵感，再选择题材和阅读感觉。")
         elif step in self.step_results:
@@ -7422,10 +7758,14 @@ class NovelCreationWizardDialog(QDialog):
             if step == "stage_plan":
                 self._sync_stage_generation_state(self.step_results[step])
                 state = self._generation_state(step)
-                if not self.step_results[step].get("stage_skeleton"):
-                    self._set_status_text("点击生成后会先整理全书阶段骨架，再按十万字阶段依次生成。")
-                elif _as_text(state.get("status")).lower() == "partial":
-                    next_batch, next_index = self._next_generation_batch("stage_plan")
+                next_batch, next_index = self._next_generation_batch("stage_plan")
+                stage_rows = self.step_results[step].get("stage_plan", [])
+                has_saved_stage = any(
+                    _stage_has_meaningful_content(item)
+                    for item in stage_rows
+                    if isinstance(stage_rows, list)
+                )
+                if _as_text(state.get("status")).lower() == "partial" and has_saved_stage:
                     if next_batch == "stage_endpoint_repair":
                         self._set_status_text(
                             f"当前阶段正文已保存，点击生成会先补齐第{next_index + 1}阶段的伏笔定位。"
@@ -7436,11 +7776,22 @@ class NovelCreationWizardDialog(QDialog):
                         )
                     else:
                         self._set_status_text("当前步骤已保存部分内容，请点击生成继续未完成批次。")
+                elif _as_text(state.get("status")).lower() == "complete":
+                    self._set_status_text("当前步骤已有完整阶段规划，可以重新生成或直接确认。")
+                elif self._has_stage_directions():
+                    self._set_status_text("阶段方向已确认，点击生成后会直接生成第1阶段具体事件。")
+                elif not self.step_results[step].get("stage_skeleton"):
+                    self._set_status_text("点击生成后会先整理全书阶段骨架，再按十万字阶段依次生成。")
                 else:
                     self._set_status_text("当前步骤已有完整阶段规划，可以重新生成或直接确认。")
             elif _as_text(state.get("status")).lower() == "partial":
                 if step == "bible":
-                    self._set_status_text("当前步骤已保存第一批资料，点击生成会继续第二批。")
+                    if route_pending:
+                        self._set_status_text("阶段方向已经生成，请先确认阶段方向，再继续生成小说圣经和世界规则。")
+                    elif "bible_core" in state.get("completed_batches", []):
+                        self._set_status_text("小说圣经和世界规则已经保存，点击生成会继续人物、设定和伏笔。")
+                    else:
+                        self._set_status_text("当前步骤已保存部分资料，点击生成会继续未完成批次。")
                 else:
                     next_index = int(state.get("next_stage_index", 0) or 0)
                     if next_index < len(self._stage_specs()):
@@ -7467,7 +7818,27 @@ class NovelCreationWizardDialog(QDialog):
                 else:
                     self._set_status_text("当前步骤已有 AI 结果，可以重新生成或直接确认。")
         else:
-            self._set_status_text("请点击 AI 生成当前步骤。")
+            if step == "bible":
+                self._set_status_text("点击生成先生成阶段方向。")
+            elif step == "stage_plan" and self._has_stage_directions():
+                self._set_status_text("阶段方向已确认，点击生成后会直接生成第1阶段具体事件。")
+            elif step == "stage_plan":
+                self._set_status_text("点击生成后会先整理全书阶段骨架，再按十万字阶段依次生成。")
+            else:
+                self._set_status_text("请点击 AI 生成当前步骤。")
+
+    def _stage_direction_pending_confirmation(self):
+        result = self.step_results.get("bible", {})
+        if not isinstance(result, dict):
+            return False
+        directions = result.get("stage_directions", [])
+        state = self._generation_state("bible")
+        return bool(
+            isinstance(directions, list)
+            and directions
+            and "stage_directions" in state.get("completed_batches", [])
+            and not bool(state.get("stage_directions_confirmed"))
+        )
 
     def _current_step_ready(self):
         step = CREATION_WIZARD_STEPS[self.current_step_index][0]
@@ -7476,6 +7847,8 @@ class NovelCreationWizardDialog(QDialog):
         if step == "bible":
             result = self.step_results.get("bible", {})
             state = self._generation_state("bible")
+            if self._stage_direction_pending_confirmation():
+                return False
             return (
                 isinstance(result, dict)
                 and _as_text(state.get("status")).lower() in {"", "complete"}
@@ -7600,9 +7973,13 @@ class NovelCreationWizardDialog(QDialog):
             }
             batch_kind, _stage_index = self._next_generation_batch("bible")
             context["generation_batch"] = batch_kind
-            if batch_kind == "bible_assets":
-                bible_result = self.step_results.get("bible", {})
-                if isinstance(bible_result, dict):
+            bible_result = self.step_results.get("bible", {})
+            if isinstance(bible_result, dict):
+                if bible_result.get("stage_directions"):
+                    context["confirmed"]["stage_directions"] = deepcopy(
+                        bible_result.get("stage_directions", [])
+                    )
+                if batch_kind == "bible_assets":
                     context["confirmed"]["bible"] = {
                         "bible": deepcopy(bible_result.get("bible", {})),
                         "world_rules": deepcopy(bible_result.get("world_rules", {})),
@@ -7615,13 +7992,25 @@ class NovelCreationWizardDialog(QDialog):
             context["confirmed"] = {
                 "bible": deepcopy(self.step_results.get("bible", {})),
             }
+            bible_result = self.step_results.get("bible", {})
+            if isinstance(bible_result, dict) and bible_result.get("stage_directions"):
+                context["confirmed"]["stage_directions"] = deepcopy(
+                    bible_result.get("stage_directions", [])
+                )
             context["generation_batch"] = batch_kind
             if isinstance(stage_result, dict) and stage_result.get("stage_skeleton"):
                 context["confirmed"]["stage_skeleton"] = deepcopy(
                     stage_result.get("stage_skeleton", [])
                 )
-            context["current_stage"] = deepcopy(current_stage)
             bible_result = self.step_results.get("bible", {})
+            stage_directions = (
+                bible_result.get("stage_directions", [])
+                if isinstance(bible_result, dict) else []
+            )
+            if 0 <= stage_index < len(stage_directions):
+                current_stage = deepcopy(current_stage)
+                current_stage["stage_direction"] = deepcopy(stage_directions[stage_index])
+            context["current_stage"] = deepcopy(current_stage)
             bible_foreshadows = (
                 bible_result.get("foreshadows", [])
                 if isinstance(bible_result, dict) else []
@@ -7650,7 +8039,11 @@ class NovelCreationWizardDialog(QDialog):
                 missing = [
                     item for item in state.get("missing_foreshadow_endpoints", [])
                     if isinstance(item, dict)
-                    and int(item.get("stage_index", -1) or -1) == stage_index
+                    and int(
+                        item.get("stage_index", -1)
+                        if item.get("stage_index", -1) is not None
+                        else -1
+                    ) == stage_index
                 ]
                 context["missing_foreshadow_endpoints"] = [
                     {
@@ -7800,6 +8193,12 @@ class NovelCreationWizardDialog(QDialog):
             if editor is not None:
                 editor.clear()
         context = self._context_for_step(step, retry_feedback=retry_feedback)
+        # _context_for_step also derives a batch for prompt context. The
+        # request opened above is authoritative, so overwrite that derived
+        # value before formatting the prompt to prevent a stale UI/state
+        # calculation from mixing two batch names in one request.
+        context["generation_batch"] = batch_kind
+        context["generation_stage_index"] = stage_index
         self.worker = NovelCreationWorker(
             provider.get("base_url", ""),
             provider.get("api_key", ""),
@@ -7848,6 +8247,44 @@ class NovelCreationWizardDialog(QDialog):
     def _merge_bible_batch(self, result, batch_kind):
         """Merge one story-base batch while keeping the other batch intact."""
         result = result if isinstance(result, dict) else {}
+        if batch_kind == "stage_directions":
+            directions = _normalize_stage_direction(
+                result.get("stage_directions", []),
+                self.target_words_spin.value(),
+            )
+            expected = _stage_direction_specs(self.target_words_spin.value())
+            if len(directions) != len(expected):
+                raise ValueError(
+                    f"阶段方向没有覆盖全部阶段：收到{len(directions)}项，需要{len(expected)}项。"
+                )
+            for index, item in enumerate(directions):
+                if not _as_text(item.get("summary")):
+                    raise ValueError(f"第{index + 1}阶段缺少阶段方向摘要。")
+                item["id"] = expected[index]["id"]
+                item["start_word"] = expected[index]["start_word"]
+                item["end_word"] = expected[index]["end_word"]
+            current = deepcopy(self.step_results.get("bible", {}))
+            if not isinstance(current, dict):
+                current = {}
+            current["stage_directions"] = directions
+            previous_state = current.get("_generation_state", {})
+            previous_completed = (
+                previous_state.get("completed_batches", [])
+                if isinstance(previous_state, dict) else []
+            )
+            completed = [str(item) for item in previous_completed if str(item)]
+            if "stage_directions" not in completed:
+                completed.append("stage_directions")
+            current["_generation_state"] = {
+                "schema_version": 2,
+                "status": "partial",
+                "completed_batches": completed,
+                "next_batch": "bible_core",
+                "stage_directions_confirmed": False,
+                "updated_at": now_str(),
+            }
+            self.step_results["bible"] = current
+            return
         if batch_kind == "bible_core" and not all(
             _has_creation_content(result.get(key))
             for key in ("bible", "world_rules")
@@ -7906,10 +8343,14 @@ class NovelCreationWizardDialog(QDialog):
             completed.append(batch_kind)
         complete = all(item in completed for item in ("bible_core", "bible_assets"))
         current["_generation_state"] = {
-            "schema_version": 1,
+            "schema_version": 2,
             "status": "complete" if complete else "partial",
             "completed_batches": completed,
             "next_batch": "" if complete else "bible_assets",
+            "stage_directions_confirmed": bool(
+                current.get("_generation_state", {}).get("stage_directions_confirmed", False)
+                if isinstance(current.get("_generation_state"), dict) else False
+            ),
             "updated_at": now_str(),
         }
         if complete:
@@ -7919,6 +8360,21 @@ class NovelCreationWizardDialog(QDialog):
         self.step_results["bible"] = current
         if complete:
             self._invalidate_steps_from("stage_plan")
+
+    def _confirm_stage_directions(self):
+        if self.worker is not None or not self._stage_direction_pending_confirmation():
+            return
+        current = deepcopy(self.step_results.get("bible", {}))
+        state = current.get("_generation_state", {})
+        if not isinstance(state, dict):
+            return
+        state["stage_directions_confirmed"] = True
+        state["next_batch"] = "bible_core"
+        current["_generation_state"] = state
+        self.step_results["bible"] = current
+        self._save_draft()
+        self._refresh_step_ui()
+        self._generate_current()
 
     def _merge_stage_batch(self, result, stage_index):
         """Merge one stage and its local foreshadow endpoints in order."""
@@ -8311,12 +8767,22 @@ class NovelCreationWizardDialog(QDialog):
 
     def _set_running(self, running):
         running = bool(running)
+        self._sync_generation_button_text()
         self.premise_generate_btn.setEnabled(not running)
         self.premise_clear_btn.setEnabled(not running)
         for button in getattr(self, "json_generate_buttons", {}).values():
             button.setEnabled(not running)
         for button in getattr(self, "json_clear_buttons", {}).values():
             button.setEnabled(not running)
+        route_button = getattr(self, "stage_direction_confirm_btn", None)
+        if route_button is not None:
+            route_button.setEnabled(
+                not running and self._stage_direction_pending_confirmation()
+            )
+        if not running and self.current_step_index == 1:
+            generate_button = self.json_generate_buttons.get("bible")
+            if generate_button is not None:
+                generate_button.setEnabled(not self._stage_direction_pending_confirmation())
         for button in self.choice_widgets:
             button.setEnabled(not running)
         self.inspiration_edit.setEnabled(not running)
@@ -8331,17 +8797,15 @@ class NovelCreationWizardDialog(QDialog):
         step = CREATION_WIZARD_STEPS[self.current_step_index][0]
         if step == "premise":
             return "正在生成：5个故事方向"
-        if self._active_batch_kind == "bible_core":
-            return "正在生成：小说圣经、世界规则"
-        if self._active_batch_kind == "bible_assets":
-            return "正在生成：人物、设定、伏笔"
-        if self._active_batch_kind == "stage_plan_stage":
-            total_stages = len(self._stage_specs())
-            return f"正在生成：第{self._active_stage_index + 1}阶段（共{total_stages}个阶段）"
-        if self._active_batch_kind == "stage_endpoint_repair":
-            return f"正在补齐：第{self._active_stage_index + 1}阶段伏笔定位"
-        if self._active_batch_kind == "stage_skeleton":
-            return "正在生成：全书阶段骨架"
+        if self._active_batch_kind:
+            total_stages = len(self._stage_specs()) if step == "stage_plan" else 0
+            name = _creation_batch_display_name(
+                self._active_batch_kind,
+                self._active_stage_index,
+                total_stages,
+            )
+            prefix = "正在补齐：" if self._active_batch_kind == "stage_endpoint_repair" else "正在生成："
+            return prefix + name
         return "AI 正在生成当前步骤，请稍候……"
 
     def _schedule_generation_retry(self, error, batch_kind="", stage_index=-1):
@@ -8386,9 +8850,17 @@ class NovelCreationWizardDialog(QDialog):
             if batch_kind in {"stage_plan_stage", "stage_endpoint_repair"}:
                 partial_payload = deepcopy(result) if isinstance(result, dict) else {}
                 partial_payload["_generation_state"] = {"status": "partial"}
-                result = self._normalize_step_result(step, partial_payload)
+                result = self._normalize_step_result(
+                    step,
+                    partial_payload,
+                    creation_batch=batch_kind,
+                )
             else:
-                result = self._normalize_step_result(step, result)
+                result = self._normalize_step_result(
+                    step,
+                    result,
+                    creation_batch=batch_kind,
+                )
         except Exception as exc:
             self._schedule_generation_retry(str(exc), batch_kind, stage_index)
             return
@@ -8465,8 +8937,16 @@ class NovelCreationWizardDialog(QDialog):
             state = self._generation_state(step)
             if state.get("status") == "partial":
                 if step == "bible":
-                    next_label = "第二批：人物、设定、伏笔"
-                    self._pending_batch_kind = "bible_assets"
+                    next_batch = _as_text(state.get("next_batch"))
+                    if next_batch == "bible_core" and not state.get("stage_directions_confirmed"):
+                        next_label = "确认阶段方向后生成小说圣经、世界规则"
+                        self._pending_batch_kind = ""
+                    elif next_batch == "bible_core":
+                        next_label = "小说圣经、世界规则"
+                        self._pending_batch_kind = "bible_core"
+                    else:
+                        next_label = "人物、设定、伏笔"
+                        self._pending_batch_kind = "bible_assets"
                     self._pending_stage_index = -1
                 else:
                     next_batch, next_index = self._next_generation_batch(step)
@@ -8498,6 +8978,7 @@ class NovelCreationWizardDialog(QDialog):
                     self._set_status_text("已生成当前步骤，可以直接确认进入下一步。")
         self._save_draft()
         self._set_running(False)
+        self._refresh_step_ui()
 
     def _on_ai_failed(self, error):
         raw_error = str(error or "生成失败。")
@@ -8760,6 +9241,7 @@ class NovelCreationWizardDialog(QDialog):
             "characters": deepcopy(assets_result.get("characters", [])),
             "lore": deepcopy(assets_result.get("lore", [])),
             "foreshadows": deepcopy(assets_result.get("foreshadows", [])),
+            "stage_directions": deepcopy(bible_result.get("stage_directions", [])),
             "stage_skeleton": deepcopy(stage_result.get("stage_skeleton", [])),
             "stage_plan": deepcopy(stage_result.get("stage_plan", [])),
             "foreshadow_schedule": deepcopy(foreshadow_schedule),
@@ -8776,6 +9258,8 @@ class NovelCreationWizardDialog(QDialog):
             "average_chapter_words": self.average_words_spin.value(),
             "completed_at": now_str(),
         }
+        if not framework.get("stage_skeleton"):
+            framework.pop("stage_skeleton", None)
         # Store one canonical project-level mainline.  The fixed premise/Bible
         # field names remain readable for old drafts, but downstream planning no
         # longer has to choose between several competing line fields.

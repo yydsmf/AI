@@ -53,6 +53,8 @@ from .novel_utils import (
     _compact_volume_handoff_for_framework,
     _compact_volume_handoff_source_for_request,
     _build_chapter_ai_context,
+    _canonical_chapter_plan_event_id,
+    CHAPTER_EVENT_HANDOFF_GUIDANCE,
     _clean_chapter_plan_story_boundary,
     _clip_context_text,
     _dedupe_volume_handoff_terminal_records,
@@ -6798,12 +6800,23 @@ class NovelChapterPlanWorker(NovelAnalysisWorker):
                 )
         if final_chapter_in_batch:
             ending_guidance += _FINAL_CHAPTER_PLAN_GUIDANCE
-        core_motive_guidance = (
-            "【核心动机与收尾窗口】核心动机仍是本项目唯一执行主线；最后5章只把已经安排的目标、阻碍、"
-            "代价和关系变化落实为具体结果，不再打开下一道需要后续章节回答的主线目标。\n"
-            if ending_guidance else
-            _core_motive_progression_guidance()
-        )
+        if ending_guidance:
+            core_motive_guidance = (
+                "【核心动机与收尾窗口】核心动机仍是本项目唯一执行主线；最后5章只把已经安排的目标、阻碍、"
+                "代价和关系变化落实为具体结果，不再打开下一道需要后续章节回答的主线目标。\n"
+            )
+        elif self.creation_wizard_mode:
+            # The wizard batch context already carries the confirmed core
+            # motive and its pressure curve. Keep the chapter request focused
+            # on the current handoff instead of repeating the full contract.
+            core_motive_guidance = (
+                "核心动机和主线压力曲线以输入中的已确认资料为准；本批只承接当前阶段已经发生的结果，"
+                "当前阶段方向是本批的宏观卖点和场景转场，必须在人物行动、具体场景和本批结果中落地；"
+                "全书阶段方向索引、前一阶段出口和当前阶段事件共同决定连续性。"
+                "不重新解释核心动机，不新增总目标，也不套用其它题材的升级顺序。\n"
+            )
+        else:
+            core_motive_guidance = _core_motive_progression_guidance()
         opening_guidance = ""
         if self.existing_chapter_count == 0 and absolute_start <= 3 <= absolute_end:
             opening_guidance = _OPENING_THREE_CHAPTER_GUIDANCE
@@ -6828,7 +6841,9 @@ class NovelChapterPlanWorker(NovelAnalysisWorker):
                 except (TypeError, ValueError, IndexError):
                     continue
                 if node_number > 0 and node_start > 0 and node_end >= node_start:
-                    node_ranges.append(f"节点{node_number}只能落在第{node_start}-{node_end}章")
+                    node_id = _canonical_chapter_plan_event_id(node.get("id", ""))
+                    node_label = f"{node_number}/{node_id}" if node_id else str(node_number)
+                    node_ranges.append(f"节点{node_label}只能落在第{node_start}-{node_end}章")
             locked_schedule_guidance = (
                 f"当前阶段的硬范围是第{schedule_start}-{schedule_end}章，"
                 "本批只在这个范围内展开；节点数量不是章节数量，不能为了讲完一个节点新增章节。"
@@ -6837,7 +6852,8 @@ class NovelChapterPlanWorker(NovelAnalysisWorker):
         if self.creation_wizard_mode:
             chapter_order_rule = (
                 f"本批次必须返回{self.chapter_count}项，列表第1项就是全书第{absolute_start}章，"
-                f"最后一项就是第{absolute_end}章。不要返回章节编号、阶段编号、事件编号或任何定位标签，"
+                f"最后一项就是第{absolute_end}章。不要返回章节编号、阶段编号或其它定位标签；"
+                "节点编号由程序按照固定槽位回填，不要把节点编号写进章节标题或outline正文，"
                 "章节号和阶段归属由程序根据列表顺序写入；到第"
                 f"{absolute_end}章后立即结束，不安排第{absolute_end + 1}章或任何后续阶段内容。"
                 f"先按全书第{absolute_start}章到第{absolute_end}章建立{self.chapter_count}个固定章节位置，"
@@ -6851,11 +6867,13 @@ class NovelChapterPlanWorker(NovelAnalysisWorker):
                 "节点不能因为包含多个场面就延长范围，不能把一个节点拆成范围外的新章节，也不能把下一个节点提前写入当前节点的槽位。"
                 "如果同一节点覆盖数章，后续每章至少改变主动人物、眼前目标、压力来源、代价、关系结果或公开后果中的两项；"
                 "只增加解释、讨论、等待或同一地点的换说法不算新推进。"
+                + CHAPTER_EVENT_HANDOFF_GUIDANCE
                 + locked_schedule_guidance
             )
             output_schema = (
                 'JSON结构只保留：{"c":[{"t":"章节名","o":"本章具体故事提纲","p":[]}]}'
-                "列表顺序就是章节顺序；不要返回i、e、s、u、g、m等定位字段。"
+                "列表顺序就是章节顺序；不要返回source_event_ids、事件编号或其它定位字段；"
+                "不要返回i、s、u、g、m等其它定位字段。"
             )
         else:
             chapter_order_rule = (
@@ -6916,7 +6934,7 @@ class NovelChapterPlanWorker(NovelAnalysisWorker):
             "让本章形成符合当前题材的阅读期待，节奏和爽点随故事本身变化。"
             "故事底盘和阶段规划已经在前面的规划基础中确认，本次直接生成当前批次的章节故事。\n"
             "项目资料是连续性事实参考，不是本章待办清单；只在当下人物选择或关系结果确实需要时取用最少内容。"
-            + _story_conflict_pacing_guidance()
+            + _story_conflict_pacing_guidance(compact=self.creation_wizard_mode)
             + opening_guidance
             + _CHAPTER_PLAN_STATE_PROGRESSION_GUIDANCE
             + _CHAPTER_PLAN_STORY_LANGUAGE_GUIDANCE

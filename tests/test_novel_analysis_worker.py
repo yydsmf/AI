@@ -402,7 +402,12 @@ class NovelAnalysisWorkerTests(unittest.TestCase):
                     self.assertNotIn("阶段结局在当前批次范围内自然兑现", prompt)
                     self.assertNotIn("扩展章继续深化当前阶段", prompt)
                     if wizard_mode:
-                        self.assertIn('{"c":[{"t":"章节名","o":"本章具体故事提纲","p":[]}]}', prompt)
+                        self.assertIn(
+                            '{"c":[{"t":"章节名","o":"本章具体故事提纲","p":[]}]}',
+                            prompt,
+                        )
+                        self.assertIn("source_event_ids由程序根据固定章节槽位回填", prompt)
+                        self.assertIn("不要返回source_event_ids、事件编号或其它定位字段", prompt)
                     else:
                         self.assertIn('{"c":[{"i":1,"t":"章节名","o":"本章具体故事提纲","p":[]}]}', prompt)
 

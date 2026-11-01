@@ -176,6 +176,9 @@ from .novel_utils import (
     _normalize_framework_analysis,
     _canonical_chapter_plan_event_id,
     _canonical_chapter_plan_stage_id,
+    CHAPTER_EVENT_HANDOFF_GUIDANCE,
+    _creation_event_catalog,
+    _creation_event_fingerprint,
     _normalize_foreshadow_review_observations,
     _normalize_import_candidates,
     _normalize_name_list,
@@ -8372,13 +8375,62 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
                     except (TypeError, ValueError, IndexError):
                         continue
                     if node_index > 0 and start > 0 and end >= start:
-                        nodes.append({"n": node_index, "r": [start, end]})
+                        nodes.append({
+                            "n": node_index,
+                            "id": _canonical_chapter_plan_event_id(item.get("id", "")),
+                            "r": [start, end],
+                            "event": self._chapter_plan_clip_text(item.get("event", ""), 420),
+                            "result": self._chapter_plan_clip_text(item.get("result", ""), 300),
+                        })
                 if nodes:
                     result["locked_node_schedule"] = {
                         "stage_id": str(locked_schedule.get("stage_id", "") or "").strip(),
                         "range": deepcopy(locked_schedule.get("range", [])[:2]),
                         "nodes": nodes,
                     }
+
+            handoff = source.get("event_handoff", {})
+            if isinstance(handoff, dict):
+                compact_handoff = {
+                    "last_consumed_event_order": deepcopy(
+                        handoff.get("last_consumed_event_order", {})
+                    ),
+                    "do_not_replay": [
+                        self._chapter_plan_clip_text(item, max(120, int(520 * scale)))
+                        for item in handoff.get("do_not_replay", [])
+                        if str(item or "").strip()
+                    ][:8],
+                }
+                for key, fields, limit in (
+                    (
+                        "completed_events",
+                        ("id", "chapters", "event", "result", "state_delta"),
+                        max(1400, int(total_limit * 0.10)),
+                    ),
+                    (
+                        "active_events",
+                        ("id", "order", "chapters", "event", "result", "state_delta", "status"),
+                        max(1800, int(total_limit * 0.14)),
+                    ),
+                ):
+                    rows = []
+                    for item in handoff.get(key, []) if isinstance(handoff.get(key), list) else []:
+                        if not isinstance(item, dict):
+                            continue
+                        row = {}
+                        for field in fields:
+                            value = item.get(field, "")
+                            if isinstance(value, (dict, list)):
+                                row[field] = deepcopy(value)
+                            else:
+                                row[field] = self._chapter_plan_clip_text(
+                                    value, max(80, int(650 * scale))
+                                )
+                        rows.append(row)
+                    if rows:
+                        compact_handoff[key] = rows
+                if compact_handoff.get("completed_events") or compact_handoff.get("active_events"):
+                    result["event_handoff"] = compact_handoff
 
             master = source.get("master_plan", {})
             if isinstance(master, dict):
@@ -8888,8 +8940,9 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
                 "chapters是用户明确给出的章节级约束，必须按绝对章号继承。"
                 "完整导入框架的章节原文已由程序本地保存；模型只返回use_imported或generate，不得重抄原文。"
                 "stages.events是可选的阶段剧情节点；完整导入框架通常没有events。"
-                "不要生成source_event_ids，不要复制章节原文或阶段节点；节点只提供故事事实和方向，不是动作清单，"
-                "outline只需自然落实其语义，不得展开成流程步骤。"
+                "不要复制章节原文或阶段节点；节点只提供故事事实和方向，不是动作清单，"
+                "如果确有可确认的阶段节点，source_event_ids只作为可选索引返回；否则留空。"
+                "outline只需自然落实节点语义，不得展开成流程步骤。"
                 "stage_index是全书原框架的阶段边界；当前阶段的扩展章先把本阶段的人物、关系和现场后果写完整，"
                 "下一阶段从当前阶段留下的新变化自然接续。"
             ),
@@ -9194,6 +9247,9 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
                             continue
                         event_row = {
                             "n": event_index,
+                            "id": _canonical_chapter_plan_event_id(
+                                event.get("id", event.get("i", ""))
+                            ) or f"{stage_id}-E{event_index:02d}",
                             "allowed_chapters": event.get("allowed_chapters", []),
                             "references": event.get("references", []),
                             "preconditions": event.get("preconditions", []),
@@ -9259,12 +9315,19 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
                 ),
             )
 
+        stage_directions = framework.get("stage_directions", [])
+        stage_directions = (
+            deepcopy(stage_directions)
+            if isinstance(stage_directions, list) else []
+        )
+
         result = {
             "source": "creation_wizard",
             "novel_name": self._chapter_plan_clip_text(framework.get("novel_name", ""), 300),
             "premise": premise_context,
             "core_motive": core_motive,
             "mainline_pressure_curve": mainline_pressure_curve,
+            "stage_directions": stage_directions,
             "bible": self._chapter_plan_clip_text(
                 json.dumps(framework.get("bible", {}), ensure_ascii=False, separators=(",", ":")), 6500
             ),
@@ -9319,6 +9382,23 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
     ):
         """只给章节规划发送当前阶段的完整事件，其他阶段只保留边界索引。"""
         source = deepcopy(value if isinstance(value, dict) else {})
+        direction_by_stage = {}
+        direction_index = []
+        for item in source.get("stage_directions", []) if isinstance(source.get("stage_directions"), list) else []:
+            if not isinstance(item, dict):
+                continue
+            match = re.search(r"(\d+)$", str(item.get("id", "") or ""))
+            if match:
+                direction_by_stage[int(match.group(1)) - 1] = deepcopy(item)
+            direction_index.append({
+                key: deepcopy(item.get(key))
+                for key in (
+                    "id", "name", "start_word", "end_word", "summary", "result",
+                    "next_pressure",
+                )
+                if item.get(key) not in (None, "", [], {})
+            })
+        source["stage_directions"] = direction_index
         stages = source.get("stage_plan", [])
         stages = stages if isinstance(stages, list) else []
         try:
@@ -9347,7 +9427,13 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
                 "end_chapter": stage_end,
             })
             if stage_start <= end_index and stage_end >= start_index:
-                scoped_stages.append(deepcopy(item))
+                scoped_item = deepcopy(item)
+                stage_match = re.search(r"(\d+)$", str(stage_id or ""))
+                if stage_match:
+                    direction = direction_by_stage.get(int(stage_match.group(1)) - 1)
+                    if direction:
+                        scoped_item["stage_direction"] = direction
+                scoped_stages.append(scoped_item)
         source["stage_index"] = stage_index
         source["stage_plan"] = scoped_stages
         return source
@@ -9377,6 +9463,7 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
             for stage in source.get("stage_plan", []) if isinstance(source.get("stage_plan"), list) else []:
                 if not isinstance(stage, dict):
                     continue
+                stage_id = _canonical_chapter_plan_stage_id(stage.get("id", ""))
                 compact_stage = {}
                 for key in (
                     "id", "name", "start_chapter", "end_chapter", "summary",
@@ -9385,6 +9472,9 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
                     value = stage.get(key, "")
                     if value not in (None, "", [], {}):
                         compact_stage[key] = value
+                direction = stage.get("stage_direction")
+                if isinstance(direction, dict):
+                    compact_stage["stage_direction"] = deepcopy(direction)
                 events = []
                 for event_index, event in enumerate(
                     stage.get("ordered_events", [])
@@ -9399,6 +9489,9 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
                         continue
                     event_row = {
                         "n": event_index,
+                        "id": _canonical_chapter_plan_event_id(
+                            event.get("id", event.get("i", ""))
+                        ) or f"{stage_id}-E{event_index:02d}",
                         "event": event_text,
                         "result": result_text,
                     }
@@ -9461,6 +9554,21 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
         source = deepcopy(value if isinstance(value, dict) else {})
         total_limit = max(1200, int(total_limit or 1200))
 
+        directions = source.get("stage_directions", [])
+        directions = directions if isinstance(directions, list) else []
+        source["stage_directions"] = [
+            {
+                key: deepcopy(item.get(key))
+                for key in (
+                    "id", "name", "start_word", "end_word", "summary",
+                    "scene_change", "character_change", "result", "next_pressure",
+                )
+                if item.get(key) not in (None, "", [], {})
+            }
+            for item in directions
+            if isinstance(item, dict)
+        ]
+
         def compact_stage(item, field_limit):
             if not isinstance(item, dict):
                 return {}
@@ -9479,6 +9587,9 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
                             continue
                         events.append({
                             "n": event_index,
+                            "id": _canonical_chapter_plan_event_id(
+                                event.get("id", event.get("i", ""))
+                            ) or f"{_canonical_chapter_plan_stage_id(item.get('id', ''))}-E{event_index:02d}",
                             "allowed_chapters": event.get("allowed_chapters", []),
                             "references": event.get("references", []),
                             "event": self._chapter_plan_clip_text(event.get("event", ""), field_limit),
@@ -9571,6 +9682,9 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
                     continue
                 events.append({
                     "n": event.get("n", event_index),
+                    "id": _canonical_chapter_plan_event_id(
+                        event.get("id", event.get("i", ""))
+                    ) or f"{_canonical_chapter_plan_stage_id(row.get('id', ''))}-E{event_index:02d}",
                     "allowed_chapters": event.get("allowed_chapters", []),
                     "state_delta": deepcopy(event.get("state_delta", {})),
                     "event": event_text,
@@ -10003,8 +10117,8 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
             "如果imported_chapter_plan_reference.location_status为pending，"
             "请根据unresolved_framework_source为当前批次补充每章source_location的起止L行号和极短anchor；"
             "只返回位置，不要抄写原文。程序会用原始框架恢复细纲，定位失败不能改判为内容缺失。\n"
-            "每章用source_event_ids列出本章承载的节点ID；一章可承载多个连续节点，扩展章可用空数组。"
-            "每个节点只能使用一次、必须位于所属阶段章号范围内并保持原顺序；阶段结束前必须全部覆盖。"
+            "如果输入存在可确认的阶段节点，用source_event_ids列出本章承载的节点ID；一章可承载多个连续节点，扩展章可用空数组。"
+            "节点索引只能引用一次、必须位于所属阶段章号范围内并保持原顺序；阶段结束前尽量覆盖全部节点。"
             "凡引用节点，outline必须清楚落实其语义，可以自然改写，不要机械逐字粘贴。"
             "当前绝对章号对应的阶段和章节字数由程序根据输入资料确定，不要在返回 JSON 中重复输出source_stage、narrative_stage或target_words。\n\n"
             "若narrative_strategy_profile为空，先从项目资料推导受众方向、题材世界、主副叙事发动机、读者承诺、"
@@ -10055,7 +10169,7 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
                 "wizard_framework.stage_plan 只包含当前阶段的阶段事实和有序剧情节点；"
                 "batch_continuity.locked_node_schedule 已由程序锁定节点可以落入的章节范围。"
                 "按节点的既定顺序安排故事，不改变当前阶段边界，不把下一阶段内容提前写入当前阶段。"
-                "节点编号和落点只供你理解，不要把它们写进返回内容，也不要为节点另造章节。"
+                "节点编号和落点只供你理解；节点归属由程序按照当前批次的固定槽位回填，不要把节点编号写进章节标题或outline正文，也不要为节点另造章节。"
                 "阶段节点是本章故事的事实来源，不是章节任务清单；同一节点第一次发生时完成它的核心转折，"
                 "如果一个节点覆盖数章，后续章节按共享剧情推进要求改变主动人物、目标、压力、代价、关系结果或公开后果，"
                 "只补解释、讨论、等待或同一地点的重复说明不算推进。"
@@ -10064,9 +10178,11 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
                 "如果某节点只是说明状态已经建立，应并入造成该结果的冲突，并写清它怎样迫使人物作出下一次选择。"
                 "涉及记录、复核、责任、封存、归档、审批或其它流程时，只保留改变人物选择、关系、资源、位置、信息或时间窗口的结果，"
                 "不要把查找、比对、确认和整理过程扩成连续章节目标。\n\n"
+                + CHAPTER_EVENT_HANDOFF_GUIDANCE
+                + "\n\n"
                 + terminal_node_progression_guidance
                 + "伏笔资料只列当前章节范围内已经出现或即将出现的线索；后续阶段的伏笔等到对应阶段再自然展开。\n\n"
-                "本批次必须返回准确数量的章节，列表顺序就是章节顺序；不要返回章节号、阶段号、节点号或其它定位标签。"
+                "本批次必须返回准确数量的章节，列表顺序就是章节顺序；不要返回章节号、阶段号或其它定位标签；节点号只通过source_event_ids字段回填，不写进章节标题或outline正文。"
                 "章节名和 outline 是读者与正文作者会看到的内容：章节名从本章具体发生的事情、人物行动、现场冲突、关系变化或结果中自然命名，且不超过15个汉字；"
                 "used_chapter_titles列出已经使用过的章节标题；新章节标题不得与其中任何标题重复，也不得与本批次其他新章节标题重复。"
                 "生成前逐项核对标题，重复时必须改成能对应本章具体事件、人物行动或结果的新标题。\n\n"
@@ -10082,11 +10198,15 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
                 + terminal_title_guidance
                 + "entity_naming_guidance 是当前项目的正式称谓和实体关系边界，优先于模型自行压缩出的简称；"
                 "涉及人物集合、组织集合和势力集合时，必须保留实体类型，不要把人数简称写成组织名称。\n"
-                + _story_conflict_pacing_guidance()
+                # The wizard batch payload already carries the confirmed
+                # stage events and pressure curve. Keep the character-led
+                # rule, but avoid sending the full global version twice.
+                + _story_conflict_pacing_guidance(compact=True)
                 + (core_motive_guidance if terminal_batch_overlap else "")
                 + "状态变化要落到人物正在经历的场景、行动和后果，不把同一句状态连续复制到多章。"
                 "章节标题和提纲都使用具体、好读、能看见人物与现场的表达；不写策划术语、抽象形容、办案式说明或编辑式总结。\n"
                 + "只输出一个合法 JSON 对象，结构为 {\"c\":[{\"t\":\"章节名\",\"o\":\"本章具体故事提纲\",\"p\":[]}]}；"
+                "不要返回source_event_ids、事件编号或其它定位字段；"
                 "列表数量必须严格等于本批次要求，p 只列本章自然涉及的主要人物，没有则为空数组。"
             )
         return self._chapter_plan_bounded_context(
@@ -11032,7 +11152,9 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
                     continue
                 nodes.append({
                     "n": event_index,
-                    "id": _canonical_chapter_plan_event_id(event.get("id", "")),
+                    "id": _canonical_chapter_plan_event_id(
+                        event.get("id", event.get("i", ""))
+                    ) or f"{stage_id}-E{event_index:02d}",
                     "allowed": [max(batch_start, allowed_start), min(batch_end, allowed_end)],
                     "event": self._chapter_plan_clip_text(event.get("event", ""), 700),
                     "result": self._chapter_plan_clip_text(event.get("result", ""), 500),
@@ -11050,6 +11172,157 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
                 "nodes": nodes,
             }
         return {}
+
+    def _creation_wizard_event_catalog(self):
+        project = self.current_project if isinstance(self.current_project, dict) else {}
+        framework = project.get("creation_framework", {})
+        if not isinstance(framework, dict) or framework.get("source") != "creation_wizard":
+            return []
+        return _creation_event_catalog(framework)
+
+    def _chapter_plan_event_progress(self, state):
+        """Build a backward-compatible local ledger of consumed wizard events."""
+        state = state if isinstance(state, dict) else {}
+        catalog = self._creation_wizard_event_catalog()
+        by_id = {item["id"]: item for item in catalog if item.get("id")}
+        progress = state.get("event_progress", {})
+        progress = deepcopy(progress) if isinstance(progress, dict) else {}
+        for event_id, event in by_id.items():
+            current = progress.get(event_id, {})
+            current = current if isinstance(current, dict) else {}
+            assigned = []
+            for value in current.get("assigned_chapters", []):
+                try:
+                    number = int(value)
+                except (TypeError, ValueError):
+                    continue
+                if number > 0 and number not in assigned:
+                    assigned.append(number)
+            current.update({
+                "stage_id": event.get("stage_id", ""),
+                "order": event.get("order", 0),
+                "allowed_chapters": list(event.get("allowed_chapters", []))[:2],
+                "event": event.get("event", ""),
+                "result": event.get("result", ""),
+                "state_delta": deepcopy(event.get("state_delta", {})),
+                "fingerprint": event.get("fingerprint", ""),
+                "assigned_chapters": assigned,
+            })
+            progress[event_id] = current
+
+        # Existing checkpoints may only have source_event_ids.  Accept them
+        # as legacy evidence, but keep the new local ledger authoritative for
+        # all newly generated batches.
+        generated = state.get("chapters", []) if isinstance(state.get("chapters"), list) else []
+        for chapter in generated:
+            if not isinstance(chapter, dict):
+                continue
+            try:
+                chapter_index = int(chapter.get("index", 0) or 0)
+            except (TypeError, ValueError):
+                chapter_index = 0
+            if chapter_index <= 0:
+                continue
+            for raw_id in _normalize_name_list(chapter.get("source_event_ids", [])):
+                event_id = _canonical_chapter_plan_event_id(raw_id)
+                if event_id not in progress:
+                    continue
+                assigned = progress[event_id].setdefault("assigned_chapters", [])
+                if chapter_index not in assigned:
+                    assigned.append(chapter_index)
+
+        last_by_stage = {}
+        for event_id, row in progress.items():
+            assigned = row.get("assigned_chapters", []) if isinstance(row, dict) else []
+            assigned = [int(value) for value in assigned if str(value).isdigit()]
+            row["assigned_chapters"] = sorted(set(assigned))
+            allowed = row.get("allowed_chapters", [])
+            try:
+                allowed_end = int(allowed[1])
+            except (TypeError, ValueError, IndexError):
+                allowed_end = 0
+            row["status"] = (
+                "consumed" if assigned and (not allowed_end or max(assigned) >= allowed_end)
+                else "active" if assigned else "pending"
+            )
+            if row["status"] == "consumed":
+                stage_id = str(row.get("stage_id", "") or "")
+                last_by_stage[stage_id] = max(
+                    int(row.get("order", 0) or 0), last_by_stage.get(stage_id, 0)
+                )
+        state["event_progress"] = progress
+        state["last_consumed_event_order"] = last_by_stage
+        return progress
+
+    def _chapter_plan_event_handoff(self, state, batch_start, batch_end):
+        """Return only the event results needed by the current planning batch."""
+        progress = self._chapter_plan_event_progress(state)
+        completed = []
+        active = []
+        for event_id, row in progress.items():
+            if not isinstance(row, dict):
+                continue
+            allowed = row.get("allowed_chapters", [])
+            try:
+                allowed_start = int(allowed[0])
+                allowed_end = int(allowed[1])
+            except (TypeError, ValueError, IndexError):
+                allowed_start = allowed_end = 0
+            if row.get("status") == "consumed" and allowed_end < int(batch_start or 0):
+                completed.append({
+                    "id": event_id,
+                    "chapters": row.get("assigned_chapters", [])[-4:],
+                    "event": str(row.get("event", "") or "")[:600],
+                    "result": str(row.get("result", "") or "")[:600],
+                    "state_delta": deepcopy(row.get("state_delta", {})),
+                })
+            elif allowed_end >= int(batch_start or 0) and allowed_start <= int(batch_end or 0):
+                active.append({
+                    "id": event_id,
+                    "order": int(row.get("order", 0) or 0),
+                    "chapters": list(row.get("allowed_chapters", []))[:2],
+                    "event": str(row.get("event", "") or "")[:700],
+                    "result": str(row.get("result", "") or "")[:500],
+                    "state_delta": deepcopy(row.get("state_delta", {})),
+                    "status": row.get("status", "pending"),
+                })
+        completed.sort(key=lambda item: (item.get("chapters", [0])[-1], item.get("id", "")))
+        active.sort(key=lambda item: (item.get("order", 0), item.get("id", "")))
+        do_not_replay = []
+        for item in completed[-8:]:
+            text = "；".join(
+                value for value in (item.get("event", ""), item.get("result", "")) if value
+            )
+            if text:
+                do_not_replay.append(text[:520])
+        return {
+            "completed_events": completed[-8:],
+            "active_events": active,
+            "do_not_replay": do_not_replay,
+            "last_consumed_event_order": deepcopy(state.get("last_consumed_event_order", {})),
+        }
+
+    def _chapter_plan_local_event_ids_for_chapter(
+        self, state, chapter_index, batch_start=None, batch_end=None
+    ):
+        """Assign event IDs from the local slot map, never from model output."""
+        chapter_index = int(chapter_index or 0)
+        batch_start = int(batch_start or chapter_index)
+        batch_end = int(batch_end or chapter_index)
+        schedule = self._chapter_plan_locked_node_schedule(state, batch_start, batch_end)
+        result = []
+        for node in schedule.get("nodes", []) if isinstance(schedule, dict) else []:
+            if not isinstance(node, dict):
+                continue
+            try:
+                start, end = [int(value) for value in node.get("range", [])[:2]]
+            except (TypeError, ValueError):
+                continue
+            if start <= chapter_index <= end:
+                event_id = _canonical_chapter_plan_event_id(node.get("id", ""))
+                if event_id and event_id not in result:
+                    result.append(event_id)
+        return result
 
     @staticmethod
     def _chapter_plan_event_schedule_key(batch_start, batch_end):
@@ -11084,10 +11357,13 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
             "nodes": [
                 {
                     "n": int(node.get("n", 0) or 0),
+                    "id": _canonical_chapter_plan_event_id(node.get("id", "")),
                     "range": placement_map.get(
                         int(node.get("n", 0) or 0),
                         list(node.get("allowed", [batch_start, batch_end]))[:2],
                     ),
+                    "event": self._chapter_plan_clip_text(node.get("event", ""), 700),
+                    "result": self._chapter_plan_clip_text(node.get("result", ""), 500),
                 }
                 for node in source.get("nodes", [])
                 if isinstance(node, dict)
@@ -11226,7 +11502,7 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
             "承接上一批末章状态，避免重复开局、重复冲突或提前进入后续阶段。",
             "原框架阶段高于宏观节奏；不得在前10%/中70%边界处切换题材。",
             "保持本项目主线；项目资料只作连续性参考，不能把背景资料自动变成章节任务。",
-            "used_chapter_titles是已经使用过的章节标题清单；新标题不得与其中任何标题重复，也不得与本批次其他新标题重复。",
+            "标题去重是硬约束：used_chapter_titles中的每个标题都已经用过，新标题不得与其中任何标题重复，也不得与本批次其他新标题重复；如果同一事件跨章继续，必须用本章新增的人物行动、冲突结果或关系变化重新命名，不能沿用上一章的事件短语。",
             "相邻章节应避免无意义重复，但不要求按固定轮换表更换开局、冲突或结尾；以当前人物处境和主线需要为准。",
             (
                 "当前批次与全书最后5章收尾窗口有交集：窗口内只落实已经安排的直接后果、行动、关系变化或主角处境落点；"
@@ -11246,6 +11522,12 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
             "previous_batch_tail": previous_tail,
             "rules": continuity_rules,
         }
+        self._chapter_plan_event_progress(state)
+        event_handoff = self._chapter_plan_event_handoff(
+            state, batch_start, batch_end
+        )
+        if event_handoff.get("completed_events") or event_handoff.get("active_events"):
+            continuity["event_handoff"] = event_handoff
         locked_node_schedule = self._chapter_plan_locked_node_schedule(
             state, batch_start, batch_end
         )
@@ -11785,6 +12067,12 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
                 "started_at": now_str(),
             }
             self._chapter_plan_reuse_foundation(state, saved_state)
+        if (
+            isinstance(self.current_project, dict)
+            and isinstance(self.current_project.get("creation_framework"), dict)
+            and self.current_project.get("creation_framework", {}).get("source") == "creation_wizard"
+        ):
+            self._chapter_plan_event_progress(state)
         if str(state.get("status", "") or "") == "complete":
             self._chapter_plan_auto_active = False
             self._pending_chapter_plan = self._chapter_plan_from_generation_state(state)
@@ -11879,10 +12167,26 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
                 chapter["source_stage"] = source_stage.get("name", "")
                 chapter["stage_id"] = source_stage.get("id", "")
             if creation_wizard_batch:
-                # The wizard schedule is validated in its own request.  The
-                # outline request must not invent a second per-chapter event
-                # index; chapter order and stage are assigned locally.
-                chapter["source_event_ids"] = []
+                # The wizard schedule fixes event ownership locally.  A model
+                # reference is accepted for backward compatibility but never
+                # changes the chapter's source event assignment.
+                model_event_refs = [
+                    _canonical_chapter_plan_event_id(value)
+                    for value in _normalize_name_list(
+                        chapter.get("source_event_ids", chapter.get("event_refs", []))
+                    )
+                ]
+                chapter["source_event_ids"] = self._chapter_plan_local_event_ids_for_chapter(
+                    state,
+                    chapter["index"],
+                    absolute_start,
+                    absolute_start + expected - 1,
+                )
+                if model_event_refs and model_event_refs != chapter["source_event_ids"]:
+                    chapter["chapter_plan_structured"] = deepcopy(
+                        chapter.get("chapter_plan_structured", {})
+                    )
+                    chapter["chapter_plan_structured"]["model_event_refs"] = model_event_refs
             else:
                 chapter["source_event_ids"] = [
                     _canonical_chapter_plan_event_id(value)
@@ -11919,6 +12223,8 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
                 return
         generated.extend(incoming)
         state["chapters"] = generated
+        if creation_wizard_batch:
+            self._chapter_plan_event_progress(state)
         state["status"] = "complete" if len(generated) >= int(state.get("requested_chapter_count", 0) or 0) else "generating"
         state.pop("error", None)
         self._persist_chapter_plan_generation_state(state)

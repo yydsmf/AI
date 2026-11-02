@@ -261,6 +261,7 @@ from .novel_creation_wizard import (
     migrate_creation_bible_display_text,
     mark_creation_wizard_draft_completed,
     normalize_creation_result,
+    project_has_explicit_power_levels,
     story_requires_explicit_power_levels,
 )
 from .fanqie_upload import (
@@ -11906,6 +11907,7 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
                 self._chapter_plan_locked_node_schedule(state, absolute_start, absolute_end)
                 if stage_data else {}
             ),
+            has_explicit_power_levels=project_has_explicit_power_levels(self.current_project),
         )
         status = f"正在规划第{absolute_start}-{absolute_end}章，共{state.get('total_chapter_count', 0)}章..."
         if state.get("master_plan", {}).get("source") == "imported_framework":

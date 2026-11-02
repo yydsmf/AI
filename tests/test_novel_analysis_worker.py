@@ -321,9 +321,8 @@ class NovelAnalysisWorkerTests(unittest.TestCase):
         self.assertIn("符合当前题材的阅读期待", prompt)
         self.assertIn("长期状态推进", prompt)
         self.assertIn("不能让同一句状态原样跨多个章节", prompt)
-        self.assertIn("每章outline末尾的‘本章境界推进：’一行", prompt)
-        self.assertIn("章前状态、章末状态和变化依据", prompt)
-        self.assertIn("普通题材不要臆造境界字段", prompt)
+        self.assertNotIn("本章境界推进：", prompt)
+        self.assertNotIn("章前状态、章末状态和变化依据", prompt)
         self.assertIn("恢复或解决必须有资料中已有或剧情自然建立的时间、资源、事件依据", prompt)
         self.assertIn("不写固定伏笔任务", prompt)
         self.assertIn("source_location", prompt)
@@ -366,6 +365,22 @@ class NovelAnalysisWorkerTests(unittest.TestCase):
         self.assertNotIn('"chapter_function"', prompt)
         self.assertNotIn('"character_task"', prompt)
         self.assertNotIn('"mainline_task"', prompt)
+
+    def test_chapter_plan_power_guidance_requires_explicit_power_lore(self):
+        ordinary = NovelChapterPlanWorker(
+            "http://example.test", "key", "model", "context", 200000, 3000, 1, 20,
+            has_explicit_power_levels=False,
+        )
+        ordinary_prompt = ordinary._analysis_prompt()
+        self.assertNotIn("本章境界推进：", ordinary_prompt)
+
+        powered = NovelChapterPlanWorker(
+            "http://example.test", "key", "model", "context", 200000, 3000, 1, 20,
+            has_explicit_power_levels=True,
+        )
+        powered_prompt = powered._analysis_prompt()
+        self.assertIn("本章境界推进：", powered_prompt)
+        self.assertIn("章前状态、章末状态和变化依据", powered_prompt)
 
     def test_chapter_plan_prompt_uses_dynamic_slots_for_stage_states(self):
         cases = (

@@ -2063,41 +2063,81 @@ def _ability_system_lore(value, allow_power_levels):
 
 
 def _has_ordered_power_lore(lore):
-    """判断设定库中是否已有可供后续章节执行的实力层次记录。"""
+    """判断设定库中是否已有可供后续章节执行的实力层次记录。
+
+    The check is intentionally item-scoped.  Combining unrelated lore entries
+    can make an ordinary project look like it has a power ladder merely because
+    different entries happen to contain words such as ``等级`` or ``阶段``.
+    """
     if not isinstance(lore, list):
         return False
-    text = " ".join(
-        _as_text(item.get("name")) + " " + _as_text(item.get("description"))
-        for item in lore
-        if isinstance(item, dict)
-    )
-    if not text:
-        return False
-    has_system_word = any(
-        word in text
-        for word in ("境界", "武道等级", "实力体系", "实力层次", "能力层次", "修炼层次")
-    )
-    ordered_names = re.findall(
-        r"(?<![一二三四五六七八九十])([\u4e00-\u9fff]{1,10}(?:境|阶|级))(?!界)",
-        text,
-    )
-    ordered_names = {
-        item for item in ordered_names
-        if item not in {"境界", "阶段", "等级", "层次"}
-    }
-    named_levels = {
-        item for item in re.findall(
-            r"(?:武者|武师|宗师|大宗师|武王|武皇|武帝|天人|圣人|神境)",
-            text,
+    system_words = ("境界", "武道等级", "实力体系", "实力层次", "能力层次", "修炼层次")
+    level_name_pattern = r"(?<![一二三四五六七八九十])([\u4e00-\u9fff]{1,10}(?:境|阶|级))(?!界)"
+    named_level_pattern = r"(?:武者|武师|宗师|大宗师|武王|武皇|武帝|天人|圣人|神境)"
+    for item in lore:
+        if not isinstance(item, dict):
+            continue
+        text = " ".join((_as_text(item.get("name")), _as_text(item.get("description")))).strip()
+        if not text or not any(word in text for word in system_words):
+            continue
+        ordered_names = {
+            value for value in re.findall(level_name_pattern, text)
+            if value not in {"境界", "阶段", "等级", "层次"}
+        }
+        named_levels = set(re.findall(named_level_pattern, text))
+        has_order = len(ordered_names) >= 2 or bool(
+            re.search(r"(?:一|二|三|四|五|六|七|八|九|十)[阶境级段层]", text)
+            or re.search(r"\d+\s*[阶境级段层]", text)
+            or re.search(r"从低到高|境界依次|境界分为|层次依次", text)
+            or len(named_levels) >= 2
         )
-    }
-    has_order = len(ordered_names) >= 2 or bool(
-        re.search(r"(?:一|二|三|四|五|六|七|八|九|十)[阶境级段层]", text)
-        or re.search(r"\d+\s*[阶境级段层]", text)
-        or re.search(r"从低到高|境界依次|境界分为|层次依次", text)
-        or len(named_levels) >= 2
+        if has_order:
+            return True
+    return False
+
+
+def project_has_explicit_power_levels(project):
+    """Return whether a saved project contains an explicit power progression.
+
+    The wizard's reviewed ``lore`` is the source of truth.  Structured legacy
+    fields are accepted as compatibility fallbacks, but genre labels and broad
+    synopsis text are deliberately ignored so ordinary projects cannot trigger
+    the chapter-level realm template.
+    """
+    project = project if isinstance(project, dict) else {}
+    framework = project.get("creation_framework", {})
+    framework = framework if isinstance(framework, dict) else {}
+    lore_sources = (
+        framework.get("lore", []),
+        project.get("lore", []),
     )
-    return has_system_word and has_order
+    for lore in lore_sources:
+        if _has_ordered_power_lore(lore):
+            return True
+    for source in (framework, project):
+        ability = source.get("ability_system", {}) if isinstance(source, dict) else {}
+        if not isinstance(ability, dict) or not ability.get("enabled"):
+            continue
+        levels = ability.get("levels", [])
+        if isinstance(levels, list) and len([item for item in levels if isinstance(item, dict) and _as_text(item.get("name"))]) >= 2:
+            return True
+        if isinstance(levels, list) and len([item for item in levels if _as_text(item)]) >= 2:
+            return True
+    for source in (framework, project):
+        systems = source.get("progression_systems", []) if isinstance(source, dict) else []
+        if isinstance(systems, dict):
+            systems = [systems]
+        if not isinstance(systems, list):
+            continue
+        if _has_ordered_power_lore([
+            {
+                "name": item.get("name", item.get("title", "")) if isinstance(item, dict) else "",
+                "description": item.get("description", item.get("content", "")) if isinstance(item, dict) else item,
+            }
+            for item in systems
+        ]):
+            return True
+    return False
 
 
 def _normalize_bible(value):

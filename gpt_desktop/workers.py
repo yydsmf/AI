@@ -93,19 +93,22 @@ _BLENDER_PROBE_CACHE = {}
 _CHAPTER_TITLE_MAX_CHARS = 15
 
 
-_CHAPTER_PLAN_STATE_PROGRESSION_GUIDANCE = (
+_CHAPTER_PLAN_GENERAL_STATE_PROGRESSION_GUIDANCE = (
     "长期状态推进要求：对项目资料中已经明确的受伤、疾病、修养、长期身体限制、身份风险、持续追踪、关系僵局和未决任务，"
     "阶段与章节规划必须安排自然的变化路径：从当前影响走向继续、缓解、恶化、转化、解决或稳定。"
     "暂时悬而未决的状态也要在本阶段留下真实的新后果或下一推进窗口，让同一状态随着人物选择持续变化；"
     "同一状态在连续章节中要呈现新的后果、压力或推进；不能让同一句状态原样跨多个章节。"
     "恢复或解决必须有资料中已有或剧情自然建立的时间、资源、事件依据，状态推进融入人物正在经历的场景。"
+)
+
+
+_CHAPTER_PLAN_POWER_PROGRESSION_GUIDANCE = (
     "如果项目资料明确存在境界、修为、等级、能力层次或功法进度，必须把它当作连续状态维护："
     "阶段入口、事件差分、阶段出口和前一批末章是硬连续性依据。每章outline都要交代主要推进人物的当前状态，"
     "本章有提升就写清从什么状态到什么状态以及依据，本章没有提升也要写明状态保持不变和原因。"
     "请把这一项直接写进每章outline末尾的‘本章境界推进：’一行；涉及多个主要人物时分别写明，"
     "至少包含人物、章前状态、章末状态和变化依据。没有突破的章节也必须写‘保持不变’及本章原因，"
     "不能只在阶段结束或少数突破章写一次，也不能跳过中间状态、凭空新增境界、提前突破或让后文倒退。"
-    "只有输入资料明确存在这类实力体系时才执行本条；普通题材不要臆造境界字段或套用这行格式。"
 )
 
 
@@ -6757,6 +6760,7 @@ class NovelChapterPlanWorker(NovelAnalysisWorker):
         total_batches=1,
         creation_wizard_mode=False,
         locked_node_schedule=None,
+        has_explicit_power_levels=False,
     ):
         super().__init__(
             base_url,
@@ -6777,6 +6781,7 @@ class NovelChapterPlanWorker(NovelAnalysisWorker):
         self.batch_number = max(1, int(batch_number or 1))
         self.total_batches = max(1, int(total_batches or 1))
         self.creation_wizard_mode = bool(creation_wizard_mode)
+        self.has_explicit_power_levels = bool(has_explicit_power_levels)
         self.locked_node_schedule = deepcopy(
             locked_node_schedule if isinstance(locked_node_schedule, dict) else {}
         )
@@ -6936,7 +6941,12 @@ class NovelChapterPlanWorker(NovelAnalysisWorker):
             "项目资料是连续性事实参考，不是本章待办清单；只在当下人物选择或关系结果确实需要时取用最少内容。"
             + _story_conflict_pacing_guidance(compact=self.creation_wizard_mode)
             + opening_guidance
-            + _CHAPTER_PLAN_STATE_PROGRESSION_GUIDANCE
+            + _CHAPTER_PLAN_GENERAL_STATE_PROGRESSION_GUIDANCE
+            + (
+                _CHAPTER_PLAN_POWER_PROGRESSION_GUIDANCE
+                if self.has_explicit_power_levels else
+                ""
+            )
             + _CHAPTER_PLAN_STORY_LANGUAGE_GUIDANCE
             + ending_guidance
             + "提纲正文应讲述人物真正会经历的故事，外部事务融入人物当下的行动、关系和现场后果。\n"

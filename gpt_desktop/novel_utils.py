@@ -15867,7 +15867,7 @@ def _normalize_long_form_state_aliases(update):
                     bool(item.get(key))
                     for key in (
                         "state", "dynamic", "dynamic_update", "runtime", "runtime_update", "runtime_change", "runtime_patch",
-                        "operational_state", "spatial_state", "current_dynamic",
+                        "operational_state", "spatial_state", "current_dynamic", "dynamic_append",
                         "current_dynamic_append", "current_dynamic_addition", "current_dynamic_additions",
                         "current_state", "state_change", "state_update", "change", "changes", "patch",
                         "updates", "update", "identity_patch", "fields", "public_accountability", "rule",
@@ -15936,7 +15936,7 @@ def _normalize_long_form_state_aliases(update):
                     )
                 dynamic = first_text(item, (
                     "state", "dynamic", "dynamic_update", "runtime", "runtime_update", "runtime_change", "runtime_patch",
-                    "operational_state", "spatial_state", "current_dynamic",
+                    "operational_state", "spatial_state", "current_dynamic", "dynamic_append",
                     "current_dynamic_append", "current_dynamic_addition", "current_dynamic_additions", "change",
                     "latest_state", "new_state", "current_state", "state_change", "state_update",
                     "new_status", "status_update", "update", "content", "status",
@@ -15946,7 +15946,7 @@ def _normalize_long_form_state_aliases(update):
                 if not dynamic and isinstance(nested_fields, dict):
                     dynamic = first_text(nested_fields, (
                         "state", "dynamic", "dynamic_update", "runtime", "runtime_update", "runtime_change", "runtime_patch",
-                        "operational_state", "spatial_state", "current_dynamic",
+                        "operational_state", "spatial_state", "current_dynamic", "dynamic_append",
                         "current_dynamic_append", "current_dynamic_addition", "current_dynamic_additions", "change",
                         "latest_state", "new_state", "current_state", "state_change", "state_update",
                         "new_status", "status_update", "update", "content", "status",
@@ -15970,7 +15970,7 @@ def _normalize_long_form_state_aliases(update):
                 if not dynamic and isinstance(nested_patch, dict):
                     dynamic = first_text(nested_patch, (
                         "state", "dynamic", "dynamic_update", "runtime", "runtime_update", "runtime_change", "runtime_patch",
-                        "operational_state", "spatial_state", "current_dynamic",
+                        "operational_state", "spatial_state", "current_dynamic", "dynamic_append",
                         "current_dynamic_append", "current_dynamic_addition", "current_dynamic_additions", "change", "latest_state", "new_state",
                         "current_state", "state_change", "state_update",
                         "new_status", "status_update", "update", "content", "status", "public_state",
@@ -15983,7 +15983,7 @@ def _normalize_long_form_state_aliases(update):
                 if not dynamic and isinstance(nested_updates, dict):
                     dynamic = first_text(nested_updates, (
                         "state", "dynamic", "dynamic_update", "runtime", "runtime_update", "runtime_change", "runtime_patch",
-                        "operational_state", "spatial_state", "current_dynamic",
+                        "operational_state", "spatial_state", "current_dynamic", "dynamic_append",
                         "current_dynamic_append", "current_dynamic_addition", "current_dynamic_additions", "change", "latest_state", "new_state",
                         "current_state", "state_change", "state_update",
                         "new_status", "status_update", "update", "content", "status", "public_state",

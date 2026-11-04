@@ -384,6 +384,8 @@ class NovelCreationWizardPersistenceTests(unittest.TestCase):
         self.assertIn("阶段方向", prompt)
         self.assertIn("场景和人物变化", prompt)
         self.assertIn("不能只是继续在同一家庭、公司、工厂、宗门", prompt)
+        self.assertIn("完结前高潮方向", prompt)
+        self.assertIn("最后3章属于高潮结果兑现与收束的一部分", prompt)
         self.assertIn('"stage_directions"', prompt)
 
     def test_generation_batch_labels_are_specific_to_the_current_batch(self):
@@ -661,9 +663,9 @@ class NovelCreationWizardPersistenceTests(unittest.TestCase):
         self.assertEqual(
             foundation["terminal_window"],
             {
-                "start_chapter": 30,
+                "start_chapter": 32,
                 "end_chapter": 34,
-                "chapter_count": 5,
+                "chapter_count": 3,
                 "source": "creation_wizard",
             },
         )
@@ -710,6 +712,11 @@ class NovelCreationWizardPersistenceTests(unittest.TestCase):
                     "final_image": "主角和搭档回到第一次取水的水井旁。",
                     "opening_echo": "开头两人在断水的水井前争执。",
                     "title_closure_intent": "标题体现供水已经稳定和关系已经改变。",
+                    "climax_event_id": "S01-E03",
+                    "climax_chapter_range": [3, 3],
+                    "climax_event": "主角在堤坝决口前选择留下抢修。",
+                    "climax_result": "供水系统恢复，核心冲突当场落地。",
+                    "post_climax_landing": "搭档接过维护责任，主角不再独自指挥。",
                     "time_jump_allowed": True,
                 },
             }],
@@ -724,6 +731,9 @@ class NovelCreationWizardPersistenceTests(unittest.TestCase):
         self.assertEqual(contract["closure_mode"], "mirror_scene")
         self.assertEqual(contract["closure_horizon"], "一年后")
         self.assertTrue(contract["time_jump_allowed"])
+        self.assertEqual(contract["climax_event_id"], "S01-E03")
+        self.assertEqual(contract["climax_chapter_range"], [3, 3])
+        self.assertIn("供水系统恢复", contract["climax_result"])
         self.assertEqual(
             contract["final_image"],
             "主角和搭档回到第一次取水的水井旁。",
@@ -817,7 +827,7 @@ class NovelCreationWizardPersistenceTests(unittest.TestCase):
             stage_index=4,
         )
         terminal_prompt = terminal_worker._analysis_prompt()
-        self.assertIn("最后5章收尾窗口", terminal_prompt)
+        self.assertIn("最后3章收尾窗口", terminal_prompt)
         self.assertIn("本阶段后部只沿着已经发生的冲突", terminal_prompt)
         self.assertNotIn(
             "本阶段解决或暂时解决当前目标后，要在 x/y 或事件结果中留下下一阶段可执行的具体目标",
@@ -842,7 +852,7 @@ class NovelCreationWizardPersistenceTests(unittest.TestCase):
             stage_index=3,
         )
         ordinary_prompt = ordinary_worker._analysis_prompt()
-        self.assertNotIn("最后5章收尾窗口", ordinary_prompt)
+        self.assertNotIn("最后3章收尾窗口", ordinary_prompt)
         self.assertIn(
             "本阶段解决或暂时解决当前目标后，要在 x/y 或事件结果中留下下一阶段可执行的具体目标",
             ordinary_prompt,

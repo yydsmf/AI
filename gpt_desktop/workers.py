@@ -136,8 +136,9 @@ _FINAL_CHAPTER_PLAN_GUIDANCE = (
 
 
 def _terminal_window_plan_guidance(start, end, overlap_start, overlap_end):
+    window_size = max(1, int(end or 0) - int(start or 0) + 1)
     return (
-        f"【全书最后5章收尾窗口｜第{start}-{end}章】\n"
+        f"【全书最后{window_size}章收尾窗口｜第{start}-{end}章】\n"
         f"当前批次与收尾窗口的交集是第{overlap_start}-{overlap_end}章。"
         "这只是内容约束，不改变当前阶段边界、批次数量、章节总数或本批必须返回的章节数量；不得因为收尾要求新增、拆分或合并章节。"
         "交集内的每一章都必须承接前一章已经成立的结果，并在当前章节中完成明确的行动、代价、关系变化或局势落点。"
@@ -145,6 +146,8 @@ def _terminal_window_plan_guidance(start, end, overlap_start, overlap_end):
         "不把新的未解释信息、未知对手、未知目的地或未来承诺写成等待后续章节回答的悬念。"
         "章节结尾只留下下一章已经安排的直接承接，不使用新的连载钩子。"
         "如果输入包含terminal_contract，收尾事件要按契约完成结果，而不是把未完成的现实动作顺延到窗口外。"
+        "最后3章是高潮结果兑现与收束的一部分：高潮若在窗口内，直接合并冲突结果、关系变化和最终落点；"
+        "高潮若在窗口前完成，窗口只承接新的直接后果，不重复验证同一成果。"
     )
 
 
@@ -163,7 +166,7 @@ _CHAPTER_PLAN_STORY_LANGUAGE_GUIDANCE = (
     "本章人物怎么说、怎么做，要根据当下场景、关系、压力、选择和结果自然变化，同一人物不必为了体现人物卡而重复同一种表现。"
     + _procedural_plot_guard_guidance()
     + "剧情仍然要由当前题材自己的场景压力、人物行动、关系碰撞、情绪变化或具体后果推进；人物和环境如何推动故事由题材自然决定。"
-    "这是全书各阶段、各批次都适用的叙事边界，不只适用于最后5章：规划事件时优先写人物正在经历的场面、行动、阻力、选择、关系变化和可观察结果。"
+    "这是全书各阶段、各批次都适用的叙事边界，不只适用于终局收尾窗口：规划事件时优先写人物正在经历的场面、行动、阻力、选择、关系变化和可观察结果。"
     "章节规划使用清楚、具体、便于执行的故事事实和人物行动表达，不得出现策划术语、抽象形容、办案式表达、编辑式说明或编辑式总结。"
     "人物认知、关系和局势的变化都落到具体看见、听见、决定、行动和结果；阶段事件按自然的场景长度组合，让相邻章节有变化并共同完成节点。"
     "伏笔随着人物实际行动、关系变化和局势发展自然生长，不写固定伏笔任务；线索可以在合适的时机转化为新的选择、代价、误会、帮助或冲突。"
@@ -183,7 +186,9 @@ class NovelContextBuildWorker(QThread):
         super().__init__()
         self.token = str(token or "")
         self.action = str(action or "")
-        self.project_snapshot = deepcopy(project_snapshot if isinstance(project_snapshot, dict) else {})
+        # The caller provides an isolated AI snapshot. Keep construction cheap
+        # on the UI thread and make the worker-owned copy inside ``run``.
+        self.project_snapshot = project_snapshot if isinstance(project_snapshot, dict) else {}
         self.chapter_index = int(chapter_index or 0)
         self.project_path = str(project_path or "")
         self.chapter_id = str(chapter_id or "")
@@ -192,8 +197,9 @@ class NovelContextBuildWorker(QThread):
         try:
             if self.isInterruptionRequested():
                 return
+            project_snapshot = deepcopy(self.project_snapshot)
             context = _build_chapter_ai_context(
-                self.project_snapshot,
+                project_snapshot,
                 self.chapter_index,
                 self.action,
             )
@@ -5620,7 +5626,7 @@ class NovelWritingWorker(QThread):
         adaptation_actions = {"novel_to_script", "novel_to_storyboard", "script_to_storyboard"}
         if self.action not in fiction_actions | outline_actions | summary_actions | adaptation_actions:
             return ""
-        terminal_window = "【全书最后5章收尾窗口" in self.context
+        terminal_window = "【全书最后" in self.context and "章收尾窗口" in self.context
         terminal_contract = "【本部终局结果契约" in self.context
         final_chapter = "这是全书最后一章" in self.context
 
@@ -5963,7 +5969,7 @@ class NovelWritingWorker(QThread):
             ),
         }
         prompt = prompts.get(self.action, prompts["outline"])
-        if "【全书最后5章收尾窗口" in self.context and self.action in {"draft", "script_to_novel"}:
+        if "【全书最后" in self.context and "章收尾窗口" in self.context and self.action in {"draft", "script_to_novel"}:
             prompt = prompt.replace(
                 "看到【续写承接点】时，优先从承接点的最后情绪、动作、场景和悬念自然接上；",
                 "看到【续写承接点】时，优先从承接点的最后情绪、动作、场景和已经发生的直接结果自然接上；"
@@ -6807,7 +6813,7 @@ class NovelChapterPlanWorker(NovelAnalysisWorker):
             ending_guidance += _FINAL_CHAPTER_PLAN_GUIDANCE
         if ending_guidance:
             core_motive_guidance = (
-                "【核心动机与收尾窗口】核心动机仍是本项目唯一执行主线；最后5章只把已经安排的目标、阻碍、"
+                "【核心动机与收尾窗口】核心动机仍是本项目唯一执行主线；收尾窗口只把已经安排的目标、阻碍、"
                 "代价和关系变化落实为具体结果，不再打开下一道需要后续章节回答的主线目标。\n"
             )
         elif self.creation_wizard_mode:
@@ -6826,6 +6832,7 @@ class NovelChapterPlanWorker(NovelAnalysisWorker):
         if self.existing_chapter_count == 0 and absolute_start <= 3 <= absolute_end:
             opening_guidance = _OPENING_THREE_CHAPTER_GUIDANCE
         locked_schedule_guidance = ""
+        final_stage_climax_guidance = ""
         if self.creation_wizard_mode:
             schedule = self.locked_node_schedule
             schedule_range = schedule.get("range", []) if isinstance(schedule, dict) else []
@@ -6854,6 +6861,14 @@ class NovelChapterPlanWorker(NovelAnalysisWorker):
                 "本批只在这个范围内展开；节点数量不是章节数量，不能为了讲完一个节点新增章节。"
                 + ("；".join(node_ranges) + "。" if node_ranges else "")
             )
+            if schedule_end >= self.total_chapter_count:
+                final_stage_climax_guidance = (
+                    "这是全书最后阶段的章节批次。先从输入的既有阶段事件、人物关系和主线压力中识别一个决定性高潮，"
+                    "让主角在已经建立的冲突上作出不可轻易撤回的行动或选择，并在对应节点中写出可验证结果；"
+                    "最后3章属于高潮结果兑现与收束的一部分，高潮可以落在最后3章内或此前，"
+                    "但高潮后的章节只能承接新的直接后果、关系落点和本部结果，不能把同一成果拆成重复证明。"
+                    "不要新增主线、主要敌人、世界规则或固定高潮章号。"
+                )
         if self.creation_wizard_mode:
             chapter_order_rule = (
                 f"本批次必须返回{self.chapter_count}项，列表第1项就是全书第{absolute_start}章，"
@@ -6873,6 +6888,7 @@ class NovelChapterPlanWorker(NovelAnalysisWorker):
                 "如果同一节点覆盖数章，后续每章至少改变主动人物、眼前目标、压力来源、代价、关系结果或公开后果中的两项；"
                 "只增加解释、讨论、等待或同一地点的换说法不算新推进。"
                 + CHAPTER_EVENT_HANDOFF_GUIDANCE
+                + final_stage_climax_guidance
                 + locked_schedule_guidance
             )
             output_schema = (
@@ -6917,6 +6933,7 @@ class NovelChapterPlanWorker(NovelAnalysisWorker):
             "每章应把人物、关系、处境或主线推进到一个读者可感知的新局面，章节之间保持场景、压力和结果的变化；"
             "小说圣经、世界规则和阶段规划提供长期事实，伏笔随着人物实际行动、关系变化和信息出现自然生长。\n"
             + core_motive_guidance
+            + final_stage_climax_guidance
             + "\n"
             "章节规划重点写本章正在发生的事情、人物如何应对以及事情留下的变化；"
             "悬念通过现场信息、人物反应、关系裂缝和新的选择自然形成，后续正文再根据实际发生内容处理暗线。\n"

@@ -170,24 +170,24 @@ class NovelLongFormContextTests(unittest.TestCase):
             self.assertIn("A不代表B", prompt)
 
     def test_terminal_window_is_derived_from_total_chapter_count(self):
-        self.assertEqual(_terminal_window_bounds(167), (163, 167))
-        self.assertEqual(_terminal_window_bounds(4), (1, 4))
+        self.assertEqual(_terminal_window_bounds(167), (165, 167))
+        self.assertEqual(_terminal_window_bounds(4), (2, 4))
         self.assertEqual(_terminal_window_bounds(0), None)
 
         project = self._project_with_current_chapter(_new_chapter(0))
         project["chapters"] = [_new_chapter(index) for index in range(10)]
         project["chapter_plan_foundation"] = {"total_chapter_count": 10}
-        self.assertEqual(_project_terminal_window_bounds(project), (6, 10))
+        self.assertEqual(_project_terminal_window_bounds(project), (8, 10))
         self.assertEqual(
-            _terminal_window_chapter_info(project, 5),
+            _terminal_window_chapter_info(project, 7),
             {
-                "chapter_number": 6,
-                "start_chapter": 6,
+                "chapter_number": 8,
+                "start_chapter": 8,
                 "end_chapter": 10,
                 "is_final": False,
             },
         )
-        self.assertIsNone(_terminal_window_chapter_info(project, 4))
+        self.assertIsNone(_terminal_window_chapter_info(project, 6))
 
     def test_terminal_context_disables_serial_hooks_and_remote_future_plans(self):
         chapters = [_new_chapter(index) for index in range(10)]
@@ -198,12 +198,12 @@ class NovelLongFormContextTests(unittest.TestCase):
         project["chapters"] = chapters
         project["chapter_plan_foundation"] = {"total_chapter_count": 10}
 
-        ordinary_context = _build_chapter_ai_context(project, 4, "draft")
-        terminal_context = _build_chapter_ai_context(project, 5, "draft")
+        ordinary_context = _build_chapter_ai_context(project, 6, "draft")
+        terminal_context = _build_chapter_ai_context(project, 7, "draft")
         final_context = _build_chapter_ai_context(project, 9, "draft")
 
-        self.assertNotIn("全书最后5章收尾窗口", ordinary_context)
-        self.assertIn("全书最后5章收尾窗口", terminal_context)
+        self.assertNotIn("全书最后3章收尾窗口", ordinary_context)
+        self.assertIn("全书最后3章收尾窗口", terminal_context)
         self.assertIn("不得用新的任务、未知对手、远方召唤", terminal_context)
         self.assertIn("收尾窗口内后续章节承接", terminal_context)
         self.assertNotIn("远期回收/转折锚点", terminal_context)
@@ -230,6 +230,9 @@ class NovelLongFormContextTests(unittest.TestCase):
                 "long_term_result": "小镇重新恢复稳定生活。",
                 "final_image": "孩子们在修好的水渠边打水。",
                 "title_closure_intent": "标题体现水渠已经重新流动。",
+                "climax_event": "主角在洪峰前打开闸门救出被困居民。",
+                "climax_result": "洪峰被引入旧河道，村庄保住了。",
+                "post_climax_landing": "搭档接过守堤职责，主角回到村口。",
                 "forbidden_pending_items": ["未完成的主要任务"],
             },
         }
@@ -243,6 +246,8 @@ class NovelLongFormContextTests(unittest.TestCase):
         self.assertIn("远期成果型", context)
         self.assertIn("三年后", context)
         self.assertIn("孩子们在修好的水渠边打水", context)
+        self.assertIn("洪峰被引入旧河道", context)
+        self.assertIn("高潮结果兑现与收束", context)
 
     def test_terminal_contract_merges_newer_fallback_fields(self):
         legacy = {

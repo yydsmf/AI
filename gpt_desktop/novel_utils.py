@@ -1574,11 +1574,31 @@ def _normalize_terminal_closure_plan(value):
         result["closure_mode"] = mode
     for key in (
         "closure_horizon", "long_term_result", "final_image", "opening_echo",
-        "title_closure_intent",
+        "title_closure_intent", "climax_event_id", "climax_event",
+        "climax_result", "post_climax_landing",
     ):
         text = str(value.get(key, "") or "").strip()
         if text:
             result[key] = text
+    raw_climax_range = value.get(
+        "climax_chapter_range",
+        value.get("climax_range", []),
+    )
+    if isinstance(raw_climax_range, (list, tuple)):
+        climax_range = []
+        for item in raw_climax_range[:2]:
+            try:
+                number = int(item)
+            except (TypeError, ValueError):
+                continue
+            if number > 0:
+                climax_range.append(number)
+        if climax_range:
+            if len(climax_range) == 1:
+                climax_range.append(climax_range[0])
+            if climax_range[1] < climax_range[0]:
+                climax_range.reverse()
+            result["climax_chapter_range"] = climax_range
     raw_jump = value.get("time_jump_allowed")
     if isinstance(raw_jump, bool):
         result["time_jump_allowed"] = raw_jump
@@ -5481,7 +5501,7 @@ def _project_ready_for_completion(project):
     return True
 
 
-TERMINAL_WINDOW_CHAPTER_COUNT = 5
+TERMINAL_WINDOW_CHAPTER_COUNT = 3
 
 
 def _terminal_window_bounds(total_chapter_count, window_size=TERMINAL_WINDOW_CHAPTER_COUNT):
@@ -5500,7 +5520,7 @@ def _terminal_window_bounds(total_chapter_count, window_size=TERMINAL_WINDOW_CHA
 
 
 def _project_terminal_window_bounds(project, window_size=TERMINAL_WINDOW_CHAPTER_COUNT):
-    """Return the last five planned chapters, falling back to saved chapters."""
+    """Return the configured final-chapter window, falling back to saved chapters."""
     project = project if isinstance(project, dict) else {}
     total = _project_planned_chapter_count(project)
     if total > 0:
@@ -5515,7 +5535,7 @@ def _project_terminal_window_bounds(project, window_size=TERMINAL_WINDOW_CHAPTER
             except (TypeError, ValueError):
                 saved_start, saved_end = 0, 0
             if saved_start > 0 and saved_end >= saved_start:
-                return saved_start, saved_end
+                return _terminal_window_bounds(saved_end, window_size)
     if total <= 0:
         chapters = project.get("chapters", [])
         total = len(chapters) if isinstance(chapters, list) else 0
@@ -5559,23 +5579,26 @@ def _terminal_window_chapter_info(project, chapter_index):
 
 
 def _terminal_window_ending_guidance(info, final=False):
-    """Prompt guidance for the final five chapters, without an audit decision."""
+    """Prompt guidance for the configured ending window, without an audit decision."""
     info = info if isinstance(info, dict) else {}
     chapter_number = int(info.get("chapter_number", 0) or 0)
     start = int(info.get("start_chapter", 0) or 0)
     end = int(info.get("end_chapter", 0) or 0)
     if not chapter_number or not start or not end:
         return ""
+    window_size = end - start + 1
     text = (
-        f"【全书最后5章收尾窗口｜第{start}-{end}章】\n"
-        f"当前是全书第{chapter_number}章，属于按总章节数计算的最后5章收尾窗口。"
+        f"【全书最后{window_size}章收尾窗口｜第{start}-{end}章】\n"
+        f"当前是全书第{chapter_number}章，属于按总章节数计算的最后{window_size}章收尾窗口。"
         "这只是内容规划范围，不改变全书总章节数、当前批次数量、十万字阶段边界或需要返回的章节数量。"
         "本章仍然只写当前章节提纲已经安排的具体场景、行动和结果，不为了收尾要求另增章节，也不把未安排的事件硬塞进本章。"
         "收尾窗口内不再开启新的主要任务、主要敌人、组织、力量体系、世界规则或下一卷主线；"
         "不把新的未解释信息、未知对手、未知目的地或未来承诺写成等待后续章节回答的悬念。"
         "如果当前章还需要承接下一章，只能承接本章已发生冲突的直接后果、行动或关系变化，"
         "不能用新的任务、幕后黑手、远方召唤或‘以后再说’制造连载钩子。"
-        "最后5章不是固定的五段分工，也不要为每一章指定一个通用收尾角色；每章从本题材当前已经发生的事情、人物处境和上一章结果自然长出自己的场面。"
+        f"最后{window_size}章不是固定分工，也不要为每一章指定一个通用收尾角色；它们是高潮结果兑现与收束的一部分。"
+        "高潮若发生在窗口内，直接把冲突结果、关系变化和最终落点合并进已经发生的场景；高潮若在窗口前完成，只承接新的直接后果，不重复验证同一成果。"
+        "每章仍从本题材当前已经发生的事情、人物处境和上一章结果自然长出自己的场面。"
     )
     if final:
         text += (
@@ -5648,6 +5671,29 @@ def _terminal_contract_guidance(contract, info):
         text = contract.get(key, "")
         if text:
             lines.append(f"{label}：{text}")
+    climax_event = contract.get("climax_event", "")
+    climax_result = contract.get("climax_result", "")
+    climax_range = contract.get("climax_chapter_range", [])
+    if climax_event or climax_result or climax_range:
+        lines.append(
+            "终局高潮：先从已经建立的主线冲突、人物关系和阶段事件中集中爆发一次决定性行动或选择，"
+            "不要凭空添加新主线、新势力或新规则。"
+        )
+        if contract.get("climax_event_id"):
+            lines.append("高潮承载事件：" + str(contract.get("climax_event_id")))
+        if climax_range:
+            lines.append("高潮章节范围：" + "-".join(str(item) for item in climax_range))
+        if climax_event:
+            lines.append("高潮事件：" + climax_event)
+        if climax_result:
+            lines.append("高潮结果：" + climax_result)
+        if contract.get("post_climax_landing"):
+            lines.append("高潮后的收束落点：" + str(contract.get("post_climax_landing")))
+        lines.append(
+            f"最后{max(1, end - start + 1)}章是高潮结果兑现与收束的一部分，不是高潮之后重复展示成果的独立展示段；"
+            "高潮若落在窗口内，直接把直接后果、关系变化和本部结果合并到已经发生的场景中；"
+            "高潮若在窗口前完成，窗口只承接新的后果和最终落点，不重新验证同一结果。"
+        )
     if info.get("is_final") or chapter_number == end:
         lines.append(
             "本章必须把契约中的本部结果写成已经发生、被人物或环境验证的事实；"
@@ -23920,7 +23966,7 @@ def _build_chapter_ai_context(project, chapter_index, action):
         )
     if terminal_window_guidance and action in {"draft", "outline", "script_to_novel"}:
         inheritance_rule_lines.append(
-            "当前属于全书最后5章收尾窗口：后续章节资料只用于承接窗口内部已经安排的直接结果；"
+            "当前属于全书最后3章收尾窗口：后续章节资料只用于承接窗口内部已经安排的直接结果；"
             "不得把窗口之外的远期任务、未知对手、未知目的地、新世界规则或新的未解释信息写成本章剧情。"
             "本章结尾不得新增必须由后续章节回答的主线悬念。"
         )

@@ -744,6 +744,39 @@ class NovelWritingStateTests(unittest.TestCase):
             chapter["id"],
         )
 
+    def test_detached_single_chapter_start_skips_draft_snapshot(self):
+        chapter = _new_chapter(0)
+        actions = []
+        saved_calls = []
+
+        class Runner:
+            def run_chapter_ai_action(self, action):
+                actions.append(action)
+
+        tab = NovelWritingTab.__new__(NovelWritingTab)
+        tab.current_project = {"meta": {"title": "测试小说"}, "chapters": [chapter]}
+        tab.current_project_path = "/tmp/source.json"
+        tab._canonical_project_path = lambda path: path
+        tab._save_current_work = lambda *args, **kwargs: (
+            saved_calls.append((args, kwargs)) or "/tmp/source.json"
+        )
+        tab._create_detached_chapter_runner = lambda *args, **kwargs: (Runner(), {})
+        tab._update_detached_auto_source_lock = lambda: None
+        tab._sync_detached_auto_status = lambda _runner: None
+        tab._set_chapter_ai_actions_enabled = lambda _enabled: None
+        tab._log_novel_diagnostic = lambda *_args, **_kwargs: None
+        tab.set_status_tip = lambda _text: None
+
+        tab._launch_detached_single_chapter_ai(
+            "/tmp/source.json",
+            0,
+            chapter["id"],
+        )
+
+        self.assertEqual(actions, ["draft"])
+        self.assertEqual(len(saved_calls), 1)
+        self.assertFalse(saved_calls[0][1]["update_draft"])
+
     def test_detached_single_runner_reselects_target_chapter_by_id(self):
         chapters = [_new_chapter(0), _new_chapter(1)]
         chapters[0]["id"] = "chapter-one"
@@ -859,9 +892,15 @@ class NovelWritingStateTests(unittest.TestCase):
         self.assertFalse(tab._context_build_target_is_current(pending))
 
     def test_detached_auto_source_lock_only_locks_source_project_editors(self):
+        class RunningDetached:
+            _background_task_kind = "auto_expand"
+
+            def _status_has_active_work(self):
+                return True
+
         tab = NovelWritingTab.__new__(NovelWritingTab)
         tab._background_chapter_ai_runners = {
-            os.path.realpath("/tmp/source.json"): object(),
+            os.path.realpath("/tmp/source.json"): RunningDetached(),
         }
         tab.current_project_path = "/tmp/source.json"
         tab.tabs = _FakeButton()
@@ -873,8 +912,8 @@ class NovelWritingStateTests(unittest.TestCase):
 
         self.assertTrue(tab.tabs.enabled)
         self.assertTrue(tab.nav_list.enabled)
-        self.assertFalse(tab.auto_expand_all_btn.enabled)
-        self.assertEqual(tab.auto_expand_all_btn.text, "后台自动扩写中")
+        self.assertTrue(tab.auto_expand_all_btn.enabled)
+        self.assertEqual(tab.auto_expand_all_btn.text, "中止自动扩写")
 
         tab.current_project_path = "/tmp/other.json"
         tab._update_detached_auto_source_lock()
@@ -916,13 +955,12 @@ class NovelWritingStateTests(unittest.TestCase):
 
         editor = FakeReadOnlyWidget()
         action = FakeEnabledWidget()
-        stop = FakeEnabledWidget()
         read_aloud = FakeEnabledWidget()
         read_aloud_stop = FakeEnabledWidget()
         read_aloud_scope = FakeEnabledWidget()
         read_aloud_rate = FakeEnabledWidget()
         workspace = FakeWorkspace(
-            [editor, action, stop, read_aloud, read_aloud_stop, read_aloud_scope, read_aloud_rate]
+            [editor, action, read_aloud, read_aloud_stop, read_aloud_scope, read_aloud_rate]
         )
         project_panel = FakeWorkspace([FakeEnabledWidget()])
 
@@ -930,7 +968,6 @@ class NovelWritingStateTests(unittest.TestCase):
         tab._detached_auto_readonly_states = []
         tab.project_workspace = workspace
         tab.project_panel = project_panel
-        tab.chapter_ai_stop_btn = stop
         tab.read_aloud_btn = read_aloud
         tab.read_aloud_stop_btn = read_aloud_stop
         tab.read_aloud_scope_combo = read_aloud_scope
@@ -947,7 +984,6 @@ class NovelWritingStateTests(unittest.TestCase):
             self.assertTrue(workspace.find_children_called)
             self.assertTrue(editor.read_only)
             self.assertFalse(action.enabled)
-            self.assertTrue(stop.enabled)
             self.assertTrue(read_aloud.enabled)
             self.assertTrue(read_aloud_stop.enabled)
             self.assertTrue(read_aloud_scope.enabled)
@@ -959,8 +995,10 @@ class NovelWritingStateTests(unittest.TestCase):
         self.assertFalse(editor.read_only)
         self.assertTrue(action.enabled)
 
-    def test_detached_auto_runner_exposes_background_stop_button(self):
+    def test_detached_auto_runner_uses_auto_button_as_stop_control(self):
         class RunningDetached:
+            _background_task_kind = "auto_expand"
+
             def _status_has_active_work(self):
                 return True
 
@@ -970,19 +1008,44 @@ class NovelWritingStateTests(unittest.TestCase):
             os.path.realpath("/tmp/source.json"): RunningDetached(),
         }
         tab.current_project_path = "/tmp/source.json"
-        tab.chapter_ai_stop_btn = _FakeButton()
         tab.auto_expand_all_btn = _FakeButton()
         tab.project_hint = _FakeLineEdit()
 
         tab._update_detached_auto_source_lock()
 
-        self.assertTrue(tab.chapter_ai_stop_btn.visible)
-        self.assertTrue(tab.chapter_ai_stop_btn.enabled)
-        self.assertEqual(tab.chapter_ai_stop_btn.text, "中止后台扩写")
+        self.assertTrue(tab.auto_expand_all_btn.visible)
+        self.assertTrue(tab.auto_expand_all_btn.enabled)
+        self.assertEqual(tab.auto_expand_all_btn.text, "中止自动扩写")
+        self.assertEqual(tab.auto_expand_all_btn.object_name, "danger")
 
         tab.current_project_path = "/tmp/other.json"
         tab._update_detached_auto_source_lock()
-        self.assertFalse(tab.chapter_ai_stop_btn.visible)
+
+    def test_detached_single_runner_uses_draft_button_as_stop_control(self):
+        class RunningDetached:
+            _background_task_kind = "single_chapter"
+
+            def _status_has_active_work(self):
+                return True
+
+        tab = NovelWritingTab.__new__(NovelWritingTab)
+        tab._is_detached_auto_runner = False
+        tab._background_chapter_ai_runners = {
+            os.path.realpath("/tmp/source.json"): RunningDetached(),
+        }
+        tab.current_project_path = "/tmp/source.json"
+        tab._chapter_ai_buttons_by_action = {"draft": _FakeButton()}
+        tab.auto_expand_all_btn = _FakeButton()
+        tab.project_hint = _FakeLineEdit()
+
+        tab._update_detached_auto_source_lock()
+
+        draft = tab._chapter_ai_buttons_by_action["draft"]
+        self.assertTrue(draft.enabled)
+        self.assertEqual(draft.text, "中止扩写")
+        self.assertEqual(draft.object_name, "danger")
+        self.assertFalse(tab.auto_expand_all_btn.enabled)
+        self.assertEqual(tab.auto_expand_all_btn.text, "后台单章扩写中")
 
     def test_detached_auto_status_mirrors_stream_chars_stage_and_queue_progress(self):
         class RunningDetached:
@@ -1142,7 +1205,7 @@ class NovelWritingStateTests(unittest.TestCase):
                 created.append((config, parent, background_runner))
                 self.current_project = {"meta": {"title": "测试小说"}}
 
-            def _load_project_data(self, data, source_path, defer_helpers=False):
+            def _load_project_data(self, data, source_path, defer_helpers=False, **_kwargs):
                 self.current_project = data
 
             def hide(self):
@@ -1160,7 +1223,13 @@ class NovelWritingStateTests(unittest.TestCase):
         tab = NovelWritingTab.__new__(NovelWritingTab)
         tab.config = {"novel": {"model": "test"}}
         tab._background_chapter_ai_runners = {}
-        tab._save_current_work = lambda *_args, **_kwargs: "/tmp/source.json"
+        saved_calls = []
+
+        def save_current_work(*args, **kwargs):
+            saved_calls.append((args, kwargs))
+            return "/tmp/source.json"
+
+        tab._save_current_work = save_current_work
         tab._update_detached_auto_source_lock = lambda: None
         tab.set_status_tip = lambda _text: None
 
@@ -1177,6 +1246,8 @@ class NovelWritingStateTests(unittest.TestCase):
             list(tab._background_chapter_ai_runners),
             [os.path.realpath("/tmp/source.json")],
         )
+        self.assertEqual(len(saved_calls), 1)
+        self.assertFalse(saved_calls[0][1]["update_draft"])
 
     def test_multiple_detached_auto_runners_are_isolated_by_project_path(self):
         created = []
@@ -1187,7 +1258,7 @@ class NovelWritingStateTests(unittest.TestCase):
                 self.current_project = {"meta": {"title": "测试小说"}}
                 self._background_task_kind = ""
 
-            def _load_project_data(self, data, source_path, defer_helpers=False):
+            def _load_project_data(self, data, source_path, defer_helpers=False, **_kwargs):
                 self.current_project = data
 
             def hide(self):
@@ -2540,7 +2611,7 @@ class NovelWritingStateTests(unittest.TestCase):
         tab._set_auto_expand_all_button_text()
 
         self.assertEqual(tab._auto_expand_all_chapter_progress(), (12, 250))
-        self.assertEqual(tab.auto_expand_all_btn.text, "自动扩写全部 12/250")
+        self.assertEqual(tab.auto_expand_all_btn.text, "中止自动扩写")
 
     def test_auto_expand_status_uses_same_absolute_progress_as_button(self):
         chapters = [_new_chapter(index) for index in range(250)]
@@ -2590,6 +2661,66 @@ class NovelWritingStateTests(unittest.TestCase):
 
         self.assertEqual(enabled, [True])
         self.assertFalse(tab._auto_expand_all_active)
+
+    def test_auto_expand_button_switches_between_start_and_stop(self):
+        tab = NovelWritingTab.__new__(NovelWritingTab)
+        tab._auto_expand_all_active = False
+        tab._current_background_chapter_runner = lambda: None
+        started = []
+        stopped = []
+        tab.start_auto_expand_all_chapters = lambda: started.append(True)
+        tab.stop_chapter_ai_action = lambda: stopped.append(True)
+
+        tab._on_auto_expand_all_clicked()
+        self.assertEqual(started, [True])
+        self.assertEqual(stopped, [])
+
+        tab._auto_expand_all_active = True
+        tab._on_auto_expand_all_clicked()
+        self.assertEqual(stopped, [True])
+
+    def test_single_expand_button_switches_between_start_and_stop(self):
+        tab = NovelWritingTab.__new__(NovelWritingTab)
+        tab._auto_expand_all_active = False
+        tab._chapter_ai_sequence_active = False
+        tab._current_background_chapter_runner = lambda: None
+        started = []
+        stopped = []
+        tab.run_chapter_ai_action = lambda action: started.append(action)
+        tab.stop_chapter_ai_action = lambda: stopped.append(True)
+
+        tab._on_chapter_ai_action_clicked("draft")
+        self.assertEqual(started, ["draft"])
+        self.assertEqual(stopped, [])
+
+        tab._chapter_ai_sequence_active = True
+        tab._on_chapter_ai_action_clicked("draft")
+        self.assertEqual(stopped, [True])
+
+    def test_single_expand_button_text_follows_running_state(self):
+        tab = NovelWritingTab.__new__(NovelWritingTab)
+        tab.current_project = {"chapters": [_new_chapter(0)]}
+        tab.current_chapter_index = 0
+        tab.chapter_ai_preview = _FakePlainTextEdit("")
+        tab._chapter_ai_preview_is_partial = False
+        tab._chapter_ai_preview_action = ""
+        tab._chapter_ai_preview_chapter_id = ""
+        tab._auto_expand_all_active = False
+        tab._chapter_ai_sequence_active = True
+        draft = _FakeButton()
+        tab._chapter_ai_buttons_by_action = {"draft": draft}
+        tab.chapter_ai_action_buttons = [draft]
+
+        tab._set_chapter_ai_actions_enabled(False)
+        self.assertTrue(draft.enabled)
+        self.assertEqual(draft.text, "中止扩写")
+        self.assertEqual(draft.object_name, "danger")
+
+        tab._chapter_ai_sequence_active = False
+        tab._set_chapter_ai_actions_enabled(True)
+        self.assertTrue(draft.enabled)
+        self.assertEqual(draft.text, "扩写正文并补提纲和摘要")
+        self.assertEqual(draft.object_name, "ghost")
 
     def test_auto_expand_restart_discards_partial_draft_instead_of_resuming_it(self):
         chapter = _new_chapter(0)
@@ -3103,7 +3234,7 @@ class NovelWritingStateTests(unittest.TestCase):
         self.assertTrue(tab._auto_expand_all_active)
         self.assertTrue(tab._auto_expand_all_waiting_next)
         self.assertEqual(tab._auto_expand_all_completed, 1)
-        self.assertEqual(tab.auto_expand_all_btn.text, "自动扩写全部 1/1")
+        self.assertEqual(tab.auto_expand_all_btn.text, "中止自动扩写")
         self.assertIn("第1章已完成（1/1）", statuses[-1])
         self.assertFalse(chapter["auto_expand_resume_required"])
 
@@ -6859,7 +6990,7 @@ class NovelWritingStateTests(unittest.TestCase):
 
         self.assertEqual(started, ["draft"])
         self.assertTrue(tab._chapter_ai_sequence_active)
-        self.assertEqual(button.text, "扩写正文并补提纲和摘要")
+        self.assertEqual(button.text, "中止扩写")
         self.assertEqual(tab.chapter_text.toPlainText(), "")
         self.assertFalse(tab._has_partial_chapter_ai_preview())
 
@@ -6910,7 +7041,7 @@ class NovelWritingStateTests(unittest.TestCase):
 
         self.assertEqual(started, ["draft"])
         self.assertTrue(tab._chapter_ai_sequence_active)
-        self.assertEqual(button.text, "扩写正文并补提纲和摘要")
+        self.assertEqual(button.text, "中止扩写")
         self.assertEqual(tab.chapter_text.toPlainText(), "")
         self.assertFalse(tab._has_partial_chapter_ai_preview())
 
@@ -9679,6 +9810,7 @@ class _FakeButton:
         self.tooltip = ""
         self.enabled = True
         self.visible = True
+        self.object_name = ""
 
     def setText(self, text):
         self.text = text
@@ -9691,6 +9823,12 @@ class _FakeButton:
 
     def setVisible(self, visible):
         self.visible = bool(visible)
+
+    def setObjectName(self, name):
+        self.object_name = str(name)
+
+    def objectName(self):
+        return self.object_name
 
 
 class _FakeComboBox:

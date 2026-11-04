@@ -3658,21 +3658,15 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
         ):
             btn = self._ghost_button(text)
             btn.setToolTip("先扩写完整正文，再根据实际正文补提纲和摘要/关键事实")
-            btn.clicked.connect(lambda _checked=False, a=action: self.run_chapter_ai_action(a))
+            btn.clicked.connect(lambda _checked=False, a=action: self._on_chapter_ai_action_clicked(a))
             ai_top.addWidget(btn)
             self.chapter_ai_action_buttons.append(btn)
             self._chapter_ai_buttons_by_action[action] = btn
         self.auto_expand_all_btn = self._ghost_button("自动扩写全部")
         self.auto_expand_all_btn.setToolTip("跳过已有正文，按章节顺序自动完成所有未写章节；遇到失败会停止")
-        self.auto_expand_all_btn.clicked.connect(self.start_auto_expand_all_chapters)
+        self.auto_expand_all_btn.clicked.connect(self._on_auto_expand_all_clicked)
         ai_top.addWidget(self.auto_expand_all_btn)
         self.chapter_ai_action_buttons.append(self.auto_expand_all_btn)
-        self.chapter_ai_stop_btn = QPushButton("中止")
-        self.chapter_ai_stop_btn.setObjectName("danger")
-        self.chapter_ai_stop_btn.setToolTip("中止当前 AI 辅助生成")
-        self.chapter_ai_stop_btn.setVisible(False)
-        self.chapter_ai_stop_btn.clicked.connect(self.stop_chapter_ai_action)
-        ai_top.addWidget(self.chapter_ai_stop_btn)
         ai_layout.addLayout(ai_top)
 
         self.chapter_ai_body = QFrame()
@@ -5917,7 +5911,9 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
                 log_debug("退出时停止后台章节任务失败", exc)
         runners.clear()
 
-    def _load_project_data(self, data, path="", defer_helpers=False):
+    def _load_project_data(
+        self, data, path="", defer_helpers=False, data_is_normalized=False
+    ):
         if getattr(self, "_fanqie_upload_locked_path", ""):
             self._set_detached_auto_source_read_only(False)
             self._fanqie_upload_locked_path = ""
@@ -5954,7 +5950,13 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
         self._loading = True
         try:
             step_start = time.perf_counter()
-            self.current_project = _normalize_project(data)
+            if data_is_normalized and isinstance(data, dict):
+                # The detached launcher saves the current normalized project
+                # immediately before loading this runner. Avoid normalizing
+                # the same full project a second time on the UI thread.
+                self.current_project = data
+            else:
+                self.current_project = _normalize_project(data)
             self._log_novel_perf(
                 "加载项目-规范化",
                 step_start,
@@ -7699,12 +7701,85 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
         self.refresh_import_candidate_lists()
         self.tabs.setCurrentWidget(self.import_candidates_tab)
 
+    @staticmethod
+    def _set_chapter_ai_button_danger(button, danger):
+        if button is None or not hasattr(button, "setObjectName"):
+            return
+        object_name = "danger" if danger else "ghost"
+        try:
+            if button.objectName() == object_name:
+                return
+            button.setObjectName(object_name)
+            style_getter = getattr(button, "style", None)
+            style = style_getter() if callable(style_getter) else None
+            if style is not None:
+                style.unpolish(button)
+                style.polish(button)
+            update = getattr(button, "update", None)
+            if callable(update):
+                update()
+        except RuntimeError:
+            pass
+
     def _set_chapter_ai_actions_enabled(self, enabled):
         for btn in getattr(self, "chapter_ai_action_buttons", []):
             btn.setEnabled(bool(enabled))
-        if hasattr(self, "chapter_ai_stop_btn"):
-            self.chapter_ai_stop_btn.setVisible(not bool(enabled))
-            self.chapter_ai_stop_btn.setEnabled(not bool(enabled))
+        auto_expand_active = bool(getattr(self, "_auto_expand_all_active", False))
+        single_expand_active = bool(getattr(self, "_chapter_ai_sequence_active", False)) and not auto_expand_active
+        draft_btn = getattr(self, "_chapter_ai_buttons_by_action", {}).get("draft")
+        if draft_btn is not None and single_expand_active:
+            draft_btn.setEnabled(True)
+            draft_btn.setText("中止扩写")
+            draft_btn.setToolTip("中止当前单章扩写，保留已经生成的内容")
+            self._set_chapter_ai_button_danger(draft_btn, True)
+        elif draft_btn is not None:
+            self._refresh_chapter_ai_action_labels()
+            self._set_chapter_ai_button_danger(draft_btn, False)
+        if hasattr(self, "auto_expand_all_btn") and auto_expand_active:
+            self.auto_expand_all_btn.setEnabled(True)
+            self.auto_expand_all_btn.setText("中止自动扩写")
+            self.auto_expand_all_btn.setToolTip("中止当前自动扩写任务，保留已经完成的章节")
+            self._set_chapter_ai_button_danger(self.auto_expand_all_btn, True)
+        elif hasattr(self, "auto_expand_all_btn"):
+            self._set_chapter_ai_button_danger(self.auto_expand_all_btn, False)
+
+    def _on_chapter_ai_action_clicked(self, action):
+        if str(action or "") == "draft" and self._single_chapter_ai_action_active():
+            self.stop_chapter_ai_action()
+            return
+        self.run_chapter_ai_action(action)
+
+    def _single_chapter_ai_action_active(self):
+        if getattr(self, "_auto_expand_all_active", False):
+            return False
+        if getattr(self, "_chapter_ai_sequence_active", False):
+            return True
+        detached = self._current_background_chapter_runner()
+        if detached is None:
+            return False
+        if str(getattr(detached, "_background_task_kind", "") or "") != "single_chapter":
+            return False
+        try:
+            return bool(detached._status_has_active_work())
+        except Exception:
+            return False
+
+    def _on_auto_expand_all_clicked(self):
+        """Use one stable button slot for starting and stopping auto expansion."""
+        if getattr(self, "_auto_expand_all_active", False):
+            self.stop_chapter_ai_action()
+            return
+        detached = self._current_background_chapter_runner()
+        if detached is not None:
+            task_kind = str(getattr(detached, "_background_task_kind", "") or "")
+            try:
+                detached_active = bool(detached._status_has_active_work())
+            except Exception:
+                detached_active = False
+            if task_kind == "auto_expand" and detached_active:
+                self.stop_chapter_ai_action()
+                return
+        self.start_auto_expand_all_chapters()
 
     def _pending_candidate_analysis_chapter_ids(self):
         chapters = self.current_project.get("chapters", [])
@@ -9225,7 +9300,7 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
         stage_fields = (
             "id", "name", "start_chapter", "end_chapter", "summary", "main_conflict",
             "relationship_changes", "world_reveals", "turning_points",
-            "end_state", "entry_state", "exit_state", "carry_over", "ordered_events",
+            "end_state", "entry_state", "exit_state", "carry_over", "closure_plan", "ordered_events",
             "mainline_pressure",
         )
         stage_plan = []
@@ -9468,7 +9543,7 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
                 compact_stage = {}
                 for key in (
                     "id", "name", "start_chapter", "end_chapter", "summary",
-                    "end_state", "entry_state", "exit_state", "mainline_pressure",
+                    "end_state", "entry_state", "exit_state", "closure_plan", "mainline_pressure",
                 ):
                     value = stage.get(key, "")
                     if value not in (None, "", [], {}):
@@ -9578,6 +9653,7 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
                 "name", "start_chapter", "end_chapter", "summary",
                 "main_conflict", "relationship_changes", "world_reveals",
                 "turning_points", "end_state", "entry_state", "exit_state",
+                "closure_plan",
                 "ordered_events",
             ):
                 value = item.get(key, "")
@@ -9888,12 +9964,19 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
                     "直接对手、失败代价、公开后果或主角选择难度中的至少两项；不强制题材采用固定势力层级，"
                     "也不能为了升级凭空添加地图、组织或新主线。章节必须把压力落到已有人物、关系、场景和选择的结果上。"
                 ),
+                "final_stage_climax_rule": (
+                    "仅当当前阶段是全书最后阶段时，先从已确认的阶段事件、人物关系和主线压力中识别一个决定性高潮，"
+                    "让主角在既有冲突上作出不可轻易撤回的行动或选择并形成可验证结果；"
+                    "最后3章属于高潮结果兑现与收束的一部分，高潮可以落在窗口内或窗口前，"
+                    "但高潮后的章节只能承接新的直接后果、关系落点和本部结果，不重复展示已经成立的成果。"
+                    "不要凭空添加新主线、新势力、新规则或固定高潮章号。"
+                ),
                 "line_field_boundary": (
                     "core_motive是唯一主线；primary_line、core_mainline和primary_story_engine只是兼容别名或执行说明，"
                     "阶段main_conflict只写本阶段阻碍核心动机的问题，不得另起总目标。"
                 ),
                 "terminal_contract_rule": (
-                    "terminal_contract是本部结果职责，不是固定题材模板。最后5章必须把契约中的核心主线结果、"
+                    "terminal_contract是本部结果职责，不是固定题材模板。终局收尾窗口内要落实契约中的核心主线结果、"
                     "核心冲突结果、主要关系结果、主角最终处境和现实落点安排在已有章节内，并在最后一章写成已经发生且被验证的事实。"
                     "不能用准备、等待、试验、复测、刚刚接手或下一步行动代替结果；允许保留的只是不会影响本部闭环的背景余波。"
                     "closure_mode只选择适合本书的即时、短期、远期、镜像或混合方式；若使用时间落点或开头呼应，必须先完成当前结果，再用具体场景证明成果持续存在，不能套统一模板。"
@@ -10060,7 +10143,7 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
             payload.update(deepcopy(extra_payload))
         if terminal_batch_overlap:
             terminal_batch_guidance = (
-                "当前批次与全书最后5章收尾窗口有交集：每章仍要留下可承接的具体结果，"
+                "当前批次与全书终局收尾窗口有交集：每章仍要留下可承接的具体结果，"
                 "但下一章只能继续落实窗口内已经安排的直接后果、行动或关系变化；"
                 "不得用新的主要任务、主要敌人、未知信息或等待回答的悬念制造连载钩子。\n"
             )
@@ -10090,6 +10173,8 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
             "terminal_contract是本部收尾的结果职责：收尾窗口内按已有章节位置分别落实契约中的核心主线结果、"
             "冲突结果、关系结果、主角处境和现实落点；最后一章必须写出已经发生并被验证的结果，"
             "不能把准备、等待、试验、复测、刚刚接手或下一步行动当作结尾。"
+            "如果契约中提供了高潮事件、高潮结果或高潮后的收束落点，先把它作为终局事件的共同锚点；"
+            "最后3章把高潮的直接后果、关系变化和本部结果合并落地，不要在高潮后重复展示同一成果。"
             "它只约束结果是否落地，不规定题材必须使用哪种场景或表达方式。\n\n"
             if terminal_batch_overlap and terminal_contract else
             ""
@@ -10110,7 +10195,7 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
         instruction_prefix = (
             "请根据以下 JSON 项目档案生成章节规划。只规划 requested_new_chapters 指定数量的新章节；"
             "不要重写已有章节，不要输出正文。"
-            "target.terminal_window只表示最后5章的内容收束范围，不改变requested_new_chapters、当前批次范围、阶段边界或返回对象数量。"
+            "target.terminal_window只表示按全书章节总数确定的内容收束范围，不改变requested_new_chapters、当前批次范围、阶段边界或返回对象数量。"
             "必须先按 creative_intent_contract、planning_contract 和 imported_chapter_plan_reference 决定内容方向；"
             "再参考 target.macro_pacing_rules 安排宏观节奏。宏观节奏不得覆盖原框架阶段。\n\n"
             "若存在 imported_chapter_plan_reference，chapters是按绝对章号执行的明确章节约束；"
@@ -10141,7 +10226,7 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
             "生成前逐项核对标题，重复时必须改成能对应本章具体事件、人物行动或结果的新标题。\n\n"
             "不要像编辑解释本章功能，不要写‘推动剧情、关系推进、制造悬念、完成任务、阶段作用’等空泛任务词，"
             "不要解释本章意义、主题、节奏、主线、人物弧线或读者效果。"
-            "以上共享叙事边界适用于全书章节规划，不只适用于最后5章。每章优先写当前题材里的具体场面和人物正在做的事："
+            "以上共享叙事边界适用于全书章节规划，不只适用于终局收尾窗口。每章优先写当前题材里的具体场面和人物正在做的事："
             "谁在什么处境中采取行动，遇到什么现场阻力，作出什么选择，带来什么关系或局势后果。"
             "输入资料里的抽象总结只作为事实参考，要改写成具体人物、地点、动作、阻力、结果和状态变化；"
             "人物认知变化必须落到看见、听见、当场反应、决定和现实后果。不要写‘章末留下悬念’或‘读者会继续追问’，直接写章末发生的具体事情。"
@@ -10164,7 +10249,7 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
             instruction_prefix = (
                 "请根据以下 JSON 项目档案生成向导已经确认的当前阶段章节规划。"
                 "只生成 requested_new_chapters 指定数量的新章节，不重写已有章节，不输出正文。"
-                "target.terminal_window只表示最后5章的内容收束范围，不改变requested_new_chapters、当前阶段边界或返回对象数量。"
+                "target.terminal_window只表示按全书章节总数确定的内容收束范围，不改变requested_new_chapters、当前阶段边界或返回对象数量。"
                 "故事简介、小说圣经、世界规则、人物、设定、伏笔和当前阶段资料共同构成只读底稿；"
                 "它们提供事实和边界，本次只把当前阶段继续落实到具体章节。\n\n"
                 "wizard_framework.stage_plan 只包含当前阶段的阶段事实和有序剧情节点；"
@@ -10174,6 +10259,9 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
                 "阶段节点是本章故事的事实来源，不是章节任务清单；同一节点第一次发生时完成它的核心转折，"
                 "如果一个节点覆盖数章，后续章节按共享剧情推进要求改变主动人物、目标、压力、代价、关系结果或公开后果，"
                 "只补解释、讨论、等待或同一地点的重复说明不算推进。"
+                "如果当前节点属于全书最后阶段，先从既有节点和人物关系中识别一个决定性高潮，并让主角的行动或选择在该节点形成可验证结果；"
+                "最后3章属于高潮结果兑现与收束的一部分，高潮可以在窗口内或窗口前发生，但高潮后的章节只能承接新的直接后果、关系落点和本部结果，"
+                "不能把同一成果拆成连续的重复证明，也不要为了高潮新增主线、主要敌人、世界规则或固定高潮章号。"
                 "安排每章时，先确定主角本章正在争取、保护、摆脱或确认什么，再把节点嵌入这次行动。"
                 "规则、权限、设备、资源和组织运行只在人物当前行动确实需要时作为阻力、资源、代价或结果出现；"
                 "如果某节点只是说明状态已经建立，应并入造成该结果的冲突，并写清它怎样迫使人物作出下一次选择。"
@@ -11506,15 +11594,16 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
             "标题去重是硬约束：used_chapter_titles中的每个标题都已经用过，新标题不得与其中任何标题重复，也不得与本批次其他新标题重复；如果同一事件跨章继续，必须用本章新增的人物行动、冲突结果或关系变化重新命名，不能沿用上一章的事件短语。",
             "相邻章节应避免无意义重复，但不要求按固定轮换表更换开局、冲突或结尾；以当前人物处境和主线需要为准。",
             (
-                "当前批次与全书最后5章收尾窗口有交集：窗口内只落实已经安排的直接后果、行动、关系变化或主角处境落点；"
-                "不得新增主要任务、主要敌人、未知信息或等待回答的悬念。"
+                "当前批次与全书终局收尾窗口有交集：窗口内只落实已经安排的直接后果、行动、关系变化或主角处境落点；"
+                "不得新增主要任务、主要敌人、未知信息或等待回答的悬念；最后3章是高潮结果兑现与收束的一部分，"
+                "高潮若在窗口内就把冲突结果、关系变化和最终落点合并到已发生的场景，高潮若在窗口前完成则只承接新的直接后果，不重复验证同一成果。"
                 if batch_terminal_overlap else
                 "上一批末章结尾已经是已发布触发点，下一批第一章必须从新反应、新结果或新阻力开始，不能复播末句、声音、动作落点或结论。"
             ),
         ]
         if batch_terminal_overlap and batch_start > 1:
             continuity_rules.append(
-                "收尾窗口批次的第一章承接上一章已经发生的结果，后续章节继续写窗口内部的直接后果，不另开新的连载主线。"
+                "收尾窗口批次的第一章承接上一章已经发生的结果，后续章节继续写高潮或其直接后果、关系落点和本部结果，不另开新的连载主线，也不重复展示已经成立的成果。"
             )
         continuity = {
             "required_absolute_range": [batch_start, batch_end],
@@ -12622,7 +12711,25 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
             return False
         index = self.current_chapter_index if chapter_index is None else int(chapter_index)
         target_id = str(chapter_id or self._current_chapter_id())
-        snapshot = deepcopy(project_snapshot) if isinstance(project_snapshot, dict) else self._ai_project_snapshot()
+        snapshot_started = time.perf_counter()
+        if isinstance(project_snapshot, dict):
+            # The caller already owns an isolated AI snapshot. Keep the UI
+            # thread from copying the full project a second time; the worker
+            # makes its private copy when its thread starts.
+            snapshot = project_snapshot
+            snapshot_source = "provided"
+        else:
+            snapshot = self._ai_project_snapshot()
+            snapshot_source = "built"
+        self._log_novel_perf(
+            "AI写作-准备上下文快照",
+            snapshot_started,
+            threshold_ms=80,
+            action=action,
+            chapter=index + 1,
+            snapshot_source=snapshot_source,
+            **self._novel_perf_summary(snapshot),
+        )
         self._context_build_token = int(getattr(self, "_context_build_token", 0) or 0) + 1
         token = str(self._context_build_token)
         self._context_build_pending = {
@@ -12817,16 +12924,23 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
             self._chapter_ai_preview_is_partial = False
             self._chapter_ai_preview_action = ""
             self._chapter_ai_preview_chapter_id = ""
-        btn.setText("扩写正文并补提纲和摘要")
-        if self._has_partial_chapter_ai_preview():
-            btn.setToolTip("重新扩写时会丢弃未完成预览，从章节提纲重写整章")
+        if self._single_chapter_ai_action_active():
+            btn.setText("中止扩写")
+            btn.setToolTip("中止当前单章扩写，保留已经生成的内容")
+            self._set_chapter_ai_button_danger(btn, True)
         else:
-            btn.setToolTip("先扩写完整正文，再根据实际正文补提纲和摘要/关键事实")
+            btn.setText("扩写正文并补提纲和摘要")
+            self._set_chapter_ai_button_danger(btn, False)
+            if self._has_partial_chapter_ai_preview():
+                btn.setToolTip("重新扩写时会丢弃未完成预览，从章节提纲重写整章")
+            else:
+                btn.setToolTip("先扩写完整正文，再根据实际正文补提纲和摘要/关键事实")
 
     def _reset_chapter_ai_sequence(self):
         self._chapter_ai_sequence_active = False
         self._chapter_ai_sequence_chapter_id = ""
         self._chapter_ai_sequence_started_outline = ""
+        self._refresh_chapter_ai_action_labels()
 
     def _stage_chapter_ai_draft_for_memory_finalize(self, final_text):
         """Keep a complete draft in preview until the state transaction commits."""
@@ -13267,11 +13381,15 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
         if not hasattr(self, "auto_expand_all_btn"):
             return
         if getattr(self, "_auto_expand_all_active", False):
-            current, total = self._auto_expand_all_chapter_progress()
-            progress = f" {current}/{total}" if current and total else ""
-            self.auto_expand_all_btn.setText(f"自动扩写全部{progress}")
+            self.auto_expand_all_btn.setText("中止自动扩写")
+            self.auto_expand_all_btn.setToolTip("中止当前自动扩写任务，保留已经完成的章节")
+            self._set_chapter_ai_button_danger(self.auto_expand_all_btn, True)
         else:
             self.auto_expand_all_btn.setText("自动扩写全部")
+            self.auto_expand_all_btn.setToolTip(
+                "跳过已有正文，按章节顺序自动完成所有未写章节；遇到失败会停止"
+            )
+            self._set_chapter_ai_button_danger(self.auto_expand_all_btn, False)
 
     def _stop_auto_expand_all(self, message=""):
         message_text = str(message or "").strip()
@@ -13369,7 +13487,12 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
         QTimer.singleShot(0, lambda p=source_path: self._launch_detached_auto_expand(p))
 
     def _create_detached_chapter_runner(
-        self, source_path, task_kind, chapter_index=None, chapter_id=""
+        self,
+        source_path,
+        task_kind,
+        chapter_index=None,
+        chapter_id="",
+        data_is_normalized=False,
     ):
         source_path = self._canonical_project_path(source_path)
         data = load_json_file(source_path, None)
@@ -13379,7 +13502,10 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
         runner._background_task_kind = str(task_kind or "chapter_ai")
         runner._save_draft_snapshot = lambda: None
         runner._notify_project_store_changed = lambda: None
-        runner._load_project_data(data, source_path, defer_helpers=True)
+        load_kwargs = {"defer_helpers": True}
+        if data_is_normalized:
+            load_kwargs["data_is_normalized"] = True
+        runner._load_project_data(data, source_path, **load_kwargs)
         if chapter_index is not None or chapter_id:
             chapters = runner.current_project.get("chapters", [])
             target_index = -1
@@ -13419,21 +13545,49 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
     def _launch_detached_single_chapter_ai(self, source_path, chapter_index, chapter_id):
         runner = None
         source_path = self._canonical_project_path(source_path)
+        perf_start = time.perf_counter()
         try:
+            save_started = time.perf_counter()
             saved_path = self._save_current_work(
-                "启动后台单章扩写", refresh_project_list=False
+                "启动后台单章扩写",
+                refresh_project_list=False,
+                update_draft=False,
+            )
+            self._log_novel_perf(
+                "启动后台单章扩写-保存项目",
+                save_started,
+                threshold_ms=0,
+                project_path=os.path.basename(source_path),
+                update_draft=False,
+                **self._novel_perf_summary(),
             )
             if not saved_path:
                 raise RuntimeError("项目保存失败，未启动后台单章扩写。")
+            runner_started = time.perf_counter()
             runner, _data = self._create_detached_chapter_runner(
                 source_path,
                 "single_chapter",
                 chapter_index=chapter_index,
                 chapter_id=chapter_id,
+                data_is_normalized=True,
+            )
+            self._log_novel_perf(
+                "启动后台单章扩写-创建运行器",
+                runner_started,
+                threshold_ms=0,
+                project_path=os.path.basename(source_path),
             )
             runner.run_chapter_ai_action("draft")
             self._update_detached_auto_source_lock()
             self._sync_detached_auto_status(runner)
+            self._log_novel_perf(
+                "启动后台单章扩写-入口总耗时",
+                perf_start,
+                threshold_ms=0,
+                project_path=os.path.basename(source_path),
+                chapter=int(chapter_index) + 1,
+                **self._novel_perf_summary(),
+            )
         except Exception as exc:
             runners = getattr(self, "_background_chapter_ai_runners", {})
             if isinstance(runners, dict) and runner is not None and runners.get(source_path) is runner:
@@ -13457,14 +13611,37 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
     def _launch_detached_auto_expand(self, source_path):
         runner = None
         source_path = self._canonical_project_path(source_path)
+        perf_start = time.perf_counter()
         try:
-            saved_path = self._save_current_work("启动后台自动扩写", refresh_project_list=False)
+            save_started = time.perf_counter()
+            saved_path = self._save_current_work(
+                "启动后台自动扩写",
+                refresh_project_list=False,
+                update_draft=False,
+            )
+            self._log_novel_perf(
+                "启动后台自动扩写-保存项目",
+                save_started,
+                threshold_ms=0,
+                project_path=os.path.basename(source_path),
+                update_draft=False,
+                **self._novel_perf_summary(),
+            )
             if not saved_path:
                 raise RuntimeError("项目保存失败，未启动后台任务。")
+            runner_started = time.perf_counter()
             runner, data = self._create_detached_chapter_runner(
-                source_path, "auto_expand"
+                source_path,
+                "auto_expand",
+                data_is_normalized=True,
             )
             runner._start_auto_expand_all_local()
+            self._log_novel_perf(
+                "启动后台自动扩写-创建运行器",
+                runner_started,
+                threshold_ms=0,
+                project_path=os.path.basename(source_path),
+            )
             self._update_detached_auto_source_lock()
             title = str((data.get("meta", {}) or {}).get("title", "") or os.path.basename(source_path))
             runners = getattr(self, "_background_chapter_ai_runners", {})
@@ -13476,6 +13653,14 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
             self.set_status_tip(
                 f"《{title}》已在后台自动扩写，可继续操作其他小说。"
                 f"当前后台任务：{active_count} 个。"
+            )
+            self._log_novel_perf(
+                "启动后台自动扩写-入口总耗时",
+                perf_start,
+                threshold_ms=0,
+                project_path=os.path.basename(source_path),
+                active_count=active_count,
+                **self._novel_perf_summary(),
             )
         except Exception as exc:
             runners = getattr(self, "_background_chapter_ai_runners", {})
@@ -13654,8 +13839,6 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
             if getattr(self, "fanqie_upload_btn", None) is not None:
                 read_aloud_controls.add(self.fanqie_upload_btn)
             for widget in child_widgets:
-                if widget is getattr(self, "chapter_ai_stop_btn", None):
-                    continue
                 if widget in read_aloud_controls:
                     continue
                 if isinstance(widget, (QPlainTextEdit, QTextEdit, QLineEdit)):
@@ -13687,24 +13870,47 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
                 detached_active = bool(detached_runner._status_has_active_work())
             except Exception:
                 detached_active = False
-        if hasattr(self, "chapter_ai_stop_btn"):
-            if detached_active and locked:
-                self.chapter_ai_stop_btn.setText("中止后台扩写")
-                self.chapter_ai_stop_btn.setToolTip("中止当前项目正在后台运行的章节任务")
-                self.chapter_ai_stop_btn.setVisible(True)
-                self.chapter_ai_stop_btn.setEnabled(True)
+        task_kind = str(
+            getattr(detached_runner, "_background_task_kind", "") or ""
+        ) if detached_runner is not None else ""
+        detached_auto_active = detached_active and locked and task_kind == "auto_expand"
+        draft_btn = getattr(self, "_chapter_ai_buttons_by_action", {}).get("draft")
+        if draft_btn is not None:
+            if detached_active and locked and task_kind == "single_chapter":
+                draft_btn.setEnabled(True)
+                draft_btn.setText("中止扩写")
+                draft_btn.setToolTip("中止当前后台单章扩写，保留已经生成的内容")
+                self._set_chapter_ai_button_danger(draft_btn, True)
+            elif locked:
+                draft_btn.setEnabled(False)
+                draft_btn.setText("扩写正文并补提纲和摘要")
+                draft_btn.setToolTip("当前项目正在后台处理章节")
+                self._set_chapter_ai_button_danger(draft_btn, False)
             else:
-                self.chapter_ai_stop_btn.setText("中止")
-                self.chapter_ai_stop_btn.setToolTip("中止当前 AI 辅助生成")
-                self.chapter_ai_stop_btn.setVisible(False)
+                self._refresh_chapter_ai_action_labels()
         if hasattr(self, "auto_expand_all_btn"):
-            self.auto_expand_all_btn.setEnabled(not locked)
-            if locked:
-                task_kind = str(getattr(detached_runner, "_background_task_kind", "") or "")
+            if detached_auto_active:
+                self.auto_expand_all_btn.setEnabled(True)
+                self.auto_expand_all_btn.setText("中止自动扩写")
+                self.auto_expand_all_btn.setToolTip("中止当前自动扩写任务，保留已经完成的章节")
+                self._set_chapter_ai_button_danger(self.auto_expand_all_btn, True)
+            elif locked:
+                self.auto_expand_all_btn.setEnabled(False)
                 task_label = "后台单章扩写中" if task_kind == "single_chapter" else "后台自动扩写中"
                 self.auto_expand_all_btn.setText(task_label)
+                self._set_chapter_ai_button_danger(self.auto_expand_all_btn, False)
+            elif getattr(self, "_auto_expand_all_active", False):
+                self.auto_expand_all_btn.setEnabled(True)
+                self.auto_expand_all_btn.setText("中止自动扩写")
+                self.auto_expand_all_btn.setToolTip("中止当前自动扩写任务，保留已经完成的章节")
+                self._set_chapter_ai_button_danger(self.auto_expand_all_btn, True)
             else:
+                self.auto_expand_all_btn.setEnabled(True)
                 self.auto_expand_all_btn.setText("自动扩写全部")
+                self.auto_expand_all_btn.setToolTip(
+                    "跳过已有正文，按章节顺序自动完成所有未写章节；遇到失败会停止"
+                )
+                self._set_chapter_ai_button_danger(self.auto_expand_all_btn, False)
         if locked and hasattr(self, "project_hint"):
             self.project_hint.setText("当前项目正在后台处理章节，可查看最新已保存内容；任务完成后自动恢复编辑。")
         elif hasattr(self, "project_hint"):
@@ -13788,11 +13994,7 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
             pending_count=len(pending),
             pending_chapter_indexes=[index + 1 for index in pending],
         )
-        project_total = len(self.current_project.get("chapters", [])) if isinstance(self.current_project, dict) else 0
-        if hasattr(self, "auto_expand_all_btn") and pending and project_total:
-            self.auto_expand_all_btn.setText(f"自动扩写全部 {pending[0] + 1}/{project_total}")
-        else:
-            self._set_auto_expand_all_button_text()
+        self._set_auto_expand_all_button_text()
         self._log_novel_perf(
             "自动扩写启动-入口总耗时",
             perf_start,
@@ -16829,6 +17031,7 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
                 self._set_chapter_ai_actions_enabled(False)
                 self.set_status_tip("正在后台准备本章资料...")
                 self._chapter_ai_sequence_active = True
+                self._refresh_chapter_ai_action_labels()
                 self._schedule_chapter_task_callback(
                     0, lambda tab: tab._start_chapter_ai_sequence()
                 )
@@ -16863,7 +17066,18 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
             )
             if not local_active and detached._status_has_active_work():
                 detached.stop_chapter_ai_action()
-                self.set_status_tip("正在中止后台自动扩写...")
+                task_kind = str(getattr(detached, "_background_task_kind", "") or "")
+                if task_kind == "single_chapter":
+                    draft_btn = getattr(self, "_chapter_ai_buttons_by_action", {}).get("draft")
+                    if draft_btn is not None:
+                        draft_btn.setEnabled(True)
+                        draft_btn.setText("扩写正文并补提纲和摘要")
+                        draft_btn.setToolTip("先扩写完整正文，再根据实际正文补提纲和摘要/关键事实")
+                        self._set_chapter_ai_button_danger(draft_btn, False)
+                    status = "正在中止后台单章扩写..."
+                else:
+                    status = "正在中止后台自动扩写..."
+                self.set_status_tip(status)
                 return
         if getattr(self, "_auto_expand_all_active", False):
             completed = int(getattr(self, "_auto_expand_all_completed", 0) or 0)
@@ -16906,6 +17120,9 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
         ):
             return
         self._chapter_ai_stop_requested_by_user = True
+        if not getattr(self, "_auto_expand_all_active", False):
+            self._reset_chapter_ai_sequence()
+            self._set_chapter_ai_actions_enabled(True)
         self.set_status_tip("正在中止 AI 辅助生成...")
         try:
             if worker is not None and worker.isRunning():

@@ -249,7 +249,7 @@ class NovelAnalysisWorkerTests(unittest.TestCase):
         self.assertIn("narrative_strategy_profile", prompt)
         self.assertIn("用户已确认的只读规划基础", prompt)
 
-    def test_missing_outline_uses_terminal_ending_guidance_only_in_last_five(self):
+    def test_missing_outline_uses_terminal_ending_guidance_only_in_last_three(self):
         ordinary = NovelChapterPlanWorker(
             "http://example.test", "key", "model", "context", 30000, 3000, 1,
             total_chapter_count=10, existing_chapter_count=0,
@@ -261,7 +261,7 @@ class NovelAnalysisWorkerTests(unittest.TestCase):
 
         terminal = NovelChapterPlanWorker(
             "http://example.test", "key", "model", "context", 30000, 3000, 1,
-            total_chapter_count=10, existing_chapter_count=5,
+            total_chapter_count=10, existing_chapter_count=7,
         )
         terminal_plan = terminal._normalize_plan({
             "chapters": [{"index": 1, "title": "结果落地"}],
@@ -280,7 +280,7 @@ class NovelAnalysisWorkerTests(unittest.TestCase):
         self.assertIn("这是全书最后一章", final_outline)
         self.assertNotIn("新信息或新阻力", final_outline)
 
-    def test_chapter_plan_prompt_marks_only_the_last_five_chapter_window(self):
+    def test_chapter_plan_prompt_marks_only_the_last_three_chapter_window(self):
         worker = NovelChapterPlanWorker(
             "http://example.test",
             "key",
@@ -295,8 +295,8 @@ class NovelAnalysisWorkerTests(unittest.TestCase):
 
         prompt = worker._analysis_prompt()
 
-        self.assertIn("最后5章收尾窗口", prompt)
-        self.assertIn("第163-167章", prompt)
+        self.assertIn("最后3章收尾窗口", prompt)
+        self.assertIn("第165-167章", prompt)
         self.assertIn("不改变当前阶段边界、批次数量、章节总数", prompt)
         self.assertIn("不得因为收尾要求新增、拆分或合并章节", prompt)
         self.assertIn("不要留下必须靠后续章节才能解决的主线任务", prompt)
@@ -314,7 +314,7 @@ class NovelAnalysisWorkerTests(unittest.TestCase):
             total_chapter_count=167,
             existing_chapter_count=150,
         )
-        self.assertNotIn("最后5章收尾窗口", ordinary._analysis_prompt())
+        self.assertNotIn("最后3章收尾窗口", ordinary._analysis_prompt())
         self.assertIn("不得重新生成、改写、总结或返回", prompt)
         self.assertNotIn('JSON 结构：{"summary"', prompt)
         self.assertNotIn('"narrative_strategy_profile":{}', prompt)
@@ -853,7 +853,7 @@ class NovelAnalysisWorkerTests(unittest.TestCase):
         self.assertIn("不是硬性字数要求", prompt)
 
     def test_terminal_fiction_prompt_overrides_generic_suspense_rule(self):
-        terminal_context = "【全书最后5章收尾窗口｜第163-167章】\n当前章节是第166章。"
+        terminal_context = "【全书最后3章收尾窗口｜第165-167章】\n当前章节是第166章。"
         worker = NovelWritingWorker(
             "http://example.test", "key", "model", "draft", terminal_context
         )

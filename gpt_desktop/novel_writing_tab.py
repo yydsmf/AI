@@ -9287,16 +9287,6 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
                 used += row_cost
             return rows
 
-        stage_skeletons = framework.get("stage_skeleton", [])
-        stage_skeletons = stage_skeletons if isinstance(stage_skeletons, list) else []
-        skeleton_by_id = {}
-        for skeleton in stage_skeletons:
-            if not isinstance(skeleton, dict):
-                continue
-            skeleton_id = _canonical_chapter_plan_stage_id(skeleton.get("id", ""))
-            if skeleton_id:
-                skeleton_by_id[skeleton_id] = skeleton
-
         stage_fields = (
             "id", "name", "start_chapter", "end_chapter", "summary", "main_conflict",
             "relationship_changes", "world_reveals", "turning_points",
@@ -9309,11 +9299,8 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
                 continue
             row = {}
             stage_id = _canonical_chapter_plan_stage_id(item.get("id", ""))
-            skeleton = skeleton_by_id.get(stage_id, {})
             for key in stage_fields:
                 value = item.get(key, "")
-                if value in (None, "", [], {}) and isinstance(skeleton, dict):
-                    value = skeleton.get(key, "")
                 if key == "ordered_events":
                     events = []
                     for event_index, event in enumerate(
@@ -18861,7 +18848,6 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
         data["timeline"] = format_creation_preview(
             "stage_plan",
             {
-                "stage_skeleton": framework.get("stage_skeleton", []),
                 "book_contract": framework.get("book_contract", {}),
                 "stage_plan": stage_plan,
                 "chapter_plan_note": framework.get("chapter_plan_note", ""),

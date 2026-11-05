@@ -58,8 +58,9 @@ CREATION_WIZARD_NAME_HISTORY_FILE = os.path.join(
     HISTORY_DIR,
     "novel_creation_wizard_name_history.json",
 )
-CREATION_WIZARD_NAME_HISTORY_LIMIT = 160
-CREATION_WIZARD_NAME_REFERENCE_LIMIT = 36
+CREATION_WIZARD_NAME_HISTORY_LIMIT = 1000
+CREATION_WIZARD_NAME_REFERENCE_LIMIT = 100
+CREATION_WIZARD_NAME_PROJECT_SCAN_VERSION = 2
 NOVEL_AUTOSAVE_DRAFT_FILE = os.path.join(
     HISTORY_DIR,
     "novel_draft.json",
@@ -139,8 +140,6 @@ def _creation_batch_display_name(batch_kind, stage_index=-1, total_stages=0):
         return "小说圣经、世界规则"
     if batch_kind == "bible_assets":
         return "人物、设定、伏笔"
-    if batch_kind == "stage_skeleton":
-        return "全书阶段骨架"
     if batch_kind == "stage_plan_stage":
         try:
             stage_number = max(1, int(stage_index) + 1)
@@ -472,6 +471,11 @@ CREATION_CHARACTER_PROFILE_GUIDANCE = """
 """.strip()
 
 
+CREATION_RECENT_NAME_GUIDANCE = """
+命名参考 n.recent_character_names 列出最近出现过的人物姓名。起名时避开名单中的姓名及相似姓名：不要直接照抄、只换一个字、使用同音或近音名、沿用相同姓氏再搭配近似名字，或重复相近的字数、读音节奏和整体结构；尽量从姓氏、读音、字形、字数和姓名节奏上拉开差异，不批量复用参考名单里的姓氏。姓名仍须符合题材、时代和人物身份，保持自然好读，不要为避重硬造生僻名。
+""".strip()
+
+
 CREATION_FORESHADOW_CLOSURE_GUIDANCE = """
 伏笔必须是能够在正文中验收的单一闭环，不是世界观百科、人物成长方向或整本书的抽象主题。每条伏笔只保留一个核心问题、一个核心承诺和一个可观察的回收结果：现在出现的具体线索是什么，人物当前怎样误解或理解，后面哪一次具体行动/对话/对抗会给出答案，以及答案会让谁的判断、关系、资源、身份或局势发生什么可见变化。不要把“身份真相、幕后势力、三年前往事、力量来源、未来世界”捆成一条伏笔，也不要用“完整真相仍未知”“后续影响仍未知”“来源和机制仍未揭示”把多条问题塞进同一条记录；这些内容应拆成独立伏笔，或留在小说圣经/世界规则/人物长期资料中。
 普通伏笔的揭示结果必须能直接回答这条线索提出的核心问题，并在场景中留下明确结果；普通伏笔的 remaining_secret 填“无”或只写不影响本部闭环的余波。只有真正贯穿全书核心矛盾、结尾仍需要保留余味的少量主线谜团，才允许 payoff_stage 写“结尾保留”，且不能把普通伏笔批量标成长期伏笔。普通伏笔优先安排在 setup_stage 之后的后续阶段完成回收；同阶段回收只适用于短线且能在一个连续场景内完整闭合的线索。
@@ -487,7 +491,7 @@ CREATION_ENDING_DIRECTION_GUIDANCE = """
 
 
 CREATION_INSPIRATION_FACT_GUIDANCE = """
-作者灵感中明确写出的事实都属于故事底盘的一部分，要完整吸收并保留事实含义。人物身份、人生阶段、职业或学业状态、关系状态、时间顺序、已经发生的事件、具体地点、关键限制、爽点和结局方向，都要在后续资料中继续体现；与主角处境、故事开场和主线直接相关的关键事实，要在每个故事方向的简介中自然写出来，不能只留在主角字段或资料字段里。人物字段、故事引子、简介、主线和关系线表达同一事实时，要保持同一时间、身份和因果关系。若灵感明确写了按阶段或按章节安排的境界、修为、等级、能力或其它连续状态，这不是可以被一句话概括的背景，而是后续阶段规划和章节规划的执行约束，要尽量保留对应节点和人物状态；作者没有明确的部分保留自由创作空间。五个方向可以用不同的场景、人物选择、冲突形状和推进方式呈现这些事实，差异继续来自故事本身。
+作者灵感中明确写出的事实都属于故事底盘的一部分，要完整吸收并保留事实含义。人物身份、人生阶段、职业或学业状态、关系状态、时间顺序、已经发生的事件、具体地点、关键限制、爽点和结局方向，都要在后续资料中继续体现；与主角处境、故事开场和主线直接相关的关键事实，要在故事简介中自然写出来，不能只留在人物字段或资料字段里。人物字段、故事引子、简介、主线和关系线表达同一事实时，要保持同一时间、身份和因果关系。若灵感明确写了按阶段或按章节安排的境界、修为、等级、能力或其它连续状态，这不是可以被一句话概括的背景，而是后续阶段规划和章节规划的执行约束，要尽量保留对应节点和人物状态；作者没有明确的部分保留自由创作空间。不同故事方向可以用不同的场景、人物选择、冲突形状和推进方式呈现这些事实，差异继续来自故事本身。
 """.strip()
 
 
@@ -522,8 +526,8 @@ STEP_PROMPTS = {
 
 先完整吸收作者灵感和全部选择，再开始写。五个方向都使用灵感中的核心内容，但各自从不同的人物选择、现实压力、关系变化或题材机制长出自己的故事；差异要来自故事本身，不靠只换名字、地点或几句设定。五个方向可以采用完全不同的剧情发动方式，不要求统一的冲突顺序、固定的网文结构或相同的推进节奏。
 
-如果作者已经明确提供了书名，五个方向的书名必须原样使用这个书名，不改字、不换说法、不另起书名；五个方向的差异来自人物选择、现实压力、关系变化和剧情走法。只有作者没有明确提供书名时，才为五个方向分别拟题。五个方向都要像真正不同的小说来写人：每个方向的主角都要有明确姓名，主角姓名不能重复，也不能只是换一个字；重要配角的姓名也尽量错开。不要连续使用同一个姓氏、相同的姓名节奏或同一套常见网文姓名模板，要让姓名随着题材、时代、人物身份、男频或女频方向和故事气质自然变化。名字要好读、好记、有辨识度，不为了变化硬塞生僻字；简介、主角字段和人物关系里使用同一个姓名，不能前后改名。
-命名参考中的姓名和姓氏来自本地已经创建过的其它项目，只用来帮助这次换一套自然的命名方式：不要直接复用其中的姓名，不要只改一个字，也不要连续沿用同一批姓氏和姓名节奏。参考为空时，也要主动避开最常见的固定网文姓名模板；仍然以符合题材、时代、人物身份和故事气质为先，不要为了不同而使用生硬或生僻的名字。
+如果作者已经明确提供了书名，五个方向的书名必须原样使用这个书名，不改字、不换说法、不另起书名；五个方向的差异来自人物选择、现实压力、关系变化和剧情走法。只有作者没有明确提供书名时，才为五个方向分别拟题。五个方向都要像真正不同的小说来写人：人物姓名要明确且彼此有辨识度，不要让不同方向或同一方向中的人物使用相同或近似姓名。名字要好读、好记，不为了变化硬塞生僻字；简介、人物关系和人物字段里使用同一个姓名，不能前后改名。
+{CREATION_RECENT_NAME_GUIDANCE}
 
 下面示例中的空对象只是为了避免重复占篇幅，实际返回时 1、2、3、4、5 五个槽位都必须各自完整填写十个字段，不能返回空对象，也不能把多个故事合并到一个槽位。
 
@@ -533,6 +537,8 @@ STEP_PROMPTS = {
     "bible": f"""{COMMON_CREATION_RULES}
 
 现在和作者一起把已经选定的故事底盘搭好。下面的“已经选定的故事”是唯一的故事来源：稳住它的主角、处境、地点、核心悬念、主要关系和结尾方向，再补足长篇故事继续生长所需要的事实。新增人物、新势力和新秘密都要服务于原来的主线，并在后续事件中拥有具体作用。
+
+{CREATION_RECENT_NAME_GUIDANCE}
 
 这一次要把小说圣经、世界规则、人物、设定和伏笔一起写出来，但五部分各自回答不同的问题：
 这一步只根据已经选定的故事和作者偏好搭建底盘，后面的阶段规划会读取这里的完整资料。这里写整本书的骨架和长期事实，让后面的场景自然长出来；剧情细节留到阶段和章节中由人物经历展开。
@@ -544,6 +550,8 @@ STEP_PROMPTS = {
 世界规则回答“这个世界怎样运转”。它写日常生活、空间和社会关系、异常或力量从哪里来、什么条件会让它发生、人物要为触碰它付出什么，以及不同人物会怎样应对。它只写长期成立的运行方式；没有明确力量体系的题材，世界规则就围绕空间、社会、异常和代价展开；明确有修炼或境界的题材，再写力量来源和总边界，详细层次统一放进设定库里的“规则”条目。
 
 人物回答“这些人各自想得到或守住什么”。人物的欲望、顾虑、秘密、人物性格/特点、语言风格和与主角的关系，都要在原故事里找到根，并能在具体场景中推动选择。人物卡中的性格、语言和备注只保留长期资料，不写固定笑点、固定口头禅、具体道具或食物、固定动作、某章行为、出场桥段和临时反应；人物之间怎样靠近、利用、误会或翻脸，交给阶段和章节中的具体事情表现，不要把场景行为塞回人物卡。设定库统一收录后面会反复用到的地点、物件、制度、势力、能力边界和日常场景。伏笔写成现在能看见的线索、人物当下的理解，以及它在后续阶段会怎样改变判断、关系和行动；把正式故事内容写进 description、revealed 和 remaining_secret，notes 留空。普通伏笔必须能够在后续某个具体场景中完整回答一个明确问题，不能只写“真相更大”“影响深远”“未来会揭开”这类宽泛方向。
+
+人物姓名以已经选定的这个故事简介及其中明确写出的姓名为准。第二步整理人物时必须原样沿用这些既定姓名，不得因为命名参考而过滤、替换、改写或遗漏；命名参考只用于为新增人物起名，不影响已确定人物的姓名。
 
 {CREATION_LORE_TYPE_GUIDANCE}
 
@@ -772,30 +780,40 @@ def _creation_premise_name(value):
 def _creation_character_names(records):
     if not isinstance(records, list):
         return []
-    marked = []
-    fallback = []
+    names = []
+    seen = set()
     for item in records:
         if not isinstance(item, dict):
             continue
         name = _creation_clean_name(item.get("name"))
-        if not name:
+        key = _creation_name_key(name)
+        if not name or not key or key in seen:
             continue
-        fallback.append(name)
-        role = _as_text(item.get("role"))
-        if any(marker in role for marker in ("主角", "男主", "女主")):
-            marked.append(name)
-    return marked or fallback[:1]
+        seen.add(key)
+        names.append(name)
+    return names
 
 
-def _creation_project_protagonist_names(payload):
+def _creation_project_character_names(payload):
     if not isinstance(payload, dict):
         return []
-    names = _creation_character_names(payload.get("characters"))
-    if names:
-        return names
     framework = payload.get("creation_framework")
-    if isinstance(framework, dict):
-        names = _creation_character_names(framework.get("characters"))
+    framework = framework if isinstance(framework, dict) else {}
+    sources = [
+        payload.get("characters"),
+        framework.get("characters"),
+    ]
+    for container in (payload.get("bible"), framework.get("bible")):
+        if isinstance(container, dict):
+            sources.append(container.get("characters"))
+    names = []
+    seen = set()
+    for source in sources:
+        for name in _creation_character_names(source):
+            key = _creation_name_key(name)
+            if key not in seen:
+                seen.add(key)
+                names.append(name)
     return names
 
 
@@ -809,16 +827,51 @@ def _creation_history_records(payload):
     for item in records:
         if isinstance(item, dict):
             name = _creation_clean_name(item.get("name"))
+            created_at_ns = item.get("created_at_ns", 0)
         else:
             name = _creation_clean_name(item)
+            created_at_ns = 0
         if name:
+            try:
+                created_at_ns = max(0, int(created_at_ns or 0))
+            except (TypeError, ValueError, OverflowError):
+                created_at_ns = 0
             result.append({
                 "name": name,
-                "created_at_ns": int(item.get("created_at_ns", 0) or 0)
-                if isinstance(item, dict)
-                else 0,
+                "created_at_ns": created_at_ns,
             })
     return result
+
+
+def _merge_creation_name_records(records, limit=CREATION_WIZARD_NAME_HISTORY_LIMIT):
+    latest = {}
+    order = {}
+    for index, item in enumerate(records if isinstance(records, list) else []):
+        name = _creation_clean_name(item.get("name") if isinstance(item, dict) else item)
+        key = _creation_name_key(name)
+        if not name or not key:
+            continue
+        try:
+            created_at_ns = max(
+                0,
+                int(item.get("created_at_ns", 0) or 0)
+                if isinstance(item, dict) else 0,
+            )
+        except (TypeError, ValueError, OverflowError):
+            created_at_ns = 0
+        previous = latest.get(key)
+        if previous is None or created_at_ns >= previous["created_at_ns"]:
+            latest[key] = {"name": name, "created_at_ns": created_at_ns}
+            order[key] = index
+    ordered = sorted(
+        latest.items(),
+        key=lambda entry: (entry[1]["created_at_ns"], order[entry[0]]),
+    )
+    try:
+        limit = max(1, int(limit))
+    except (TypeError, ValueError):
+        limit = CREATION_WIZARD_NAME_HISTORY_LIMIT
+    return [item for _key, item in ordered[-limit:]]
 
 
 def _bootstrap_creation_name_history():
@@ -827,7 +880,11 @@ def _bootstrap_creation_name_history():
     if not isinstance(data, dict):
         data = {}
     records = _creation_history_records(data)
-    if data.get("project_scan_complete"):
+    try:
+        schema_version = int(data.get("schema_version", 0) or 0)
+    except (TypeError, ValueError, OverflowError):
+        schema_version = 0
+    if data.get("project_scan_complete") and schema_version >= CREATION_WIZARD_NAME_PROJECT_SCAN_VERSION:
         return records
 
     project_dir = os.path.join(HISTORY_DIR, "novel_projects")
@@ -839,14 +896,19 @@ def _bootstrap_creation_name_history():
         ]
     except OSError:
         paths = []
-    paths.sort(
-        key=lambda path: os.path.getmtime(path) if os.path.exists(path) else 0,
-        reverse=True,
-    )
+    paths.sort(key=_creation_path_mtime_ns, reverse=True)
     for path in paths:
         payload = load_json_file(path, {})
-        for name in _creation_project_protagonist_names(payload):
-            records.append({"name": name, "created_at_ns": 0})
+        try:
+            project_updated_at = os.stat(path).st_mtime_ns
+        except OSError:
+            project_updated_at = 0
+        for name in _creation_project_character_names(payload):
+            records.append({
+                "name": name,
+                "source": "project_scan",
+                "created_at_ns": project_updated_at,
+            })
 
     draft_dir = CREATION_WIZARD_DRAFT_DIR
     try:
@@ -859,31 +921,46 @@ def _bootstrap_creation_name_history():
         draft_paths = []
     for path in draft_paths:
         payload = load_json_file(path, {})
+        try:
+            draft_updated_at = os.stat(path).st_mtime_ns
+        except OSError:
+            draft_updated_at = 0
         candidates = payload.get("premise_candidates", []) if isinstance(payload, dict) else []
         for candidate in candidates if isinstance(candidates, list) else []:
             if isinstance(candidate, dict):
                 name = _creation_premise_name(candidate.get("protagonist"))
                 if name:
-                    records.append({"name": name, "created_at_ns": 0})
+                    records.append({"name": name, "created_at_ns": draft_updated_at})
         step_results = payload.get("step_results", {}) if isinstance(payload, dict) else {}
         bible = step_results.get("bible", {}) if isinstance(step_results, dict) else {}
         for name in _creation_character_names(bible.get("characters") if isinstance(bible, dict) else []):
-            records.append({"name": name, "created_at_ns": 0})
+            records.append({"name": name, "created_at_ns": draft_updated_at})
 
-    data["schema_version"] = 1
+    data["schema_version"] = CREATION_WIZARD_NAME_PROJECT_SCAN_VERSION
     data["project_scan_complete"] = True
-    data["records"] = records[-CREATION_WIZARD_NAME_HISTORY_LIMIT:]
+    data["records"] = _merge_creation_name_records(records)
     save_json_file(CREATION_WIZARD_NAME_HISTORY_FILE, data)
     return _creation_history_records(data)
 
 
+def _creation_path_mtime_ns(path):
+    try:
+        return os.stat(path).st_mtime_ns
+    except OSError:
+        return 0
+
+
 def _creation_name_references(current_names=None):
-    records = _bootstrap_creation_name_history()
+    _bootstrap_creation_name_history()
     data = load_json_file(CREATION_WIZARD_NAME_HISTORY_FILE, {})
-    records.extend(_creation_history_records(data))
+    records = sorted(
+        _creation_history_records(data),
+        key=lambda item: item.get("created_at_ns", 0),
+        reverse=True,
+    )
     ordered = []
     seen = set()
-    for item in list(current_names or []) + list(reversed(records)):
+    for item in list(current_names or []) + records:
         name = _creation_clean_name(item.get("name") if isinstance(item, dict) else item)
         key = _creation_name_key(name)
         if not name or not key or key in seen:
@@ -901,9 +978,9 @@ def _creation_name_references(current_names=None):
             surnames.append(surname)
     result = {}
     if ordered:
-        result["recent_protagonist_names"] = ordered
+        result["recent_character_names"] = ordered
     if surnames:
-        result["recent_surnames"] = surnames[:18]
+        result["recent_surnames"] = surnames
     return result
 
 
@@ -923,16 +1000,23 @@ def remember_creation_wizard_names(names, source="premise"):
         data = {}
     records = _creation_history_records(data)
     created_at_ns = time.time_ns()
-    existing = {_creation_name_key(item.get("name")): item for item in records}
+    new_records = []
     for name in values:
-        existing[_creation_name_key(name)] = {
+        new_records.append({
             "name": name,
             "source": _as_text(source) or "premise",
             "created_at_ns": created_at_ns,
-        }
-    data["schema_version"] = 1
+        })
+    try:
+        schema_version = int(data.get("schema_version", 0) or 0)
+    except (TypeError, ValueError, OverflowError):
+        schema_version = 0
+    data["schema_version"] = max(
+        CREATION_WIZARD_NAME_PROJECT_SCAN_VERSION,
+        schema_version,
+    )
     data["project_scan_complete"] = bool(data.get("project_scan_complete"))
-    data["records"] = list(existing.values())[-CREATION_WIZARD_NAME_HISTORY_LIMIT:]
+    data["records"] = _merge_creation_name_records(records + new_records)
     save_json_file(CREATION_WIZARD_NAME_HISTORY_FILE, data)
 
 
@@ -3037,8 +3121,6 @@ def _expand_creation_transport(step, payload):
     if step == "stage_plan":
         if "planning_schema_version" not in data and "v" in data:
             data["planning_schema_version"] = data.get("v", "2")
-        if "stage_skeleton" not in data and isinstance(data.get("g"), list):
-            data["stage_skeleton"] = data.get("g", [])
         if "book_contract" not in data and isinstance(data.get("k"), (dict, list)):
             data["book_contract"] = _expand_stage_contract_transport(data["k"])
         if "chapter_plan_note" not in data and "n" in data:
@@ -3198,6 +3280,18 @@ def normalize_creation_result(
                 foreshadow_stage_count=foreshadow_stage_count,
             )
         )
+        if any(
+            key in payload
+            for key in ("stage_directions", "stage_direction", "directions", "route", "阶段方向")
+        ):
+            result["stage_directions"] = _normalize_stage_direction(
+                _first_value(
+                    payload,
+                    ("stage_directions", "stage_direction", "directions", "route", "阶段方向"),
+                    [],
+                ),
+                total_words,
+            )
         return result
     if step == "story_assets":
         return _normalize_story_assets_fields(
@@ -3224,15 +3318,6 @@ def normalize_creation_result(
             "planning_schema_version": _as_text(
                 _first_value(payload, ("planning_schema_version", "schema_version"), "2")
             ) or "2",
-            "stage_skeleton": _normalize_stage_skeleton(
-                _first_value(
-                    payload,
-                    ("stage_skeleton", "skeleton", "full_book_skeleton", "全书阶段骨架"),
-                    [],
-                ),
-                total_words,
-                average_chapter_words,
-            ),
             "book_contract": contract,
             "stage_plan": normalized,
             "foreshadow_schedule": _normalize_foreshadow_schedule(
@@ -3379,7 +3464,6 @@ def creation_wizard_draft_from_project_draft(project):
             "selected": deepcopy(selected),
         },
         "stage_plan": {
-            "stage_skeleton": deepcopy(framework.get("stage_skeleton", [])),
             "stage_plan": deepcopy(framework.get("stage_plan", [])),
             "foreshadow_schedule": deepcopy(framework.get("foreshadow_schedule", [])),
             "chapter_plan_note": _as_text(framework.get("chapter_plan_note")),
@@ -3739,29 +3823,6 @@ def _format_stage_state_preview(value):
 
 def _format_stage_plan_preview(result):
     lines = []
-    skeleton = result.get("stage_skeleton", [])
-    if isinstance(skeleton, list) and skeleton:
-        skeleton_lines = ["全书阶段骨架："]
-        for index, item in enumerate(skeleton, 1):
-            if not isinstance(item, dict):
-                continue
-            stage_id = _as_text(item.get("id")) or f"S{index:02d}"
-            name = _as_text(item.get("name")) or f"阶段{index}"
-            start = _as_text(item.get("start_chapter"))
-            end = _as_text(item.get("end_chapter"))
-            range_text = f"（第{start}—{end}章）" if start and end else ""
-            skeleton_lines.append(f"{stage_id} · {name}{range_text}")
-            summary = _as_text(item.get("summary"))
-            if summary:
-                skeleton_lines.append(f"  主线变化：{summary}")
-            turns = _normalize_stage_text_list(item.get("turning_points", []))
-            if turns:
-                skeleton_lines.append("  关键转折：" + "；".join(turns))
-            end_state = _as_text(item.get("end_state"))
-            if end_state:
-                skeleton_lines.append(f"  阶段结束：{end_state}")
-        if len(skeleton_lines) > 1:
-            lines.append("\n".join(skeleton_lines))
     contract = result.get("book_contract", {})
     contract_labels = (
         ("hard_facts", "全书固定事实"),
@@ -4038,51 +4099,6 @@ def _creation_stage_batch_specs(total_words, average_chapter_words):
             "total_chapters": total_chapters,
         })
     return specs
-
-
-def _normalize_stage_skeleton(value, total_words=500000, average_chapter_words=3000):
-    """Normalize the compact whole-book stage anchor without changing stage data."""
-    if isinstance(value, dict):
-        value = _first_value(value, ("stages", "items", "g", "阶段"), [])
-    raw_items = _as_list(value)
-    if not raw_items:
-        return []
-    specs = _creation_stage_batch_specs(total_words, average_chapter_words)
-    by_index = {}
-    for position, raw in enumerate(raw_items):
-        if isinstance(raw, (list, tuple)):
-            raw = _compact_record(
-                raw,
-                ("id", "name", "summary", "turning_points", "end_state"),
-            )
-        if not isinstance(raw, dict):
-            continue
-        raw_id = _as_text(_first_value(raw, ("id", "stage_id", "阶段编号", "i")))
-        stage_index = _creation_stage_index(raw_id)
-        if stage_index < 0:
-            stage_index = position if position < len(specs) else -1
-        if not 0 <= stage_index < len(specs) or stage_index in by_index:
-            continue
-        turning_points = _normalize_stage_text_list(
-            _first_value(raw, ("turning_points", "turns", "关键转折", "转折"), [])
-        )
-        row = {
-            "id": specs[stage_index]["id"],
-            "name": _as_text(_first_value(raw, ("name", "title", "阶段名称"))),
-            "start_chapter": specs[stage_index]["start_chapter"],
-            "end_chapter": specs[stage_index]["end_chapter"],
-            "target_words": specs[stage_index]["target_words"],
-            "summary": _as_text(
-                _first_value(raw, ("summary", "core_conflict", "main_line", "阶段主线"))
-            ),
-            "turning_points": turning_points,
-            "end_state": _as_text(
-                _first_value(raw, ("end_state", "ending_state", "阶段结束", "结束状态"))
-            ),
-        }
-        if row["name"] or row["summary"] or row["turning_points"] or row["end_state"]:
-            by_index[stage_index] = row
-    return [by_index[index] for index in sorted(by_index)]
 
 
 def _compact_stage_plan_handoff(stage_plan):
@@ -4375,7 +4391,6 @@ def build_chapter_plan_foundation(framework):
             "version": "1",
         },
         "book_contract": book_contract,
-        "stage_skeleton": deepcopy(framework.get("stage_skeleton", [])),
         "structured_stages": structured_stages,
         "terminal_contract": terminal_contract,
         "arcs": arcs,
@@ -5693,31 +5708,6 @@ c 中每项只能使用 n、r、g、s、p、v、q；l 中每项只能使用 n、
             prompt += """
 
 补充方向：让人物、设定和伏笔都能在后续场景中落地。伏笔的阶段位置表示它如何进入人物生活、如何在行动和关系变化中逐步显出意义；让线索从当前理解出发，在后续重要事件、人物关系和关键转折中逐步显出新的意义。"""
-        elif self.creation_batch == "stage_skeleton":
-            stage_specs = _creation_stage_batch_specs(
-                total_words,
-                average_chapter_words,
-            )
-            stage_count = len(stage_specs)
-            stage_ranges = "；".join(
-                f"{item['id']}（第{item['start_chapter']}—{item['end_chapter']}章）"
-                for item in stage_specs
-            )
-            skeleton_shape = ",".join(
-                f'["{item["id"]}","阶段名称","这一阶段的主线变化",["关键转折一","关键转折二"],"阶段结束时的人物和局势"]'
-                for item in stage_specs
-            )
-            prompt = f"""{COMMON_CREATION_RULES}
-
-读取作者选定的故事、用户确认的全书阶段方向和完整故事底盘，在正式生成十万字阶段规划前，先建立一份简短的全书阶段骨架。阶段方向是每十万字阶段的宏观卖点、场景转场、关键人物变化和不可逆结果；骨架必须逐阶段承接这些方向，不能只写抽象的“升级、扩大、加压”，也不能把多个阶段压回同一地点或同一类日常事务。它只负责固定每个阶段的主线变化、关键转折和阶段结束状态，不写章节细纲，不写事件数组，不安排具体伏笔章位，也不重复小说圣经、世界规则和人物设定。每个阶段都必须回答同一条核心动机在本阶段推进了什么：主角当前要完成的具体目标是什么、为了目标主动做了什么、遇到的主要阻碍或代价是什么、阶段结束后得到或失去什么，以及这个结果如何打开下一阶段更具体的目标。阶段不是互不相干的事件集合，也不能每阶段重新换一条主线。先从本阶段故事真正会发生的变化出发，再确定阶段转折；转折方式由题材、人物关系、环境和事件自然决定，不要求各阶段使用同一种推进顺序。阶段之间还要自然提高至少两项：冲突牵连范围、直接对手、失败代价、公开后果或主角选择难度；不要求所有题材采用家族、地方、区域或跨界的固定顺序，也不为形式凭空添加势力。阶段数量和章节范围完全按照作者输入；每个阶段写一条清楚的主线变化、两到四个关键转折和一条结束状态，内容要能让后面的阶段规划沿着同一条故事发展，避免阶段之间方向漂移，尽量不用固定清单式要求。
-
-阶段骨架同样不能把记录、复核、责任追溯、合同、公司治理、审批、归档或案卷式资料往来当成阶段变化；除非作者明确指定相关题材，否则不得从“边界、资源、条件、责任”等普通词推导出合同冲突或公司冲突。阶段变化要写人物在具体处境中的行动、阻力、选择和结果，先守住题材自己的事件发动机，再概括阶段走向。相邻阶段不能只把同一任务扩大范围、增加参与者或改成更复杂的分工；必须由上一阶段已经发生的结果逼出新的主问题或关系冲突，变化方式随题材自然产生。
-
-本书总字数为{total_words}字，按每十万字划分为{stage_count}个阶段。必须恰好返回{stage_count}项，不能少一项，也不能多出额外阶段；阶段编号和章节范围固定为：{stage_ranges}。即使某一阶段的故事暂时不如其它阶段集中，也必须为该阶段写出属于它的主线变化、关键转折和结束状态，不能把相邻阶段合并，也不能提前结束全书。
-
-第一阶段的开头要有强冲突前三章，并把冲突落到人物、场景、行为、动作、情绪和结果上。第1章直接让主角进入正在发生的具体冲突；第2章承接上一章的后果，让冲突升级并出现改变判断的反转；第3章让主角主动选择或反击，并承担已经发生的直接后果，形成必须继续追读的新局面。这里写宏观走向即可，具体冲突和表现方式结合题材自由发挥；不要先铺完背景，也不要用抽象概括代替人物正在经历的现场。最后一个阶段的结束状态要让本部主线、主角当前目标和主要关系形成看得见的结果；可以留下不影响本部结局的续作余味，但不能把本部核心矛盾和主角必须完成的事情推给下一部。
-
-只返回一个合法 JSON 对象：{{"g":[{skeleton_shape}]}}。g 必须严格按上述编号顺序覆盖全部{stage_count}个阶段，每项固定五个位置；不要返回章节事件、伏笔内容、代码、Markdown 或其它字段。"""
         elif self.creation_batch == "stage_endpoint_repair":
             current_stage = self.creation_context.get("current_stage", {})
             stage_number = (
@@ -5836,7 +5826,7 @@ c 中每项只能使用 n、r、g、s、p、v、q；l 中每项只能使用 n、
 
 本阶段所有事件都服务于同一条核心动机。先从主角正在争取、保护、摆脱或确认的具体结果出发，再让世界观、组织运行、设备状态、规则和责任分工作为人物行动的阻力、资源、代价或结果出现。若某个事件只是说明权限已分配、记录已完成、规则已建立或设备已稳定，应并入造成该结果的冲突事件，并继续表现这个结果如何迫使人物作出下一次选择。
 
-读取作者选定的故事、完整故事底盘、全书阶段骨架和已经完成的前面阶段，只生成当前第{stage_number}/{total_stages or '?'}阶段，范围为第{start_chapter}章到第{end_chapter}章。全书阶段骨架只负责提供本阶段的方向和结束状态，不要把骨架中的摘要和转折原样重复成另一份总规划；当前阶段的具体内容以本次事件和人物处境为准。前面阶段的结束状态、带入内容和仍在推动人物的问题是连续性依据。当前阶段必须沿着核心动机继续：先明确主角本阶段要完成的具体目标，再让事件围绕主角的行动、阻碍、选择、代价和结果展开；{stage_progression_guidance}阶段规划使用结构化表达，写清人物真正正在经历的事情、事件顺序、直接结果和状态变化；字段服务于故事事实，尽量不用固定清单式要求，不把每个事件套成同一张检查表。
+读取作者选定的故事、完整故事底盘、已确认的全书阶段方向和已经完成的前面阶段，只生成当前第{stage_number}/{total_stages or '?'}阶段，范围为第{start_chapter}章到第{end_chapter}章。当前阶段方向用于确定本阶段的主要场景、人物变化和阶段结果；不要把阶段方向原样重复成另一份总规划，具体内容以本阶段事件和人物处境为准。前面阶段的结束状态、带入内容和仍在推动人物的问题是连续性依据。当前阶段必须沿着核心动机继续：先明确主角本阶段要完成的具体目标，再让事件围绕主角的行动、阻碍、选择、代价和结果展开；{stage_progression_guidance}阶段规划使用结构化表达，写清人物真正正在经历的事情、事件顺序、直接结果和状态变化；字段服务于故事事实，尽量不用固定清单式要求，不把每个事件套成同一张检查表。
 
 程序性事项沿用上面的共享边界：维护、生产、资源、权限和规则只有在具体人物的使坏、失误、隐瞒、争夺、误判或重大纰漏造成现场后果时才形成事件；公司、合同或调查题材也必须落到直接利益者的行动和对抗，不把流程步骤本身当成叙事骨架。
 
@@ -5870,8 +5860,6 @@ c 中每项只能使用 n、r、g、s、p、v、q；l 中每项只能使用 n、
         return prompt
 
     def _analysis_progress_label(self):
-        if self.creation_batch == "stage_skeleton":
-            return "全书阶段骨架"
         if self.creation_batch == "stage_endpoint_repair":
             return f"第{self.stage_index + 1}阶段伏笔定位"
         if self.creation_batch == "stage_plan_stage":
@@ -5887,8 +5875,6 @@ c 中每项只能使用 n、r、g、s、p、v、q；l 中每项只能使用 n、
         return "当前步骤"
 
     def _max_tokens_for_request(self):
-        if self.creation_batch == "stage_skeleton":
-            return 8000
         if self.creation_batch == "stage_endpoint_repair":
             return 6000
         if self.creation_batch == "bible_core":
@@ -5924,8 +5910,6 @@ c 中每项只能使用 n、r、g、s、p、v、q；l 中每项只能使用 n、
             return "正在生成：5个故事方向"
         if self.creation_batch == "stage_directions":
             return "正在生成：全书阶段方向"
-        if self.creation_batch == "stage_skeleton":
-            return "正在生成：全书阶段骨架"
         if self.creation_batch == "stage_endpoint_repair":
             return f"正在补齐：第{self.stage_index + 1}阶段伏笔定位"
         if self.creation_batch == "bible_core":
@@ -6954,7 +6938,7 @@ class NovelCreationWizardDialog(QDialog):
         )
         batch_for_normalization = ""
         if step == "bible":
-            batch_for_normalization = creation_batch or self._next_generation_batch(step)[0]
+            batch_for_normalization = creation_batch
         result = normalize_creation_result(
             step,
             payload,
@@ -7068,20 +7052,6 @@ class NovelCreationWizardDialog(QDialog):
         if not isinstance(result, dict):
             return None
         specs = self._stage_specs()
-        has_stage_directions = self._has_stage_directions()
-        skeleton = [] if has_stage_directions else _normalize_stage_skeleton(
-            result.get("stage_skeleton", []),
-            self.target_words_spin.value(),
-            self.average_words_spin.value(),
-        )
-        if has_stage_directions:
-            # The confirmed second-step route is the third-step anchor. A
-            # stale legacy skeleton must not continue to affect state text,
-            # button labels, prompts, or the saved framework.
-            result.pop("stage_skeleton", None)
-        if skeleton:
-            result["stage_skeleton"] = skeleton
-        skeleton_complete = len(skeleton) == len(specs)
         self._canonicalize_stage_schedule(result, strict=False)
         first_missing_stage, _by_index = _stage_plan_progress(
             result.get("stage_plan", []),
@@ -7105,14 +7075,10 @@ class NovelCreationWizardDialog(QDialog):
             ),
             default=None,
         )
-        # Existing completed projects may predate the compact skeleton. Keep
-        # their already complete stage plan usable; new generation runs still
-        # request a skeleton before the first stage batch.
         complete = first_missing_stage is None and not foreshadow_missing
         result["_generation_state"] = {
             "schema_version": 1,
             "status": "complete" if complete else "partial",
-            "skeleton_complete": skeleton_complete,
             # Stage content decides which stage is generated next. Missing
             # foreshadow endpoints are repaired separately and must never
             # point the whole-stage request back to an already saved stage.
@@ -7141,34 +7107,6 @@ class NovelCreationWizardDialog(QDialog):
             result["foreshadow_endpoint_warnings"] = []
         return first_missing_stage
 
-    def _merge_stage_skeleton(self, result):
-        """Save the compact whole-book anchor before any stage batch runs."""
-        skeleton = _normalize_stage_skeleton(
-            result.get("stage_skeleton", []) if isinstance(result, dict) else [],
-            self.target_words_spin.value(),
-            self.average_words_spin.value(),
-        )
-        specs = self._stage_specs()
-        if len(skeleton) != len(specs):
-            raise ValueError(
-                f"全书阶段骨架没有覆盖全部阶段：收到{len(skeleton)}个，需要{len(specs)}个。"
-            )
-        current = deepcopy(self.step_results.get("stage_plan", {}))
-        if not isinstance(current, dict):
-            current = {}
-        current["stage_skeleton"] = skeleton
-        current.setdefault("stage_plan", [])
-        current["_generation_state"] = {
-            "schema_version": 1,
-            "status": "partial",
-            "skeleton_complete": True,
-            "next_stage_index": 0,
-            "stage_count": len(specs),
-            "missing_foreshadow_endpoints": [],
-            "updated_at": now_str(),
-        }
-        self.step_results["stage_plan"] = current
-
     def _stage_specs(self):
         return _creation_stage_batch_specs(
             self.target_words_spin.value(),
@@ -7182,7 +7120,14 @@ class NovelCreationWizardDialog(QDialog):
             if isinstance(bible_result, dict) else []
         )
         specs = self._stage_specs()
-        return isinstance(directions, list) and len(directions) == len(specs)
+        return (
+            isinstance(directions, list)
+            and len(directions) == len(specs)
+            and all(
+                isinstance(item, dict) and _as_text(item.get("summary"))
+                for item in directions
+            )
+        )
 
     def _next_generation_batch(self, step):
         state = self._generation_state(step)
@@ -7231,17 +7176,13 @@ class NovelCreationWizardDialog(QDialog):
                 return "bible_core", -1
             return "bible_assets", -1
         if step == "stage_plan":
+            if not self._has_stage_directions():
+                return "", -1
             specs = self._stage_specs()
             result = self.step_results.get("stage_plan", {})
             if isinstance(result, dict):
                 self._sync_stage_generation_state(result)
                 state = self._generation_state(step)
-                if self._has_stage_directions():
-                    # Stage directions now replace the third-step skeleton.
-                    # Keep any stale legacy skeleton out of new requests.
-                    result.pop("stage_skeleton", None)
-                elif not result.get("stage_skeleton"):
-                    return "stage_skeleton", -1
                 if _as_text(state.get("status")).lower() == "partial":
                     first_missing, stages_by_index = _stage_plan_progress(
                         result.get("stage_plan", []),
@@ -7748,6 +7689,9 @@ class NovelCreationWizardDialog(QDialog):
         button = self.json_generate_buttons.get(step)
         if button is None:
             return
+        if step == "stage_plan" and not self._has_stage_directions():
+            button.setText("请先完成并确认阶段方向")
+            return
 
         if self.worker is not None and self._active_batch_kind:
             batch_kind = self._active_batch_kind
@@ -7787,11 +7731,13 @@ class NovelCreationWizardDialog(QDialog):
         self.next_btn.setText("确认并创建项目" if self.current_step_index == len(CREATION_WIZARD_STEPS) - 1 else "确认并下一步")
         route_button = getattr(self, "stage_direction_confirm_btn", None)
         route_pending = step == "bible" and self._stage_direction_pending_confirmation()
-        generate_button = self.json_generate_buttons.get("bible") if step == "bible" else None
+        generate_button = self.json_generate_buttons.get(step)
         self._sync_generation_button_text()
         if generate_button is not None:
             generate_button.setEnabled(
-                self.worker is None and not route_pending
+                self.worker is None
+                and not route_pending
+                and (step != "stage_plan" or self._has_stage_directions())
             )
         if route_button is not None:
             route_button.setVisible(route_pending)
@@ -7810,7 +7756,11 @@ class NovelCreationWizardDialog(QDialog):
                     for item in stage_rows
                     if isinstance(stage_rows, list)
                 )
-                if _as_text(state.get("status")).lower() == "partial" and has_saved_stage:
+                if not self._has_stage_directions():
+                    self._set_status_text(
+                        "请返回第二步，完成并确认全部阶段方向后再生成第三步阶段规划。"
+                    )
+                elif _as_text(state.get("status")).lower() == "partial" and has_saved_stage:
                     if next_batch == "stage_endpoint_repair":
                         self._set_status_text(
                             f"当前阶段正文已保存，点击生成会先补齐第{next_index + 1}阶段的伏笔定位。"
@@ -7823,12 +7773,8 @@ class NovelCreationWizardDialog(QDialog):
                         self._set_status_text("当前步骤已保存部分内容，请点击生成继续未完成批次。")
                 elif _as_text(state.get("status")).lower() == "complete":
                     self._set_status_text("当前步骤已有完整阶段规划，可以重新生成或直接确认。")
-                elif self._has_stage_directions():
-                    self._set_status_text("阶段方向已确认，点击生成后会直接生成第1阶段具体事件。")
-                elif not self.step_results[step].get("stage_skeleton"):
-                    self._set_status_text("点击生成后会先整理全书阶段骨架，再按十万字阶段依次生成。")
                 else:
-                    self._set_status_text("当前步骤已有完整阶段规划，可以重新生成或直接确认。")
+                    self._set_status_text("阶段方向已确认，点击生成后会直接生成第1阶段具体事件。")
             elif _as_text(state.get("status")).lower() == "partial":
                 if step == "bible":
                     if route_pending:
@@ -7868,7 +7814,9 @@ class NovelCreationWizardDialog(QDialog):
             elif step == "stage_plan" and self._has_stage_directions():
                 self._set_status_text("阶段方向已确认，点击生成后会直接生成第1阶段具体事件。")
             elif step == "stage_plan":
-                self._set_status_text("点击生成后会先整理全书阶段骨架，再按十万字阶段依次生成。")
+                self._set_status_text(
+                    "请返回第二步，完成并确认全部阶段方向后再生成第三步阶段规划。"
+                )
             else:
                 self._set_status_text("请点击 AI 生成当前步骤。")
 
@@ -7900,6 +7848,8 @@ class NovelCreationWizardDialog(QDialog):
                 and not self._bible_validation_error(result)
             )
         if step == "stage_plan":
+            if not self._has_stage_directions():
+                return False
             result = self.step_results.get(step, {})
             if not isinstance(result, dict):
                 return False
@@ -8001,6 +7951,7 @@ class NovelCreationWizardDialog(QDialog):
             # Only the reusable personality and voice are sent to the model;
             # source names and the original character's story data stay local.
             context["author_input"]["custom_protagonist_style"] = custom_protagonist_style
+        premise = self._current_premise() if step != "premise" else {}
         if step == "premise":
             current_names = [
                 _creation_premise_name(item.get("protagonist"))
@@ -8008,7 +7959,8 @@ class NovelCreationWizardDialog(QDialog):
                 if isinstance(item, dict)
             ]
             context["naming_reference"] = _creation_name_references(current_names)
-        premise = self._current_premise() if step != "premise" else {}
+        elif step == "bible":
+            context["naming_reference"] = _creation_name_references()
         if step != "premise":
             context["selected_premise"] = premise
         if step == "bible":
@@ -8031,6 +7983,9 @@ class NovelCreationWizardDialog(QDialog):
                     }
         elif step == "stage_plan":
             batch_kind, stage_index = self._next_generation_batch("stage_plan")
+            if not batch_kind:
+                context["generation_batch"] = ""
+                return context
             specs = self._stage_specs()
             current_stage = specs[stage_index] if 0 <= stage_index < len(specs) else {}
             stage_result = self.step_results.get("stage_plan", {})
@@ -8043,10 +7998,6 @@ class NovelCreationWizardDialog(QDialog):
                     bible_result.get("stage_directions", [])
                 )
             context["generation_batch"] = batch_kind
-            if isinstance(stage_result, dict) and stage_result.get("stage_skeleton"):
-                context["confirmed"]["stage_skeleton"] = deepcopy(
-                    stage_result.get("stage_skeleton", [])
-                )
             bible_result = self.step_results.get("bible", {})
             stage_directions = (
                 bible_result.get("stage_directions", [])
@@ -8198,6 +8149,10 @@ class NovelCreationWizardDialog(QDialog):
         step = CREATION_WIZARD_STEPS[self.current_step_index][0]
         batch_kind, stage_index = self._next_generation_batch(step)
         if not batch_kind:
+            if step == "stage_plan":
+                self._set_status_text(
+                    "请返回第二步，完成并确认全部阶段方向后再生成第三步阶段规划。"
+                )
             return
         if step == "stage_plan" and batch_kind == "stage_plan_stage":
             # A queued continuation can carry an older stage index while the
@@ -8962,16 +8917,14 @@ class NovelCreationWizardDialog(QDialog):
                 if step == "bible":
                     self._merge_bible_batch(result, batch_kind)
                 elif step == "stage_plan":
-                    if batch_kind == "stage_skeleton":
-                        self._merge_stage_skeleton(result)
-                    elif batch_kind == "stage_endpoint_repair":
+                    if batch_kind == "stage_endpoint_repair":
                         self._merge_stage_endpoint_repair(result, stage_index)
                     else:
                         self._merge_stage_batch(result, stage_index)
                 if step == "bible" and batch_kind == "bible_assets":
                     remember_creation_wizard_names(
                         _creation_character_names(result.get("characters", [])),
-                        source="bible",
+                        source="bible_assets",
                     )
             except Exception as exc:
                 self._schedule_generation_retry(str(exc), batch_kind, stage_index)
@@ -9000,11 +8953,7 @@ class NovelCreationWizardDialog(QDialog):
                     if next_batch == "stage_endpoint_repair":
                         next_label = f"补齐第{next_index + 1}阶段的伏笔定位"
                     elif next_batch == "stage_plan_stage":
-                        next_label = (
-                            f"第{next_index + 1}阶段"
-                            if batch_kind != "stage_skeleton"
-                            else "第1阶段"
-                        )
+                        next_label = f"第{next_index + 1}阶段"
                     else:
                         next_label = "未完成的阶段"
                 self._set_status_text(f"已保存当前批次，接下来生成{next_label}。")
@@ -9107,6 +9056,10 @@ class NovelCreationWizardDialog(QDialog):
                 "selected": candidate,
             }
             return
+        if step == "stage_plan" and not self._has_stage_directions():
+            raise ValueError(
+                "请返回第二步，完成并确认全部阶段方向后再生成第三步阶段规划。"
+            )
         if step not in self.step_results:
             raise ValueError("请先点击 AI 生成当前步骤。")
         generation_state = self._generation_state(step)
@@ -9287,7 +9240,6 @@ class NovelCreationWizardDialog(QDialog):
             "lore": deepcopy(assets_result.get("lore", [])),
             "foreshadows": deepcopy(assets_result.get("foreshadows", [])),
             "stage_directions": deepcopy(bible_result.get("stage_directions", [])),
-            "stage_skeleton": deepcopy(stage_result.get("stage_skeleton", [])),
             "stage_plan": deepcopy(stage_result.get("stage_plan", [])),
             "foreshadow_schedule": deepcopy(foreshadow_schedule),
             "planning_schema_version": _as_text(
@@ -9303,8 +9255,6 @@ class NovelCreationWizardDialog(QDialog):
             "average_chapter_words": self.average_words_spin.value(),
             "completed_at": now_str(),
         }
-        if not framework.get("stage_skeleton"):
-            framework.pop("stage_skeleton", None)
         # Store one canonical project-level mainline.  The fixed premise/Bible
         # field names remain readable for old drafts, but downstream planning no
         # longer has to choose between several competing line fields.

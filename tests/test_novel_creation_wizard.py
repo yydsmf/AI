@@ -1,4 +1,5 @@
 import os
+import json
 import tempfile
 import unittest
 from types import SimpleNamespace
@@ -147,7 +148,8 @@ class NovelCreationWizardPersistenceTests(unittest.TestCase):
         dialog.average_words_spin = SimpleNamespace(value=lambda: 3000)
         dialog._selected_custom_protagonist_style = lambda: {}
 
-        context = dialog._context_for_step("premise")
+        with patch.object(wizard, "_creation_name_references", return_value={}):
+            context = dialog._context_for_step("premise")
         self.assertEqual(context["author_input"]["role"], "公主、腹黑")
         self.assertEqual(context["author_input"]["plot"], "追夫、破镜重圆")
 
@@ -334,7 +336,7 @@ class NovelCreationWizardPersistenceTests(unittest.TestCase):
         dialog.step_results["bible"]["_generation_state"]["stage_directions_confirmed"] = True
         self.assertEqual(dialog._next_generation_batch("bible")[0], "bible_core")
 
-    def test_confirmed_stage_directions_skip_the_legacy_skeleton_batch(self):
+    def test_confirmed_stage_directions_start_stage_batches_directly(self):
         dialog = wizard.NovelCreationWizardDialog.__new__(
             wizard.NovelCreationWizardDialog
         )
@@ -342,6 +344,10 @@ class NovelCreationWizardPersistenceTests(unittest.TestCase):
         dialog.average_words_spin = SimpleNamespace(value=lambda: 3000)
         dialog.step_results = {
             "bible": {
+                "_generation_state": {
+                    "completed_batches": ["stage_directions"],
+                    "stage_directions_confirmed": True,
+                },
                 "stage_directions": [
                     {
                         "name": "家族逆袭",
@@ -366,7 +372,6 @@ class NovelCreationWizardPersistenceTests(unittest.TestCase):
             dialog._next_generation_batch("stage_plan"),
             ("stage_plan_stage", 0),
         )
-        self.assertEqual(dialog.step_results["stage_plan"].get("stage_skeleton"), None)
 
     def test_stage_direction_prompt_requires_new_scene_and_character_changes(self):
         worker = wizard.NovelCreationWorker(
@@ -496,7 +501,7 @@ class NovelCreationWizardPersistenceTests(unittest.TestCase):
         )
         self.assertEqual(result["stage_directions"][0]["summary"], "当前请求的方向")
 
-    def test_confirmed_stage_directions_remove_stale_stage_skeleton_from_state(self):
+    def test_stage_plan_requires_complete_stage_directions(self):
         dialog = wizard.NovelCreationWizardDialog.__new__(
             wizard.NovelCreationWizardDialog
         )
@@ -504,22 +509,106 @@ class NovelCreationWizardPersistenceTests(unittest.TestCase):
         dialog.average_words_spin = SimpleNamespace(value=lambda: 3000)
         dialog.step_results = {
             "bible": {
+                "_generation_state": {
+                    "completed_batches": [],
+                    "stage_directions_confirmed": False,
+                },
+                "stage_directions": [{"summary": "仅有第一阶段"}],
+            },
+            "stage_plan": {
+                "stage_plan": [],
+            },
+        }
+        self.assertEqual(
+            dialog._next_generation_batch("stage_plan"),
+            ("", -1),
+        )
+
+    def test_recovered_stage_directions_survive_bible_core_normalization(self):
+        dialog = wizard.NovelCreationWizardDialog.__new__(
+            wizard.NovelCreationWizardDialog
+        )
+        dialog.target_words_spin = SimpleNamespace(value=lambda: 200000)
+        dialog.average_words_spin = SimpleNamespace(value=lambda: 3000)
+        dialog._allow_power_levels = lambda: False
+        result = dialog._normalize_step_result(
+            "bible",
+            {
                 "stage_directions": [
                     {"summary": "第一阶段方向"},
                     {"summary": "第二阶段方向"},
                 ],
+                "bible": {"main_conflict": "主线冲突"},
+                "world_rules": {},
             },
-            "stage_plan": {
-                "stage_skeleton": [{"id": "S01"}, {"id": "S02"}],
-                "stage_plan": [],
-            },
-        }
-        dialog._sync_stage_generation_state(dialog.step_results["stage_plan"])
-        self.assertNotIn("stage_skeleton", dialog.step_results["stage_plan"])
-        self.assertEqual(
-            dialog._next_generation_batch("stage_plan"),
-            ("stage_plan_stage", 0),
+            creation_batch="bible_core",
         )
+        self.assertEqual(
+            [item["summary"] for item in result["stage_directions"]],
+            ["第一阶段方向", "第二阶段方向"],
+        )
+        self.assertEqual(result["bible"]["main_conflict"], "主线冲突")
+
+    def test_restoring_full_bible_payload_does_not_misclassify_it_as_directions_only(self):
+        dialog = wizard.NovelCreationWizardDialog.__new__(
+            wizard.NovelCreationWizardDialog
+        )
+        dialog.target_words_spin = SimpleNamespace(value=lambda: 200000)
+        dialog.average_words_spin = SimpleNamespace(value=lambda: 3000)
+        dialog._allow_power_levels = lambda: False
+        dialog.step_results = {}
+        result = dialog._normalize_step_result(
+            "bible",
+            {
+                "_generation_state": {
+                    "status": "complete",
+                    "completed_batches": ["stage_directions", "bible_core", "bible_assets"],
+                    "stage_directions_confirmed": True,
+                },
+                "stage_directions": [
+                    {"summary": "第一阶段方向"},
+                    {"summary": "第二阶段方向"},
+                ],
+                "bible": {"main_conflict": "主线冲突"},
+                "world_rules": {"rules": ["长期规则"], "costs_and_limits": ["代价"]},
+                "characters": [{"name": "主角"}],
+                "lore": [{"name": "地点", "description": "故事地点"}],
+                "foreshadows": [{"code": "F0001", "name": "线索"}],
+            },
+        )
+        self.assertEqual(len(result["stage_directions"]), 2)
+        self.assertEqual(result["bible"]["main_conflict"], "主线冲突")
+        self.assertEqual(result["world_rules"]["rules"], ["长期规则"])
+        self.assertEqual(result["characters"][0]["name"], "主角")
+        self.assertTrue(result["_generation_state"]["stage_directions_confirmed"])
+
+    def test_stage_plan_context_receives_all_directions_and_current_direction(self):
+        dialog = wizard.NovelCreationWizardDialog.__new__(
+            wizard.NovelCreationWizardDialog
+        )
+        directions = [
+            {"id": "R01", "summary": "进入山门，赢下外门争斗"},
+            {"id": "R02", "summary": "下山追查灵脉异变"},
+        ]
+        dialog.inspiration_edit = SimpleNamespace(text=lambda: "作者灵感")
+        dialog.project_name_hint = "测试书名"
+        dialog.choice_values = {}
+        dialog.target_words_spin = SimpleNamespace(value=lambda: 200000)
+        dialog.average_words_spin = SimpleNamespace(value=lambda: 3000)
+        dialog._selected_custom_protagonist_style = lambda: {}
+        dialog._current_premise = lambda: {"title": "测试书名", "synopsis": "简介"}
+        dialog.step_results = {
+            "bible": {
+                "stage_directions": directions,
+                "foreshadows": [],
+            },
+            "stage_plan": {},
+        }
+
+        context = dialog._context_for_step("stage_plan")
+
+        self.assertEqual(context["confirmed"]["stage_directions"], directions)
+        self.assertEqual(context["current_stage"]["stage_direction"], directions[0])
 
     def test_character_style_choice_only_exposes_personality_and_voice(self):
         entry = {
@@ -902,6 +991,160 @@ class NovelCreationWizardPersistenceTests(unittest.TestCase):
     def test_character_name_split_rule_is_in_bible_prompt(self):
         self.assertIn("姓名字段只填写人物的正式姓名", wizard.STEP_PROMPTS["bible"])
         self.assertIn("陶大姑陶秀兰", wizard.STEP_PROMPTS["bible"])
+
+    def test_bible_prompt_preserves_names_from_selected_story(self):
+        prompt = wizard.STEP_PROMPTS["bible"]
+        self.assertIn("已经选定的这个故事简介及其中明确写出的姓名为准", prompt)
+        self.assertIn("必须原样沿用这些既定姓名", prompt)
+        self.assertIn("不得因为命名参考而过滤、替换、改写或遗漏", prompt)
+        self.assertIn("命名参考只用于为新增人物起名", prompt)
+        self.assertNotIn("五个方向", prompt)
+
+    def test_recent_name_guidance_uses_one_all_people_reference(self):
+        for step in ("premise", "bible"):
+            prompt = wizard.STEP_PROMPTS[step]
+            self.assertIn("n.recent_character_names", prompt)
+            self.assertIn("同音或近音", prompt)
+            self.assertIn("只换一个字", prompt)
+            self.assertIn("读音节奏", prompt)
+        self.assertNotIn("主角姓名不能重复", wizard.STEP_PROMPTS["premise"])
+        self.assertNotIn("软性避重", wizard.STEP_PROMPTS["premise"])
+
+    def test_character_name_collection_keeps_every_character(self):
+        records = [
+            {"name": "林澈", "role": "主角"},
+            {"name": "程绛", "role": "重要配角"},
+            {"name": "齐越", "role": "维修学徒"},
+            {"name": "林澈", "role": "重复资料"},
+        ]
+        self.assertEqual(
+            wizard._creation_character_names(records),
+            ["林澈", "程绛", "齐越"],
+        )
+
+    def test_project_name_scan_includes_all_character_cards(self):
+        payload = {
+            "characters": [{"name": "林澈"}, {"name": "程绛"}],
+            "creation_framework": {
+                "characters": [{"name": "程绛"}, {"name": "齐越"}],
+            },
+        }
+        self.assertEqual(
+            wizard._creation_project_character_names(payload),
+            ["林澈", "程绛", "齐越"],
+        )
+
+    def test_name_reference_returns_100_most_recent_names(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            history_path = os.path.join(temp_dir, "name_history.json")
+            records = [
+                {"name": f"人物{i:03d}", "created_at_ns": i + 1}
+                for i in range(120)
+            ]
+            with open(history_path, "w", encoding="utf-8") as file:
+                json.dump({
+                    "schema_version": wizard.CREATION_WIZARD_NAME_PROJECT_SCAN_VERSION,
+                    "project_scan_complete": True,
+                    "records": records,
+                }, file, ensure_ascii=False)
+            with patch.object(wizard, "CREATION_WIZARD_NAME_HISTORY_FILE", history_path):
+                references = wizard._creation_name_references()
+        self.assertEqual(wizard.CREATION_WIZARD_NAME_REFERENCE_LIMIT, 100)
+        self.assertEqual(len(references["recent_character_names"]), 100)
+        self.assertEqual(references["recent_character_names"][0], "人物119")
+        self.assertEqual(references["recent_character_names"][-1], "人物020")
+
+    def test_legacy_project_scan_backfills_all_names_by_project_recency(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            history_dir = os.path.join(temp_dir, "history")
+            project_dir = os.path.join(history_dir, "novel_projects")
+            draft_dir = os.path.join(history_dir, "novel_creation_wizard_drafts")
+            os.makedirs(project_dir)
+            os.makedirs(draft_dir)
+            history_path = os.path.join(history_dir, "name_history.json")
+            with open(history_path, "w", encoding="utf-8") as file:
+                json.dump({
+                    "schema_version": 1,
+                    "project_scan_complete": True,
+                    "records": [{"name": "旧姓名", "created_at_ns": 1}],
+                }, file, ensure_ascii=False)
+            older_path = os.path.join(project_dir, "older.json")
+            newer_path = os.path.join(project_dir, "newer.json")
+            for path, names in (
+                (older_path, ["旧项目甲", "旧项目乙"]),
+                (newer_path, ["新项目甲", "新项目乙", "新项目丙"]),
+            ):
+                with open(path, "w", encoding="utf-8") as file:
+                    json.dump({"characters": [{"name": name} for name in names]}, file)
+            os.utime(older_path, ns=(1_000_000_000, 1_000_000_000))
+            os.utime(newer_path, ns=(2_000_000_000, 2_000_000_000))
+            with (
+                patch.object(wizard, "HISTORY_DIR", history_dir),
+                patch.object(wizard, "CREATION_WIZARD_DRAFT_DIR", draft_dir),
+                patch.object(wizard, "CREATION_WIZARD_NAME_HISTORY_FILE", history_path),
+            ):
+                references = wizard._creation_name_references()
+                with open(history_path, "r", encoding="utf-8") as file:
+                    saved_history = json.load(file)
+        names = references["recent_character_names"]
+        self.assertTrue(set(("新项目甲", "新项目乙", "新项目丙", "旧项目甲", "旧项目乙", "旧姓名")) <= set(names))
+        self.assertLess(max(names.index("新项目甲"), names.index("新项目乙")), names.index("旧项目甲"))
+        self.assertEqual(
+            saved_history["schema_version"],
+            wizard.CREATION_WIZARD_NAME_PROJECT_SCAN_VERSION,
+        )
+
+    def test_step_two_uses_the_shared_reference_without_a_separate_name_group(self):
+        dialog = wizard.NovelCreationWizardDialog.__new__(wizard.NovelCreationWizardDialog)
+        dialog.inspiration_edit = SimpleNamespace(text=lambda: "作者灵感")
+        dialog.project_name_hint = ""
+        dialog.choice_values = {}
+        dialog.target_words_spin = SimpleNamespace(value=lambda: 300000)
+        dialog.average_words_spin = SimpleNamespace(value=lambda: 3000)
+        dialog._selected_custom_protagonist_style = lambda: {}
+        dialog.premise_candidates = [
+            {"protagonist": "林澈"},
+            {"protagonist": "沈闻"},
+            {"protagonist": "周予"},
+        ]
+        dialog.premise_selected_index = 1
+        dialog._current_premise = lambda: {"protagonist": "沈闻", "title": "已选故事"}
+        dialog.step_results = {"bible": {"characters": [{"name": "程绛"}, {"name": "齐越"}]}}
+        dialog._next_generation_batch = lambda _step: ("bible_core", -1)
+        with patch.object(
+            wizard,
+            "_creation_name_references",
+            side_effect=lambda *args: {"received_args": args},
+        ):
+            context = dialog._context_for_step("bible")
+        self.assertEqual(context["naming_reference"]["received_args"], ())
+        self.assertEqual(context["selected_premise"]["title"], "已选故事")
+        self.assertNotIn("五个方向", wizard.STEP_PROMPTS["bible"])
+        self.assertNotIn("主角姓名不能重复", wizard.STEP_PROMPTS["bible"])
+
+    def test_step_one_adds_existing_candidate_names_to_the_same_reference(self):
+        dialog = wizard.NovelCreationWizardDialog.__new__(wizard.NovelCreationWizardDialog)
+        dialog.inspiration_edit = SimpleNamespace(text=lambda: "作者灵感")
+        dialog.project_name_hint = ""
+        dialog.choice_values = {}
+        dialog.target_words_spin = SimpleNamespace(value=lambda: 300000)
+        dialog.average_words_spin = SimpleNamespace(value=lambda: 3000)
+        dialog._selected_custom_protagonist_style = lambda: {}
+        dialog.premise_candidates = [
+            {"protagonist": "林澈"},
+            {"protagonist": "沈闻"},
+        ]
+        with patch.object(
+            wizard,
+            "_creation_name_references",
+            side_effect=lambda names: {"received_names": names},
+        ):
+            context = dialog._context_for_step("premise")
+        self.assertEqual(
+            context["naming_reference"]["received_names"],
+            ["林澈", "沈闻"],
+        )
+        self.assertEqual(set(context["naming_reference"]), {"received_names"})
 
 
 if __name__ == "__main__":

@@ -6,6 +6,7 @@ from unittest.mock import patch
 
 import gpt_desktop.workers as workers_module
 from gpt_desktop.core import reasoning_effort_for_model
+from gpt_desktop.novel_utils import _parse_style_finalize_result
 
 from gpt_desktop.workers import (
     NovelAnalysisWorker,
@@ -22,6 +23,47 @@ from gpt_desktop.workers import (
 
 
 class NovelAnalysisWorkerTests(unittest.TestCase):
+    def test_openai_model_keeps_chat_completions_request_shape(self):
+        url, headers, payload, protocol = workers_module._build_novel_generation_request(
+            "https://provider.example/v1",
+            "key",
+            "gpt-5.6-sol",
+            "系统",
+            "用户",
+            stream=True,
+            max_tokens=16000,
+            temperature=0.2,
+            reasoning_effort="high",
+            response_format=True,
+        )
+
+        self.assertEqual(protocol, "openai")
+        self.assertEqual(url, "https://provider.example/v1/chat/completions")
+        self.assertEqual(headers["Authorization"], "Bearer key")
+        self.assertEqual(payload["messages"], [
+            {"role": "system", "content": "系统"},
+            {"role": "user", "content": "用户"},
+        ])
+        self.assertEqual(payload["temperature"], 0.2)
+        self.assertEqual(payload["max_tokens"], 16000)
+        self.assertEqual(payload["reasoning_effort"], "high")
+        self.assertEqual(payload["response_format"], {"type": "json_object"})
+
+    def test_novel_language_guidance_keeps_story_codes_and_translates_analysis_terms(self):
+        guidance = workers_module._novel_chinese_output_guidance()
+
+        self.assertIn("自然语言字段、故事资料、阶段说明、章节规划、摘要、记忆、文风说明和正文默认使用自然中文", guidance)
+        self.assertIn("人物代号 K", guidance)
+        self.assertIn("deadline、escalation、setup、payoff、core_motive", guidance)
+        self.assertIn("不要擅自翻译、删除或改写", guidance)
+
+    def test_writing_action_prompt_contains_shared_language_guidance(self):
+        worker = NovelWritingWorker("http://example.test", "key", "model", "draft", "context")
+        prompt = worker._action_prompt()
+
+        self.assertIn("【中文表达与字符边界】", prompt)
+        self.assertEqual(prompt.count("【中文表达与字符边界】"), 1)
+
     def test_novel_writing_reasoning_is_high_for_all_requested_actions(self):
         actions = (
             "draft",
@@ -280,6 +322,31 @@ class NovelAnalysisWorkerTests(unittest.TestCase):
         self.assertIn("这是全书最后一章", final_outline)
         self.assertNotIn("新信息或新阻力", final_outline)
 
+    def test_wizard_final_stage_inherits_climax_guidance_without_moving_nodes(self):
+        for stage_range, existing, count, expected_climax in (
+            ([137, 167], 136, 31, True),
+            ([103, 136], 102, 34, False),
+        ):
+            schedule = {
+                "range": stage_range,
+                "nodes": [{"n": 1, "id": "S05-E01", "range": [145, 146]}]
+                if expected_climax else [],
+            }
+            worker = NovelChapterPlanWorker(
+                "http://example.test", "key", "model", "context", 500000, 3000, count,
+                total_chapter_count=167, existing_chapter_count=existing,
+                creation_wizard_mode=True, locked_node_schedule=schedule,
+            )
+            prompt = worker._analysis_prompt()
+            with self.subTest(stage=stage_range):
+                self.assertEqual("最后阶段高潮兑现位置｜第162-164章" in prompt, expected_climax)
+                self.assertEqual(worker.locked_node_schedule, schedule)
+                if expected_climax:
+                    self.assertIn("节点1/S05-E01只能落在第145-146章", prompt)
+                    self.assertIn("已经确认的阶段事件、高潮章位和已写正文继续沿用", prompt)
+                    self.assertIn("现有第165-167章收尾窗口", prompt)
+                    self.assertNotIn("高潮可以落在最后3章内或此前", prompt)
+
     def test_chapter_plan_prompt_marks_only_the_last_three_chapter_window(self):
         worker = NovelChapterPlanWorker(
             "http://example.test",
@@ -533,7 +600,7 @@ class NovelAnalysisWorkerTests(unittest.TestCase):
             total_chapter_count=100,
             existing_chapter_count=85,
         )
-        self.assertTrue(worker._retry_stream_transport_before_nonstream)
+        self.assertTrue(worker._analysis_stream_only)
 
         plan = worker._normalize_plan({
             "chapters": [
@@ -637,6 +704,57 @@ class NovelAnalysisWorkerTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "不支持流式输出"):
             worker._analyze_chunk_resilient("prompt", "context", 1, 1, True)
 
+    def test_explicit_stream_unsupported_error_allows_nonstream_fallback(self):
+        worker = NovelAnalysisWorker("http://example.test", "key", "model", "context")
+        calls = []
+
+        def fake_stream(*_args, **_kwargs):
+            calls.append("stream")
+            raise RuntimeError("This model does not support streaming")
+
+        def fake_post(*_args, **_kwargs):
+            calls.append("post")
+            return {"characters": [], "lore": [], "foreshadows": [], "project_materials": {}}
+
+        worker._post_analysis_chunk_stream = fake_stream
+        worker._post_analysis_chunk = fake_post
+
+        parsed, response_format = worker._analyze_chunk_resilient(
+            "prompt", "context", 1, 1, True
+        )
+
+        self.assertEqual(calls, ["stream", "post"])
+        self.assertEqual(parsed["characters"], [])
+        self.assertTrue(response_format)
+        self.assertFalse(worker._analysis_request_capabilities()[1])
+
+    def test_stream_transport_error_is_retried_as_stream(self):
+        worker = NovelAnalysisWorker("http://example.test", "key", "model", "context")
+        worker.retry_attempts = 2
+        worker._analysis_retry_wait_seconds = lambda *_args: 0
+        calls = []
+
+        def fake_stream(*_args, **_kwargs):
+            calls.append("stream")
+            if len(calls) == 1:
+                raise RuntimeError("upstream HTTP/2 stream failed")
+            return {"characters": [], "lore": [], "foreshadows": [], "project_materials": {}}
+
+        def unexpected_nonstream(*_args, **_kwargs):
+            raise AssertionError("流式传输异常不应切换为普通请求")
+
+        worker._post_analysis_chunk_stream = fake_stream
+        worker._post_analysis_chunk = unexpected_nonstream
+
+        parsed, response_format = worker._analyze_chunk_with_retries(
+            "prompt", "context", 1, 1, True
+        )
+
+        self.assertEqual(calls, ["stream", "stream"])
+        self.assertEqual(parsed["lore"], [])
+        self.assertTrue(response_format)
+        self.assertTrue(worker._analysis_request_capabilities()[1])
+
     def test_rate_limit_error_retries_after_ten_seconds(self):
         worker = NovelAnalysisWorker("http://example.test", "key", "model", "正文")
         worker.retry_attempts = 2
@@ -695,7 +813,7 @@ class NovelAnalysisWorkerTests(unittest.TestCase):
         attempt = worker.diagnostics["attempts"][0]
         self.assertEqual(attempt["requested_model"], "gpt-5.6-sol")
         self.assertEqual(attempt["response_model"], "gpt-5.6-sol")
-        self.assertEqual(attempt["system_prompt_chars"], len("系统提示词"))
+        self.assertGreater(attempt["system_prompt_chars"], len("系统提示词"))
         self.assertGreater(attempt["user_text_chars"], len("本次规划上下文"))
         self.assertGreater(attempt["response_chars"], 0)
         self.assertEqual(attempt["finish_reason"], "stop")
@@ -733,6 +851,326 @@ class NovelAnalysisWorkerTests(unittest.TestCase):
         self.assertFalse(worker.diagnostics["attempts"][0]["received_done"])
         self.assertEqual(worker.diagnostics["attempts"][0]["outcome"], "success")
 
+    def test_analysis_stream_retries_without_non_default_temperature(self):
+        worker = NovelAnalysisWorker("http://example.test", "key", "model", "项目资料")
+        response_text = json.dumps({
+            "characters": [],
+            "lore": [],
+            "foreshadows": [],
+            "project_materials": {},
+        }, ensure_ascii=False)
+
+        class ErrorResponse(_FakeStreamResponse):
+            status_code = 400
+
+            def __init__(self):
+                super().__init__([])
+                self.content = json.dumps({
+                    "error": {"message": "claude-sonnet-5-5 does not support non-default temperature"}
+                }).encode("utf-8")
+
+        class FallbackSession:
+            trust_env = False
+
+            def __init__(self):
+                self.payloads = []
+                self.responses = [
+                    ErrorResponse(),
+                    _FakeStreamResponse([
+                        "data: " + json.dumps({
+                            "choices": [{
+                                "delta": {"content": response_text},
+                                "finish_reason": "stop",
+                            }]
+                        }, ensure_ascii=False),
+                        "data: [DONE]",
+                    ]),
+                ]
+
+            def post(self, *_args, **kwargs):
+                self.payloads.append(dict(kwargs.get("json") or {}))
+                return self.responses.pop(0)
+
+            def close(self):
+                pass
+
+        session = FallbackSession()
+        worker._new_session = lambda: session
+
+        parsed = worker._post_analysis_chunk_stream(
+            "系统提示词", "本次规划上下文", 1, 1, True
+        )
+
+        self.assertEqual(parsed["characters"], [])
+        self.assertEqual(len(session.payloads), 2)
+        self.assertEqual(session.payloads[0]["temperature"], 0.2)
+        self.assertNotIn("temperature", session.payloads[1])
+        self.assertTrue(worker.diagnostics["temperature_fallback"])
+
+    def test_response_normalization_keeps_nested_provider_reasoning_out_of_content(self):
+        payload = {
+            "choices": [{
+                "delta": {
+                    "provider_specific_fields": {
+                        "thinking": {
+                            "reasoning_content": "中转站内部思考",
+                        },
+                    },
+                    "content": "<NOVEL_OUTPUT_START>结果<NOVEL_OUTPUT_END>",
+                },
+            }],
+        }
+
+        normalized = workers_module._normalize_novel_response_payload(payload)
+
+        self.assertEqual(normalized["content"], "<NOVEL_OUTPUT_START>结果<NOVEL_OUTPUT_END>")
+        self.assertEqual(normalized["reasoning"], "中转站内部思考")
+        self.assertIn(
+            "provider_specific_fields.thinking.reasoning_content",
+            normalized["reasoning_fields"],
+        )
+
+    def test_writing_worker_accepts_anthropic_native_thinking_and_text_sse(self):
+        worker = NovelWritingWorker(
+            "http://example.test", "key", "claude-sonnet-5-5", "outline", "context"
+        )
+        worker._session = _FakeStreamSession([
+            'data: {"type":"message_start","message":{"model":"claude-sonnet-5-5"}}',
+            'data: {"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"内部思考"}}',
+            'data: {"type":"content_block_delta","index":1,"delta":{"type":"text_delta","text":"<NOVEL_OUTPUT_START>\\n主角推开门。\\n<NOVEL_OUTPUT_END>"}}',
+            'data: {"type":"message_delta","delta":{"stop_reason":"end_turn"}}',
+            'data: {"type":"message_stop"}',
+        ])
+        errors = []
+        results = []
+        worker.failed.connect(errors.append)
+        worker.result_ready.connect(lambda action, value: results.append((action, value)))
+
+        worker.run()
+
+        self.assertEqual(errors, [])
+        self.assertEqual(results, [("outline", "主角推开门。")])
+        self.assertEqual(worker.diagnostics["ignored_reasoning_chars"], 4)
+        self.assertIn("thinking", worker.diagnostics["reasoning_fields_seen"])
+
+    def test_claude_writing_request_uses_native_messages_shape(self):
+        worker = NovelWritingWorker(
+            "https://provider.example", "key", "claude-sonnet-5-5", "outline", "context"
+        )
+        session = _FakeStreamSession([
+            'data: {"type":"message_start","message":{"model":"claude-sonnet-5-5"}}',
+            'data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"<NOVEL_OUTPUT_START>结果<NOVEL_OUTPUT_END>"}}',
+            'data: {"type":"message_delta","delta":{"stop_reason":"end_turn"}}',
+            'data: {"type":"message_stop"}',
+        ])
+        worker._session = session
+
+        worker.run()
+
+        self.assertEqual(session.last_url, "https://provider.example/v1/messages")
+        self.assertIn("x-api-key", session.last_headers)
+        self.assertNotIn("Authorization", session.last_headers)
+        self.assertEqual(session.last_payload["system"], worker._action_prompt())
+        self.assertEqual(session.last_payload["messages"], [{"role": "user", "content": "context"}])
+        self.assertNotIn("temperature", session.last_payload)
+        self.assertNotIn("response_format", session.last_payload)
+        self.assertNotIn("reasoning_effort", session.last_payload)
+        self.assertEqual(worker.diagnostics["api_protocol"], "anthropic")
+
+    def test_analysis_stream_accepts_native_anthropic_text_delta(self):
+        worker = NovelAnalysisWorker(
+            "http://example.test", "key", "claude-sonnet-5-5", "项目资料"
+        )
+        response_text = json.dumps({
+            "characters": [],
+            "lore": [],
+            "foreshadows": [],
+            "project_materials": {},
+        }, ensure_ascii=False)
+        native_chunks = [
+            'data: {"type":"content_block_delta","delta":{"type":"thinking_delta","thinking":"规划思考"}}',
+            "data: " + json.dumps({
+                "type": "content_block_delta",
+                "delta": {"type": "text_delta", "text": response_text},
+            }, ensure_ascii=False),
+            'data: {"type":"message_delta","delta":{"stop_reason":"end_turn"}}',
+            'data: {"type":"message_stop"}',
+        ]
+        worker._new_session = lambda: _FakeStreamSession(native_chunks)
+
+        parsed = worker._post_analysis_chunk_stream(
+            "系统提示词", "向导/章节规划上下文", 1, 1, True
+        )
+
+        self.assertEqual(parsed["characters"], [])
+        attempt = worker.diagnostics["attempts"][0]
+        self.assertEqual(attempt["finish_reason"], "end_turn")
+        self.assertEqual(attempt["reasoning_chars"], len("规划思考"))
+        self.assertEqual(attempt["outcome"], "success")
+
+    def test_claude_analysis_nonstream_uses_messages_and_normalizes_blocks(self):
+        worker = NovelAnalysisWorker(
+            "https://provider.example", "key", "claude-sonnet-5-5", "项目资料"
+        )
+        response_text = json.dumps({
+            "characters": [], "lore": [], "foreshadows": [], "project_materials": {},
+        }, ensure_ascii=False)
+
+        class NativeResponse:
+            status_code = 200
+            headers = {}
+
+            def close(self):
+                pass
+
+            def json(self):
+                return {
+                    "model": "claude-sonnet-5-5",
+                    "content": [
+                        {"type": "thinking", "thinking": "隐藏思考"},
+                        {"type": "text", "text": response_text},
+                    ],
+                    "stop_reason": "end_turn",
+                }
+
+        class NativeSession:
+            trust_env = False
+
+            def __init__(self):
+                self.args = None
+                self.kwargs = None
+
+            def post(self, *args, **kwargs):
+                self.args, self.kwargs = args, kwargs
+                return NativeResponse()
+
+            def close(self):
+                pass
+
+        session = NativeSession()
+        worker._new_session = lambda: session
+
+        parsed = worker._post_analysis_chunk("系统提示词", "上下文", 1, 1, True)
+
+        self.assertEqual(parsed["characters"], [])
+        self.assertEqual(session.args[0], "https://provider.example/v1/messages")
+        self.assertIn("x-api-key", session.kwargs["headers"])
+        self.assertNotIn("temperature", session.kwargs["json"])
+        self.assertNotIn("response_format", session.kwargs["json"])
+        self.assertNotIn("reasoning_effort", session.kwargs["json"])
+
+    def test_claude_analysis_falls_back_only_when_messages_route_is_unavailable(self):
+        worker = NovelAnalysisWorker(
+            "https://messages-route-missing.example", "key", "claude-sonnet-5-5", "项目资料"
+        )
+        key = workers_module._novel_protocol_cache_key(worker.base_url, worker.model)
+        workers_module._NOVEL_ANTHROPIC_PROTOCOL_OVERRIDES.discard(key)
+        self.addCleanup(workers_module._NOVEL_ANTHROPIC_PROTOCOL_OVERRIDES.discard, key)
+        response_text = json.dumps({
+            "characters": [], "lore": [], "foreshadows": [], "project_materials": {},
+        }, ensure_ascii=False)
+
+        class MissingRouteResponse(_FakeStreamResponse):
+            status_code = 404
+            headers = {}
+            content = b'{"error":{"message":"route not found"}}'
+
+        class FallbackSession:
+            trust_env = False
+
+            def __init__(self):
+                self.calls = []
+                self.responses = [
+                    MissingRouteResponse([]),
+                    _FakeStreamResponse([
+                        "data: " + json.dumps({
+                            "choices": [{"delta": {"content": response_text}, "finish_reason": "stop"}]
+                        }, ensure_ascii=False),
+                        "data: [DONE]",
+                    ]),
+                ]
+
+            def post(self, *args, **kwargs):
+                self.calls.append((args, kwargs))
+                return self.responses.pop(0)
+
+            def close(self):
+                pass
+
+        session = FallbackSession()
+        worker._new_session = lambda: session
+
+        parsed = worker._post_analysis_chunk_stream("系统提示词", "上下文", 1, 1, True)
+
+        self.assertEqual(parsed["characters"], [])
+        self.assertEqual(session.calls[0][0][0], "https://messages-route-missing.example/v1/messages")
+        self.assertEqual(session.calls[1][0][0], "https://messages-route-missing.example/v1/chat/completions")
+        self.assertNotIn("temperature", session.calls[0][1]["json"])
+        self.assertIn("temperature", session.calls[1][1]["json"])
+        self.assertEqual(worker.diagnostics["protocol_fallback"], "openai")
+        self.assertEqual(worker.api_protocol, "openai")
+
+    def test_authentication_errors_do_not_trigger_protocol_fallback(self):
+        self.assertFalse(workers_module._anthropic_endpoint_unsupported(401, "invalid API key"))
+        self.assertFalse(workers_module._anthropic_endpoint_unsupported(400, "model does not exist"))
+        self.assertFalse(workers_module._anthropic_endpoint_unsupported(404, "model not found"))
+        self.assertTrue(workers_module._anthropic_endpoint_unsupported(404, "Not Found"))
+        self.assertTrue(workers_module._anthropic_endpoint_unsupported(400, "route not found"))
+
+    def test_claude_analysis_request_uses_native_messages_shape(self):
+        worker = NovelAnalysisWorker(
+            "https://provider.example", "key", "claude-sonnet-5-5", "项目资料"
+        )
+        response_text = json.dumps({
+            "characters": [], "lore": [], "foreshadows": [], "project_materials": {},
+        }, ensure_ascii=False)
+        session = _FakeStreamSession([
+            'data: {"type":"message_start","message":{"model":"claude-sonnet-5-5"}}',
+            "data: " + json.dumps({"type": "content_block_delta", "delta": {"type": "text_delta", "text": response_text}}, ensure_ascii=False),
+            'data: {"type":"message_delta","delta":{"stop_reason":"end_turn"}}',
+            'data: {"type":"message_stop"}',
+        ])
+        worker._new_session = lambda: session
+
+        parsed = worker._post_analysis_chunk_stream("系统提示词", "上下文", 1, 1, True)
+
+        self.assertEqual(parsed["characters"], [])
+        self.assertEqual(session.last_url, "https://provider.example/v1/messages")
+        self.assertIn("x-api-key", session.last_headers)
+        self.assertNotIn("Authorization", session.last_headers)
+        self.assertEqual(session.last_payload["system"], workers_module._with_novel_language_guidance("系统提示词"))
+        self.assertNotIn("temperature", session.last_payload)
+        self.assertNotIn("response_format", session.last_payload)
+        self.assertNotIn("reasoning_effort", session.last_payload)
+        self.assertEqual(worker.diagnostics["api_protocol"], "anthropic")
+
+    def test_style_finalize_parser_requires_the_inner_prose_boundary(self):
+        acceptance = '{"paragraph_structure_check":true}'
+        bounded = _parse_style_finalize_result(
+            "【终稿正文】\n<NOVEL_PROSE_START>终稿正文。<NOVEL_PROSE_END>\n\n"
+            f"【终稿验收】\n{acceptance}"
+        )
+        unbounded = _parse_style_finalize_result(
+            "【终稿正文】\n终稿正文。\n\n"
+            f"【终稿验收】\n{acceptance}"
+        )
+
+        self.assertEqual(bounded["text"], "终稿正文。")
+        self.assertEqual(unbounded["text"], "")
+        self.assertFalse(unbounded["parsed"])
+
+    def test_boundary_stream_filter_handles_fragmented_markers_without_leaking_them(self):
+        stream_filter = workers_module._NovelBoundaryStreamFilter(
+            "<NOVEL_OUTPUT_START>", "<NOVEL_OUTPUT_END>"
+        )
+        pieces = [
+            stream_filter.feed("解释。<NOVEL_OUT"),
+            stream_filter.feed("PUT_START>正文片段<NOVEL_OUTPUT_"),
+            stream_filter.feed("END>额外说明"),
+        ]
+
+        self.assertEqual("".join(pieces), "正文片段")
+
     def test_analysis_stream_stops_after_complete_json_without_finish_or_done(self):
         worker = NovelAnalysisWorker("http://example.test", "key", "model", "项目资料")
         content = json.dumps(
@@ -756,6 +1194,37 @@ class NovelAnalysisWorkerTests(unittest.TestCase):
         self.assertFalse(worker.diagnostics["attempts"][0]["finish_reason"])
         self.assertFalse(worker.diagnostics["attempts"][0]["received_done"])
         self.assertEqual(worker.diagnostics["attempts"][0]["outcome"], "success")
+
+    def test_analysis_stream_does_not_accept_json_prefix_with_trailing_content(self):
+        worker = NovelAnalysisWorker("http://example.test", "key", "model", "项目资料")
+        content = '{"v":"4","k":{},"s":{}},"f":[]}'
+        worker._new_session = lambda: _FakeStreamSession([
+            f'data: {json.dumps({"choices": [{"delta": {"content": content}}]}, ensure_ascii=False)}',
+        ])
+
+        with self.assertRaisesRegex(ValueError, "JSON 对象后仍有未归入对象的实质内容"):
+            worker._post_analysis_chunk_stream(
+                "系统提示词", "本次规划上下文", 1, 1, True
+            )
+
+        self.assertEqual(worker.diagnostics["attempts"][0]["outcome"], "error")
+
+    def test_analysis_stream_rejects_trailing_content_even_with_finish_reason(self):
+        worker = NovelAnalysisWorker("http://example.test", "key", "model", "项目资料")
+        content = '{"characters":[],"lore":[],"foreshadows":[],"project_materials":{}}说明'
+        worker._new_session = lambda: _FakeStreamSession([
+            "data: " + json.dumps({
+                "choices": [{
+                    "delta": {"content": content},
+                    "finish_reason": "stop",
+                }]
+            }, ensure_ascii=False),
+        ])
+
+        with self.assertRaisesRegex(ValueError, "JSON 对象后仍有未归入对象的实质内容"):
+            worker._post_analysis_chunk_stream(
+                "系统提示词", "本次规划上下文", 1, 1, True
+            )
 
     def test_rate_limit_error_does_not_split_large_chunk(self):
         worker = NovelAnalysisWorker("http://example.test", "key", "model", "正文")
@@ -964,6 +1433,8 @@ class NovelAnalysisWorkerTests(unittest.TestCase):
         self.assertIn("同一信息只有出现新证据", finalize_prompt)
         self.assertIn("同时校验剧情执行、连续性和样本文风", finalize_prompt)
         self.assertIn("用户上下文指定的输出分区", finalize_prompt)
+        self.assertIn("<NOVEL_OUTPUT_START>", finalize_prompt)
+        self.assertIn("<NOVEL_OUTPUT_END>", finalize_prompt)
         self.assertIn("独立小说文风审校员", audit_prompt)
         self.assertIn("最多列5项真正影响整体读感的阻断差异", audit_prompt)
         self.assertIn("评分达到80才允许通过", audit_prompt)
@@ -1062,7 +1533,7 @@ class NovelAnalysisWorkerTests(unittest.TestCase):
 
         worker.run()
 
-        self.assertEqual(chunks, ["半截正文"])
+        self.assertEqual(chunks, [])
         self.assertEqual(results, [])
         self.assertTrue(errors)
         self.assertIn("未完整结束", errors[0])
@@ -1166,7 +1637,7 @@ class NovelAnalysisWorkerTests(unittest.TestCase):
     def test_writing_worker_accepts_stop_finish_reason_without_done_marker(self):
         worker = NovelWritingWorker("http://example.test", "key", "model", "draft", "context")
         worker._session = _FakeStreamSession([
-            'data: {"choices":[{"delta":{"content":"完整正文。"},"finish_reason":"stop"}]}',
+            'data: {"choices":[{"delta":{"content":"<NOVEL_PROSE_START>\\n完整正文。\\n<NOVEL_PROSE_END>"},"finish_reason":"stop"}]}',
         ])
         errors = []
         results = []
@@ -1182,7 +1653,7 @@ class NovelAnalysisWorkerTests(unittest.TestCase):
         worker = NovelWritingWorker("http://example.test", "key", "model", "draft", "context")
         worker._session = _FakeStreamSession([
             'data: {"choices":[{"delta":{"reasoning_content":"内部规划，不应进入正文"}}]}',
-            'data: {"choices":[{"delta":{"content":"正式正文。"},"finish_reason":"stop"}]}',
+            'data: {"choices":[{"delta":{"content":"<NOVEL_PROSE_START>\\n正式正文。\\n<NOVEL_PROSE_END>"},"finish_reason":"stop"}]}',
         ])
         errors = []
         results = []
@@ -1263,8 +1734,17 @@ class NovelAnalysisWorkerTests(unittest.TestCase):
                 worker = NovelWritingWorker(
                     "https://api.dxmcs.xin", "key", "gpt-5.6-sol", action, "context"
                 )
+                content = (
+                    "<NOVEL_PROSE_START>\n正文完成。\n<NOVEL_PROSE_END>"
+                    if action in {"draft", "style_rewrite"}
+                    else "<NOVEL_OUTPUT_START>\n终稿完成。\n<NOVEL_OUTPUT_END>"
+                    if action == "style_finalize"
+                    else "{}"
+                )
                 session = _FakeStreamSession([
-                    'data: {"choices":[{"delta":{"content":"正文完成。"},"finish_reason":"stop"}]}',
+                    "data: " + json.dumps({
+                        "choices": [{"delta": {"content": content}, "finish_reason": "stop"}]
+                    }, ensure_ascii=False),
                 ])
                 worker._session = session
 
@@ -1437,7 +1917,7 @@ class NovelAnalysisWorkerTests(unittest.TestCase):
     def test_draft_worker_rejects_body_that_ends_mid_sentence(self):
         worker = NovelWritingWorker("http://example.test", "key", "model", "draft", "context")
         worker._session = _FakeStreamSession([
-            'data: {"choices":[{"delta":{"content":"办公室里安静得"},"finish_reason":"stop"}]}',
+            'data: {"choices":[{"delta":{"content":"<NOVEL_PROSE_START>\\n办公室里安静得\\n<NOVEL_PROSE_END>"},"finish_reason":"stop"}]}',
         ])
         errors = []
         results = []
@@ -1452,7 +1932,8 @@ class NovelAnalysisWorkerTests(unittest.TestCase):
 
     def test_draft_worker_accepts_em_dash_cliffhanger(self):
         worker = NovelWritingWorker("http://example.test", "key", "model", "draft", "context")
-        content = "黑暗中传来规律的声音。\n\n滴——\n\n滴——"
+        content = "<NOVEL_PROSE_START>\n黑暗中传来规律的声音。\n\n滴——\n\n滴——\n<NOVEL_PROSE_END>"
+        delivered_content = "黑暗中传来规律的声音。\n\n滴——\n\n滴——"
         worker._session = _FakeStreamSession([
             "data: " + json.dumps({
                 "choices": [{
@@ -1470,7 +1951,7 @@ class NovelAnalysisWorkerTests(unittest.TestCase):
         worker.run()
 
         self.assertEqual(errors, [])
-        self.assertEqual(results, [("draft", content)])
+        self.assertEqual(results, [("draft", delivered_content)])
 
     def test_structured_draft_worker_validates_extracted_backup_draft(self):
         context = "【剧情执行稿任务】\n严格输出三个分区。"
@@ -1478,7 +1959,7 @@ class NovelAnalysisWorkerTests(unittest.TestCase):
         content = (
             "【剧情执行清单】\n1. 主角渡劫。\n\n"
             "【本章声纹执行表】\n结尾停在监护声。\n\n"
-            "【备用正文草稿】\n黑暗中响起声音。\n\n滴——"
+            "【备用正文草稿】\n<NOVEL_PROSE_START>\n黑暗中响起声音。\n\n滴——\n<NOVEL_PROSE_END>"
         )
         worker._session = _FakeStreamSession([
             "data: " + json.dumps({
@@ -1616,7 +2097,7 @@ class NovelAnalysisWorkerTests(unittest.TestCase):
     def test_outline_worker_allows_compact_unpunctuated_result(self):
         worker = NovelWritingWorker("http://example.test", "key", "model", "outline", "context")
         worker._session = _FakeStreamSession([
-            'data: {"choices":[{"delta":{"content":"1. 主角进入王城"},"finish_reason":"stop"}]}',
+            'data: {"choices":[{"delta":{"content":"<NOVEL_OUTPUT_START>\\n1. 主角进入王城\\n<NOVEL_OUTPUT_END>"},"finish_reason":"stop"}]}',
         ])
         errors = []
         results = []
@@ -1627,6 +2108,22 @@ class NovelAnalysisWorkerTests(unittest.TestCase):
 
         self.assertEqual(errors, [])
         self.assertEqual(results, [("outline", "1. 主角进入王城")])
+
+    def test_outline_worker_rejects_unbounded_provider_explanation(self):
+        worker = NovelWritingWorker("http://example.test", "key", "model", "outline", "context")
+        worker._session = _FakeStreamSession([
+            'data: {"choices":[{"delta":{"content":"我先分析一下。1. 主角进入王城"},"finish_reason":"stop"}]}',
+        ])
+        errors = []
+        results = []
+        worker.failed.connect(errors.append)
+        worker.result_ready.connect(lambda action, content: results.append((action, content)))
+
+        worker.run()
+
+        self.assertEqual(results, [])
+        self.assertTrue(errors)
+        self.assertIn("边界不完整", errors[0])
 
     def test_chapter_title_worker_normalizes_title_response(self):
         worker = NovelChapterTitleWorker(
@@ -1868,7 +2365,7 @@ class NovelAnalysisWorkerTests(unittest.TestCase):
         self.assertGreater(len(batches), 1)
         self.assertTrue(all(len(batch) <= 5 for batch in batches))
 
-    def test_chapter_title_worker_falls_back_to_non_stream_when_json_parse_fails(self):
+    def test_chapter_title_worker_keeps_streaming_when_json_parse_fails(self):
         worker = NovelChapterTitleWorker(
             "http://example.test",
             "key",
@@ -1896,7 +2393,7 @@ class NovelAnalysisWorkerTests(unittest.TestCase):
 
         self.assertEqual(titles, ["会议室里的选择（大结局）"])
         self.assertEqual(len(calls), 2)
-        self.assertFalse(calls[-1][2][1])
+        self.assertTrue(calls[-1][2][1])
 
     def test_analysis_prompt_uses_existing_project_dossier_for_dedupe(self):
         worker = NovelAnalysisWorker("http://example.test", "key", "model", "context")
@@ -2662,27 +3159,32 @@ class NovelAnalysisWorkerTests(unittest.TestCase):
                 normalized = worker._normalize_framework_result({"meta": {"target_words": raw}})
                 self.assertEqual(normalized["meta"]["target_words"], expected)
 
-    def test_analysis_stream_json_error_falls_back_to_non_stream_request(self):
+    def test_analysis_stream_json_error_is_retried_as_stream(self):
         worker = NovelAnalysisWorker("http://example.test", "key", "model", "context")
+        worker.retry_attempts = 2
+        worker._analysis_retry_wait_seconds = lambda *_args: 0
         calls = []
 
         def fake_stream(*_args, **_kwargs):
             calls.append("stream")
-            raise ValueError("AI 返回内容不是合法 JSON。解析位置：第 1 行，第 20 列。")
+            if len(calls) == 1:
+                raise ValueError("AI 返回内容不是合法 JSON。解析位置：第 1 行，第 20 列。")
+            return {"characters": [], "lore": [], "foreshadows": [], "project_materials": {}}
 
         def fake_post(*_args, **_kwargs):
-            calls.append("post")
-            return {"characters": [], "lore": [], "foreshadows": [], "project_materials": {}}
+            raise AssertionError("流式 JSON 错误不应切换为普通请求")
 
         worker._post_analysis_chunk_stream = fake_stream
         worker._post_analysis_chunk = fake_post
 
-        parsed, response_format = worker._analyze_chunk_resilient("prompt", "正文", 1, 1, True)
+        parsed, response_format = worker._analyze_chunk_with_retries(
+            "prompt", "正文", 1, 1, True
+        )
 
-        self.assertEqual(calls, ["stream", "post"])
+        self.assertEqual(calls, ["stream", "stream"])
         self.assertEqual(parsed["foreshadows"], [])
         self.assertTrue(response_format)
-        self.assertFalse(worker._analysis_request_capabilities()[1])
+        self.assertTrue(worker._analysis_request_capabilities()[1])
 
     def test_json_parser_repairs_deterministic_syntax_only(self):
         worker = NovelAnalysisWorker("http://example.test", "key", "model", "context")
@@ -2709,6 +3211,16 @@ class NovelAnalysisWorkerTests(unittest.TestCase):
             ["unescaped_quote", "control_character"],
         )
 
+    def test_json_parser_repairs_dialogue_quote_before_chinese_comma(self):
+        worker = NovelAnalysisWorker("http://example.test", "key", "model", "context")
+
+        parsed = worker._parse_json_result(
+            '{"summary":"他说:"先等等",然后转身。","arcs":[]}'
+        )
+
+        self.assertEqual(parsed["summary"], '他说:"先等等",然后转身。')
+        self.assertEqual(worker.diagnostics["json_syntax_repair_types"], ["unescaped_quote"])
+
     def test_json_parser_can_close_only_completed_containers(self):
         worker = NovelAnalysisWorker("http://example.test", "key", "model", "context")
 
@@ -2728,7 +3240,7 @@ class NovelAnalysisWorkerTests(unittest.TestCase):
         self.assertEqual(worker.diagnostics["json_syntax_repair_count"], 0)
         self.assertIn("第 1 行", worker.diagnostics["last_json_parse_error"])
 
-    def test_candidate_postprocess_stream_json_error_falls_back_to_non_stream_request(self):
+    def test_candidate_postprocess_stream_json_error_is_retried_as_stream(self):
         worker = NovelCandidatePostprocessWorker(
             "http://example.test",
             "key",
@@ -2740,21 +3252,26 @@ class NovelAnalysisWorkerTests(unittest.TestCase):
 
         def fake_stream(*_args, **_kwargs):
             calls.append("stream")
-            raise ValueError("AI 返回内容不是合法 JSON。解析位置：第 1 行，第 20 列。")
+            if len(calls) == 1:
+                raise ValueError("AI 返回内容不是合法 JSON。解析位置：第 1 行，第 20 列。")
+            return {"characters": [], "lore": [], "foreshadows": [{"name": "虎符失踪", "status": "已回收"}], "project_materials": {}}
 
         def fake_post(*_args, **_kwargs):
-            calls.append("post")
-            return {"characters": [], "lore": [], "foreshadows": [{"name": "虎符失踪", "status": "已回收"}], "project_materials": {}}
+            raise AssertionError("候选合并的流式 JSON 错误不应切换为普通请求")
 
         worker._post_analysis_chunk_stream = fake_stream
         worker._post_analysis_chunk = fake_post
 
-        parsed, response_format = worker._analyze_chunk_resilient("prompt", "候选", 1, 1, True)
+        worker.retry_attempts = 2
+        worker._analysis_retry_wait_seconds = lambda *_args: 0
+        parsed, response_format = worker._analyze_chunk_with_retries(
+            "prompt", "候选", 1, 1, True
+        )
 
-        self.assertEqual(calls, ["stream", "post"])
+        self.assertEqual(calls, ["stream", "stream"])
         self.assertEqual(parsed["foreshadows"][0]["status"], "已回收")
         self.assertTrue(response_format)
-        self.assertFalse(worker._analysis_request_capabilities()[1])
+        self.assertTrue(worker._analysis_request_capabilities()[1])
 
     def test_candidate_postprocess_accepts_empty_merged_result(self):
         worker = NovelCandidatePostprocessWorker(
@@ -3069,8 +3586,12 @@ class _FakeStreamSession:
         self._response = _FakeStreamResponse(lines)
         self.closed = False
         self.last_payload = None
+        self.last_url = None
+        self.last_headers = None
 
-    def post(self, *_args, **_kwargs):
+    def post(self, *args, **_kwargs):
+        self.last_url = args[0] if args else None
+        self.last_headers = _kwargs.get("headers") or {}
         self.last_payload = _kwargs.get("json")
         return self._response
 

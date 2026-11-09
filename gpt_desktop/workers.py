@@ -59,6 +59,7 @@ from .novel_utils import (
     _clip_context_text,
     _dedupe_volume_handoff_terminal_records,
     _extract_prose_delivery_result,
+    _extract_novel_output_delivery_result,
     _grounded_prose_contract,
     _infer_foreshadow_status,
     _merge_text_lines_without_duplicates,
@@ -68,13 +69,17 @@ from .novel_utils import (
     _normalize_chapter_plan_foundation,
     _normalize_framework_analysis,
     _normalize_volume_continuity_anchors,
+    _novel_chinese_output_guidance,
     _core_motive_progression_guidance,
     _procedural_plot_guard_guidance,
     _ensure_final_chapter_title_suffix,
     _story_conflict_pacing_guidance,
+    _final_stage_climax_planning_guidance,
     _terminal_window_bounds,
     NOVEL_PROSE_END_MARKER,
     NOVEL_PROSE_START_MARKER,
+    NOVEL_OUTPUT_END_MARKER,
+    NOVEL_OUTPUT_START_MARKER,
 )
 from .novel_import import (
     _extract_framework_chapter_plan_from_locations,
@@ -91,6 +96,440 @@ from .novel_storage import save_novel_raw_model_output
 
 _BLENDER_PROBE_CACHE = {}
 _CHAPTER_TITLE_MAX_CHARS = 15
+
+
+def _with_novel_language_guidance(prompt):
+    prompt = str(prompt or "")
+    if "【中文表达与字符边界】" in prompt:
+        return prompt
+    return prompt + "\n\n" + _novel_chinese_output_guidance()
+
+
+# OpenAI-compatible gateways use several names for Claude thinking output.
+# Keep this normalization local to the novel workers so chat workflows retain
+# their existing behavior.
+_AI_REASONING_KEYS = (
+    "reasoning_content",
+    "reasoning",
+    "thinking",
+    "redacted_thinking",
+    "thinking_blocks",
+    "reasoning_details",
+)
+_AI_REASONING_TYPES = {
+    "thinking",
+    "redacted_thinking",
+    "reasoning",
+    "reasoning_delta",
+    "thinking_delta",
+}
+
+_NOVEL_ANTHROPIC_PROTOCOL_OVERRIDES = set()
+_NOVEL_ANTHROPIC_PROTOCOL_LOCK = threading.Lock()
+_NOVEL_ANTHROPIC_DEFAULT_MAX_TOKENS = 30000
+
+
+def _novel_model_protocol(model):
+    """Select the native Messages protocol for Claude-named novel models."""
+    return "anthropic" if "claude" in str(model or "").strip().lower() else "openai"
+
+
+def _novel_protocol_cache_key(base_url, model):
+    return (
+        str(base_url or "").strip().rstrip("/").lower(),
+        str(model or "").strip().lower(),
+    )
+
+
+def _novel_api_protocol(base_url, model):
+    protocol = _novel_model_protocol(model)
+    if protocol != "anthropic":
+        return protocol
+    with _NOVEL_ANTHROPIC_PROTOCOL_LOCK:
+        if _novel_protocol_cache_key(base_url, model) in _NOVEL_ANTHROPIC_PROTOCOL_OVERRIDES:
+            return "openai"
+    return protocol
+
+
+def _remember_novel_openai_protocol(base_url, model):
+    with _NOVEL_ANTHROPIC_PROTOCOL_LOCK:
+        _NOVEL_ANTHROPIC_PROTOCOL_OVERRIDES.add(
+            _novel_protocol_cache_key(base_url, model)
+        )
+
+
+def _anthropic_endpoint_unsupported(status_code, error_text=""):
+    """Only fall back when the Messages route itself is explicitly unavailable."""
+    try:
+        status = int(status_code or 0)
+    except (TypeError, ValueError):
+        status = 0
+    if status in {405, 415}:
+        return True
+    if status == 404:
+        lowered = str(error_text or "").lower()
+        if any(marker in lowered for marker in (
+            "model not found",
+            "unknown model",
+            "invalid model",
+            "model does not exist",
+        )):
+            return False
+        return any(marker in lowered for marker in (
+            "not found", "unknown endpoint", "unsupported endpoint",
+            "endpoint", "route", "path",
+        ))
+    if status != 400:
+        return False
+    lowered = str(error_text or "").lower()
+    return any(marker in lowered for marker in (
+        "unknown endpoint",
+        "unsupported endpoint",
+        "endpoint not found",
+        "route not found",
+        "unknown route",
+        "path not found",
+        "unsupported path",
+    ))
+
+
+def _build_novel_generation_request(
+    base_url,
+    api_key,
+    model,
+    system_prompt,
+    user_text,
+    *,
+    stream,
+    max_tokens=0,
+    temperature=None,
+    reasoning_effort="",
+    response_format=False,
+    protocol=None,
+):
+    """Build an OpenAI Chat Completions or Anthropic Messages request."""
+    protocol = str(protocol or _novel_api_protocol(base_url, model)).strip().lower()
+    if protocol == "anthropic":
+        try:
+            output_limit = max(1, int(max_tokens or _NOVEL_ANTHROPIC_DEFAULT_MAX_TOKENS))
+        except (TypeError, ValueError):
+            output_limit = _NOVEL_ANTHROPIC_DEFAULT_MAX_TOKENS
+        return (
+            api_url(base_url, "/v1/messages"),
+            {
+                "x-api-key": str(api_key or ""),
+                "anthropic-version": "2023-06-01",
+                "Content-Type": "application/json",
+                "Accept": "text/event-stream" if stream else "application/json",
+            },
+            {
+                "model": model,
+                "max_tokens": output_limit,
+                "system": str(system_prompt or ""),
+                "messages": [{"role": "user", "content": str(user_text or "")}],
+                "stream": bool(stream),
+            },
+            protocol,
+        )
+
+    payload = {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": str(system_prompt or "")},
+            {"role": "user", "content": str(user_text or "")},
+        ],
+    }
+    if stream:
+        payload["stream"] = True
+    if temperature is not None:
+        payload["temperature"] = temperature
+    if max_tokens:
+        payload["max_tokens"] = int(max_tokens)
+    if reasoning_effort:
+        payload["reasoning_effort"] = reasoning_effort
+    if response_format:
+        payload["response_format"] = {"type": "json_object"}
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+    }
+    if stream:
+        headers["Accept"] = "text/event-stream"
+    return api_url(base_url, "/v1/chat/completions"), headers, payload, protocol
+
+
+def _ai_text_from_value(value):
+    """Extract visible text blocks without converting thinking into content."""
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value
+    if isinstance(value, (list, tuple)):
+        return "".join(
+            text for text in (_ai_text_from_value(item) for item in value) if text
+        )
+    if not isinstance(value, dict):
+        return str(value or "")
+    block_type = str(value.get("type", "") or "").strip().lower()
+    if block_type in _AI_REASONING_TYPES or "reasoning" in block_type or "thinking" in block_type:
+        return ""
+    for key in ("text", "content", "output_text", "value"):
+        if key in value:
+            text = _ai_text_from_value(value.get(key))
+            if text:
+                return text
+    return ""
+
+
+def _ai_reasoning_from_value(value, force=False):
+    """Extract non-user-facing reasoning text for diagnostics only."""
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value if force else ""
+    if isinstance(value, (list, tuple)):
+        return "".join(
+            text for text in (_ai_reasoning_from_value(item, force=force) for item in value) if text
+        )
+    if not isinstance(value, dict):
+        return ""
+    block_type = str(value.get("type", "") or "").strip().lower()
+    is_reasoning = (
+        force
+        or block_type in _AI_REASONING_TYPES
+        or "reasoning" in block_type
+        or "thinking" in block_type
+    )
+    if is_reasoning:
+        for key in ("thinking", "reasoning", "reasoning_content", "redacted_thinking", "text", "content", "value"):
+            if key in value:
+                text = _ai_reasoning_from_value(value.get(key), force=True)
+                if text:
+                    return text
+        return ""
+    for key in ("content", "blocks", "items", "delta"):
+        if key in value:
+            text = _ai_reasoning_from_value(value.get(key), force=False)
+            if text:
+                return text
+    return ""
+
+
+def _ai_content_piece(*values):
+    for value in values:
+        text = _ai_text_from_value(value)
+        if text:
+            return str(text)
+    return ""
+
+
+def _ai_reasoning_piece(*objects):
+    pieces = []
+    seen = set()
+
+    def collect_provider_fields(value):
+        if isinstance(value, (list, tuple)):
+            return "".join(collect_provider_fields(item) for item in value)
+        if not isinstance(value, dict):
+            return ""
+        found = []
+        for key, child in value.items():
+            normalized_key = str(key or "").strip().lower()
+            if normalized_key in _AI_REASONING_KEYS:
+                text = _ai_reasoning_from_value(child, force=True)
+                if text and text not in seen:
+                    seen.add(text)
+                    found.append(text)
+            elif isinstance(child, (dict, list, tuple)):
+                nested = collect_provider_fields(child)
+                if nested:
+                    found.append(nested)
+        return "".join(found)
+
+    def find_provider_fields(value):
+        if isinstance(value, (list, tuple)):
+            return "".join(find_provider_fields(item) for item in value)
+        if not isinstance(value, dict):
+            return ""
+        found = []
+        for key, child in value.items():
+            normalized_key = str(key or "").strip().lower()
+            if normalized_key == "provider_specific_fields":
+                text = collect_provider_fields(child)
+                if text:
+                    found.append(text)
+            elif normalized_key not in {"content", "text", "output_text"}:
+                nested = find_provider_fields(child)
+                if nested:
+                    found.append(nested)
+        return "".join(found)
+
+    for obj in objects:
+        if not isinstance(obj, dict):
+            continue
+        obj_type = str(obj.get("type", "") or "").strip().lower()
+        if obj_type in _AI_REASONING_TYPES or "reasoning" in obj_type or "thinking" in obj_type:
+            text = _ai_reasoning_from_value(obj, force=True)
+            if text and text not in seen:
+                seen.add(text)
+                pieces.append(text)
+        for key in _AI_REASONING_KEYS:
+            if key in obj:
+                text = _ai_reasoning_from_value(obj.get(key), force=True)
+                if text and text not in seen:
+                    seen.add(text)
+                    pieces.append(text)
+        for key in ("content", "content_block", "blocks", "items"):
+            value = obj.get(key)
+            if isinstance(value, (list, tuple, dict)):
+                text = _ai_reasoning_from_value(value, force=False)
+                if text and text not in seen:
+                    seen.add(text)
+                    pieces.append(text)
+        text = find_provider_fields(obj)
+        if text:
+            pieces.append(text)
+    return "".join(pieces)
+
+
+def _ai_reasoning_field_names(*objects):
+    names = []
+
+    def visit(value, prefix=""):
+        if isinstance(value, (list, tuple)):
+            for index, item in enumerate(value):
+                visit(item, f"{prefix}[{index}]")
+            return
+        if not isinstance(value, dict):
+            return
+        for key, child in value.items():
+            normalized_key = str(key or "").strip().lower()
+            path = f"{prefix}.{key}" if prefix else str(key)
+            if normalized_key in _AI_REASONING_KEYS:
+                if path not in names:
+                    names.append(path)
+                if isinstance(child, (dict, list, tuple)):
+                    visit(child, path)
+            elif normalized_key not in {"content", "text", "output_text"}:
+                visit(child, path)
+
+    for obj in objects:
+        visit(obj)
+    return names
+
+
+def _normalize_novel_response_payload(data):
+    """Normalize common OpenAI-compatible and Claude message/stream shapes."""
+    payload = data if isinstance(data, dict) else {}
+    choices = payload.get("choices")
+    choice = choices[0] if isinstance(choices, list) and choices else {}
+    choice = choice if isinstance(choice, dict) else {}
+    delta = choice.get("delta", {})
+    message = choice.get("message", {})
+    delta = delta if isinstance(delta, dict) else {}
+    message = message if isinstance(message, dict) else {}
+    native_delta = payload.get("delta", {})
+    native_delta = native_delta if isinstance(native_delta, dict) else {}
+    content_block = payload.get("content_block", {})
+    content_block = content_block if isinstance(content_block, dict) else {}
+
+    content = _ai_content_piece(
+        delta.get("content"),
+        delta.get("text"),
+        message.get("content"),
+        message.get("text"),
+        choice.get("text"),
+        content_block,
+        payload.get("content") if not choices else None,
+        payload.get("text") if not choices else None,
+        native_delta.get("text")
+        if str(native_delta.get("type", "") or "").lower() == "text_delta" else None,
+    )
+    reasoning = _ai_reasoning_piece(
+        delta,
+        message,
+        choice,
+        native_delta,
+        content_block,
+        payload,
+    )
+    finish_reason = str(
+        choice.get("finish_reason")
+        or native_delta.get("stop_reason")
+        or payload.get("stop_reason")
+        or ""
+    )
+    event_type = str(payload.get("type", "") or "").strip().lower()
+    return {
+        "content": content,
+        "reasoning": reasoning,
+        "finish_reason": finish_reason,
+        "done": event_type in {"message_stop", "response.completed"},
+        "reasoning_fields": _ai_reasoning_field_names(
+            delta, message, choice, native_delta, content_block, payload
+        ),
+    }
+
+
+_NOVEL_JSON_RESULT_ACTIONS = {
+    "style_profile",
+    "style_cards",
+    "style_semantic_vocabulary",
+    "style_voice_cards",
+    "style_technique_cards",
+    "style_plot_extract",
+    "style_audit",
+    "memory_finalize",
+    "memory_reconcile",
+    "memory_repair",
+    "logic_repair",
+}
+_NOVEL_TEXT_BOUNDARY_ACTIONS = {
+    "outline",
+    "summary",
+    "style_baseline",
+    "style_sheet",
+    "style_sheet_merge",
+    "style_persona",
+    "style_rules",
+    "style_runtime_voice_pack",
+    "style_finalize",
+    "novel_to_script",
+    "novel_to_storyboard",
+    "script_to_storyboard",
+}
+
+
+class _NovelBoundaryStreamFilter:
+    def __init__(self, start_marker, end_marker):
+        self.start_marker = str(start_marker or "")
+        self.end_marker = str(end_marker or "")
+        self.buffer = ""
+        self.started = False
+        self.finished = False
+
+    def feed(self, piece):
+        if self.finished:
+            return ""
+        self.buffer += str(piece or "")
+        if not self.started:
+            start_index = self.buffer.find(self.start_marker)
+            if start_index < 0:
+                self.buffer = self.buffer[-(len(self.start_marker) - 1):]
+                return ""
+            self.buffer = self.buffer[start_index + len(self.start_marker):]
+            self.buffer = self.buffer.lstrip("\r\n")
+            self.started = True
+        end_index = self.buffer.find(self.end_marker)
+        if end_index >= 0:
+            output = self.buffer[:end_index]
+            self.buffer = ""
+            self.finished = True
+            return output
+        safe_length = max(0, len(self.buffer) - (len(self.end_marker) - 1))
+        output = self.buffer[:safe_length]
+        self.buffer = self.buffer[safe_length:]
+        return output
 
 
 _CHAPTER_PLAN_GENERAL_STATE_PROGRESSION_GUIDANCE = (
@@ -1256,6 +1695,7 @@ class NovelAnalysisWorker(QThread):
         self.base_url = base_url
         self.api_key = api_key
         self.model = model
+        self.api_protocol = _novel_api_protocol(self.base_url, self.model)
         self.text = str(text or "")
         self.dossier = str(dossier or "").strip()
         self.input_chunk_records = self._normalize_input_chunk_records(chunks)
@@ -1269,7 +1709,7 @@ class NovelAnalysisWorker(QThread):
         self._capability_lock = threading.Lock()
         self._output_chars_lock = threading.Lock()
         self._output_chars_total = 0
-        self._analysis_response_format_supported = True
+        self._analysis_response_format_supported = self.api_protocol != "anthropic"
         self._analysis_stream_supported = True
         # Long-form chapter planning must keep using SSE across retries. Other
         # analysis workers retain the existing stream/non-stream compatibility fallback.
@@ -1290,6 +1730,8 @@ class NovelAnalysisWorker(QThread):
         input_bytes = self.text.encode("utf-8", errors="replace")
         self.diagnostics = {
             "requested_model": str(self.model or ""),
+            "api_protocol": self.api_protocol,
+            "protocol_fallback": "",
             "response_models": [],
             "input_chars": len(self.text),
             "input_utf8_bytes": len(input_bytes),
@@ -1304,6 +1746,7 @@ class NovelAnalysisWorker(QThread):
             "started_at": "",
             "finished_at": "",
             "reasoning_chars": 0,
+            "reasoning_fields_seen": [],
             "content_chars": 0,
             "partial_output_chars": 0,
             "raw_response_chars": 0,
@@ -1319,6 +1762,7 @@ class NovelAnalysisWorker(QThread):
             "done_received": False,
             "json_syntax_repair_count": 0,
             "json_syntax_repair_types": [],
+            "temperature_fallback": False,
             "last_json_parse_error": "",
             "last_json_parse_excerpt": "",
             "invalid_json_output_chars": 0,
@@ -1397,6 +1841,7 @@ class NovelAnalysisWorker(QThread):
         attempt = {
             "index": 0,
             "requested_model": str(self.model or ""),
+            "api_protocol": self.api_protocol,
             "response_model": "",
             "stream": bool(stream),
             "response_format_requested": bool(use_response_format),
@@ -1648,6 +2093,8 @@ class NovelAnalysisWorker(QThread):
 
     def _analysis_request_capabilities(self):
         with self._capability_lock:
+            if self.api_protocol == "anthropic":
+                return False, self._analysis_stream_supported
             return self._analysis_response_format_supported, self._analysis_stream_supported
 
     def _set_analysis_response_format_supported(self, supported):
@@ -1831,6 +2278,32 @@ class NovelAnalysisWorker(QThread):
         return text[start:]
 
     @staticmethod
+    def _json_candidate_tail(content, candidate):
+        """Return content after the extracted object for stream completeness checks."""
+        text = str(content or "").strip().lstrip("\ufeff")
+        candidate = str(candidate or "")
+        if not candidate:
+            return text
+        start = text.find("{")
+        if start < 0:
+            return text
+        return text[start + len(candidate):]
+
+    def _stream_json_candidate_required_keys(self):
+        """Return top-level keys needed before a stream may end early."""
+        return ()
+
+    def _stream_json_candidate_is_acceptable(self, content, candidate, parsed):
+        """Keep prefix completion compatible while rejecting hidden JSON tails."""
+        if not isinstance(parsed, dict):
+            return False
+        required_keys = tuple(self._stream_json_candidate_required_keys() or ())
+        if any(key not in parsed for key in required_keys):
+            return False
+        tail = self._json_candidate_tail(content, candidate).strip()
+        return not tail or tail == "```"
+
+    @staticmethod
     def _repair_json_syntax(content):
         """Repair only deterministic JSON punctuation/escaping errors.
 
@@ -1872,7 +2345,23 @@ class NovelAnalysisWorker(QThread):
                     next_index = index + 1
                     while next_index < len(text) and text[next_index].isspace():
                         next_index += 1
-                    if next_index >= len(text) or text[next_index] in ",}]:":
+                    closes_string = next_index >= len(text) or text[next_index] in "}]:"
+                    if not closes_string and text[next_index] == ",":
+                        # A model may leave dialogue quotes unescaped before a
+                        # Chinese comma, e.g. `他说:"先等等",然后转身`.
+                        # Treat the quote as a JSON delimiter only when the
+                        # token after the comma can start the next JSON value.
+                        value_index = next_index + 1
+                        while value_index < len(text) and text[value_index].isspace():
+                            value_index += 1
+                        if value_index >= len(text):
+                            closes_string = True
+                        else:
+                            next_value = text[value_index]
+                            closes_string = next_value in '}]"{[-0123456789' or text.startswith(
+                                ("true", "false", "null"), value_index
+                            )
+                    if closes_string:
                         output.append(char)
                         in_string = False
                     else:
@@ -2088,6 +2577,8 @@ class NovelAnalysisWorker(QThread):
     def _reasoning_effort_for_request(self):
         # Structured writing tasks expose their action directly; analysis
         # workers use the progress label (for example 框架分类).
+        if _novel_model_protocol(self.model) == "anthropic":
+            return ""
         action = str(getattr(self, "action", "") or "").strip() or self._analysis_progress_label()
         return reasoning_effort_for_model(self.model, self.base_url, action)
 
@@ -2096,36 +2587,44 @@ class NovelAnalysisWorker(QThread):
         status_code = int(match.group(1)) if match else 0
         return reasoning_effort_not_supported(status_code, error)
 
+    @staticmethod
+    def _temperature_not_supported(error):
+        """Match only providers that reject the explicit non-default value."""
+        text = str(error or "").lower()
+        return "non-default temperature" in text or "不支持非默认 temperature" in text
+
     def _allow_retry_chunk_split(self):
         return True
 
+    @staticmethod
+    def _with_novel_language_guidance(prompt):
+        return _with_novel_language_guidance(prompt)
+
     def _post_analysis_chunk(self, prompt, chunk_text, chunk_index, total_chunks, use_response_format=True):
-        url = api_url(self.base_url, "/v1/chat/completions")
-        headers = {
-            "Authorization": f"Bearer {self.api_key}",
-            "Content-Type": "application/json",
-        }
+        prompt = self._with_novel_language_guidance(prompt)
         user_text = self._chunk_user_text(chunk_text, chunk_index, total_chunks)
-        payload = {
-            "model": self.model,
-            "messages": [
-                {"role": "system", "content": prompt},
-                {"role": "user", "content": user_text},
-            ],
-            "temperature": 0.2,
-        }
         max_tokens = self._max_tokens_for_request()
-        if max_tokens:
-            payload["max_tokens"] = int(max_tokens)
-            self.diagnostics["max_output_tokens"] = int(max_tokens)
         reasoning_effort = self._reasoning_effort_for_request()
-        if reasoning_effort:
-            payload["reasoning_effort"] = reasoning_effort
-        if use_response_format:
-            payload["response_format"] = {"type": "json_object"}
+        protocol = _novel_api_protocol(self.base_url, self.model)
+        url, headers, payload, protocol = _build_novel_generation_request(
+            self.base_url,
+            self.api_key,
+            self.model,
+            prompt,
+            user_text,
+            stream=False,
+            max_tokens=max_tokens,
+            temperature=0.2,
+            reasoning_effort=reasoning_effort,
+            response_format=bool(use_response_format),
+            protocol=protocol,
+        )
+        self.diagnostics["request_endpoint"] = url
+        if max_tokens:
+            self.diagnostics["max_output_tokens"] = int(max_tokens)
         diagnostic_started = time.perf_counter()
         diagnostic_index = self._begin_analysis_api_diagnostic(
-            prompt, user_text, False, use_response_format
+            prompt, user_text, False, bool(use_response_format and protocol == "openai")
         )
         session = self._new_session()
         response = None
@@ -2149,7 +2648,55 @@ class NovelAnalysisWorker(QThread):
                     raise Exception(f"接口错误 {response.status_code}：{extract_api_error(response)}")
                 data = response.json()
             except Exception as first_error:
-                if "reasoning_effort" in payload and self._reasoning_effort_error(first_error):
+                if protocol == "anthropic" and _anthropic_endpoint_unsupported(
+                    getattr(response, "status_code", 0) if response is not None else 0,
+                    extract_api_error(response) if response is not None else first_error,
+                ):
+                    if response is not None:
+                        try:
+                            response.close()
+                        except Exception:
+                            pass
+                    _remember_novel_openai_protocol(self.base_url, self.model)
+                    protocol = "openai"
+                    self.api_protocol = "openai"
+                    self.diagnostics["api_protocol"] = "openai"
+                    self._set_analysis_response_format_supported(True)
+                    url, headers, payload, protocol = _build_novel_generation_request(
+                        self.base_url, self.api_key, self.model, prompt, user_text,
+                        stream=False, max_tokens=max_tokens, temperature=0.2,
+                        reasoning_effort=reasoning_effort,
+                        response_format=use_response_format, protocol=protocol,
+                    )
+                    self.diagnostics["protocol_fallback"] = "openai"
+                    self.diagnostics["request_endpoint"] = url
+                    response = session.post(url, headers=headers, json=payload, timeout=(10, 180), proxies=self._proxies())
+                    time_to_headers_ms = round((time.perf_counter() - diagnostic_started) * 1000, 1)
+                    response_headers = self._diagnostic_response_headers(response)
+                    if response.status_code >= 400:
+                        raise Exception(f"接口错误 {response.status_code}：{extract_api_error(response)}")
+                    data = response.json()
+                elif "temperature" in payload and self._temperature_not_supported(first_error):
+                    if response is not None:
+                        try:
+                            response.close()
+                        except Exception:
+                            pass
+                    payload.pop("temperature", None)
+                    self.diagnostics["temperature_fallback"] = True
+                    response = session.post(
+                        url,
+                        headers=headers,
+                        json=payload,
+                        timeout=(10, 180),
+                        proxies=self._proxies(),
+                    )
+                    time_to_headers_ms = round((time.perf_counter() - diagnostic_started) * 1000, 1)
+                    response_headers = self._diagnostic_response_headers(response)
+                    if response.status_code >= 400:
+                        raise Exception(f"接口错误 {response.status_code}：{extract_api_error(response)}")
+                    data = response.json()
+                elif "reasoning_effort" in payload and self._reasoning_effort_error(first_error):
                     if response is not None:
                         try:
                             response.close()
@@ -2171,13 +2718,10 @@ class NovelAnalysisWorker(QThread):
                 else:
                     raise
             response_model = str(data.get("model", "") or "")
-            message = data.get("choices", [{}])[0].get("message", {}) or {}
-            content = str(message.get("content", "") or "")
-            reasoning = str(
-                message.get("reasoning_content", "")
-                or message.get("reasoning", "")
-                or ""
-            )
+            normalized = _normalize_novel_response_payload(data)
+            content = normalized["content"]
+            reasoning = normalized["reasoning"]
+            self.diagnostics["reasoning_fields_seen"] = normalized["reasoning_fields"]
             self.last_partial_output = content or reasoning
             self._emit_output_chars(len(content))
             parsed = self._parse_json_result(content)
@@ -2233,34 +2777,30 @@ class NovelAnalysisWorker(QThread):
                 pass
 
     def _post_analysis_chunk_stream(self, prompt, chunk_text, chunk_index, total_chunks, use_response_format=True):
-        url = api_url(self.base_url, "/v1/chat/completions")
-        headers = {
-            "Authorization": f"Bearer {self.api_key}",
-            "Content-Type": "application/json",
-            "Accept": "text/event-stream",
-        }
+        prompt = self._with_novel_language_guidance(prompt)
         user_text = self._chunk_user_text(chunk_text, chunk_index, total_chunks)
-        payload = {
-            "model": self.model,
-            "messages": [
-                {"role": "system", "content": prompt},
-                {"role": "user", "content": user_text},
-            ],
-            "temperature": 0.2,
-            "stream": True,
-        }
         max_tokens = self._max_tokens_for_request()
-        if max_tokens:
-            payload["max_tokens"] = int(max_tokens)
-            self.diagnostics["max_output_tokens"] = int(max_tokens)
         reasoning_effort = self._reasoning_effort_for_request()
-        if reasoning_effort:
-            payload["reasoning_effort"] = reasoning_effort
-        if use_response_format:
-            payload["response_format"] = {"type": "json_object"}
+        protocol = _novel_api_protocol(self.base_url, self.model)
+        url, headers, payload, protocol = _build_novel_generation_request(
+            self.base_url,
+            self.api_key,
+            self.model,
+            prompt,
+            user_text,
+            stream=True,
+            max_tokens=max_tokens,
+            temperature=0.2,
+            reasoning_effort=reasoning_effort,
+            response_format=bool(use_response_format),
+            protocol=protocol,
+        )
+        self.diagnostics["request_endpoint"] = url
+        if max_tokens:
+            self.diagnostics["max_output_tokens"] = int(max_tokens)
         diagnostic_started = time.perf_counter()
         diagnostic_index = self._begin_analysis_api_diagnostic(
-            prompt, user_text, True, use_response_format
+            prompt, user_text, True, bool(use_response_format and protocol == "openai")
         )
         session = self._new_session()
         r = None
@@ -2293,6 +2833,42 @@ class NovelAnalysisWorker(QThread):
             time_to_headers_ms = round((time.perf_counter() - diagnostic_started) * 1000, 1)
             self._response = r
             self._register_response(r)
+            if r.status_code >= 400 and protocol == "anthropic":
+                first_error = extract_api_error(r)
+                if _anthropic_endpoint_unsupported(r.status_code, first_error):
+                    self._release_response(r)
+                    try:
+                        r.close()
+                    except Exception:
+                        pass
+                    _remember_novel_openai_protocol(self.base_url, self.model)
+                    url, headers, payload, protocol = _build_novel_generation_request(
+                        self.base_url,
+                        self.api_key,
+                        self.model,
+                        prompt,
+                        user_text,
+                        stream=True,
+                        max_tokens=max_tokens,
+                        temperature=0.2,
+                        reasoning_effort=reasoning_effort,
+                        response_format=use_response_format,
+                        protocol="openai",
+                    )
+                    self.api_protocol = "openai"
+                    self._set_analysis_response_format_supported(True)
+                    self.diagnostics["protocol_fallback"] = "openai"
+                    self.diagnostics["request_endpoint"] = url
+                    r = session.post(
+                        url,
+                        headers=headers,
+                        json=payload,
+                        stream=True,
+                        timeout=(10, 180),
+                        proxies=self._proxies(),
+                    )
+                    self._response = r
+                    self._register_response(r)
             if r.status_code >= 400 and "reasoning_effort" in payload:
                 first_error = extract_api_error(r)
                 if reasoning_effort_not_supported(r.status_code, first_error):
@@ -2302,6 +2878,26 @@ class NovelAnalysisWorker(QThread):
                     except Exception:
                         pass
                     payload.pop("reasoning_effort", None)
+                    r = session.post(
+                        url,
+                        headers=headers,
+                        json=payload,
+                        stream=True,
+                        timeout=(10, 180),
+                        proxies=self._proxies(),
+                    )
+                    self._response = r
+                    self._register_response(r)
+            if r.status_code >= 400 and "temperature" in payload:
+                first_error = extract_api_error(r)
+                if self._temperature_not_supported(first_error):
+                    self._release_response(r)
+                    try:
+                        r.close()
+                    except Exception:
+                        pass
+                    payload.pop("temperature", None)
+                    self.diagnostics["temperature_fallback"] = True
                     r = session.post(
                         url,
                         headers=headers,
@@ -2365,34 +2961,24 @@ class NovelAnalysisWorker(QThread):
                     continue
                 if data.get("model"):
                     response_model = str(data.get("model") or "")
+                elif data.get("type") == "message_start":
+                    message = data.get("message", {})
+                    if isinstance(message, dict) and message.get("model"):
+                        response_model = str(message.get("model") or "")
                 if isinstance(data.get("error"), dict):
                     raise Exception(data["error"].get("message") or json.dumps(data["error"], ensure_ascii=False))
                 if isinstance(data.get("error"), str) and data.get("error"):
                     raise Exception(data.get("error"))
-                choices = data.get("choices") or []
-                if not choices:
-                    continue
-                choice = choices[0] or {}
-                if choice.get("finish_reason"):
-                    finish_reason = str(choice.get("finish_reason") or "")
-                delta = choice.get("delta") or {}
-                message = choice.get("message") or {}
-                content_piece = (
-                    delta.get("content")
-                    or delta.get("text")
-                    or message.get("content")
-                    or choice.get("text")
-                    or ""
-                )
-                reasoning_piece = (
-                    delta.get("reasoning_content")
-                    or delta.get("reasoning")
-                    or message.get("reasoning_content")
-                    or message.get("reasoning")
-                    or ""
-                )
-                content_piece = str(content_piece or "")
-                reasoning_piece = str(reasoning_piece or "")
+                normalized = _normalize_novel_response_payload(data)
+                if normalized["finish_reason"]:
+                    finish_reason = normalized["finish_reason"]
+                content_piece = normalized["content"]
+                reasoning_piece = normalized["reasoning"]
+                if normalized["done"]:
+                    received_done = True
+                for key in normalized["reasoning_fields"]:
+                    if key not in self.diagnostics["reasoning_fields_seen"]:
+                        self.diagnostics["reasoning_fields_seen"].append(key)
                 content_chars += len(content_piece)
                 reasoning_chars += len(reasoning_piece)
                 piece = content_piece or reasoning_piece
@@ -2420,19 +3006,24 @@ class NovelAnalysisWorker(QThread):
                     elif not full:
                         self.last_partial_output = reasoning_full
 
+                if normalized["done"]:
+                    break
+
                 # Some compatible gateways send the final content and then
                 # leave the HTTP connection open without a finish signal. Once
                 # the top-level JSON object is complete, there is no useful
                 # content left to wait for. If a finish reason was provided,
                 # keep reading so a following DONE marker remains observable.
-                if full.strip() and not finish_reason:
+                if full.strip() and not finish_reason and protocol != "anthropic":
                     candidate = self._extract_json_object_candidate(full)
                     if candidate and candidate.rstrip().endswith("}"):
                         try:
                             parsed_candidate = json.loads(candidate)
                         except Exception:
                             parsed_candidate = None
-                        if isinstance(parsed_candidate, dict):
+                        if self._stream_json_candidate_is_acceptable(
+                            full, candidate, parsed_candidate
+                        ):
                             parsed_stream_result = parsed_candidate
                             break
 
@@ -2442,6 +3033,26 @@ class NovelAnalysisWorker(QThread):
                 raise ValueError(
                     f"AI 返回在输出上限处被截断（finish_reason={finish_reason}）。"
                 )
+            candidate = self._extract_json_object_candidate(full)
+            if candidate and candidate.rstrip().endswith("}"):
+                try:
+                    parsed_candidate = json.loads(candidate)
+                except Exception:
+                    parsed_candidate = None
+                if isinstance(parsed_candidate, dict):
+                    required_keys = tuple(self._stream_json_candidate_required_keys() or ())
+                    missing_keys = [key for key in required_keys if key not in parsed_candidate]
+                    if missing_keys:
+                        raise ValueError(
+                            "流式 JSON 已提前闭合，但缺少当前批次必需字段："
+                            + ", ".join(missing_keys)
+                        )
+                    if not self._stream_json_candidate_is_acceptable(
+                        full, candidate, parsed_candidate
+                    ):
+                        raise ValueError(
+                            "流式 JSON 对象后仍有未归入对象的实质内容。"
+                        )
             try:
                 parsed = (
                     parsed_stream_result
@@ -2585,7 +3196,7 @@ class NovelAnalysisWorker(QThread):
             return True
         if self._is_analysis_output_limit_error(error):
             return True
-        if getattr(self, "_analysis_stream_only", False) and self._is_stream_json_error(error):
+        if self._is_stream_transport_error(error) or self._is_stream_json_error(error):
             return True
         msg = str(error or "").lower()
         retry_markers = (
@@ -2669,12 +3280,37 @@ class NovelAnalysisWorker(QThread):
         return f"第 {label}/{total} 块暂时失败，{wait_seconds} 秒后自动重试 {next_attempt}/{attempts}..."
 
     def _is_stream_unsupported_error(self, error):
-        msg = str(error or "").lower()
-        return "stream" in msg and (
-            "support" in msg
-            or "unsupported" in msg
-            or "not support" in msg
-            or "不支持" in msg
+        msg = re.sub(r"\s+", " ", str(error or "").lower()).strip()
+        explicit_markers = (
+            "stream is not supported",
+            "streaming is not supported",
+            "stream not supported",
+            "streaming not supported",
+            "stream unsupported",
+            "streaming unsupported",
+            "unsupported stream",
+            "unsupported streaming",
+            "does not support stream",
+            "does not support streaming",
+            "do not support stream",
+            "do not support streaming",
+            "stream is disabled",
+            "streaming is disabled",
+            "不支持流式",
+            "不支持 stream",
+            "不支持 streaming",
+        )
+        if any(marker in msg for marker in explicit_markers):
+            return True
+        return bool(
+            re.search(
+                r"\bstream(?:ing)?(?:\s+parameter|\s+mode|\s+output)?\s+(?:is\s+)?not\s+supported\b",
+                msg,
+            )
+            or re.search(
+                r"\b(?:does|do)\s+not\s+support\s+(?:the\s+)?stream(?:ing)?\b",
+                msg,
+            )
         )
 
     def _is_stream_transport_error(self, error):
@@ -2685,22 +3321,14 @@ class NovelAnalysisWorker(QThread):
             "chunkedencodingerror",
             "connection broken",
             "remote end closed connection",
+            "remote disconnected",
+            "connection aborted",
+            "connection reset",
             "protocolerror",
             "upstream http/2 stream failed",
             "http/2 stream failed",
         )
         return any(marker in msg for marker in transport_markers)
-
-    def _is_stream_http2_fallback_error(self, error):
-        """Only provider-level HTTP/2 stream failures force non-stream fallback.
-
-        Ordinary premature responses should stay on the streaming path and use
-        the normal retry budget; otherwise a transient disconnect changes the
-        request mode unnecessarily and breaks providers that only support
-        streaming for long framework calls.
-        """
-        msg = str(error or "").lower()
-        return "http/2 stream failed" in msg or "upstream http/2 stream failed" in msg
 
     def _is_stream_json_error(self, error):
         msg = str(error or "").lower()
@@ -2712,60 +3340,131 @@ class NovelAnalysisWorker(QThread):
             or "unterminated string" in msg
         )
 
-    def _analyze_chunk_resilient(self, prompt, chunk, label, total, use_response_format, split_depth=0):
+    def _fallback_after_explicit_stream_unsupported(
+        self,
+        prompt,
+        chunk,
+        label,
+        total,
+        use_response_format,
+        progress_label,
+        error,
+    ):
+        if getattr(self, "_analysis_stream_only", False):
+            raise RuntimeError(
+                "当前章节规划接口不支持流式输出，已停止普通模式重试，请更换支持流式的模型或厂商。"
+            ) from error
+        self._set_analysis_stream_supported(False)
+        self.progress.emit(
+            f"当前接口不支持流式{progress_label}，已自动退回普通请求..."
+        )
+        return (
+            self._post_analysis_chunk(
+                prompt,
+                chunk,
+                label,
+                total,
+                use_response_format,
+            ),
+            use_response_format,
+        )
+
+    def _request_analysis_chunk_with_capability_fallback(
+        self,
+        prompt,
+        chunk,
+        label,
+        total,
+        use_response_format,
+        progress_label="候选分析",
+    ):
         response_format_supported, stream_supported = self._analysis_request_capabilities()
         use_response_format = bool(use_response_format and response_format_supported)
         if getattr(self, "_analysis_stream_only", False) and not stream_supported:
-            raise RuntimeError("当前章节规划接口不支持流式输出，已停止普通模式重试，请更换支持流式的模型或厂商。")
+            raise RuntimeError(
+                "当前章节规划接口不支持流式输出，已停止普通模式重试，请更换支持流式的模型或厂商。"
+            )
+
         try:
             if stream_supported:
-                return self._post_analysis_chunk_stream(prompt, chunk, label, total, use_response_format), use_response_format
-            return self._post_analysis_chunk(prompt, chunk, label, total, use_response_format), use_response_format
-        except Exception as e:
-            msg = str(e).lower()
-            if use_response_format and ("response_format" in msg or "json_object" in msg):
+                result = self._post_analysis_chunk_stream(
+                    prompt,
+                    chunk,
+                    label,
+                    total,
+                    use_response_format,
+                )
+            else:
+                result = self._post_analysis_chunk(
+                    prompt,
+                    chunk,
+                    label,
+                    total,
+                    use_response_format,
+                )
+            return result, use_response_format
+        except Exception as error:
+            message = str(error).lower()
+            if use_response_format and (
+                "response_format" in message or "json_object" in message
+            ):
                 self._set_analysis_response_format_supported(False)
-                self.progress.emit("当前接口不支持强制 JSON，已降级继续分块分析...")
+                self.progress.emit(
+                    f"当前接口不支持强制 JSON，已移除该参数并继续使用流式{progress_label}..."
+                )
                 try:
                     if stream_supported:
-                        return self._post_analysis_chunk_stream(prompt, chunk, label, total, False), False
-                    return self._post_analysis_chunk(prompt, chunk, label, total, False), False
-                except Exception as e2:
-                    if self._is_stream_unsupported_error(e2):
-                        if getattr(self, "_analysis_stream_only", False):
-                            raise RuntimeError(
-                                "当前章节规划接口不支持流式输出，已停止普通模式重试，请更换支持流式的模型或厂商。"
-                            ) from e2
-                        self._set_analysis_stream_supported(False)
-                        self.progress.emit("当前接口不支持流式候选分析，已自动退回普通分块请求...")
-                        return self._post_analysis_chunk(prompt, chunk, label, total, False), False
-                    if stream_supported and self._is_stream_http2_fallback_error(e2):
-                        if getattr(self, "_retry_stream_transport_before_nonstream", False):
-                            raise
-                        self._set_analysis_stream_supported(False)
-                        self.progress.emit("流式候选分析连接提前结束，已切换为普通请求重试...")
-                        return self._post_analysis_chunk(prompt, chunk, label, total, False), False
+                        result = self._post_analysis_chunk_stream(
+                            prompt,
+                            chunk,
+                            label,
+                            total,
+                            False,
+                        )
+                    else:
+                        result = self._post_analysis_chunk(
+                            prompt,
+                            chunk,
+                            label,
+                            total,
+                            False,
+                        )
+                    return result, False
+                except Exception as retry_error:
+                    if stream_supported and self._is_stream_unsupported_error(retry_error):
+                        return self._fallback_after_explicit_stream_unsupported(
+                            prompt,
+                            chunk,
+                            label,
+                            total,
+                            False,
+                            progress_label,
+                            retry_error,
+                        )
                     raise
-            if self._is_stream_unsupported_error(e):
-                if getattr(self, "_analysis_stream_only", False):
-                    raise RuntimeError(
-                        "当前章节规划接口不支持流式输出，已停止普通模式重试，请更换支持流式的模型或厂商。"
-                    ) from e
-                self._set_analysis_stream_supported(False)
-                self.progress.emit("当前接口不支持流式候选分析，已自动退回普通分块请求...")
-                return self._post_analysis_chunk(prompt, chunk, label, total, use_response_format), use_response_format
-            if stream_supported and self._is_stream_http2_fallback_error(e):
-                if getattr(self, "_retry_stream_transport_before_nonstream", False):
-                    raise
-                self._set_analysis_stream_supported(False)
-                self.progress.emit("流式候选分析连接提前结束，已切换为普通请求重试...")
-                return self._post_analysis_chunk(prompt, chunk, label, total, use_response_format), use_response_format
-            if stream_supported and self._is_stream_json_error(e):
-                if getattr(self, "_analysis_stream_only", False):
-                    raise
-                self._set_analysis_stream_supported(False)
-                self.progress.emit("流式候选分析返回不完整 JSON，已切换为普通请求重试...")
-                return self._post_analysis_chunk(prompt, chunk, label, total, use_response_format), use_response_format
+
+            if stream_supported and self._is_stream_unsupported_error(error):
+                return self._fallback_after_explicit_stream_unsupported(
+                    prompt,
+                    chunk,
+                    label,
+                    total,
+                    use_response_format,
+                    progress_label,
+                    error,
+                )
+            raise
+
+    def _analyze_chunk_resilient(self, prompt, chunk, label, total, use_response_format, split_depth=0):
+        try:
+            return self._request_analysis_chunk_with_capability_fallback(
+                prompt,
+                chunk,
+                label,
+                total,
+                use_response_format,
+            )
+        except Exception as e:
             if (
                 self._allow_retry_chunk_split()
                 and split_depth <= 0
@@ -3173,44 +3872,14 @@ class NovelCandidatePostprocessWorker(NovelAnalysisWorker):
         return str(chunk_text or "")
 
     def _analyze_chunk_resilient(self, prompt, chunk, label, total, use_response_format, split_depth=0):
-        response_format_supported, stream_supported = self._analysis_request_capabilities()
-        use_response_format = bool(use_response_format and response_format_supported)
-        try:
-            if stream_supported:
-                return self._post_analysis_chunk_stream(prompt, chunk, label, total, use_response_format), use_response_format
-            return self._post_analysis_chunk(prompt, chunk, label, total, use_response_format), use_response_format
-        except Exception as e:
-            msg = str(e).lower()
-            if use_response_format and ("response_format" in msg or "json_object" in msg):
-                self._set_analysis_response_format_supported(False)
-                self.progress.emit("当前接口不支持强制 JSON，已降级继续候选合并...")
-                try:
-                    if stream_supported:
-                        return self._post_analysis_chunk_stream(prompt, chunk, label, total, False), False
-                    return self._post_analysis_chunk(prompt, chunk, label, total, False), False
-                except Exception as e2:
-                    if self._is_stream_unsupported_error(e2):
-                        self._set_analysis_stream_supported(False)
-                        self.progress.emit("当前接口不支持流式候选合并，已自动退回普通请求...")
-                        return self._post_analysis_chunk(prompt, chunk, label, total, False), False
-                    if stream_supported and self._is_stream_http2_fallback_error(e2):
-                        self._set_analysis_stream_supported(False)
-                        self.progress.emit("流式候选合并连接提前结束，已切换为普通请求重试...")
-                        return self._post_analysis_chunk(prompt, chunk, label, total, False), False
-                    raise
-            if self._is_stream_unsupported_error(e):
-                self._set_analysis_stream_supported(False)
-                self.progress.emit("当前接口不支持流式候选合并，已自动退回普通请求...")
-                return self._post_analysis_chunk(prompt, chunk, label, total, use_response_format), use_response_format
-            if stream_supported and self._is_stream_http2_fallback_error(e):
-                self._set_analysis_stream_supported(False)
-                self.progress.emit("流式候选合并连接提前结束，已切换为普通请求重试...")
-                return self._post_analysis_chunk(prompt, chunk, label, total, use_response_format), use_response_format
-            if stream_supported and self._is_stream_json_error(e):
-                self._set_analysis_stream_supported(False)
-                self.progress.emit("流式候选合并返回不完整 JSON，已切换为普通请求重试...")
-                return self._post_analysis_chunk(prompt, chunk, label, total, use_response_format), use_response_format
-            raise
+        return self._request_analysis_chunk_with_capability_fallback(
+            prompt,
+            chunk,
+            label,
+            total,
+            use_response_format,
+            progress_label="候选合并",
+        )
 
     def run(self):
         try:
@@ -3281,10 +3950,6 @@ class NovelFrameworkImportWorker(NovelAnalysisWorker):
             proxy_mode=proxy_mode,
             max_concurrency=1,
         )
-        # Framework classification is a single structured request. If the
-        # gateway closes an otherwise successful SSE response early, retry the
-        # same request in non-stream mode instead of failing the import.
-        self._retry_stream_transport_before_nonstream = False
 
     def _analysis_prompt(self):
         return (
@@ -3892,7 +4557,6 @@ class NovelVolumeHandoffWorker(NovelAnalysisWorker):
             proxy_mode=proxy_mode,
             max_concurrency=1,
         )
-        self._retry_stream_transport_before_nonstream = True
 
     def _analysis_prompt(self):
         return (
@@ -4347,7 +5011,6 @@ class NovelVolumeIntentWorker(NovelAnalysisWorker):
             proxy_mode=proxy_mode,
             max_concurrency=1,
         )
-        self._retry_stream_transport_before_nonstream = True
 
     def _analysis_prompt(self):
         return (
@@ -4451,7 +5114,6 @@ class NovelVolumeFrameworkWorker(NovelFrameworkImportWorker):
             proxy_url=proxy_url,
             proxy_mode=proxy_mode,
         )
-        self._retry_stream_transport_before_nonstream = True
 
     def _analysis_prompt(self):
         stage_guidance = self._stage_planning_guidance()
@@ -4695,7 +5357,6 @@ class NovelVolumeFrameworkAlignmentWorker(NovelAnalysisWorker):
             proxy_mode=proxy_mode,
             max_concurrency=1,
         )
-        self._retry_stream_transport_before_nonstream = True
 
     def _analysis_prompt(self):
         return (
@@ -5188,24 +5849,6 @@ class NovelChapterTitleWorker(NovelAnalysisWorker):
                 titles_by_index = self._request_title_batch_once(batch, label, total)
             except Exception as e:
                 last_error = e
-                msg = str(e).lower()
-                response_format_supported, stream_supported = self._analysis_request_capabilities()
-                if stream_supported and ("不是合法 json" in msg or "not valid json" in msg or "jsondecodeerror" in msg):
-                    self._set_analysis_stream_supported(False)
-                    self.progress.emit(f"第 {label}/{total} 批章节标题返回格式异常，已切换普通请求重试...")
-                    try:
-                        titles_by_index = self._request_title_batch_once(batch, label, total)
-                    except Exception as e2:
-                        last_error = e2
-                    else:
-                        missing_items = [item for item in batch if not titles_by_index.get(item["index"])]
-                        titles_by_index.update(self._retry_missing_title_items(missing_items, label, total))
-                        return [
-                            _ensure_final_chapter_title_suffix(titles_by_index[item["index"]])
-                            if item["index"] == len(self.chapters)
-                            else titles_by_index[item["index"]]
-                            for item in batch
-                        ]
                 if attempt < 2:
                     self.progress.emit(f"第 {label}/{total} 批章节标题生成失败，正在自动重试 2/2...")
                     continue
@@ -5266,6 +5909,7 @@ class NovelWritingWorker(QThread):
         self.base_url = base_url
         self.api_key = api_key
         self.model = model
+        self.api_protocol = _novel_api_protocol(self.base_url, self.model)
         self.action = str(action or "")
         self.context = str(context or "")
         self.proxy_url = str(proxy_url or "").strip()
@@ -5284,6 +5928,9 @@ class NovelWritingWorker(QThread):
         self.diagnostics = {
             "action": self.action,
             "model": self.model,
+            "api_protocol": self.api_protocol,
+            "request_endpoint": "",
+            "protocol_fallback": "",
             "context_chars": len(self.context),
             "context_utf8_bytes": len(context_bytes),
             "context_sha256": hashlib.sha256(context_bytes).hexdigest(),
@@ -5300,9 +5947,11 @@ class NovelWritingWorker(QThread):
             "json_response_format_fallback": False,
             "json_response_format_transport_fallback": False,
             "json_response_format_cached_fallback": False,
+            "temperature_fallback": False,
             "reasoning_effort_requested": "",
             "reasoning_effort_fallback": False,
             "ignored_reasoning_chars": 0,
+            "reasoning_fields_seen": [],
             "system_prompt_chars": 0,
             "system_prompt_sha256": "",
             "http_status": None,
@@ -5478,9 +6127,14 @@ class NovelWritingWorker(QThread):
         return 0
 
     def _uses_json_response_format(self):
-        return self.action in {"memory_finalize", "memory_reconcile", "memory_repair", "logic_repair"}
+        return (
+            self.api_protocol != "anthropic"
+            and self.action in {"memory_finalize", "memory_reconcile", "memory_repair", "logic_repair"}
+        )
 
     def _reasoning_effort_for_request(self):
+        if _novel_model_protocol(self.model) == "anthropic":
+            return ""
         configured_effort = reasoning_effort_for_model(self.model, self.base_url, self.action)
         if configured_effort:
             return configured_effort
@@ -5706,6 +6360,22 @@ class NovelWritingWorker(QThread):
         )
 
     def _action_prompt(self):
+        prompt = self._action_prompt_base()
+        if self.action in {"draft", "style_rewrite", "script_to_novel"}:
+            if NOVEL_PROSE_START_MARKER not in prompt or NOVEL_PROSE_END_MARKER not in prompt:
+                boundary = (
+                    f"只输出可直接交付的小说正文，并严格使用{NOVEL_PROSE_START_MARKER}和"
+                    f"{NOVEL_PROSE_END_MARKER}包住正文；包络外不得输出思考、分析、前言、后记或创作建议。"
+                )
+                prompt += boundary
+        elif self.action in _NOVEL_TEXT_BOUNDARY_ACTIONS:
+            prompt += (
+                f"只输出当前任务要求的结果，并使用{NOVEL_OUTPUT_START_MARKER}和"
+                f"{NOVEL_OUTPUT_END_MARKER}包住；包络外不得输出思考、分析、前言、后记或创作建议。"
+            )
+        return _with_novel_language_guidance(prompt)
+
+    def _action_prompt_base(self):
         if self.action == "style_baseline":
             return (
                 "你是中文小说基准稿改写器。严格保留作者原文的全部人物、事件、信息、顺序、叙事人称和大致篇幅，"
@@ -5894,6 +6564,8 @@ class NovelWritingWorker(QThread):
                 "在后续正文验收与修复阶段处理被舍弃的冲突描述，不能把两种状态同时写入正文。"
                 "本章声纹执行表必须逐个区分实际说话人物，并明确普通段落合并与短段边界。"
                 "严格使用用户指定的三个分区标题，不输出分析、状态JSON、Markdown代码块或额外内容。"
+                f"备用正文草稿必须使用{NOVEL_PROSE_START_MARKER}和{NOVEL_PROSE_END_MARKER}包住；"
+                "包络外不得输出思考、分析、计划或总结。"
                 + _grounded_prose_contract()
             )
         if self.action in {"draft", "style_rewrite"} and "【正文风格参考】\n" in self.context:
@@ -5950,7 +6622,8 @@ class NovelWritingWorker(QThread):
             "script_to_novel": (
                 "你是专业小说改编编辑。请把剧本改编成小说正文。\n"
                 "要求：保留剧情、人物关系、关键对白和情绪推进；把场景、动作、对白转为自然叙事；"
-                "输出可直接阅读的正文，不要输出说明、分析或创作建议。"
+                f"输出可直接阅读的正文，并严格使用{NOVEL_PROSE_START_MARKER}和{NOVEL_PROSE_END_MARKER}包住正文；"
+                "不要输出说明、分析或创作建议。"
             ),
             "novel_to_script": (
                 "你是专业影视剧本改编编辑。请把小说正文改编成可拍摄剧本。\n"
@@ -5985,6 +6658,17 @@ class NovelWritingWorker(QThread):
         done_received = False
         first_piece_seen = False
         json_payload_complete = False
+        stream_boundary_filter = None
+        if self.action in {"draft", "style_rewrite", "script_to_novel"}:
+            stream_boundary_filter = _NovelBoundaryStreamFilter(
+                NOVEL_PROSE_START_MARKER,
+                NOVEL_PROSE_END_MARKER,
+            )
+        elif self.action in _NOVEL_TEXT_BOUNDARY_ACTIONS:
+            stream_boundary_filter = _NovelBoundaryStreamFilter(
+                NOVEL_OUTPUT_START_MARKER,
+                NOVEL_OUTPUT_END_MARKER,
+            )
         try:
             self.diagnostics.update({
                 "started_at": now_str(),
@@ -6000,7 +6684,6 @@ class NovelWritingWorker(QThread):
                 raise Exception("没有可用的章节资料。")
 
             self.progress.emit(self._initial_progress_text())
-            url = api_url(self.base_url, "/v1/chat/completions")
             system_prompt = self._action_prompt()
             sent_context = self.context[:NOVEL_AI_CONTEXT_LIMIT]
             self.diagnostics.update({
@@ -6014,46 +6697,45 @@ class NovelWritingWorker(QThread):
                     sent_context.encode("utf-8", errors="replace")
                 ).hexdigest(),
             })
-            headers = {
-                "Authorization": f"Bearer {self.api_key}",
-                "Content-Type": "application/json",
-                "Accept": "text/event-stream",
-            }
-            payload = {
-                "model": self.model,
-                "messages": [
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": sent_context},
-                ],
-                "temperature": (
-                    0.30 if self.action == "draft" and "【剧情执行稿任务】" in self.context
-                    else 0.20 if self.action in (
-                        "style_profile", "style_baseline", "style_sheet", "style_sheet_merge",
-                        "style_persona", "style_cards", "style_rules", "style_finalize", "style_audit",
-                        "style_semantic_vocabulary", "style_voice_cards", "style_technique_cards",
-                        "style_runtime_voice_pack", "style_plot_extract", "style_rewrite", "memory_finalize",
-                        "memory_reconcile", "memory_repair", "logic_repair",
-                    )
-                    else 1.5 if self.action in ("draft", "script_to_novel")
-                    else 0.35
-                ),
-                "stream": True,
-            }
+            temperature = (
+                0.30 if self.action == "draft" and "【剧情执行稿任务】" in self.context
+                else 0.20 if self.action in (
+                    "style_profile", "style_baseline", "style_sheet", "style_sheet_merge",
+                    "style_persona", "style_cards", "style_rules", "style_finalize", "style_audit",
+                    "style_semantic_vocabulary", "style_voice_cards", "style_technique_cards",
+                    "style_runtime_voice_pack", "style_plot_extract", "style_rewrite", "memory_finalize",
+                    "memory_reconcile", "memory_repair", "logic_repair",
+                )
+                else 1.5 if self.action in ("draft", "script_to_novel")
+                else 0.35
+            )
             max_tokens = self._max_tokens_for_request()
             self.diagnostics["max_output_tokens"] = max_tokens
-            if max_tokens:
-                payload["max_tokens"] = max_tokens
             reasoning_effort = self._reasoning_effort_for_request()
             if reasoning_effort:
-                payload["reasoning_effort"] = reasoning_effort
                 self.diagnostics["reasoning_effort_requested"] = reasoning_effort
+            protocol = _novel_api_protocol(self.base_url, self.model)
+            url, headers, payload, protocol = _build_novel_generation_request(
+                self.base_url,
+                self.api_key,
+                self.model,
+                system_prompt,
+                sent_context,
+                stream=True,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                reasoning_effort=reasoning_effort,
+                response_format=self._uses_json_response_format(),
+                protocol=protocol,
+            )
+            self.diagnostics["api_protocol"] = protocol
+            self.diagnostics["request_endpoint"] = url
             cached_json_fallback = (
-                self._uses_json_response_format()
+                "response_format" in payload
                 and self._uses_cached_json_transport_fallback()
             )
-            if self._uses_json_response_format() and not cached_json_fallback:
-                payload["response_format"] = {"type": "json_object"}
-            elif cached_json_fallback:
+            if cached_json_fallback:
+                payload.pop("response_format", None)
                 self.diagnostics["json_response_format_cached_fallback"] = True
             try:
                 r = self._post_stream_request_interruptibly(url, headers, payload)
@@ -6077,6 +6759,40 @@ class NovelWritingWorker(QThread):
                 })
                 self.result_ready.emit(self.action, "")
                 return
+            if r.status_code >= 400 and protocol == "anthropic":
+                first_error = extract_api_error(r)
+                if _anthropic_endpoint_unsupported(r.status_code, first_error):
+                    try:
+                        r.close()
+                    except Exception:
+                        pass
+                    _remember_novel_openai_protocol(self.base_url, self.model)
+                    self.api_protocol = "openai"
+                    protocol = "openai"
+                    url, headers, payload, protocol = _build_novel_generation_request(
+                        self.base_url,
+                        self.api_key,
+                        self.model,
+                        system_prompt,
+                        sent_context,
+                        stream=True,
+                        max_tokens=max_tokens,
+                        temperature=temperature,
+                        reasoning_effort=reasoning_effort,
+                        response_format=self._uses_json_response_format(),
+                        protocol=protocol,
+                    )
+                    self.diagnostics["api_protocol"] = protocol
+                    self.diagnostics["request_endpoint"] = url
+                    self.diagnostics["protocol_fallback"] = "openai"
+                    r = self._post_stream_request_interruptibly(url, headers, payload)
+                    if r is None:
+                        self.diagnostics.update({
+                            "outcome": "stopped",
+                            "finished_at": now_str(),
+                        })
+                        self.result_ready.emit(self.action, "")
+                        return
             if r.status_code >= 400 and "reasoning_effort" in payload:
                 first_error = extract_api_error(r)
                 if self._reasoning_effort_not_supported(r.status_code, first_error):
@@ -6107,6 +6823,26 @@ class NovelWritingWorker(QThread):
                     payload.pop("response_format", None)
                     self.diagnostics["json_response_format_fallback"] = True
                     self.progress.emit("接口不支持结构化 JSON，已自动兼容重试当前步骤...")
+                    r = self._post_stream_request_interruptibly(url, headers, payload)
+                    if r is None:
+                        self.diagnostics.update({
+                            "outcome": "stopped",
+                            "finished_at": now_str(),
+                        })
+                        self.result_ready.emit(self.action, "")
+                        return
+                else:
+                    raise Exception(f"接口错误 {r.status_code}：{first_error}")
+            if r.status_code >= 400 and "temperature" in payload:
+                first_error = extract_api_error(r)
+                if NovelAnalysisWorker._temperature_not_supported(first_error):
+                    try:
+                        r.close()
+                    except Exception:
+                        pass
+                    payload.pop("temperature", None)
+                    self.diagnostics["temperature_fallback"] = True
+                    self.progress.emit("接口不支持非默认 temperature，已自动兼容重试当前步骤...")
                     r = self._post_stream_request_interruptibly(url, headers, payload)
                     if r is None:
                         self.diagnostics.update({
@@ -6172,34 +6908,31 @@ class NovelWritingWorker(QThread):
                     raise Exception(data["error"].get("message") or json.dumps(data["error"], ensure_ascii=False))
                 if isinstance(data.get("error"), str) and data.get("error"):
                     raise Exception(data.get("error"))
-                choices = data.get("choices") or []
-                if not choices:
-                    continue
-                choice = choices[0] or {}
-                if choice.get("finish_reason"):
-                    finish_reason = str(choice.get("finish_reason") or "")
-                delta = choice.get("delta") or {}
-                message = choice.get("message") or {}
-                reasoning_piece = delta.get("reasoning_content") or delta.get("reasoning")
+                if data.get("type") == "message_start":
+                    message = data.get("message", {})
+                    if isinstance(message, dict):
+                        self.diagnostics["response_model"] = str(message.get("model") or "")
+                normalized = _normalize_novel_response_payload(data)
+                if normalized["finish_reason"]:
+                    finish_reason = normalized["finish_reason"]
+                if normalized["done"]:
+                    done_received = True
+                reasoning_piece = normalized["reasoning"]
                 if reasoning_piece:
-                    reasoning_piece = str(reasoning_piece)
                     self.diagnostics["ignored_reasoning_chars"] = int(
                         self.diagnostics.get("ignored_reasoning_chars", 0) or 0
                     ) + len(reasoning_piece)
+                    for key in normalized["reasoning_fields"]:
+                        if key not in self.diagnostics["reasoning_fields_seen"]:
+                            self.diagnostics["reasoning_fields_seen"].append(key)
                     received_chars += len(reasoning_piece)
                     # Reasoning is not part of the saved JSON result, but it
                     # is still upstream output. Keep the live character
                     # counter visible while the model is preparing content.
                     self.diagnostics["received_chars"] = received_chars
                     self.output_chars.emit(received_chars)
-                piece = (
-                    delta.get("content")
-                    or delta.get("text")
-                    or message.get("content")
-                    or choice.get("text")
-                )
+                piece = normalized["content"]
                 if piece:
-                    piece = str(piece)
                     received_chars += len(piece)
                     self.diagnostics["received_chars"] = received_chars
                     self.output_chars.emit(received_chars)
@@ -6242,7 +6975,15 @@ class NovelWritingWorker(QThread):
                         "style_plot_extract", "style_rewrite", "memory_finalize", "memory_reconcile",
                         "memory_repair", "logic_repair",
                     }:
-                        self.chunk.emit(piece)
+                        visible_piece = (
+                            stream_boundary_filter.feed(piece)
+                            if stream_boundary_filter is not None
+                            else piece
+                        )
+                        if visible_piece:
+                            self.chunk.emit(visible_piece)
+                if normalized["done"]:
+                    break
             content = full.strip()
             self.last_response_text = full
             stopped = bool(self._stop_requested or self.isInterruptionRequested())
@@ -6271,13 +7012,10 @@ class NovelWritingWorker(QThread):
                 raise Exception(self._incomplete_stream_error(finish_reason))
             validation_text = content
             prose_delivery = None
-            if self.action == "draft":
+            if self.action in {"draft", "style_rewrite", "script_to_novel"}:
                 prose_delivery = _extract_prose_delivery_result(
                     content,
-                    require_marker=(
-                        "【剧情执行稿任务】" not in self.context
-                        and "【小说正文直写】" in self.context
-                    ),
+                    require_marker=True,
                 )
                 if not prose_delivery.get("ok"):
                     raise Exception(str(prose_delivery.get("error", "AI 正文交付边界不完整。")))
@@ -6288,6 +7026,25 @@ class NovelWritingWorker(QThread):
                     "prose_delivery_source": str(prose_delivery.get("source", "") or ""),
                     "prose_metadata_stripped": bool(validation_text != content.strip()),
                 })
+            elif self.action in _NOVEL_TEXT_BOUNDARY_ACTIONS:
+                output_delivery = _extract_novel_output_delivery_result(
+                    content,
+                    require_marker=True,
+                )
+                if not output_delivery.get("ok"):
+                    raise Exception(str(output_delivery.get("error", "AI 输出边界不完整。")))
+                validation_text = str(output_delivery.get("text", "") or "").strip()
+                self.diagnostics.update({
+                    "raw_response_chars": len(content),
+                    "delivered_output_chars": len(validation_text),
+                    "output_delivery_source": str(output_delivery.get("source", "") or ""),
+                    "output_metadata_stripped": bool(validation_text != content.strip()),
+                })
+            elif self.action in _NOVEL_JSON_RESULT_ACTIONS:
+                candidate = NovelAnalysisWorker._extract_json_object_candidate(content)
+                if candidate and candidate != content:
+                    validation_text = candidate
+                    self.diagnostics["json_metadata_stripped"] = True
             self.diagnostics.update({
                 "outcome": "stopped" if stopped else "success",
                 "finish_reason": finish_reason,
@@ -6304,7 +7061,15 @@ class NovelWritingWorker(QThread):
                 and not self._draft_ending_looks_complete(validation_text)
             ):
                 raise Exception("AI 正文似乎还没有写完，已保留当前预览内容，可点续写正文继续。")
-            delivered_content = validation_text if self.action == "draft" else content
+            delivered_content = (
+                validation_text
+                if self.action in {
+                    "draft", "style_rewrite", "script_to_novel",
+                    *_NOVEL_TEXT_BOUNDARY_ACTIONS,
+                    *_NOVEL_JSON_RESULT_ACTIONS,
+                }
+                else content
+            )
             self.result_ready.emit(self.action, delivered_content)
         except Exception as e:
             stopped = bool(self._stop_requested or self.isInterruptionRequested())
@@ -6583,7 +7348,6 @@ class NovelChapterEventPlacementWorker(NovelAnalysisWorker):
             max_concurrency=1,
         )
         self._analysis_stream_only = True
-        self._retry_stream_transport_before_nonstream = True
         self.nodes = [deepcopy(item) for item in nodes if isinstance(item, dict)]
         self.stage_id = str(stage_id or "").strip().upper()
         self.batch_start = max(1, int(batch_start or 1))
@@ -6778,7 +7542,6 @@ class NovelChapterPlanWorker(NovelAnalysisWorker):
             max_concurrency=1,
         )
         self._analysis_stream_only = True
-        self._retry_stream_transport_before_nonstream = True
         self.target_words = max(1, int(target_words or 1))
         self.average_chapter_words = max(1, int(average_chapter_words or 3000))
         self.chapter_count = max(1, int(chapter_count or 1))
@@ -6833,6 +7596,11 @@ class NovelChapterPlanWorker(NovelAnalysisWorker):
             opening_guidance = _OPENING_THREE_CHAPTER_GUIDANCE
         locked_schedule_guidance = ""
         final_stage_climax_guidance = ""
+        stage_fact_boundary_guidance = (
+            "前面已确认的阶段是已经发生并确认的事实和结果，本批只承接其后果、变化、新选择和新冲突，"
+            "不重新完成已经兑现的事件、人物目标、关系结果或主线闭环；超出本批的阶段属于尚未发生的规划内容，"
+            "本批只形成前置压力、入口条件或行动动机，不提前写出后续阶段的具体事件、结果、兑现或终局闭环。"
+        )
         if self.creation_wizard_mode:
             schedule = self.locked_node_schedule
             schedule_range = schedule.get("range", []) if isinstance(schedule, dict) else []
@@ -6863,11 +7631,9 @@ class NovelChapterPlanWorker(NovelAnalysisWorker):
             )
             if schedule_end >= self.total_chapter_count:
                 final_stage_climax_guidance = (
-                    "这是全书最后阶段的章节批次。先从输入的既有阶段事件、人物关系和主线压力中识别一个决定性高潮，"
-                    "让主角在已经建立的冲突上作出不可轻易撤回的行动或选择，并在对应节点中写出可验证结果；"
-                    "最后3章属于高潮结果兑现与收束的一部分，高潮可以落在最后3章内或此前，"
-                    "但高潮后的章节只能承接新的直接后果、关系落点和本部结果，不能把同一成果拆成重复证明。"
-                    "不要新增主线、主要敌人、世界规则或固定高潮章号。"
+                    "这是全书最后阶段的章节批次。沿用输入中已经确认的高潮事件、结果和章位，"
+                    "在对应节点中写出主角的决定性行动或选择，不自行提前、延后或另造高潮。"
+                    + _final_stage_climax_planning_guidance(self.total_chapter_count)
                 )
         if self.creation_wizard_mode:
             chapter_order_rule = (
@@ -6878,6 +7644,12 @@ class NovelChapterPlanWorker(NovelAnalysisWorker):
                 f"{absolute_end}章后立即结束，不安排第{absolute_end + 1}章或任何后续阶段内容。"
                 f"先按全书第{absolute_start}章到第{absolute_end}章建立{self.chapter_count}个固定章节位置，"
                 "再把阶段节点压入这些位置；每一项只对应一个固定位置，节点内容再多也不能新增章节。"
+            )
+            stage_fact_boundary_guidance = (
+                "已经生成的前面阶段是已经发生并确认的事实和结果，本批章节只能承接这些结果带来的后果、变化、新选择和新冲突，"
+                "不重新完成前面已经兑现的事件、人物目标、关系结果或主线闭环。"
+                "尚未生成的后续阶段属于尚未发生的规划内容，本批只能为后续阶段形成前置压力、入口条件或行动动机，"
+                "不得提前写出后续阶段的具体事件、结果、兑现或终局闭环；当前阶段结束状态只在本批固定章节范围内完成。"
             )
             event_rule = (
                 "当前阶段的剧情节点已经由程序先行安排，输入中的locked_node_schedule提供每个节点的落点范围。"
@@ -6933,6 +7705,7 @@ class NovelChapterPlanWorker(NovelAnalysisWorker):
             "每章应把人物、关系、处境或主线推进到一个读者可感知的新局面，章节之间保持场景、压力和结果的变化；"
             "小说圣经、世界规则和阶段规划提供长期事实，伏笔随着人物实际行动、关系变化和信息出现自然生长。\n"
             + core_motive_guidance
+            + stage_fact_boundary_guidance
             + final_stage_climax_guidance
             + "\n"
             "章节规划重点写本章正在发生的事情、人物如何应对以及事情留下的变化；"

@@ -5366,7 +5366,7 @@ class NovelWritingStateTests(unittest.TestCase):
             (action, context, status_text)
         )
         terminal = (
-            f"【终稿正文】\n{revised}\n\n"
+            f"【终稿正文】\n<NOVEL_PROSE_START>\n{revised}\n<NOVEL_PROSE_END>\n\n"
             "【终稿验收】\n"
             '{"previous_chapter_repetition_check":true,"logic_continuity_check":true}'
         )
@@ -5433,7 +5433,7 @@ class NovelWritingStateTests(unittest.TestCase):
             (action, context, status_text)
         )
         terminal = (
-            f"【终稿正文】\n{revised}\n\n"
+            f"【终稿正文】\n<NOVEL_PROSE_START>\n{revised}\n<NOVEL_PROSE_END>\n\n"
             "【终稿验收】\n"
             '{"beat_evidence":[{"beat":1,"evidence_quote":'
             '"赵明进入仓库，并在墙后找到了暗格"}],'
@@ -5504,7 +5504,7 @@ class NovelWritingStateTests(unittest.TestCase):
 
         tab.on_chapter_ai_ready(
             "style_finalize",
-            f"【终稿正文】\n{revised}\n\n【终稿验收】\n{acceptance}",
+            f"【终稿正文】\n<NOVEL_PROSE_START>\n{revised}\n<NOVEL_PROSE_END>\n\n【终稿验收】\n{acceptance}",
         )
 
         self.assertEqual([item[0] for item in started], ["memory_finalize"])
@@ -5569,7 +5569,7 @@ class NovelWritingStateTests(unittest.TestCase):
 
         tab.on_chapter_ai_ready(
             "style_finalize",
-            f"【终稿正文】\n{revised}\n\n【终稿验收】\n{acceptance}",
+            f"【终稿正文】\n<NOVEL_PROSE_START>\n{revised}\n<NOVEL_PROSE_END>\n\n【终稿验收】\n{acceptance}",
         )
 
         self.assertEqual([item[0] for item in started], ["memory_finalize"])
@@ -5625,7 +5625,7 @@ class NovelWritingStateTests(unittest.TestCase):
 
         tab.on_chapter_ai_ready(
             "style_finalize",
-            f"【终稿正文】\n{revised}\n\n【终稿验收】\n{acceptance}",
+            f"【终稿正文】\n<NOVEL_PROSE_START>\n{revised}\n<NOVEL_PROSE_END>\n\n【终稿验收】\n{acceptance}",
         )
 
         self.assertEqual([item[0] for item in started], ["memory_finalize"])
@@ -5683,7 +5683,7 @@ class NovelWritingStateTests(unittest.TestCase):
             "logic_continuity_check": True,
             "paragraph_structure_check": True,
         }, ensure_ascii=False)
-        response = f"【终稿正文】\n{revised}\n\n【终稿验收】\n{acceptance}"
+        response = f"【终稿正文】\n<NOVEL_PROSE_START>\n{revised}\n<NOVEL_PROSE_END>\n\n【终稿验收】\n{acceptance}"
 
         tab.on_chapter_ai_ready("style_finalize", response)
 
@@ -9007,6 +9007,12 @@ class NovelWritingStateTests(unittest.TestCase):
         self.assertIn("不得另增章节", context)
         self.assertIn("不得新增主要任务、主要敌人、未知信息或等待回答的悬念", context)
         self.assertNotIn("不得把批次结尾写成全书结局", context)
+        self.assertIn("最后阶段高潮兑现位置｜第162-164章", context)
+        self.assertIn("现有第165-167章收尾窗口", context)
+        self.assertNotIn("高潮可以落在窗口内或窗口前", context)
+        self.assertNotIn("高潮可以在窗口内或窗口前发生", context)
+        self.assertEqual(state["total_chapter_count"], 167)
+        self.assertEqual(state["existing_chapter_count"], 162)
 
     def test_chapter_plan_reference_keeps_250_items_and_filters_late_batch_range(self):
         tab = NovelWritingTab.__new__(NovelWritingTab)

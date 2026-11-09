@@ -10,6 +10,40 @@ from gpt_desktop.core import load_json_file, save_json_file
 
 
 class NovelStorageTests(unittest.TestCase):
+    def test_empty_stopped_raw_output_does_not_replace_existing_response(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            old_dir = novel_storage.NOVEL_RAW_OUTPUT_DIR
+            try:
+                novel_storage.NOVEL_RAW_OUTPUT_DIR = tmp
+                first = novel_storage.save_novel_raw_model_output(
+                    "creation-wizard-premise-premise-first",
+                    1,
+                    '{"c":{}}',
+                    {
+                        "stage": "premise:premise",
+                        "project_path": "/tmp/test-draft.json",
+                        "outcome": "success",
+                    },
+                )
+                second = novel_storage.save_novel_raw_model_output(
+                    "creation-wizard-premise-premise-second",
+                    1,
+                    "",
+                    {
+                        "stage": "premise:premise",
+                        "project_path": "/tmp/test-draft.json",
+                        "outcome": "stopped",
+                    },
+                )
+                self.assertEqual(second, first)
+                with open(first, encoding="utf-8") as handle:
+                    self.assertEqual(handle.read(), '{"c":{}}')
+                metadata = load_json_file(first.replace(".txt", ".json"), {})
+                self.assertEqual(metadata.get("outcome"), "success")
+                self.assertEqual(metadata.get("output_chars"), 8)
+            finally:
+                novel_storage.NOVEL_RAW_OUTPUT_DIR = old_dir
+
     def test_character_style_library_round_trip_and_update(self):
         with tempfile.TemporaryDirectory() as tmp:
             old_file = novel_storage.NOVEL_CHARACTER_STYLE_LIBRARY_FILE

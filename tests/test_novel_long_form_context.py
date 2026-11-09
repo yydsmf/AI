@@ -80,6 +80,7 @@ from gpt_desktop.novel_utils import (
     _project_terminal_contract,
     _project_terminal_window_bounds,
     _terminal_window_bounds,
+    _final_stage_climax_planning_guidance,
     _terminal_window_chapter_info,
     _merge_long_form_state_patch,
     _memory_repair_patch_targets,
@@ -188,6 +189,22 @@ class NovelLongFormContextTests(unittest.TestCase):
             },
         )
         self.assertIsNone(_terminal_window_chapter_info(project, 6))
+
+    def test_climax_guidance_precedes_the_unchanged_terminal_window(self):
+        for total, climax_range, terminal_range in (
+            (167, "162-164", (165, 167)),
+            (100, "95-97", (98, 100)),
+            (6, "1-3", (4, 6)),
+            (4, "1-1", (2, 4)),
+        ):
+            with self.subTest(total=total):
+                guidance = _final_stage_climax_planning_guidance(total)
+                self.assertIn(f"最后阶段高潮兑现位置｜第{climax_range}章", guidance)
+                self.assertEqual(_terminal_window_bounds(total), terminal_range)
+                self.assertIn("最后3章的收尾完结安排保持不变", guidance)
+                self.assertIn("已经确认的阶段事件、高潮章位和已写正文继续沿用", guidance)
+        for total in (0, 1, 3, "invalid"):
+            self.assertEqual(_final_stage_climax_planning_guidance(total), "")
 
     def test_terminal_context_disables_serial_hooks_and_remote_future_plans(self):
         chapters = [_new_chapter(index) for index in range(10)]
@@ -3464,7 +3481,7 @@ class NovelLongFormContextTests(unittest.TestCase):
             3000,
         )
         returned = (
-            "【终稿正文】\n终稿第一段。\n\n终稿第二段。\n\n"
+            "【终稿正文】\n<NOVEL_PROSE_START>\n终稿第一段。\n\n终稿第二段。\n<NOVEL_PROSE_END>\n\n"
             "【终稿验收】\n"
             '{"beat_evidence":[],"previous_chapter_repetition_check":true,'
             '"paragraph_structure_check":true}\n\n'
@@ -3479,6 +3496,8 @@ class NovelLongFormContextTests(unittest.TestCase):
         parsed = _parse_style_finalize_result(returned)
 
         self.assertIn("【终稿编辑任务】", context)
+        self.assertIn("<NOVEL_PROSE_START>", context)
+        self.assertIn("<NOVEL_PROSE_END>", context)
         self.assertNotIn("对白字数占比不符", context)
         self.assertNotIn("终稿正文控制在2550-3450字", context)
         self.assertIn("自然排版与句式跟随样本读感变化", context)
@@ -3493,7 +3512,7 @@ class NovelLongFormContextTests(unittest.TestCase):
         self.assertEqual(parsed["memory_update"]["state_snapshot"]["location"], "原地")
 
         partial = _parse_style_finalize_result(
-            "【终稿正文】\n只返回正文。\n\n"
+            "【终稿正文】\n<NOVEL_PROSE_START>\n只返回正文。\n<NOVEL_PROSE_END>\n\n"
             "【终稿验收】\n"
             '{"previous_chapter_repetition_check":true,"paragraph_structure_check":true}'
         )

@@ -289,6 +289,70 @@ class NovelCreationWizardPersistenceTests(unittest.TestCase):
         self.assertEqual(len(result["lore"]), 1)
         self.assertEqual(result["foreshadows"][0]["code"], "F0001")
 
+    def test_bible_assets_prompt_uses_100_char_soft_caps_and_raises_budget(self):
+        worker = wizard.NovelCreationWorker(
+            "http://example.test",
+            "key",
+            "model",
+            "bible",
+            {
+                "author_input": {"total_words": 500000},
+                "selected_premise": {"genre": "都市修真"},
+                "confirmed": {
+                    "stage_directions": [],
+                    "bible": {"bible": {}, "world_rules": {}},
+                },
+            },
+            batch_kind="bible_assets",
+        )
+        prompt = worker._analysis_prompt()
+
+        self.assertEqual(worker._max_tokens_for_request(), 30000)
+        self.assertIn("设定库用于保存后续可以反复调用的稳定故事事实", prompt)
+        self.assertIn("l.d优先说明该设定是什么、稳定起什么作用、具有哪些明确边界或区别", prompt)
+        self.assertIn("每项根据实际需要选择最关键的一到两个方面", prompt)
+        self.assertIn("阶段中的具体使用方式、事件推进、人物连续行动、因果变化和局势转折，由阶段规划、章节规划和伏笔字段展开", prompt)
+        self.assertIn("设定说明直接呈现故事中的稳定事实", prompt)
+        self.assertIn("每项保留一到两个最有用的方面，形成简洁、具体、可复用的资料", prompt)
+        self.assertIn("伏笔说明用一两句写清它指向的正式人物、势力、设定或关系", prompt)
+        self.assertIn("l.d、l.k、f.r使用软上限", prompt)
+        self.assertIn("每项通常控制在100字以内", prompt)
+        self.assertIn("100字只是篇幅参考，不是硬性截断", prompt)
+        self.assertIn("优先保留最关键的事实，删除过程、重复说明和枝节", prompt)
+        self.assertIn("不能为了符合字数而留空", prompt)
+        self.assertIn('"d":"具体内容"', prompt)
+        self.assertIn('"k":"人物当前知道多少"', prompt)
+        self.assertIn('"r":"揭开后会改变什么"', prompt)
+        self.assertIn('"d":"读者能看到的线索及后续变化"', prompt)
+        self.assertIn("写清当前可见的具体线索、人物当前理解、回收时谁做了什么、读者确认了什么、当场产生什么后果", prompt)
+        self.assertNotIn("l.d按该设定实际需要择要写最关键的类型、作用、边界、关联或区别", prompt)
+        self.assertNotIn("设定说明不能只写名词", prompt)
+        self.assertNotIn("l.k必须填写人物当前对该设定的有效认知", prompt)
+        self.assertNotIn("f.r只写伏笔回收后读者确认的答案", prompt)
+        self.assertIn("【中文表达与字符边界】", prompt)
+        self.assertIn("故事内真实存在的外文词可以按项目资料原样保留", prompt)
+        self.assertIn("人物代号 K", prompt)
+        self.assertIn("不要在中文故事字段中混入 deadline、escalation、setup、payoff、core_motive", prompt)
+
+        stage_worker = wizard.NovelCreationWorker(
+            "http://example.test",
+            "key",
+            "model",
+            "stage_plan",
+            {
+                "author_input": {"total_words": 500000, "average_chapter_words": 3000},
+                "selected_premise": {"genre": "都市修真"},
+                "current_stage": {"number": 1, "start_chapter": 1, "end_chapter": 34},
+            },
+            batch_kind="stage_plan_stage",
+            stage_index=0,
+        )
+        self.assertEqual(stage_worker._max_tokens_for_request(), 30000)
+        self.assertEqual(
+            stage_worker._stream_json_candidate_required_keys(),
+            ("v", "k", "s", "f"),
+        )
+
     def test_stage_directions_normalize_and_keep_scene_character_result_fields(self):
         result = wizard.normalize_creation_result(
             "bible",
@@ -373,6 +437,88 @@ class NovelCreationWizardPersistenceTests(unittest.TestCase):
             ("stage_plan_stage", 0),
         )
 
+    def test_stage_generation_resumes_at_first_missing_stage_after_s02(self):
+        dialog = wizard.NovelCreationWizardDialog.__new__(
+            wizard.NovelCreationWizardDialog
+        )
+        dialog.target_words_spin = SimpleNamespace(value=lambda: 500000)
+        dialog.average_words_spin = SimpleNamespace(value=lambda: 3000)
+        dialog.step_results = {
+            "bible": {
+                "stage_directions": [
+                    {"id": f"R{index:02d}", "summary": f"方向{index}"}
+                    for index in range(1, 6)
+                ],
+                "foreshadows": [],
+            },
+            "stage_plan": {
+                "stage_plan": [
+                    {
+                        "id": f"S{index:02d}",
+                        "name": f"阶段{index}",
+                        "ordered_events": [{
+                            "id": f"S{index:02d}-E01",
+                            "event": f"阶段{index}已发生的事件",
+                            "result": f"阶段{index}已发生的结果",
+                        }],
+                    }
+                    for index in (1, 2)
+                ],
+                "foreshadow_schedule": [],
+            },
+        }
+
+        result = dialog.step_results["stage_plan"]
+        dialog._sync_stage_generation_state(result)
+
+        self.assertEqual(
+            dialog._next_generation_batch("stage_plan"),
+            ("stage_plan_stage", 2),
+        )
+        self.assertEqual(
+            [stage["id"] for stage in result["stage_plan"]],
+            ["S01", "S02"],
+        )
+        self.assertEqual(result["_generation_state"]["next_stage_index"], 2)
+
+    def test_stage_result_ownership_is_explicit_in_all_stage_prompts(self):
+        context = {
+            "author_input": {"total_words": 500000, "average_chapter_words": 3000},
+            "selected_premise": {"genre": "都市高武"},
+            "current_stage": {
+                "number": 3,
+                "total_stages": 5,
+                "start_chapter": 69,
+                "end_chapter": 102,
+                "target_words": 100000,
+                "stage_direction": {
+                    "id": "R03",
+                    "name": "第三轮",
+                    "result": "第三阶段结果",
+                },
+            },
+        }
+        worker = wizard.NovelCreationWorker(
+            "http://example.test",
+            "key",
+            "model",
+            "stage_plan",
+            context,
+            batch_kind="stage_plan_stage",
+            stage_index=2,
+        )
+        for prompt in (wizard.STEP_PROMPTS["stage_plan"], worker._analysis_prompt()):
+            with self.subTest(prompt=prompt[:80]):
+                self.assertIn("每个阶段方向的 result 只归该阶段完成", prompt)
+                self.assertIn(
+                    "当前阶段事件的 result、exit_state.known_facts 和 carry_over 都必须服从当前阶段方向的 result",
+                    prompt,
+                )
+                self.assertIn(
+                    "后续阶段方向中的 result 是尚未发生的未来结果，当前阶段不得把它完成或写成既成事实",
+                    prompt,
+                )
+
     def test_stage_direction_prompt_requires_new_scene_and_character_changes(self):
         worker = wizard.NovelCreationWorker(
             "http://example.test",
@@ -390,8 +536,66 @@ class NovelCreationWizardPersistenceTests(unittest.TestCase):
         self.assertIn("场景和人物变化", prompt)
         self.assertIn("不能只是继续在同一家庭、公司、工厂、宗门", prompt)
         self.assertIn("完结前高潮方向", prompt)
-        self.assertIn("最后3章属于高潮结果兑现与收束的一部分", prompt)
+        self.assertIn("当前阶段形成可见兑现", prompt)
+        self.assertIn("next_pressure 只从本阶段已经兑现的结果引出新的处境", prompt)
+        self.assertIn("最后阶段高潮兑现位置｜第62-64章", prompt)
+        self.assertIn("现有第65-67章收尾窗口", prompt)
+        self.assertIn("不要求高潮写满三章", prompt)
+        self.assertNotIn("高潮可以发生在最后3章内或此前", prompt)
         self.assertIn('"stage_directions"', prompt)
+
+    def test_stage_direction_fields_keep_time_and_state_roles_across_genres(self):
+        for genre in ("东方仙侠", "职场婚恋", "科幻末世"):
+            with self.subTest(genre=genre):
+                worker = wizard.NovelCreationWorker(
+                    "http://example.test",
+                    "key",
+                    "model",
+                    "bible",
+                    {
+                        "author_input": {
+                            "total_words": 500000,
+                            "average_chapter_words": 3000,
+                            "genre": genre,
+                        },
+                        "selected_premise": {"genre": genre},
+                    },
+                    batch_kind="stage_directions",
+                )
+                prompt = worker._analysis_prompt()
+                self.assertIn("各字段从不同角度描述同一组事实，不是多组待执行事件", prompt)
+                self.assertIn("不先写完结局再追加一遍同样的收尾", prompt)
+                self.assertIn("人物已知的事情继续影响其行动，不重新当作第一次发现", prompt)
+                self.assertIn("用引起变化的具体行动及结果衔接后续选择", prompt)
+                self.assertIn("当前阶段形成可见兑现", prompt)
+                self.assertIn("阶段性推进人物可以继续出现，但后续要以新的位置", prompt)
+                self.assertIn("不规定各题材的剧情顺序、角色分工或场景轮换", prompt)
+                self.assertIn("章位仅供内部安排最后阶段节奏", prompt)
+                self.assertIn("具体章位由第三步落实到 climax_chapter_range", prompt)
+                self.assertEqual(prompt.count("最后阶段高潮兑现位置｜第162-164章"), 1)
+                self.assertIn("现有第165-167章收尾窗口", prompt)
+
+                schema, _ = json.JSONDecoder().raw_decode(
+                    prompt, prompt.index('{"stage_directions":')
+                )
+                self.assertEqual(set(schema), {"stage_directions"})
+                direction = schema["stage_directions"][0]
+                self.assertEqual(
+                    set(direction),
+                    {
+                        "id", "name", "word_range", "summary", "scene_change",
+                        "character_change", "result", "next_pressure",
+                    },
+                )
+                self.assertIn("按实际先后", direction["summary"])
+                self.assertIn("本阶段结束时已成立的状态", direction["result"])
+                self.assertIn("不写章号、事件过程或另一套时间安排", direction["result"])
+                self.assertIn("承接前阶段事实", direction["character_change"])
+                self.assertIn("非最后阶段", direction["next_pressure"])
+                self.assertIn("最后阶段只写不影响本部闭环的余味", direction["next_pressure"])
+                self.assertIn("不新增待办，也不重启已解决事项", direction["next_pressure"])
+                for story_specific_detail in ("江白", "乔苗苗", "各国使团"):
+                    self.assertNotIn(story_specific_detail, prompt)
 
     def test_generation_batch_labels_are_specific_to_the_current_batch(self):
         self.assertEqual(
@@ -582,7 +786,7 @@ class NovelCreationWizardPersistenceTests(unittest.TestCase):
         self.assertEqual(result["characters"][0]["name"], "主角")
         self.assertTrue(result["_generation_state"]["stage_directions_confirmed"])
 
-    def test_stage_plan_context_receives_all_directions_and_current_direction(self):
+    def test_stage_plan_context_uses_current_direction_as_stage_batch_target(self):
         dialog = wizard.NovelCreationWizardDialog.__new__(
             wizard.NovelCreationWizardDialog
         )
@@ -608,7 +812,47 @@ class NovelCreationWizardPersistenceTests(unittest.TestCase):
         context = dialog._context_for_step("stage_plan")
 
         self.assertEqual(context["confirmed"]["stage_directions"], directions)
+        self.assertNotIn("stage_directions", context["confirmed"]["bible"])
         self.assertEqual(context["current_stage"]["stage_direction"], directions[0])
+
+        transport = wizard.format_creation_context(context)
+        self.assertIn("前面阶段已经生成的事件、结果、状态和时间是已经成立的故事事实", transport)
+        self.assertIn("current_stage.stage_direction 是本批次要完成的阶段目标", transport)
+
+    def test_formal_foreshadow_markers_keep_only_canonical_event_reference(self):
+        stage_plan = [
+            {
+                "id": "S01",
+                "ordered_events": [
+                    {
+                        "id": "S01-E01",
+                        "references": ["F0001/setup", "F0001", "主角"],
+                    },
+                    {
+                        "id": "S01-E02",
+                        "references": ["F0001/setup", "地点"],
+                    },
+                ],
+            }
+        ]
+
+        wizard._dedupe_stage_endpoint_markers(
+            stage_plan,
+            [{
+                "code": "F0001",
+                "setup_event_id": "S01-E02",
+                "payoff_event_id": "S01-E02",
+            }],
+        )
+
+        self.assertEqual(
+            stage_plan[0]["ordered_events"][0]["references"],
+            ["F0001", "主角"],
+        )
+        self.assertEqual(
+            stage_plan[0]["ordered_events"][1]["references"],
+            ["F0001/setup", "地点"],
+        )
 
     def test_character_style_choice_only_exposes_personality_and_voice(self):
         entry = {
@@ -707,6 +951,29 @@ class NovelCreationWizardPersistenceTests(unittest.TestCase):
         for step in ("premise", "bible"):
             self.assertIn("作者灵感中明确写出的事实", wizard.STEP_PROMPTS[step])
 
+    def test_project_name_hint_does_not_lock_premise_titles_without_explicit_title(self):
+        self.assertEqual(
+            wizard._creation_requested_title(
+                "山下有个傻千金（Claude兼容测试）",
+                "山下有个傻千金（Claude兼容测试）",
+            ),
+            "",
+        )
+        self.assertEqual(
+            wizard._creation_requested_title(
+                "书名：山下有个傻千金",
+                "山下有个傻千金（Claude兼容测试）",
+            ),
+            "山下有个傻千金",
+        )
+        self.assertEqual(
+            wizard._creation_requested_title(
+                "《山下有个傻千金》",
+                "山下有个傻千金（Claude兼容测试）",
+            ),
+            "《山下有个傻千金》",
+        )
+
     def test_core_motive_guidance_is_shared_and_carried_into_foundation(self):
         guidance = wizard.CREATION_CORE_MOTIVE_GUIDANCE
         for phrase in ("核心动机", "具体目标", "失败代价", "反差", "阶段目标"):
@@ -771,6 +1038,34 @@ class NovelCreationWizardPersistenceTests(unittest.TestCase):
             foundation["creative_intent_contract"]["core_motive"],
             foundation["core_motive"],
         )
+
+    def test_stage_lifecycle_guidance_is_shared_across_all_three_wizard_steps(self):
+        guidance = wizard.CREATION_STAGE_LIFECYCLE_GUIDANCE
+        for phrase in (
+            "除核心动机外",
+            "当前阶段形成一次可见兑现",
+            "新的身份、利益位置、关系状态",
+            "本规则只约束承担阶段主要推进作用的人物和关系任务",
+            "新的、更高强度的人物冲突",
+            "同一先后顺序",
+            "同步调整核心动机中的节点",
+        ):
+            self.assertIn(phrase, guidance)
+        for step in ("premise", "bible", "stage_plan"):
+            with self.subTest(step=step):
+                self.assertIn("阶段性人物生命周期与时间一致性", wizard.STEP_PROMPTS[step])
+                self.assertIn("除核心动机外", wizard.STEP_PROMPTS[step])
+
+        self.assertIn("阶段性兑现顺序写清", wizard.STEP_PROMPTS["premise"])
+        self.assertIn("普通配角和局部陪衬人物不受这条跨阶段兑现要求影响", wizard.STEP_PROMPTS["premise"])
+        self.assertIn("通过人物之间新的目标、立场、关系或利益冲突", wizard.STEP_PROMPTS["premise"])
+        self.assertIn("e 只负责补充最终落点", wizard.STEP_PROMPTS["premise"])
+        self.assertIn("阶段性对手、关键推进人物目标和关系任务", wizard.STEP_PROMPTS["bible"])
+        self.assertIn("人物长期资料中的目标、秘密和关系底色", wizard.STEP_PROMPTS["bible"])
+        self.assertIn("普通配角、生活人物和局部陪衬人物不套用这条跨阶段兑现要求", wizard.STEP_PROMPTS["stage_plan"])
+        self.assertIn("由人物目标、关系变化、利益争夺、选择或正面/间接对抗推动的更高强度新场景", wizard.STEP_PROMPTS["stage_plan"])
+        self.assertIn("兑现后的新位置、立场、关系结果或现实后果", wizard.STEP_PROMPTS["stage_plan"])
+        self.assertIn("同一人物原先的争夺、救场、追查、试探、扩权或误会已经完成转化", wizard.STEP_PROMPTS["stage_plan"])
 
     def test_terminal_contract_projects_final_stage_results_and_roles(self):
         foundation = wizard.build_chapter_plan_foundation({
@@ -917,6 +1212,11 @@ class NovelCreationWizardPersistenceTests(unittest.TestCase):
         )
         terminal_prompt = terminal_worker._analysis_prompt()
         self.assertIn("最后3章收尾窗口", terminal_prompt)
+        self.assertEqual(terminal_prompt.count("最后阶段高潮兑现位置｜第162-164章"), 1)
+        self.assertIn("现有第165-167章收尾窗口", terminal_prompt)
+        self.assertIn("climax_chapter_range 只写实际承载高潮最终兑现的章节范围", terminal_prompt)
+        self.assertIn("不另开跟踪者、小反派或临时任务填篇幅", terminal_prompt)
+        self.assertNotIn("高潮可以落在最后3章内", terminal_prompt)
         self.assertIn("本阶段后部只沿着已经发生的冲突", terminal_prompt)
         self.assertNotIn(
             "本阶段解决或暂时解决当前目标后，要在 x/y 或事件结果中留下下一阶段可执行的具体目标",
@@ -942,10 +1242,22 @@ class NovelCreationWizardPersistenceTests(unittest.TestCase):
         )
         ordinary_prompt = ordinary_worker._analysis_prompt()
         self.assertNotIn("最后3章收尾窗口", ordinary_prompt)
+        self.assertNotIn("最后阶段高潮兑现位置", ordinary_prompt)
         self.assertIn(
             "本阶段解决或暂时解决当前目标后，要在 x/y 或事件结果中留下下一阶段可执行的具体目标",
             ordinary_prompt,
         )
+        for prompt in (terminal_prompt, ordinary_prompt, wizard.STEP_PROMPTS["stage_plan"]):
+            with self.subTest(prompt=prompt[:80]):
+                self.assertEqual(
+                    prompt.count(
+                        "result 是本阶段结束时要达到的状态，不是 summary 之外的第二组事件"
+                    ),
+                    1,
+                )
+                self.assertIn("同一事实只安排一次实际发生", prompt)
+                self.assertIn("前阶段已成立的认知和关系从该状态继续发展", prompt)
+                self.assertIn("此前阻止行动的条件改变时，用具体行动及结果衔接后续选择", prompt)
 
     def test_character_profile_guidance_blocks_adversarial_voice_labels(self):
         guidance = wizard.CREATION_CHARACTER_PROFILE_GUIDANCE
@@ -1145,6 +1457,86 @@ class NovelCreationWizardPersistenceTests(unittest.TestCase):
             ["林澈", "沈闻"],
         )
         self.assertEqual(set(context["naming_reference"]), {"received_names"})
+
+    def test_stale_worker_cleanup_does_not_release_current_worker(self):
+        dialog = wizard.NovelCreationWizardDialog.__new__(
+            wizard.NovelCreationWizardDialog
+        )
+
+        class FakeWorker:
+            def __init__(self):
+                self.deleted = False
+
+            def deleteLater(self):
+                self.deleted = True
+
+        current = FakeWorker()
+        stale = FakeWorker()
+        dialog.worker = current
+        dialog._close_requested = False
+        dialog._set_running = lambda _running: None
+        dialog._refresh_step_ui = lambda: None
+
+        dialog._cleanup_worker(stale)
+
+        self.assertIs(dialog.worker, current)
+        self.assertTrue(stale.deleted)
+        self.assertFalse(current.deleted)
+
+    def test_late_worker_result_is_ignored_after_worker_replacement(self):
+        dialog = wizard.NovelCreationWizardDialog.__new__(
+            wizard.NovelCreationWizardDialog
+        )
+        current = object()
+        stale = object()
+        dialog.worker = current
+        with patch.object(dialog, "sender", return_value=stale):
+            self.assertFalse(dialog._is_current_worker_signal())
+        with patch.object(dialog, "sender", return_value=current):
+            self.assertTrue(dialog._is_current_worker_signal())
+
+    def test_close_timeout_keeps_worker_reference_until_finished(self):
+        dialog = wizard.NovelCreationWizardDialog.__new__(
+            wizard.NovelCreationWizardDialog
+        )
+
+        class FakeWorker:
+            def __init__(self):
+                self.stop_called = False
+                self.quit_called = False
+
+            def stop(self):
+                self.stop_called = True
+
+            def quit(self):
+                self.quit_called = True
+
+            def wait(self, _timeout):
+                return False
+
+        class FakeEvent:
+            def __init__(self):
+                self.ignored = False
+
+            def ignore(self):
+                self.ignored = True
+
+        worker = FakeWorker()
+        event = FakeEvent()
+        dialog.worker = worker
+        dialog._close_requested = False
+        dialog._generation_failed = False
+        dialog._pending_batch_kind = "stage_plan_stage"
+        dialog._pending_stage_index = 2
+        dialog._save_draft = lambda: None
+        dialog._set_status_text = lambda _text: None
+        dialog.closeEvent(event)
+
+        self.assertTrue(event.ignored)
+        self.assertTrue(worker.stop_called)
+        self.assertTrue(worker.quit_called)
+        self.assertIs(dialog.worker, worker)
+        self.assertTrue(dialog._close_requested)
 
 
 if __name__ == "__main__":

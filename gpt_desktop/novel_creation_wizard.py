@@ -31,10 +31,12 @@ from .novel_utils import (
     _core_motive_progression_guidance,
     _derive_mainline_pressure_curve,
     _entity_naming_guidance,
+    _final_stage_climax_planning_guidance,
     _normalize_foreshadow_code,
     _normalize_mainline_pressure_curve,
     _normalize_terminal_closure_plan,
     _normalize_terminal_contract,
+    _novel_chinese_output_guidance,
     _procedural_plot_guard_guidance,
     _story_conflict_pacing_guidance,
     _terminal_window_bounds,
@@ -450,6 +452,19 @@ CREATION_CUSTOM_PROTAGONIST_STYLE_GUIDANCE = """
 CREATION_PROCEDURAL_PLOT_GUARD = _procedural_plot_guard_guidance().strip()
 CREATION_ENTITY_NAMING_GUIDANCE = _entity_naming_guidance().strip()
 CREATION_CORE_MOTIVE_GUIDANCE = _core_motive_progression_guidance().strip()
+CREATION_CHINESE_OUTPUT_GUIDANCE = _novel_chinese_output_guidance().strip()
+
+CREATION_STAGE_LIFECYCLE_GUIDANCE = """
+【阶段性人物生命周期与时间一致性】
+核心动机可以贯穿全书，但除核心动机外，承担当前阶段主要推进作用的阶段性对手、关键推进人物目标和关系任务，都要在当前阶段形成一次可见兑现：目标达成、计划落空、身份揭开、关系定性、立场改变、退出当前冲突，或转化为后续会产生作用的既成后果。本规则只约束承担阶段主要推进作用的人物和关系任务，不要求普通配角、生活人物或仅承担局部陪衬功能的人物每次跨阶段出现时都改变位置。阶段性推进人物若继续出现，后续要以新的身份、利益位置、关系状态、行动目标或已兑现结果参与新的、更高强度的人物冲突，不把原来的争夺、救场、追查、试探或扩权循环换规模继续重复。
+兑现后的结果要通过人物冲突转化成新的、更高强度的场景事件：由人物新的目标、立场、关系、利益争夺、选择或正面/间接对抗推动，写清谁与谁发生了什么冲突以及冲突造成的直接后果；强度提升不只表现为异兽等级、范围、数量、地图或资源规模扩大。
+阶段方向和阶段规划都要写清当前阶段的直接目标如何落地，以及兑现后打开了什么新的处境、选择、关系或代价。阶段之间承接的是已经成立的结果，不是把同一个阶段性目标延期到后面再完成；核心动机的持续推进与阶段性人物目标的阶段闭环要同时成立。
+第一步的核心动机、明确时间节点和结尾方向必须保持同一先后顺序。若核心动机写明某项阶段性结果发生在订婚、出发、决战或其它明确节点之前，结尾方向只补充全书最终结果，不能把同一项结果推迟到更晚的阶段；若故事确实需要推迟兑现，应同步调整核心动机中的节点和主线表述，让全书只有一套时间顺序。
+""".strip()
+
+CREATION_STAGE_RESULT_OWNERSHIP_GUIDANCE = """
+【阶段结果归属】每个阶段方向的 result 只归该阶段完成，是该阶段唯一允许实际达成的出口；后续阶段方向中的 result 是尚未发生的未来结果，当前阶段不得把它完成或写成既成事实。当前阶段事件的 result、exit_state.known_facts 和 carry_over 都必须服从当前阶段方向的 result：事件可以推进后续结果所需的前置条件或压力，但不得越过本阶段出口；exit_state.known_facts 只记录本阶段实际完成的事实，carry_over 只交接本阶段出口之后仍未解决的入口压力。前阶段已经完成的结果只作为当前入口事实和后续影响，不重复完成。阶段出口说明该阶段最终状态，不是 summary 之外的另一组事件。
+""".strip()
 
 
 def _creation_entity_naming_guidance(context):
@@ -504,16 +519,18 @@ COMMON_CREATION_RULES = f"""
 5. 危险和代价优先落到躲避、交换、资源变化、身份暴露、关系破裂、空间变化和局势改变上；身体伤势随题材和现场需要自然出现。
 6. 实力体系跟随题材本身生长：明确需要修炼、境界或能力层次的故事，在设定库里展开来源、层次、边界和成长条件；普通都市、言情、悬疑、灵异、现实和没有明确力量体系的科幻，把重点放在人物处境、规则边界和具体事件上。
 7. {CREATION_CORE_MOTIVE_GUIDANCE}
-8. {CREATION_ENDING_DIRECTION_GUIDANCE}
-9. {CREATION_CHARACTER_PROFILE_GUIDANCE}
-10. {CREATION_FORESHADOW_CLOSURE_GUIDANCE}
-11. {CREATION_CUSTOM_PROTAGONIST_STYLE_GUIDANCE}
-12. 不使用“短促直接”“温和克制”“冷淡”“命令式”这几类语言风格，其它可以正常使用。
-13. {CREATION_PROCEDURAL_PLOT_GUARD}
-14. {CREATION_ENTITY_NAMING_GUIDANCE}
-15. 字段值直接写具体内容，保持清楚、稳定、方便后续执行；内容呈现为作者自己的故事底稿，各资料类别各自承担作用，同一段剧情只放在最合适的位置。
-16. JSON 只作为程序读取的容器：保持紧凑，不用 Markdown、缩进、空行或多余空格；压缩外壳，不压缩事实、人物数量、设定数量、伏笔数量或故事内容。
-17. {CREATION_INSPIRATION_FACT_GUIDANCE}
+8. {CREATION_STAGE_LIFECYCLE_GUIDANCE}
+9. {CREATION_ENDING_DIRECTION_GUIDANCE}
+10. {CREATION_CHARACTER_PROFILE_GUIDANCE}
+11. {CREATION_FORESHADOW_CLOSURE_GUIDANCE}
+12. {CREATION_CUSTOM_PROTAGONIST_STYLE_GUIDANCE}
+13. 不使用“短促直接”“温和克制”“冷淡”“命令式”这几类语言风格，其它可以正常使用。
+14. {CREATION_PROCEDURAL_PLOT_GUARD}
+15. {CREATION_ENTITY_NAMING_GUIDANCE}
+16. 字段值直接写具体内容，保持清楚、稳定、方便后续执行；内容呈现为作者自己的故事底稿，各资料类别各自承担作用，同一段剧情只放在最合适的位置。
+17. JSON 只作为程序读取的容器：保持紧凑，不用 Markdown、缩进、空行或多余空格；压缩外壳，不压缩事实、人物数量、设定数量、伏笔数量或故事内容。
+18. {CREATION_INSPIRATION_FACT_GUIDANCE}
+19. {CREATION_CHINESE_OUTPUT_GUIDANCE}
 """.strip()
 
 
@@ -523,6 +540,7 @@ STEP_PROMPTS = {
 现在先从作者给出的灵感出发，写出 5 个彼此真正不同、可以直接开始连载的故事方向。每个方向的简介都从一个正在发生的强冲突切入：让主角在具体场面里立刻遇到会改变处境的压力、对抗、失控或突发事件，并让这次冲突留下清楚的现实后果，把故事推向后面。冲突的形状由题材、灵感、人物关系和风格自然决定，不套固定顺序，不把简介写成资料清单或策划说明。简介要求用自然的网络小说叙述语言风格，不要出现策划术语、抽象形容、办案式风格、编辑式说明、编辑式总结之类的词。简介字数软要求为 300 字左右。
 每个方向的 m“贯穿全书的矛盾”要让读者看懂主角为什么非行动不可、要到达什么具体结果、失败会失去什么、什么自然节点会让代价加重或机会改变，并体现主要反差轴；这些是核心动机的验收维度，不是固定句式、固定顺序或每项各写一段，可以根据题材合并在人物关系、秘密、选择、资源限制或现场后果里。不能只写“赚钱、变强、复仇、逆天改命”这类抽象愿望，也不要为了凑齐维度给所有故事硬加金额、倒计时、强敌或升级路线。核心动机要能被拆成连续阶段目标：解决当前阻碍后，结果打开下一道更具体的阻碍或更高代价，不能每个方向只剩一串互不相干的事件。
 这里的 m 是候选故事的核心动机主线契约，不是另起一条“主线矛盾”：下游会把它统一保存为 core_motive。关系线、主题和阶段冲突都只能围绕这条核心动机展开，不能各自提出另一项主角必须完成的总任务。
+每个方向还要把阶段性兑现顺序写清：除核心动机外，承担前段主要推进作用的阶段性对手、关键推进人物目标或关系任务，要在对应阶段完成、失效、转化或明确改变位置，再由已成立的结果通过人物之间新的目标、立场、关系或利益冲突打开更强的新剧情压力。普通配角和局部陪衬人物不受这条跨阶段兑现要求影响；阶段性推进人物可以继续出现，但不能让同一个阶段性目标只靠扩大范围、提高数量或更换危机反复拖到后段。
 
 先完整吸收作者灵感和全部选择，再开始写。五个方向都使用灵感中的核心内容，但各自从不同的人物选择、现实压力、关系变化或题材机制长出自己的故事；差异要来自故事本身，不靠只换名字、地点或几句设定。五个方向可以采用完全不同的剧情发动方式，不要求统一的冲突顺序、固定的网文结构或相同的推进节奏。
 
@@ -532,6 +550,7 @@ STEP_PROMPTS = {
 下面示例中的空对象只是为了避免重复占篇幅，实际返回时 1、2、3、4、5 五个槽位都必须各自完整填写十个字段，不能返回空对象，也不能把多个故事合并到一个槽位。
 
 每个方向的 e“结尾方向”必须先写本部核心动机、核心矛盾、主要关系和主角最终处境的明确落点，再写可选的余味。余味可以是遗憾、代价、关系暂未完全定型或世界仍有空间，但不能把新敌人、新任务、下一卷承诺或必须由后续回答的重大问题当成本部结尾内容。
+e 只负责补充最终落点，不负责推迟 m 中已经写明的阶段性兑现。m、r、e 中出现明确时间节点时，必须按同一先后顺序组织；同一人物或同一阶段性对手的阶段结果不能在 m 中写成前段完成、在 e 中又写成后段才完成。
 
 只输出一个合法 JSON 对象。不要使用可变长度的候选数组，改用固定的五个编号对象：{{"c":{{"1":{{"t":"书名","g":"类型","a":"读者方向","y":"风格","h":"一句话故事引子","d":"故事简介，约300字","p":"主角初始处境、性格和最想得到的东西","m":"核心动机主线","r":"人物关系长线变化","e":"结尾方向（本部结果与余波）"}},"2":{{}},"3":{{}},"4":{{}},"5":{{}}}},"s":0}}。c 只能有 1、2、3、4、5 五个键，不能增加第6个方向，也不能漏掉任何一个方向；每个方向都必须完整填写，不要输出 Markdown、解释或其它键。""",
     "bible": f"""{COMMON_CREATION_RULES}
@@ -542,10 +561,11 @@ STEP_PROMPTS = {
 
 这一次要把小说圣经、世界规则、人物、设定和伏笔一起写出来，但五部分各自回答不同的问题：
 这一步只根据已经选定的故事和作者偏好搭建底盘，后面的阶段规划会读取这里的完整资料。这里写整本书的骨架和长期事实，让后面的场景自然长出来；剧情细节留到阶段和章节中由人物经历展开。
-小说圣经回答“这整本书最核心的东西是什么”。其中的主线矛盾字段必须承担一条可执行的核心动机契约：主角为什么非走下去、要在什么期限或机会窗口内完成什么具体目标、失败会失去什么、谁或什么在阻挡，以及主角的开局处境与终局目标/对手/代价之间有什么大反差。再把这条大目标拆成会自然延伸的阶段目标，让每个阶段都是同一件事的下一道阻碍或更高代价。这里的长期问题要写成随着人物一次次选择不断变深的具体事情，不写“读者会……”或编辑式的阅读说明，也不承担章节剧情复述。
-结尾方向字段必须写成“本部结果与余波”：先说明核心动机的最终结果、核心矛盾的解决或代价、主要关系的落点和主角最终处境，再说明哪些内容可以作为不影响本部闭环的余味。可以保留情绪、关系或世界层面的开放感，但不得把新的敌人、任务、规则、目的地、下一卷承诺或必须继续回答的核心真相写成结尾依赖；结尾方向不是要求最后一章继续留悬念。
+结尾方向字段必须写成“本部结果与余波”：先说明核心动机的最终结果、核心矛盾的解决或代价、主要关系的落点和主角最终处境，再说明哪些内容可以作为不影响本部闭环的余味；不得把新的敌人、任务、规则、目的地、下一卷承诺或必须继续回答的核心真相写成结尾依赖。
+小说圣经回答“这整本书最核心的东西是什么”。其中的主线矛盾字段必须承担一条可执行的核心动机契约：主角为什么非走下去、要在什么期限或机会窗口内完成什么具体目标、失败会失去什么、谁或什么在阻挡，以及主角的开局处境与终局目标/对手/代价之间有什么大反差。再把这条大目标拆成会自然延伸的阶段目标，让每个阶段都是同一件事的下一道阻碍或更高代价。这里的长期问题要写成随着人物一次次选择不断变深的具体事情，不写“读者会……”或编辑式的阅读说明，也不承担章节剧情复述。全书最终结果由第一步已选故事的结尾方向、第二步阶段方向和第三步阶段规划逐步落地；小说圣经只保留长期底盘，不再另写一份结尾方案，避免形成并行的收尾版本。
 这里不再把“主线矛盾”和“核心动机”当成两条并列主线：固定输出中的第4项 main_conflict 只是兼容字段，内容就是唯一的 core_motive 主线契约。它要同时包含主角必须完成的具体目标、阻碍目标的对手或结构、失败代价、期限/机会窗口和持续反差；后续系统会把它投影到 core_motive，不要再另写一条不同的总目标。
 其中的“主题”只回答这条故事最终要讨论或留下的人的命题、价值冲突和情感认识；主题字段只提炼意义，不能把核心动机换一种说法再写一遍。主题不要直接重复具体任务、金额、期限、对手、资源缺口或“主角必须完成某事”等执行信息；这些内容只写进主线矛盾。主题可以从核心动机中提炼意义，但不能替代核心动机，也不能反过来要求主角围绕抽象观点行动。
+人物长期资料中的目标、秘密和关系底色用于支撑不同阶段的选择，不代表同一个阶段性任务可以无限延续；具体阶段兑现、关系定性和对手位置变化交给阶段方向与阶段规划落实。
 
 世界规则回答“这个世界怎样运转”。它写日常生活、空间和社会关系、异常或力量从哪里来、什么条件会让它发生、人物要为触碰它付出什么，以及不同人物会怎样应对。它只写长期成立的运行方式；没有明确力量体系的题材，世界规则就围绕空间、社会、异常和代价展开；明确有修炼或境界的题材，再写力量来源和总边界，详细层次统一放进设定库里的“规则”条目。
 
@@ -557,7 +577,7 @@ STEP_PROMPTS = {
 
 选定故事尚未确定的部分，保留为人物正在面对的问题、线索和可能解释；从故事自然延伸出来、后面反复会用到的人物、地点、势力、物件、制度和暗线，都补足为可落地的故事资料。字段值以清楚、稳定、方便后续执行为先，简介字段保持可公开发布的自然网络小说语言，其余内容像作者自己的故事底稿一样具体易读。
 
-只输出一个合法 JSON 对象，使用短键和固定顺序数组：{{"b":["核心设定","读者承诺","主题","核心动机契约（主线矛盾）","人物关系底子","结尾方向","硬边界"],"w":["世界概况","力量或能力体系","长期规则数组","代价限制数组","地理与生活"],"c":[["姓名","身份和故事位置","当前目标","秘密","人物性格/特点","语言风格","害怕失去什么、与主角的长期关系底色和长期变化"]],"l":[["名称","类型","具体内容","人物当前知道多少"]],"f":[["编号","名称","埋设阶段","回收阶段","读者能看到的线索及后续变化","揭开后会改变什么","仍未揭开的部分"]]}}。实际输出时：b固定7项，其中第4项“核心动机契约（主线矛盾）”必须完整承载唯一的 core_motive 主线；w固定5项，c每项固定7项，l每项固定4项，f每项固定7项；人物字段只写长期资料，具体剧情动作留给阶段和章节；空内容保留空字符串占位，资料数量和文字事实完整保留。""",
+只输出一个合法 JSON 对象，使用短键和固定顺序数组：{{"b":["核心设定","读者承诺","主题","核心动机契约（主线矛盾）","人物关系底子","硬边界"],"w":["世界概况","力量或能力体系","长期规则数组","代价限制数组","地理与生活"],"c":[["姓名","身份和故事位置","当前目标","秘密","人物性格/特点","语言风格","害怕失去什么、与主角的长期关系底色和长期变化"]],"l":[["名称","类型","具体内容","人物当前知道多少"]],"f":[["编号","名称","埋设阶段","回收阶段","读者能看到的线索及后续变化","揭开后会改变什么","仍未揭开的部分"]]}}。实际输出时：b固定6项，其中第4项“核心动机契约（主线矛盾）”必须完整承载唯一的 core_motive 主线；w固定5项，c每项固定7项，l每项固定4项，f每项固定7项；人物字段只写长期资料，具体剧情动作留给阶段和章节；空内容保留空字符串占位，资料数量和文字事实完整保留。""",
     "story_assets": f"""{COMMON_CREATION_RULES}
 
 接着前面已经确定的故事，把后面真的会反复出现的人物、地方、势力、物件、规矩和暗线写出来。每一项都要落到人物看得见、摸得着的生活里，并且在某一次选择中起作用；线索的意义随着人物行动、关系变化和局势变化逐步显现。
@@ -584,7 +604,8 @@ STAGE_PLAN_OBJECT_OUTPUT_RULES = """
 这次使用对象协议，阶段和事件按字段名归位；只返回一个合法 JSON 对象。
 短键含义如下：k=全书底盘契约（其中的核心动机是唯一执行主线），s=当前阶段对象，f=当前阶段实际发生的伏笔端点。阶段对象中 i=阶段编号，n=阶段名称，r=章节范围，b=开始状态，e=按顺序发生的场景事件对象数组，x=结束状态，y=带入下一阶段的事实，u=本阶段主线压力递进摘要，m=可选的终局收尾方案。u使用scope、step、opponents、cost、exit_change五个字段，分别写冲突牵连范围、相较前阶段新增的压力、直接阻止主角的人物或人物集团、必须付出的不可逆代价、阶段结束后改变的处境或关系。状态对象中 t=时间，l=地点，c=人物状态，k=已经发生并被人物掌握的事实，q=仍会推动人物行动的问题。事件对象中 i=事件编号，r=允许章节范围，a=关联资料，p=前置条件，h=可直接扩写的场景事件，o=直接结果，d=实际状态变化。伏笔端点对象中 i=伏笔编号，k=setup或payoff，e=承载这个端点的事件编号，d=这一次在场景中发生的具体变化；一次只写一个端点。
 每个 h 都要像一段可以直接扩写的剧情节点：只写这件事真正需要的故事事实，必要时交代人物、场景、动作、阻力、选择或结果，尽量不用固定清单式要求，不为凑齐项目硬塞字段。剧情发动机由题材和人物处境决定，可以是正面碰撞、追逐逃避、关系变化、欲望争夺、环境失控、能力试探、秘密暴露或其它自然发生的压力；相邻事件要让人物处境产生新的变化，不把这些方式排成固定轮换。资料只有在人物正在做事、被迫应对或关系发生变化时进入场景。
- m 只在全书最后阶段返回，结构至少包含 closure_mode、closure_horizon、long_term_result、final_image、opening_echo、title_closure_intent、time_jump_allowed；同时补充一组与本书实际高潮有关的可选字段：climax_event_id、climax_chapter_range、climax_event、climax_result、post_climax_landing。高潮字段只引用已经建立的主线冲突、人物关系和阶段事件，不凭空添加新主线、新势力或新规则；climax_chapter_range 只写实际承载高潮的章节范围。closure_mode 从 immediate_verified、short_term_verified、long_term_epilogue、mirror_scene、mixed 中选择最适合本书的一种；不能为了统一格式强行使用远期跳跃。long_term_epilogue 或 mixed 必须给出可信的时间跨度和具体成果，mirror_scene 必须说明要呼应的开头地点、物件、动作或关系；所有模式都必须先让本部核心结果落地，再用最后画面收束。最后3章属于高潮结果兑现与收束的一部分，不是高潮之后重复展示成果的独立段落；高潮若发生在最后3章，直接把冲突结果、关系变化和最终落点合并进已经发生的场景，高潮若在此前完成，最后3章只承接新的直接后果和最终落点。
+除 core_motive 外，承担当前阶段主要推进作用的阶段性对手、关键推进人物目标和关系任务，都要在本阶段事件中形成一次可见兑现，并把兑现后的新位置、立场、关系结果或现实后果转化为由人物目标、关系变化、利益争夺、选择或正面/间接对抗推动的更高强度新场景。普通配角、生活人物和局部陪衬人物不套用这条跨阶段兑现要求；阶段性推进人物可以继续出现，但后续事件使用的是兑现后的新目标或新处境。同一人物原先的争夺、救场、追查、试探、扩权或误会已经完成转化后，不能只换更大的对象继续循环。
+ m 只在全书最后阶段返回，结构至少包含 closure_mode、closure_horizon、long_term_result、final_image、opening_echo、title_closure_intent、time_jump_allowed；同时补充一组与本书实际高潮有关的可选字段：climax_event_id、climax_chapter_range、climax_event、climax_result、post_climax_landing。高潮字段只引用已经建立的主线冲突、人物关系和阶段事件，不凭空添加新主线、新势力或新规则；climax_chapter_range 只写实际承载高潮最终兑现的章节范围，放在收尾窗口开始前的三章内，交锋和升级可以更早展开。closure_mode 从 immediate_verified、short_term_verified、long_term_epilogue、mirror_scene、mixed 中选择最适合本书的一种；不能为了统一格式强行使用远期跳跃。long_term_epilogue 或 mixed 必须给出可信的时间跨度和具体成果，mirror_scene 必须说明要呼应的开头地点、物件、动作或关系；所有模式都必须先让本部核心结果落地，再用最后画面收束。最后3章继续承担既有的收尾完结，不把高潮提前结束后留下的长篇余波塞成一串告别、拒绝邀请或成果展示；post_climax_landing 只安排必要且不重复的直接后果、关系落点和最终处境，不另开短线填篇幅。
 当前阶段发生的正式伏笔端点，都在承载事件的 a 中加入一次“F编号/setup”或“F编号/payoff”，并在 f 中用同一事件编号 e 关联。setup写线索第一次进入人物生活，payoff写线索在场景中产生决定性变化；同一条伏笔在其它事件中继续出现、深化、造成后果是正常的，这些事件只把它作为普通关联资料或写出“F编号”，不要重复标成正式 setup/payoff。程序以正式端点为准，再把后续事件中的具体变化交给章节规划继续使用；阶段之间允许继续铺开同一条暗线，程序会依据事件 r 的章节范围落下具体章号。
 实际返回的 f 使用单端点格式，例如 {"i":"F06","k":"payoff","e":"E04","d":"人物在现场做出选择后，线索改变了什么"}。全书契约保留长期事实、世界运行方式、人物底色和结尾方向；伏笔通过 setup 与 payoff 表达它在场景中的进入、变化和意义显现。
 
@@ -598,7 +619,7 @@ STEP_PROMPTS["stage_plan"] = f"""{COMMON_CREATION_RULES}
 
 全书最后阶段必须额外规划“终局收尾方案”：根据题材、核心动机和故事规模，在即时结果型 immediate_verified、短期验证型 short_term_verified、远期成果型 long_term_epilogue、镜像回响型 mirror_scene、混合型 mixed 中选择一种，不要为了格式统一强行使用时间跳跃。若选择短期或远期验证，必须写出可信的时间跨度、已经持续存在的成果和一个能在场景中看见的验证；若选择镜像回响，必须写清呼应开头的地点、物件、动作或关系变化；若选择 mixed，先完成当前主线，再用时间落点或镜像画面确认成果。终局方案不是另开剧情，也不能用“多年后一切都变好了”的摘要替代具体场景。
 
-阶段规划固定事实、顺序、状态和阶段推进，但剧情推进以场景为单位。每个阶段先回应对应的阶段方向，再拆成事件；阶段方向中的场景变化、人物变化和阶段结果不能只停留在阶段对象里，至少要在本阶段的关键事件中落地。每个事件写清本次真正发生、会影响后续的故事事实；时间、地点、人物、动作、阻力、选择、关系变化和结果等内容，只在当前事件确实需要时补充。事件之间通过人物正在做的事和已经发生的变化自然衔接。先判断这一事件真正由什么推动，再选择最适合题材的场景：人物对抗、关系变化、现场危机、公开行动、利益争夺、环境压力或信息出现都可以成为主发动机。相邻事件主动更换主发动机、场景目标和压力来源，让人物、关系、空间和局势持续变化。
+阶段规划固定事实、顺序、状态和阶段推进，但剧情推进以场景为单位。每个阶段先回应对应的阶段方向，再拆成事件；阶段方向中的场景变化、人物变化和阶段结果不能只停留在阶段对象里，至少要在本阶段的关键事件中落地。{CREATION_STAGE_RESULT_OWNERSHIP_GUIDANCE}阶段方向各字段共同描述同一组事实，result 是本阶段结束时要达到的状态，不是 summary 之外的第二组事件；next_pressure 只表示下一阶段从本阶段结果继续承接的入口压力，本阶段可以让它出现或形成，但不提前解决它；后续阶段和全书结尾的结果不得提前写进当前阶段。同一事实只安排一次实际发生，前阶段已成立的认知和关系从该状态继续发展。此前阻止行动的条件改变时，用具体行动及结果衔接后续选择。每个事件写清本次真正发生、会影响后续的故事事实；时间、地点、人物、动作、阻力、选择、关系变化和结果等内容，只在当前事件确实需要时补充。事件之间通过人物正在做的事和已经发生的变化自然衔接。先判断这一事件真正由什么推动，再选择最适合题材的场景：人物对抗、关系变化、现场危机、公开行动、利益争夺、环境压力或信息出现都可以成为主发动机。相邻事件主动更换主发动机、场景目标和压力来源，让人物、关系、空间和局势持续变化。
 同一事件如果覆盖数章，只承担一次明确的转折；前面的章节让事情发生，后面的章节写它造成的新反应、新选择、新损失、新关系变化或新阻力，不要把同一场谈话、同一份材料或同一个结论反复当成新的剧情。对都市灵异、惊悚、悬疑、情感等题材，声音、空间、物件、生活压力、人物之间的隐瞒和现场失控持续进入剧情；对其它题材，使用该题材自己的场景压力和人物对抗。故事的关键变化要发生在人物正在经历的场面里，而不是停在解释性结论上。
 阶段事件继续由当前题材里的具体场景和人物行动推进；上面的共享程序性事项边界同样适用于阶段事件，不要把流程本身拆成连续事件或阶段主线。每个事件都要让人看见人物在哪里、正在做什么、遇到什么阻力、作出什么选择以及选择造成的可观察结果。当前阶段必须沿着上一阶段已经成立的压力继续提高，至少让冲突牵连范围、直接对手、失败代价、公开后果或主角选择难度中的两项发生自然变化；不得为了“升级”凭空添加固定类型的势力或地图。相邻事件主动更换主发动机、场景目标和压力来源；如果连续两个事件仍使用同一地点、同一对象或同一技术目标，下一事件必须把前面结果转化为新的具体人物、对手行动、关系裂痕、路线变化、公开后果或更高代价，不能继续完整处理同一个物件或重复同一种诊断。阶段内仍允许用一章或两章的小事件完成过渡，已有的 b-a+1<=2 只限制单个事件容量，不代替阶段压力递进。
 伏笔端点使用底盘已有编号或名称，关联到本阶段实际发生的事件；setup写线索第一次进入人物生活，payoff写线索在场景中完成单一核心问题的回答，并留下具体行动、对白、证据、关系结果或局势结果。payoff不能只写“进一步揭示”“冲突升级”“确认重要”“出现新线索”或“人物意识到事情不简单”，这些只是推进，不是回收。同一条伏笔可以在多个事件中继续出现、深化或影响人物选择，但正式 setup/payoff 只各自标记一次；后续事件用普通关联资料或“F编号”承接，不把每次提及都写成新的正式端点。不同伏笔的正式回收必须使用不同的决定性证据和回收动作；已经被前一条伏笔确认的技术事实、故障因果或人物责任，后续伏笔只能作为既定事实转化成新的关系选择、公开承担、对手行动或现场代价，不能再次完整验证一遍。阶段之间允许继续铺开同一条暗线，程序会依据事件的允许章节范围落下具体章号，模型只负责事件顺序和端点归属，不写具体章号。
@@ -665,17 +686,14 @@ def _extract_requested_title(value):
 
 
 def _creation_requested_title(inspiration, project_name_hint=""):
-    """Return the author's fixed title without treating free-form inspiration as one."""
+    """Return a title only when the author marked it explicitly."""
     text = _as_text(inspiration)
     title = _extract_requested_title(text)
     if title:
         return title
-    hint = _as_text(project_name_hint)
-    # A draft opened with a project hint starts with that exact text in the
-    # inspiration field.  Do not use the hint after the author replaces it
-    # with a different free-form inspiration.
-    if hint and text == hint:
-        return hint
+    # ``project_name_hint`` is only the temporary project/copy name.  It must
+    # not lock all five premise titles unless the author explicitly marks it
+    # as the book title in the inspiration field.
     return ""
 
 
@@ -1566,6 +1584,19 @@ _BIBLE_FIELDS = (
     "theme",
     "main_conflict",
     "relationship_foundation",
+    "hard_boundaries",
+)
+
+# Older wizard drafts used a seven-item Bible array with an independent ending
+# direction. Keep reading that shape for compatibility, while new generation
+# uses the six fields above so the ending is carried by the selected premise,
+# stage directions, and terminal stage planning.
+_BIBLE_LEGACY_FIELDS = (
+    "core_setting",
+    "reader_promise",
+    "theme",
+    "main_conflict",
+    "relationship_foundation",
     "ending_direction",
     "hard_boundaries",
 )
@@ -1589,6 +1620,8 @@ _BIBLE_FIELD_ALIASES = {
         "relationship_foundation", "relationship_base", "关系基础", "人物关系",
         "人物关系底子", "重要人物关系的起点",
     ),
+    # Kept for reading older drafts and provider responses. New prompts no
+    # longer request this Bible field.
     "ending_direction": (
         "ending_direction", "ending", "结尾方向", "结局方向",
         "结尾留下的方向",
@@ -2225,7 +2258,9 @@ def project_has_explicit_power_levels(project):
 
 
 def _normalize_bible(value):
-    return _normalize_text_record(value, _BIBLE_FIELDS, _BIBLE_FIELD_ALIASES)
+    # Read both current and legacy named fields. The current prompt omits the
+    # legacy ending field, but preserving it here keeps old drafts loadable.
+    return _normalize_text_record(value, _BIBLE_LEGACY_FIELDS, _BIBLE_FIELD_ALIASES)
 
 
 def _legacy_faction_lore(value):
@@ -2995,7 +3030,12 @@ def _expand_creation_transport(step, payload):
 
     if step == "bible":
         if "bible" not in data and isinstance(data.get("b"), list):
-            data["bible"] = _compact_record(data["b"], _BIBLE_FIELDS)
+            bible_fields = (
+                _BIBLE_LEGACY_FIELDS
+                if len(data["b"]) >= len(_BIBLE_LEGACY_FIELDS)
+                else _BIBLE_FIELDS
+            )
+            data["bible"] = _compact_record(data["b"], bible_fields)
         elif "bible" not in data and isinstance(data.get("b"), dict):
             data["bible"] = _expand_transport_aliases(
                 data["b"],
@@ -3595,7 +3635,6 @@ def _format_bible_section_body(result):
         "relationship_foundation": "人物关系底子",
         "reader_promise": "持续悬念",
         "theme": "故事想留下的东西",
-        "ending_direction": "结尾方向",
         "hard_boundaries": "必须守住的边界",
     }
     if not isinstance(bible, dict):
@@ -3605,7 +3644,7 @@ def _format_bible_section_body(result):
     else:
         for key in (
             "core_setting", "main_conflict", "relationship_foundation",
-            "reader_promise", "theme", "ending_direction", "hard_boundaries",
+            "reader_promise", "theme", "hard_boundaries",
         ):
             text = _preview_field(bible, key)
             if text:
@@ -4180,6 +4219,54 @@ def _merge_foreshadow_schedule_rows(existing, incoming, total_chapters=0):
     return rows
 
 
+def _dedupe_stage_endpoint_markers(stage_plan, canonical_schedule):
+    """Keep each formal setup/payoff marker on its canonical event only."""
+    keep_by_endpoint = {}
+    for row in canonical_schedule if isinstance(canonical_schedule, list) else []:
+        if not isinstance(row, dict):
+            continue
+        code = _normalize_foreshadow_code(row.get("code"))
+        if not code:
+            continue
+        for kind in ("setup", "payoff"):
+            event_id = _as_text(row.get(f"{kind}_event_id")).upper()
+            if event_id:
+                keep_by_endpoint[(code, kind)] = event_id
+
+    marker_pattern = re.compile(r"^\s*(F0*\d+)\s*/\s*(setup|payoff)\s*$", re.IGNORECASE)
+    for stage in stage_plan if isinstance(stage_plan, list) else []:
+        if not isinstance(stage, dict):
+            continue
+        for event in stage.get("ordered_events", []) if isinstance(stage.get("ordered_events"), list) else []:
+            if not isinstance(event, dict):
+                continue
+            event_id = _as_text(event.get("id")).upper()
+            raw_references = event.get("references", [])
+            references = (
+                list(raw_references)
+                if isinstance(raw_references, list)
+                else ([raw_references] if raw_references else [])
+            )
+            cleaned = []
+            seen = set()
+            for reference in references:
+                text = _as_text(reference)
+                match = marker_pattern.fullmatch(text)
+                if not match:
+                    cleaned.append(reference)
+                    continue
+                code = _normalize_foreshadow_code(match.group(1))
+                kind = match.group(2).lower()
+                endpoint = (code, kind)
+                if endpoint in seen:
+                    continue
+                if keep_by_endpoint.get(endpoint) != event_id:
+                    continue
+                seen.add(endpoint)
+                cleaned.append(f"{code}/{kind}")
+            event["references"] = cleaned
+
+
 def build_chapter_plan_foundation(framework):
     """将向导确认内容投影到已有章节规划可识别的基础字段。"""
     framework = framework if isinstance(framework, dict) else {}
@@ -4264,7 +4351,10 @@ def build_chapter_plan_foundation(framework):
             arc["stage_direction"] = deepcopy(stage_directions[index - 1])
         arcs.append(arc)
     summary = _as_text(premise.get("synopsis", ""))
-    ending = _as_text(premise.get("ending_direction", "")) or _as_text(bible.get("ending_direction", ""))
+    # The selected premise is the only early ending signal. The Bible no
+    # longer generates a parallel ending field; stage directions and the final
+    # stage planning refine the ending later in the existing workflow.
+    ending = _as_text(premise.get("ending_direction", ""))
     boundaries = _as_text(bible.get("hard_boundaries", "")) or (
         "本部核心矛盾和主角当前目标在结尾形成明确结果；可以保留不影响本部结局的续作余味。"
     )
@@ -4612,6 +4702,20 @@ def format_creation_context(context):
         for key, value in context.items()
         if value not in (None, "", [], {})
     }
+    planning_guidance = ""
+    if context.get("generation_batch") == "stage_plan_stage":
+        planning_guidance = (
+            "本次是当前阶段的具体事件规划。前面阶段已经生成的事件、结果、状态和时间是已经成立的故事事实，"
+            "当前阶段只能承接这些事实带来的后果、变化、新选择和新冲突，不重新完成已经兑现的事件、人物目标、关系结果或主线闭环；"
+            "current_stage.stage_direction 是本批次要完成的阶段目标。"
+            "完整的 confirmed.stage_directions 用于参照全书阶段边界和保持远期一致，不是当前批次的待执行事件清单；"
+            "当前批次沿当前阶段目标落地，不提前兑现后续阶段或全书结局。"
+            "尚未生成的后续阶段属于尚未发生的规划内容，当前批次只为它形成前置压力、入口条件或行动动机，"
+            "不提前写出后续阶段的具体事件、结果、兑现或终局闭环。"
+            "current_stage.stage_direction.result 是本阶段最后必须成立的阶段出口，next_pressure 只表示下一阶段从哪里继续，不能在本阶段提前完成。"
+            "main_line、relationship_engine 和 story_engine 描述全书冲突底盘，当前阶段把底盘推进到新的选择、关系、公开后果、资源代价或对手行动，"
+            "每次事件根据当前题材自然选择推进方式。"
+        )
     return (
         "下面是作者已经说过、或在前面亲自确认过的故事资料。"
         "只沿着这些资料往下写，不替作者改掉题材、人物选择、结尾方向和必须守住的边界。"
@@ -4620,7 +4724,8 @@ def format_creation_context(context):
         "a.inspiration 是作者亲自写下的完整灵感原文，里面的书名、标签、简介、人物、关系、情节、场景、爽点和节奏要求都要逐项吸收；"
         "a.requested_title 是作者已经明确确定的书名；只要它非空，后续返回中的书名必须原样保留，不能改写、缩写或另起书名；"
         "a 里的主分类、主题、角色、情节、读者方向、风格和主角起点是硬要求，不要只在标签里提到，也不要用相似题材替换。"
-        "不要逐条复述资料，直接写出人物和事情。\n"
+        + planning_guidance
+        + "不要逐条复述资料，直接写出人物和事情。\n"
         + json.dumps(transport, ensure_ascii=False, separators=(",", ": "))
     )
 
@@ -5663,19 +5768,25 @@ class NovelCreationWorker(NovelAnalysisWorker):
 
 现在只为已经选定的故事生成全书的“阶段方向”，暂时不要生成小说圣经、世界规则、人物、设定库或伏笔。阶段方向是给后续资料和第三步阶段规划使用的轻量主线路线图，也是用户在生成故事底盘前要先确认的内容。
 
-本书总字数为{total_words}字，严格按每十万字划分为{len(specs)}个阶段，范围固定为：{ranges}。必须恰好返回这些阶段，不能合并、拆分或增加阶段。每个阶段只写一个具有主线卖点的大跨度推进，用两到三句话的自然网络小说语言说清：主角处在什么新的场景或地方、与哪些具体人物或势力发生什么核心冲突、主角主动做出什么关键选择、阶段结束留下什么不可逆结果，以及结果怎样把主线推向下一阶段。
+本书总字数为{total_words}字，严格按每十万字划分为{len(specs)}个阶段，范围固定为：{ranges}。必须恰好返回这些阶段，不能合并、拆分或增加阶段。每个阶段只写一个具有主线卖点的大跨度推进，用两到三句话的自然网络小说语言说清人物正在经历的核心冲突、关键行动和直接后果。阶段间由已经成立的结果自然衔接，最后阶段转入本部结局。除核心动机外，承担当前阶段主要推进作用的阶段性对手、关键推进人物目标或关系任务，要在当前阶段形成可见兑现，再由兑现后的新处境进入下一阶段；阶段性推进人物可以继续出现，但后续要以新的位置、关系、利益或后果参与由人物冲突推动的新场景。
 
-阶段方向必须有可见的场景和人物变化。相邻阶段不能只是继续在同一家庭、公司、工厂、宗门、训练场或同一资源问题上加码，也不能只换地点、换对手名字、增加资源数量、扩大管理范围或重复“寻找—维护—生产—分配—复核”一类动作。每个阶段至少自然改变以下两项：主要场景或活动范围、直接对手或利益关系、参与并改变局势的关键人物、冲突发动方式、主角承担的代价、人物关系结果。变化方式必须服从题材自己的卖点：升级流可以进入新的城市、宗门、秘境和强敌关系，末日题材可以从据点生存转入远行、势力冲突、灾变现场或新的生存选择，情感题材可以从家庭关系转入公开选择、身份变化和人生方向；不要把这些例子当成所有题材的固定顺序。
+阶段方向按实际发生顺序建立事实边界：前面已经生成的阶段属于已经发生并确认的事实和结果，后续阶段只能承接这些结果带来的后果、变化、新选择和新冲突，不把已经完成的事件、人物目标、关系结果或主线闭环重新完成一次；尚未生成的阶段属于尚未发生的规划内容，当前阶段只写自己的事件、行动和结果，为后续阶段形成前置压力、入口条件或行动动机，不提前写出后续阶段的具体事件、结果、兑现或终局闭环。每个阶段的结果只承担本阶段出口，下一阶段从这个出口继续推进。
 
-阶段方向不是逐章大纲，不写事件编号、章节号、伏笔编号、工作流程、资料清单或抽象的“实力提升、压力增加、主线升级”。要写读者能感到的核心卖点和转场：人物到了哪里、谁被卷进来、什么关系或局势被改变。阶段末可以回到前面埋下的线索兑现，但兑现必须带来新的场景结果或人物选择；不要让全书长期围绕同一类日常事务循环。
+各字段从不同角度描述同一组事实，不是多组待执行事件。summary 按实际先后概述关键过程，同一事件只安排一次实际发生，不先写完结局再追加一遍同样的收尾。result 只概括本阶段结束时已经成立的状态，不写章号、事件过程或另一套时间安排；其中要看得出本阶段直接目标、阶段性对手或关系任务已经完成、失效、转化或改变位置。character_change 写本阶段新增的认知、选择或关系变化，承接前阶段已成立的事实；人物已知的事情继续影响其行动，不重新当作第一次发现。此前阻止行动的条件若发生改变，用引起变化的具体行动及结果衔接后续选择。next_pressure 只从本阶段已经兑现的结果引出新的处境、选择、关系或代价，不把同一个阶段性目标原样延期到下一阶段。这些职责只区分过程、终态和状态延续，不规定各题材的剧情顺序、角色分工或场景轮换。
 
-最后一个阶段必须额外写出本书自己的完结前高潮方向：让前面阶段积累的主线压力、主要人物关系和不可逆代价在一个决定性行动或选择中集中爆发，形成已经发生并能被验证的结果。高潮必须从已有故事自然汇聚，不凭空添加新主线、新势力或新规则；最后3章属于高潮结果兑现与收束的一部分，高潮可以发生在最后3章内或此前，但高潮后的内容只能承接直接后果、关系落点和本部结局，不能继续用同义场景重复展示已经成立的成果。最后阶段的 next_pressure 只写不影响本部闭环的背景余波，不得把新的核心任务留给下一部。
+阶段方向必须有可见的场景和人物变化。相邻阶段不能只是继续在同一家庭、公司、工厂、宗门、训练场或同一资源问题上加码，也不能只换地点、换对手名字、增加资源数量、扩大管理范围或重复“寻找—维护—生产—分配—复核”一类动作。每个阶段至少自然改变以下两项：主要场景或活动范围、直接对手或利益关系、参与并改变局势的关键人物、冲突发动方式、主角承担的代价、人物关系结果。对承担本阶段主要推进作用的阶段性对手、关键推进人物目标或关系任务，若在下一阶段继续出现，应先在本阶段完成当前目标或关系结果，再以兑现后的新位置、立场、后果或更高风险进入由人物目标、关系变化、利益争夺或正面/间接对抗推动的新场景；普通配角和局部陪衬人物不套用这条跨阶段兑现要求。变化方式必须服从题材自己的卖点：升级流可以进入新的城市、宗门、秘境和强敌关系，末日题材可以从据点生存转入远行、势力冲突、灾变现场或新的生存选择，情感题材可以从家庭关系转入公开选择、身份变化和人生方向；不要把这些例子当成所有题材的固定顺序。
 
-只返回一个合法 JSON 对象，不要 Markdown 或解释：{{"stage_directions":[{{"id":"R01","name":"阶段名","word_range":[0,100000],"summary":"两到三句话的阶段方向，必须包含具体场景、人物冲突、主角选择和阶段结果","scene_change":"这一阶段主要进入或改变的具体场景/地方","character_change":"新增或发生实质关系变化的关键人物","result":"阶段结束时已经落地的不可逆结果","next_pressure":"由这个结果自然打开的下一阶段压力"}}]}}。字段名必须保持不变，数组顺序必须与阶段范围一致。"""
+阶段方向不是逐章大纲，不写事件编号、章节号、伏笔编号、工作流程、资料清单或抽象的“实力提升、压力增加、主线升级”。下方提供的章位仅供内部安排最后阶段节奏，不抄入阶段方向的文字字段；具体章位由第三步落实到 climax_chapter_range。要写读者能感到的核心卖点和转场：人物到了哪里、谁被卷进来、什么关系或局势被改变。阶段末可以回到前面埋下的线索兑现，但兑现必须带来新的场景结果或人物选择；不要让全书长期围绕同一类日常事务循环。
+
+最后一个阶段必须额外写出本书自己的完结前高潮方向：让前面阶段积累的主线压力、主要人物关系和不可逆代价在一个决定性行动或选择中集中爆发，形成已经发生并能被验证的结果。高潮必须从已有故事自然汇聚，不凭空添加新主线、新势力或新规则；最后阶段的前中部继续推进既有冲突，按下方的高潮兑现范围安排决定性结果，再自然进入现有最后3章的收尾完结。能够提前完成的次要交代融入原有事件，必须在高潮后发生的结果留给必要收束，不把主线过早结束后剩下的篇幅铺成告别、庆祝或新的短线。
+
+{_final_stage_climax_planning_guidance(total_chapters)}
+
+只返回一个合法 JSON 对象，不要 Markdown 或解释：{{"stage_directions":[{{"id":"R01","name":"阶段名","word_range":[0,100000],"summary":"两到三句话按实际先后概述本阶段关键过程，同一事件只安排一次","scene_change":"这一阶段主要进入或改变的具体场景/地方","character_change":"承接前阶段事实，本阶段新增的认知、选择或关系变化","result":"本阶段结束时已成立的状态，不写章号、事件过程或另一套时间安排","next_pressure":"非最后阶段写已成立结果引出的后续压力；最后阶段只写不影响本部闭环的余味，不新增待办，也不重启已解决事项"}}]}}。字段名必须保持不变，数组顺序必须与阶段范围一致。"""
         elif self.creation_batch == "bible_core":
             prompt = f"""{COMMON_CREATION_RULES}
 
-只根据作者已经选定的故事和用户确认的阶段方向，生成小说圣经和世界规则。阶段方向是全书大跨度推进的上游路线：圣经要为每个阶段提供人物动机、关系变化、场景落点和世界事实，但不能把阶段方向改写成另一条主线，也不能把所有阶段压缩成同一地点、同一类人物或同一类资源问题。小说圣经写整本书的核心矛盾、人物关系底子、贯穿全书并会随着人物选择不断变深的问题、主题、结尾方向和长期事实，让后面的阶段和场景都有清楚的根。主线矛盾字段必须完整承载核心动机契约：主角为什么非行动不可、要完成什么可验收的具体目标、期限或机会窗口是什么、失败会失去什么、阻碍来自谁或什么，以及开局与终局之间的主要反差；不能只写“赚钱、变强、复仇”这类抽象方向。主题字段只提炼这条故事要讨论的人性命题、价值冲突或情感认识，不重复具体任务、金额、期限、资源缺口、对手或执行步骤；不能用主题代替主线矛盾，也不能让主题变成另一条主线。还要写出解决当前目标后会自然打开的下一道具体阻碍或更高代价，保证后续阶段是在推进同一条主线，而不是不断换题。世界规则写世界长期怎样运转、日常生活、地点和社会关系、异常或能力的来源、触发条件、作用边界和代价；普通都市、灵异、悬疑、情感和现实题材，把规则落在空间、社会、异常与人物处境上；明确有修炼或境界的题材，再写力量来源和总边界，详细层次留给下一批的设定记录。
+只根据作者已经选定的故事和用户确认的阶段方向，生成小说圣经和世界规则。阶段方向是全书大跨度推进的上游路线：圣经要为每个阶段提供人物动机、关系变化、场景落点和世界事实，但不能把阶段方向改写成另一条主线，也不能把所有阶段压缩成同一地点、同一类人物或同一类资源问题。小说圣经写整本书的核心矛盾、人物关系底子、贯穿全书并会随着人物选择不断变深的问题、主题和长期事实，让后面的阶段和场景都有清楚的根；本部结尾由第一步已选故事的结尾方向、第二步阶段方向和第三步阶段规划逐步细化，圣经不再另写一份结尾方案。结尾方向字段必须写成“本部结果与余波”：先说明核心动机的最终结果、核心矛盾的解决或代价、主要关系的落点和主角最终处境，再说明哪些内容可以作为不影响本部闭环的余味；不得把新的敌人、任务、规则、目的地、下一卷承诺或必须继续回答的核心真相写成结尾依赖。主线矛盾字段必须完整承载核心动机契约：主角为什么非行动不可、要完成什么可验收的具体目标、期限或机会窗口是什么、失败会失去什么、阻碍来自谁或什么，以及开局与终局之间的主要反差；不能只写“赚钱、变强、复仇”这类抽象方向。主题字段只提炼这条故事要讨论的人性命题、价值冲突或情感认识，不重复具体任务、金额、期限、资源缺口、对手或执行步骤；不能用主题代替主线矛盾，也不能让主题变成另一条主线。还要写出解决当前目标后会自然打开的下一道具体阻碍或更高代价，保证后续阶段是在推进同一条主线，而不是不断换题。世界规则写世界长期怎样运转、日常生活、地点和社会关系、异常或能力的来源、触发条件、作用边界和代价；普通都市、灵异、悬疑、情感和现实题材，把规则落在空间、社会、异常与人物处境上；明确有修炼或境界的题材，再写力量来源和总边界，详细层次留给下一批的设定记录。
 
 世界规则的五个位置都要形成可执行的事实：世界概况交代长期环境，力量或能力体系交代来源与总边界，长期规则数组写会反复成立的运行方式，代价限制数组写人物触碰这些规则后会承担的现实后果，地理与生活写人物平常真正会走进的地方和生活压力。每条规则都能影响人物选择，数组写实际内容，不用空泛的分类名。
 
@@ -5684,16 +5795,18 @@ class NovelCreationWorker(NovelAnalysisWorker):
 这是预计写到{_creation_scale_requirements(total_words)[0]}的长篇，资料要足够支撑后续人物、设定、伏笔和阶段规划，让人物在不同阶段拥有新的处境和选择。伏笔位置此时只写阶段参考，不写具体章号。小说简介保持自然网络小说语言；reader_promise 也直接写故事会持续制造的悬念、压力和选择，不对读者说“读者会”“读者将”或“本书将”，不写编辑式说明。其余内容以清楚、稳定、方便后续执行为先。
 
 只返回一个合法 JSON 对象，不能有 Markdown 或解释。为了避免字段名称混进正文，b 和 w 使用短键对象，不使用定长内容数组：
-{{"b":{{"c":"小说圣经的核心内容","r":"读者承诺","t":"主题","m":"主线矛盾","p":"人物关系底子","e":"结尾方向","h":"必须守住的边界"}},"w":{{"s":"世界概况","p":"力量或能力体系的来源与总边界","r":["长期规则一","长期规则二"],"c":["代价限制一","代价限制二"],"g":"地理与生活"}}}}
-b 只能使用 c、r、t、m、p、e、h；w 只能使用 s、p、r、c、g。键名只是程序标记，不能把“小说圣经的核心内容”“世界概况”等示例文字原样返回；每个值必须直接写这本小说的实际内容。不要输出人物、设定或伏笔。"""
+{{"b":{{"c":"小说圣经的核心内容","r":"读者承诺","t":"主题","m":"主线矛盾","p":"人物关系底子","h":"必须守住的边界"}},"w":{{"s":"世界概况","p":"力量或能力体系的来源与总边界","r":["长期规则一","长期规则二"],"c":["代价限制一","代价限制二"],"g":"地理与生活"}}}}
+b 只能使用 c、r、t、m、p、h；w 只能使用 s、p、r、c、g。键名只是程序标记，不能把“小说圣经的核心内容”“世界概况”等示例文字原样返回；每个值必须直接写这本小说的实际内容。不要输出人物、设定或伏笔。"""
         elif self.creation_batch == "bible_assets":
             prompt = f"""{COMMON_CREATION_RULES}
 
-读取作者已经选定的故事、用户确认的阶段方向，以及前一批已经生成的小说圣经和世界规则，补齐人物、设定和伏笔。阶段方向中的场景跨度、关键人物变化和阶段结果必须被具体资料支撑，但不要把阶段方向改写成资料说明，更不要让所有阶段共用一组人物、地点或资源循环。所有人物目标、关键设定和伏笔都必须服务于已经确认的核心动机：它们要帮助主角完成目标、制造阻碍、抬高代价、改变资源/关系/信息/时间窗口，或在阶段转换时打开下一道具体目标；不能各自发展成脱离主线的独立故事。人物要分别写身份、想得到或守住的东西、秘密、人物性格/特点、语言风格，以及害怕失去什么、与主角的长期关系底色和长期变化。人物性格/特点写长期稳定的性格底色，语言风格写可迁移的表达分类和习惯；人物性格、语言风格和 notes 都不要落到具体事件、食物、地点、道具、固定笑点、固定动作、固定口头禅、某一次剧情反应或固定触发模式上。具体怎样牵制、靠近、利用、误会或翻脸，留给后面的阶段和章节在场景中表现。设定库统一收录后面反复会用到的地点、物件、势力、制度、日常场景和能力边界。明确有修炼、境界或力量层次的题材，在设定的规则条目里写详细层次；其它题材把设定落在空间、生活、社会关系和异常边界上。伏笔围绕主线冲突、重要人物关系和关键设定展开，但每条只保留一个核心问题和一个可验收的回收结果：写清当前可见的具体线索、人物当前理解、回收时谁做了什么、读者确认了什么、当场产生什么后果，notes留空，状态统一为未埋。普通伏笔的 remaining_secret 填“无”或只写不影响本部闭环的余波；只有少量真正贯穿全书核心矛盾的长期主线谜团才允许保留核心未解部分。
+读取作者已经选定的故事、用户确认的阶段方向，以及前一批已经生成的小说圣经和世界规则，补齐人物、设定和伏笔。阶段方向中的场景跨度、关键人物变化和阶段结果必须被具体资料支撑，但不要把阶段方向改写成资料说明，更不要让所有阶段共用一组人物、地点或资源循环。所有人物目标、关键设定和伏笔都必须服务于已经确认的核心动机：它们要帮助主角完成目标、制造阻碍、抬高代价、改变资源/关系/信息/时间窗口，或在阶段转换时打开下一道具体目标；不能各自发展成脱离主线的独立故事。人物要分别写身份、想得到或守住的东西、秘密、人物性格/特点、语言风格，以及害怕失去什么、与主角的长期关系底色和长期变化。人物性格/特点写长期稳定的性格底色，语言风格写可迁移的表达分类和习惯；人物性格、语言风格和 notes 都不要落到具体事件、食物、地点、道具、固定笑点、固定动作、固定口头禅、某一次剧情反应或固定触发模式上。具体怎样牵制、靠近、利用、误会或翻脸，留给后面的阶段和章节在场景中表现。设定库用于保存后续可以反复调用的稳定故事事实，优先收录地点、物件、势力、制度、日常场景和能力边界等长期成立的内容。l.d优先说明该设定是什么、稳定起什么作用、具有哪些明确边界或区别；每项根据实际需要选择最关键的一到两个方面，保持信息集中、清楚、方便后续调用。阶段中的具体使用方式、事件推进、人物连续行动、因果变化和局势转折，由阶段规划、章节规划和伏笔字段展开。明确有修炼、境界或能力层次的题材，实力体系条目可以保留必要的层次顺序、能力边界和提升条件；其它设定以稳定事实和实际使用价值为主，保持简洁、具体、可复用。伏笔围绕主线冲突、重要人物关系和关键设定展开，但每条只保留一个核心问题和一个可验收的回收结果：写清当前可见的具体线索、人物当前理解、回收时谁做了什么、读者确认了什么、当场产生什么后果，notes留空，状态统一为未埋。普通伏笔的 remaining_secret 填“无”或只写不影响本部闭环的余波；只有少量真正贯穿全书核心矛盾的长期主线谜团才允许保留核心未解部分。
 
 {CREATION_LORE_TYPE_GUIDANCE}
 
-人物说明不能只写一个身份标签：c.r写正式身份和故事位置，c.q用一两句补清所属关系、与主角的牵制以及和相近人物的区别；人物是某个组织、家族或势力的代表时，人物姓名与组织正式名称分别保留。设定说明不能只写名词：l.d用一两句写清实体类型、正式名称、关联人物或势力、作用范围和与相近实体的区别。伏笔说明用一两句写清它指向的正式人物、势力、设定或关系，以及线索现在出现的内容和后续会改变的判断；每条必须能够单独回答一个问题，不得把身份、幕后势力、历史经过、力量来源和未来世界合并在一条伏笔中；三类说明都直接写故事资料，不写字段解释或编辑总结。
+{CREATION_CHINESE_OUTPUT_GUIDANCE}
+
+人物说明不能只写一个身份标签：c.r写正式身份和故事位置，c.q用一两句补清所属关系、与主角的牵制以及和相近人物的区别；人物是某个组织、家族或势力的代表时，人物姓名与组织正式名称分别保留。设定说明直接呈现故事中的稳定事实：l.d从类型、作用、边界、关联和区别中选择最适合该设定的关键内容，每项保留一到两个最有用的方面，形成简洁、具体、可复用的资料。伏笔说明用一两句写清它指向的正式人物、势力、设定或关系，以及线索现在出现的内容和后续会改变的判断；每条必须能够单独回答一个问题，不得把身份、幕后势力、历史经过、力量来源和未来世界合并在一条伏笔中；三类说明都直接写故事资料，不写字段解释或编辑总结。l.d、l.k、f.r使用软上限：每项通常控制在100字以内，100字只是篇幅参考，不是硬性截断；超过时优先保留最关键的事实，删除过程、重复说明和枝节，不要为了凑字数扩写，也不能为了符合字数而留空。
 
 {power_levels_guidance}
 
@@ -5809,10 +5922,12 @@ c 中每项只能使用 n、r、g、s、p、v、q；l 中每项只能使用 n、
                     "续作只能保留不影响当前结局的背景余波，不把本部必须解决的事情留给下一部。"
                     "最后几章不要再开需要后续章节解决的主线、重大反转、重要人物、新的世界规则或等待回答的悬念；要把结局写成具体场景中的行动、结果和已经成立的生活状态，"
                     "如果本书适合短期或远期验证，可以在 closure_plan 指定的时间落点后写一个具体的成果场景，但不能用空泛的多年后概括、作者总结或一句抽象结论代替过程。"
-                    "先在阶段后部安排一个由既有主线压力汇聚出的决定性高潮，再让最后3章承接高潮的直接后果、关系落点和本部结果；高潮可以落在最后3章内，也可以在此前完成，但不能在高潮后重复证明同一结果。"
+                    "先在阶段后部安排一个由既有主线压力汇聚出的决定性高潮，最终兑现在下方指定的收尾前三章范围内完成，再让最后3章承接直接后果、关系落点和本部结果，不重复证明同一结果。"
                     "阶段最后事件的 result 必须是已经发生、当场可验证的结果，不能把准备开始、等待确认、试验复测、刚刚接手或下一轮行动当作结尾；"
                     "如果还存在未完成的核心任务，必须在当前固定章节范围内写出完成、失败代价或明确转化；最后阶段对象还要给出 closure_plan，供章节规划和正文保持同一收尾方式。"
                 )
+            if final_stage_guidance:
+                final_stage_guidance += "\n" + _final_stage_climax_planning_guidance(total_chapters)
             stage_progression_guidance = (
                 "本阶段后部只沿着已经发生的冲突、人物选择和关系变化完成窗口内的直接结果；"
                 "收尾窗口内不再打开下一道需要后续章节回答的主线目标、主要敌人、未知信息或悬念，"
@@ -5820,24 +5935,32 @@ c 中每项只能使用 n、r、g、s、p、v、q；l 中每项只能使用 n、
                 if terminal_overlap else
                 "本阶段解决或暂时解决当前目标后，要在 x/y 或事件结果中留下下一阶段可执行的具体目标、缺口或更高代价，不能只写‘局势继续发展’。"
             )
+            stage_fact_boundary_guidance = (
+                CREATION_STAGE_RESULT_OWNERSHIP_GUIDANCE + " " +
+                "已经生成的前面阶段是已经发生并确认的事实和结果，当前阶段只能承接这些结果带来的后果、变化、新选择和新冲突，"
+                "不重新完成前面已经兑现的事件、人物目标、关系结果或主线闭环。"
+                "尚未生成的后续阶段属于尚未发生的规划内容，当前阶段只能为它形成前置压力、入口条件或行动动机，"
+                "只生成当前阶段的事件和结果，不提前写出后续阶段的具体事件、结果、兑现或终局闭环。"
+            )
             prompt = f"""{COMMON_CREATION_RULES}
 
 {_story_conflict_pacing_guidance()}
 
 本阶段所有事件都服务于同一条核心动机。先从主角正在争取、保护、摆脱或确认的具体结果出发，再让世界观、组织运行、设备状态、规则和责任分工作为人物行动的阻力、资源、代价或结果出现。若某个事件只是说明权限已分配、记录已完成、规则已建立或设备已稳定，应并入造成该结果的冲突事件，并继续表现这个结果如何迫使人物作出下一次选择。
 
-读取作者选定的故事、完整故事底盘、已确认的全书阶段方向和已经完成的前面阶段，只生成当前第{stage_number}/{total_stages or '?'}阶段，范围为第{start_chapter}章到第{end_chapter}章。当前阶段方向用于确定本阶段的主要场景、人物变化和阶段结果；不要把阶段方向原样重复成另一份总规划，具体内容以本阶段事件和人物处境为准。前面阶段的结束状态、带入内容和仍在推动人物的问题是连续性依据。当前阶段必须沿着核心动机继续：先明确主角本阶段要完成的具体目标，再让事件围绕主角的行动、阻碍、选择、代价和结果展开；{stage_progression_guidance}阶段规划使用结构化表达，写清人物真正正在经历的事情、事件顺序、直接结果和状态变化；字段服务于故事事实，尽量不用固定清单式要求，不把每个事件套成同一张检查表。
+读取作者选定的故事、完整故事底盘、已确认的全书阶段方向和已经完成的前面阶段，只生成当前第{stage_number}/{total_stages or '?'}阶段，范围为第{start_chapter}章到第{end_chapter}章。当前阶段方向用于确定本阶段的主要场景、人物变化和阶段结果；具体内容以本阶段事件和人物处境为准。{CREATION_STAGE_RESULT_OWNERSHIP_GUIDANCE}阶段方向各字段共同描述同一组事实，result 是本阶段结束时要达到的状态，不是 summary 之外的第二组事件；同一事实只安排一次实际发生，前阶段已成立的认知和关系从该状态继续发展。next_pressure 只表示下一阶段从当前结果继续承接的入口压力，本阶段可以让它出现、形成或变得迫近，但不在本阶段提前解决；后续阶段方向和第一步结尾方向只用于保持远期一致，不得提前兑现其中的后续结果或全书结局。前阶段事件、结果、状态和时间构成本阶段的实际入口，当前阶段从这些既成事实带来的后果、选择和压力继续推进；current_stage.stage_direction 是本批次的执行目标。前阶段已经成立的结果优先作为事实承接，阶段方向中已经被前阶段完成的结果转化为后续影响、关系变化或新的处境。此前阻止行动的条件改变时，用具体行动及结果衔接后续选择；当前阶段时间从前阶段最后一个事件的实际时间继续计算，相对时间落点与前阶段状态保持一致。当前阶段必须沿着核心动机继续：先明确主角本阶段要完成的具体目标，再让事件围绕主角的行动、阻碍、选择、代价和结果展开；除核心动机外，本阶段承担主要推进作用的阶段性对手、关键推进人物目标和关系任务也要在本阶段内完成一次兑现，并在兑现后转入由人物目标、关系变化、利益争夺、选择或正面/间接对抗推动的更高强度新场景；阶段性推进人物继续出现时，承接的是已改变的位置、关系、利益或后果，不再重复原来的阶段目标。{stage_progression_guidance}阶段规划使用结构化表达，写清人物真正正在经历的事情、事件顺序、直接结果和状态变化；字段服务于故事事实，尽量不用固定清单式要求，不把每个事件套成同一张检查表。
 
 程序性事项沿用上面的共享边界：维护、生产、资源、权限和规则只有在具体人物的使坏、失误、隐瞒、争夺、误判或重大纰漏造成现场后果时才形成事件；公司、合同或调查题材也必须落到直接利益者的行动和对抗，不把流程步骤本身当成叙事骨架。
 
 输入资料中的 current_foreshadow_endpoints 是本阶段自然发生的正式暗线端点清单。每一项落到一个当前事件中；kind=setup 写线索怎样第一次进入人物生活，kind=payoff 写线索怎样在现场完成一个明确问题的回答，并产生可观察的直接结果。payoff不能只写推进、部分揭示、再次出现、冲突升级、确认“事情不简单”或留下新的问题；如果当前事件只能继续铺垫，就不能把它当成正式 payoff。清单为空时，场景仍然沿着人物和主线自然推进。同一条伏笔在其它事件里继续出现、深化或产生后果是正常的，但正式端点只在真正承担该变化的事件中标记一次；后续事件用普通关联资料或“F编号”继续承接，不重复写“F编号/setup”或“F编号/payoff”。承载正式端点的事件 references 加入对应标记，让程序可以把端点和事件稳定对应起来。
 
-阶段内的事件以场景为核心：在需要的地方写清本次真正发生的事实，尽量不用固定清单式要求，不为凑齐项目逐项重复。allowed_chapters 是事件容量：一章写一个主要场面和直接结果；最多连续两章写同一冲突的升级、选择和后果。每个事件的章节范围必须满足 b-a+1<=2；如果一个事件想覆盖三章或四章，必须先拆成至少两个事件，每个事件各自绑定具体人物关系、独立阻力、选择和结果，再由结果衔接下一事件。事件长度由冲突本身决定，不要为了填满阶段章节数把多数事件都写成两章，也不要让整阶段只由两章事件串联；当阶段超过20章时，尤其不能机械用连续两章事件填满范围，能在单章完成的人物选择、关系转折、信息落地、对手出手或结果验证要自然独立成单章事件。只有同一冲突确实需要升级时才使用两章，且第二章必须出现新的行动和结果。不能把同一段家庭谈话、资源讨论或权限说明换一种说法继续占满多章。生成事件数组前逐项确认范围长度，超过两章就拆分，不要把超长范围交给程序再落位。相邻事件从人物目标和现场结果自然长出新的推进方式。伏笔只在实际发生的阶段返回，一次只返回一个当前正式端点；f中的每项写 i、k、e、d，其中 k 为 setup 或 payoff，e 是承载它的事件编号，d 是这一次在场景中发生的具体变化。后续事件可以继续写同一条线索的新增影响，但不重复返回同一种正式端点。程序会依据事件范围落下具体章号。{("同时返回全书长期事实 k。" if first_stage else "本阶段沿用前面已经确认的长期事实。")}
+阶段内的事件以场景为核心：在需要的地方写清本次真正发生的事实，尽量不用固定清单式要求，不为凑齐项目逐项重复。allowed_chapters 是事件容量：一章写一个主要场面和直接结果；最多连续两章写同一冲突的升级、选择和后果。每个事件的章节范围必须满足 b-a+1<=2；如果一个事件想覆盖三章或四章，必须先拆成至少两个事件，每个事件各自绑定具体人物关系、独立阻力、选择和结果，再由结果衔接下一事件。事件长度由冲突本身决定，不要为了填满阶段章节数把多数事件都写成两章，也不要让整阶段只由两章事件串联；当阶段超过20章时，尤其不能机械用连续两章事件填满范围，能在单章完成的人物选择、关系转折、信息落地、对手出手或结果验证要自然独立成单章事件。只有同一冲突确实需要升级时才使用两章，且第二章必须出现新的行动和结果。不能把同一段家庭谈话、资源讨论或权限说明换一种说法继续占满多章。生成事件数组前逐项确认范围长度，超过两章就拆分，不要把超长范围交给程序再落位。相邻事件从人物目标和现场结果自然长出新的推进方式。main_line、relationship_engine 和 story_engine 作为全书冲突底盘，当前阶段通过本题材自然的场景压力、人物选择、关系变化、公开后果或资源代价推进底盘；它们提供长期方向，不构成每个阶段重复执行的固定事件顺序。伏笔只在实际发生的阶段返回，一次只返回一个当前正式端点；f中的每项写 i、k、e、d，其中 k 为 setup 或 payoff，e 是承载它的事件编号，d 是这一次在场景中发生的具体变化。后续事件可以继续写同一条线索的新增影响，但不重复返回同一种正式端点。程序会依据事件范围落下具体章号。{("同时返回全书长期事实 k。" if first_stage else "本阶段沿用前面已经确认的长期事实。")}
 
             {opening_guidance}{subject_guidance}{final_stage_guidance}
 
 {STAGE_PLAN_OBJECT_OUTPUT_RULES}
 """
+            prompt += "\n\n" + stage_fact_boundary_guidance
         if self.creation_step == "stage_plan":
             prompt = _compact_stage_plan_prompt(prompt)
         retry_feedback = _as_text(
@@ -5874,17 +5997,22 @@ c 中每项只能使用 n、r、g、s、p、v、q；l 中每项只能使用 n、
             return "5个故事方向"
         return "当前步骤"
 
+    def _stream_json_candidate_required_keys(self):
+        if self.creation_batch == "stage_plan_stage":
+            return ("v", "k", "s", "f")
+        return super()._stream_json_candidate_required_keys()
+
     def _max_tokens_for_request(self):
         if self.creation_batch == "stage_endpoint_repair":
             return 6000
         if self.creation_batch == "bible_core":
             return 16000
         if self.creation_batch == "bible_assets":
-            return 22000
+            return 30000
         if self.creation_batch == "stage_directions":
             return 14000
         if self.creation_batch == "stage_plan_stage":
-            return 16000
+            return 30000
         return {
             "premise": 12000,
             "bible": 50000,
@@ -6432,6 +6560,7 @@ class NovelCreationWizardDialog(QDialog):
         self.imported_project_path = ""
         self.completed_result_payload = {}
         self.worker = None
+        self._close_requested = False
         self._active_batch_kind = ""
         self._active_stage_index = -1
         self._pending_batch_kind = ""
@@ -7989,8 +8118,11 @@ class NovelCreationWizardDialog(QDialog):
             specs = self._stage_specs()
             current_stage = specs[stage_index] if 0 <= stage_index < len(specs) else {}
             stage_result = self.step_results.get("stage_plan", {})
+            confirmed_bible = deepcopy(self.step_results.get("bible", {}))
+            if isinstance(confirmed_bible, dict):
+                confirmed_bible.pop("stage_directions", None)
             context["confirmed"] = {
-                "bible": deepcopy(self.step_results.get("bible", {})),
+                "bible": confirmed_bible,
             }
             bible_result = self.step_results.get("bible", {})
             if isinstance(bible_result, dict) and bible_result.get("stage_directions"):
@@ -8230,7 +8362,8 @@ class NovelCreationWizardDialog(QDialog):
         self.worker.failed.connect(self._on_ai_failed)
         self.worker.progress.connect(self._on_worker_progress)
         self.worker.output_chars.connect(self._on_worker_output_chars)
-        self.worker.finished.connect(self._cleanup_worker)
+        worker = self.worker
+        worker.finished.connect(lambda *_args, w=worker: self._cleanup_worker(w))
         self._active_batch_kind = batch_kind
         self._active_stage_index = stage_index
         self._pending_batch_kind = ""
@@ -8570,6 +8703,10 @@ class NovelCreationWizardDialog(QDialog):
             strict=False,
         )
         current["foreshadow_schedule"] = canonical_schedule
+        _dedupe_stage_endpoint_markers(
+            current.get("stage_plan", []),
+            canonical_schedule,
+        )
         current_missing = [
             item for item in _stage_foreshadow_shortfalls(
                 bible_foreshadows,
@@ -8750,6 +8887,10 @@ class NovelCreationWizardDialog(QDialog):
             if 0 <= index < len(specs)
         ]
         current["foreshadow_schedule"] = canonical_schedule
+        _dedupe_stage_endpoint_markers(
+            current.get("stage_plan", []),
+            canonical_schedule,
+        )
         current["foreshadow_endpoint_warnings"] = [
             item for item in current.get("foreshadow_endpoint_warnings", [])
             if not (
@@ -8842,7 +8983,14 @@ class NovelCreationWizardDialog(QDialog):
         self._set_running(False)
         return False
 
+    def _is_current_worker_signal(self):
+        """Ignore late signals from a worker that has already been replaced."""
+        sender = self.sender()
+        return sender is None or sender is self.worker
+
     def _on_ai_result(self, result):
+        if not self._is_current_worker_signal():
+            return
         step = CREATION_WIZARD_STEPS[self.current_step_index][0]
         batch_kind = self._active_batch_kind
         stage_index = self._active_stage_index
@@ -8975,6 +9123,8 @@ class NovelCreationWizardDialog(QDialog):
         self._refresh_step_ui()
 
     def _on_ai_failed(self, error):
+        if not self._is_current_worker_signal():
+            return
         raw_error = str(error or "生成失败。")
         raw_error_lower = raw_error.lower()
         if "流式响应在结果完成前中断" in raw_error:
@@ -9009,11 +9159,27 @@ class NovelCreationWizardDialog(QDialog):
         self._save_draft()
         self._set_running(False)
 
-    def _cleanup_worker(self):
-        worker = self.worker
+    def _cleanup_worker(self, worker=None):
+        worker = worker or self.worker
+        if worker is None:
+            return
+        if self.worker is not worker:
+            # A stale queued signal must never release a newer worker.
+            try:
+                worker.deleteLater()
+            except Exception:
+                pass
+            return
         self.worker = None
-        if worker is not None:
+        try:
             worker.deleteLater()
+        except Exception:
+            pass
+        if self._close_requested:
+            self._close_requested = False
+            self._set_running(False)
+            QTimer.singleShot(0, self.close)
+            return
         self._set_running(False)
         self._refresh_step_ui()
         pending = bool(self._pending_batch_kind) and not self._generation_failed
@@ -9103,6 +9269,10 @@ class NovelCreationWizardDialog(QDialog):
                     + "。请重新生成对应阶段。"
                 )
             normalized["foreshadow_schedule"] = canonical_schedule
+            _dedupe_stage_endpoint_markers(
+                normalized.get("stage_plan", []),
+                canonical_schedule,
+            )
             if len(normalized.get("stage_plan", [])) < len(self._stage_specs()):
                 raise ValueError("阶段规划尚未覆盖全部十万字阶段，请继续生成。")
             missing_schedule = _stage_foreshadow_shortfalls(
@@ -9284,17 +9454,19 @@ class NovelCreationWizardDialog(QDialog):
         if self.worker is not None:
             self._save_draft()
             self._generation_failed = True
+            self._close_requested = True
             self._pending_batch_kind = ""
             self._pending_stage_index = -1
             try:
                 self.worker.stop()
+                self.worker.quit()
                 self.worker.wait(2000)
             except Exception:
                 pass
             event.ignore()
-            self.worker = None
-            self._set_running(False)
+            self._set_status_text("正在停止当前生成任务，任务结束后关闭向导……")
             return
+        self._close_requested = False
         self._save_draft()
         super().closeEvent(event)
 

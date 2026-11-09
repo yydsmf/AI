@@ -526,6 +526,7 @@ def save_novel_raw_model_output(request_id, attempt_index, raw_text, metadata=No
     stem = f"{slot_id}--latest"
     text_path = os.path.join(NOVEL_RAW_OUTPUT_DIR, f"{stem}.txt")
     metadata_path = os.path.join(NOVEL_RAW_OUTPUT_DIR, f"{stem}.json")
+    outcome = str(raw_metadata.get("outcome", "") or "").strip().lower()
     record = {
         "schema_version": 2,
         "record_type": "novel_raw_model_output",
@@ -543,6 +544,21 @@ def save_novel_raw_model_output(request_id, attempt_index, raw_text, metadata=No
     try:
         with _NOVEL_DIAGNOSTIC_LOCK:
             os.makedirs(NOVEL_RAW_OUTPUT_DIR, exist_ok=True)
+            # A late stop signal can arrive after a useful response was
+            # already captured for the same stage. Keep that response visible
+            # instead of replacing it with an empty diagnostic record.
+            if not text and outcome in {"stopped", "cancelled"}:
+                try:
+                    with open(metadata_path, "r", encoding="utf-8") as handle:
+                        previous = json.load(handle)
+                    if (
+                        isinstance(previous, dict)
+                        and int(previous.get("output_chars", 0) or 0) > 0
+                        and previous.get("raw_output_path")
+                    ):
+                        return str(previous["raw_output_path"])
+                except (OSError, TypeError, ValueError):
+                    pass
             temp_text_path = f"{text_path}.{os.getpid()}.{threading.get_ident()}.tmp"
             try:
                 with open(temp_text_path, "w", encoding="utf-8") as handle:

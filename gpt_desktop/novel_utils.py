@@ -26,6 +26,26 @@ NOVEL_AI_CONTEXT_LIMIT = 160000
 FANQIE_UPLOAD_SELECTED_ACCOUNT_FIELD = "fanqie_upload_selected_account_id"
 
 
+def _novel_chinese_output_guidance():
+    """Shared language boundary for all novel-generation prompts.
+
+    Protocol keys and story-owned identifiers follow different rules: the
+    former may remain English for parsing, while natural-language story
+    fields should stay Chinese unless the source explicitly requires another
+    character sequence.
+    """
+    return (
+        "【中文表达与字符边界】自然语言字段、故事资料、阶段说明、章节规划、摘要、记忆、文风说明和正文默认使用自然中文；"
+        "程序协议中的 JSON 键名、字段名、示例键、编号格式和内部标记只服务于结构解析，不要把它们当作故事用语写入自然语言字段。"
+        "英文单词或英文分析术语若只是表达期限、升级、铺垫、回收、主线等意思，直接换成对应中文，例如‘期限/截止节点’、‘升级/加剧’、‘铺垫/回收’和‘核心动机/主线’；"
+        "不要在中文故事字段中混入 deadline、escalation、setup、payoff、core_motive 等协议或分析标签。"
+        "人物姓名、组织名、物件名、技能名、品牌名、型号、等级代号、文件名、网址、作者明确要求保留的原文引用和故事内真实存在的外文词可以按项目资料原样保留；"
+        "例如人物代号 K、型号 X-7、S 级或资料中明确写出的英文专名都属于故事事实，不要擅自翻译、删除或改写。"
+        "普通对白、情绪表达、叙事说明和阶段字段默认使用自然中文；不要因为人物会说外语、表达态度或想显得利落，就把普通英文口语直接塞进中文故事字段。"
+        "判断字符是否保留时，以它是否是项目资料明确规定的正式名称、代号、型号或原文引用为准；仅仅为了显得专业、像分析报告或像提示词而使用的英文，改为自然中文。"
+    )
+
+
 def _canonical_chapter_plan_stage_id(value, fallback=""):
     """Normalize legacy/current source-framework stage identifiers."""
     normalized = re.sub(r"\s+", "", str(value or "").strip().upper())
@@ -5519,6 +5539,27 @@ def _terminal_window_bounds(total_chapter_count, window_size=TERMINAL_WINDOW_CHA
     return max(1, total - size + 1), total
 
 
+def _final_stage_climax_planning_guidance(total_chapter_count):
+    """Position newly planned climax payoffs before the unchanged ending window."""
+    bounds = _terminal_window_bounds(total_chapter_count)
+    if not bounds or bounds[0] <= 1:
+        return ""
+    terminal_start, terminal_end = bounds
+    climax_end = terminal_start - 1
+    climax_start = max(1, climax_end - 2)
+    return (
+        f"【最后阶段高潮兑现位置｜第{climax_start}-{climax_end}章】\n"
+        f"规划新的终局事件时，把真正解决核心冲突、兑现本书主要承诺的决定性结果安排在第{climax_start}-{climax_end}章内完成，"
+        f"即现有第{terminal_start}-{terminal_end}章收尾窗口开始前的至多三章内；最后3章的收尾完结安排保持不变。"
+        "这里限定最终兑现的位置，交锋、升级和人物选择可以更早展开，不要求高潮写满三章，也不规定各章固定分工。"
+        "高潮后的剩余篇幅只承接必要且不同的直接后果、关系变化和最终处境；功能相同的告别、拒绝邀请或成果展示自然合并，"
+        "不另开跟踪者、小反派或临时任务填篇幅，也不因为还有章位就专门补过渡。"
+        "不要为推迟兑现增加反复恢复、假胜利、重复试探，或让主角故意放过已经能够解决的冲突；"
+        "颁奖、宣布胜利或重复确认不能冒充尚未完成的核心高潮。"
+        "已经确认的阶段事件、高潮章位和已写正文继续沿用，不为调整位置自行重排或改写既有事实。"
+    )
+
+
 def _project_terminal_window_bounds(project, window_size=TERMINAL_WINDOW_CHAPTER_COUNT):
     """Return the configured final-chapter window, falling back to saved chapters."""
     project = project if isinstance(project, dict) else {}
@@ -10934,7 +10975,7 @@ def _build_legacy_style_execution_context(
         "严格只输出以下三个分区，不输出其他标题、分析、状态JSON或Markdown代码块：\n"
         f"【剧情执行清单】\n{beat_low}-{beat_high}条唯一剧情拍点\n\n"
         "【本章声纹执行表】\n主叙事模式、0至1张条件性片段卡、1至2种主导语言节奏、段落中心区间、1至2名核心声纹人物、具体章末落点\n\n"
-        "【备用正文草稿】\n完整正文草稿"
+        f"【备用正文草稿】\n{NOVEL_PROSE_START_MARKER}\n完整正文草稿\n{NOVEL_PROSE_END_MARKER}"
     )
     # The planning stage now carries pacing, payoff and emotional architecture.
     # Keep the prose stage focused on story facts and author voice instead of
@@ -10964,7 +11005,7 @@ def _build_legacy_style_execution_context(
         + "严格只输出以下三个分区，不输出其他标题、分析、状态JSON或Markdown代码块：\n"
         "【剧情执行清单】\n按发生顺序列出自然数量的唯一剧情拍点\n\n"
         "【本章声纹执行表】\n核心人物口吻、自然适用的原生词与说话方式、叙述衔接和具体章末落点\n\n"
-        "【备用正文草稿】\n完整正文草稿"
+        f"【备用正文草稿】\n{NOVEL_PROSE_START_MARKER}\n完整正文草稿\n{NOVEL_PROSE_END_MARKER}"
     )
     structure_block = f"【完整样本结构软参考｜只防严重漂移】\n{structure_contract}" if structure_contract else ""
     vocabulary_block = f"【作者原生用词池｜优先替换AI默认措辞】\n{native_vocabulary}" if native_vocabulary else ""
@@ -11443,6 +11484,55 @@ def _parse_style_execution_result(value):
 
 NOVEL_PROSE_START_MARKER = "<NOVEL_PROSE_START>"
 NOVEL_PROSE_END_MARKER = "<NOVEL_PROSE_END>"
+NOVEL_OUTPUT_START_MARKER = "<NOVEL_OUTPUT_START>"
+NOVEL_OUTPUT_END_MARKER = "<NOVEL_OUTPUT_END>"
+
+
+def _extract_bounded_novel_output(value, start_marker, end_marker, require_marker=False):
+    raw = str(value or "").strip()
+    start_index = raw.find(start_marker)
+    end_index = (
+        raw.find(end_marker, start_index + len(start_marker))
+        if start_index >= 0 else -1
+    )
+    if start_index < 0 or end_index < 0:
+        if require_marker:
+            return {
+                "ok": False,
+                "text": "",
+                "source": "boundary_missing",
+                "error": "AI 输出边界不完整：缺少完整结果包络。",
+            }
+        return {
+            "ok": bool(raw),
+            "text": raw,
+            "source": "plain_compatibility",
+            "error": "" if raw else "AI 返回为空。",
+        }
+    text = raw[start_index + len(start_marker):end_index].strip()
+    if not text:
+        return {
+            "ok": False,
+            "text": "",
+            "source": "boundary_empty",
+            "error": "AI 输出边界不完整：包络内为空。",
+        }
+    return {
+        "ok": True,
+        "text": text,
+        "source": "bounded_output",
+        "error": "",
+    }
+
+
+def _extract_novel_output_delivery_result(value, require_marker=False):
+    """Extract a non-prose novel result without retaining model pre/postamble."""
+    return _extract_bounded_novel_output(
+        value,
+        NOVEL_OUTPUT_START_MARKER,
+        NOVEL_OUTPUT_END_MARKER,
+        require_marker=require_marker,
+    )
 
 
 def _extract_prose_delivery_result(value, require_marker=False):
@@ -11465,10 +11555,20 @@ def _extract_prose_delivery_result(value, require_marker=False):
     if has_structured_sections:
         parsed = _parse_style_execution_result(raw)
         draft = str(parsed.get("draft", "") or "").strip()
-        if parsed.get("parsed") and parsed.get("style_plan_parsed") and draft:
+        bounded_draft = _extract_bounded_novel_output(
+            draft,
+            NOVEL_PROSE_START_MARKER,
+            NOVEL_PROSE_END_MARKER,
+            require_marker=True,
+        )
+        if (
+            parsed.get("parsed")
+            and parsed.get("style_plan_parsed")
+            and bounded_draft.get("ok")
+        ):
             return {
                 "ok": True,
-                "text": draft,
+                "text": str(bounded_draft.get("text", "") or "").strip(),
                 "source": "structured_backup_draft",
                 "execution": str(parsed.get("execution", "") or "").strip(),
                 "style_plan": str(parsed.get("style_plan", "") or "").strip(),
@@ -12197,7 +12297,7 @@ def _build_style_finalize_context(
             )
             + delivery_audit_text
             + "严格只输出以下两个分区，不输出提纲、摘要、状态JSON、审校报告、评分、修改说明或Markdown代码块：\n"
-            "【终稿正文】\n可直接写入章节的完整正文\n\n"
+            f"【终稿正文】\n{NOVEL_PROSE_START_MARKER}\n可直接写入章节的完整正文\n{NOVEL_PROSE_END_MARKER}\n\n"
             "【终稿验收】\n"
             + acceptance_schema + "\n"
             + "剧情执行清单只用于组织本章正文，不要求逐项提交逐字证据；正文应保留自然的事件合并，不要为了满足验收格式补写解释。"
@@ -12226,7 +12326,7 @@ def _build_style_finalize_context(
             "自然排版与句式跟随样本读感变化，不执行固定换行、固定短句、固定对白数量或六种主叙事模式。"
             "章首从上一章触发后的新变量开始，章末停在具体动作、对白、信息或后果。"
             "严格输出六个分区：\n"
-            "【终稿正文】\n完整正文\n\n"
+            f"【终稿正文】\n{NOVEL_PROSE_START_MARKER}\n完整正文\n{NOVEL_PROSE_END_MARKER}\n\n"
             "【终稿验收】\n" + acceptance_schema + "\n\n"
             "【实际提纲】\n6-10条概括终稿已发生内容\n\n"
             "【本章摘要】\n简短概括核心事件与情绪变化\n\n"
@@ -12377,6 +12477,14 @@ def _parse_style_finalize_result(value):
         end = matches[index + 1].start() if index + 1 < len(matches) else len(text)
         sections[match.group(1)] = text[match.end():end].strip()
     body = sections.get("终稿正文", "")
+    if body:
+        bounded = _extract_bounded_novel_output(
+            body,
+            NOVEL_PROSE_START_MARKER,
+            NOVEL_PROSE_END_MARKER,
+            require_marker=True,
+        )
+        body = str(bounded.get("text", "") or "").strip() if bounded.get("ok") else ""
     acceptance = _parse_style_finalize_acceptance(
         sections.get("终稿验收", "")
     )
@@ -12386,7 +12494,13 @@ def _parse_style_finalize_result(value):
     # sections from this response.
     parsed = bool(body and acceptance)
     if not body and text and not matches:
-        body = text
+        bounded = _extract_bounded_novel_output(
+            text,
+            NOVEL_PROSE_START_MARKER,
+            NOVEL_PROSE_END_MARKER,
+            require_marker=True,
+        )
+        body = str(bounded.get("text", "") or "").strip() if bounded.get("ok") else ""
     return {
         "text": body,
         "outline": sections.get("实际提纲", ""),
@@ -23883,6 +23997,10 @@ def _build_chapter_ai_context(project, chapter_index, action):
         )
     draft_task += no_text_count_rule
     draft_task += _grounded_prose_contract(style_active=bool(style_reference))
+    draft_task += (
+        f"正文交付边界：只输出可以直接进入小说的正文，并严格使用{NOVEL_PROSE_START_MARKER}"
+        f"和{NOVEL_PROSE_END_MARKER}包住正文；包络外不得输出分析、思考、计划、总结、标题或致读者说明。"
+    )
     task_map = {
         "outline": (
             "请为当前章节生成章节提纲。当前章节已有正文草稿时，必须以正文草稿为唯一事实来源，"

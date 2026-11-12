@@ -50,6 +50,7 @@ from gpt_desktop.novel_utils import (
     _build_writing_check_text,
     _concrete_prose_expression_guidance,
     _derive_mainline_pressure_curve,
+    _mainline_pressure_context,
     _ensure_final_chapter_completion_marker,
     _ensure_final_chapter_title_suffix,
     _is_confirmed_project_final_chapter,
@@ -65,6 +66,7 @@ from gpt_desktop.novel_utils import (
     _parse_chapter_logic_repair_result,
     _parse_memory_repair_result,
     _parse_memory_reconciliation_result,
+    _prose_review_validation_errors,
     _parse_style_technique_cards_result,
     _parse_style_voice_cards_result,
     _procedural_plot_guard_guidance,
@@ -114,6 +116,26 @@ from gpt_desktop.novel_utils import (
 
 
 class NovelLongFormContextTests(unittest.TestCase):
+    def test_pressure_context_can_render_only_confirmed_stage_facts(self):
+        project = {
+            "chapter_plan_foundation": {
+                "mainline_pressure_curve": {
+                    "stage_ladder": [{
+                        "stage_id": "S01",
+                        "conflict_scope": "主角与堂兄争夺族中继承资格",
+                        "pressure_step": "堂兄公开揭穿主角旧伤，逼他当众应战",
+                    }],
+                },
+            },
+        }
+
+        facts_only = _mainline_pressure_context(project, include_guidance=False)
+        with_guidance = _mainline_pressure_context(project, include_guidance=True)
+
+        self.assertIn("主角与堂兄争夺族中继承资格", facts_only)
+        self.assertNotIn("递进只要求当前阶段相较前阶段", facts_only)
+        self.assertIn("本底稿只记录已确认的压力因果事实", with_guidance)
+
     def test_final_chapter_markers_are_exact_and_idempotent(self):
         self.assertEqual(
             _ensure_final_chapter_title_suffix("厂内厂外的灯一起亮"),
@@ -161,6 +183,23 @@ class NovelLongFormContextTests(unittest.TestCase):
         context = _build_chapter_ai_context(project, 0, "draft")
         self.assertIn("人物冲突落地", context)
         self.assertIn("同一冲突跨章时", context)
+
+    def test_pressure_context_keeps_stage_event_changes_separate_from_pressure_dimensions(self):
+        project = {
+            "mainline_pressure_curve": {
+                "core_result": "完成主线目标",
+                "stage_ladder": [{
+                    "stage_id": "S01",
+                    "start_chapter": 1,
+                    "end_chapter": 10,
+                    "conflict_scope": "主角与对手正面冲突",
+                }],
+            },
+        }
+        context = _mainline_pressure_context(project, 0, include_guidance=True)
+
+        self.assertIn("本底稿只记录已确认的压力因果事实", context)
+        self.assertIn("不能只凭压力提高视为阶段变化", context)
 
     def test_concrete_prose_guidance_rejects_both_stock_contrast_forms(self):
         for prompt in (
@@ -391,6 +430,21 @@ class NovelLongFormContextTests(unittest.TestCase):
         self.assertNotIn("AI推理", cleaned)
         self.assertIn("仍需保留正常剧情。", cleaned)
         self.assertTrue(any(item["reference"] == "NF-162-01" for item in changes))
+
+    def test_internal_metadata_sanitizer_preserves_natural_thought_and_legitimate_foreign_text(self):
+        project = self._project_with_current_chapter(_new_chapter(0))
+        prose = (
+            "她想，必须先弄清他为何撒谎。"
+            "门禁屏幕显示ACCESS DENIED，旁边印着型号X-7。"
+            "他低声说：\"No one gets out.\""
+        )
+
+        cleaned, changes = _sanitize_prose_internal_references(
+            project, prose, strip_metadata=True
+        )
+
+        self.assertEqual(cleaned, prose)
+        self.assertEqual(changes, [])
 
     def test_narrative_strategy_profile_persists_but_is_excluded_from_runtime_chapter_context(self):
         male = self._project_with_current_chapter(_new_chapter(0))
@@ -3879,6 +3933,13 @@ class NovelLongFormContextTests(unittest.TestCase):
         self.assertIn("物件的存在、撤走、开合、损毁、移动和持有人", context)
         self.assertIn("不得把人物判断失误", context)
         self.assertIn("AI推理、提示词、输出要求", context)
+        self.assertIn("必须逐段检查中文正文中是否混入没有必要的非中文普通词汇", context)
+        self.assertIn("intermittently", context)
+        self.assertIn("非中文词汇混入", context)
+        self.assertIn("其他语种的无必要词句或残片", context)
+        self.assertIn("乱码、编码损坏", context)
+        self.assertIn("普通旁白、人物对白和人物内心活动中的自然解释不是AI推理泄漏", context)
+        self.assertIn("明确面向生成过程的元说明", context)
         self.assertIn("无法确定或需要猜测剧情时不要修", context)
 
     def test_logic_audit_requires_ordered_literal_evidence_and_supports_local_patch(self):
@@ -4263,6 +4324,83 @@ class NovelLongFormContextTests(unittest.TestCase):
         self.assertIn("不得只因提纲或项目资料出现该名称", context)
         self.assertTrue(parsed["parsed"])
         self.assertIn("密信由周青持有", parsed["key_facts"])
+
+    def test_planned_foreshadow_alias_matches_persistent_id_in_reconciliation(self):
+        chapter = _new_chapter(0)
+        project = self._project_with_current_chapter(chapter)
+        project["foreshadow_items"] = [{
+            "id": "foreshadow-lock",
+            "name": "木锁裂痕",
+            "status": "未埋",
+            "setup_chapter": "第1章",
+        }]
+        body = "赵明发现木锁上有一道细长的裂痕，先把它记在心里。"
+        update = self._strict_update(project)
+        update["foreshadow_updates"] = [{
+            "operation": "update",
+            "ref": "F001",
+            "status": "已埋",
+            "state": "发现裂痕",
+            "revealed": "木锁存在裂痕",
+            "remaining_secret": "裂痕成因未知",
+            "evidence_quote": "发现木锁上有一道细长的裂痕",
+        }]
+        update["long_term_events"] = [{
+            "event": "发现木锁裂痕",
+            "evidence_quote": "发现木锁上有一道细长的裂痕",
+            "storage": {"foreshadow_refs": ["F001"]},
+        }]
+        for update_ref, checked_ref in (
+            ("F001", "F001"),
+            ("F001", "foreshadow-lock"),
+            ("foreshadow-lock", "F001"),
+        ):
+            with self.subTest(update_ref=update_ref, checked_ref=checked_ref):
+                candidate = deepcopy(update)
+                candidate["foreshadow_updates"][0]["ref"] = update_ref
+                candidate["state_reconciliation"]["foreshadow_refs"] = [checked_ref]
+
+                errors = _validate_long_form_memory_update(
+                    project, 0, candidate, final_text=body,
+                    require_revision=True, require_evidence=True,
+                )
+
+                self.assertEqual(errors, [])
+
+    def test_memory_repair_manifest_includes_planned_foreshadow_reference(self):
+        chapter = _new_chapter(0)
+        project = self._project_with_current_chapter(chapter)
+        project["foreshadow_items"] = [{
+            "id": "foreshadow-lock", "name": "木锁裂痕", "status": "未埋",
+            "setup_chapter": "第1章",
+        }]
+        context = _build_long_form_memory_repair_context(
+            project, 0, "赵明暂时没有碰到木锁。",
+            memory_update=self._strict_update(project),
+            validation_errors=["state_reconciliation.foreshadow_refs遗漏：foreshadow-lock"],
+        )
+        manifest = json.loads(self._context_section(context, "机械引用清单"))
+
+        self.assertEqual(
+            manifest["state_reconciliation_required_refs"]["foreshadow_refs"], ["F001"]
+        )
+
+    def test_memory_contracts_distinguish_existing_records_from_new_cards(self):
+        chapter = _new_chapter(0)
+        project = self._project_with_current_chapter(chapter)
+        finalize = _build_long_form_memory_finalize_context(project, 0, "赵明来到城门。")
+        repair = _build_long_form_memory_repair_context(
+            project, 0, "赵明来到城门。", memory_update=self._strict_update(project),
+            validation_errors=["lore更新第1项不得修改永久canon字段"],
+        )
+
+        self.assertIn('"operation":"update","ref":"C001"', finalize)
+        self.assertIn('"operation":"update","ref":"L001"', finalize)
+        self.assertIn('"refs":["C001","C002"]', finalize)
+        self.assertIn('"key":"NCF1","conflict"', finalize)
+        self.assertIn('"key":"NTASK1","task"', finalize)
+        self.assertIn("update中不得输出canon", repair)
+        self.assertIn("公开内容写story_known，不能写进canon", repair)
 
     def test_memory_repair_patch_parser_and_merge_preserve_valid_fields(self):
         original = {
@@ -10921,6 +11059,63 @@ class NovelLongFormContextTests(unittest.TestCase):
         self.assertEqual(parsed["summary"], "本章摘要")
         self.assertEqual(parsed["key_facts"], "1. 本章事实")
         self.assertEqual(parsed["memory_update"]["base_revision"], 29)
+
+    def test_memory_finalize_parser_marks_prose_review_presence_without_defaulting_it_to_checked(self):
+        base = {
+            "outline": "本章提纲",
+            "summary": "本章摘要",
+            "key_facts": ["本章事实"],
+            "long_form_memory": {"base_revision": 0},
+        }
+
+        missing = _parse_memory_repair_result(json.dumps(base, ensure_ascii=False))
+        self.assertFalse(missing["prose_review_present"])
+        self.assertEqual(missing["prose_review"], {})
+
+        checked = deepcopy(base)
+        checked["prose_review"] = {"checked": True, "issues": []}
+        parsed = _parse_memory_repair_result(json.dumps(checked, ensure_ascii=False))
+        self.assertTrue(parsed["prose_review_present"])
+        self.assertEqual(_prose_review_validation_errors(parsed["prose_review"], True), [])
+
+    def test_prose_review_validation_requires_explicit_completion(self):
+        self.assertEqual(
+            _prose_review_validation_errors({}, present=False),
+            ["prose_review缺失，必须明确完成终稿审读"],
+        )
+        self.assertEqual(
+            _prose_review_validation_errors({"checked": False, "issues": []}),
+            ["prose_review.checked必须为true"],
+        )
+        self.assertEqual(
+            _prose_review_validation_errors({"checked": True, "issues": "无"}),
+            ["prose_review.issues必须为数组"],
+        )
+        self.assertEqual(
+            _prose_review_validation_errors({
+                "checked": True,
+                "issues": [],
+                "blocking_issues": [{
+                    "category": "unknown",
+                    "quote": "不存在",
+                    "reason": "原因明确",
+                }],
+            }, final_text="实际正文"),
+            [
+                "prose_review.blocking_issues第1项category无效",
+                "prose_review.blocking_issues第1项quote不是正文逐字原文",
+            ],
+        )
+
+    def test_memory_repair_parser_does_not_require_prose_review(self):
+        parsed = _parse_memory_repair_result(json.dumps({
+            "long_form_memory_patch": {
+                "replace": {"summary": "修复后的摘要"},
+            },
+        }, ensure_ascii=False))
+
+        self.assertTrue(parsed["parsed"])
+        self.assertFalse(parsed["prose_review_present"])
 
     def test_reconciliation_does_not_guess_unknown_reference_operation(self):
         project = self._project_with_current_chapter(_new_chapter(0))

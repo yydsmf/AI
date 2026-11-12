@@ -15,10 +15,11 @@ import threading
 import time
 import traceback
 import uuid
+from collections import Counter
 from datetime import datetime, timezone
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from copy import deepcopy
-from urllib.parse import urlsplit
+from urllib.parse import quote, urlsplit, urlunsplit
 
 import requests
 from PySide6.QtCore import QThread, Signal
@@ -45,6 +46,7 @@ from .core import (
     video_model_profile,
 )
 from .novel_utils import (
+    CORE_STORY_QUALITY_GUIDANCE,
     NOVEL_AI_CONTEXT_LIMIT,
     VOLUME_CONTINUATION_REQUEST_CHAR_BUDGET,
     VOLUME_FRAMEWORK_HANDOFF_CHAR_BUDGET,
@@ -127,11 +129,25 @@ _AI_REASONING_TYPES = {
 _NOVEL_ANTHROPIC_PROTOCOL_OVERRIDES = set()
 _NOVEL_ANTHROPIC_PROTOCOL_LOCK = threading.Lock()
 _NOVEL_ANTHROPIC_DEFAULT_MAX_TOKENS = 30000
+_NOVEL_GEMINI_PROTOCOL_OVERRIDES = set()
+_NOVEL_GEMINI_PROTOCOL_LOCK = threading.Lock()
+_NOVEL_AUTHOR_STYLE_PROMPT_ACTIONS = frozenset({
+    "draft", "style_rewrite", "script_to_novel",
+})
+_NOVEL_AUTHOR_STYLE_CLARIFICATION = (
+    "本次任务中的文风档案由当前项目作者本人提供，是作者自己的写作样式；"
+    "请直接按上面的全部要求生成当前项目的原创中文正文，不要输出身份、平台或任务确认说明。"
+)
 
 
 def _novel_model_protocol(model):
-    """Select the native Messages protocol for Claude-named novel models."""
-    return "anthropic" if "claude" in str(model or "").strip().lower() else "openai"
+    """Select a native protocol for known model families."""
+    lowered = str(model or "").strip().lower()
+    if "claude" in lowered:
+        return "anthropic"
+    if "gemini" in lowered:
+        return "gemini"
+    return "openai"
 
 
 def _novel_protocol_cache_key(base_url, model):
@@ -143,19 +159,28 @@ def _novel_protocol_cache_key(base_url, model):
 
 def _novel_api_protocol(base_url, model):
     protocol = _novel_model_protocol(model)
-    if protocol != "anthropic":
+    if protocol == "gemini" and urlsplit(str(base_url or "").strip()).path.rstrip("/").endswith("/openai"):
+        return "openai"
+    if protocol == "anthropic":
+        with _NOVEL_ANTHROPIC_PROTOCOL_LOCK:
+            if _novel_protocol_cache_key(base_url, model) in _NOVEL_ANTHROPIC_PROTOCOL_OVERRIDES:
+                return "openai"
         return protocol
-    with _NOVEL_ANTHROPIC_PROTOCOL_LOCK:
-        if _novel_protocol_cache_key(base_url, model) in _NOVEL_ANTHROPIC_PROTOCOL_OVERRIDES:
-            return "openai"
+    if protocol == "gemini":
+        with _NOVEL_GEMINI_PROTOCOL_LOCK:
+            if _novel_protocol_cache_key(base_url, model) in _NOVEL_GEMINI_PROTOCOL_OVERRIDES:
+                return "openai"
+        return protocol
     return protocol
 
 
 def _remember_novel_openai_protocol(base_url, model):
-    with _NOVEL_ANTHROPIC_PROTOCOL_LOCK:
-        _NOVEL_ANTHROPIC_PROTOCOL_OVERRIDES.add(
-            _novel_protocol_cache_key(base_url, model)
-        )
+    if _novel_model_protocol(model) == "gemini":
+        lock, overrides = _NOVEL_GEMINI_PROTOCOL_LOCK, _NOVEL_GEMINI_PROTOCOL_OVERRIDES
+    else:
+        lock, overrides = _NOVEL_ANTHROPIC_PROTOCOL_LOCK, _NOVEL_ANTHROPIC_PROTOCOL_OVERRIDES
+    with lock:
+        overrides.add(_novel_protocol_cache_key(base_url, model))
 
 
 def _anthropic_endpoint_unsupported(status_code, error_text=""):
@@ -193,6 +218,239 @@ def _anthropic_endpoint_unsupported(status_code, error_text=""):
     ))
 
 
+def _gemini_endpoint_unsupported(status_code, error_text=""):
+    """Keep Gemini's model/version errors separate from missing API routes."""
+    lowered = str(error_text or "").lower()
+    if any(marker in lowered for marker in (
+        "not found for api version", "not supported for generatecontent",
+        "not supported for streamgeneratecontent", "call listmodels",
+    )):
+        return False
+    return _anthropic_endpoint_unsupported(status_code, error_text)
+
+
+def _native_protocol_endpoint_unsupported(protocol, status_code, error_text=""):
+    if protocol == "anthropic":
+        return _anthropic_endpoint_unsupported(status_code, error_text)
+    if protocol == "gemini":
+        return _gemini_endpoint_unsupported(status_code, error_text)
+    return False
+
+
+def _gemini_model_name(model):
+    model = str(model or "").strip()
+    return model[7:] if model.lower().startswith("models/") else model
+
+
+def _gemini_api_url(base_url, resource):
+    parts = urlsplit(str(base_url or "").strip())
+    path = parts.path.rstrip("/")
+    if path.endswith("/v1"):
+        path = path[:-3] + "/v1beta"
+    elif not path.endswith("/v1beta"):
+        path += "/v1beta"
+    return urlunsplit(parts._replace(path=path + "/" + resource, fragment=""))
+
+
+def _gemini_generation_endpoint(base_url, model, stream=False):
+    operation = "streamGenerateContent" if stream else "generateContent"
+    model_name = quote(_gemini_model_name(model), safe="")
+    url = _gemini_api_url(base_url, f"models/{model_name}:{operation}")
+    if stream:
+        url += "&alt=sse" if "?" in url else "?alt=sse"
+    return url
+
+
+def _has_json_response_format(payload):
+    if not isinstance(payload, dict):
+        return False
+    if "response_format" in payload:
+        return True
+    generation_config = payload.get("generationConfig", {})
+    return isinstance(generation_config, dict) and bool(generation_config.get("responseMimeType"))
+
+
+def _remove_json_response_format(payload):
+    if not isinstance(payload, dict):
+        return False
+    removed = payload.pop("response_format", None) is not None
+    generation_config = payload.get("generationConfig")
+    if isinstance(generation_config, dict):
+        removed = generation_config.pop("responseMimeType", None) is not None or removed
+        if not generation_config:
+            payload.pop("generationConfig", None)
+    return removed
+
+
+def _novel_openai_stream_usage_supported(base_url):
+    """Return whether the relay is documented to accept stream_options."""
+    host = (urlsplit(str(base_url or "").strip()).hostname or "").lower()
+    # xcmapi documents the basic Chat Completions body but does not document
+    # stream_options/include_usage. Avoid a guaranteed rejected first request;
+    # usage fields are still parsed when the relay includes them in its stream.
+    return host not in {"xcmapi.org", "www.xcmapi.com"}
+
+
+def _openai_cache_options_not_supported(status_code, error_text=""):
+    try:
+        status = int(status_code or 0)
+    except (TypeError, ValueError):
+        status = 0
+    if status not in {400, 404, 422}:
+        return False
+    lowered = str(error_text or "").lower()
+    return "stream_options" in lowered or "include_usage" in lowered
+
+
+def _remove_openai_cache_options(payload, error_text=""):
+    if not isinstance(payload, dict):
+        return False
+    # The generic OpenAI-compatible path no longer sends explicit cache
+    # extensions. This helper remains for providers that reject the standard
+    # stream usage option and need one legacy retry.
+    return payload.pop("stream_options", None) is not None
+
+
+def _anthropic_cache_options_not_supported(status_code, error_text=""):
+    """Match a rejected native Anthropic prompt-cache marker, not auth/model errors."""
+    try:
+        status = int(status_code or 0)
+    except (TypeError, ValueError):
+        status = 0
+    if status not in {400, 404, 422}:
+        return False
+    lowered = str(error_text or "").lower()
+    return any(marker in lowered for marker in (
+        "cache_control",
+        "cache control",
+        "prompt caching",
+        "prompt cache",
+        "ephemeral",
+        "unknown parameter",
+        "unsupported parameter",
+    ))
+
+
+def _remove_anthropic_cache_options(payload):
+    """Return the system prompt to the legacy string form for older relays."""
+    if not isinstance(payload, dict):
+        return False
+    system = payload.get("system")
+    if not isinstance(system, list):
+        return False
+    text_parts = []
+    changed = False
+    for block in system:
+        if isinstance(block, dict):
+            if "cache_control" in block:
+                changed = True
+            text = block.get("text")
+            if text is not None:
+                text_parts.append(str(text))
+        elif block is not None:
+            text_parts.append(str(block))
+    if changed:
+        payload["system"] = "".join(text_parts)
+    return changed
+
+
+def _normalize_novel_usage(data):
+    """Normalize provider usage fields, including prompt-cache counters."""
+    payload = data if isinstance(data, dict) else {}
+    usage = payload.get("usage")
+    if not isinstance(usage, dict):
+        usage = payload.get("usageMetadata")
+    if not isinstance(usage, dict):
+        usage = payload.get("usage_metadata")
+    if not isinstance(usage, dict):
+        return {}
+
+    details = usage.get("prompt_tokens_details")
+    if not isinstance(details, dict):
+        details = usage.get("input_tokens_details")
+    if not isinstance(details, dict):
+        details = {}
+
+    def number(*values):
+        for value in values:
+            if value in (None, ""):
+                continue
+            try:
+                return max(0, int(value))
+            except (TypeError, ValueError):
+                continue
+        return 0
+
+    cached_present = any(key in details for key in (
+        "cached_tokens", "cache_read_input_tokens", "cachedContentTokenCount",
+        "cached_content_token_count", "total_cached_tokens",
+    )) or any(key in usage for key in (
+        "cache_read_input_tokens", "cachedContentTokenCount",
+        "cached_content_token_count", "total_cached_tokens", "cached_tokens",
+    ))
+    cached_tokens = number(
+        details.get("cached_tokens"),
+        details.get("cache_read_input_tokens"),
+        details.get("cachedContentTokenCount"),
+        details.get("cached_content_token_count"),
+        details.get("total_cached_tokens"),
+        usage.get("cache_read_input_tokens"),
+        usage.get("cachedContentTokenCount"),
+        usage.get("cached_content_token_count"),
+        usage.get("total_cached_tokens"),
+        usage.get("cached_tokens"),
+    )
+    cache_write_tokens = number(
+        details.get("cache_write_tokens"),
+        details.get("cache_creation_input_tokens"),
+        usage.get("cache_creation_input_tokens"),
+        usage.get("cache_write_input_tokens"),
+        usage.get("cache_write_tokens"),
+    )
+    result = {
+        "input_tokens": number(
+            usage.get("prompt_tokens"), usage.get("input_tokens"),
+            usage.get("promptTokenCount"), usage.get("prompt_token_count"),
+        ),
+        "output_tokens": number(
+            usage.get("completion_tokens"), usage.get("output_tokens"),
+            usage.get("candidatesTokenCount"), usage.get("candidates_token_count"),
+        ),
+        "total_tokens": number(
+            usage.get("total_tokens"), usage.get("totalTokenCount"),
+            usage.get("total_token_count"),
+        ),
+        "cached_input_tokens": cached_tokens,
+        "cache_write_input_tokens": cache_write_tokens,
+        "cache_reported": bool(cached_present or cache_write_tokens > 0),
+        "cache_status": (
+            "hit" if cached_tokens > 0
+            else "write" if cache_write_tokens > 0
+            else "miss" if cached_present else "unreported"
+        ),
+    }
+    return result
+
+
+def _is_gemini_model_list_endpoint(base_url):
+    parts = urlsplit(str(base_url or "").strip())
+    path = parts.path.rstrip("/")
+    if path.endswith("/openai"):
+        return False
+    return (parts.hostname or "").lower() == "generativelanguage.googleapis.com" or path.endswith("/v1beta")
+
+
+def _novel_openai_api_url(base_url, model, resource):
+    if _novel_model_protocol(model) == "gemini":
+        parts = urlsplit(str(base_url or "").strip())
+        path = parts.path.rstrip("/")
+        if path.endswith("/openai"):
+            return urlunsplit(parts._replace(path=path + "/" + resource, fragment=""))
+        if path.endswith("/v1beta"):
+            base_url = urlunsplit(parts._replace(path=path[:-7], fragment=""))
+    return api_url(base_url, "/v1/" + resource)
+
+
 def _build_novel_generation_request(
     base_url,
     api_key,
@@ -207,7 +465,7 @@ def _build_novel_generation_request(
     response_format=False,
     protocol=None,
 ):
-    """Build an OpenAI Chat Completions or Anthropic Messages request."""
+    """Build an OpenAI, Anthropic, or Gemini native generation request."""
     protocol = str(protocol or _novel_api_protocol(base_url, model)).strip().lower()
     if protocol == "anthropic":
         try:
@@ -225,22 +483,66 @@ def _build_novel_generation_request(
             {
                 "model": model,
                 "max_tokens": output_limit,
-                "system": str(system_prompt or ""),
+                # Native Anthropic prompt caching is enabled at a stable
+                # content boundary. The user turn remains outside the cache.
+                "system": [{
+                    "type": "text",
+                    "text": str(system_prompt or ""),
+                    "cache_control": {"type": "ephemeral"},
+                }],
                 "messages": [{"role": "user", "content": str(user_text or "")}],
                 "stream": bool(stream),
             },
             protocol,
         )
 
+    if protocol == "gemini":
+        # Native Gemini GenerateContent uses implicit caching automatically;
+        # explicit cachedContent resources are a separate lifecycle and are
+        # not needed for the stable-prefix requests made by this worker.
+        generation_config = {}
+        if temperature is not None:
+            generation_config["temperature"] = temperature
+        if max_tokens:
+            generation_config["maxOutputTokens"] = int(max_tokens)
+        if response_format:
+            generation_config["responseMimeType"] = "application/json"
+        payload = {
+            "systemInstruction": {
+                "parts": [{"text": str(system_prompt or "")}],
+            },
+            "contents": [{
+                "role": "user",
+                "parts": [{"text": str(user_text or "")}],
+            }],
+        }
+        if generation_config:
+            payload["generationConfig"] = generation_config
+        return (
+            _gemini_generation_endpoint(base_url, model, stream=stream),
+            {
+                "x-goog-api-key": str(api_key or ""),
+                "Content-Type": "application/json",
+                "Accept": "text/event-stream" if stream else "application/json",
+            },
+            payload,
+            protocol,
+        )
+
     payload = {
         "model": model,
         "messages": [
+            # Keep the reusable system prefix in the ordinary Chat
+            # Completions shape. Compatible relays can apply implicit prompt
+            # caching without receiving provider-specific cache extensions.
             {"role": "system", "content": str(system_prompt or "")},
             {"role": "user", "content": str(user_text or "")},
         ],
     }
     if stream:
         payload["stream"] = True
+        if _novel_openai_stream_usage_supported(base_url):
+            payload["stream_options"] = {"include_usage": True}
     if temperature is not None:
         payload["temperature"] = temperature
     if max_tokens:
@@ -255,7 +557,7 @@ def _build_novel_generation_request(
     }
     if stream:
         headers["Accept"] = "text/event-stream"
-    return api_url(base_url, "/v1/chat/completions"), headers, payload, protocol
+    return _novel_openai_api_url(base_url, model, "chat/completions"), headers, payload, protocol
 
 
 def _ai_text_from_value(value):
@@ -419,8 +721,43 @@ def _ai_reasoning_field_names(*objects):
 
 
 def _normalize_novel_response_payload(data):
-    """Normalize common OpenAI-compatible and Claude message/stream shapes."""
+    """Normalize OpenAI-compatible, Claude, and Gemini response shapes."""
     payload = data if isinstance(data, dict) else {}
+    gemini_candidates = payload.get("candidates")
+    gemini_candidate = (
+        gemini_candidates[0]
+        if isinstance(gemini_candidates, list) and gemini_candidates
+        and isinstance(gemini_candidates[0], dict)
+        else {}
+    )
+    gemini_content = gemini_candidate.get("content", {})
+    gemini_parts = gemini_content.get("parts", []) if isinstance(gemini_content, dict) else []
+    gemini_content_parts = []
+    gemini_reasoning_parts = []
+    gemini_reasoning_fields = []
+    if isinstance(gemini_parts, list):
+        for index, part in enumerate(gemini_parts):
+            if not isinstance(part, dict) or not part.get("text"):
+                continue
+            text = str(part.get("text") or "")
+            if part.get("thought") is True:
+                gemini_reasoning_parts.append(text)
+                gemini_reasoning_fields.append(f"candidates[0].content.parts[{index}].thought")
+            else:
+                gemini_content_parts.append(text)
+    if "candidates" in payload or "promptFeedback" in payload:
+        feedback = payload.get("promptFeedback", {})
+        block_reason = feedback.get("blockReason") if isinstance(feedback, dict) else ""
+        reason = str(gemini_candidate.get("finishReason") or block_reason or "").strip().lower()
+        return {
+            "content": "".join(gemini_content_parts),
+            "reasoning": "".join(gemini_reasoning_parts),
+            "finish_reason": reason,
+            "done": bool(reason),
+            "reasoning_fields": gemini_reasoning_fields,
+            "usage": _normalize_novel_usage(payload),
+        }
+
     choices = payload.get("choices")
     choice = choices[0] if isinstance(choices, list) and choices else {}
     choice = choice if isinstance(choice, dict) else {}
@@ -468,7 +805,16 @@ def _normalize_novel_response_payload(data):
         "reasoning_fields": _ai_reasoning_field_names(
             delta, message, choice, native_delta, content_block, payload
         ),
+        "usage": _normalize_novel_usage(payload),
     }
+
+
+def _validate_gemini_finish_reason(finish_reason):
+    reason = str(finish_reason or "").strip().lower()
+    if reason in {"max_tokens", "length", "token_limit"}:
+        raise ValueError(f"AI 返回在输出上限处被截断（finish_reason={reason}）。")
+    if reason != "stop":
+        raise ValueError(f"Gemini 输出未正常完成（finish_reason={reason or '未返回'}）。")
 
 
 _NOVEL_JSON_RESULT_ACTIONS = {
@@ -1633,32 +1979,96 @@ class ModelListWorker(QThread):
             if not self.api_key:
                 raise Exception("请先设置 API Key。")
 
-            url = api_url(self.base_url, "/v1/models")
-            headers = {
-                "Authorization": f"Bearer {self.api_key}",
-                "Content-Type": "application/json",
-            }
+            is_gemini = _is_gemini_model_list_endpoint(self.base_url)
+            if is_gemini:
+                url = _gemini_api_url(self.base_url, "models")
+                headers = {
+                    "x-goog-api-key": str(self.api_key or ""),
+                    "Content-Type": "application/json",
+                }
+            else:
+                url = _novel_openai_api_url(self.base_url, "gemini", "models")
+                headers = {
+                    "Authorization": f"Bearer {self.api_key}",
+                    "Content-Type": "application/json",
+                }
             session = requests.Session()
             self._session = session
             session.trust_env = False
             try:
-                r = session.get(url, headers=headers, timeout=10, proxies=self._proxies())
-                self._response = r
-                try:
-                    if r.status_code >= 400:
-                        raise Exception(f"接口错误 {r.status_code}：{extract_api_error(r)}")
-                    data = r.json()
-                finally:
+                pages = []
+                page_token = ""
+                seen_tokens = set()
+                while not (self._stop_requested or self.isInterruptionRequested()):
+                    params = {"pageToken": page_token} if page_token else None
+                    r = session.get(
+                        url,
+                        headers=headers,
+                        params=params,
+                        timeout=10,
+                        proxies=self._proxies(),
+                    )
+                    self._response = r
                     try:
-                        r.close()
-                    except Exception:
-                        pass
+                        if r.status_code >= 400:
+                            error_text = extract_api_error(r)
+                            if (
+                                not is_gemini
+                                and not urlsplit(url).path.endswith("/openai/models")
+                                and _anthropic_endpoint_unsupported(r.status_code, error_text)
+                            ):
+                                is_gemini = True
+                                url = _gemini_api_url(self.base_url, "models")
+                                headers = {
+                                    "x-goog-api-key": str(self.api_key or ""),
+                                    "Content-Type": "application/json",
+                                }
+                                continue
+                            raise Exception(f"接口错误 {r.status_code}：{error_text}")
+                        data = r.json()
+                    finally:
+                        try:
+                            r.close()
+                        except Exception:
+                            pass
+                    if not isinstance(data, dict):
+                        break
+                    is_gemini = is_gemini or "models" in data
+                    pages.append(data)
+                    if not is_gemini:
+                        break
+                    page_token = str(data.get("nextPageToken") or "").strip()
+                    if not page_token:
+                        break
+                    if page_token in seen_tokens:
+                        raise ValueError("模型列表分页返回了重复的 pageToken，无法获取完整模型列表。")
+                    seen_tokens.add(page_token)
             finally:
                 try:
                     session.close()
                 except Exception:
                     pass
-            models = sorted({item.get("id") for item in data.get("data", []) if item.get("id")})
+            if is_gemini:
+                models = set()
+                for page in pages:
+                    for item in page.get("models", []):
+                        if not isinstance(item, dict):
+                            continue
+                        methods = item.get("supportedGenerationMethods", [])
+                        if methods and "generateContent" not in methods:
+                            continue
+                        name = str(item.get("name") or "").strip()
+                        if name.lower().startswith("models/"):
+                            name = name[7:]
+                        if name:
+                            models.add(name)
+                models = sorted(models)
+            else:
+                models = sorted({
+                    item.get("id")
+                    for page in pages for item in page.get("data", [])
+                    if isinstance(item, dict) and item.get("id")
+                })
             if not models:
                 raise Exception("接口没有返回可用模型。")
             if self._stop_requested or self.isInterruptionRequested():
@@ -1733,6 +2143,12 @@ class NovelAnalysisWorker(QThread):
             "api_protocol": self.api_protocol,
             "protocol_fallback": "",
             "response_models": [],
+            "usage": {},
+            "cached_input_tokens": 0,
+            "cache_write_input_tokens": 0,
+            "cache_status": "unreported",
+            "prompt_cache_key": "",
+            "prompt_cache_options_fallback": False,
             "input_chars": len(self.text),
             "input_utf8_bytes": len(input_bytes),
             "input_sha256": hashlib.sha256(input_bytes).hexdigest(),
@@ -1824,7 +2240,14 @@ class NovelAnalysisWorker(QThread):
             return {}
         return headers
 
-    def _begin_analysis_api_diagnostic(self, prompt, user_text, stream, use_response_format):
+    def _begin_analysis_api_diagnostic(
+        self,
+        prompt,
+        user_text,
+        stream,
+        use_response_format,
+        prompt_cache_key="",
+    ):
         prompt = str(prompt or "")
         user_text = str(user_text or "")
         # The UI counter represents returned content, not hidden reasoning.
@@ -1845,6 +2268,7 @@ class NovelAnalysisWorker(QThread):
             "response_model": "",
             "stream": bool(stream),
             "response_format_requested": bool(use_response_format),
+            "prompt_cache_key": str(prompt_cache_key or ""),
             "system_prompt_chars": len(prompt),
             "system_prompt_utf8_bytes": len(prompt_bytes),
             "system_prompt_sha256": hashlib.sha256(prompt_bytes).hexdigest(),
@@ -1859,6 +2283,7 @@ class NovelAnalysisWorker(QThread):
             "last_piece_at_ms": 0,
             "max_idle_gap_ms": 0,
             "finish_reason": "",
+            "usage": {},
             "response_headers": {},
             "response_chars": 0,
             "raw_response_chars": 0,
@@ -1876,6 +2301,8 @@ class NovelAnalysisWorker(QThread):
             attempt["index"] = len(attempts) + 1
             attempts.append(attempt)
             self.diagnostics["api_call_count"] = len(attempts)
+            if prompt_cache_key:
+                self.diagnostics["prompt_cache_key"] = str(prompt_cache_key)
             return attempt["index"] - 1
 
     def _finish_analysis_api_diagnostic(self, index, **updates):
@@ -1929,6 +2356,22 @@ class NovelAnalysisWorker(QThread):
             self.diagnostics["finish_reason"] = str(
                 attempt.get("finish_reason", "") or ""
             )
+            usage = attempt.get("usage", {})
+            if isinstance(usage, dict) and usage:
+                self.diagnostics["usage"] = deepcopy(usage)
+                self.diagnostics["cached_input_tokens"] = int(
+                    usage.get("cached_input_tokens", 0) or 0
+                )
+                self.diagnostics["cache_write_input_tokens"] = int(
+                    usage.get("cache_write_input_tokens", 0) or 0
+                )
+                self.diagnostics["cache_status"] = str(
+                    usage.get("cache_status", "unreported") or "unreported"
+                )
+            if attempt.get("prompt_cache_key") and not self.diagnostics.get("prompt_cache_key"):
+                self.diagnostics["prompt_cache_key"] = str(
+                    attempt.get("prompt_cache_key") or ""
+                )
             self.diagnostics["done_received"] = bool(
                 attempt.get("received_done", False)
             )
@@ -2577,7 +3020,7 @@ class NovelAnalysisWorker(QThread):
     def _reasoning_effort_for_request(self):
         # Structured writing tasks expose their action directly; analysis
         # workers use the progress label (for example 框架分类).
-        if _novel_model_protocol(self.model) == "anthropic":
+        if _novel_model_protocol(self.model) in {"anthropic", "gemini"}:
             return ""
         action = str(getattr(self, "action", "") or "").strip() or self._analysis_progress_label()
         return reasoning_effort_for_model(self.model, self.base_url, action)
@@ -2619,17 +3062,25 @@ class NovelAnalysisWorker(QThread):
             response_format=bool(use_response_format),
             protocol=protocol,
         )
+        self.api_protocol = protocol
+        self.diagnostics["api_protocol"] = protocol
         self.diagnostics["request_endpoint"] = url
         if max_tokens:
             self.diagnostics["max_output_tokens"] = int(max_tokens)
         diagnostic_started = time.perf_counter()
         diagnostic_index = self._begin_analysis_api_diagnostic(
-            prompt, user_text, False, bool(use_response_format and protocol == "openai")
+            prompt,
+            user_text,
+            False,
+            bool(use_response_format and protocol in {"openai", "gemini"}),
+            prompt_cache_key=payload.get("prompt_cache_key", ""),
         )
         session = self._new_session()
         response = None
         content = ""
         reasoning = ""
+        finish_reason = ""
+        usage = {}
         response_model = ""
         response_headers = {}
         time_to_headers_ms = 0.0
@@ -2648,7 +3099,8 @@ class NovelAnalysisWorker(QThread):
                     raise Exception(f"接口错误 {response.status_code}：{extract_api_error(response)}")
                 data = response.json()
             except Exception as first_error:
-                if protocol == "anthropic" and _anthropic_endpoint_unsupported(
+                if protocol in {"anthropic", "gemini"} and _native_protocol_endpoint_unsupported(
+                    protocol,
                     getattr(response, "status_code", 0) if response is not None else 0,
                     extract_api_error(response) if response is not None else first_error,
                 ):
@@ -2670,7 +3122,77 @@ class NovelAnalysisWorker(QThread):
                     )
                     self.diagnostics["protocol_fallback"] = "openai"
                     self.diagnostics["request_endpoint"] = url
+                    self.diagnostics["prompt_cache_key"] = str(
+                        payload.get("prompt_cache_key", "") or ""
+                    )
                     response = session.post(url, headers=headers, json=payload, timeout=(10, 180), proxies=self._proxies())
+                    time_to_headers_ms = round((time.perf_counter() - diagnostic_started) * 1000, 1)
+                    response_headers = self._diagnostic_response_headers(response)
+                    cache_error = extract_api_error(response)
+                    if _openai_cache_options_not_supported(
+                        response.status_code,
+                        cache_error,
+                    ):
+                        try:
+                            response.close()
+                        except Exception:
+                            pass
+                        _remove_openai_cache_options(payload, cache_error)
+                        self.diagnostics["prompt_cache_options_fallback"] = True
+                        response = session.post(
+                            url,
+                            headers=headers,
+                            json=payload,
+                            timeout=(10, 180),
+                            proxies=self._proxies(),
+                        )
+                        time_to_headers_ms = round((time.perf_counter() - diagnostic_started) * 1000, 1)
+                        response_headers = self._diagnostic_response_headers(response)
+                    if response.status_code >= 400:
+                        raise Exception(f"接口错误 {response.status_code}：{extract_api_error(response)}")
+                    data = response.json()
+                elif protocol == "anthropic" and _anthropic_cache_options_not_supported(
+                    getattr(response, "status_code", 0) if response is not None else 0,
+                    extract_api_error(response) if response is not None else first_error,
+                ):
+                    if response is not None:
+                        try:
+                            response.close()
+                        except Exception:
+                            pass
+                    _remove_anthropic_cache_options(payload)
+                    self.diagnostics["prompt_cache_options_fallback"] = True
+                    response = session.post(
+                        url,
+                        headers=headers,
+                        json=payload,
+                        timeout=(10, 180),
+                        proxies=self._proxies(),
+                    )
+                    time_to_headers_ms = round((time.perf_counter() - diagnostic_started) * 1000, 1)
+                    response_headers = self._diagnostic_response_headers(response)
+                    if response.status_code >= 400:
+                        raise Exception(f"接口错误 {response.status_code}：{extract_api_error(response)}")
+                    data = response.json()
+                elif protocol == "openai" and _openai_cache_options_not_supported(
+                    getattr(response, "status_code", 0) if response is not None else 0,
+                    extract_api_error(response) if response is not None else first_error,
+                ):
+                    cache_error = extract_api_error(response) if response is not None else first_error
+                    if response is not None:
+                        try:
+                            response.close()
+                        except Exception:
+                            pass
+                    _remove_openai_cache_options(payload, cache_error)
+                    self.diagnostics["prompt_cache_options_fallback"] = True
+                    response = session.post(
+                        url,
+                        headers=headers,
+                        json=payload,
+                        timeout=(10, 180),
+                        proxies=self._proxies(),
+                    )
                     time_to_headers_ms = round((time.perf_counter() - diagnostic_started) * 1000, 1)
                     response_headers = self._diagnostic_response_headers(response)
                     if response.status_code >= 400:
@@ -2717,25 +3239,31 @@ class NovelAnalysisWorker(QThread):
                     data = response.json()
                 else:
                     raise
-            response_model = str(data.get("model", "") or "")
+            response_model = str(data.get("model") or data.get("modelVersion") or "")
             normalized = _normalize_novel_response_payload(data)
             content = normalized["content"]
             reasoning = normalized["reasoning"]
+            finish_reason = normalized["finish_reason"]
+            usage = normalized.get("usage", {}) or {}
             self.diagnostics["reasoning_fields_seen"] = normalized["reasoning_fields"]
             self.last_partial_output = content or reasoning
             self._emit_output_chars(len(content))
+            if protocol == "gemini":
+                _validate_gemini_finish_reason(normalized["finish_reason"])
             parsed = self._parse_json_result(content)
             piece_at_ms = round((time.perf_counter() - diagnostic_started) * 1000, 1)
             self._finish_analysis_api_diagnostic(
                 diagnostic_index,
                 http_status=int(getattr(response, "status_code", 0) or 0),
                 response_model=response_model,
+                finish_reason=finish_reason,
                 time_to_headers_ms=time_to_headers_ms,
                 time_to_first_piece_ms=piece_at_ms if (content or reasoning) else 0,
                 time_to_first_reasoning_ms=piece_at_ms if reasoning else 0,
                 time_to_first_content_ms=piece_at_ms if content else 0,
                 last_piece_at_ms=piece_at_ms if (content or reasoning) else 0,
                 response_headers=response_headers,
+                usage=usage,
                 response_chars=len(content),
                 raw_response_chars=len(content) + len(reasoning),
                 reasoning_chars=len(reasoning),
@@ -2751,8 +3279,10 @@ class NovelAnalysisWorker(QThread):
                 diagnostic_index,
                 http_status=int(getattr(response, "status_code", 0) or 0) if response is not None else 0,
                 response_model=response_model,
+                finish_reason=finish_reason,
                 time_to_headers_ms=time_to_headers_ms,
                 response_headers=response_headers,
+                usage=usage,
                 response_chars=len(content),
                 raw_response_chars=len(content) + len(reasoning),
                 reasoning_chars=len(reasoning),
@@ -2795,18 +3325,25 @@ class NovelAnalysisWorker(QThread):
             response_format=bool(use_response_format),
             protocol=protocol,
         )
+        self.api_protocol = protocol
+        self.diagnostics["api_protocol"] = protocol
         self.diagnostics["request_endpoint"] = url
         if max_tokens:
             self.diagnostics["max_output_tokens"] = int(max_tokens)
         diagnostic_started = time.perf_counter()
         diagnostic_index = self._begin_analysis_api_diagnostic(
-            prompt, user_text, True, bool(use_response_format and protocol == "openai")
+            prompt,
+            user_text,
+            True,
+            bool(use_response_format and protocol in {"openai", "gemini"}),
+            prompt_cache_key=payload.get("prompt_cache_key", ""),
         )
         session = self._new_session()
         r = None
         full = ""
         response_model = ""
         finish_reason = ""
+        usage = {}
         response_headers = {}
         time_to_headers_ms = 0.0
         time_to_first_piece_ms = 0.0
@@ -2833,9 +3370,30 @@ class NovelAnalysisWorker(QThread):
             time_to_headers_ms = round((time.perf_counter() - diagnostic_started) * 1000, 1)
             self._response = r
             self._register_response(r)
-            if r.status_code >= 400 and protocol == "anthropic":
+            if r.status_code >= 400 and protocol == "anthropic" and _anthropic_cache_options_not_supported(
+                r.status_code,
+                extract_api_error(r),
+            ):
+                self._release_response(r)
+                try:
+                    r.close()
+                except Exception:
+                    pass
+                _remove_anthropic_cache_options(payload)
+                self.diagnostics["prompt_cache_options_fallback"] = True
+                r = session.post(
+                    url,
+                    headers=headers,
+                    json=payload,
+                    stream=True,
+                    timeout=(10, 180),
+                    proxies=self._proxies(),
+                )
+                self._response = r
+                self._register_response(r)
+            if r.status_code >= 400 and protocol in {"anthropic", "gemini"}:
                 first_error = extract_api_error(r)
-                if _anthropic_endpoint_unsupported(r.status_code, first_error):
+                if _native_protocol_endpoint_unsupported(protocol, r.status_code, first_error):
                     self._release_response(r)
                     try:
                         r.close()
@@ -2856,9 +3414,13 @@ class NovelAnalysisWorker(QThread):
                         protocol="openai",
                     )
                     self.api_protocol = "openai"
+                    self.diagnostics["api_protocol"] = "openai"
                     self._set_analysis_response_format_supported(True)
                     self.diagnostics["protocol_fallback"] = "openai"
                     self.diagnostics["request_endpoint"] = url
+                    self.diagnostics["prompt_cache_key"] = str(
+                        payload.get("prompt_cache_key", "") or ""
+                    )
                     r = session.post(
                         url,
                         headers=headers,
@@ -2869,6 +3431,28 @@ class NovelAnalysisWorker(QThread):
                     )
                     self._response = r
                     self._register_response(r)
+            if r.status_code >= 400 and protocol == "openai" and _openai_cache_options_not_supported(
+                r.status_code,
+                extract_api_error(r),
+            ):
+                cache_error = extract_api_error(r)
+                self._release_response(r)
+                try:
+                    r.close()
+                except Exception:
+                    pass
+                _remove_openai_cache_options(payload, cache_error)
+                self.diagnostics["prompt_cache_options_fallback"] = True
+                r = session.post(
+                    url,
+                    headers=headers,
+                    json=payload,
+                    stream=True,
+                    timeout=(10, 180),
+                    proxies=self._proxies(),
+                )
+                self._response = r
+                self._register_response(r)
             if r.status_code >= 400 and "reasoning_effort" in payload:
                 first_error = extract_api_error(r)
                 if reasoning_effort_not_supported(r.status_code, first_error):
@@ -2959,8 +3543,8 @@ class NovelAnalysisWorker(QThread):
                 except Exception:
                     invalid_sse_lines += 1
                     continue
-                if data.get("model"):
-                    response_model = str(data.get("model") or "")
+                if data.get("model") or data.get("modelVersion"):
+                    response_model = str(data.get("model") or data.get("modelVersion") or "")
                 elif data.get("type") == "message_start":
                     message = data.get("message", {})
                     if isinstance(message, dict) and message.get("model"):
@@ -2970,6 +3554,8 @@ class NovelAnalysisWorker(QThread):
                 if isinstance(data.get("error"), str) and data.get("error"):
                     raise Exception(data.get("error"))
                 normalized = _normalize_novel_response_payload(data)
+                if normalized.get("usage"):
+                    usage = normalized["usage"]
                 if normalized["finish_reason"]:
                     finish_reason = normalized["finish_reason"]
                 content_piece = normalized["content"]
@@ -3014,7 +3600,17 @@ class NovelAnalysisWorker(QThread):
                 # the top-level JSON object is complete, there is no useful
                 # content left to wait for. If a finish reason was provided,
                 # keep reading so a following DONE marker remains observable.
-                if full.strip() and not finish_reason and protocol != "anthropic":
+                usage_requested = bool(
+                    protocol == "openai"
+                    and isinstance(payload.get("stream_options"), dict)
+                    and payload["stream_options"].get("include_usage")
+                )
+                if (
+                    full.strip()
+                    and not finish_reason
+                    and protocol not in {"anthropic", "gemini"}
+                    and not usage_requested
+                ):
                     candidate = self._extract_json_object_candidate(full)
                     if candidate and candidate.rstrip().endswith("}"):
                         try:
@@ -3027,6 +3623,8 @@ class NovelAnalysisWorker(QThread):
                             parsed_stream_result = parsed_candidate
                             break
 
+            if protocol == "gemini":
+                _validate_gemini_finish_reason(finish_reason)
             if not full.strip():
                 raise Exception("AI 没有返回有效候选内容。")
             if finish_reason in {"length", "max_tokens", "token_limit"}:
@@ -3077,6 +3675,7 @@ class NovelAnalysisWorker(QThread):
                 max_idle_gap_ms=max_idle_gap_ms,
                 finish_reason=finish_reason,
                 response_headers=response_headers,
+                usage=usage,
                 response_chars=len(full),
                 raw_response_chars=content_chars + reasoning_chars,
                 reasoning_chars=reasoning_chars,
@@ -3093,6 +3692,38 @@ class NovelAnalysisWorker(QThread):
             elapsed_ms = round((time.perf_counter() - diagnostic_started) * 1000, 1)
             if last_piece_at_ms:
                 max_idle_gap_ms = max(max_idle_gap_ms, elapsed_ms - last_piece_at_ms)
+            if self._is_stream_read_failure(exc) and (protocol != "gemini" or finish_reason == "stop"):
+                recovered = self._recover_complete_stream_result_after_read_failure(
+                    full,
+                    parsed_stream_result=parsed_stream_result,
+                    finish_reason=finish_reason,
+                )
+                if recovered is not None:
+                    self._finish_analysis_api_diagnostic(
+                        diagnostic_index,
+                        http_status=int(getattr(r, "status_code", 0) or 0) if r is not None else 0,
+                        response_model=response_model,
+                        time_to_headers_ms=time_to_headers_ms,
+                        time_to_first_piece_ms=time_to_first_piece_ms,
+                        time_to_first_content_ms=time_to_first_content_ms,
+                        last_piece_at_ms=last_piece_at_ms,
+                        max_idle_gap_ms=max_idle_gap_ms,
+                        finish_reason=finish_reason,
+                        response_headers=response_headers,
+                        usage=usage,
+                        response_chars=len(full),
+                        raw_response_chars=content_chars + reasoning_chars,
+                        reasoning_chars=reasoning_chars,
+                        content_chars=content_chars,
+                        sse_lines=sse_lines,
+                        invalid_sse_lines=invalid_sse_lines,
+                        received_done=received_done,
+                        outcome="success",
+                        stream_transport_recovered=True,
+                        finished_at=now_str(),
+                        elapsed_ms=elapsed_ms,
+                    )
+                    return recovered
             stream_failure_text = str(exc)[:1000]
             if self._is_stream_read_failure(exc):
                 stream_failure_text = self._analysis_stream_failure_message(
@@ -3117,6 +3748,7 @@ class NovelAnalysisWorker(QThread):
                 max_idle_gap_ms=max_idle_gap_ms,
                 finish_reason=finish_reason,
                 response_headers=response_headers,
+                usage=usage,
                 response_chars=len(full),
                 raw_response_chars=content_chars + reasoning_chars,
                 reasoning_chars=reasoning_chars,
@@ -3154,6 +3786,8 @@ class NovelAnalysisWorker(QThread):
         return any(
             marker in msg
             for marker in (
+                "nonetype' object has no attribute 'read'",
+                'nonetype" object has no attribute "read"',
                 "stream_read_error",
                 "stream read error",
                 "response ended prematurely",
@@ -3191,7 +3825,40 @@ class NovelAnalysisWorker(QThread):
             f"完成原因：{finish}。"
         )
 
+    def _recover_complete_stream_result_after_read_failure(
+        self,
+        content,
+        parsed_stream_result=None,
+        finish_reason="",
+    ):
+        """Recover only a fully validated JSON result after an upstream close."""
+        if str(finish_reason or "").strip().lower() in {
+            "length",
+            "max_tokens",
+            "token_limit",
+        }:
+            return None
+        if parsed_stream_result is not None:
+            return parsed_stream_result
+        candidate = self._extract_json_object_candidate(content)
+        if not candidate or not candidate.rstrip().endswith("}"):
+            return None
+        try:
+            parsed = json.loads(candidate)
+        except Exception:
+            return None
+        if not isinstance(parsed, dict):
+            return None
+        required_keys = tuple(self._stream_json_candidate_required_keys() or ())
+        if any(key not in parsed for key in required_keys):
+            return None
+        if not self._stream_json_candidate_is_acceptable(content, candidate, parsed):
+            return None
+        return parsed
+
     def _is_retryable_analysis_error(self, error):
+        if self._is_stream_read_failure(error):
+            return True
         if self._is_analysis_rate_limit_error(error):
             return True
         if self._is_analysis_output_limit_error(error):
@@ -3407,6 +4074,7 @@ class NovelAnalysisWorker(QThread):
             message = str(error).lower()
             if use_response_format and (
                 "response_format" in message or "json_object" in message
+                or "responsemimetype" in message or "response_mime_type" in message
             ):
                 self._set_analysis_response_format_supported(False)
                 self.progress.emit(
@@ -5931,6 +6599,12 @@ class NovelWritingWorker(QThread):
             "api_protocol": self.api_protocol,
             "request_endpoint": "",
             "protocol_fallback": "",
+            "usage": {},
+            "cached_input_tokens": 0,
+            "cache_write_input_tokens": 0,
+            "cache_status": "unreported",
+            "prompt_cache_key": "",
+            "prompt_cache_options_fallback": False,
             "context_chars": len(self.context),
             "context_utf8_bytes": len(context_bytes),
             "context_sha256": hashlib.sha256(context_bytes).hexdigest(),
@@ -6133,7 +6807,7 @@ class NovelWritingWorker(QThread):
         )
 
     def _reasoning_effort_for_request(self):
-        if _novel_model_protocol(self.model) == "anthropic":
+        if _novel_model_protocol(self.model) in {"anthropic", "gemini"}:
             return ""
         configured_effort = reasoning_effort_for_model(self.model, self.base_url, self.action)
         if configured_effort:
@@ -6179,6 +6853,8 @@ class NovelWritingWorker(QThread):
             "response_format",
             "json_object",
             "json response",
+            "responsemimetype",
+            "response_mime_type",
             "unknown parameter",
             "unsupported parameter",
         ))
@@ -6361,7 +7037,7 @@ class NovelWritingWorker(QThread):
 
     def _action_prompt(self):
         prompt = self._action_prompt_base()
-        if self.action in {"draft", "style_rewrite", "script_to_novel"}:
+        if self.action in _NOVEL_AUTHOR_STYLE_PROMPT_ACTIONS:
             if NOVEL_PROSE_START_MARKER not in prompt or NOVEL_PROSE_END_MARKER not in prompt:
                 boundary = (
                     f"只输出可直接交付的小说正文，并严格使用{NOVEL_PROSE_START_MARKER}和"
@@ -6373,7 +7049,10 @@ class NovelWritingWorker(QThread):
                 f"只输出当前任务要求的结果，并使用{NOVEL_OUTPUT_START_MARKER}和"
                 f"{NOVEL_OUTPUT_END_MARKER}包住；包络外不得输出思考、分析、前言、后记或创作建议。"
             )
-        return _with_novel_language_guidance(prompt)
+        prompt = _with_novel_language_guidance(prompt)
+        if self.action in _NOVEL_AUTHOR_STYLE_PROMPT_ACTIONS:
+            prompt += "\n\n" + _NOVEL_AUTHOR_STYLE_CLARIFICATION
+        return prompt
 
     def _action_prompt_base(self):
         if self.action == "style_baseline":
@@ -6517,6 +7196,12 @@ class NovelWritingWorker(QThread):
                 "同时做一次不改写正文的读感诊断：只标出有明确原文位置的重复说明、无结果流程赘述、"
                 "机械短碎表达或局部语言冲突。没有明确可替换原文时必须不提出修补；不得把剧情选择、"
                 "文风偏好、现实流程不完整或正常留白当成问题。"
+                "审读还必须覆盖中文正文中的其他语种残留、未翻译外语句子、乱码、编码损坏、异常替代字符和无意义的字母数字符号混排；"
+                "不得把非ASCII字符本身、正常中文标点、单位/数学符号、合法专名、型号、代码标识、作者要求保留的原文、"
+                "确有必要的外语对白或故事内文件/界面内容误报为异常。普通旁白、对白和人物内心活动中的自然判断不是AI推理泄漏；"
+                "只有明确面向生成过程的推理、提示词、JSON/字段、校验、输出或工作流说明，或内部任务/状态资料直接进入正文，才报告为元信息泄漏。"
+                "prose_review中的issues只记录普通读感诊断；已确认的无必要非中文残留、乱码/编码损坏或AI推理/说明字段泄漏必须放入blocking_issues，"
+                "每项使用category、quote、reason，并且quote必须是正文逐字片段；只有确认排除后才能返回blocking_issues为空。"
                 "必须使用用户资料提供的短引用和当前修订号，所有动态更新都附正文逐字证据。"
                 "输出时必须先完成outline、summary、key_facts和long_form_memory四个核心字段，再输出logic_audit、prose_review和repair_patches。"
                 "这四个核心字段即使内容为空或没有动态更新也必须存在；禁止只返回审校字段，禁止先返回审校字段后停止。"
@@ -6655,6 +7340,7 @@ class NovelWritingWorker(QThread):
         full = ""
         received_chars = 0
         finish_reason = ""
+        usage = {}
         done_received = False
         first_piece_seen = False
         json_payload_complete = False
@@ -6729,22 +7415,26 @@ class NovelWritingWorker(QThread):
                 protocol=protocol,
             )
             self.diagnostics["api_protocol"] = protocol
+            self.api_protocol = protocol
             self.diagnostics["request_endpoint"] = url
+            self.diagnostics["prompt_cache_key"] = str(
+                payload.get("prompt_cache_key", "") or ""
+            )
             cached_json_fallback = (
-                "response_format" in payload
+                _has_json_response_format(payload)
                 and self._uses_cached_json_transport_fallback()
             )
             if cached_json_fallback:
-                payload.pop("response_format", None)
+                _remove_json_response_format(payload)
                 self.diagnostics["json_response_format_cached_fallback"] = True
             try:
                 r = self._post_stream_request_interruptibly(url, headers, payload)
             except Exception as first_error:
                 if (
-                    "response_format" in payload
+                    _has_json_response_format(payload)
                     and self._json_transport_fallback_error(first_error)
                 ):
-                    payload.pop("response_format", None)
+                    _remove_json_response_format(payload)
                     self._remember_json_transport_fallback()
                     self.diagnostics["json_response_format_fallback"] = True
                     self.diagnostics["json_response_format_transport_fallback"] = True
@@ -6759,9 +7449,28 @@ class NovelWritingWorker(QThread):
                 })
                 self.result_ready.emit(self.action, "")
                 return
-            if r.status_code >= 400 and protocol == "anthropic":
+            if r.status_code >= 400 and protocol == "anthropic" and _anthropic_cache_options_not_supported(
+                r.status_code,
+                extract_api_error(r),
+            ):
+                try:
+                    r.close()
+                except Exception:
+                    pass
+                _remove_anthropic_cache_options(payload)
+                self.diagnostics["prompt_cache_options_fallback"] = True
+                self.progress.emit("当前 Claude 兼容接口不支持原生缓存参数，已自动兼容重试当前步骤...")
+                r = self._post_stream_request_interruptibly(url, headers, payload)
+                if r is None:
+                    self.diagnostics.update({
+                        "outcome": "stopped",
+                        "finished_at": now_str(),
+                    })
+                    self.result_ready.emit(self.action, "")
+                    return
+            if r.status_code >= 400 and protocol in {"anthropic", "gemini"}:
                 first_error = extract_api_error(r)
-                if _anthropic_endpoint_unsupported(r.status_code, first_error):
+                if _native_protocol_endpoint_unsupported(protocol, r.status_code, first_error):
                     try:
                         r.close()
                     except Exception:
@@ -6785,6 +7494,9 @@ class NovelWritingWorker(QThread):
                     self.diagnostics["api_protocol"] = protocol
                     self.diagnostics["request_endpoint"] = url
                     self.diagnostics["protocol_fallback"] = "openai"
+                    self.diagnostics["prompt_cache_key"] = str(
+                        payload.get("prompt_cache_key", "") or ""
+                    )
                     r = self._post_stream_request_interruptibly(url, headers, payload)
                     if r is None:
                         self.diagnostics.update({
@@ -6793,6 +7505,26 @@ class NovelWritingWorker(QThread):
                         })
                         self.result_ready.emit(self.action, "")
                         return
+            if r.status_code >= 400 and protocol == "openai" and _openai_cache_options_not_supported(
+                r.status_code,
+                extract_api_error(r),
+            ):
+                cache_error = extract_api_error(r)
+                try:
+                    r.close()
+                except Exception:
+                    pass
+                _remove_openai_cache_options(payload, cache_error)
+                self.diagnostics["prompt_cache_options_fallback"] = True
+                self.progress.emit("当前 OpenAI 兼容接口不支持缓存扩展参数，已自动兼容重试当前步骤...")
+                r = self._post_stream_request_interruptibly(url, headers, payload)
+                if r is None:
+                    self.diagnostics.update({
+                        "outcome": "stopped",
+                        "finished_at": now_str(),
+                    })
+                    self.result_ready.emit(self.action, "")
+                    return
             if r.status_code >= 400 and "reasoning_effort" in payload:
                 first_error = extract_api_error(r)
                 if self._reasoning_effort_not_supported(r.status_code, first_error):
@@ -6813,14 +7545,14 @@ class NovelWritingWorker(QThread):
                         return
                 else:
                     raise Exception(f"接口错误 {r.status_code}：{first_error}")
-            if r.status_code >= 400 and "response_format" in payload:
+            if r.status_code >= 400 and _has_json_response_format(payload):
                 first_error = extract_api_error(r)
                 if self._json_response_format_not_supported(r.status_code, first_error):
                     try:
                         r.close()
                     except Exception:
                         pass
-                    payload.pop("response_format", None)
+                    _remove_json_response_format(payload)
                     self.diagnostics["json_response_format_fallback"] = True
                     self.progress.emit("接口不支持结构化 JSON，已自动兼容重试当前步骤...")
                     r = self._post_stream_request_interruptibly(url, headers, payload)
@@ -6908,11 +7640,25 @@ class NovelWritingWorker(QThread):
                     raise Exception(data["error"].get("message") or json.dumps(data["error"], ensure_ascii=False))
                 if isinstance(data.get("error"), str) and data.get("error"):
                     raise Exception(data.get("error"))
-                if data.get("type") == "message_start":
+                if data.get("modelVersion"):
+                    self.diagnostics["response_model"] = str(data.get("modelVersion") or "")
+                elif data.get("type") == "message_start":
                     message = data.get("message", {})
                     if isinstance(message, dict):
                         self.diagnostics["response_model"] = str(message.get("model") or "")
                 normalized = _normalize_novel_response_payload(data)
+                if normalized.get("usage"):
+                    usage = normalized["usage"]
+                    self.diagnostics["usage"] = deepcopy(usage)
+                    self.diagnostics["cached_input_tokens"] = int(
+                        usage.get("cached_input_tokens", 0) or 0
+                    )
+                    self.diagnostics["cache_write_input_tokens"] = int(
+                        usage.get("cache_write_input_tokens", 0) or 0
+                    )
+                    self.diagnostics["cache_status"] = str(
+                        usage.get("cache_status", "unreported") or "unreported"
+                    )
                 if normalized["finish_reason"]:
                     finish_reason = normalized["finish_reason"]
                 if normalized["done"]:
@@ -6926,16 +7672,11 @@ class NovelWritingWorker(QThread):
                         if key not in self.diagnostics["reasoning_fields_seen"]:
                             self.diagnostics["reasoning_fields_seen"].append(key)
                     received_chars += len(reasoning_piece)
-                    # Reasoning is not part of the saved JSON result, but it
-                    # is still upstream output. Keep the live character
-                    # counter visible while the model is preparing content.
                     self.diagnostics["received_chars"] = received_chars
-                    self.output_chars.emit(received_chars)
                 piece = normalized["content"]
                 if piece:
                     received_chars += len(piece)
                     self.diagnostics["received_chars"] = received_chars
-                    self.output_chars.emit(received_chars)
                     if json_payload_complete and piece.isspace():
                         self.diagnostics["ignored_trailing_whitespace_chars"] = int(
                             self.diagnostics.get("ignored_trailing_whitespace_chars", 0) or 0
@@ -6962,6 +7703,9 @@ class NovelWritingWorker(QThread):
                                 ) + ignored
                                 full = candidate
                     self.last_response_text = full
+                    # The UI counts result content; reasoning and discarded
+                    # whitespace remain available in transport diagnostics.
+                    self.output_chars.emit(len(full))
                     response_char_limit = self._response_char_limit()
                     if response_char_limit and len(full) > response_char_limit:
                         self.diagnostics["response_char_limit_exceeded"] = True
@@ -7555,6 +8299,148 @@ class NovelChapterPlanWorker(NovelAnalysisWorker):
             locked_node_schedule if isinstance(locked_node_schedule, dict) else {}
         )
 
+    def _chapter_slot_node_map_guidance(self, absolute_start, absolute_end):
+        """Expand locked absolute node ranges into one row per chapter slot.
+
+        The model writes chapter objects, while the wizard schedule is stored
+        at event-node level.  Keeping that conversion explicit in the prompt
+        avoids making the model infer that a two-chapter node needs two output
+        objects.
+        """
+        schedule = self.locked_node_schedule
+        if not isinstance(schedule, dict):
+            return ""
+        nodes = schedule.get("nodes", [])
+        if not isinstance(nodes, list) or not nodes:
+            return ""
+        normalized_nodes = []
+        for node in nodes:
+            if not isinstance(node, dict):
+                continue
+            try:
+                node_number = int(node.get("n", 0) or 0)
+                node_range = node.get("range", [])
+                node_start = int(node_range[0])
+                node_end = int(node_range[1])
+            except (TypeError, ValueError, IndexError):
+                continue
+            if node_number <= 0 or node_start <= 0 or node_end < node_start:
+                continue
+            normalized_nodes.append((node_number, node_start, node_end))
+        if not normalized_nodes:
+            return ""
+
+        rows = []
+        for slot, chapter_number in enumerate(
+            range(int(absolute_start), int(absolute_end) + 1), 1
+        ):
+            owner = next(
+                (
+                    (node_number, node_start, node_end)
+                    for node_number, node_start, node_end in normalized_nodes
+                    if node_start <= chapter_number <= node_end
+                ),
+                None,
+            )
+            if owner is None:
+                rows.append(f"槽位{slot}=全书第{chapter_number}章=当前阶段承接槽位")
+            else:
+                node_number, node_start, node_end = owner
+                rows.append(
+                    f"槽位{slot}=全书第{chapter_number}章=节点{node_number}"
+                    f"（节点范围第{node_start}-{node_end}章）"
+                )
+        return (
+            "【逐章槽位映射】下面每一行都是一个必须单独输出的章节对象，"
+            "不是节点摘要；同一节点出现两行，就必须生成两个不同的章节对象，"
+            "分别写出该章新增的人物行动、压力变化、代价或结果。"
+            + "；".join(rows)
+            + "。"
+        )
+
+    def _chapter_event_boundary_guidance(self):
+        """Make the existing event contract explicit without adding an API call.
+
+        The wizard already stores event preconditions, results and state deltas.
+        The chapter worker must see those fields as execution boundaries, not as
+        loose inspiration that can be completed early from the global ending.
+        """
+        schedule = self.locked_node_schedule
+        if not isinstance(schedule, dict):
+            return ""
+        nodes = schedule.get("nodes", [])
+        if not isinstance(nodes, list) or not nodes:
+            return ""
+
+        def compact(value, limit):
+            if isinstance(value, (dict, list)):
+                value = json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+            text = re.sub(r"\s+", " ", str(value or "").strip())
+            return text[:limit].rstrip()
+
+        rows = []
+        for position, node in enumerate(nodes):
+            if not isinstance(node, dict):
+                continue
+            node_number = int(node.get("n", position + 1) or position + 1)
+            node_id = str(node.get("id", "") or "").strip()
+            node_range = node.get("range", [])
+            try:
+                range_text = f"第{int(node_range[0])}-{int(node_range[1])}章"
+            except (TypeError, ValueError, IndexError):
+                range_text = "当前节点范围"
+            event_text = compact(node.get("event", ""), 420)
+            result_text = compact(node.get("result", ""), 300)
+            preconditions = compact(node.get("preconditions", ""), 220)
+            state_delta = compact(node.get("state_delta", ""), 220)
+            parts = [
+                f"节点{node_number}{('/' + node_id) if node_id else ''}（{range_text}）",
+                f"当前事件：{event_text}" if event_text else "当前事件以节点资料为准",
+                f"前置条件：{preconditions}" if preconditions else "",
+                f"本节点结果上限：{result_text}" if result_text else "本节点结果以上一阶段资料和当前节点字段为准",
+                f"本节点状态变化：{state_delta}" if state_delta else "",
+            ]
+            next_node = nodes[position + 1] if position + 1 < len(nodes) else None
+            if isinstance(next_node, dict):
+                next_preconditions = compact(next_node.get("preconditions", ""), 220)
+                if next_preconditions:
+                    parts.append(
+                        "下一节点只作为当前章末入口，不在本节点执行："
+                        + next_preconditions
+                    )
+                else:
+                    parts.append("本节点结束后只留下下一节点入口，不提前执行下一节点结果")
+            elif bool(node.get("is_stage_final_node", False)):
+                if bool(schedule.get("stage_is_final", False)):
+                    parts.append(
+                        "这是全书最后阶段的阶段末节点；终局结果仍只能按已确认的高潮章位和收尾窗口兑现，"
+                        "普通节点不得提前执行终局"
+                    )
+                else:
+                    parts.append(
+                        "这是当前阶段最后节点；只在本节点范围内完成当前阶段出口，"
+                        "后续阶段只保留为新的压力入口"
+                    )
+            rows.append("；".join(part for part in parts if part) + "。")
+        if not rows:
+            return ""
+
+        stage_exit = compact(schedule.get("stage_exit_state", ""), 480)
+        exit_rule = (
+            "当前阶段出口只用于核对本阶段最后节点完成后的状态，不是普通节点可提前执行的剧情清单。"
+        )
+        if stage_exit:
+            exit_rule += "阶段出口参考：" + stage_exit + "。"
+        return (
+            "【当前阶段事件边界｜核心约束】"
+            "当前节点的event、preconditions、result和state_delta组成一条不可越过的局部因果链。"
+            "每章只能推进当前槽位所属节点；result是该节点允许完成的硬上限，不能把后续节点、阶段出口或全书终局提前写进当前节点。"
+            "下一节点的前置条件只能作为当前节点形成的新压力、行动动机或章末入口，不能提前兑现下一节点结果。"
+            + exit_rule
+            + "\n"
+            + "\n".join(rows)
+        )
+
     def _analysis_prompt(self):
         absolute_start = self.existing_chapter_count + 1
         absolute_end = self.existing_chapter_count + self.chapter_count
@@ -7595,6 +8481,7 @@ class NovelChapterPlanWorker(NovelAnalysisWorker):
         if self.existing_chapter_count == 0 and absolute_start <= 3 <= absolute_end:
             opening_guidance = _OPENING_THREE_CHAPTER_GUIDANCE
         locked_schedule_guidance = ""
+        chapter_slot_node_guidance = ""
         final_stage_climax_guidance = ""
         stage_fact_boundary_guidance = (
             "前面已确认的阶段是已经发生并确认的事实和结果，本批只承接其后果、变化、新选择和新冲突，"
@@ -7626,8 +8513,13 @@ class NovelChapterPlanWorker(NovelAnalysisWorker):
                     node_ranges.append(f"节点{node_label}只能落在第{node_start}-{node_end}章")
             locked_schedule_guidance = (
                 f"当前阶段的硬范围是第{schedule_start}-{schedule_end}章，"
-                "本批只在这个范围内展开；节点数量不是章节数量，不能为了讲完一个节点新增章节。"
+                "本批只在这个范围内展开；节点数量不等于章节数量，"
+                "程序已经把节点范围展开为本批每一个章节槽位；必须按槽位数量输出章节对象，"
+                "不能按节点数量输出，也不能为了讲完一个节点新增章节。"
                 + ("；".join(node_ranges) + "。" if node_ranges else "")
+            )
+            chapter_slot_node_guidance = self._chapter_slot_node_map_guidance(
+                absolute_start, absolute_end
             )
             if schedule_end >= self.total_chapter_count:
                 final_stage_climax_guidance = (
@@ -7638,9 +8530,12 @@ class NovelChapterPlanWorker(NovelAnalysisWorker):
         if self.creation_wizard_mode:
             chapter_order_rule = (
                 f"本批次必须返回{self.chapter_count}项，列表第1项就是全书第{absolute_start}章，"
-                f"最后一项就是第{absolute_end}章。不要返回章节编号、阶段编号或其它定位标签；"
+                f"最后一项就是第{absolute_end}章。每个章节对象必须带本批槽位字段i，"
+                f"i必须从1连续到{self.chapter_count}且不能重复；i是本批次槽位序号，"
+                f"第i项对应全书第{self.existing_chapter_count}+i章（本批绝对范围为第{absolute_start}-{absolute_end}章）。"
+                "不要返回绝对章号、阶段编号或其它定位字段；"
                 "节点编号由程序按照固定槽位回填，不要把节点编号写进章节标题或outline正文，"
-                "章节号和阶段归属由程序根据列表顺序写入；到第"
+                "章节号和阶段归属由程序根据i和程序上下文写入；到第"
                 f"{absolute_end}章后立即结束，不安排第{absolute_end + 1}章或任何后续阶段内容。"
                 f"先按全书第{absolute_start}章到第{absolute_end}章建立{self.chapter_count}个固定章节位置，"
                 "再把阶段节点压入这些位置；每一项只对应一个固定位置，节点内容再多也不能新增章节。"
@@ -7659,14 +8554,19 @@ class NovelChapterPlanWorker(NovelAnalysisWorker):
                 "节点不能因为包含多个场面就延长范围，不能把一个节点拆成范围外的新章节，也不能把下一个节点提前写入当前节点的槽位。"
                 "如果同一节点覆盖数章，后续每章至少改变主动人物、眼前目标、压力来源、代价、关系结果或公开后果中的两项；"
                 "只增加解释、讨论、等待或同一地点的换说法不算新推进。"
+                "输出对象的数量以逐章槽位表为准，不以节点数量为准。"
+                + self._chapter_event_boundary_guidance()
                 + CHAPTER_EVENT_HANDOFF_GUIDANCE
                 + final_stage_climax_guidance
                 + locked_schedule_guidance
+                + chapter_slot_node_guidance
             )
             output_schema = (
-                'JSON结构只保留：{"c":[{"t":"章节名","o":"本章具体故事提纲","p":[]}]}'
-                "列表顺序就是章节顺序；不要返回source_event_ids、事件编号或其它定位字段；"
-                "不要返回i、s、u、g、m等其它定位字段。"
+                'JSON结构只保留：{"c":[{"i":1,"t":"章节名","o":"本章具体故事提纲","p":[]}]}'
+                "c中的i必须覆盖本批次1到"
+                f"{self.chapter_count}的全部槽位；列表顺序和i都必须保持章节顺序。"
+                "不要返回source_event_ids、事件编号或其它定位字段；"
+                "不要返回s、u、g、m等其它定位字段。"
             )
         else:
             chapter_order_rule = (
@@ -7698,6 +8598,8 @@ class NovelChapterPlanWorker(NovelAnalysisWorker):
             "这只压缩JSON外壳，不得删减章节数量、outline中的故事事实或必要的连续性约束。\n"
             "规划目标：严格执行用户已确认的故事底盘、叙事策略画像和阶段规划；提纲仍给正文留下场景、对白和节奏空间，"
             "只固定人物正在经历的事实、选择和结果。\n"
+            + CORE_STORY_QUALITY_GUIDANCE
+            + "\n\n"
             f"目标总字数约 {self.target_words} 字，单章目标约 {self.average_chapter_words} 字，"
             f"全书预计约 {self.total_chapter_count} 章，已有 {self.existing_chapter_count} 章，"
             f"本次是第 {self.batch_number}/{self.total_batches} 批，必须输出接下来的 {self.chapter_count} 章，"
@@ -7729,7 +8631,10 @@ class NovelChapterPlanWorker(NovelAnalysisWorker):
             "让本章形成符合当前题材的阅读期待，节奏和爽点随故事本身变化。"
             "故事底盘和阶段规划已经在前面的规划基础中确认，本次直接生成当前批次的章节故事。\n"
             "项目资料是连续性事实参考，不是本章待办清单；只在当下人物选择或关系结果确实需要时取用最少内容。"
-            + _story_conflict_pacing_guidance(compact=self.creation_wizard_mode)
+            + _story_conflict_pacing_guidance(
+                compact=self.creation_wizard_mode,
+                shared_quality_included=True,
+            )
             + opening_guidance
             + _CHAPTER_PLAN_GENERAL_STATE_PROGRESSION_GUIDANCE
             + (
@@ -7798,6 +8703,22 @@ class NovelChapterPlanWorker(NovelAnalysisWorker):
 
     def _allow_retry_chunk_split(self):
         return False
+
+    def _chapter_plan_structure_retry_prompt(self, prompt, error):
+        """Carry an exact slot-validation failure into the next full-batch retry."""
+        if not self.creation_wizard_mode:
+            return prompt
+        absolute_start = self.existing_chapter_count + 1
+        absolute_end = self.existing_chapter_count + self.chapter_count
+        return (
+            str(prompt or "")
+            + "\n【上一轮结构校验结果】"
+            + str(error or "当前批次章节槽位未完整覆盖").strip()
+            + "。本次重新生成时只修正章节槽位结构，不要解释原因；"
+            + f"必须返回c数组且恰好包含{self.chapter_count}项，i必须一次性覆盖1到{self.chapter_count}，"
+            + f"对应全书第{absolute_start}-{absolute_end}章；不要按节点数量输出，"
+            "必须按逐章槽位映射为每个槽位各输出一个章节对象；不要漏项、重复、合并章节或新增范围外章节。"
+        )
 
     def _clean_title(self, value, fallback):
         title = str(value or "").strip()
@@ -7874,6 +8795,52 @@ class NovelChapterPlanWorker(NovelAnalysisWorker):
         chapters = data.get("chapters", [])
         if not isinstance(chapters, list) or not chapters:
             raise ValueError("AI 没有返回章节规划列表。")
+        for item in chapters:
+            if isinstance(item, dict) and "index" not in item and "i" in item:
+                item["index"] = item.get("i")
+        explicit_slots = bool(
+            self.creation_wizard_mode
+            and any(
+                isinstance(item, dict)
+                and any(key in item for key in ("index", "i"))
+                for item in chapters
+            )
+        )
+        if explicit_slots:
+            slot_numbers = []
+            for position, item in enumerate(chapters, 1):
+                if not isinstance(item, dict):
+                    raise ValueError(
+                        f"章节规划槽位不完整：第{position}项不是章节对象，无法确认对应章节槽位。"
+                    )
+                raw_index = item.get("index", item.get("i", ""))
+                try:
+                    slot_numbers.append(int(raw_index))
+                except (TypeError, ValueError):
+                    raise ValueError(
+                        f"章节规划槽位无效：第{position}项的i必须是1到{self.chapter_count}的整数。"
+                    )
+            expected_slots = set(range(1, self.chapter_count + 1))
+            seen_slots = set(slot_numbers)
+            duplicates = sorted(
+                index for index, count in Counter(slot_numbers).items() if count > 1
+            )
+            missing = sorted(expected_slots - seen_slots)
+            out_of_range = sorted(
+                index for index in seen_slots
+                if index < 1 or index > self.chapter_count
+            )
+            if duplicates or missing or out_of_range or len(chapters) != self.chapter_count:
+                details = []
+                if missing:
+                    details.append("缺少本批槽位" + ",".join(str(index) for index in missing))
+                if duplicates:
+                    details.append("重复本批槽位" + ",".join(str(index) for index in duplicates))
+                if out_of_range:
+                    details.append("越界本批槽位" + ",".join(str(index) for index in out_of_range))
+                if len(chapters) != self.chapter_count:
+                    details.append(f"实际返回{len(chapters)}项而不是{self.chapter_count}项")
+                raise ValueError("章节规划槽位不完整：" + "；".join(details) + "。")
         normalized = []
         for fallback_index, item in enumerate(chapters, 1):
             if not isinstance(item, dict):
@@ -8016,10 +8983,15 @@ class NovelChapterPlanWorker(NovelAnalysisWorker):
         if not normalized:
             raise ValueError("AI 返回的章节规划为空。")
         if len(normalized) != self.chapter_count:
+            slot_hint = (
+                "；本次未检测到i槽位字段，已按旧格式兼容解析"
+                if self.creation_wizard_mode and not explicit_slots
+                else ""
+            )
             raise ValueError(
                 f"章节规划数量不一致：本批次第{self.existing_chapter_count + 1}-"
                 f"{self.existing_chapter_count + self.chapter_count}章需要{self.chapter_count}章，"
-                f"实际返回{len(normalized)}章。"
+                f"实际返回{len(normalized)}章{slot_hint}。"
             )
         for index, item in enumerate(normalized, 1):
             item["index"] = index
@@ -8059,10 +9031,11 @@ class NovelChapterPlanWorker(NovelAnalysisWorker):
             self.progress.emit("正在生成章节规划...")
             response_format_supported, _stream_supported = self._analysis_request_capabilities()
             last_error = None
+            analysis_prompt = self._analysis_prompt()
             structure_attempts = max(1, int(self.retry_attempts or 1))
             for structure_attempt in range(structure_attempts):
                 parsed, response_format_supported = self._analyze_chunk_with_retries(
-                    self._analysis_prompt(),
+                    analysis_prompt,
                     self.text,
                     1,
                     1,
@@ -8081,6 +9054,9 @@ class NovelChapterPlanWorker(NovelAnalysisWorker):
                     if structure_attempt + 1 < structure_attempts:
                         self._increment_analysis_diagnostic("structure_regeneration_count")
                         self.diagnostics["first_structure_error"] = str(e)[:1000]
+                        analysis_prompt = self._chapter_plan_structure_retry_prompt(
+                            self._analysis_prompt(), str(e)
+                        )
                         self.progress.emit(
                             f"当前批次章节数量或结构不完整，正在自动重做本批（第{structure_attempt + 2}/{structure_attempts}次）..."
                         )

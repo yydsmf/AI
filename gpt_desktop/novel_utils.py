@@ -42,6 +42,8 @@ def _novel_chinese_output_guidance():
         "人物姓名、组织名、物件名、技能名、品牌名、型号、等级代号、文件名、网址、作者明确要求保留的原文引用和故事内真实存在的外文词可以按项目资料原样保留；"
         "例如人物代号 K、型号 X-7、S 级或资料中明确写出的英文专名都属于故事事实，不要擅自翻译、删除或改写。"
         "普通对白、情绪表达、叙事说明和阶段字段默认使用自然中文；不要因为人物会说外语、表达态度或想显得利落，就把普通英文口语直接塞进中文故事字段。"
+        "中文小说正文的旁白和普通对白句子默认使用中文；不要把普通英文副词、形容词或短语夹在中文句子中。"
+        "只要英文不是资料确立的正式专名/代号/型号、作者要求保留的原文引用，或剧情中确实发生的外语表达，就改用自然中文。"
         "判断字符是否保留时，以它是否是项目资料明确规定的正式名称、代号、型号或原文引用为准；仅仅为了显得专业、像分析报告或像提示词而使用的英文，改为自然中文。"
     )
 
@@ -128,6 +130,7 @@ def _creation_event_catalog(framework):
                 "stage_id": stage_id,
                 "order": event_index,
                 "allowed_chapters": [allowed_start, allowed_end],
+                "preconditions": deepcopy(raw_event.get("preconditions", raw_event.get("p", []))),
                 "event": _as_text(raw_event.get("event", raw_event.get("h", raw_event.get("text", "")))).strip(),
                 "result": _as_text(raw_event.get("result", raw_event.get("o", ""))).strip(),
                 "state_delta": deepcopy(raw_event.get("state_delta", raw_event.get("d", {}))),
@@ -1102,7 +1105,7 @@ def _derive_mainline_pressure_curve(stages, core_result="", terminal_result=""):
     return result
 
 
-def _mainline_pressure_context(project, chapter_index=None, limit=3600):
+def _mainline_pressure_context(project, chapter_index=None, limit=3600, include_guidance=True):
     """Render the current causal pressure without imposing a genre template."""
     project = project if isinstance(project, dict) else {}
     foundation = project.get("chapter_plan_foundation", {})
@@ -1208,14 +1211,15 @@ def _mainline_pressure_context(project, chapter_index=None, limit=3600):
     if terminal_result:
         header.append("终局结果：" + terminal_result)
     header.extend(rows)
-    header.append(
-        "递进只要求当前阶段相较前阶段在冲突牵连范围、直接对手、失败代价、公开后果或主角选择难度中自然提高至少两项；"
-        "不强制所有题材采用同一层级顺序，也不为提高压力凭空添加家族、地方势力、区域或跨界设定。"
-    )
-    header.append(
-        "本章或本事件必须把压力落到当前题材已有的人物、关系、场景和行动上，形成新的选择与结果；"
-        "不能靠重复处理同一对象的说明、维护、分配、确认或等待制造推进。"
-    )
+    if include_guidance:
+        header.append(
+            "本底稿只记录已确认的压力因果事实；压力递进与阶段大事件差异须同时满足公共核心约束，不能只凭压力提高视为阶段变化。"
+            "不强制所有题材采用同一层级顺序，也不为提高压力凭空添加家族、地方势力、区域或跨界设定。"
+        )
+        header.append(
+            "本章或本事件必须把压力落到当前题材已有的人物、关系、场景和行动上，形成新的选择与结果；"
+            "不能靠重复处理同一对象的说明、维护、分配、确认或等待制造推进。"
+        )
     return _clip_context_text("\n".join(header), int(limit or 3600), preserve_lines=True)
 
 
@@ -11034,8 +11038,28 @@ def _build_legacy_style_execution_context(
     )[:int(limit or NOVEL_AI_CONTEXT_LIMIT)]
 
 
-def _story_conflict_pacing_guidance(compact=False):
+CORE_STORY_QUALITY_GUIDANCE = """
+【核心约束｜非作者明确要求不可随便更改、删除或弱化】
+以下要求共同适用于第一步故事方向、第二步阶段方向、第三步阶段规划及AI章节规划。表达方式随题材自然变化，不套统一事件类型。
+1. 每个事件落到具体人物或人物关系：写清人物想得到或守住什么、谁以什么行动阻挠或利用、主角如何选择以及造成什么可观察后果。避免报告式、案卷式、说明式推进；记录、复核、责任、封存、归档、资源、权限、规则、维护、合同、设备状态、生产安排等如确因题材和剧情需要出现，只作为具体人物冲突的必要背景或短结果，不把资料往来、维护或生产流程本身写成连续事件发动机、阶段主线、章节主线、悬念反转或伏笔回收方式。公司、合同或治理事项落到直接利益者的人物行动与对抗；设备、生产、资源、权限或规则问题落到具体人物的争夺、使坏、失误、隐瞒、误判或纰漏及现场后果。不从普通词汇自行推导出与题材无关的合同、公司、调查或案卷剧情。
+2. 从第二阶段起，结合题材与前后因果，相邻阶段必须同时实现压力递进和阶段大事件差异，二者不可互相替代：阶段压力从前一阶段已经成立的结果中引出，持续增加对手行动、冲突牵连、人物代价和局势压力；相较前一阶段，冲突牵连范围、直接对手、失败代价、公开后果或主角选择难度中自然提高至少两项，最终阶段达到全书峰值。阶段大事件也必须落实差异：相较前一阶段，主要场景、关键人物、事件核心、人物冲突四方面均须发生实质更换或升级，不能只满足其中若干项。具体地点或人物可以延续，但只有场景功能/范围、人物立场/关系/作用各自发生实质变化时，才算对应维度已升级；事件核心和人物冲突仍须分别发生实质变化，四方面不能互相替代。不得为满足变化而凭空扩大地图、势力或人物数量，也不能只提高同一事件的规模来代替阶段差异。第一阶段建立故事基准，后续变化由前项结果自然引出，不规定统一顺序或事件类型。
+3. 已完成的救援、解围或关系选择作为既成结果承接，不撤销后重演；同一人物不反复陷入同类待救危机。已取得的关键物品不反复失而复得、不拆成碎片，也不以同功能替代物延长争夺；后续变化须由新的具体行动和结果造成。
+4. 相邻阶段的大事件和关键推进不能只是同一任务换地点或加码重演，也不能只换人物名称、数量或说法反复处理已经解决的冲突；应由前项结果引出新的行动、选择、代价、关系变化或局势后果。高度相似、承担相同推进作用的事件或节点应合并，避免同一冲突拆成多个近义节点反复展开。服务主线的小事件可以自然过渡，但不能代替阶段推进或把同一问题拆开循环展开。
+""".strip()
+
+
+def _story_conflict_pacing_guidance(compact=False, shared_quality_included=False):
     """Keep every story unit character-led and prevent one event from becoming filler."""
+    if shared_quality_included:
+        return (
+            "【章节级执行补充】\n"
+            "公共核心约束负责主线、人物冲突、阶段递进和重复事件边界；以下只约束章节规划中的事件容量与场面推进。"
+            "这里的跨章变化只衡量同一事件内部的推进，不替代公共核心约束中的阶段差异要求。"
+            "单个阶段事件或剧情节点最多覆盖两章（b-a+1<=2）。"
+            "对于以人物对抗或关系推进为核心的题材，通常每两章至少要让主角和路人、配角、对手或反派发生一次有效碰撞，"
+            "并改变其下一步行动、关系状态或现实处境；"
+            "碰撞从人物当前目标和现场压力中自然发生，不轮换固定类型，也不为满足频率硬塞重复对抗。\n"
+        )
     if compact:
         return (
             "【人物冲突落地】\n"
@@ -11058,7 +11082,7 @@ def _story_conflict_pacing_guidance(compact=False):
         "同一治理、谈话或资源事件的 allowed_chapters 不得连续超过两章；如果阶段需要覆盖四章或更长，必须拆成至少两个事件，每个事件各自完成一轮人物冲突、选择和结果，再由结果衔接下一事件。"
         "同一主线可以连续，但不能用一个事件包住四章，也不能把同一段家庭谈话、资源讨论或权限说明拆成换说法后继续占满多章。"
         "跨两章的后续场景至少改变下列两项：主动人物、眼前目标、场景或对象、压力来源、代价、关系结果或公开后果；"
-        "只增加解释、讨论、复核、等待或同一地点的换说法不算推进。同一地点可以继续使用，但必须有新的外部行动、人物进入或退出、信息暴露、选择或不可逆结果改变下一步。"
+        "只增加解释、讨论、复核、等待或同一地点的换说法不算推进。同一事件内可以继续使用同一地点，但必须有新的外部行动、人物进入或退出、信息暴露、选择或不可逆结果改变下一步；这项单事件规则不替代阶段层级的四方面变化要求。"
         "当同一类直接压力源已经连续支撑两个相邻事件后，下一事件要让前面结果自然引出新的具体目标、对手行动、关系裂痕、现场损失、公开后果或更高代价；"
         "不要只把同一资源缺口、权限争夺、设备故障、谈判条件或说明事项换地点、换人物、换说法继续延长。压力转化必须从已经发生的选择和后果中长出来，不凭空换题，也不要求所有题材采用同一种升级顺序。\n"
     )
@@ -11074,7 +11098,7 @@ def _core_motive_progression_guidance():
         "这些要求只负责检查主线是否具体、有压力、能持续推进，不规定小说必须使用倒计时、赚钱、升级、复仇、强敌、打脸或同一种阶段结构。言情、悬疑、现实、群像、日常、历史、科幻和其它题材，应从自己的关系、秘密、规则、生活压力、伦理选择或世界机制中长出目标和代价；不要为了凑齐检查项，给所有故事硬加金额、期限、幕后黑手或升级路线。\n"
         "字段职责必须固定，不能抢任务：core_motive是唯一的具体执行主线；premise.main_line、bible.main_conflict、creative_intent_contract.primary_line、chapter_plan_foundation.core_mainline和narrative_strategy_profile.primary_story_engine在新项目中都只是这条主线的兼容别名或执行说明，不得另起一条目标。theme只提炼最终讨论的人性命题、价值冲突和情感认识，不写具体任务、金额、期限、对手或资源缺口。阶段的main_conflict/dominant_line只写本阶段阻碍核心动机的具体问题、代价或门槛，不得替换全书目标；supporting_lines、人物关系、伏笔和世界规则只能改变主线人物的选择、资源、信息、关系、位置或时间窗口。\n"
         "剧情推进不是让主角不停遇到事情，而是主角为了完成核心目标不断遇到阻碍、作出选择、付出代价、解决当前障碍，并因此打开或加深下一阶段目标。阶段目标必须形成延伸链：当前危机解决后，结果明确带来下一道更具体的门槛、对手、资源缺口、关系选择、认知真相或更高代价，不能每个阶段重新换一条主线。\n"
-        "阶段压力要逐步提高，但提高方式由题材决定：相邻阶段至少自然增加冲突牵连范围、直接对手、失败代价、公开后果或主角选择难度中的两项。可以在同一地点、同一关系或同一类事件中升级，不要求固定经过家族、地方、区域或跨界，也不得为了升级凭空添加新地图、新势力或第二条总目标。阶段出口必须说明已成立的变化怎样逼出下一阶段更高压力；最后阶段把峰值压力转化为核心动机的实际结果。\n"
+        "阶段出口说明已成立的变化怎样逼出下一阶段的具体阻力，最后阶段把峰值压力转化为核心动机的实际结果。\n"
         "每个重要事件都要能回答：它为什么会因为核心动机发生，主角为目标采取了什么行动，遇到什么阻碍，解决或暂时解决后距离目标发生了什么可见变化。事件可以推进、阻碍、加压、转向、揭示代价或兑现阶段目标，但不能只是热闹、日常或支线；支线只有在改变主线人物的选择、关系、资源、信息、位置或时间窗口时才保留。\n"
         "不要求每章机械重复‘核心动机’几个字，也不要求所有章节都直接完成目标；不要把章节机械写成‘目标—阻碍—解决—下阶段目标’的固定句式。每章必须让主线的进度、阻力、代价、路径、关系或下一步发生真实变化，变化可以通过行动、对话、关系转折、信息揭示、环境后果或人物选择自然呈现；阶段末再留下已经成立的结果和下一阶段继续追逐的具体目标。"
     )
@@ -14887,7 +14911,11 @@ def _long_form_compact_update_contract_instructions(project, chapter_index):
         "不能因为新增了一条更宽泛的概括而退役精确旧事实；仍有效的精确旧事实必须继续保留。"
         "本章选择索引中未发生变化的已有事实由程序自动保留并生成复核索引，不得为它们输出keep；"
         "fact_updates只提交正文明确新增、更新、退出或取代的事实。"
-        "record_updates只写人物或设定的动态变化。人物卡：只为有明确姓名或稳定称谓、后续会再次出场或持续影响关系/主线的具体人物create；一次性路人、无名群体和只完成单章功能的人物不要建卡。新人物create使用NC/NL临时key并填写稳定名称和canon；人物canon的role、goal、secret、personality、voice、notes逐项只填写最终正文能够支持的内容，不能为了填满字段猜测。人物字段必须独立判断：直接对白足够辨识时必须提取voice；正文明确呈现出可长期保留的性格变化时才提取personality；明确争夺资源/机缘、控制或进入地点、保护/排除/追杀/阻止对象、职责或利益诉求时必须提取goal；只有正文明确揭示的隐情才提取secret。personality和voice都只保留能够迁移到其它场景的长期特点，notes只保留稳定关系底色、长期身份变化或后文必须继承的资料；固定笑点、固定口头禅、固定动作套路、具体食物/道具/地点、某章行为、出场桥段、一次性反应和临时情绪不得写入人物卡。不能因为secret无证据而连带留空goal、personality或voice。"
+        "record_updates只写人物或设定的动态变化。索引中已有C/L引用的同一实体必须使用update，不能create、另造临时key或回传整张卡片。"
+        '已有人物更新结构为{"operation":"update","ref":"C001","state":"本章持续变化","evidence_quote":"正文逐字证据"}；'
+        '已有设定更新结构为{"operation":"update","ref":"L001","state":"本章动态变化","story_known":"正文已公开内容","evidence_quote":"正文逐字证据"}。'
+        "update不得输出canon、type、description或整份身份定义；人物补充使用identity_patch，设定新增公开内容使用story_known。"
+        "人物卡：只为有明确姓名或稳定称谓、后续会再次出场或持续影响关系/主线的具体人物create；一次性路人、无名群体和只完成单章功能的人物不要建卡。新人物create使用NC临时key，新设定create使用NL临时key，并填写稳定名称和canon；人物canon的role、goal、secret、personality、voice、notes逐项只填写最终正文能够支持的内容，不能为了填满字段猜测。人物字段必须独立判断：直接对白足够辨识时必须提取voice；正文明确呈现出可长期保留的性格变化时才提取personality；明确争夺资源/机缘、控制或进入地点、保护/排除/追杀/阻止对象、职责或利益诉求时必须提取goal；只有正文明确揭示的隐情才提取secret。personality和voice都只保留能够迁移到其它场景的长期特点，notes只保留稳定关系底色、长期身份变化或后文必须继承的资料；固定笑点、固定口头禅、固定动作套路、具体食物/道具/地点、某章行为、出场桥段、一次性反应和临时情绪不得写入人物卡。不能因为secret无证据而连带留空goal、personality或voice。"
         "已有人物若正文补出了此前空缺的身份、目标、秘密、人物性格/特点或语言风格，使用identity_patch逐项补齐；程序保留已有内容，并只追加正文有证据的新补充，不覆盖或替换旧资料。已有姓名未明或临时称谓人物正式命名时，继续沿用原人物ref并用name升级同一ID。"
         "如果正文把已有的姓名未明或临时称谓人物正式命名，必须沿用原人物ref并用update填写name为正式姓名，"
         "不得新建第二张人物卡；只有正文没有对应旧人物时才create。"
@@ -14897,6 +14925,10 @@ def _long_form_compact_update_contract_instructions(project, chapter_index):
         "本章伏笔是否更新必须以最终正文中的evidence_quote和当前正文语义为准；即使历史记录已经写过已埋，也不能据此把本章无关内容挂到该伏笔。"
         "每条foreshadow_updates必须输出status、state、revealed、remaining_secret和evidence_quote；status只能是未埋/已埋/已回收/无需回收/废弃：正文只是推进或仍有未揭示边界时写已埋，只有正文明确解释、揭晓或兑现该伏笔时才写已回收，并填写真实payoff_chapter；正文明确说明不需要继续牵引或已经作废时才写无需回收或废弃。state填写本章运行态变化，revealed只写正文已公开内容，remaining_secret写仍未揭示边界；不得把operation或status当作state或revealed，evidence_quotes数组必须落实为一条正文中的连续evidence_quote。"
         "state_patch只写本章结束时新增或变化的时间、地点、人物、关系、物件、冲突和任务；"
+        'character_states每项使用{"ref":"C001","state":"章末状态","evidence_quote":"正文逐字证据"}；'
+        'relationship_states每项使用{"refs":["C001","C002"],"state":"关系变化","evidence_quote":"正文逐字证据"}，不得用关系临时key代替人物refs。'
+        '新增冲突每项使用{"id":"","key":"NCF1","conflict":"持续冲突","evidence_quote":"正文逐字证据"}；'
+        '新增任务每项使用{"id":"","key":"NTASK1","task":"未完成行动","evidence_quote":"正文逐字证据"}。'
         "更新已有冲突或任务必须填写真实ID及previous_conflict/previous_task，新增使用NCF/NTASK临时key。"
         "所有非keep事实更新、人物/设定/伏笔更新以及state_patch变化都必须附最终正文中的8-60字连续逐字evidence_quote。"
         "每个会影响后文的事件还必须进入long_term_events一次，并用storage明确指向fact_refs、character_refs、lore_refs、"
@@ -19286,7 +19318,26 @@ def _validate_long_form_memory_update(
             ("conflict_refs", required_conflict_refs),
             ("task_refs", required_task_refs),
         ):
-            missing = sorted(required - checked_sets.get(key, set()))
+            kind = {
+                "character_refs": "characters",
+                "lore_refs": "lore",
+                "foreshadow_refs": "foreshadows",
+            }.get(key)
+            checked = checked_sets.get(key, set())
+            if kind:
+                # Planned routes use persistent IDs while model output uses
+                # short aliases. Compare their identities in one namespace.
+                checked_ids = {
+                    _resolve_long_form_record_ref(project, kind, ref) or ref
+                    for ref in checked
+                }
+                missing = sorted(
+                    ref for ref in required
+                    if (_resolve_long_form_record_ref(project, kind, ref) or ref)
+                    not in checked_ids
+                )
+            else:
+                missing = sorted(required - checked)
             if missing:
                 errors.append(f"state_reconciliation.{key}遗漏：" + "、".join(missing[:10]))
         missing_relationships = sorted(required_relationships - checked_relationships)
@@ -19557,7 +19608,8 @@ def _parse_memory_repair_result(value):
             "memory_update": {},
             "memory_patch": {},
             "logic_audit": {},
-            "prose_review": {"checked": True, "issues": []},
+            "prose_review": {},
+            "prose_review_present": False,
             "repair_patches": [],
         }
 
@@ -19711,7 +19763,8 @@ def _parse_memory_repair_result(value):
     memory_update = data.get("long_form_memory", {})
     memory_patch = data.get("long_form_memory_patch", data.get("memory_patch", {}))
     logic_audit = data.get("logic_audit", {})
-    prose_review = data.get("prose_review", {"checked": True, "issues": []})
+    prose_review_present = "prose_review" in data
+    prose_review = data.get("prose_review", {})
     repair_patches = data.get("repair_patches", [])
     patch_replacements = (
         memory_patch.get("replace", memory_patch)
@@ -19738,9 +19791,48 @@ def _parse_memory_repair_result(value):
         "memory_update": deepcopy(memory_update) if isinstance(memory_update, dict) else {},
         "memory_patch": deepcopy(memory_patch) if isinstance(memory_patch, dict) else {},
         "logic_audit": deepcopy(logic_audit) if isinstance(logic_audit, dict) else {},
-        "prose_review": deepcopy(prose_review) if isinstance(prose_review, dict) else {"checked": True, "issues": []},
+        "prose_review": deepcopy(prose_review),
+        "prose_review_present": prose_review_present,
         "repair_patches": deepcopy(repair_patches) if isinstance(repair_patches, list) else [],
     }
+
+
+def _prose_review_validation_errors(prose_review, present=True, final_text=""):
+    if not present:
+        return ["prose_review缺失，必须明确完成终稿审读"]
+    if not isinstance(prose_review, dict):
+        return ["prose_review必须为对象"]
+    errors = []
+    if prose_review.get("checked") is not True:
+        errors.append("prose_review.checked必须为true")
+    if not isinstance(prose_review.get("issues"), list):
+        errors.append("prose_review.issues必须为数组")
+    if not isinstance(prose_review.get("blocking_issues", []), list):
+        errors.append("prose_review.blocking_issues必须为数组")
+    else:
+        body = str(final_text or "")
+        categories = {"non_chinese", "encoding_corruption", "metadata_leak"}
+        for index, item in enumerate(prose_review.get("blocking_issues", []), 1):
+            if not isinstance(item, dict):
+                errors.append(f"prose_review.blocking_issues第{index}项必须为对象")
+                continue
+            category = str(item.get("category", "") or "").strip()
+            quote = str(item.get("quote", "") or "").strip()
+            reason = str(item.get("reason", "") or "").strip()
+            if category not in categories:
+                errors.append(f"prose_review.blocking_issues第{index}项category无效")
+            if len(_compact_text(quote)) < 2 or (body and quote not in body):
+                errors.append(f"prose_review.blocking_issues第{index}项quote不是正文逐字原文")
+            if len(_compact_text(reason)) < 4:
+                errors.append(f"prose_review.blocking_issues第{index}项reason不足")
+    return errors
+
+
+def _prose_review_blocking_issues(prose_review):
+    if not isinstance(prose_review, dict):
+        return []
+    issues = prose_review.get("blocking_issues", [])
+    return [item for item in issues if isinstance(item, (dict, str))] if isinstance(issues, list) else []
 
 
 _CHAPTER_LOGIC_AUDIT_CATEGORIES = {
@@ -20340,6 +20432,16 @@ def _memory_repair_reference_manifest(project, chapter_index, memory_update):
         lore_aliases.get(item_id, item_id) for item_id in outlined_lore_ids
     }
     required["lore_refs"].update(outlined_lore_refs)
+    if _foreshadow_plan_routing_enabled(project):
+        foreshadow_aliases = _long_form_record_reference_maps(project).get(
+            "foreshadows", {}
+        ).get("id_to_alias", {})
+        required["foreshadow_refs"].update(
+            foreshadow_aliases.get(item_id, item_id)
+            for item_id in _planned_foreshadow_ids(
+                project, chapter_index, str(chapter.get("title", "") or "")
+            )
+        )
 
     for item in record_updates.get("characters", []) if isinstance(record_updates.get("characters"), list) else []:
         if isinstance(item, dict):
@@ -20641,7 +20743,12 @@ def _build_long_form_memory_patch_context(
         "禁止把conflicts或tasks放在long_form_memory顶层。"
         "record_updates只允许create/update；本章没有动态变化的已有人物或设定不要写入record_updates，"
         "若正文明确给已有姓名未明或临时称谓人物补出正式姓名，必须使用原人物引用和name更新卡片名称，保留原ID、运行态和旧称；"
-        "只在state_reconciliation.record_runtime_review中列为unchanged。"
+        "没有动态变化的设定只在state_reconciliation.record_runtime_review中列为unchanged。"
+        "已有C/L引用的同一实体只能update，不能create或另造临时key；"
+        "update中不得输出canon，即使原错误结果带有canon也必须移除；不得回传整张人物卡或设定定义。"
+        "已有人物只输出ref、state、changes、evidence_quote及必要的identity_patch/name；"
+        "已有设定只输出ref、state、story_known、changes、evidence_quote，公开内容写story_known，不能写进canon。"
+        "只有正文确立的全新实体才能create并填写canon。"
         "修复时必须原样保留原结果中已有的NF/NL/NCF/NTASK/NT临时key，不得为了修复字段而重命名、另造同义临时key。"
         "fact_updates使用retire或supersede时必须保留被处理的已有AF-ID，逐字复制原scope和previous_fact，"
         "同时填写非空reason和正文逐字证据；supersede还要填写新的NF临时key和同scope新fact，该NF必须同步进入long_term_events.storage.fact_refs和"
@@ -20921,6 +21028,16 @@ def _build_long_form_memory_finalize_context(project, chapter_index, final_text)
         "状态整理前必须检查正文成品是否误写入内部人物/设定/伏笔短引用、任务或状态字段名、JSON/代码、AI推理、提示词、输出要求、校验说明或工作流程说明；"
         "只有明确不是故事内界面文字、手机消息、文件内容或自然对白时才算泄漏。发现确定泄漏时才在repair_patches中给出最终正文里唯一出现的最小替换；"
         "无法确定或需要猜测剧情时不要修，不要仅因项目目录存在某个C/L/F编号就替换。\n"
+        "还必须逐段检查中文正文中是否混入没有必要的非中文普通词汇，尤其是夹在中文叙述里的英文副词、形容词或短语；"
+        "例如 intermittently 这类英文若只是表达‘断断续续’，必须改成自然中文。确认属于误混时，在prose_review中指出，并在repair_patches中用正文唯一出现的最小完整语句作before，"
+        "只做保持原意的中文局部替换，reason填写‘非中文词汇混入’。不得误改项目明确规定的人名、组织名、品牌/作品名、专名、技能名、型号、等级代号、代码标识、"
+        "作者要求保留的原文引用、剧情中确有必要的外语对白，以及故事内真实存在的文件或界面内容；不确定是否为故事事实时不要改。"
+        "检查范围不只包括英文，还包括其他语种的无必要词句或残片、未翻译的外语句子、乱码、编码损坏、异常替代字符、"
+        "不可解释的字母/数字/符号混排和疑似模型输出残片；但不能把非ASCII字符本身、正常中文标点、数学或单位符号、"
+        "真实专名、型号、代码标识或作者明确保留的原文误判为异常。普通旁白、人物对白和人物内心活动中的自然解释不是AI推理泄漏；"
+        "只有出现‘我先分析/根据提示/输出JSON/校验结果/作为模型/下面给出答案’等明确面向生成过程的元说明，或把任务、状态、"
+        "字段、流程和审查过程直接写成正文，才记录为推理/说明字段泄漏。发现明确异常时必须给出可逐字定位的prose_review.issue，"
+        "并且只有能够保持原意的安全局部替换时才给repair_patches；不确定时只记录为已检查，不要猜测性改写。\n"
         "生成状态资料前，先独立审查最终正文内部是否存在有前后逐字原文直接证明的硬矛盾。"
         "重点检查同一人物的生死、清醒、伤势和位置，物件的存在、撤走、开合、损毁、移动和持有人，"
         "人物进出场、时间先后、原因结果、明确知识或权限以及代词唯一指向。"
@@ -20954,7 +21071,7 @@ def _build_long_form_memory_finalize_context(project, chapter_index, final_text)
         "本章不是十章边界。完整性优先，但只返回本章真正新增、改变、明确结束或被正文直接核对且后文必须继承的最小增量；"
         "不得为了接近上限填满数组。建议fact_updates 1-4项、long_term_events 1-3项、"
         "record_updates的人物与设定各0-3项、伏笔0-2项、state_patch各列表0-5项。"
-        "人物仅行动、说话或提供信息时只进入current_chapter_character_refs与state_reconciliation.character_refs；"
+        "人物仅行动、说话或提供信息时只进入current_chapter_character_refs；对应核对索引由程序生成；"
         "只有章末持续状态、公开层或关系确有变化才写record_updates或state_patch。"
         "相同语义不得同时拆成多条事实、事件和状态；可以交叉引用，但每个分区只承担自己的存储职责。"
         "stage_archive必须为null。目标JSON总长度不超过8000字；确有彼此独立且后文必须继承的关键变化时可以突破建议数量，但不得省略。"
@@ -20969,8 +21086,8 @@ def _build_long_form_memory_finalize_context(project, chapter_index, final_text)
         '"logic_audit":{"checked":true,"issues":[{"severity":"critical|major",'
         '"category":"chronology|causality|character_state|character_location|object_state|object_ownership|spatial_state|pronoun_reference|knowledge_permission|numeric_consistency|entity_relationship|fact_boundary",'
         '"earlier_quote":"较早的正文逐字原文","later_quote":"较晚的正文逐字原文","explanation":"两种状态为何不能同时成立"}]},'
-        '"prose_review":{"checked":true,"issues":["仅记录可逐字定位的读感问题"]},'
-        '"repair_patches":[{"before":"正文中唯一出现的原句片段","after":"局部替换文本","reason":"重复说明|流程赘述|机械短碎|局部语言冲突|正文泄漏"}]}。'
+        '"prose_review":{"checked":true,"issues":["仅记录可逐字定位的读感问题"],"blocking_issues":[{"category":"non_chinese|encoding_corruption|metadata_leak","quote":"异常正文逐字片段","reason":"确认的问题"}]},'
+        '"repair_patches":[{"before":"正文中唯一出现的原句片段","after":"局部替换文本","reason":"重复说明|流程赘述|机械短碎|局部语言冲突|正文泄漏|非中文词汇混入"}]}。'
         "输出顺序必须是outline、summary、key_facts、long_form_memory、logic_audit、prose_review、repair_patches。"
         "outline、summary、key_facts和long_form_memory是必填的核心结果；即使没有逻辑问题、没有读感修补、"
         "或本章没有新的长期状态变化，也绝不能只返回logic_audit、prose_review或repair_patches。"
@@ -20979,6 +21096,15 @@ def _build_long_form_memory_finalize_context(project, chapter_index, final_text)
         "logic_audit必须同时检查最终正文内部的直接矛盾，以及正文与【实体称谓与关系边界】之间的明确冲突；不评价文风和剧情选择，checked必须为true。"
         "prose_review还必须检查正文是否误写入内部人物/设定/伏笔短引用、任务或状态字段名、JSON/代码、AI推理、提示词、输出要求、校验说明或工作流程说明；"
         "只有明确属于生成过程而不是故事内界面文字、手机消息、文件内容或自然对白时才记录为正文泄漏。"
+        "issues用于读感诊断；blocking_issues只用于已经确认的无必要非中文残留、乱码/编码损坏或AI推理/说明字段泄漏，"
+        "每项必须是含category、quote、reason的对象，quote必须是正文逐字片段。确认的问题即使暂时没有安全替换，也必须放入blocking_issues；"
+        "只有正文复查确认全部排除后才能返回blocking_issues:[]。"
+        "prose_review还必须逐段检测中文叙述中无必要混入的英文副词、形容词和短语；例如 intermittently 若只表示‘断断续续’，必须指出并用repair_patches作自然中文的最小替换。"
+        "检查范围还包括其他语种残留、未翻译句子、乱码/编码损坏、异常替代字符和无意义的字母数字符号混排；"
+        "不能把非ASCII字符本身、正常中文标点、单位/数学符号或合法专名误判为异常。仅在资料确立的正式专名/代号/型号、作者要求保留的原文引用、"
+        "确有必要的外语对白或故事内文件/界面内容中保留外文；不能把普通外语词误当专名，也不能误改真实外语内容。"
+        "普通旁白、对白和人物内心活动中的自然判断不是AI推理泄漏；只有明确出现面向生成过程的推理、提示词、JSON/字段、校验、输出或工作流说明，"
+        "或把内部任务/状态资料直接写进正文，才记录为元信息泄漏。"
         "prose_review只记录有明确原文位置的重复说明、无结果流程赘述、机械短碎、局部语言冲突或确定的正文泄漏；"
         "正常留白、剧情选择、文风偏好和现实流程不完整都不是问题。repair_patches通常为空；"
         "只有确实需要修补且before在最终正文中逐字唯一出现时才返回，最多3项；不确定的疑似泄漏不要修。"

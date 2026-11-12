@@ -6,7 +6,10 @@ from unittest.mock import patch
 
 import gpt_desktop.workers as workers_module
 from gpt_desktop.core import reasoning_effort_for_model
-from gpt_desktop.novel_utils import _parse_style_finalize_result
+from gpt_desktop.novel_utils import (
+    CORE_STORY_QUALITY_GUIDANCE,
+    _parse_style_finalize_result,
+)
 
 from gpt_desktop.workers import (
     NovelAnalysisWorker,
@@ -23,6 +26,26 @@ from gpt_desktop.workers import (
 
 
 class NovelAnalysisWorkerTests(unittest.TestCase):
+    def test_chapter_plan_prompt_uses_shared_story_quality_constraints_once(self):
+        worker = NovelChapterPlanWorker(
+            "http://example.test", "key", "model", "context", 200000, 3000, 2, 20
+        )
+
+        prompt = worker._analysis_prompt()
+
+        self.assertIn(CORE_STORY_QUALITY_GUIDANCE, prompt)
+        self.assertEqual(prompt.count("【核心约束｜非作者明确要求不可随便更改、删除或弱化】"), 1)
+        self.assertIn("相邻阶段必须同时实现压力递进和阶段大事件差异", prompt)
+        self.assertIn("主要场景、关键人物、事件核心、人物冲突四方面均须发生实质更换或升级", prompt)
+        self.assertIn("高度相似、承担相同推进作用的事件或节点应合并", prompt)
+        self.assertIn("单个阶段事件或剧情节点最多覆盖两章（b-a+1<=2）", prompt)
+        self.assertIn("这里的跨章变化只衡量同一事件内部的推进", prompt)
+        self.assertIn("不替代公共核心约束中的阶段差异要求", prompt)
+        self.assertEqual(prompt.count("b-a+1<=2"), 1)
+        self.assertEqual(prompt.count("同一事件跨章时"), 1)
+        self.assertEqual(prompt.count("只补解释、讨论、等待"), 1)
+        self.assertNotIn("同一类直接压力连续支撑两个相邻事件后", prompt)
+
     def test_openai_model_keeps_chat_completions_request_shape(self):
         url, headers, payload, protocol = workers_module._build_novel_generation_request(
             "https://provider.example/v1",
@@ -49,12 +72,43 @@ class NovelAnalysisWorkerTests(unittest.TestCase):
         self.assertEqual(payload["reasoning_effort"], "high")
         self.assertEqual(payload["response_format"], {"type": "json_object"})
 
+    def test_anthropic_request_marks_stable_system_prefix_for_prompt_cache(self):
+        url, headers, payload, protocol = workers_module._build_novel_generation_request(
+            "https://provider.example/v1",
+            "key",
+            "claude-sonnet-5-5",
+            "系统",
+            "用户",
+            stream=True,
+        )
+
+        self.assertEqual(protocol, "anthropic")
+        self.assertEqual(url, "https://provider.example/v1/messages")
+        self.assertEqual(headers["anthropic-version"], "2023-06-01")
+        self.assertEqual(payload["system"], [{
+            "type": "text",
+            "text": "系统",
+            "cache_control": {"type": "ephemeral"},
+        }])
+
+    def test_anthropic_cache_marker_can_fall_back_to_legacy_system_string(self):
+        payload = {
+            "system": [{
+                "type": "text",
+                "text": "系统",
+                "cache_control": {"type": "ephemeral"},
+            }]
+        }
+        self.assertTrue(workers_module._remove_anthropic_cache_options(payload))
+        self.assertEqual(payload["system"], "系统")
+
     def test_novel_language_guidance_keeps_story_codes_and_translates_analysis_terms(self):
         guidance = workers_module._novel_chinese_output_guidance()
 
         self.assertIn("自然语言字段、故事资料、阶段说明、章节规划、摘要、记忆、文风说明和正文默认使用自然中文", guidance)
         self.assertIn("人物代号 K", guidance)
         self.assertIn("deadline、escalation、setup、payoff、core_motive", guidance)
+        self.assertIn("不要把普通英文副词、形容词或短语夹在中文句子中", guidance)
         self.assertIn("不要擅自翻译、删除或改写", guidance)
 
     def test_writing_action_prompt_contains_shared_language_guidance(self):
@@ -63,6 +117,40 @@ class NovelAnalysisWorkerTests(unittest.TestCase):
 
         self.assertIn("【中文表达与字符边界】", prompt)
         self.assertEqual(prompt.count("【中文表达与字符边界】"), 1)
+
+    def test_all_writing_protocols_add_shared_author_style_clarification(self):
+        context = "【正文风格参考】\n示例正文\n"
+        cases = (
+            "claude-sonnet-5-5",
+            "gpt-6.1-sol",
+            "gemini-3.1-pro",
+        )
+        for model in cases:
+            with self.subTest(model=model):
+                worker = NovelWritingWorker(
+                    "https://provider.example", "key", model, "draft", context
+                )
+                prompt = worker._action_prompt()
+                self.assertIn("完整原样本提供本次仿写的写法来源", prompt)
+                self.assertIn("文风档案由当前项目作者本人提供", prompt)
+                self.assertIn("直接按上面的全部要求生成当前项目的原创中文正文", prompt)
+
+        future_protocol_worker = NovelWritingWorker(
+            "https://provider.example", "key", "future-model", "draft", context
+        )
+        future_protocol_worker.api_protocol = "future-protocol"
+        self.assertIn(
+            "文风档案由当前项目作者本人提供",
+            future_protocol_worker._action_prompt(),
+        )
+
+        outline_worker = NovelWritingWorker(
+            "https://provider.example", "key", "gpt-6.1-sol", "outline", context
+        )
+        self.assertNotIn(
+            "文风档案由当前项目作者本人提供",
+            outline_worker._action_prompt(),
+        )
 
     def test_novel_writing_reasoning_is_high_for_all_requested_actions(self):
         actions = (
@@ -347,6 +435,117 @@ class NovelAnalysisWorkerTests(unittest.TestCase):
                     self.assertIn("现有第165-167章收尾窗口", prompt)
                     self.assertNotIn("高潮可以落在最后3章内或此前", prompt)
 
+    def test_wizard_chapter_prompt_expands_node_ranges_into_each_slot(self):
+        placements = [
+            {"n": index, "range": [137 + (index - 1) * 2, 138 + (index - 1) * 2]}
+            for index in range(1, 16)
+        ]
+        placements.append({"n": 16, "range": [167, 167]})
+        worker = NovelChapterPlanWorker(
+            "http://example.test", "key", "model", "context", 500000, 3000, 31,
+            total_chapter_count=167,
+            existing_chapter_count=136,
+            creation_wizard_mode=True,
+            locked_node_schedule={"range": [137, 167], "nodes": placements},
+        )
+
+        prompt = worker._analysis_prompt()
+
+        self.assertIn("节点数量不等于章节数量", prompt)
+        self.assertIn("不能按节点数量输出", prompt)
+        self.assertIn("下面每一行都是一个必须单独输出的章节对象", prompt)
+        self.assertIn("槽位1=全书第137章=节点1（节点范围第137-138章）", prompt)
+        self.assertIn("槽位2=全书第138章=节点1（节点范围第137-138章）", prompt)
+        self.assertIn("槽位30=全书第166章=节点15（节点范围第165-166章）", prompt)
+        self.assertIn("槽位31=全书第167章=节点16（节点范围第167-167章）", prompt)
+        self.assertIn("输出对象的数量以逐章槽位表为准", prompt)
+
+    def test_wizard_chapter_prompt_keeps_each_event_within_its_result_boundary(self):
+        schedule = {
+            "range": [1, 10],
+            "stage_start": 1,
+            "stage_end": 10,
+            "stage_is_final": False,
+            "stage_exit_state": "当前阶段完成后进入下一阶段压力",
+            "nodes": [
+                {
+                    "n": 1,
+                    "id": "S01-E01",
+                    "range": [1, 2],
+                    "preconditions": ["主角已经被逼入现场"],
+                    "event": "主角与对手正面交锋",
+                    "result": "主角夺得暂时退路，但对手锁定其位置",
+                    "state_delta": {"pressure": "对手追踪升级"},
+                    "is_stage_final_node": False,
+                },
+                {
+                    "n": 2,
+                    "id": "S01-E02",
+                    "range": [3, 10],
+                    "preconditions": ["对手已经锁定主角位置"],
+                    "event": "主角被迫带人突围",
+                    "result": "主角完成当前阶段目标并留下下一阶段入口",
+                    "state_delta": {"position": "获得新的行动空间"},
+                    "is_stage_final_node": True,
+                },
+            ],
+        }
+        worker = NovelChapterPlanWorker(
+            "http://example.test", "key", "model", "context", 10000, 1000, 10,
+            total_chapter_count=10,
+            existing_chapter_count=0,
+            creation_wizard_mode=True,
+            locked_node_schedule=schedule,
+        )
+
+        prompt = worker._analysis_prompt()
+
+        self.assertIn("当前节点的event、preconditions、result和state_delta组成一条不可越过的局部因果链", prompt)
+        self.assertIn("主角夺得暂时退路，但对手锁定其位置", prompt)
+        self.assertIn("下一节点只作为当前章末入口，不在本节点执行", prompt)
+        self.assertIn("当前阶段最后节点；只在本节点范围内完成当前阶段出口", prompt)
+        self.assertIn("本批绝对范围为第1-10章", prompt)
+        self.assertNotIn("全书第137-167章", prompt)
+
+    def test_wizard_event_boundary_keeps_final_stage_rule_separate(self):
+        schedule = {
+            "range": [1, 10],
+            "stage_start": 1,
+            "stage_end": 10,
+            "stage_is_final": True,
+            "stage_exit_state": "终局结果已经成立",
+            "nodes": [
+                {
+                    "n": 1,
+                    "id": "S05-E01",
+                    "range": [1, 8],
+                    "event": "主角逼近最终对手",
+                    "result": "最终对手被迫暴露弱点",
+                    "is_stage_final_node": False,
+                },
+                {
+                    "n": 2,
+                    "id": "S05-E02",
+                    "range": [9, 10],
+                    "event": "主角完成最终选择",
+                    "result": "核心矛盾完成收束",
+                    "is_stage_final_node": True,
+                },
+            ],
+        }
+        worker = NovelChapterPlanWorker(
+            "http://example.test", "key", "model", "context", 10000, 1000, 10,
+            total_chapter_count=10,
+            existing_chapter_count=0,
+            creation_wizard_mode=True,
+            locked_node_schedule=schedule,
+        )
+
+        prompt = worker._analysis_prompt()
+
+        self.assertIn("终局结果仍只能按已确认的高潮章位和收尾窗口兑现", prompt)
+        self.assertNotIn("当前阶段最后节点；只在本节点范围内完成当前阶段出口", prompt)
+
     def test_chapter_plan_prompt_marks_only_the_last_three_chapter_window(self):
         worker = NovelChapterPlanWorker(
             "http://example.test",
@@ -485,9 +684,10 @@ class NovelAnalysisWorkerTests(unittest.TestCase):
                     self.assertNotIn("扩展章继续深化当前阶段", prompt)
                     if wizard_mode:
                         self.assertIn(
-                            '{"c":[{"t":"章节名","o":"本章具体故事提纲","p":[]}]}',
+                            '{"c":[{"i":1,"t":"章节名","o":"本章具体故事提纲","p":[]}]}',
                             prompt,
                         )
+                        self.assertIn("i必须覆盖本批次1到", prompt)
                         self.assertIn("source_event_ids由程序根据固定章节槽位回填", prompt)
                         self.assertIn("不要返回source_event_ids、事件编号或其它定位字段", prompt)
                     else:
@@ -521,6 +721,64 @@ class NovelAnalysisWorkerTests(unittest.TestCase):
                         with self.subTest(actual_count=actual_count):
                             with self.assertRaisesRegex(ValueError, f"实际返回{actual_count}章"):
                                 worker._normalize_plan({"c": chapters[:actual_count]})
+
+    def test_wizard_chapter_plan_validates_explicit_slot_numbers(self):
+        worker = NovelChapterPlanWorker(
+            "http://example.test", "key", "model", "context",
+            500000, 3000, 3, total_chapter_count=20,
+            creation_wizard_mode=True,
+        )
+
+        plan = worker._normalize_plan({
+            "c": [
+                {"i": 3, "t": "夜入边城", "o": "第三章推进。", "p": []},
+                {"i": 1, "t": "囚车破局", "o": "第一章推进。", "p": []},
+                {"i": 2, "t": "荒道追兵", "o": "第二章推进。", "p": []},
+            ],
+        })
+
+        self.assertEqual([item["index"] for item in plan["chapters"]], [1, 2, 3])
+        self.assertEqual(
+            [item["title"] for item in plan["chapters"]],
+            ["囚车破局", "荒道追兵", "夜入边城"],
+        )
+
+        chapters_plan = worker._normalize_plan({
+            "chapters": [
+                {"i": 1, "title": "囚车破局", "outline": "推进。"},
+                {"i": 2, "title": "荒道追兵", "outline": "推进。"},
+                {"i": 3, "title": "夜入边城", "outline": "推进。"},
+            ],
+        })
+        self.assertEqual(
+            [item["index"] for item in chapters_plan["chapters"]],
+            [1, 2, 3],
+        )
+
+        with self.assertRaisesRegex(ValueError, "缺少本批槽位2,3；重复本批槽位1；越界本批槽位4"):
+            worker._normalize_plan({
+                "c": [
+                    {"i": 1, "t": "囚车破局", "o": "推进。", "p": []},
+                    {"i": 1, "t": "重复章", "o": "推进。", "p": []},
+                    {"i": 4, "t": "越界章", "o": "推进。", "p": []},
+                ],
+            })
+
+    def test_wizard_structure_retry_prompt_carries_slot_error(self):
+        worker = NovelChapterPlanWorker(
+            "http://example.test", "key", "model", "context",
+            500000, 3000, 3, total_chapter_count=20,
+            creation_wizard_mode=True,
+        )
+
+        retry_prompt = worker._chapter_plan_structure_retry_prompt(
+            "原始提示词", "章节规划槽位不完整：缺少本批槽位2。"
+        )
+
+        self.assertIn("上一轮结构校验结果", retry_prompt)
+        self.assertIn("缺少本批槽位2", retry_prompt)
+        self.assertIn("i必须一次性覆盖1到3", retry_prompt)
+        self.assertIn("对应全书第1-3章", retry_prompt)
 
     def test_framework_import_prompt_uses_compact_chapter_locations(self):
         worker = NovelFrameworkImportWorker(
@@ -755,6 +1013,37 @@ class NovelAnalysisWorkerTests(unittest.TestCase):
         self.assertTrue(response_format)
         self.assertTrue(worker._analysis_request_capabilities()[1])
 
+    def test_http_client_none_read_failure_is_retried_as_stream(self):
+        worker = NovelAnalysisWorker("http://example.test", "key", "model", "context")
+        worker.retry_attempts = 2
+        worker._analysis_retry_wait_seconds = lambda *_args: 0
+        self.assertTrue(
+            worker._is_stream_read_failure(
+                AttributeError("'NoneType' object has no attribute 'read'")
+            )
+        )
+        calls = []
+
+        def fake_stream(*_args, **_kwargs):
+            calls.append("stream")
+            if len(calls) == 1:
+                raise RuntimeError(
+                    "流式响应在结果完成前中断。原始错误："
+                    "'NoneType' object has no attribute 'read'"
+                )
+            return {"characters": [], "lore": [], "foreshadows": [], "project_materials": {}}
+
+        worker._post_analysis_chunk_stream = fake_stream
+
+        parsed, response_format = worker._analyze_chunk_with_retries(
+            "prompt", "context", 1, 1, True
+        )
+
+        self.assertEqual(calls, ["stream", "stream"])
+        self.assertEqual(parsed["lore"], [])
+        self.assertTrue(response_format)
+        self.assertEqual(worker.diagnostics["retry_count"], 1)
+
     def test_rate_limit_error_retries_after_ten_seconds(self):
         worker = NovelAnalysisWorker("http://example.test", "key", "model", "正文")
         worker.retry_attempts = 2
@@ -828,7 +1117,7 @@ class NovelAnalysisWorkerTests(unittest.TestCase):
         self.assertEqual(attempt["outcome"], "success")
 
     def test_analysis_stream_accepts_finish_reason_without_done_marker(self):
-        worker = NovelAnalysisWorker("http://example.test", "key", "model", "项目资料")
+        worker = NovelAnalysisWorker("http://example.test", "key", "claude-opus-5-5[次]", "项目资料")
         content = json.dumps(
             {
                 "characters": [],
@@ -850,6 +1139,70 @@ class NovelAnalysisWorkerTests(unittest.TestCase):
         self.assertEqual(worker.diagnostics["attempts"][0]["finish_reason"], "stop")
         self.assertFalse(worker.diagnostics["attempts"][0]["received_done"])
         self.assertEqual(worker.diagnostics["attempts"][0]["outcome"], "success")
+
+    def test_analysis_stream_recovers_complete_json_before_transport_close(self):
+        worker = NovelAnalysisWorker("http://example.test", "key", "claude-opus-5-5[次]", "项目资料")
+        content = json.dumps(
+            {
+                "characters": [],
+                "lore": [],
+                "foreshadows": [],
+                "project_materials": {},
+            },
+            ensure_ascii=False,
+        )
+
+        class DisconnectingResponse(_FakeStreamResponse):
+            def iter_lines(self, decode_unicode=False):
+                yield from super().iter_lines(decode_unicode=decode_unicode)
+                raise workers_module.requests.exceptions.ChunkedEncodingError(
+                    "response ended prematurely"
+                )
+
+        class DisconnectingSession(_FakeStreamSession):
+            def __init__(self, lines):
+                super().__init__([])
+                self._response = DisconnectingResponse(lines)
+
+        worker._new_session = lambda: DisconnectingSession([
+            f'data: {json.dumps({"choices": [{"delta": {"content": content}}]}, ensure_ascii=False)}',
+        ])
+
+        parsed = worker._post_analysis_chunk_stream(
+            "系统提示词", "本次规划上下文", 1, 1, True
+        )
+
+        self.assertEqual(parsed["characters"], [])
+        attempt = worker.diagnostics["attempts"][0]
+        self.assertEqual(attempt["outcome"], "success")
+        self.assertFalse(attempt["received_done"])
+        self.assertTrue(attempt["stream_transport_recovered"])
+
+    def test_analysis_stream_does_not_recover_truncated_json_before_transport_close(self):
+        worker = NovelAnalysisWorker("http://example.test", "key", "model", "项目资料")
+
+        class DisconnectingResponse(_FakeStreamResponse):
+            def iter_lines(self, decode_unicode=False):
+                yield from super().iter_lines(decode_unicode=decode_unicode)
+                raise workers_module.requests.exceptions.ChunkedEncodingError(
+                    "response ended prematurely"
+                )
+
+        class DisconnectingSession(_FakeStreamSession):
+            def __init__(self, lines):
+                super().__init__([])
+                self._response = DisconnectingResponse(lines)
+
+        worker._new_session = lambda: DisconnectingSession([
+            'data: {"choices":[{"delta":{"content":"{\\"characters\\":["}}]}',
+        ])
+
+        with self.assertRaisesRegex(RuntimeError, "流式响应在结果完成前中断"):
+            worker._post_analysis_chunk_stream(
+                "系统提示词", "本次规划上下文", 1, 1, True
+            )
+
+        self.assertEqual(worker.diagnostics["attempts"][0]["outcome"], "error")
 
     def test_analysis_stream_retries_without_non_default_temperature(self):
         worker = NovelAnalysisWorker("http://example.test", "key", "model", "项目资料")
@@ -970,7 +1323,11 @@ class NovelAnalysisWorkerTests(unittest.TestCase):
         self.assertEqual(session.last_url, "https://provider.example/v1/messages")
         self.assertIn("x-api-key", session.last_headers)
         self.assertNotIn("Authorization", session.last_headers)
-        self.assertEqual(session.last_payload["system"], worker._action_prompt())
+        self.assertEqual(session.last_payload["system"], [{
+            "type": "text",
+            "text": worker._action_prompt(),
+            "cache_control": {"type": "ephemeral"},
+        }])
         self.assertEqual(session.last_payload["messages"], [{"role": "user", "content": "context"}])
         self.assertNotIn("temperature", session.last_payload)
         self.assertNotIn("response_format", session.last_payload)
@@ -1138,7 +1495,11 @@ class NovelAnalysisWorkerTests(unittest.TestCase):
         self.assertEqual(session.last_url, "https://provider.example/v1/messages")
         self.assertIn("x-api-key", session.last_headers)
         self.assertNotIn("Authorization", session.last_headers)
-        self.assertEqual(session.last_payload["system"], workers_module._with_novel_language_guidance("系统提示词"))
+        self.assertEqual(session.last_payload["system"], [{
+            "type": "text",
+            "text": workers_module._with_novel_language_guidance("系统提示词"),
+            "cache_control": {"type": "ephemeral"},
+        }])
         self.assertNotIn("temperature", session.last_payload)
         self.assertNotIn("response_format", session.last_payload)
         self.assertNotIn("reasoning_effort", session.last_payload)
@@ -1450,6 +1811,10 @@ class NovelAnalysisWorkerTests(unittest.TestCase):
         self.assertIn("连续性总编辑", memory_finalize_worker._action_prompt())
         self.assertIn("记录缺失或覆盖", memory_finalize_worker._action_prompt())
         self.assertIn("正文成品泄漏检查", memory_finalize_worker._action_prompt())
+        self.assertIn("其他语种残留", memory_finalize_worker._action_prompt())
+        self.assertIn("乱码、编码损坏", memory_finalize_worker._action_prompt())
+        self.assertIn("人物内心活动中的自然判断不是AI推理泄漏", memory_finalize_worker._action_prompt())
+        self.assertIn("blocking_issues", memory_finalize_worker._action_prompt())
         self.assertIn("无法确定或需要猜测剧情时不要修", memory_finalize_worker._action_prompt())
         self.assertIn("只能填写在fact_updates各项的key字段", memory_finalize_worker._action_prompt())
         self.assertIn("至少被一个long_term_events.storage.fact_refs引用", memory_finalize_worker._action_prompt())
@@ -1812,7 +2177,7 @@ class NovelAnalysisWorkerTests(unittest.TestCase):
         self.assertFalse(worker.diagnostics["response_char_limit_exceeded"])
         self.assertEqual(worker.diagnostics["ignored_trailing_whitespace_chars"], 40000)
 
-    def test_memory_worker_reports_reasoning_and_content_in_received_char_count(self):
+    def test_memory_worker_counts_only_result_content_for_display(self):
         worker = NovelWritingWorker(
             "http://example.test", "key", "model", "memory_finalize", "context"
         )
@@ -1834,7 +2199,35 @@ class NovelAnalysisWorkerTests(unittest.TestCase):
         self.assertEqual(worker.diagnostics["response_chars"], 2)
         self.assertEqual(worker.diagnostics["ignored_reasoning_chars"], 2)
         self.assertEqual(worker.diagnostics["received_chars"], 4)
-        self.assertEqual(received[-1], 4)
+        self.assertEqual(received, [2])
+
+    def test_memory_worker_excludes_native_claude_thinking_from_display_count(self):
+        worker = NovelWritingWorker(
+            "http://example.test", "key", "claude-model", "memory_finalize", "context"
+        )
+        content = '{"summary":"章节摘要"}'
+        events = [
+            {"type": "content_block_delta", "index": 0,
+             "delta": {"type": "thinking_delta", "thinking": "思考" * 6000}},
+            {"type": "content_block_delta", "index": 1,
+             "delta": {"type": "text_delta", "text": content}},
+            {"type": "message_delta", "delta": {"stop_reason": "end_turn"}},
+            {"type": "message_stop"},
+        ]
+        worker._session = _FakeStreamSession([
+            "data: " + json.dumps(event, ensure_ascii=False) for event in events
+        ])
+        received = []
+        results = []
+        worker.output_chars.connect(received.append)
+        worker.result_ready.connect(lambda _action, value: results.append(value))
+
+        worker.run()
+
+        self.assertEqual(results, [content])
+        self.assertEqual(worker.diagnostics["ignored_reasoning_chars"], 12000)
+        self.assertEqual(worker.diagnostics["received_chars"], 12000 + len(content))
+        self.assertEqual(received, [len(content)])
 
     def test_memory_worker_only_falls_back_for_response_format_compatibility_errors(self):
         self.assertTrue(NovelWritingWorker._json_response_format_not_supported(

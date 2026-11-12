@@ -1047,6 +1047,67 @@ class NovelWritingStateTests(unittest.TestCase):
         self.assertFalse(tab.auto_expand_all_btn.enabled)
         self.assertEqual(tab.auto_expand_all_btn.text, "后台单章扩写中")
 
+    def test_detached_lock_releases_when_runner_is_finished_but_not_polled_out(self):
+        class FinishedDetached:
+            _background_task_kind = "auto_expand"
+
+            def _status_has_active_work(self):
+                return False
+
+        tab = NovelWritingTab.__new__(NovelWritingTab)
+        tab._is_detached_auto_runner = False
+        tab._background_chapter_ai_runners = {
+            os.path.realpath("/tmp/source.json"): FinishedDetached(),
+        }
+        tab.current_project_path = "/tmp/source.json"
+        tab.auto_expand_all_btn = _FakeButton()
+        tab.project_hint = _FakeLineEdit()
+        tab._detached_auto_readonly_states = []
+        tab._clear_detached_auto_status_mirror = lambda: None
+        tab._set_detached_auto_source_read_only = lambda _locked: None
+
+        tab._update_detached_auto_source_lock()
+
+        self.assertTrue(tab.auto_expand_all_btn.enabled)
+        self.assertEqual(tab.auto_expand_all_btn.text, "自动扩写全部")
+
+    def test_stopping_detached_runner_refreshes_visible_lock_immediately(self):
+        class RunningDetached:
+            _background_task_kind = "auto_expand"
+
+            def __init__(self):
+                self.active = True
+
+            def _status_has_active_work(self):
+                return self.active
+
+            def stop_chapter_ai_action(self):
+                self.active = False
+
+        runner = RunningDetached()
+        tab = NovelWritingTab.__new__(NovelWritingTab)
+        tab._is_detached_auto_runner = False
+        tab._current_background_chapter_runner = lambda: runner
+        tab.writing_worker = None
+        tab.context_build_worker = None
+        tab.chapter_plan_worker = None
+        synced = []
+        updated = []
+        scheduled = []
+        tab._sync_detached_auto_status = lambda value: synced.append(value)
+        tab._update_detached_auto_source_lock = lambda: updated.append(True)
+        tab._schedule_chapter_task_callback = lambda delay, callback: scheduled.append(
+            (delay, callback)
+        )
+        tab.set_status_tip = lambda _text: None
+
+        tab.stop_chapter_ai_action()
+
+        self.assertEqual(synced, [runner])
+        self.assertEqual(updated, [True])
+        self.assertEqual(len(scheduled), 1)
+        self.assertEqual(scheduled[0][0], 0)
+
     def test_detached_auto_status_mirrors_stream_chars_stage_and_queue_progress(self):
         class RunningDetached:
             _status_message = "正在扩写正文..."
@@ -1834,6 +1895,45 @@ class NovelWritingStateTests(unittest.TestCase):
             tab._chapter_plan_next_batch_info(state),
             (50, 1, 3, 1, 50),
         )
+
+    def test_chapter_plan_progress_distinguishes_saved_plans_from_failed_batch(self):
+        tab = NovelWritingTab.__new__(NovelWritingTab)
+        tab.current_project = {"imported_chapter_plan_reference": {}}
+        tab.chapter_ai_preview = _FakePlainTextEdit("")
+        state = {
+            "status": "failed",
+            "total_chapter_count": 167,
+            "existing_chapter_count": 0,
+            "requested_chapter_count": 167,
+            "batch_size": 50,
+            "chapters": [{"index": index} for index in range(1, 137)],
+        }
+
+        tab._show_chapter_plan_generation_progress(state, "当前批次生成失败")
+
+        preview = tab.chapter_ai_preview.toPlainText()
+        self.assertIn("已保存规划：136/167章", preview)
+        self.assertIn("待重试批次：第137-167章，共31章（本批失败结果未保存）", preview)
+        self.assertNotIn("已完成：136/167章", preview)
+
+    def test_chapter_plan_progress_includes_existing_chapters_in_saved_total(self):
+        tab = NovelWritingTab.__new__(NovelWritingTab)
+        tab.current_project = {"imported_chapter_plan_reference": {}}
+        tab.chapter_ai_preview = _FakePlainTextEdit("")
+        state = {
+            "status": "generating",
+            "total_chapter_count": 30,
+            "existing_chapter_count": 10,
+            "requested_chapter_count": 20,
+            "batch_size": 50,
+            "chapters": [{"index": index} for index in range(11, 21)],
+        }
+
+        tab._show_chapter_plan_generation_progress(state)
+
+        preview = tab.chapter_ai_preview.toPlainText()
+        self.assertIn("已保存规划：20/30章", preview)
+        self.assertIn("当前批次：第21-30章，共10章", preview)
 
     def test_chapter_plan_stage_batches_resume_from_existing_chapters(self):
         tab = NovelWritingTab.__new__(NovelWritingTab)
@@ -2661,6 +2761,63 @@ class NovelWritingStateTests(unittest.TestCase):
 
         self.assertEqual(enabled, [True])
         self.assertFalse(tab._auto_expand_all_active)
+
+    def test_stop_unlocks_actions_when_worker_finished_before_cleanup_callback(self):
+        class FinishedWorker:
+            def isRunning(self):
+                return False
+
+        chapter = _new_chapter(0)
+        tab = NovelWritingTab.__new__(NovelWritingTab)
+        tab.current_project = {"chapters": [chapter]}
+        tab.current_chapter_index = 0
+        tab._current_background_chapter_runner = lambda: None
+        tab.writing_worker = FinishedWorker()
+        tab.context_build_worker = None
+        tab.chapter_plan_worker = None
+        tab._auto_expand_all_active = False
+        tab._chapter_plan_auto_active = False
+        tab._chapter_ai_transient_retry_pending = False
+        tab._chapter_ai_sequence_active = True
+        tab._status_message = "AI 辅助生成已中止。"
+        enabled = []
+        statuses = []
+        tab._set_chapter_ai_actions_enabled = enabled.append
+        tab.set_status_tip = statuses.append
+
+        tab.stop_chapter_ai_action()
+
+        self.assertEqual(enabled, [True])
+        self.assertFalse(tab._chapter_ai_sequence_active)
+        self.assertTrue(tab._chapter_ai_stop_requested_by_user)
+        self.assertEqual(statuses, [])
+
+    def test_stop_invalidates_finished_context_build_before_cleanup_callback(self):
+        class FinishedWorker:
+            def isRunning(self):
+                return False
+
+        tab = NovelWritingTab.__new__(NovelWritingTab)
+        tab.current_project = {"chapters": [_new_chapter(0)]}
+        tab.current_chapter_index = 0
+        tab._current_background_chapter_runner = lambda: None
+        tab.writing_worker = None
+        tab.context_build_worker = FinishedWorker()
+        tab.chapter_plan_worker = None
+        tab._context_build_token = 4
+        tab._context_build_pending = {"token": "stale"}
+        tab._auto_expand_all_active = False
+        tab._chapter_plan_auto_active = False
+        tab._chapter_ai_transient_retry_pending = False
+        enabled = []
+        tab._set_chapter_ai_actions_enabled = enabled.append
+        tab.set_status_tip = lambda _text: None
+
+        tab.stop_chapter_ai_action()
+
+        self.assertEqual(enabled, [True])
+        self.assertEqual(tab._context_build_token, 5)
+        self.assertEqual(tab._context_build_pending, {})
 
     def test_auto_expand_button_switches_between_start_and_stop(self):
         tab = NovelWritingTab.__new__(NovelWritingTab)
@@ -5043,6 +5200,7 @@ class NovelWritingStateTests(unittest.TestCase):
                         }
                     result = {
                         "logic_audit": {"checked": True, "issues": []},
+                        "prose_review": {"checked": True, "issues": []},
                         "outline": "赵明核对资料来源。", "summary": final_text,
                         "key_facts": ["资料来源仍然未知。"],
                         "long_form_memory": memory_update,
@@ -6034,6 +6192,7 @@ class NovelWritingStateTests(unittest.TestCase):
         self.assertEqual([item[0] for item in started], ["memory_finalize"])
         result = json.dumps({
             "logic_audit": {"checked": True, "issues": []},
+            "prose_review": {"checked": True, "issues": []},
             "outline": "1. 赵明进入王城。\n2. 赵明取出旧案卷宗。",
             "summary": "赵明进入王城并取得旧案卷宗。",
             "key_facts": ["赵明已经取得旧案卷宗。"],
@@ -6110,6 +6269,7 @@ class NovelWritingStateTests(unittest.TestCase):
                     "explanation": "屏风已经撤走，后文不能继续扑向屏风。",
                 }],
             },
+            "prose_review": {"checked": True, "issues": []},
             "outline": "1. 屏风被撤下。",
             "summary": "管事试图逃走。",
             "key_facts": ["屏风已经撤下。"],
@@ -6121,6 +6281,138 @@ class NovelWritingStateTests(unittest.TestCase):
         self.assertEqual(len(started), 1)
         self.assertEqual(started[0][0], final_text)
         self.assertEqual(started[0][2][0]["category"], "object_state")
+
+    def test_memory_finalize_rejects_missing_prose_review_instead_of_committing(self):
+        chapter = _new_chapter(0)
+        tab = NovelWritingTab.__new__(NovelWritingTab)
+        tab.current_project = {"chapters": [chapter]}
+        tab.current_chapter_index = 0
+        tab._chapter_ai_memory_pending = {
+            "chapter_id": chapter["id"],
+            "transaction_id": "tx-prose-review",
+            "final_text": "她抬头看向门外。",
+            "logic_audit_required": True,
+            "prose_patch_rounds": 0,
+        }
+        tab._schedule_transient_chapter_ai_retry = lambda *_args, **_kwargs: False
+        tab._log_novel_diagnostic = lambda *_args, **_kwargs: None
+        failures = []
+        tab._fail_memory_sync = lambda message: failures.append(message)
+
+        tab._handle_memory_finalize_ready(json.dumps({
+            "logic_audit": {"checked": True, "issues": []},
+            "outline": "她看向门外。",
+            "summary": "她抬头看向门外。",
+            "key_facts": ["她看向门外。"],
+            "long_form_memory": {},
+        }, ensure_ascii=False))
+
+        self.assertEqual(failures, ["prose_review缺失，必须明确完成终稿审读"])
+        self.assertEqual(chapter.get("text", ""), "")
+
+    def test_memory_finalize_stops_after_two_prose_patch_rounds(self):
+        chapter = _new_chapter(0)
+        tab = NovelWritingTab.__new__(NovelWritingTab)
+        tab.current_project = {
+            "chapters": [chapter],
+            "long_form_memory": {"schema_version": "2", "revision": 0},
+        }
+        tab.current_chapter_index = 0
+        final_text = "她抬头看向门外，风从走廊尽头吹来。"
+        tab.chapter_ai_preview = _FakePlainTextEdit(final_text)
+        tab._chapter_ai_memory_pending = {
+            "chapter_id": chapter["id"],
+            "transaction_id": "tx-prose-round-limit",
+            "final_text": final_text,
+            "logic_audit_required": True,
+            "prose_review_required": True,
+            "prose_patch_rounds": 2,
+        }
+        tab._log_novel_diagnostic = lambda *_args, **_kwargs: None
+        tab._memory_bundle_validation_errors = lambda *_args, **_kwargs: []
+        tab._clear_transient_chapter_ai_retry = lambda *_args, **_kwargs: None
+        tab._apply_style_final_result = lambda *_args, **_kwargs: self.fail(
+            "两轮正文修补后仍有问题时不应提交"
+        )
+        failures = []
+        tab._fail_memory_sync = lambda message: failures.append(message)
+
+        tab._handle_memory_finalize_ready(json.dumps({
+            "logic_audit": {"checked": True, "issues": []},
+            "prose_review": {
+                "checked": True,
+                "issues": ["门外一处非中文残片仍需处理"],
+                "blocking_issues": [{
+                    "category": "non_chinese",
+                    "quote": "门外",
+                    "reason": "中文叙述混入无必要外语残片",
+                }],
+            },
+            "repair_patches": [{
+                "before": "她抬头看向门外",
+                "after": "她抬头望向门外",
+                "reason": "非中文词汇混入",
+            }],
+            "outline": "她看向门外。",
+            "summary": "她抬头看向门外。",
+            "key_facts": ["她看向门外。"],
+            "long_form_memory": {},
+        }, ensure_ascii=False))
+
+        self.assertEqual(
+            failures,
+            ["正文经过两轮局部修补后仍有未解决的审读问题，已停止提交并保留恢复检查点"],
+        )
+        self.assertEqual(chapter.get("text", ""), "")
+
+    def test_memory_finalize_blocks_confirmed_prose_issue_without_safe_patch(self):
+        chapter = _new_chapter(0)
+        tab = NovelWritingTab.__new__(NovelWritingTab)
+        tab.current_project = {
+            "chapters": [chapter],
+            "long_form_memory": {"schema_version": "2", "revision": 0},
+        }
+        tab.current_chapter_index = 0
+        final_text = "她看向门外 intermittently。"
+        tab.chapter_ai_preview = _FakePlainTextEdit(final_text)
+        tab._chapter_ai_memory_pending = {
+            "chapter_id": chapter["id"],
+            "transaction_id": "tx-prose-blocking-no-patch",
+            "final_text": final_text,
+            "logic_audit_required": True,
+            "prose_review_required": True,
+            "prose_patch_rounds": 0,
+        }
+        tab._log_novel_diagnostic = lambda *_args, **_kwargs: None
+        tab._memory_bundle_validation_errors = lambda *_args, **_kwargs: []
+        tab._clear_transient_chapter_ai_retry = lambda *_args, **_kwargs: None
+        tab._apply_style_final_result = lambda *_args, **_kwargs: self.fail(
+            "存在已确认且未修复的正文问题时不应提交"
+        )
+        failures = []
+        tab._fail_memory_sync = lambda message: failures.append(message)
+
+        tab._handle_memory_finalize_ready(json.dumps({
+            "logic_audit": {"checked": True, "issues": []},
+            "prose_review": {
+                "checked": True,
+                "issues": ["英文副词混入中文叙述"],
+                "blocking_issues": [{
+                    "category": "non_chinese",
+                    "quote": "intermittently",
+                    "reason": "该英文副词仅表示断断续续，属于无必要混入",
+                }],
+            },
+            "repair_patches": [],
+            "outline": "她看向门外。",
+            "summary": "她看向门外。",
+            "key_facts": ["她看向门外。"],
+            "long_form_memory": {},
+        }, ensure_ascii=False))
+
+        self.assertEqual(len(failures), 1)
+        self.assertIn("没有安全补丁", failures[0])
+        self.assertEqual(chapter.get("text", ""), "")
 
     def test_local_logic_repair_restarts_independent_memory_finalize(self):
         chapter = _new_chapter(0)
@@ -6187,6 +6479,7 @@ class NovelWritingStateTests(unittest.TestCase):
         )
         result = json.dumps({
             "logic_audit": {"checked": True, "issues": []},
+            "prose_review": {"checked": True, "issues": []},
             "outline": "1. 赵明核对资料。",
             "summary": "赵明确认资料来源仍未知。",
             "key_facts": ["资料来源仍然未知。"],
@@ -6774,6 +7067,105 @@ class NovelWritingStateTests(unittest.TestCase):
         self.assertEqual(memory["revision"], 1)
         self.assertEqual(len(memory["active_facts"]), 2)
         self.assertEqual(memory["active_facts"][-1]["fact"], "赵明已经取得旧案卷宗")
+
+    def test_memory_repair_response_continues_prose_patch_review_before_commit(self):
+        chapter = _new_chapter(0)
+        tab = NovelWritingTab.__new__(NovelWritingTab)
+        tab.current_project = {
+            "chapters": [chapter],
+            "characters": [],
+            "lore": [],
+            "foreshadow_items": [],
+            "long_form_memory": {"schema_version": "2", "revision": 0},
+        }
+        tab.current_chapter_index = 0
+        tab.chapter_ai_preview = _FakePlainTextEdit("")
+        tab.chapter_ai_stream_text = ""
+        tab._chapter_ai_memory_repair_attempts = 1
+        tab._chapter_ai_memory_pending = {
+            "chapter_id": chapter["id"],
+            "transaction_id": "tx-memory-repair-prose",
+            "final_text": "她看向门外 intermittently。",
+            "bundle": {
+                "outline": "她看向门外。",
+                "summary": "她看向门外。",
+                "key_facts": "1. 她看向门外。",
+                "memory_update": {},
+                "logic_audit": {"checked": True, "issues": []},
+                "prose_review": {"checked": True, "issues": ["混入英文副词"]},
+                "prose_review_present": True,
+                "repair_patches": [{
+                    "before": "她看向门外 intermittently。",
+                    "after": "她断断续续地看向门外。",
+                    "reason": "非中文词汇混入",
+                }],
+            },
+            "errors": ["状态资料需要修复"],
+            "logic_audit_required": True,
+            "prose_review_required": True,
+            "prose_patch_rounds": 0,
+        }
+        tab._ai_project_snapshot = lambda: deepcopy(tab.current_project)
+        tab._log_novel_diagnostic = lambda *_args, **_kwargs: None
+        tab._memory_bundle_validation_errors = lambda *_args, **_kwargs: []
+        tab._clear_transient_chapter_ai_retry = lambda *_args, **_kwargs: None
+        tab._start_memory_finalize = lambda text, **kwargs: setattr(
+            tab, "_restarted_finalize", (text, kwargs)
+        )
+        tab._apply_style_final_result = lambda *_args, **_kwargs: self.fail(
+            "状态修复后应先回到正文审读"
+        )
+
+        tab._handle_memory_repair_ready(json.dumps({
+            "summary": "她看向门外。",
+            "long_form_memory_patch": {
+                "replace": {"state_patch": {}},
+            },
+            "prose_review": {
+                "checked": True,
+                "issues": ["英文副词混入中文叙述"],
+            },
+        }, ensure_ascii=False))
+
+        self.assertEqual(
+            tab._restarted_finalize,
+            ("她断断续续地看向门外。", {"prose_patch_rounds": 1}),
+        )
+
+    def test_memory_repair_saves_partial_progress_before_delayed_retry(self):
+        chapter = _new_chapter(0)
+        tab = NovelWritingTab.__new__(NovelWritingTab)
+        tab.current_project = {
+            "chapters": [chapter], "characters": [], "lore": [], "foreshadow_items": [],
+            "long_form_memory": {"schema_version": "2", "revision": 0},
+        }
+        tab.current_chapter_index = 0
+        tab.chapter_ai_preview = _FakePlainTextEdit("")
+        tab._chapter_ai_memory_repair_attempts = 1
+        tab._chapter_ai_memory_pending = {
+            "chapter_id": chapter["id"], "final_text": "已经完成的正文终稿。",
+            "errors": ["本章摘要为空", "关键事实为空"],
+            "bundle": {"outline": "实际提纲", "summary": "", "key_facts": "", "memory_update": {}},
+        }
+        tab._persist_ai_generation_state = lambda: None
+        tab._note_project_dirty = lambda: None
+        callbacks = []
+        tab._schedule_transient_chapter_ai_retry = lambda *_args, **kwargs: (
+            callbacks.append(kwargs["retry_callback"]) or True
+        )
+
+        tab._handle_memory_repair_ready(json.dumps({"summary": "第一轮已经修好的摘要"}))
+
+        checkpoint = chapter["ai_generation_checkpoint"]
+        self.assertEqual(len(callbacks), 1)
+        self.assertEqual(checkpoint["bundle"]["summary"], "第一轮已经修好的摘要")
+        self.assertNotIn("本章摘要为空", checkpoint["validation_errors"])
+        self.assertIn("关键事实为空", checkpoint["validation_errors"])
+        self.assertEqual(checkpoint["status"], "pending")
+        self.assertEqual(checkpoint["final_text"], "已经完成的正文终稿。")
+        self.assertEqual(tab._chapter_ai_memory_pending["bundle"], checkpoint["bundle"])
+        self.assertEqual(tab._chapter_ai_memory_pending["errors"], checkpoint["validation_errors"])
+        self.assertEqual(chapter["text"], "")
 
     def test_memory_repair_stops_auto_expand_after_three_retries(self):
         chapter = _new_chapter(0)

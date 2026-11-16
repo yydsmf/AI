@@ -102,11 +102,124 @@ class GeminiProtocolTests(unittest.TestCase):
                 self.assertEqual(payload["systemInstruction"], {"parts": [{"text": "system"}]})
                 self.assertEqual(payload["contents"], [{"role": "user", "parts": [{"text": "user"}]}])
                 self.assertEqual(payload["generationConfig"], {
-                    "temperature": 0.2, "maxOutputTokens": 16000, "responseMimeType": "application/json",
+                    "temperature": 0.2, "maxOutputTokens": 28672, "responseMimeType": "application/json",
+                    "thinkingConfig": {"thinkingBudget": 24576},
                 })
                 self.assertNotIn("reasoning_effort", payload)
                 self.assertNotIn("response_format", payload)
                 self.assertNotIn("stream", payload)
+
+    def test_modern_native_gemini_high_is_independent_of_stream_and_alias(self):
+        for model in ("gemini-3.1-pro", "gemini-3.8-flash-high", "models/gemini-4-hydrogen"):
+            for stream in (False, True):
+                with self.subTest(model=model, stream=stream):
+                    _, _, payload, _ = workers._build_novel_generation_request(
+                        BASE_URL, "key", model, "system", "user", stream=stream,
+                        reasoning_effort="high",
+                    )
+                    self.assertEqual(payload["generationConfig"]["thinkingConfig"], {"thinkingLevel": "HIGH"})
+                    self.assertGreaterEqual(payload["generationConfig"]["maxOutputTokens"], 16384)
+                    self.assertNotIn("reasoning_effort", payload)
+
+    def test_gemini_keeps_high_when_caller_requests_xhigh(self):
+        for protocol in ("gemini", "openai"):
+            for stream in (False, True):
+                with self.subTest(protocol=protocol, stream=stream):
+                    _, _, payload, _ = workers._build_novel_generation_request(
+                        BASE_URL, "key", "models/gemini-3.8-flash-high", "system", "user",
+                        stream=stream, reasoning_effort="xhigh", protocol=protocol,
+                    )
+                    if protocol == "gemini":
+                        self.assertEqual(
+                            payload["generationConfig"]["thinkingConfig"],
+                            {"thinkingLevel": "HIGH"},
+                        )
+                        self.assertNotIn("reasoning_effort", payload)
+                    else:
+                        self.assertEqual(payload["reasoning_effort"], "high")
+
+    def test_modern_gemini_omits_temperature_on_both_transports(self):
+        models = (
+            "gemini-3.5-flash-lite", "gemini-3.5-flash_lite-preview",
+            "gemini-3.6-flash", "models/GEMINI-3.8-flash-high", "gemini-4-pro",
+            "gemini-flash-latest", "gemini-pro",
+        )
+        for model in models:
+            for protocol in ("gemini", "openai"):
+                for stream in (False, True):
+                    with self.subTest(model=model, protocol=protocol, stream=stream):
+                        _, _, payload, _ = workers._build_novel_generation_request(
+                            BASE_URL, "key", model, "system", "user", stream=stream,
+                            temperature=0.2, reasoning_effort="high", protocol=protocol,
+                        )
+                        self.assertNotIn("temperature", payload)
+                        config = payload.get("generationConfig", {})
+                        self.assertNotIn("temperature", config)
+                        if protocol == "gemini" and "latest" not in model and model != "gemini-pro":
+                            self.assertEqual(config["thinkingConfig"], {"thinkingLevel": "HIGH"})
+                        elif protocol == "openai":
+                            self.assertEqual(payload["reasoning_effort"], "high")
+
+    def test_legacy_gemini_preserves_requested_temperature(self):
+        for model in (
+            "gemini-1.5-pro", "gemini-2.0-flash", "models/gemini-2.5-pro",
+            "gemini-3-pro-preview", "gemini-3.1-pro", "gemini-3.5-flash",
+        ):
+            for protocol in ("gemini", "openai"):
+                for stream in (False, True):
+                    with self.subTest(model=model, protocol=protocol, stream=stream):
+                        _, _, payload, _ = workers._build_novel_generation_request(
+                            BASE_URL, "key", model, "system", "user", stream=stream,
+                            temperature=0.2, protocol=protocol,
+                        )
+                        config = payload["generationConfig"] if protocol == "gemini" else payload
+                        self.assertEqual(config["temperature"], 0.2)
+
+    def test_modern_gemini_workers_omit_temperature_after_protocol_fallback(self):
+        model = "gemini-3.8-flash"
+        cache_key = workers._novel_protocol_cache_key(BASE_URL, model)
+        self.addCleanup(workers._NOVEL_GEMINI_PROTOCOL_OVERRIDES.discard, cache_key)
+        for mode in ("stream", "nonstream", "writing"):
+            with self.subTest(mode=mode):
+                workers._NOVEL_GEMINI_PROTOCOL_OVERRIDES.discard(cache_key)
+                text = "<NOVEL_OUTPUT_START>Result.<NOVEL_OUTPUT_END>" if mode == "writing" else json.dumps(RESULT)
+                if mode == "nonstream":
+                    success = Response({"choices": [{"message": {"content": text}}]})
+                else:
+                    success = Response(lines=[sse({
+                        "choices": [{"delta": {"content": text}, "finish_reason": "stop"}],
+                    }), "data: [DONE]"])
+                session = Session(Response({"error": {"message": "route not found"}}, status=404), success)
+                if mode == "writing":
+                    worker = workers.NovelWritingWorker(BASE_URL, "key", model, "outline", "context")
+                    worker._session.close()
+                    worker._session = session
+                    errors = []
+                    worker.failed.connect(errors.append)
+                    worker.run()
+                    self.assertEqual(errors, [])
+                else:
+                    worker = workers.NovelAnalysisWorker(BASE_URL, "key", model, "context")
+                    worker._new_session = lambda: session
+                    method = worker._post_analysis_chunk_stream if mode == "stream" else worker._post_analysis_chunk
+                    self.assertEqual(method("system", "user", 1, 1), RESULT)
+                self.assertEqual(len(session.calls), 2)
+                native, compatible = (call[1]["json"] for call in session.calls)
+                self.assertNotIn("temperature", native["generationConfig"])
+                self.assertEqual(native["generationConfig"]["thinkingConfig"], {"thinkingLevel": "HIGH"})
+                self.assertNotIn("temperature", compatible)
+                self.assertEqual(compatible["reasoning_effort"], "high")
+                self.assertEqual(worker.diagnostics["protocol_fallback"], "openai")
+
+    def test_gemini_openai_workers_keep_high_on_explicit_compatible_endpoint(self):
+        base = "https://generativelanguage.googleapis.com/v1beta/openai"
+        for worker in (
+            workers.NovelAnalysisWorker(base, "key", MODEL, "context"),
+            workers.NovelWritingWorker(base, "key", MODEL, "memory_reconcile", "context"),
+        ):
+            with self.subTest(worker=type(worker).__name__):
+                self.assertEqual(worker.api_protocol, "openai")
+                self.assertEqual(worker._reasoning_effort_for_request(), "high")
 
     def test_native_usage_supports_google_cached_token_field(self):
         usage = workers._normalize_novel_usage({
@@ -275,6 +388,7 @@ class GeminiProtocolTests(unittest.TestCase):
                 self.assertIn(":", session.calls[0][0].split("/models/")[-1])
                 self.assertEqual(session.calls[1][0], BASE_URL + "/v1/chat/completions")
                 self.assertEqual(session.calls[1][1]["headers"]["Authorization"], "Bearer key")
+                self.assertEqual(session.calls[1][1]["json"]["reasoning_effort"], "high")
                 self.assertEqual(worker.diagnostics["protocol_fallback"], "openai")
                 self.assertEqual(worker.api_protocol, "openai")
                 self.assertEqual(workers._novel_api_protocol(BASE_URL, MODEL), "openai")

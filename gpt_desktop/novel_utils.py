@@ -144,8 +144,8 @@ def _creation_event_catalog(framework):
 CHAPTER_EVENT_HANDOFF_GUIDANCE = (
     "阶段事件是当前阶段的唯一剧情事实来源，程序已经为当前批次确定事件顺序和章节槽位；"
     "模型只把当前槽位中的事件转化为人物正在经历的具体故事，不自行重排事件或创建第二套事件顺序。"
-    "batch_continuity.event_handoff中的completed_events是已经发生的事实，只能作为当前压力、关系变化和人物新选择的起点；"
-    "active_events才是当前批次可以展开的阶段事件，do_not_replay中的内容不能重新写成主事件。"
+    "batch_continuity.event_handoff中的completed_events只标识已分配过章位的事件，实际已发生的事实以已保存章节提纲和previous_batch_tail为准；"
+    "active_events标识当前批次可展开的事件，其完整计划读取当前阶段事件事实包；计划result与state_delta随对应章位中的行动成立。"
     "同一物件、故障、证据或技术结论再次出现时，必须转化为新人物、新目标、新对手、新代价、新关系结果或新的公开后果；"
     "只增加解释、讨论、等待、记录、复核、确认、整理或同一地点的换说法，不算剧情推进。"
     "source_event_ids由程序根据固定章节槽位回填，模型不需要返回事件编号；历史返回的索引也不能改变程序归属。"
@@ -2509,6 +2509,58 @@ def _analysis_chunk_sort_key(value):
     return key
 
 
+_CREATION_PREMISE_AUTHOR_FIELDS = {
+    "audience",
+    "genre",
+    "theme",
+    "role",
+    "plot",
+    "style",
+    "protagonist_route",
+    "protagonist_style",
+    "custom_protagonist_style",
+}
+
+
+def _clean_creation_framework_premise(value):
+    """Keep loaded premise data at title/synopsis/core-motive boundary."""
+    framework = deepcopy(value) if isinstance(value, dict) else {}
+
+    def clean_candidate(candidate, keep_author_fields=False):
+        candidate = candidate if isinstance(candidate, dict) else {}
+        cleaned = {
+            "title": str(
+                candidate.get("title", candidate.get("name", "")) or ""
+            ).strip(),
+            "synopsis": str(
+                candidate.get("synopsis", candidate.get("summary", "")) or ""
+            ).strip(),
+            "core_motive": str(
+                candidate.get("core_motive", "") or ""
+            ).strip(),
+        }
+        if keep_author_fields:
+            for key in _CREATION_PREMISE_AUTHOR_FIELDS:
+                item = candidate.get(key)
+                if item not in (None, "", [], {}):
+                    cleaned[key] = deepcopy(item)
+        return cleaned
+
+    candidates = framework.get("premise_candidates", [])
+    framework["premise_candidates"] = [
+        cleaned
+        for cleaned in (
+            clean_candidate(item) for item in candidates if isinstance(item, dict)
+        )
+        if cleaned["title"] or cleaned["synopsis"]
+    ] if isinstance(candidates, list) else []
+    framework["premise"] = clean_candidate(
+        framework.get("premise", {}),
+        keep_author_fields=True,
+    )
+    return framework
+
+
 def _normalize_project(data):
     base = _default_project()
     if not isinstance(data, dict):
@@ -2519,7 +2571,9 @@ def _normalize_project(data):
     base["meta"].update({k: str(meta.get(k, base["meta"].get(k, ""))) for k in base["meta"]})
     creation_framework = data.get("creation_framework", {})
     if isinstance(creation_framework, dict):
-        base["creation_framework"] = deepcopy(creation_framework)
+        base["creation_framework"] = _clean_creation_framework_premise(
+            creation_framework
+        )
     creation_wizard_state = data.get("creation_wizard_state", {})
     if isinstance(creation_wizard_state, dict):
         base["creation_wizard_state"] = deepcopy(creation_wizard_state)
@@ -8590,10 +8644,6 @@ def _style_centered_structure_bands(reference, target_chars=0):
     structure = reference if isinstance(reference, dict) else _style_text_structure(reference)
     target = max(0, int(target_chars or 0))
     expected_paragraphs = structure["paragraphs_per_1000"] * target / 1000 if target else 0.0
-    expected_dialogue_turns = structure["dialogue_turns_per_1000"] * target / 1000 if target else 0.0
-    expected_short_dialogue_turns = (
-        structure["short_dialogue_turns_per_1000"] * target / 1000 if target else 0.0
-    )
     return {
         "paragraph_low": max(1, round(expected_paragraphs * 0.85)) if expected_paragraphs else 0,
         "paragraph_high": max(1, round(expected_paragraphs * 1.15)) if expected_paragraphs else 0,
@@ -8601,23 +8651,6 @@ def _style_centered_structure_bands(reference, target_chars=0):
         "density_high": structure["paragraphs_per_1000"] * 1.15,
         "short_pct_low": max(0.0, structure["short_paragraph_pct"] - 8.0),
         "short_pct_high": min(100.0, structure["short_paragraph_pct"] + 8.0),
-        "dialogue_pct_low": max(0.0, structure["dialogue_char_pct"] - 8.0),
-        "dialogue_pct_high": min(100.0, structure["dialogue_char_pct"] + 8.0),
-        "dialogue_turn_low": max(0, round(expected_dialogue_turns * 0.80)),
-        "dialogue_turn_high": max(1, round(expected_dialogue_turns * 1.20)) if expected_dialogue_turns else 0,
-        "dialogue_turn_rate_high": max(
-            structure["dialogue_turns_per_1000"] + 4.0,
-            structure["dialogue_turns_per_1000"] * 1.20,
-        ),
-        "short_dialogue_turn_low": max(0, round(expected_short_dialogue_turns * 0.80)),
-        "short_dialogue_turn_high": (
-            max(1, round(expected_short_dialogue_turns * 1.25))
-            if expected_short_dialogue_turns else 0
-        ),
-        "short_dialogue_turn_rate_high": max(
-            structure["short_dialogue_turns_per_1000"] + 3.0,
-            structure["short_dialogue_turns_per_1000"] * 1.25,
-        ),
     }
 
 
@@ -8638,12 +8671,6 @@ def _style_fragmentation_drift_flags(reference, candidate):
         - ref["single_sentence_short_paragraph_pct"] > 18
     ):
         flags.append("非对白单句短段偏高")
-    if current["dialogue_char_pct"] > bands["dialogue_pct_high"]:
-        flags.append("对白字数占比偏高")
-    if current["dialogue_turns_per_1000"] > bands["dialogue_turn_rate_high"]:
-        flags.append("对白轮数偏多")
-    if current["short_dialogue_turns_per_1000"] > bands["short_dialogue_turn_rate_high"]:
-        flags.append("短对白轮数偏多")
     return flags
 
 
@@ -8742,23 +8769,6 @@ def _style_draft_mismatch_reasons(style_reference, draft_text, output_target=0):
     if ref_sentence and not (ref_sentence * 0.75 <= draft_sentence <= ref_sentence * 1.35):
         reasons.append(f"句子长度中位数不符：样本约{ref_sentence}字，首次正文约{draft_sentence}字")
 
-    dialogue_gap = abs(draft["dialogue_char_pct"] - reference["dialogue_char_pct"])
-    if dialogue_gap > 8:
-        reasons.append(
-            f"对白字数占比不符：样本约{reference['dialogue_char_pct']:.0f}%，"
-            f"首次正文约{draft['dialogue_char_pct']:.0f}%"
-        )
-    bands = _style_centered_structure_bands(reference, draft["chars"])
-    if draft["dialogue_turns_per_1000"] > bands["dialogue_turn_rate_high"]:
-        reasons.append(
-            f"对白轮数偏多：样本每1000字约{reference['dialogue_turns_per_1000']:.1f}轮，"
-            f"首次正文约{draft['dialogue_turns_per_1000']:.1f}轮"
-        )
-    if draft["short_dialogue_turns_per_1000"] > bands["short_dialogue_turn_rate_high"]:
-        reasons.append(
-            f"短对白轮数偏多：样本每1000字约{reference['short_dialogue_turns_per_1000']:.1f}轮，"
-            f"首次正文约{draft['short_dialogue_turns_per_1000']:.1f}轮"
-        )
     fragmentation_flags = _style_fragmentation_drift_flags(reference, draft)
     if len(fragmentation_flags) >= 2:
         reasons.append(
@@ -8788,7 +8798,7 @@ def _style_finalize_preflight_targets(style_reference, candidate_text, output_ta
     if len(fragmentation_flags) >= 2:
         lines.append(
             "候选同时出现" + "、".join(fragmentation_flags)
-            + "；本次必须整体减少无效换行和功能性短问短答，不能只修其中一项。"
+            + "；请综合检查无效换行和仅为重复交接流程的短问短答；有口吻、情绪或关系作用的自然对白应保留，不能只凭句长和轮数删减。"
         )
 
     density = reference["paragraphs_per_1000"]
@@ -8835,38 +8845,11 @@ def _style_finalize_preflight_targets(style_reference, candidate_text, output_ta
             f"候选非对白单句短段占{candidate['single_sentence_short_paragraph_pct']:.0f}%，"
             f"样本约{reference['single_sentence_short_paragraph_pct']:.0f}%；普通说明连续短段必须先合并再交付。"
         )
-    dialogue_overage = candidate["dialogue_char_pct"] - reference["dialogue_char_pct"]
-    if dialogue_overage > 8:
-        dialogue_high_pct = bands["dialogue_pct_high"]
-        dialogue_high_chars = max(0, math.floor(candidate["chars"] * dialogue_high_pct / 100))
-        dialogue_rewrite_chars = max(
-            0,
-            int(candidate.get("dialogue_chars", 0) or 0) - dialogue_high_chars,
-        )
+    if lines and candidate["dialogue_turn_count"]:
         lines.append(
-            f"候选对白字数占{candidate['dialogue_char_pct']:.0f}%，样本约"
-            f"{reference['dialogue_char_pct']:.0f}%；本次至少将{dialogue_rewrite_chars}字普通对白"
-            f"改写为人物化叙述，交付时对白总字数不得超过约{dialogue_high_chars}字。"
-            "保留人物声纹和冲突小场景，优先改写普通核验、汇报、流程命令和重复问答；"
-            "不能只删引号、缩短对白或用新增对白补回。"
-        )
-    if (
-        bands["dialogue_turn_high"]
-        and candidate["dialogue_turn_count"] > bands["dialogue_turn_high"]
-    ):
-        lines.append(
-            f"候选有{candidate['dialogue_turn_count']}轮对白，按样本和本章篇幅约应保持"
-            f"{bands['dialogue_turn_low']}-{bands['dialogue_turn_high']}轮；优先删除或改写只负责确认、"
-            "交接、复问和重复结论的台词，不得删减冲突、关系变化和关键信息。"
-        )
-    if (
-        bands["short_dialogue_turn_high"]
-        and candidate["short_dialogue_turn_count"] > bands["short_dialogue_turn_high"]
-    ):
-        lines.append(
-            f"候选15字以内短对白有{candidate['short_dialogue_turn_count']}轮，样本中心区间约为"
-            f"{bands['short_dialogue_turn_low']}-{bands['short_dialogue_turn_high']}轮；"
-            "将无新增信息的‘可以、好、明白、结果、能否’式功能台词并入动作或相邻完整表达。"
+            "排版调整只处理无效换行，不为命中段数删减对白、心理或情绪层次；"
+            "对白不设占比、轮数或句长目标。只有重复已知内容且没有人物口吻、情绪或关系作用的流程问答才合并，"
+            "‘可以、好、明白’等短句是否保留取决于场景。"
         )
     return "\n".join(f"- {line}" for line in lines)
 
@@ -8882,7 +8865,7 @@ def _style_finalize_priority_edit_text(style_reference, candidate_text, output_t
     return (
         "只修正下面这些已经严重偏离样本的结构问题；剧情完整、人物自然反应和场景适配高于数字，不得为了命中指标新增对白、笑点、动作或拆段。\n"
         + preflight
-        + "\n人物语言声纹只约束已经需要开口的人物。不要为了展示口吻新增台词；普通核验、汇报、程序命令和重复追问优先并回人物化叙述。"
+        + "\n人物语言声纹只约束已经需要开口的人物。不要为了展示口吻新增台词；核验、汇报、程序命令和追问只有在纯属重复流程、没有人物或情绪作用时才并回叙述，不因台词短或没有新信息就压缩。"
     )
 
 
@@ -9273,11 +9256,10 @@ def _style_finalize_acceptance_errors(
     if _style_finalize_acceptance_flag_failed(
         result.get("mechanical_prose_check")
     ):
-        errors.append("正文机械感明显：同构动作、重复解释或功能性问答形成流程化播报")
+        errors.append("正文机械感明显：同构动作、重复解释或无人物与情绪作用的流程问答形成播报；保留自然接话、情绪回环和关系反应")
     reference = _style_text_structure(style_reference)
     final_structure = _style_text_structure(body)
     if reference["chars"] >= 500 and final_structure["chars"] >= 300:
-        bands = _style_centered_structure_bands(reference, final_structure["chars"])
         fragmentation_flags = _style_fragmentation_drift_flags(
             reference,
             final_structure,
@@ -9286,7 +9268,7 @@ def _style_finalize_acceptance_errors(
             errors.append(
                 "终稿结构同时向短碎方向漂移："
                 + "、".join(fragmentation_flags)
-                + "；必须整体减少无效换行和功能性短问短答"
+                + "；综合整理无效换行和纯流程复问，保留有口吻、情绪或关系作用的对白，不按句长和轮数统一压缩"
             )
         ref_density = reference["paragraphs_per_1000"]
         final_density = final_structure["paragraphs_per_1000"]
@@ -9331,35 +9313,6 @@ def _style_finalize_acceptance_errors(
         if final_run >= 3 and final_run > max(2, reference_run + 1):
             errors.append(
                 f"终稿连续非对白短段达到{final_run}段，样本最长约{reference_run}段"
-            )
-        if (
-            final_structure["dialogue_char_pct"]
-            > reference["dialogue_char_pct"] + 12.0
-        ):
-            errors.append(
-                f"终稿对白字数占比明显高于样本：样本{reference['dialogue_char_pct']:.0f}%，"
-                f"终稿{final_structure['dialogue_char_pct']:.0f}%；保留声纹小场景，"
-                "把普通核验、汇报、命令和重复问答合并回人物化叙述"
-            )
-        if final_structure["dialogue_turns_per_1000"] > max(
-            reference["dialogue_turns_per_1000"] + 4.0,
-            reference["dialogue_turns_per_1000"] * 1.30,
-        ):
-            errors.append(
-                f"终稿对白轮数明显高于样本：样本每1000字约"
-                f"{reference['dialogue_turns_per_1000']:.1f}轮，终稿约"
-                f"{final_structure['dialogue_turns_per_1000']:.1f}轮；"
-                "删除或改写只承担确认、交接、复问和重复结论的台词"
-            )
-        if final_structure["short_dialogue_turns_per_1000"] > max(
-            reference["short_dialogue_turns_per_1000"] + 3.0,
-            reference["short_dialogue_turns_per_1000"] * 1.35,
-        ):
-            errors.append(
-                f"终稿短对白轮数明显高于样本：样本每1000字约"
-                f"{reference['short_dialogue_turns_per_1000']:.1f}轮，终稿约"
-                f"{final_structure['short_dialogue_turns_per_1000']:.1f}轮；"
-                "把无新增信息的极短问答并入动作或相邻完整表达"
             )
         # The local structural measurements are authoritative for this check.
         # A model can omit the boolean after completing a valid edit; do not
@@ -10501,11 +10454,11 @@ def _style_generation_issue_text(reasons):
             continue
         if any(key in text for key in ("段落密度", "短段比例", "中长段", "短对白", "对白轮数", "对白比例", "对白字数占比")):
             if "对白" in text:
-                text = "对白与叙述衔接读感漂移：无必要台词或功能性问答偏多，需要减少重复确认。"
+                text = "对白与叙述衔接读感需核对：只有语义复述且没有人物、情绪或关系作用的流程问答才合并，保留自然接话与情绪回环。"
             elif "中长段" in text:
                 text = "叙述承载不足：必要信息被过度碎片化，需要自然合并成完整表达。"
             else:
-                text = "自然排版读感向短碎方向漂移：无效碎片、功能性问答或同义复述偏多。"
+                text = "自然排版读感向短碎方向漂移：检查无效碎片和纯流程复问，保留有作用的自然对白、心理与情绪层次。"
         lines.append("- " + text)
     return "\n".join(lines) or "- 本地读感检测无硬性问题"
 
@@ -10551,16 +10504,14 @@ def _style_runtime_profile(profile_text, style_reference="", include_structure=T
         distribution = (
             f"当前完整样本实际分布：每1000字约"
             f"{reference_structure['paragraphs_per_1000']:.1f}个非空段，"
-            f"15字以内短段约占{reference_structure['short_paragraph_pct']:.0f}%，"
-            f"对白字数约占{reference_structure['dialogue_char_pct']:.0f}%，"
-            f"每1000字约{reference_structure['dialogue_turns_per_1000']:.1f}轮对白。"
+            f"15字以内短段约占{reference_structure['short_paragraph_pct']:.0f}%。"
         )
     if include_structure:
         boundary = (
             "【运行时文风边界｜高于档案中的宽泛习惯】\n"
             + distribution
             + "档案中的‘大量、高频、常用、经常、偏短、偏多’只说明这种写法出现时的形态或相对辨识度，"
-            "不能决定它在单章出现多少；频率、段落结构和对白总量一律以完整样本实际分布为准。"
+            "不能决定它在单章出现多少；段落结构只作为防止明显排版漂移的软参考，对白总量、句长和轮数由人物与场景决定，不按样本统计压缩或补齐。"
             "每章常驻的只有作者惯用词、句法松紧、动作与反应词、说话标签、句子长短、称呼语气和人物接话方式。"
             "推理链、反复验证、群体同步反应、误读布局、喜剧反差、危机升级、专业排除和等待揭露都属于条件性剧情手法，"
             "只有当前提纲确实需要且符合片段卡适用边界时才能调用；不得为了证明文风相似而增加对应场面。"
@@ -10620,25 +10571,21 @@ def _style_execution_structure_contract(style_reference, context):
     structure = _style_text_structure(style_reference)
     if structure["chars"] < 500:
         return ""
-    density = float(structure["paragraphs_per_1000"] or 0)
-    short_pct = float(structure["short_paragraph_pct"] or 0)
     single_short_pct = float(structure["single_sentence_short_paragraph_pct"] or 0)
-    dialogue_pct = float(structure["dialogue_char_pct"] or 0)
     median = max(1, int(structure["paragraph_median"] or 1))
     target = _style_output_target_from_context(context)
     bands = _style_centered_structure_bands(structure, target)
     noun_short_limit = max(2, round(max(2000, target or 2000) / 1000))
     lines = [
-        "以下数字来自完整样本，是防止多项同时向短碎方向漂移的中心区间，不是逐项配额；低于下限时不得补对白、笑点、动作或拆段：",
+        "以下段落数字来自完整样本，只用于发现明显排版漂移，不是内容配额；不得据此增删对白、心理、动作或情绪：",
         f"- 每1000字非空段落中心区间为{bands['density_low']:.1f}-{bands['density_high']:.1f}段；段落长度中位数可参考{max(1, median - 8)}-{median + 8}字。",
         f"- 15字以内短段占比中心区间为{bands['short_pct_low']:.0f}%-{bands['short_pct_high']:.0f}%。",
         f"- 非对白35字以内单句短段占比可参考{max(0, single_short_pct - 15):.0f}%-{min(100, single_short_pct + 15):.0f}%。",
-        f"- 对白字数占比中心区间为{bands['dialogue_pct_low']:.0f}%-{bands['dialogue_pct_high']:.0f}%；人物没必要开口时直接用叙述，不为比例制造问答。",
-        "- 对白根据人物、场景和剧情需要自然出现，不设置固定句长、轮数或表达形式。",
+        "- 对白根据人物、场景和剧情需要自然出现；句长、轮数和对白比例随场景变化，不设数量目标，也不因偏离样本比例压缩对白。",
         f"- 普通对象名、操作名、阴性结果不得独立成段；约本章篇幅最多保留{noun_short_limit}个非对白名词独段，只留给真正改变认知的首次命名。",
         "- 连续3个及以上普通非对白短段应合并；真正的转折、对白、打断和样本式强调不为统计强行合并。",
-        "- 只有在连续对白没有新增信息、行动或关系变化时，才自然合并重复的问答；具体排版跟随场景和样本文本。",
-        "- 段落密度、短段和对白占比明显同时漂移时，优先合并无效换行和功能性问答，不为统计数字新增或截断对白。",
+        "- 只有连续问答既在重复已知内容，又没有人物口吻、情绪、关系或场景作用时才自然合并；确认、迟疑、短句和情绪回环是否保留由语境决定。",
+        "- 段落密度和短段比例同时明显漂移时，检查无效换行；对白无论长短，按人物、场景、情绪和关系需要保留。",
     ]
     return "\n".join(lines)
 
@@ -10647,21 +10594,21 @@ def _style_repetition_boundary_text():
     return (
         "文风中的重复必须区分用途：保留关键词强调、对白回环、情绪递进、悬念停顿和结论落点等修辞性重复；"
         "删除没有新增动作、信息、决定、后果或情绪转折的同义复述。"
-        "同一事实、规则、因果或证据边界原则上只完整说明一次；前文已经说明后，只有出现新证据、新决定或新后果时才能再次提及，"
-        "并应直接写新增部分，不重新讲完整背景。"
-        "每个核心结论必须指定一个信息所有者和一次完整揭示：由最合适的人物、行动结果或旁白其中之一承担，其他人物只能给出"
-        "会推动下一步的质疑、反应、决定或后果，不能换一种说法复述；人物已经说清后，旁白不得再补‘真正危险在于’、"
+        "同一事实、规则、因果或证据边界原则上只完整说明一次；前文已经说明后，新证据、新决定、新后果、理解差异或情绪与关系需要时可以再次提及，"
+        "但不为向读者解释而重新讲完整背景。"
+        "核心结论由最合适的人物、行动结果或旁白自然揭示，避免多人轮流复述同一说明；其他人物可以有符合其理解、关系和情绪的质疑、"
+        "迟疑、确认或回应，不要求每次回应立即推动行动。人物已经说清后，旁白不得再补‘真正危险在于’、"
         "‘这意味着’、‘不是A而是B’之类总结，旁白已经交代后也不得安排角色复述给读者。"
         "依赖检测、调查、拆封、来电或人物揭晓才能确认的答案，在结果出现前只能写可观察异常和立即行动，不能提前把完整因果说完，"
-        "再让结果或专业人物重复认证。专业结论出现时，把发现与必要后果合并为一次自然表达，下一段立即进入人物决定、冲突或新结果。"
-        "采购、核验、经手、审批、保管、运输等路径若不是本章核心冲突，必须压成一段人物化叙述或一句结果；"
-        "不得用连续短问短答把流程逐项盘完，也不得在叙述列举后再让人物逐项复问。"
+        "再让结果或专业人物重复认证。专业结论出现时，把发现与必要后果自然表达，随后可以承接人物理解、情绪、关系反应或行动，不机械地立刻切到下一结果。"
+        "采购、核验、经手、审批、保管、运输等路径若不是本章核心冲突，只概括必要的流程结果；"
+        "压缩的是流程信息，不是发生在其中的人物交流、心理或情绪。不要把流程逐项盘问，也不要在叙述列举后再让人物为读者复述；有口吻、情绪或关系作用的接话应保留。"
         "章节提纲只提供当前剧情方向，不是专业信息补全任务；提纲只概括为部分资金、相关主体、一次确认或一轮回应时，"
         "不得为了显得专业而自行补出多组精确金额、持股比例、文件名、时间戳、合同数量、界面字段或完整机构流程。"
         "只有会直接改变人物选择、关系、代价或章末结果的一项代表性细节可以具体落地，其余直接写结果。"
         "目标篇幅仍有余量时，优先展开人物取舍、关系后果、情绪共鸣和场景中的具体生活痕迹，不能追加查账、举证、核验或处置步骤补字数。"
         "状态快照、人物卡、设定、伏笔和关键事实是静默连续性约束，不是需要角色用对白或旁白逐条证明已经记住的正文任务。"
-        "同一人物连续出现多个同义反应时只保留最有力度且会影响下一步行动的一个；多人反应相同时用一个代表性反应或群体结果承接。"
+        "同一人物的同义反应若只在原地复述、没有情绪层次才合并；多人反应纯属重复时可用代表性反应承接，体现不同处境、理解或关系的反应仍应保留。"
         "上一章结尾原文是已经向读者发布的边界，不是本章可以复用的起笔素材；章节开篇不得原样或同义重写上一章的末句、"
         "对白、声音、动作落点、结论或情绪。上一章以对白结束时，从听者的新反应或新回答开始；以动作结束时，从动作造成的"
         "新结果或新阻力开始；以声音结束时，从声源揭示或人物听见后的新反应开始。只从上一章章末未完成状态继续，"
@@ -10963,7 +10910,7 @@ def _build_legacy_style_execution_context(
         "非调查推理模式不得预设连续思路段，确实需要判断时最多安排一段且不超过两句；"
         "调查推理模式最多安排两段集中判断，结论必须立刻改变动作、选择或风险。"
         f"三、段落节奏，把上方样本结构数字作为防止严重漂移的软参考；普通说明怎样合并，约本章篇幅最多保留{short_noun_limit}个非对白名词独段，"
-        "非对白单句短段不得连续超过2段。专业过程只保留会改变剧情结果的一步，其他步骤合并成结果句；"
+        "非对白单句短段不得连续超过2段。非核心专业流程只保留会改变剧情结果的必要步骤，其余操作信息合并成结果句；这项限制只针对流程信息，不压缩人物对白、立场表达和情绪反应。"
         "不能把每条信息都扩写成‘观察—理解—操作’的固定三段式，也不得为了命中比例新增对白、短段或笑点。"
         "四、本章核心声纹人物只列1至2人，写‘人物｜句子长短与称呼语气｜接话方式｜应避免的标准工作句’；"
         "其他人物静默继承人物卡，不逐人列满、不生成示例台词、不要求每个出场人物开口；"
@@ -10974,7 +10921,7 @@ def _build_legacy_style_execution_context(
         "也禁止用‘不是失败/但还不够/倒计时开始’式对称三段总结；若提纲要求阶段升级，必须用实际命令、异常或后果呈现。"
         "全表控制在300至600字，只保留会真正改变本章读感的少量规则，不写第二份剧情说明书。"
         + "随后生成一份完整备用正文草稿，供终稿调用失败时兜底。备用草稿只展开唯一剧情拍点，静默遵守边界，"
-        "不得用重复解释、重复反应、往返确认或同义对白补足篇幅。备用正文必须先按【本章写作长度】控制在目标的85%-115%，"
+        "不得用没有新增事实、人物态度或情绪关系变化的重复解释、反应、确认或同义对白补足篇幅；自然接话和有作用的重复、迟疑、让步、改口应按场景保留。备用正文必须先按【本章写作长度】控制在目标的85%-115%，"
         "并在交付前只检查是否严重偏离完整样本的段落与对白形态；不能为了命中数字新增短段、对白、冲突或喜剧。"
         "严格只输出以下三个分区，不输出其他标题、分析、状态JSON或Markdown代码块：\n"
         f"【剧情执行清单】\n{beat_low}-{beat_high}条唯一剧情拍点\n\n"
@@ -10999,10 +10946,10 @@ def _build_legacy_style_execution_context(
         "随后给出简短的本章声纹执行表：只写1至2名核心人物的口吻、样本中本章自然适用的习惯用词/口语、叙述与对白衔接方式、章末落点。"
         "人物对白、冲突声纹、日常口语与喜剧习惯常驻执行；不要求凑词频，不设置段落、短句或对白数量配额，不选择主叙事模式，不强制套片段卡。"
         "作者画像中‘大量、经常、偏短、偏多’等定性描述只表示相对倾向，不能被放大成整章统一节拍；"
-        "完整样本的自然读感优先；如果正文出现无效碎片、功能性问答堆叠或统一节拍，必须主动合并。"
-        "同一事实的证明边界只完整交代一次；后续角色或专业人员只给新增结果、决定或阻力，不能换一种说法再次解释。"
+        "完整样本的自然读感优先；只合并无效碎片和没有人物、情绪或关系作用的流程复问，不把自然接话、迟疑和情绪回环当作冗余，也不改成统一节拍。"
+        "同一事实的证明边界只完整交代一次；后续角色或专业人员不为读者换一种说法复述，但可以表现理解差异、情绪反应和关系回应，不要求每句都有新结果。"
         "本章主线不是调查推理时，关于‘能证明什么/不能证明什么’、隐私规则或查询范围最多完整出现一处；机构人物只承担一个改变结果的动作，不能形成流程辩论。"
-        "备用正文必须完整执行剧情拍点，正文写法以作者样本为最高标准；避免重复解释、同义对白、流程复述和替人物讲道理。"
+        "备用正文必须完整执行剧情拍点，正文写法以作者样本为最高标准；避免无情绪与人物作用的重复解释、同义对白、流程复述和作者式说理；可随人物处境、关系与事件压力自然展开必要的心理和情绪。"
         + _concrete_prose_expression_guidance(
             style_active=bool(style_reference), compact=True
         )
@@ -11042,9 +10989,14 @@ CORE_STORY_QUALITY_GUIDANCE = """
 【核心约束｜非作者明确要求不可随便更改、删除或弱化】
 以下要求共同适用于第一步故事方向、第二步阶段方向、第三步阶段规划及AI章节规划。表达方式随题材自然变化，不套统一事件类型。
 1. 每个事件落到具体人物或人物关系：写清人物想得到或守住什么、谁以什么行动阻挠或利用、主角如何选择以及造成什么可观察后果。避免报告式、案卷式、说明式推进；记录、复核、责任、封存、归档、资源、权限、规则、维护、合同、设备状态、生产安排等如确因题材和剧情需要出现，只作为具体人物冲突的必要背景或短结果，不把资料往来、维护或生产流程本身写成连续事件发动机、阶段主线、章节主线、悬念反转或伏笔回收方式。公司、合同或治理事项落到直接利益者的人物行动与对抗；设备、生产、资源、权限或规则问题落到具体人物的争夺、使坏、失误、隐瞒、误判或纰漏及现场后果。不从普通词汇自行推导出与题材无关的合同、公司、调查或案卷剧情。
-2. 从第二阶段起，结合题材与前后因果，相邻阶段必须同时实现压力递进和阶段大事件差异，二者不可互相替代：阶段压力从前一阶段已经成立的结果中引出，持续增加对手行动、冲突牵连、人物代价和局势压力；相较前一阶段，冲突牵连范围、直接对手、失败代价、公开后果或主角选择难度中自然提高至少两项，最终阶段达到全书峰值。阶段大事件也必须落实差异：相较前一阶段，主要场景、关键人物、事件核心、人物冲突四方面均须发生实质更换或升级，不能只满足其中若干项。具体地点或人物可以延续，但只有场景功能/范围、人物立场/关系/作用各自发生实质变化时，才算对应维度已升级；事件核心和人物冲突仍须分别发生实质变化，四方面不能互相替代。不得为满足变化而凭空扩大地图、势力或人物数量，也不能只提高同一事件的规模来代替阶段差异。第一阶段建立故事基准，后续变化由前项结果自然引出，不规定统一顺序或事件类型。
+2. 从第二阶段起，结合题材与前后因果，相邻阶段必须同时实现压力递进和阶段大事件差异，二者不可互相替代。阶段压力从前一阶段已经成立的结果中引出，持续增加对手行动、冲突牵连、人物代价和局势压力；相较前一阶段，冲突牵连范围、直接对手施加的行动阻力、失败代价、公开后果或主角选择难度中自然提高至少两项，最终阶段达到全书峰值。直接对手施加的压力可以通过行动、手段、关系和造成的后果增强，不代表对手的身份、权力或势力层级必须提高。
+
+阶段大事件也必须有明确差异。同一阶段内，围绕本阶段的大事件，允许相同的主要场景、对手和冲突随人物行动及其后果逐步升级，推进至本阶段高潮；每个节点都要带来新的行动、选择或结果，不能反复处理已经解决的问题。跨入新阶段后，主要场景、阶段性关键人物、事件核心和人物冲突四方面均须更换，不能只沿用原场景、原关键人物或原冲突继续升级、加码或扩大规模来代替更换。主角作为全书主线主体可以持续出现；前阶段的人物和地点也可以作为承接背景，但不能因此算作本阶段主要场景或阶段性关键人物已经更换。阶段性关键人物的更换不要求对手的身份、权力或势力层级逐阶段提高，也不得为满足更换而凭空扩大地图、势力或人物数量。
+
+后续阶段的变化须由前项结果自然引出，不规定统一的事件类型或推进顺序，也不能只提高同一事件的规模来代替阶段差异。
 3. 已完成的救援、解围或关系选择作为既成结果承接，不撤销后重演；同一人物不反复陷入同类待救危机。已取得的关键物品不反复失而复得、不拆成碎片，也不以同功能替代物延长争夺；后续变化须由新的具体行动和结果造成。
 4. 相邻阶段的大事件和关键推进不能只是同一任务换地点或加码重演，也不能只换人物名称、数量或说法反复处理已经解决的冲突；应由前项结果引出新的行动、选择、代价、关系变化或局势后果。高度相似、承担相同推进作用的事件或节点应合并，避免同一冲突拆成多个近义节点反复展开。服务主线的小事件可以自然过渡，但不能代替阶段推进或把同一问题拆开循环展开。
+生成全书阶段方向时，完成全部阶段后还要回看非相邻阶段：核心动机和长期对抗可以延续，但已完成或已明确兑现的具体阶段冲突、关系选择，不得换名、换地点或加码后再次作为阶段大事件；曾承担阶段核心作用的同一冲突机制，也不能只改表面便在后续阶段继续充当核心推进。若长期对抗仍须延续，后续阶段应从前项结果引出新的具体行动、人物冲突和结果。第三步阶段规划与AI章节规划按当前上下文中可见的全书阶段方向和已生成事实落实这一边界，只细化当前阶段，不改写已确认方向，也不提前兑现其它阶段结果。
 """.strip()
 
 
@@ -11155,8 +11107,6 @@ def _project_core_motive_text(project, limit=2200):
         contract.get("core_motive") or contract.get("primary_line"),
         foundation.get("core_motive") or foundation.get("core_mainline"),
         bible.get("main_conflict"),
-        premise.get("core_motive"),
-        premise.get("main_line"),
         meta.get("premise"),
     )
     for value in candidates:
@@ -11241,7 +11191,9 @@ def _prose_scene_grounding_guidance(compact=False):
             "【信息落地与对白边界】\n"
             "章节提纲、人物卡和作者规划只提供事实，不是正文措辞。旁白不要用‘第一步、第二步、第三步’或同类清单概括人物接下来要做什么，"
             "也不要连续堆姓名、身份、职位或性格标签代替人物表现；信息要随当前视角的所见、动作、对白、判断或结果自然出现。"
-            "冲突可以保留；连续对白不要求统一节拍或每句配动作，场面需要变化时再用有效的动作、心理或现场反馈承接，不设固定频率。\n"
+            "冲突可以保留；整场对话应有信息、关系、情绪或行动上的作用，不要求每句都新增信息或立即推动行动，也不统一压短。"
+            "按人物、关系和事件压力自然安排接话、停顿与必要的情绪回环；可穿插当下念头、犹豫、期待或身体感受表现未说出口的情绪，不要求每次心理变化立即转成行动。"
+            "对白、动作、心理或现场反馈按场景需要衔接，不设固定频率，也不机械地每句配动作；流程信息的概括要求不用于压缩人物交流、心理或情绪。\n"
         )
     return (
         "【信息落地与场景反应】\n"
@@ -11250,9 +11202,11 @@ def _prose_scene_grounding_guidance(compact=False):
         "需要保留的信息，要随人物当前的所见所闻、具体动作、现场判断、对白和随后结果自然显现；人物首次出现时，只保留当前场景真正有用的信息。"
         "人物确实在现场安排行动时，可以由人物自然说出，但要符合当下目的和人物口吻，不能把资料改成作者清单。\n"
         "【连续对白与反应】\n"
-        "冲突可以保留，但连续对白不要变成每句都反驳、质问、解释或下结论的对抗式问答；每一轮说话都应让信息、关系压力或人物行动继续变化。"
-        "当连续对白已经推进几轮且场面需要变化时，可以用能改变下一步的动作、表情、停顿、视线、心理判断、物件操作或现场反馈承接；"
-        "具体落点由人物关系、情绪、场景和项目文风决定，不设固定句数、动作频率或统一段落结构，也不要机械地每句配同类动作。\n"
+        "冲突可以保留，但连续对白不要变成每句都反驳、质问、解释或下结论的对抗式问答；整场对话应在信息、关系、情绪或人物行动上有所作用，"
+        "不要求每一轮都新增信息、升级压力或立即推动行动，也不把对白统一压短。"
+        "人物可以按当下关系、情绪和事件压力自然铺垫、确认、迟疑、绕话或回环；这些表达承担人物口吻、情绪变化或关系意味时应当保留。"
+        "需要时穿插动作、表情、停顿、视线、当下念头、犹豫、期待、身体感受或现场反馈，表现人物未说出口的顾虑和情绪，"
+        "不要求每次心理变化立即变成行动。具体详略由人物关系、事件压力、场景和项目文风决定，不设固定句数、动作频率或统一段落结构，也不要机械地每句配同类动作；流程信息的概括要求不用于压缩人物交流、心理或情绪。\n"
     )
 
 
@@ -11302,6 +11256,40 @@ def _concrete_prose_expression_guidance(style_active=False, compact=False):
     )
 
 
+def _prose_language_accuracy_guidance():
+    """Keep dialogue intelligible without imposing a fixed sentence style."""
+    return (
+        "【句意与词义搭配】\n"
+        "正文使用词义搭配准确、句意清楚的中文表达；对白按人物当下真正想表达的意思，写成符合身份、时代、关系和情绪的自然口语。"
+        "写完后核对可疑句中的行动者、动作、对象、条件和结果是否符合本意，量词与中心词是否搭配自然；"
+        "需要补足时按日常中文补足必要信息，让对方直接听懂。"
+        "主语或宾语在语境明确时可以自然省略，短答、停顿和修辞也按语境保留，不为补齐句子而硬扩写。"
+        "物品或抽象概念作主语时，结合惯用搭配和上下文判断：表达自然、意思明确的保留；"
+        "只有字面搭配与人物本意不符或造成理解别扭时，才按真实行动关系重组整句，写清人物实际要做什么、影响什么或会有什么结果。"
+        "人物的反驳、承诺和表态用日常口语讲具体事情。"
+        "人物表达的确定程度、承诺内容、否定范围和态度与剧情保持一致；句式长短及含蓄程度随人物和场景变化。\n"
+    )
+
+
+def _prose_language_review_guidance():
+    """Review language in the existing local prose-patch transaction."""
+    return (
+        "【正文语言审读与局部修补】\n"
+        "逐句结合上下文检查对白和叙述的词义搭配、主谓与动宾关系、必要成分、指代和句意，"
+        "找出搭配不当、成分缺失导致意思不清、指代混乱或修辞组合使意思难以理解的明确问题。"
+        "专项核对生硬拟人、抽象概念与具体动作硬拼，以及量词和中心词的搭配；即使能猜出大意，"
+        "搭配生硬的句子也要按人物实际要表达的具体意思重写。抽象概念替人完成具体动作的句子，"
+        "改为人物对实际做法、条件或后果的判断；按原意重新组织整句的主语、动作和对象，使表面句意与说话意图相符。"
+        "正常的口语短答、省略、停顿、含蓄表达和语境清楚的修辞保留原有语气。"
+        "把能够逐字定位的问题及原因记入prose_review.issues；原意能够由上下文确定时，"
+        "在repair_patches中提供符合人物口吻、词义搭配准确、句意完整的局部替换。"
+        "以完整问题句为修补单位，必要时连同紧邻接话一起调整；before逐字复制正文中唯一出现的连续原文，"
+        "不足8字时带上相邻原文以便唯一定位，after保留定位所带入的正确内容。"
+        "修补保留说话人、事实、人物决定、确定程度、承诺强度、否定范围和剧情结果。"
+        "上下文不足以确定原意时只记录具体问题；正确内容保持原样。\n"
+    )
+
+
 def _grounded_prose_contract(style_active=False):
     """Keep generated prose direct, concrete, and story-focused."""
     emotion_guidance = (
@@ -11310,7 +11298,7 @@ def _grounded_prose_contract(style_active=False):
         (
             "【自然语气与情绪】\n"
             "情绪明确时，不要把人物台词全部改成平直的完整陈述句；可以按人物、关系和现场自然使用语气词、"
-            "口语接话、停顿、改口、称呼变化、反问或短句。语气词、动作、心理、对白内容和现场结果共同完成情绪表达，"
+            "口语接话、停顿、改口、称呼变化或反问，句式长短随语境变化。语气词、动作、心理、对白内容和现场结果共同完成情绪表达，"
             "不能用语气词替代人物反应。\n"
         )
     )
@@ -11323,31 +11311,28 @@ def _grounded_prose_contract(style_active=False):
         "除非当前剧情明确要求人物看到或说出这个内部编号，否则不能把它当成地点、人物、物件或线索名称。"
         "AF/NF/CF/NCF/TASK/NTASK/NOBJ以及state_reconciliation、long_form_memory、repair_patches、logic_audit、prose_review等字段名同样属于程序资料；"
         "它们不能出现在小说正文里，也不能被改写成对白、聊天内容、旁白或人物内心。"
-        "情绪和气氛必须通过人物当下的动作、对白、反应和具体结果表现，不要用漂亮形容替代剧情。\n"
+        "情绪和气氛必须通过人物当下的动作、对白、心理、反应和具体结果表现，不要用漂亮形容替代剧情。\n"
         + _story_conflict_pacing_guidance(compact=True)
         + _procedural_plot_guard_guidance(compact=True)
         + _prose_scene_grounding_guidance()
         + "【对白自然衔接】\n"
-        "对白要像人物当面说话。人物回答时，按当下的关系和语境自然接住对方；需要说明来由、指代或态度时，把意思说清楚，让前一句与下一句接得上。"
+        "人物回答时，按当下的关系和语境自然接住对方，让前一句与下一句接得上。"
         "人物可以顺着对方的话解释、补充、反问、改口、调侃、试探、施压、让步或转开话题，这些表达由人物目的、关系和现场情绪决定。"
         "句式长短、语气词、称呼变化和说话后的动作随人物身份、关系和情绪自然变化；"
         "没有文风档案时，也要让语气词、停顿和接话方式从人物、关系和现场情绪中自然长出；"
         "已加载文风档案时，应优先沿用档案中适合当前人物和场景的表达，不要主动抹平；"
-        "也不要让所有人物采用同一种接话方式。"
-        "对白要推动关系、现场压力或人物行动继续变化，不让角色互相解释已经知道的事。\n"
-        "人物受到冲突、误解、意外、吸引或关系变化影响时，要写出会改变下一步行为的当下念头、判断或身体感受；"
-        "心理、动作和对白可以按场景需要交错、穿插或由其中一种承担推进，具体比例随人物、情绪和文风自然变化，不要求固定交替顺序。"
-        "不得用解释式、观点式和“金句式”抽象表达；"
-        "人物表达拒绝、讥讽或不满时，落到眼前的具体对象、安排和后果上，让台词像人物当场说给对方听的话。"
-        "人物反感眼前的说法或安排时，直接落到具体对象、场面和自己是否配合上；允许用人物自己的口语吐槽或拒绝，"
-        "不要把具体冲突写成抽象的权利、资格、归属、责任或关系宣言，也不要反复套用‘事实+反转总结’的口号式句型。"
-        "正文尽量少用‘决定’‘选择’‘不代表’等抽象词，除非剧情确实离不开，优先写具体的人、物、动作、反应和结果。\n"
+        "也不要让所有人物采用同一种接话方式；不要为了向读者复述资料而让角色互相解释已经知道的事，因安抚、试探、误解或情绪变化而再次提起时应按人物需要自然表达。\n"
+        "心理、动作和对白可以按场景需要交错、穿插，具体比例随人物、情绪和文风自然变化，不要求固定交替顺序。"
+        "不要用作者式说理或模板金句替代人物表达；人物需要解释、表达看法、拒绝、讥讽或不满时，"
+        "应从眼前的具体对象、安排、自身处境和情绪出发，让台词像人物当场说给对方听的话，允许自然展开，不必每次都交代行动后果。"
+        "不要把具体冲突写成脱离现场的权利、资格、归属、责任或关系宣言，也不要反复套用‘事实+反转总结’的口号式句型。"
+        "不要用‘决定’‘选择’‘不代表’等抽象结论代替具体的人、物、动作、心理和反应；人物当下自然需要这些词时可以正常使用。\n"
         + _concrete_prose_expression_guidance(style_active=style_active, compact=True)
         + emotion_guidance
         + "【具体状态词搭配】\n"
         "涉及气血、真气、灵力、内力、经脉、伤势、药剂等身体或力量状态时，先判断实际变化是稳定、恢复、运转、凝聚、消耗、紊乱、受损还是不足，使用与该状态匹配的动词和形容词；"
         "不要把‘完整、正确、成立、合理’等适合结论、资料或关系的抽象词直接套在气血、伤势或力量上。"
-        "对白中的反驳必须回应对方眼前的动作或主张，写出具体后果；例如对方说‘不用药剂’，应落到‘没有药剂辅助，气血稳不住、冲关时会乱或身体扛不住’这类现场结果，"
+        "对白中的反驳要回应对方眼前的动作或主张；需要解释身体或力量状态时，应使用‘没有药剂辅助，气血稳不住、冲关时会乱或身体扛不住’这类语义匹配的表达，不要求每次反驳都列出原因和后果，"
         "不要把‘嘴硬’和一个抽象结论拼成听着利落、实际不合语义的金句。\n"
     )
 
@@ -11365,12 +11350,12 @@ def _natural_expression_guidance(style_active=False):
         + (
             _style_voice_priority_guidance()
             if style_active else
-            "情绪明确时，不要把对白全压成平直陈述句；可以按人物和语境使用语气词、口语接话、停顿、改口、称呼变化或短句。"
+            "情绪明确时，不要把对白全压成平直陈述句；可以按人物和语境使用语气词、口语接话、停顿、改口或称呼变化，句式长短随语境变化。"
             "语气词、动作、身体反应、心理判断和现场后果共同完成情绪表达。"
         )
         + "涉及气血、真气、灵力、内力、经脉、伤势、药剂等状态时，先核对变化，用稳定、恢复、运转、凝聚、消耗、紊乱、受损或不足等匹配表达；"
         "不要把‘完整、正确、成立、合理’直接套上去；例如‘没有药剂辅助，气血稳不住’自然，‘气血变得完整’不自然。"
-        "对白回应眼前主张和后果，不把‘嘴硬’与抽象结论拼成金句。"
+        "对白贴合眼前主张、人物情绪和语境，需要说明后果时再自然说明，不把‘嘴硬’与抽象结论拼成金句。"
         "项目资料决定故事事实、人物和剧情；文风参考只决定表达方式，不把参考原文的人物、剧情、物件或句子带入当前正文。"
     )
 
@@ -11447,8 +11432,8 @@ def _build_style_execution_context(
         "项目资料中已经确定的人名、时间、地点、关系、物件、编号、人物状态和已发生事件保持原样延续。"
         "正文从当前章节的状态自然展开。"
         f"输出必须严格使用{NOVEL_PROSE_START_MARKER}和{NOVEL_PROSE_END_MARKER}包住正文；"
-        "包络外不输出任何说明，包络内不写‘我会’‘接下来’‘本章将’等规划、分析或执行稿内容，"
-        "只写可以直接进入小说的正文。\n"
+        "正文呈现故事中的人物言行、心理和叙述；模型针对生成任务的计划、分析和执行说明留在正文之外，"
+        "包络外不输出任何说明。\n"
         + _grounded_prose_contract(style_active=bool(reference))
     )
     budget = max(0, effective_limit - len(instruction) - 2)
@@ -12308,7 +12293,7 @@ def _build_style_finalize_context(
             "章末必须停在声纹表指定的具体动作、声音、异常、后果或一句人物对白上，禁止再追加抽象阶段宣告或对称三段总结。"
             + "输出前静默检查人物、物品、地点、伤势、时间、因果、结尾状态、对白声纹、办案式流程扩张和机械化表达。"
             + "段落排版指标已删除；自然排版、句式、对白衔接和习惯用词只用于贴近读感，不能据此新增、拆分或删改剧情。"
-            "只有普通说明、同义确认、重复边界说明和无新增信息的功能性问答形成明显机械播报时，才自然合并。"
+            "只有普通说明、同义确认、重复边界说明和流程问答既形成机械播报，又没有人物、情绪或关系作用时才自然合并；保留有作用的接话、犹豫与心理层次。"
             "同一证据或判断的‘能证明什么、不能证明什么’只完整说明一次；后续核验只写新增结果及其造成的选择或后果。"
             + "必须按【终稿剧情验收清单】逐项确认唯一剧情拍点已经执行，并删除非必要的前两章剧情复演。"
             + "终稿前在内部逐段检查净推进：相邻几段可以共同完成一个强调或情绪单元，"
@@ -12332,7 +12317,7 @@ def _build_style_finalize_context(
             "只要存在期限冲突、倒计时被占满或履约时间不足，就必须先修正文，不能把compatible写成true；"
             "提纲内部存在互斥描述时，还必须确认终稿只保留与已确认事实一致的一种状态。"
             "procedural_expansion_check只能在确认没有把非主线调查、核验、审批、封存、交接和记录扩成流程播报后写true；"
-            "mechanical_prose_check只能在确认没有同构动作、重复解释、功能性问答和段尾总结形成机械化播报后写true；"
+            "mechanical_prose_check只能在确认没有同构动作、重复解释、纯流程复问和段尾总结形成机械化播报后写true；自然接话、情绪回环、必要心理活动或关系回应不属于机械播报；"
             "这两项是硬约束，明确为false时必须修正文；字段缺失不等于失败。"
             "paragraph_structure_check如模型自行提供，只作诊断，不是重写条件；"
             "role_voice_attribution_check只能在逐句核对说话人、示例句归属和当前问答逻辑后写true。"
@@ -12344,7 +12329,7 @@ def _build_style_finalize_context(
             "发现硬矛盾时做最小修复，不新增提纲外流程、解释或事件。"
             "正文写法以作者样本和本章声纹表为最高标准：常驻执行人物对白、冲突声纹、日常口语和自然适用的作者原生词，"
             "用它们替换模型惯用表达，但不凑词频、不把低频词写成口头禅。"
-            "项目叙事策略只决定本章兑现与情绪方向，不得显性讲解；优先写动作、关系回应和后果，压缩程序过程、专业说明、重复确认和段尾总结。"
+            "项目叙事策略只决定本章兑现与情绪方向，不得显性讲解；动作、对白、心理、关系回应和后果随场景自然配合，只压缩无人物、情绪或关系作用的流程复述、专业赘述、重复确认和机械总结。"
             "当前状态快照、下一章记忆选择和未决任务只约束连续性，不是本章待办；当前提纲未明确安排的事项必须保持未决，"
             "不得扩成拍点、对白、核验或处置流程。"
             "自然排版与句式跟随样本读感变化，不执行固定换行、固定短句、固定对白数量或六种主叙事模式。"
@@ -12379,8 +12364,8 @@ def _build_style_finalize_context(
                 task_rule = (
                     "上一版终稿的剧情拍点、因果、人物状态和章末钩子必须全部保留，但原来的无效换行、"
                     "重复问答、同义解释和模型化动作标签不是必须保留内容。当前长度和自然读感已经明显漂移，"
-                    "必须在本次交付中完成整章压缩重组：合并无效碎片与功能性问答，删除不产生新变量的复述，"
-                    "减少无必要台词；不能只做少量同义改写后原样交付，也不能新增解释、流程或事件。"
+                    "需要整章压缩重组时，只合并无效碎片和无人物、情绪或关系作用的流程复问；"
+                    "保留自然对白、情绪回环与必要心理，篇幅不足时围绕已有场景补足人物体验，不一律减少台词；不能只做少量同义改写后原样交付，也不能新增说明、流程或事件。"
                 )
             else:
                 task_heading = "【终稿局部补救】"
@@ -12413,8 +12398,8 @@ def _build_style_finalize_context(
                 "也不能通过拆句让同一表达重复出现。语义不需要标签时直接省去，必要处保留，不改变剧情。"
                 if vocabulary_density_rescue else ""
             )
-            + "正文写法以作者样本、人物口吻、习惯词和自然口语为最高标准；优先用选择、动作、关系回应和后果推进，"
-            "压缩程序过程、专业说明、同义确认、机械总结和替人物讲道理。"
+            + "正文写法以作者样本、人物口吻、习惯词和自然口语为最高标准；选择、动作、对白、心理、关系回应和后果按场景自然配合，"
+            "只压缩无人物、情绪或关系作用的流程复述、专业赘述、同义确认、机械总结和作者式说理。"
             "当前状态快照、下一章记忆选择和未决任务只约束连续性，不是本章待办；当前提纲未明确安排的事项必须保持未决，"
             "不得扩成拍点、对白、核验或处置流程。"
             "本章主线不是调查推理时，关于‘能证明什么/不能证明什么’、隐私规则或查询范围最多完整出现一处；"
@@ -12563,16 +12548,6 @@ def _style_candidate_rank(style_reference, candidate, output_target=0):
         ) / 100 * 2.5
         distance += abs(structure["long_paragraph_pct"] - reference["long_paragraph_pct"]) / 100 * 1.5
         distance += relative_gap(structure["sentence_median"], reference["sentence_median"]) * 2.0
-        distance += abs(structure["dialogue_char_pct"] - reference["dialogue_char_pct"]) / 100 * 1.5
-        distance += abs(structure["dialogue_paragraph_pct"] - reference["dialogue_paragraph_pct"]) / 100
-        distance += relative_gap(
-            structure["dialogue_turns_per_1000"],
-            reference["dialogue_turns_per_1000"],
-        ) * 1.5
-        distance += relative_gap(
-            structure["short_dialogue_turns_per_1000"],
-            reference["short_dialogue_turns_per_1000"],
-        ) * 1.5
     return (round(invalid_penalty + distance, 6),)
 
 
@@ -12604,6 +12579,7 @@ def _build_style_rewrite_context(
         hard_targets.append(f"正文总字数控制在约{round(target * 0.85)}-{round(target * 1.15)}字")
     hard_target_text = "\n".join(f"- {item}" for item in hard_targets)
     ledger = str(plot_ledger or "").strip()
+    has_style = bool(str(style_reference or "").strip() or "【正文风格参考】\n" in original)
     instruction = (
         "【风格验收未通过：本次必须重写】\n"
         "首次正文的剧情事件、人物关系、设定事实和先后顺序均须保留，不得新增、删减或改换剧情；"
@@ -12622,6 +12598,15 @@ def _build_style_rewrite_context(
         "样本反复使用且适合当前语境的词应原样沿用，不得用模型默认同义词替换；局部词不得硬塞或集中堆砌。"
         "只输出重写后的完整正文，不输出标题、说明、分析、指标或修改记录。"
     )
+    if not has_style:
+        instruction = (
+            "【正文语言修订任务】\n"
+            "依据当前章节资料和原正文修订完整正文，保留剧情事实、人物决定、事件顺序和结果。"
+            "结合上下文处理下列明确问题，保持说话人的确定程度、承诺强度、否定范围和态度；正确句子与原段落原样保留。\n"
+            f"待修订问题：\n{reason_lines or '- 检查句意和词义搭配，修订明确的语言错误'}\n"
+            "以完整问题句为单位组织自然表达，保留有作用的短答、省略和接话。"
+            "只输出修订后的完整正文。"
+        )
     style_marker = "【AI文风画像】" if "【AI文风画像】" in original else "【风格锁定规则】"
     style_start = original.find(style_marker)
     if style_start >= 0:
@@ -21024,7 +21009,7 @@ def _build_long_form_memory_finalize_context(project, chapter_index, final_text)
     stage_boundary = (chapter_index + 1) % 10 == 0
     task = (
         "只读取已经完成的【最终正文】，独立生成实际提纲、本章摘要、需继承关键事实和版本2长篇记忆增量；"
-        "不得重写正文，不得把原规划提纲或下一章资料中的未来事件写成已经发生。\n"
+        "正文修补仅通过repair_patches提供局部替换，不输出整章正文；不得把原规划提纲或下一章资料中的未来事件写成已经发生。\n"
         "状态整理前必须检查正文成品是否误写入内部人物/设定/伏笔短引用、任务或状态字段名、JSON/代码、AI推理、提示词、输出要求、校验说明或工作流程说明；"
         "只有明确不是故事内界面文字、手机消息、文件内容或自然对白时才算泄漏。发现确定泄漏时才在repair_patches中给出最终正文里唯一出现的最小替换；"
         "无法确定或需要猜测剧情时不要修，不要仅因项目目录存在某个C/L/F编号就替换。\n"
@@ -21086,8 +21071,8 @@ def _build_long_form_memory_finalize_context(project, chapter_index, final_text)
         '"logic_audit":{"checked":true,"issues":[{"severity":"critical|major",'
         '"category":"chronology|causality|character_state|character_location|object_state|object_ownership|spatial_state|pronoun_reference|knowledge_permission|numeric_consistency|entity_relationship|fact_boundary",'
         '"earlier_quote":"较早的正文逐字原文","later_quote":"较晚的正文逐字原文","explanation":"两种状态为何不能同时成立"}]},'
-        '"prose_review":{"checked":true,"issues":["仅记录可逐字定位的读感问题"],"blocking_issues":[{"category":"non_chinese|encoding_corruption|metadata_leak","quote":"异常正文逐字片段","reason":"确认的问题"}]},'
-        '"repair_patches":[{"before":"正文中唯一出现的原句片段","after":"局部替换文本","reason":"重复说明|流程赘述|机械短碎|局部语言冲突|正文泄漏|非中文词汇混入"}]}。'
+        '"prose_review":{"checked":true,"issues":["可逐字定位的语言或读感问题"],"blocking_issues":[{"category":"non_chinese|encoding_corruption|metadata_leak","quote":"异常正文逐字片段","reason":"确认的问题"}]},'
+        '"repair_patches":[{"before":"正文中唯一出现的原句片段","after":"局部替换文本","reason":"搭配不当|句意不清|指代混乱|重复说明|流程赘述|机械短碎|局部语言冲突|正文泄漏|非中文词汇混入"}]}。'
         "输出顺序必须是outline、summary、key_facts、long_form_memory、logic_audit、prose_review、repair_patches。"
         "outline、summary、key_facts和long_form_memory是必填的核心结果；即使没有逻辑问题、没有读感修补、"
         "或本章没有新的长期状态变化，也绝不能只返回logic_audit、prose_review或repair_patches。"
@@ -21096,7 +21081,7 @@ def _build_long_form_memory_finalize_context(project, chapter_index, final_text)
         "logic_audit必须同时检查最终正文内部的直接矛盾，以及正文与【实体称谓与关系边界】之间的明确冲突；不评价文风和剧情选择，checked必须为true。"
         "prose_review还必须检查正文是否误写入内部人物/设定/伏笔短引用、任务或状态字段名、JSON/代码、AI推理、提示词、输出要求、校验说明或工作流程说明；"
         "只有明确属于生成过程而不是故事内界面文字、手机消息、文件内容或自然对白时才记录为正文泄漏。"
-        "issues用于读感诊断；blocking_issues只用于已经确认的无必要非中文残留、乱码/编码损坏或AI推理/说明字段泄漏，"
+        "issues用于语言和读感诊断；blocking_issues只用于已经确认的无必要非中文残留、乱码/编码损坏或AI推理/说明字段泄漏，"
         "每项必须是含category、quote、reason的对象，quote必须是正文逐字片段。确认的问题即使暂时没有安全替换，也必须放入blocking_issues；"
         "只有正文复查确认全部排除后才能返回blocking_issues:[]。"
         "prose_review还必须逐段检测中文叙述中无必要混入的英文副词、形容词和短语；例如 intermittently 若只表示‘断断续续’，必须指出并用repair_patches作自然中文的最小替换。"
@@ -21105,11 +21090,11 @@ def _build_long_form_memory_finalize_context(project, chapter_index, final_text)
         "确有必要的外语对白或故事内文件/界面内容中保留外文；不能把普通外语词误当专名，也不能误改真实外语内容。"
         "普通旁白、对白和人物内心活动中的自然判断不是AI推理泄漏；只有明确出现面向生成过程的推理、提示词、JSON/字段、校验、输出或工作流说明，"
         "或把内部任务/状态资料直接写进正文，才记录为元信息泄漏。"
-        "prose_review只记录有明确原文位置的重复说明、无结果流程赘述、机械短碎、局部语言冲突或确定的正文泄漏；"
-        "正常留白、剧情选择、文风偏好和现实流程不完整都不是问题。repair_patches通常为空；"
+        "prose_review同时记录有明确原文位置的重复说明、无结果流程赘述、机械短碎、局部语言冲突或确定的正文泄漏；"
+        "正常留白、剧情选择、文风偏好和现实流程不完整都不是问题。"
         "只有确实需要修补且before在最终正文中逐字唯一出现时才返回，最多3项；不确定的疑似泄漏不要修。"
         "每项只能做一处局部替换，不能改剧情事实、人物决定、时间线、关系结果、伏笔或章末结果，"
-        "更不能重写整段或整章。"
+        "替换范围限于问题句及必要的相邻接话，正确段落保持原样。"
         "outline、summary和key_facts只能概括最终正文已经发生的内容。summary控制在500字以内；"
         "key_facts通常控制在3-8条，每条只保留一个后文必须继承的合并事实，同一事件的背景、过程、判断和结果不得拆成多条。"
         "确有超过8项彼此独立且都会影响后文时必须保留，不得为了数字上限丢失关键连续性。"
@@ -21130,6 +21115,7 @@ def _build_long_form_memory_finalize_context(project, chapter_index, final_text)
     ) if part)
     source_sections = [
         ("任务", task, 3600, False),
+        ("正文语言检查规则", _prose_language_review_guidance(), 1200, False),
         (
             "当前章节",
             f"第{chapter_index + 1}章《{chapter.get('title', '')}》\n"
@@ -24069,15 +24055,15 @@ def _build_chapter_ai_context(project, chapter_index, action):
         "正文风格：口语化、自然、有网文阅读感，不要太工整、太书面、太像范文。"
         "句子长短混用，按人物当下状态自然变化。"
         "不得使用抽象情绪判断、四字词堆叠和模板化反应。"
-        "人物情绪优先通过对白、具体动作和当下反应体现。保持剧情高密度推进，但不要写成流水账。"
+        "人物情绪通过对白、具体动作、心理和当下反应自然体现。以完整场景保持有效推进和节奏起伏，不把每句对白、每次反应都当作推进任务，也不要写成流水账。"
         "不得写段尾总结、抽象情绪判断和万能反应动作；"
         "不得用“沉默、皱眉、冷意、压迫感、空气安静、所有人愣住、下一秒”等模板化表达替代具体剧情。"
         "场景描写优先用具体物件、动作和细节承载情绪，不要总用氛围词概括。"
-        "心理描写贴着人物当下的动作、对白、反应和感受展开；需要时写出人物的判断、犹豫、后悔或心动，让心理变化推动下一步。"
+        "心理描写贴着人物当下的动作、对白、反应和感受展开；根据场景、人物关系和事件压力，适当写出判断、犹豫、后悔、期待或心动，表现说出口与未说出口之间的情绪，不要求每段心理立即改变行动。"
         + terminal_ending_text +
         "段落结构要有变化，不要连续使用“动作描写 + 心理解释 + 氛围总结”的固定结构。"
         "场景细节用具体物件、声音、动作痕迹和环境反馈承载冲突、人物状态和信息变化，让细节与人物行动、情绪和现场结果相互照应。"
-        "不要写无意义生活噪声，不要让细节拖慢剧情。"
+        "避免与人物、情绪、关系和事件均无关的细节及重复灌水；有助于人物口吻、情绪积累、关系意味和场景真实感的接话、停顿与生活细节可以自然展开，详略服从当前场景。"
         "写每一场时优先让人物在具体环境里做事、被打断、受阻、临时反应，不要只用旁白解释情绪和局势。"
         "参考【本章写作长度】安排详略，但不要为了贴字数牺牲完整场景、冲突收束和正文质量；只输出正文内容。"
         if has_current_text else
@@ -24096,15 +24082,15 @@ def _build_chapter_ai_context(project, chapter_index, action):
         "正文风格：口语化、自然、有网文阅读感，不要太工整、太书面、太像范文。"
         "句子长短混用，按人物当下状态自然变化。"
         "不得使用抽象情绪判断、四字词堆叠和模板化反应。"
-        "人物情绪优先通过对白、具体动作和当下反应体现。保持剧情高密度推进，但不要写成流水账。"
+        "人物情绪通过对白、具体动作、心理和当下反应自然体现。以完整场景保持有效推进和节奏起伏，不把每句对白、每次反应都当作推进任务，也不要写成流水账。"
         "不得写段尾总结、抽象情绪判断和万能反应动作；"
         "不得用“沉默、皱眉、冷意、压迫感、空气安静、所有人愣住、下一秒”等模板化表达替代具体剧情。"
         "场景描写优先用具体物件、动作和细节承载情绪，不要总用氛围词概括。"
-        "心理描写贴着人物当下的动作、对白、反应和感受展开；需要时写出人物的判断、犹豫、后悔或心动，让心理变化推动下一步。"
+        "心理描写贴着人物当下的动作、对白、反应和感受展开；根据场景、人物关系和事件压力，适当写出判断、犹豫、后悔、期待或心动，表现说出口与未说出口之间的情绪，不要求每段心理立即改变行动。"
         + terminal_ending_text +
         "段落结构要有变化，不要连续使用“动作描写 + 心理解释 + 氛围总结”的固定结构。"
         "场景细节用具体物件、声音、动作痕迹和环境反馈承载冲突、人物状态和信息变化，让细节与人物行动、情绪和现场结果相互照应。"
-        "不要写无意义生活噪声，不要让细节拖慢剧情。"
+        "避免与人物、情绪、关系和事件均无关的细节及重复灌水；有助于人物口吻、情绪积累、关系意味和场景真实感的接话、停顿与生活细节可以自然展开，详略服从当前场景。"
         "写每一场时优先让人物在具体环境里做事、被打断、受阻、临时反应，不要只用旁白解释情绪和局势。"
         "参考【本章写作长度】安排详略，但不要为了贴字数牺牲完整场景、冲突收束和正文质量；只输出正文内容。"
     )
@@ -24189,7 +24175,7 @@ def _build_chapter_ai_context(project, chapter_index, action):
         "上一章结尾原文已经发布，不能把末句、对白、声音、动作落点、结论或情绪再次原样或同义写出；"
         "下一章必须从新反应、新结果、新阻力或新信息开始，不能让同一触发句同时作为上一章结尾和下一章开头。",
         "状态快照、活跃事实、人物卡、设定和伏笔用于静默保证连续性；未在本章发生变化的旧信息不是正文任务，"
-        "不得为了证明记住资料而让旁白或人物重新解释。只有新证据、新变化、新后果或当前行动确实依赖时才简短引用。",
+        "不得为了证明记住资料而让旁白或人物重新解释。新证据、新变化、新后果、当前行动或人物情绪与关系确实依赖时，可按场景需要自然引用，不重新复述整段背景，也不把‘简短’套用于人物正常交流。",
         "伏笔只在合适章节推进；已回收/无需回收/废弃伏笔不要重复当新线索。缺资料时保持克制，不要补出会影响后文的新设定。",
         "人物秘密、伏笔完整答案和未解锁的设定属于作者层；正文只能使用本上下文已显示的故事内已知内容和当章允许推进的边界。",
     ]
@@ -24344,8 +24330,8 @@ def _build_chapter_ai_context(project, chapter_index, action):
             f"{remaining_line}\n"
             "这是正文长度控制目标；通常把有效正文保持在目标的85%-115%，连续超出会破坏整书总字数和节奏。\n"
             "本章扩写字数代表本章正文希望补到的大约总量；如果正文草稿已有内容，只输出剩余部分。\n"
-            "完整收束确有必要时可以略微超出，但不得用重复解释、重复反应或同义对白扩充篇幅；"
-            "也不得为贴字数删掉关键结尾、跳过必要铺垫；"
+            "完整收束确有必要时可以略微超出，但不得用没有人物、情绪或关系作用的重复解释、重复反应或同义对白扩充篇幅；"
+            "也不得为贴字数删掉关键结尾、必要铺垫、自然对白或有作用的心理与情绪层次；"
             "项目总目标字数只用于整本小说规模规划，不要把项目总字数当作单章输出字数。"
         )
     else:

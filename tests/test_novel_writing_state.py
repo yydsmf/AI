@@ -104,7 +104,9 @@ class NovelWritingStateTests(unittest.TestCase):
         self.assertEqual(state["event_progress"]["S01-E02"]["status"], "consumed")
         self.assertEqual([item["id"] for item in handoff["completed_events"]], ["S01-E01", "S01-E02"])
         self.assertEqual([item["id"] for item in handoff["active_events"]], ["S01-E03"])
-        self.assertTrue(handoff["do_not_replay"])
+        self.assertNotIn("do_not_replay", handoff)
+        self.assertNotIn("result", handoff["completed_events"][0])
+        self.assertIn("实际已发生", handoff["usage"])
         self.assertEqual(
             tab._chapter_plan_local_event_ids_for_chapter(state, 3, 3, 4),
             ["S01-E03"],
@@ -124,6 +126,46 @@ class NovelWritingStateTests(unittest.TestCase):
             _format_chapter_outline_display("主角突破瓶颈。  本章境界推进：从炼气三层升到四层。"),
             "主角突破瓶颈。\n本章境界推进：从炼气三层升到四层。",
         )
+
+    def test_chapter_outline_display_accepts_ascii_realm_colon(self):
+        self.assertEqual(
+            _format_chapter_outline_display("他收起气息。本章境界推进:楚天行；大宗师巅峰保持不变。"),
+            "他收起气息。\n本章境界推进：楚天行；大宗师巅峰保持不变。",
+        )
+
+    def test_wizard_plan_transports_one_complete_event_package(self):
+        tab = NovelWritingTab.__new__(NovelWritingTab)
+        project = self._wizard_event_project()
+        stage = project["creation_framework"]["stage_plan"][0]
+        event_text = "人物在现场对抗并付出真实代价。" * 150 + "事件完整末尾"
+        stage["ordered_events"][0]["event"] = event_text
+        stage["entry_state"] = {"character_states": ["主角原有实力保持。" * 150]}
+        project["creation_framework"]["stage_directions"] = [{
+            "id": "R01", "name": "宏观阶段", "summary": "当前卖点",
+            "key_beats": ["第二步节点无需作为第二份执行清单"],
+        }]
+        tab.current_project = project
+        state = {"target_words": 12000, "average_chapter_words": 3000,
+                 "total_chapter_count": 4, "existing_chapter_count": 0, "chapters": []}
+        context = tab._chapter_plan_batch_context(state, 4)
+        payload = json.loads(context[context.index('{"task":'):])
+        transmitted = payload["wizard_framework"]["stage_plan"][0]
+        self.assertEqual(transmitted["ordered_events"][0]["event"], event_text)
+        self.assertEqual(transmitted["entry_state"], stage["entry_state"])
+        self.assertEqual(context.count(event_text), 1)
+        self.assertNotIn("第二步节点无需作为第二份执行清单", context)
+        self.assertNotIn("event", payload["batch_continuity"]["locked_node_schedule"]["nodes"][0])
+        self.assertNotIn("同一节点第一次发生时完成它的核心转折", context)
+        self.assertIn('"i":1', context)
+
+    def test_event_handoff_does_not_promote_planned_result_to_actual_fact(self):
+        tab = NovelWritingTab.__new__(NovelWritingTab)
+        tab.current_project = self._wizard_event_project()
+        tab.current_project["creation_framework"]["stage_plan"][0]["ordered_events"][0]["result"] = "计划中的对手死亡"
+        state = {"chapters": [{"index": 1, "source_event_ids": ["S01-E01"], "outline": "实际对手仍在逃走。"}]}
+        handoff = tab._chapter_plan_event_handoff(state, 2, 4)
+        self.assertNotIn("计划中的对手死亡", json.dumps(handoff, ensure_ascii=False))
+        self.assertIn("previous_batch_tail", handoff["usage"])
 
     def test_chapter_plan_preview_formats_realm_progress_marker(self):
         tab = NovelWritingTab.__new__(NovelWritingTab)

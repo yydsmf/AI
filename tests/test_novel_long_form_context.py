@@ -66,6 +66,8 @@ from gpt_desktop.novel_utils import (
     _parse_chapter_logic_repair_result,
     _parse_memory_repair_result,
     _parse_memory_reconciliation_result,
+    _prose_scene_grounding_guidance,
+    _prose_language_review_guidance,
     _prose_review_validation_errors,
     _parse_style_technique_cards_result,
     _parse_style_voice_cards_result,
@@ -102,6 +104,7 @@ from gpt_desktop.novel_utils import (
     _select_style_reference_excerpts,
     _select_style_execution_cards,
     _style_draft_mismatch_reasons,
+    _style_fragmentation_drift_flags,
     _style_finalize_acceptance_errors,
     _style_finalize_error_is_hard,
     _style_finalize_preflight_targets,
@@ -112,6 +115,7 @@ from gpt_desktop.novel_utils import (
     _style_candidate_needs_rescue,
     _style_native_vocabulary_text,
     _style_recent_vocabulary_usage_text,
+    _style_text_structure,
 )
 
 
@@ -3000,7 +3004,7 @@ class NovelLongFormContextTests(unittest.TestCase):
         self.assertIn("连续对白不要变成每句都反驳、质问、解释或下结论的对抗式问答", context)
         self.assertIn("不设固定句数、动作频率或统一段落结构", context)
         self.assertIn("【对白自然衔接】", context)
-        self.assertIn("需要说明来由、指代或态度时，把意思说清楚", context)
+        self.assertIn("人物回答时，按当下的关系和语境自然接住对方", context)
         self.assertIn("场景描写优先用具体物件、动作和细节承载情绪", context)
         self.assertIn("段落结构要有变化", context)
         self.assertNotIn("对白要有真人说话的不完整感", context)
@@ -3008,10 +3012,11 @@ class NovelLongFormContextTests(unittest.TestCase):
         self.assertIn("场景细节用具体物件、声音、动作痕迹和环境反馈承载冲突、人物状态和信息变化", context)
         self.assertNotIn("场景细节要克制", context)
         self.assertNotIn("少量加入具体物件、声音、动作痕迹和环境反馈", context)
-        self.assertIn("不要写无意义生活噪声", context)
+        self.assertIn("避免与人物、情绪、关系和事件均无关的细节及重复灌水", context)
         self.assertIn("优先让人物在具体环境里做事、被打断、受阻、临时反应", context)
         self.assertIn("完整收束确有必要时可以略微超出", context)
-        self.assertIn("不得用重复解释、重复反应或同义对白扩充篇幅", context)
+        self.assertIn("不得用没有人物、情绪或关系作用的重复解释、重复反应或同义对白扩充篇幅", context)
+        self.assertIn("不得为贴字数删掉关键结尾、必要铺垫、自然对白或有作用的心理与情绪层次", context)
         self.assertNotIn("2970-3150字", context)
         self.assertNotIn("严格长度约束", context)
         self.assertIn("项目总目标字数：20万字", context)
@@ -3040,7 +3045,8 @@ class NovelLongFormContextTests(unittest.TestCase):
         self.assertIn("能力或条件有差别时落到动作、卡点和后果", draft_context)
         self.assertIn("不是固定句式", draft_context)
         self.assertIn("不要用‘第一步、第二步、第三步’或同类清单概括人物接下来要做什么", draft_context)
-        self.assertIn("连续对白不要求统一节拍或每句配动作", draft_context)
+        self.assertIn("不要求每一轮都新增信息、升级压力或立即推动行动", draft_context)
+        self.assertIn("也不把对白统一压短", draft_context)
         self.assertIn("不得把参考原文的人物、剧情、物件或句子带入当前正文", guidance)
         self.assertNotIn("空得很有存在感", draft_context)
         self.assertNotIn("沉默很有情绪", draft_context)
@@ -9670,6 +9676,38 @@ class NovelLongFormContextTests(unittest.TestCase):
         }])
         self.assertIn("混入了分析或结构化内容", structured_errors[0])
 
+    def test_language_patch_can_replace_whole_sentence_and_preserve_other_dialogue(self):
+        body = "他把照片推回桌上。\n‘照片不用替过去作证。’\n‘知道了。’\n‘三日之内，债务自然会解决。’"
+        replacement = "‘当年的事，用不着拿这张照片来证明。’"
+        repaired, errors = _apply_chapter_prose_repair_patches(body, [{
+            "before": "‘照片不用替过去作证。’",
+            "after": replacement,
+            "reason": "词义搭配不当，依据上下文重写完整问题句",
+        }])
+        self.assertEqual(errors, [])
+        self.assertEqual(repaired, body.replace("‘照片不用替过去作证。’", replacement))
+
+    def test_rewrite_without_style_keeps_prose_task_instead_of_requesting_sample_imitation(self):
+        context = _build_style_rewrite_context(
+            "【当前章节】\n原剧情。", "原正文。", ["修正搭配不当"],
+        )
+        self.assertIn("【正文语言修订任务】", context)
+        self.assertIn("保持说话人的确定程度、承诺强度、否定范围和态度", context)
+        self.assertNotIn("风格验收未通过", context)
+        self.assertNotIn("贴近【正文风格参考】", context)
+
+    def test_existing_prose_review_carries_language_repair_rules_without_new_schema(self):
+        chapter = _new_chapter(0)
+        context = _build_long_form_memory_finalize_context({"chapters": [chapter]}, 0, "原正文。")
+        self.assertEqual(context.count(_prose_language_review_guidance().strip()), 1)
+        self.assertLess(context.index("【正文语言审读与局部修补】"), context.index("【最终正文】\n"))
+        self.assertIn("搭配不当|句意不清|指代混乱", context)
+        self.assertIn("before逐字复制正文中唯一出现的连续原文", context)
+        self.assertIn("正文修补仅通过repair_patches提供局部替换，不输出整章正文", context)
+        self.assertNotIn("不得重写正文", context)
+        self.assertNotIn("repair_patches通常为空", context)
+        self.assertIn("最多3项", context)
+
     def test_style_finalize_context_omits_metrics_for_unseen_rejected_candidate(self):
         reference = "\n".join(
             f"人物看清第{index}处变化以后，才作出下一步决定。"
@@ -9736,7 +9774,7 @@ class NovelLongFormContextTests(unittest.TestCase):
             for error in errors
         ))
 
-    def test_style_finalize_acceptance_flags_excessive_functional_dialogue(self):
+    def test_style_finalize_acceptance_uses_semantic_flow_check_not_dialogue_ratio(self):
         reference = "\n".join(
             f"人物观察现场变化，并根据第{index}项结果作出新的决定。"
             for index in range(60)
@@ -9753,7 +9791,11 @@ class NovelLongFormContextTests(unittest.TestCase):
             reference,
         )
 
-        self.assertTrue(any("对白字数占比明显高于样本" in error for error in errors))
+        self.assertFalse(any("对白字数占比明显高于样本" in error for error in errors))
+        errors = _style_finalize_acceptance_errors(
+            "", body, {"mechanical_prose_check": False}, reference,
+        )
+        self.assertTrue(any("正文机械感明显" in error for error in errors))
 
     def test_style_finalize_acceptance_flags_large_length_drift(self):
         reference = "\n".join(
@@ -9852,7 +9894,7 @@ class NovelLongFormContextTests(unittest.TestCase):
         self.assertTrue(any("结构多项同时向短碎方向漂移" in reason for reason in reasons))
         self.assertTrue(any("终稿结构同时向短碎方向漂移" in error for error in errors))
 
-    def test_style_finalize_preflight_reports_centered_dialogue_merge_targets(self):
+    def test_style_finalize_preflight_preserves_dialogue_while_merging_layout(self):
         reference = "\n".join(
             (
                 f"样本第{index}段，人物先处理眼前变化，再顺着结果采取下一步行动。"
@@ -9872,9 +9914,68 @@ class NovelLongFormContextTests(unittest.TestCase):
         )
 
         self.assertIn("交付时保持", result)
-        self.assertIn("轮对白", result)
-        self.assertIn("短对白", result)
-        self.assertIn("功能台词并入动作或相邻完整表达", result)
+        self.assertIn("不为命中段数删减对白、心理或情绪层次", result)
+        self.assertIn("对白不设占比、轮数或句长目标", result)
+        self.assertIn("只有重复已知内容且没有人物口吻、情绪或关系作用的流程问答才合并", result)
+        self.assertNotIn("轮对白", result)
+        self.assertNotIn("对白总字数不得超过", result)
+        self.assertNotIn("字普通对白改写为", result)
+
+    def test_dialogue_statistics_alone_do_not_fail_rewrite_or_rank_candidates(self):
+        dialogue = "\n".join(
+            "“先别走。”“你还生气？”她摸着杯沿，原先想好的话到了嘴边，又舍不得说得太重。"
+            "他等了片刻，终于把门重新合上。“我只是怕你不回来。”“我在。”"
+            for _ in range(20)
+        )
+        # Keep every layout and sentence-length measurement identical.
+        narrative = dialogue.translate(str.maketrans({"“": "他", "”": "说"}))
+        self.assertGreater(_style_text_structure(dialogue)["short_dialogue_turn_count"], 50)
+        for reference, candidate in ((narrative, dialogue), (dialogue, narrative)):
+            with self.subTest(dialogue_reference=reference == dialogue):
+                self.assertEqual(_style_fragmentation_drift_flags(reference, candidate), [])
+                self.assertEqual(_style_draft_mismatch_reasons(reference, candidate), [])
+                self.assertEqual(_style_finalize_preflight_targets(reference, candidate), "")
+                self.assertEqual(_style_finalize_acceptance_errors("", candidate, {}, reference), [])
+                self.assertEqual(
+                    _style_candidate_rank(reference, candidate),
+                    _style_candidate_rank(reference, reference),
+                )
+
+    def test_draft_context_keeps_dialogue_and_psychology_with_or_without_style(self):
+        for reference in ("", "作者样本：她想解释，又不知该从哪句说起。\n“先坐一会儿吧。”"):
+            for existing in ("", "她推开门，看见他还在等。"):
+                with self.subTest(has_style=bool(reference), continuation=bool(existing)):
+                    chapter = _new_chapter(0)
+                    chapter["outline"] = "夫妻争执后试着和解，却都不愿先服软。"
+                    chapter["text"] = existing
+                    project = self._project_with_current_chapter(chapter)
+                    project["style_reference"] = reference
+
+                    context = _build_chapter_ai_context(project, 0, "draft")
+
+                    self.assertIn(_prose_scene_grounding_guidance().strip(), context)
+                    self.assertIn("不要求每一轮都新增信息、升级压力或立即推动行动", context)
+                    self.assertIn("这些表达承担人物口吻、情绪变化或关系意味时应当保留", context)
+                    self.assertIn("表现人物未说出口的顾虑和情绪", context)
+                    self.assertIn("不要求每次心理变化立即变成行动", context)
+                    self.assertIn("流程信息的概括要求不用于压缩人物交流、心理或情绪", context)
+                    if reference:
+                        self.assertIn(reference, context)
+                        self.assertIn("完整文风正文样本是正文表达的最高标准", context)
+                    else:
+                        self.assertIn("以完整场景保持有效推进和节奏起伏", context)
+                        self.assertNotIn("【仿写优先级｜已加载文风档案】", context)
+
+    def test_mechanical_flow_check_remains_blocking_with_or_without_style(self):
+        body = "“确认了吗？”\n“确认了。”\n“再确认一次。”" * 30
+        for reference in ("", "人物在场景中自然交流，动作与情绪相互照应。" * 40):
+            with self.subTest(has_style=bool(reference)):
+                errors = _style_finalize_acceptance_errors(
+                    "", body, {"mechanical_prose_check": False}, reference,
+                )
+                mechanical = [error for error in errors if "正文机械感明显" in error]
+                self.assertEqual(len(mechanical), 1)
+                self.assertTrue(_style_finalize_error_is_hard(mechanical[0]))
 
     def test_style_finalize_preflight_never_adds_dialogue_to_quiet_candidate(self):
         reference = "\n".join(

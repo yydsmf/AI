@@ -8,7 +8,13 @@ import gpt_desktop.workers as workers_module
 from gpt_desktop.core import reasoning_effort_for_model
 from gpt_desktop.novel_utils import (
     CORE_STORY_QUALITY_GUIDANCE,
+    _build_chapter_ai_context,
+    _new_chapter,
     _parse_style_finalize_result,
+    _prose_scene_grounding_guidance,
+    _prose_language_accuracy_guidance,
+    _prose_language_review_guidance,
+    _build_long_form_memory_finalize_context,
 )
 
 from gpt_desktop.workers import (
@@ -26,6 +32,45 @@ from gpt_desktop.workers import (
 
 
 class NovelAnalysisWorkerTests(unittest.TestCase):
+    def test_prose_language_accuracy_is_shared_once_across_prose_actions(self):
+        for action, marker in (
+            ("draft", "【小说正文直写】"),
+            ("draft", ""),
+            ("style_rewrite", ""),
+            ("style_rewrite", "【正文风格参考】\n作者样本。"),
+            ("style_finalize", "【终稿编辑任务】"),
+            ("script_to_novel", ""),
+        ):
+            for in_context in (False, True):
+                with self.subTest(action=action, marker=marker, in_context=in_context):
+                    context = marker + "\n当前章节资料。"
+                    if in_context:
+                        context += "\n" + _prose_language_accuracy_guidance()
+                    worker = NovelWritingWorker("http://example.test", "key", "model", action, context)
+                    combined = worker._action_prompt() + "\n" + context
+                    self.assertEqual(combined.count("【句意与词义搭配】"), 1)
+                    self.assertIn("人物表达的确定程度、承诺内容、否定范围和态度与剧情保持一致", combined)
+                    self.assertIn("短答、停顿和修辞也按语境保留", combined)
+                    self.assertIn("主语或宾语在语境明确时可以自然省略", combined)
+                    self.assertIn("表达自然、意思明确的保留", combined)
+                    self.assertNotIn("涉及物品或抽象概念时，写清实际使用它的人", combined)
+                    self.assertNotIn("包络内不写‘我会’", combined)
+                    if action == "style_rewrite" and not marker:
+                        self.assertIn("小说正文修订编辑", combined)
+                        self.assertNotIn("章节策划助手", combined)
+
+    def test_memory_finalize_language_review_is_shared_once_with_context(self):
+        chapter = _new_chapter(0)
+        context = _build_long_form_memory_finalize_context(
+            {"chapters": [chapter]}, 0, "他答道：‘给我三天，这笔债我来处理。’",
+        )
+        for context in (context, "最终正文：‘知道了。’"):
+            worker = NovelWritingWorker("http://example.test", "key", "model", "memory_finalize", context)
+            combined = worker._action_prompt() + "\n" + context
+            self.assertEqual(combined.count("【正文语言审读与局部修补】"), 1)
+            self.assertIn(_prose_language_review_guidance(), combined)
+            self.assertNotIn("不改写正文的读感诊断", combined)
+
     def test_chapter_plan_prompt_uses_shared_story_quality_constraints_once(self):
         worker = NovelChapterPlanWorker(
             "http://example.test", "key", "model", "context", 200000, 3000, 2, 20
@@ -36,8 +81,13 @@ class NovelAnalysisWorkerTests(unittest.TestCase):
         self.assertIn(CORE_STORY_QUALITY_GUIDANCE, prompt)
         self.assertEqual(prompt.count("【核心约束｜非作者明确要求不可随便更改、删除或弱化】"), 1)
         self.assertIn("相邻阶段必须同时实现压力递进和阶段大事件差异", prompt)
-        self.assertIn("主要场景、关键人物、事件核心、人物冲突四方面均须发生实质更换或升级", prompt)
+        self.assertIn("跨入新阶段后，主要场景、阶段性关键人物、事件核心和人物冲突四方面均须更换", prompt)
+        self.assertIn("直接对手施加的压力可以通过行动、手段、关系和造成的后果增强", prompt)
+        self.assertIn("不代表对手的身份、权力或势力层级必须提高", prompt)
         self.assertIn("高度相似、承担相同推进作用的事件或节点应合并", prompt)
+        self.assertIn("完成全部阶段后还要回看非相邻阶段", prompt)
+        self.assertIn("核心动机和长期对抗可以延续", prompt)
+        self.assertIn("第三步阶段规划与AI章节规划按当前上下文中可见的全书阶段方向和已生成事实落实这一边界", prompt)
         self.assertIn("单个阶段事件或剧情节点最多覆盖两章（b-a+1<=2）", prompt)
         self.assertIn("这里的跨章变化只衡量同一事件内部的推进", prompt)
         self.assertIn("不替代公共核心约束中的阶段差异要求", prompt)
@@ -56,7 +106,7 @@ class NovelAnalysisWorkerTests(unittest.TestCase):
             stream=True,
             max_tokens=16000,
             temperature=0.2,
-            reasoning_effort="high",
+            reasoning_effort="xhigh",
             response_format=True,
         )
 
@@ -69,7 +119,7 @@ class NovelAnalysisWorkerTests(unittest.TestCase):
         ])
         self.assertEqual(payload["temperature"], 0.2)
         self.assertEqual(payload["max_tokens"], 16000)
-        self.assertEqual(payload["reasoning_effort"], "high")
+        self.assertEqual(payload["reasoning_effort"], "xhigh")
         self.assertEqual(payload["response_format"], {"type": "json_object"})
 
     def test_anthropic_request_marks_stable_system_prefix_for_prompt_cache(self):
@@ -101,6 +151,81 @@ class NovelAnalysisWorkerTests(unittest.TestCase):
         }
         self.assertTrue(workers_module._remove_anthropic_cache_options(payload))
         self.assertEqual(payload["system"], "系统")
+
+    def test_all_novel_analysis_and_writing_actions_request_xhigh_except_gemini(self):
+        for model in ("gpt-6.1-sol", "claude-opus-5-5[次]", "gemini-3.8-flash-high", "unknown-model"):
+            with self.subTest(model=model):
+                expected = "high" if "gemini" in model else "xhigh"
+                analysis = NovelAnalysisWorker("https://provider.example", "key", model, "context")
+                self.assertEqual(analysis._reasoning_effort_for_request(), expected)
+                for action in ("draft", "outline", "summary", "memory_finalize", "memory_reconcile",
+                               "memory_repair", "logic_repair", "style_audit", "new_auxiliary_action"):
+                    worker = NovelWritingWorker("https://provider.example", "key", model, action, "context")
+                    self.assertEqual(worker._reasoning_effort_for_request(), expected)
+
+    def test_anthropic_native_xhigh_respects_supported_model_versions(self):
+        cases = (
+            ("claude-opus-5-5[次]", "xhigh"),
+            ("claude-sonnet-5-5", "xhigh"),
+            ("claude-haiku-5-5", "xhigh"),
+            ("claude-opus-5", "xhigh"),
+            ("claude-sonnet-5", "xhigh"),
+            ("claude-opus-4-8", "xhigh"),
+            ("claude-opus-4-7", "xhigh"),
+            ("claude-sonnet-4-6", "high"),
+            ("claude-opus-4-6", "high"),
+            ("claude-mythos-5-1", "xhigh"),
+        )
+        for model, expected in cases:
+            for stream in (False, True):
+                with self.subTest(model=model, stream=stream):
+                    _, _, payload, _ = workers_module._build_novel_generation_request(
+                        "https://provider.example", "key", model, "system", "user",
+                        stream=stream, reasoning_effort="xhigh",
+                    )
+                    self.assertEqual(payload["thinking"], {"type": "adaptive"})
+                    self.assertEqual(payload["output_config"], {"effort": expected})
+                    self.assertNotIn("reasoning_effort", payload)
+
+    def test_claude_openai_transport_keeps_xhigh(self):
+        _, _, payload, protocol = workers_module._build_novel_generation_request(
+            "https://provider.example", "key", "claude-opus-5-5", "system", "user",
+            stream=True, reasoning_effort="xhigh", protocol="openai",
+        )
+        self.assertEqual(protocol, "openai")
+        self.assertEqual(payload["reasoning_effort"], "xhigh")
+        self.assertNotIn("output_config", payload)
+
+    def test_anthropic_native_high_uses_supported_thinking_mode(self):
+        for model in ("claude-opus-5-5[次]", "claude-sonnet-5-5", "claude-sonnet-4-6"):
+            for stream in (False, True):
+                with self.subTest(model=model, stream=stream):
+                    _, _, payload, _ = workers_module._build_novel_generation_request(
+                        "https://provider.example", "key", model, "system", "user",
+                        stream=stream, reasoning_effort="high",
+                    )
+                    self.assertEqual(payload["thinking"], {"type": "adaptive"})
+                    self.assertEqual(payload["output_config"], {"effort": "high"})
+                    self.assertEqual(
+                        payload["max_tokens"],
+                        workers_module._NOVEL_ANTHROPIC_DEFAULT_MAX_TOKENS,
+                    )
+                    self.assertNotIn("reasoning_effort", payload)
+                    self.assertNotIn("temperature", payload)
+
+    def test_legacy_claude_budget_leaves_output_room_and_dated_names_remain_legacy(self):
+        for model in ("claude-opus-4-5", "claude-sonnet-4-20250514", "claude-3-7-sonnet-20250219"):
+            with self.subTest(model=model):
+                _, _, payload, _ = workers_module._build_novel_generation_request(
+                    "https://provider.example", "key", model, "system", "user",
+                    stream=True, max_tokens=4000, reasoning_effort="xhigh",
+                )
+                self.assertEqual(payload["thinking"]["type"], "enabled")
+                self.assertGreaterEqual(payload["thinking"]["budget_tokens"], 1024)
+                self.assertLess(payload["thinking"]["budget_tokens"], payload["max_tokens"])
+                self.assertEqual(payload["max_tokens"], 16000)
+                if model == "claude-opus-4-5":
+                    self.assertEqual(payload["output_config"], {"effort": "high"})
 
     def test_novel_language_guidance_keeps_story_codes_and_translates_analysis_terms(self):
         guidance = workers_module._novel_chinese_output_guidance()
@@ -152,7 +277,7 @@ class NovelAnalysisWorkerTests(unittest.TestCase):
             outline_worker._action_prompt(),
         )
 
-    def test_novel_writing_reasoning_is_high_for_all_requested_actions(self):
+    def test_novel_writing_reasoning_is_xhigh_except_gemini_for_all_requested_actions(self):
         actions = (
             "draft",
             "outline",
@@ -181,18 +306,34 @@ class NovelAnalysisWorkerTests(unittest.TestCase):
             with self.subTest(action=action):
                 self.assertEqual(
                     reasoning_effort_for_model("unknown-model", "", action),
+                    "xhigh",
+                )
+                self.assertEqual(
+                    reasoning_effort_for_model("gemini-3.8-flash", "", action),
                     "high",
                 )
 
-    def test_framework_and_chapter_planning_reasoning_is_fixed_at_high(self):
+    def test_framework_and_chapter_planning_reasoning_is_xhigh_except_gemini(self):
         for action in ("框架分类", "章节规划"):
             with self.subTest(action=action):
                 self.assertEqual(
                     reasoning_effort_for_model(
                         "gpt-5.6-sol", "https://api.dxmcs.xin", action
                     ),
+                    "xhigh",
+                )
+                self.assertEqual(
+                    reasoning_effort_for_model("unknown-model", "", action),
+                    "xhigh",
+                )
+                self.assertEqual(
+                    reasoning_effort_for_model("gemini-3.8-flash", "", action),
                     "high",
                 )
+
+    def test_non_novel_chat_reasoning_policy_is_unchanged(self):
+        self.assertEqual(reasoning_effort_for_model("gpt-5.5", "", "chat"), "high")
+        self.assertEqual(reasoning_effort_for_model("unknown-model", "", "chat"), "")
 
     def test_volume_handoff_run_finalizes_success_diagnostics(self):
         worker = NovelVolumeHandoffWorker(
@@ -501,7 +642,8 @@ class NovelAnalysisWorkerTests(unittest.TestCase):
         prompt = worker._analysis_prompt()
 
         self.assertIn("当前节点的event、preconditions、result和state_delta组成一条不可越过的局部因果链", prompt)
-        self.assertIn("主角夺得暂时退路，但对手锁定其位置", prompt)
+        self.assertNotIn("主角夺得暂时退路，但对手锁定其位置", prompt)
+        self.assertIn("完整事件事实只读取wizard_framework.stage_plan.ordered_events", prompt)
         self.assertIn("下一节点只作为当前章末入口，不在本节点执行", prompt)
         self.assertIn("当前阶段最后节点；只在本节点范围内完成当前阶段出口", prompt)
         self.assertIn("本批绝对范围为第1-10章", prompt)
@@ -1099,6 +1241,8 @@ class NovelAnalysisWorkerTests(unittest.TestCase):
         self.assertEqual(parsed["characters"], [])
         self.assertEqual(worker.diagnostics["api_call_count"], 1)
         self.assertEqual(worker.diagnostics["response_models"], ["gpt-5.6-sol"])
+        self.assertEqual(session.last_payload["reasoning_effort"], "xhigh")
+        self.assertEqual(worker.diagnostics["reasoning_effort_requested"], "xhigh")
         attempt = worker.diagnostics["attempts"][0]
         self.assertEqual(attempt["requested_model"], "gpt-5.6-sol")
         self.assertEqual(attempt["response_model"], "gpt-5.6-sol")
@@ -1329,6 +1473,8 @@ class NovelAnalysisWorkerTests(unittest.TestCase):
             "cache_control": {"type": "ephemeral"},
         }])
         self.assertEqual(session.last_payload["messages"], [{"role": "user", "content": "context"}])
+        self.assertEqual(session.last_payload["output_config"], {"effort": "xhigh"})
+        self.assertEqual(session.last_payload["thinking"], {"type": "adaptive"})
         self.assertNotIn("temperature", session.last_payload)
         self.assertNotIn("response_format", session.last_payload)
         self.assertNotIn("reasoning_effort", session.last_payload)
@@ -1412,6 +1558,7 @@ class NovelAnalysisWorkerTests(unittest.TestCase):
         self.assertEqual(parsed["characters"], [])
         self.assertEqual(session.args[0], "https://provider.example/v1/messages")
         self.assertIn("x-api-key", session.kwargs["headers"])
+        self.assertEqual(session.kwargs["json"]["output_config"], {"effort": "xhigh"})
         self.assertNotIn("temperature", session.kwargs["json"])
         self.assertNotIn("response_format", session.kwargs["json"])
         self.assertNotIn("reasoning_effort", session.kwargs["json"])
@@ -1495,6 +1642,7 @@ class NovelAnalysisWorkerTests(unittest.TestCase):
         self.assertEqual(session.last_url, "https://provider.example/v1/messages")
         self.assertIn("x-api-key", session.last_headers)
         self.assertNotIn("Authorization", session.last_headers)
+        self.assertEqual(session.last_payload["output_config"], {"effort": "xhigh"})
         self.assertEqual(session.last_payload["system"], [{
             "type": "text",
             "text": workers_module._with_novel_language_guidance("系统提示词"),
@@ -1671,9 +1819,9 @@ class NovelAnalysisWorkerTests(unittest.TestCase):
                 self.assertNotIn("剧情推进要求", prompt)
                 self.assertNotIn("每两章至少要让主角", prompt)
                 self.assertIn("不得出现策划术语、抽象形容", prompt)
-                self.assertIn("不要把具体冲突写成抽象的权利、资格、归属、责任或关系宣言", prompt)
+                self.assertIn("不要把具体冲突写成脱离现场的权利、资格、归属、责任或关系宣言", prompt)
                 self.assertIn("不要用‘记录、责任线、复核、封存、归档’之类的办案式、案卷式叙事结构去推动剧情", prompt)
-                self.assertIn("正文尽量少用‘决定’‘选择’‘不代表’等抽象词", prompt)
+                self.assertIn("不要用‘决定’‘选择’‘不代表’等抽象结论代替具体的人、物、动作、心理和反应", prompt)
                 self.assertIn("不要用‘第一步、第二步、第三步’或同类清单概括人物接下来要做什么", prompt)
                 self.assertIn("不设固定句数、动作频率或统一段落结构", prompt)
 
@@ -1715,6 +1863,58 @@ class NovelAnalysisWorkerTests(unittest.TestCase):
         self.assertIn("雨已停", prompt)
         self.assertIn("不要在下一章开头改成仍在下雨", prompt)
 
+    def test_draft_prompt_preserves_natural_dialogue_with_and_without_style(self):
+        for reference in ("", "样本：她想了半天，只轻轻叫了一声他的名字。\n“你还在呀。”"):
+            for existing in ("", "她推开房门，看见他还没有走。"):
+                with self.subTest(has_style=bool(reference), continuation=bool(existing)):
+                    chapter = _new_chapter(0)
+                    chapter["outline"] = "夫妻争执后试着和解，却都不愿先服软。"
+                    chapter["text"] = existing
+                    project = {"chapters": [chapter], "style_reference": reference}
+                    context = _build_chapter_ai_context(project, 0, "draft")
+                    worker = NovelWritingWorker(
+                        "http://example.test", "key", "model", "draft", context,
+                    )
+
+                    prompt = worker._action_prompt()
+                    combined = prompt + "\n" + context
+
+                    self.assertEqual(combined.count(_prose_scene_grounding_guidance().strip()), 1)
+                    self.assertIn("不要求每一轮都新增信息、升级压力或立即推动行动", combined)
+                    self.assertIn("表现人物未说出口的顾虑和情绪", combined)
+                    self.assertIn("不要求每次心理变化立即变成行动", combined)
+                    self.assertNotIn("每一轮说话都应", combined)
+                    if reference:
+                        self.assertIn("完整文风正文样本是正文表达的最高标准", prompt)
+                        self.assertNotIn("【自然语气与情绪】", prompt)
+                    else:
+                        self.assertIn("【自然语气与情绪】", prompt)
+                        self.assertNotIn("【仿写优先级｜已加载文风档案】", combined)
+
+    def test_prose_and_finalize_worker_prompts_keep_scene_based_dialogue_rules(self):
+        for action, marker in (
+            ("draft", "【小说正文直写】"),
+            ("draft", "【剧情执行稿任务】"),
+            ("style_finalize", "【终稿编辑任务】"),
+        ):
+            for has_style in (False, True):
+                with self.subTest(action=action, marker=marker, has_style=has_style):
+                    context = marker + "\n当前章节资料。"
+                    if has_style:
+                        context += "\n【正文风格参考】\n作者完整样本。"
+                    worker = NovelWritingWorker(
+                        "http://example.test", "key", "model", action, context,
+                    )
+
+                    prompt = worker._action_prompt()
+
+                    self.assertIn("不要求每一轮都新增信息、升级压力或立即推动行动", prompt)
+                    self.assertIn("心理、动作和对白可以按场景需要交错、穿插", prompt)
+                    self.assertIn("不要求每次心理变化立即变成行动", prompt)
+                    self.assertEqual("【仿写优先级｜已加载文风档案】" in prompt, has_style)
+                    if action == "style_finalize":
+                        self.assertIn("理解差异或情绪与关系需要时可以自然再提", prompt)
+
     def test_draft_prompt_with_style_reference_uses_minimal_full_sample_guidance(self):
         worker = NovelWritingWorker(
             "http://example.test",
@@ -1732,7 +1932,7 @@ class NovelAnalysisWorkerTests(unittest.TestCase):
         self.assertNotIn("唯一写法标准", prompt)
         self.assertNotIn("【风格锁定规则】", prompt)
         self.assertNotIn("不要自行追求多动作、多对白", prompt)
-        self.assertNotIn("作者原生用词池", prompt)
+        self.assertNotIn("【作者原生用词池", prompt)
         self.assertNotIn("中段必须出现一次意料之外", prompt)
         self.assertNotIn("至少写出 3 处具体可见细节", prompt)
         self.assertNotIn("多用动作和对话推进", prompt)
@@ -1791,7 +1991,7 @@ class NovelAnalysisWorkerTests(unittest.TestCase):
         self.assertIn("不能自动美化成标准商业文风", profile_prompt)
         self.assertIn("修辞性重复", profile_prompt)
         self.assertIn("跨段或跨章反复解释", profile_prompt)
-        self.assertIn("同一信息只有出现新证据", finalize_prompt)
+        self.assertIn("同一信息在新证据、新决定、新后果、理解差异或情绪与关系需要时可以自然再提", finalize_prompt)
         self.assertIn("同时校验剧情执行、连续性和样本文风", finalize_prompt)
         self.assertIn("用户上下文指定的输出分区", finalize_prompt)
         self.assertIn("<NOVEL_OUTPUT_START>", finalize_prompt)
@@ -2060,18 +2260,18 @@ class NovelAnalysisWorkerTests(unittest.TestCase):
 
         self.assertEqual(results, [("memory_finalize", "{}")])
         self.assertEqual(session.last_payload["response_format"], {"type": "json_object"})
-        self.assertEqual(session.last_payload["reasoning_effort"], "high")
+        self.assertEqual(session.last_payload["reasoning_effort"], "xhigh")
         self.assertTrue(worker.diagnostics["json_response_format_requested"])
-        self.assertEqual(worker.diagnostics["reasoning_effort_requested"], "high")
+        self.assertEqual(worker.diagnostics["reasoning_effort_requested"], "xhigh")
         self.assertIn("不能漏掉字符串末尾", worker._action_prompt())
 
-    def test_writing_worker_uses_high_reasoning_for_known_providers(self):
+    def test_writing_worker_uses_xhigh_reasoning_for_known_providers(self):
         cases = (
-            ("https://api.dxmcs.xin", "gpt-5.6-luna", "high"),
-            ("https://api.dxmcs.xin", "gpt-5.6-sol", "high"),
-            ("https://api.dxmcs.xin", "gpt-5.6-terra", "high"),
-            ("https://api.dxmcs.xin", "gpt-5.5", "high"),
-            ("https://hubway.cc", "gpt-5.5", "high"),
+            ("https://api.dxmcs.xin", "gpt-5.6-luna", "xhigh"),
+            ("https://api.dxmcs.xin", "gpt-5.6-sol", "xhigh"),
+            ("https://api.dxmcs.xin", "gpt-5.6-terra", "xhigh"),
+            ("https://api.dxmcs.xin", "gpt-5.5", "xhigh"),
+            ("https://hubway.cc", "gpt-5.5", "xhigh"),
         )
         for base_url, model, expected in cases:
             with self.subTest(base_url=base_url, model=model):
@@ -2085,14 +2285,14 @@ class NovelAnalysisWorkerTests(unittest.TestCase):
 
                 self.assertEqual(session.last_payload["reasoning_effort"], expected)
 
-    def test_writing_worker_uses_high_reasoning_for_novel_writing_tasks(self):
+    def test_writing_worker_uses_xhigh_reasoning_for_novel_writing_tasks(self):
         cases = (
-            ("draft", "high"),
-            ("style_finalize", "high"),
-            ("style_rewrite", "high"),
-            ("memory_reconcile", "high"),
-            ("memory_repair", "high"),
-            ("logic_repair", "high"),
+            ("draft", "xhigh"),
+            ("style_finalize", "xhigh"),
+            ("style_rewrite", "xhigh"),
+            ("memory_reconcile", "xhigh"),
+            ("memory_repair", "xhigh"),
+            ("logic_repair", "xhigh"),
         )
         for action, expected in cases:
             with self.subTest(action=action):
@@ -2117,7 +2317,7 @@ class NovelAnalysisWorkerTests(unittest.TestCase):
 
                 self.assertEqual(session.last_payload["reasoning_effort"], expected)
 
-    def test_writing_worker_uses_high_reasoning_for_state_tasks(self):
+    def test_writing_worker_uses_xhigh_reasoning_for_state_tasks(self):
         worker = NovelWritingWorker(
             "https://api.dxmcs.xin", "key", "gpt-5.6-sol", "memory_finalize", "context"
         )
@@ -2128,7 +2328,7 @@ class NovelAnalysisWorkerTests(unittest.TestCase):
 
         worker.run()
 
-        self.assertEqual(session.last_payload["reasoning_effort"], "high")
+        self.assertEqual(session.last_payload["reasoning_effort"], "xhigh")
 
     def test_memory_worker_aborts_abnormally_oversized_stream(self):
         worker = NovelWritingWorker(

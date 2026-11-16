@@ -11,6 +11,21 @@ from gpt_desktop.novel_utils import _normalize_mainline_pressure_curve
 
 
 class NovelCreationWizardPersistenceTests(unittest.TestCase):
+    def test_every_wizard_batch_requests_xhigh_except_gemini(self):
+        batches = (
+            ("premise", ""), ("bible", "stage_directions"),
+            ("bible", "bible_core"), ("bible", "bible_assets"),
+            ("stage_plan", "stage_plan_stage"), ("stage_plan", "stage_endpoint_repair"),
+        )
+        for model in ("gpt-6.1-sol", "gpt-6-sol", "claude-opus-5-5[次]", "gemini-3.8-flash-high"):
+            for step, batch in batches:
+                with self.subTest(model=model, step=step, batch=batch):
+                    worker = wizard.NovelCreationWorker(
+                        "https://provider.example", "key", model, step, {}, batch_kind=batch,
+                    )
+                    expected = "high" if "gemini" in model else "xhigh"
+                    self.assertEqual(worker._reasoning_effort_for_request(), expected)
+
     def test_stage_event_capacity_allows_two_chapters_but_rejects_three(self):
         two_chapter_stage = {
             "ordered_events": [{
@@ -263,6 +278,47 @@ class NovelCreationWizardPersistenceTests(unittest.TestCase):
         self.assertIn("一个核心问题、一个核心承诺和一个可观察的回收结果", guidance)
         self.assertIn("写不出这四点，就不要生成伏笔", guidance)
         self.assertIn("影响核心动机、核心矛盾或主要关系的谜团", guidance)
+
+    def test_premise_core_motive_is_parsed_preserved_and_passed_downstream(self):
+        payload = {
+            "c": {
+                str(index): {
+                    "t": f"方向{index}",
+                    "d": f"简介{index}",
+                    "m": f"核心动机{index}",
+                }
+                for index in range(1, 6)
+            },
+            "s": 1,
+        }
+        result = wizard.normalize_creation_result("premise", payload)
+        self.assertEqual(result["selected_index"], 1)
+        self.assertEqual(result["candidates"][1]["core_motive"], "核心动机2")
+
+        framework = wizard._clean_creation_framework_premise_fields({
+            "premise": {
+                **result["candidates"][1],
+                "main_line": "旧版主线字段应被清理",
+            },
+            "premise_candidates": [
+                {
+                    **item,
+                    "main_line": "旧版主线字段应被清理",
+                }
+                for item in result["candidates"]
+            ],
+        })
+        self.assertEqual(len(framework["premise_candidates"]), 5)
+        self.assertEqual(
+            [item["core_motive"] for item in framework["premise_candidates"]],
+            [f"核心动机{index}" for index in range(1, 6)],
+        )
+        self.assertTrue(all("main_line" not in item for item in framework["premise_candidates"]))
+        self.assertNotIn("main_line", framework["premise"])
+        self.assertEqual(
+            wizard._creation_downstream_premise(framework["premise"]),
+            {"title": "方向2", "synopsis": "简介2", "core_motive": "核心动机2"},
+        )
 
     def test_bible_assets_recovers_rows_mixed_under_compact_c_key(self):
         result = wizard.normalize_creation_result(
@@ -720,8 +776,16 @@ class NovelCreationWizardPersistenceTests(unittest.TestCase):
                 self.assertIn("同一人物不反复陷入同类待救危机", prompt)
                 self.assertIn("不以同功能替代物延长争夺", prompt)
                 self.assertIn("每个阶段方向的 result 只归该阶段完成", prompt)
-                self.assertIn("主要场景、关键人物、事件核心、人物冲突四方面均须发生实质更换或升级", prompt)
+                self.assertIn("跨入新阶段后，主要场景、阶段性关键人物、事件核心和人物冲突四方面均须更换", prompt)
+                self.assertIn("同一阶段内，围绕本阶段的大事件", prompt)
+                self.assertIn("不代表对手的身份、权力或势力层级必须提高", prompt)
+                self.assertIn("完成全部阶段后还要回看非相邻阶段", prompt)
+                self.assertIn("核心动机和长期对抗可以延续", prompt)
+                self.assertIn("第三步阶段规划与AI章节规划按当前上下文中可见的全书阶段方向和已生成事实落实这一边界", prompt)
                 self.assertIn("不把资料往来、维护或生产流程本身写成连续事件发动机", prompt)
+                self.assertNotIn("既有场景或人物可以延续", prompt)
+                self.assertNotIn("沿用地点或人物时写清其实质变化", prompt)
+                self.assertNotIn("场景和关键人物的变化或升级", prompt)
                 self.assertIn("b-a+1<=2", prompt)
                 self.assertEqual(prompt.count("b-a+1<=2"), 1)
                 self.assertEqual(prompt.count(wizard.CREATION_STAGE_EVENT_GUIDANCE), 1)
@@ -733,6 +797,128 @@ class NovelCreationWizardPersistenceTests(unittest.TestCase):
                     "后续阶段方向中的 result 是尚未发生的未来结果，当前阶段不得把它完成或写成既成事实",
                     prompt,
                 )
+        stage_prompt = worker._analysis_prompt()
+        self.assertIn("scene_change与character_change按公共核心约束填写", stage_prompt)
+
+    def test_stage_batch_required_keys_change_after_first_stage(self):
+        first = wizard.NovelCreationWorker(
+            "http://example.test",
+            "key",
+            "model",
+            "stage_plan",
+            {"author_input": {"total_words": 500000}},
+            batch_kind="stage_plan_stage",
+            stage_index=0,
+        )
+        later = wizard.NovelCreationWorker(
+            "http://example.test",
+            "key",
+            "model",
+            "stage_plan",
+            {"author_input": {"total_words": 500000}},
+            batch_kind="stage_plan_stage",
+            stage_index=1,
+        )
+
+        self.assertEqual(first._stream_json_candidate_required_keys(), ("v", "k", "s", "f"))
+        self.assertEqual(later._stream_json_candidate_required_keys(), ("v", "s"))
+
+        later_payload = {"v": "4", "s": {"i": "S02"}}
+        later_text = wizard.json.dumps(later_payload, ensure_ascii=False, separators=(",", ":"))
+        candidate = later._extract_json_object_candidate(later_text)
+        self.assertTrue(
+            later._stream_json_candidate_is_acceptable(
+                later_text,
+                candidate,
+                later_payload,
+            )
+        )
+
+    def test_stage_plan_object_example_keeps_pressure_inside_stage(self):
+        marker = "返回结构示例（示例中的空数组和空字段实际可以省略）："
+        example = wizard.STAGE_PLAN_OBJECT_OUTPUT_RULES.split(marker, 1)[1].split(
+            "。本次只生成", 1
+        )[0]
+
+        parsed = json.loads(example)
+
+        self.assertEqual(list(parsed), ["v", "k", "s", "f"])
+        self.assertIn("u", parsed["s"])
+        self.assertNotIn("u", parsed)
+        self.assertEqual(
+            set(parsed["s"]["u"]),
+            {"scope", "step", "opponents", "cost", "exit_change"},
+        )
+        for event in parsed["s"]["e"]:
+            start, end = event["r"]
+            self.assertLessEqual(start, end)
+            self.assertLessEqual(end - start + 1, 2)
+        self.assertIn(
+            "返回覆盖全部章节的完整事件数组",
+            wizard.STAGE_PLAN_OBJECT_OUTPUT_RULES,
+        )
+
+    def test_stage_batch_prompt_calculates_event_capacity_for_current_range(self):
+        cases = (
+            (0, 1, 34, 19),
+            (1, 35, 68, 17),
+            (4, 137, 167, 16),
+            (0, 1, 3, 3),
+            (0, 1, 4, 4),
+            (2, 69, 69, 1),
+            (0, "1", "34", 19),
+        )
+        for stage_index, start, end, minimum in cases:
+            with self.subTest(stage_index=stage_index, start=start, end=end):
+                worker = wizard.NovelCreationWorker(
+                    "http://example.test",
+                    "key",
+                    "model",
+                    "stage_plan",
+                    {
+                        "author_input": {"total_words": 500000, "average_chapter_words": 3000},
+                        "current_stage": {
+                            "number": stage_index + 1,
+                            "total_stages": 5,
+                            "start_chapter": start,
+                            "end_chapter": end,
+                        },
+                    },
+                    batch_kind="stage_plan_stage",
+                    stage_index=stage_index,
+                )
+
+                prompt = worker._analysis_prompt()
+
+                self.assertEqual(prompt.count("【当前阶段事件容量】"), 1)
+                self.assertIn(f"至少需要{minimum}个事件", prompt)
+                self.assertIn(f"共{int(end) - int(start) + 1}章", prompt)
+                self.assertIn("不能遗漏中间或尾部章节", prompt)
+                self.assertIn("这是章节容量下限，不是固定事件数量", prompt)
+                self.assertIn("不要机械安排两章事件或用重复剧情凑数", prompt)
+                if stage_index == 0 and int(end) >= 3:
+                    self.assertIn("前3章各用1个独立事件", prompt)
+                else:
+                    self.assertNotIn("前3章各用1个独立事件", prompt)
+
+    def test_stage_batch_prompt_skips_capacity_for_missing_or_invalid_ranges(self):
+        for current_stage in (
+            {},
+            {"start_chapter": 0, "end_chapter": 34},
+            {"start_chapter": 35, "end_chapter": 34},
+            {"start_chapter": "invalid", "end_chapter": 34},
+        ):
+            with self.subTest(current_stage=current_stage):
+                worker = wizard.NovelCreationWorker(
+                    "http://example.test",
+                    "key",
+                    "model",
+                    "stage_plan",
+                    {"current_stage": current_stage},
+                    batch_kind="stage_plan_stage",
+                )
+
+                self.assertNotIn("【当前阶段事件容量】", worker._analysis_prompt())
 
     def test_stage_direction_prompt_restores_shared_quality_constraints(self):
         worker = wizard.NovelCreationWorker(
@@ -749,12 +935,23 @@ class NovelCreationWizardPersistenceTests(unittest.TestCase):
         prompt = worker._analysis_prompt()
         self.assertIn("阶段方向", prompt)
         self.assertIn("每阶段只设一个独特的大事件、一个首要目标和一条核心人物冲突", prompt)
-        self.assertIn("四方面均须发生实质更换或升级", prompt)
+        self.assertIn("跨入新阶段后，主要场景、阶段性关键人物、事件核心和人物冲突四方面均须更换", prompt)
+        self.assertIn("完成全部阶段后还要回看非相邻阶段", prompt)
+        self.assertIn("事件核心与人物冲突的实质更换须直接体现在summary和key_beats中", prompt)
+        self.assertIn("scene_change、character_change只说明场景和阶段性关键人物差异", prompt)
+        self.assertIn(
+            "scene_change 和 character_change 分别说明相较前阶段更换的主要场景与阶段性关键人物",
+            prompt,
+        )
+        self.assertEqual(prompt.count("前阶段的人物和地点也可以作为承接背景"), 1)
         self.assertNotIn("每个小事件机械更换四方面", prompt)
         self.assertNotIn("不要求两项都变化", prompt)
         self.assertIn("从第二阶段起，结合题材与前后因果", prompt)
         self.assertIn("自然提高至少两项，最终阶段达到全书峰值", wizard.CREATION_CORE_QUALITY_GUIDANCE)
-        self.assertIn("四方面不能互相替代", wizard.CREATION_CORE_QUALITY_GUIDANCE)
+        self.assertIn("四方面均须更换", wizard.CREATION_CORE_QUALITY_GUIDANCE)
+        self.assertIn("从阶段2起写本阶段相较前阶段更换的主要场景", prompt)
+        self.assertIn("从阶段2起写本阶段相较前阶段更换的阶段性关键人物", prompt)
+        self.assertNotIn("主要场景更换或实质升级", prompt)
         self.assertIn("相邻阶段的大事件和关键推进不能只是同一任务换地点或加码重演", prompt)
         self.assertIn("避免报告式、案卷式、说明式推进", prompt)
         self.assertIn("同一人物不反复陷入同类待救危机", prompt)
@@ -774,7 +971,7 @@ class NovelCreationWizardPersistenceTests(unittest.TestCase):
         self.assertIn("末阶段承载尚未解决的本部核心对抗", prompt)
         self.assertIn("字段按同一条故事链填写", prompt)
         self.assertEqual(prompt.count("【核心约束｜非作者明确要求不可随便更改、删除或弱化】"), 1)
-        self.assertIn("next_pressure 只写该出口自然带出的下一阶段阻力", prompt)
+        self.assertIn("next_pressure只承接该出口仍有效的压力", prompt)
         self.assertIn("阶段方向不写具体章节号，高潮具体章位由第三步落实", prompt)
         self.assertNotIn("最后阶段高潮兑现位置", prompt)
         self.assertNotIn("第65-67章收尾窗口", prompt)
@@ -812,16 +1009,18 @@ class NovelCreationWizardPersistenceTests(unittest.TestCase):
                 self.assertIn("规划末阶段时先确定最终由什么行动或选择兑现本部核心目标", prompt)
                 self.assertIn("最后一个高潮节点必须是 key_beats 最后一项", prompt)
                 self.assertEqual(prompt.count("若末阶段恰有3个节点，只标记第2、3项"), 1)
-                self.assertIn("按第一步选定故事中的 main_line 确定本部唯一目标", prompt)
-                self.assertIn("relationship_engine 确定人物关系的长线变化", prompt)
-                self.assertIn("ending_direction 确定本部闭环结果", prompt)
+                self.assertNotIn("按第一步选定故事中的 main_line 确定本部唯一目标", prompt)
+                self.assertNotIn("relationship_engine 确定人物关系的长线变化", prompt)
+                self.assertNotIn("ending_direction 确定本部闭环结果", prompt)
                 self.assertIn("第一步未设定拆分时物件保持完整", prompt)
                 self.assertIn("主线期限从同一起点累计，不另设或重置阶段倒计时", prompt)
                 self.assertIn("人物、物件及群体规模的增减，须由节点中的具体行动和结果承接", prompt)
                 self.assertIn("每阶段只设一个独特的大事件", prompt)
                 self.assertIn("同一连续行动链中的步骤合并为一个节点", prompt)
                 self.assertIn("相邻节点须带来新的处境或目标变化", prompt)
-                self.assertIn("节点推进至本阶段结果成立为止", prompt)
+                self.assertIn("节点推进至本阶段核心目标和核心矛盾的结果成立为止", prompt)
+                self.assertIn("key_beats必须在本部核心目标实际兑现处结束", prompt)
+                self.assertIn("高潮之后的战后处置、关系落点、交接、返家或其它收尾行为不得再写入key_beats", prompt)
                 self.assertIn("后续阶段以紧邻前一阶段result为状态起点", prompt)
                 self.assertIn("已成立的胜负、生死、关系、势力归属、物件数量与去向不得重置或改写", prompt)
                 self.assertIn("末阶段承载尚未解决的本部核心对抗", prompt)
@@ -831,14 +1030,23 @@ class NovelCreationWizardPersistenceTests(unittest.TestCase):
                 self.assertIn("climax_beat_indices 标记这段连续2或3个节点", prompt)
                 self.assertIn("6个节点且高潮占末尾3项时为[4,5,6]", prompt)
                 self.assertIn("若尚未完成核心目标，不是高潮终点", prompt)
-                self.assertIn("随后仍在解决主线的行动或选择要保留在连续高潮节点中", prompt)
+                self.assertIn("随后仍在解决主线的行动或选择仍属于高潮推进，必须留在连续高潮节点中", prompt)
                 self.assertIn("规划末阶段时先确定最终由什么行动或选择兑现本部核心目标", prompt)
-                self.assertIn("result 汇总最后节点之后已经成立的出口状态", prompt)
-                self.assertIn("只有核心目标兑现后、不再改变核心矛盾结果的收场行为才移入 result", prompt)
+                self.assertIn("result只概括本阶段最后一个关键推进节点后已经成立的阶段出口状态", prompt)
+                self.assertIn("末阶段以最后高潮节点兑现后的状态为准", prompt)
+                self.assertIn("不写一串后续事件、不把收尾过程改写成节点", prompt)
+                self.assertIn("填写result时须区分压力已解除、暂时受阻但仍有效、仍未解决", prompt)
+                self.assertIn("不得没有新的行动及因果说明便重新列为未解决", prompt)
+                self.assertIn("已完成的人物关系选择只承接其新后果，不再次把同一选择或决裂作为推进点", prompt)
+                self.assertIn("连续高潮节点以前序节点已经成立的结果为后续起点，不重复处理、达成或宣布既成结果", prompt)
+                self.assertIn("核心目标兑现后，只有不再改变核心矛盾结果的必要直接后果、关系落点、交接或返家可以写入 result", prompt)
                 self.assertIn("全书本部唯一核心目标须由末阶段高潮兑现", prompt)
                 self.assertIn("不得另添结尾方向未设定的新主线或终局对抗", prompt)
                 self.assertIn("物件保持完整，沿用已确定的用途", prompt)
                 self.assertIn("结尾方向未设定的新主线", prompt)
+                self.assertIn("高潮后的收尾事件不再新增节点", prompt)
+                self.assertIn("只写已成立状态，不写后续收尾事件序列", prompt)
+                self.assertEqual(worker._max_tokens_for_request(), 18000)
                 premise_prompt = wizard.NovelCreationWorker(
                     "http://example.test", "key", "model", "bible",
                     {"author_input": {"total_words": 500000, "no_injury": True},
@@ -846,7 +1054,7 @@ class NovelCreationWizardPersistenceTests(unittest.TestCase):
                     batch_kind="stage_directions",
                 )._analysis_prompt()
                 self.assertIn("作者明确选择无伤", premise_prompt)
-                self.assertIn("main_line 确定本部唯一目标", premise_prompt)
+                self.assertNotIn("main_line 确定本部唯一目标", premise_prompt)
                 self.assertNotIn("三个月内夺回旧部", premise_prompt)
                 self.assertEqual(premise_prompt.count("作者明确选择无伤"), 1)
                 self.assertIn("每个节点让人物的行动、选择或关系改变主角推进目标的处境", prompt)
@@ -878,8 +1086,9 @@ class NovelCreationWizardPersistenceTests(unittest.TestCase):
                 self.assertIn("唯一大事件", direction["summary"])
                 self.assertIn("阶段1可留空", direction["scene_change"])
                 self.assertIn("阶段1可留空", direction["character_change"])
-                self.assertIn("节点兑现后的出口状态", direction["result"])
-                self.assertIn("最后3章", direction["result"])
+                self.assertIn("本阶段最后一个关键推进节点后已成立的阶段出口状态", direction["result"])
+                self.assertIn("末阶段以最后高潮节点兑现后的状态为准", direction["result"])
+                self.assertNotIn("最后3章", direction["result"])
                 self.assertIn("下一阶段入口处境", direction["next_pressure"])
                 self.assertIsInstance(direction["key_beats"], list)
                 self.assertIsInstance(direction["climax_beat_indices"], list)
@@ -1177,7 +1386,13 @@ class NovelCreationWizardPersistenceTests(unittest.TestCase):
         self.assertEqual(directions, original_directions)
 
         dialog._next_generation_batch = lambda _step: ("stage_plan_stage", 1)
+        dialog.step_results["stage_plan"]["book_contract"] = {
+            "hard_facts": ["主角开局已是宗师，不可退回先天。"],
+        }
         final_context = dialog._context_for_step("stage_plan")
+        self.assertEqual(final_context["confirmed"]["book_contract"], {
+            "hard_facts": ["主角开局已是宗师，不可退回先天。"],
+        })
         self.assertEqual(final_context["current_stage"]["stage_direction"], directions[1])
         self.assertIn("未来阶段节点", wizard.format_creation_context(final_context))
         self.assertNotIn("当前阶段节点", wizard.format_creation_context(final_context))
@@ -1359,16 +1574,18 @@ class NovelCreationWizardPersistenceTests(unittest.TestCase):
             "premise",
             context,
         )._analysis_prompt()
-        self.assertIn("核心动机作为全书唯一主线", prompt)
-        self.assertIn("五个方向各有辨识度", prompt)
+        self.assertNotIn("核心动机作为全书唯一主线", prompt)
+        self.assertIn("每个方向同时提炼一条简短的核心动机", prompt)
+        self.assertIn("第一步只保留书名、故事简介和核心动机", prompt)
+        self.assertIn("五个方向要分别形成不同的故事抓手", prompt)
         self.assertIn("作者明确提供 requested_title", prompt)
-        self.assertIn("【核心约束｜非作者明确要求不可随便更改、删除或弱化】", prompt)
-        self.assertIn("阶段压力从前一阶段已经成立的结果中引出", prompt)
-        self.assertIn("持续增加对手行动、冲突牵连、人物代价和局势压力", prompt)
-        self.assertIn("最终阶段达到全书峰值", prompt)
-        self.assertIn("同一人物不反复陷入同类待救危机", prompt)
-        self.assertEqual(prompt.count("【核心约束｜非作者明确要求不可随便更改、删除或弱化】"), 1)
-        self.assertNotIn("主线契约", prompt)
+        # The first step keeps only the synopsis and one compact mainline
+        # anchor. Shared planning constraints still begin at the second step.
+        self.assertNotIn("【核心约束｜非作者明确要求不可随便更改、删除或弱化】", prompt)
+        self.assertNotIn("阶段压力从前一阶段已经成立的结果中引出", prompt)
+        self.assertNotIn("持续增加对手行动、冲突牵连、人物代价和局势压力", prompt)
+        self.assertNotIn("最终阶段达到全书峰值", prompt)
+        self.assertNotIn("同一人物不反复陷入同类待救危机", prompt)
         self.assertNotIn("正在发生的强冲突", prompt)
 
         request_text = wizard.format_creation_context(context, premise_minimal=True)
@@ -1473,7 +1690,9 @@ class NovelCreationWizardPersistenceTests(unittest.TestCase):
             "total_words": 100000,
             "average_chapter_words": 3000,
         })
-        self.assertEqual(fallback["core_motive"], "第一步的具体主线。")
+        # Historical first-step planning fields are intentionally discarded;
+        # without the second-step Bible there is no chapter-plan core motive.
+        self.assertEqual(fallback["core_motive"], "")
         self.assertEqual(
             foundation["creative_intent_contract"]["core_motive"],
             foundation["core_motive"],
@@ -1484,34 +1703,48 @@ class NovelCreationWizardPersistenceTests(unittest.TestCase):
         for phrase in (
             "除核心动机外",
             "当前阶段形成一次可见兑现",
-            "新的身份、利益位置、关系状态",
             "本规则只约束承担阶段主要推进作用的人物和关系任务",
-            "新的、更高强度的人物冲突",
             "同一先后顺序",
             "同步调整核心动机中的节点",
         ):
             self.assertIn(phrase, guidance)
+        self.assertNotIn("可以作为承接背景或非核心参与者", guidance)
+        self.assertNotIn("通过人物新的目标、立场、关系", guidance)
+        self.assertNotIn("跨阶段的主要场景、阶段性关键人物", guidance)
         for step in ("bible", "stage_plan"):
             with self.subTest(step=step):
                 self.assertIn("阶段性人物生命周期与时间一致性", wizard.STEP_PROMPTS[step])
                 self.assertIn("除核心动机外", wizard.STEP_PROMPTS[step])
 
         premise_prompt = wizard.STEP_PROMPTS["premise"]
-        self.assertIn("核心动机作为全书唯一主线", premise_prompt)
-        self.assertIn("热门爆款网络小说风格", premise_prompt)
-        self.assertIn("压力和冲突强度随故事推进逐步递进", premise_prompt)
-        self.assertIn("冲突通过人物的目标、选择、关系和行动落地", premise_prompt)
-        self.assertIn("五个方向各有辨识度", premise_prompt)
+        self.assertEqual(
+            premise_prompt.count("【核心约束｜非作者明确要求不可随便更改、删除或弱化】"),
+            0,
+        )
+        for step_prompt in (wizard.STEP_PROMPTS["bible"], wizard.STEP_PROMPTS["stage_plan"]):
+            self.assertEqual(
+                step_prompt.count("【核心约束｜非作者明确要求不可随便更改、删除或弱化】"),
+                1,
+            )
+        self.assertNotIn("核心动机作为全书唯一主线", premise_prompt)
+        self.assertNotIn("热门爆款网络小说风格", premise_prompt)
+        self.assertNotIn("压力和冲突强度随故事推进逐步递进", premise_prompt)
+        self.assertNotIn("冲突通过人物的目标、选择、关系和行动落地", premise_prompt)
+        self.assertNotIn("结尾方向 e 写本部已经成立的闭环结果", premise_prompt)
+        self.assertNotIn("不写本部结束后的未来余味、新敌人、新任务或续作钩子", premise_prompt)
+        self.assertIn("五个方向要分别形成不同的故事抓手", premise_prompt)
         self.assertIn("参考 n 中已有姓名", premise_prompt)
         self.assertNotIn("CREATION_CORE_MOTIVE_GUIDANCE", premise_prompt)
         self.assertNotIn("CREATION_STAGE_LIFECYCLE_GUIDANCE", premise_prompt)
         self.assertIn("核心动机是唯一执行主线", wizard.STEP_PROMPTS["bible"])
         self.assertIn("阶段性对手、关键推进人物目标和关系任务", wizard.STEP_PROMPTS["bible"])
         self.assertIn("人物长期资料中的目标、秘密和关系底色", wizard.STEP_PROMPTS["bible"])
-        self.assertIn("普通配角、生活人物和局部陪衬人物不套用这条跨阶段兑现要求", wizard.STEP_PROMPTS["stage_plan"])
-        self.assertIn("由人物目标、关系变化、利益争夺、选择或正面/间接对抗推动的更高强度新场景", wizard.STEP_PROMPTS["stage_plan"])
-        self.assertIn("兑现后的新位置、立场、关系结果或现实后果", wizard.STEP_PROMPTS["stage_plan"])
-        self.assertIn("同一人物原先的争夺、救场、追查、试探、扩权或误会已经完成转化", wizard.STEP_PROMPTS["stage_plan"])
+        self.assertIn("不要求普通配角、生活人物或仅承担局部陪衬功能的人物每次跨阶段出现时都改变位置", wizard.STEP_PROMPTS["stage_plan"])
+        self.assertIn("阶段性对手、关键推进人物目标和关系任务，都要在当前阶段形成一次可见兑现", wizard.STEP_PROMPTS["stage_plan"])
+        self.assertIn("跨入新阶段后，主要场景、阶段性关键人物、事件核心和人物冲突四方面均须更换", wizard.STEP_PROMPTS["stage_plan"])
+        self.assertIn("同一阶段内，围绕本阶段的大事件", wizard.STEP_PROMPTS["stage_plan"])
+        self.assertNotIn("新的、更高强度的人物冲突", wizard.STEP_PROMPTS["stage_plan"])
+        self.assertNotIn("兑现后以新的位置、立场、关系或后果进入新的冲突", wizard.STEP_PROMPTS["stage_plan"])
 
     def test_terminal_contract_projects_final_stage_results_and_roles(self):
         foundation = wizard.build_chapter_plan_foundation({
@@ -1527,10 +1760,10 @@ class NovelCreationWizardPersistenceTests(unittest.TestCase):
                 "end_chapter": 4,
                 "end_state": "小镇恢复供水，主角交出指挥权。",
                 "relationship_changes": ["搭档愿意共同留下"],
-                "exit_state": {
+                "exit_state": wizard._normalize_stage_state({
                     "c": ["主角不再独自承担守护责任"],
                     "k": ["供水系统稳定运行"],
-                },
+                }),
                 "ordered_events": [{
                     "id": "S01-E01",
                     "allowed_chapters": [4, 4],
@@ -1556,6 +1789,9 @@ class NovelCreationWizardPersistenceTests(unittest.TestCase):
 
         contract = foundation["terminal_contract"]
         self.assertIn("供水系统完成修复并连续运行。", contract["required_results"])
+        self.assertIn("供水系统稳定运行", contract["required_results"])
+        self.assertEqual(contract["protagonist_final_state"], "主角不再独自承担守护责任")
+        self.assertEqual(contract["world_final_state"], "供水系统稳定运行")
         self.assertIn("搭档愿意共同留下", contract["relationship_results"])
         self.assertNotIn("chapter_roles", contract)
         self.assertEqual(contract["closure_mode"], "mirror_scene")
@@ -1584,10 +1820,7 @@ class NovelCreationWizardPersistenceTests(unittest.TestCase):
             "total_words": 100000,
             "average_chapter_words": 3000,
         })
-        self.assertEqual(
-            premise_first["core_motive"],
-            "第一步已经具体化的核心动机。",
-        )
+        self.assertEqual(premise_first["core_motive"], "第一步已经具体化的核心动机。")
 
     def test_bible_display_exposes_core_motive_label(self):
         bible = {
@@ -1617,13 +1850,19 @@ class NovelCreationWizardPersistenceTests(unittest.TestCase):
         self.assertIn("结尾只写本部已经发生并成立的结果", guidance)
         self.assertIn("不添加结局之后的未来余味", guidance)
         self.assertIn("不得留下新敌人、新任务、新规则", guidance)
-        self.assertIn("e=结尾方向", premise_prompt)
+        self.assertNotIn("e=结尾方向", premise_prompt)
+        self.assertNotIn("结尾方向 e 写本部已经成立的闭环结果", premise_prompt)
+        self.assertNotIn("核心动机的兑现、核心矛盾的结果、主要关系落点和主角最终处境", premise_prompt)
         self.assertNotIn("本部结局的闭环契约", premise_prompt)
         self.assertNotIn("不得留下新敌人、新任务、新规则", premise_prompt)
         bible_prompt = wizard.NovelCreationWorker(
             "http://example.test", "key", "model", "bible", {}, batch_kind="bible_core"
         )._analysis_prompt()
-        self.assertIn("结尾方向字段写成“本部闭环结果”", bible_prompt)
+        self.assertIn(
+            "本部闭环由本步确认的核心动机、阶段方向和第三步阶段规划逐步细化",
+            bible_prompt,
+        )
+        self.assertNotIn("结尾方向字段写成“本部闭环结果”", bible_prompt)
         self.assertNotIn("结尾之后仍可存在的余味", premise_prompt)
 
         foundation = wizard.build_chapter_plan_foundation({
@@ -1872,12 +2111,15 @@ class NovelCreationWizardPersistenceTests(unittest.TestCase):
         dialog.average_words_spin = SimpleNamespace(value=lambda: 3000)
         dialog._selected_custom_protagonist_style = lambda: {}
         dialog.premise_candidates = [
-            {"protagonist": "林澈"},
-            {"protagonist": "沈闻"},
-            {"protagonist": "周予"},
+            {"title": "方向一", "synopsis": "主角林澈卷入一场旧案。"},
+            {"title": "方向二", "synopsis": "主角沈闻被迫面对家族秘密。"},
+            {"title": "方向三", "synopsis": "主角周予在危机中寻找出路。"},
         ]
         dialog.premise_selected_index = 1
-        dialog._current_premise = lambda: {"protagonist": "沈闻", "title": "已选故事"}
+        dialog._current_premise = lambda: {
+            "title": "已选故事",
+            "synopsis": "主角沈闻被迫面对家族秘密。",
+        }
         dialog.step_results = {"bible": {"characters": [{"name": "程绛"}, {"name": "齐越"}]}}
         dialog._next_generation_batch = lambda _step: ("bible_core", -1)
         with patch.object(
@@ -1906,8 +2148,8 @@ class NovelCreationWizardPersistenceTests(unittest.TestCase):
         dialog.average_words_spin = SimpleNamespace(value=lambda: 3000)
         dialog._selected_custom_protagonist_style = lambda: {}
         dialog.premise_candidates = [
-            {"protagonist": "林澈"},
-            {"protagonist": "沈闻"},
+            {"title": "方向一", "synopsis": "主角林澈卷入一场旧案。"},
+            {"title": "方向二", "synopsis": "主角沈闻被迫面对家族秘密。"},
         ]
         with patch.object(
             wizard,

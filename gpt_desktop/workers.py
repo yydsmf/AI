@@ -34,9 +34,9 @@ from .core import (
     image_file_to_base64,
     image_suffix_from_bytes,
     image_suffix_from_content_type,
+    novel_reasoning_effort_for_model,
     now_str,
     prepare_image_upload_file,
-    reasoning_effort_for_model,
     reasoning_effort_not_supported,
     requests_proxies,
     safe_response_text,
@@ -63,6 +63,9 @@ from .novel_utils import (
     _extract_prose_delivery_result,
     _extract_novel_output_delivery_result,
     _grounded_prose_contract,
+    _prose_language_accuracy_guidance,
+    _prose_language_review_guidance,
+    _prose_scene_grounding_guidance,
     _infer_foreshadow_status,
     _merge_text_lines_without_duplicates,
     _merge_foreshadow_description_without_bloat,
@@ -451,6 +454,77 @@ def _novel_openai_api_url(base_url, model, resource):
     return api_url(base_url, "/v1/" + resource)
 
 
+def _novel_anthropic_reasoning_options(model, output_limit, reasoning_effort):
+    """Map novel reasoning effort to the model's supported thinking controls."""
+    name = str(model or "").strip().lower()
+    version = re.search(r"claude-(?:opus|sonnet|haiku)[-.](\d+)(?:[-.](\d{1,2})(?!\d))?", name)
+    if version:
+        generation = (int(version.group(1)), int(version.group(2) or 0))
+        adaptive = generation >= (5, 0) or (
+            generation >= (4, 6) and "haiku" not in name
+        )
+    else:
+        adaptive = any(family in name for family in ("fable", "mythos"))
+        generation = (3, 7) if re.search(r"claude-3[-.]7", name) else (0, 0)
+    if adaptive:
+        effort = reasoning_effort
+        if effort == "xhigh" and (0, 0) < generation < (4, 7):
+            effort = "high"
+        return {"thinking": {"type": "adaptive"}, "output_config": {"effort": effort}}
+    if generation >= (3, 7):
+        # Legacy Claude has no High thinking level. Leave room for the final
+        # answer and use its documented manual extended-thinking budget.
+        options = {"thinking": {
+            "type": "enabled", "budget_tokens": min(12000, output_limit - 4096),
+        }}
+        if generation == (4, 5) and "opus" in name:
+            options["output_config"] = {"effort": "high"}
+        return options
+    return {}
+
+
+def _novel_gemini_reasoning_options(model, max_tokens=0):
+    name = str(model or "").strip().lower()
+    version = re.search(r"gemini-(\d+)(?:\.(\d+))?", name)
+    if version and int(version.group(1)) >= 3:
+        return {"thinkingLevel": "HIGH"}
+    if version and (int(version.group(1)), int(version.group(2) or 0)) == (2, 5):
+        # Gemini 2.5 exposes a separate thinking budget instead of
+        # thinkingLevel. It is independent of maxOutputTokens, so keep the
+        # provider's documented High-capacity ceiling.
+        budget = 32768 if "pro" in name else 24576
+        return {"thinkingBudget": budget}
+    return {}
+
+
+def _novel_gemini_temperature_supported(model):
+    """Keep sampling overrides only for Gemini versions that still support them."""
+    name = str(model or "").strip().lower()
+    version = re.search(r"gemini-(\d+)(?:\.(\d+))?", name)
+    if not version:
+        return False
+    generation = (int(version.group(1)), int(version.group(2) or 0))
+    if generation >= (3, 6):
+        return False
+    if generation == (3, 5) and re.search(r"flash[-_.]?lite", name):
+        return False
+    return True
+
+
+def _novel_reasoning_output_limit(protocol, payload, requested=0):
+    if protocol == "anthropic":
+        value = payload.get("max_tokens", 0)
+    elif protocol == "gemini":
+        config = payload.get("generationConfig", {})
+        value = config.get("maxOutputTokens", 0) if isinstance(config, dict) else 0
+    else:
+        value = payload.get("max_tokens", requested)
+    try:
+        return max(0, int(value or requested or 0))
+    except (TypeError, ValueError):
+        return 0
+
+
 def _build_novel_generation_request(
     base_url,
     api_key,
@@ -467,11 +541,22 @@ def _build_novel_generation_request(
 ):
     """Build an OpenAI, Anthropic, or Gemini native generation request."""
     protocol = str(protocol or _novel_api_protocol(base_url, model)).strip().lower()
+    if protocol == "gemini" or _novel_model_protocol(model) == "gemini":
+        # Apply model-version compatibility before native/compatible transport
+        # selection so newer Google models never receive deprecated sampling.
+        if not _novel_gemini_temperature_supported(model):
+            temperature = None
     if protocol == "anthropic":
         try:
             output_limit = max(1, int(max_tokens or _NOVEL_ANTHROPIC_DEFAULT_MAX_TOKENS))
         except (TypeError, ValueError):
             output_limit = _NOVEL_ANTHROPIC_DEFAULT_MAX_TOKENS
+        reasoning_options = {}
+        if reasoning_effort:
+            output_limit = max(16000, output_limit)
+            reasoning_options = _novel_anthropic_reasoning_options(
+                model, output_limit, reasoning_effort,
+            )
         return (
             api_url(base_url, "/v1/messages"),
             {
@@ -492,6 +577,7 @@ def _build_novel_generation_request(
                 }],
                 "messages": [{"role": "user", "content": str(user_text or "")}],
                 "stream": bool(stream),
+                **reasoning_options,
             },
             protocol,
         )
@@ -507,6 +593,18 @@ def _build_novel_generation_request(
             generation_config["maxOutputTokens"] = int(max_tokens)
         if response_format:
             generation_config["responseMimeType"] = "application/json"
+        if reasoning_effort:
+            thinking_config = _novel_gemini_reasoning_options(model, max_tokens)
+            if thinking_config:
+                generation_config["thinkingConfig"] = thinking_config
+                if "thinkingBudget" in thinking_config:
+                    max_output = int(thinking_config["thinkingBudget"]) + 4096
+                else:
+                    max_output = 16384
+                generation_config["maxOutputTokens"] = max(
+                    int(generation_config.get("maxOutputTokens", 0) or 0),
+                    max_output,
+                )
         payload = {
             "systemInstruction": {
                 "parts": [{"text": str(system_prompt or "")}],
@@ -548,7 +646,9 @@ def _build_novel_generation_request(
     if max_tokens:
         payload["max_tokens"] = int(max_tokens)
     if reasoning_effort:
-        payload["reasoning_effort"] = reasoning_effort
+        payload["reasoning_effort"] = (
+            "high" if _novel_model_protocol(model) == "gemini" else reasoning_effort
+        )
     if response_format:
         payload["response_format"] = {"type": "json_object"}
     headers = {
@@ -2156,6 +2256,8 @@ class NovelAnalysisWorker(QThread):
             "retry_count": 0,
             "structure_repair_count": 0,
             "structure_regeneration_count": 0,
+            "reasoning_effort_requested": "",
+            "reasoning_effort_fallback": False,
             "attempts": [],
             "outcome": "pending",
             "elapsed_ms": 0,
@@ -3018,12 +3120,9 @@ class NovelAnalysisWorker(QThread):
         return 0
 
     def _reasoning_effort_for_request(self):
-        # Structured writing tasks expose their action directly; analysis
-        # workers use the progress label (for example 框架分类).
-        if _novel_model_protocol(self.model) in {"anthropic", "gemini"}:
-            return ""
-        action = str(getattr(self, "action", "") or "").strip() or self._analysis_progress_label()
-        return reasoning_effort_for_model(self.model, self.base_url, action)
+        # All novel analysis subclasses, including every wizard batch and
+        # auxiliary task, share the same policy. Native mappings live above.
+        return novel_reasoning_effort_for_model(self.model)
 
     def _reasoning_effort_error(self, error):
         match = re.search(r"接口错误\s+(\d+)", str(error or ""))
@@ -3048,6 +3147,7 @@ class NovelAnalysisWorker(QThread):
         user_text = self._chunk_user_text(chunk_text, chunk_index, total_chunks)
         max_tokens = self._max_tokens_for_request()
         reasoning_effort = self._reasoning_effort_for_request()
+        self.diagnostics["reasoning_effort_requested"] = reasoning_effort
         protocol = _novel_api_protocol(self.base_url, self.model)
         url, headers, payload, protocol = _build_novel_generation_request(
             self.base_url,
@@ -3065,8 +3165,9 @@ class NovelAnalysisWorker(QThread):
         self.api_protocol = protocol
         self.diagnostics["api_protocol"] = protocol
         self.diagnostics["request_endpoint"] = url
-        if max_tokens:
-            self.diagnostics["max_output_tokens"] = int(max_tokens)
+        effective_max_tokens = _novel_reasoning_output_limit(protocol, payload, max_tokens)
+        if effective_max_tokens:
+            self.diagnostics["max_output_tokens"] = effective_max_tokens
         diagnostic_started = time.perf_counter()
         diagnostic_index = self._begin_analysis_api_diagnostic(
             prompt,
@@ -3225,6 +3326,7 @@ class NovelAnalysisWorker(QThread):
                         except Exception:
                             pass
                     payload.pop("reasoning_effort", None)
+                    self.diagnostics["reasoning_effort_fallback"] = True
                     response = session.post(
                         url,
                         headers=headers,
@@ -3311,6 +3413,7 @@ class NovelAnalysisWorker(QThread):
         user_text = self._chunk_user_text(chunk_text, chunk_index, total_chunks)
         max_tokens = self._max_tokens_for_request()
         reasoning_effort = self._reasoning_effort_for_request()
+        self.diagnostics["reasoning_effort_requested"] = reasoning_effort
         protocol = _novel_api_protocol(self.base_url, self.model)
         url, headers, payload, protocol = _build_novel_generation_request(
             self.base_url,
@@ -3328,8 +3431,9 @@ class NovelAnalysisWorker(QThread):
         self.api_protocol = protocol
         self.diagnostics["api_protocol"] = protocol
         self.diagnostics["request_endpoint"] = url
-        if max_tokens:
-            self.diagnostics["max_output_tokens"] = int(max_tokens)
+        effective_max_tokens = _novel_reasoning_output_limit(protocol, payload, max_tokens)
+        if effective_max_tokens:
+            self.diagnostics["max_output_tokens"] = effective_max_tokens
         diagnostic_started = time.perf_counter()
         diagnostic_index = self._begin_analysis_api_diagnostic(
             prompt,
@@ -3462,6 +3566,7 @@ class NovelAnalysisWorker(QThread):
                     except Exception:
                         pass
                     payload.pop("reasoning_effort", None)
+                    self.diagnostics["reasoning_effort_fallback"] = True
                     r = session.post(
                         url,
                         headers=headers,
@@ -6807,14 +6912,9 @@ class NovelWritingWorker(QThread):
         )
 
     def _reasoning_effort_for_request(self):
-        if _novel_model_protocol(self.model) in {"anthropic", "gemini"}:
-            return ""
-        configured_effort = reasoning_effort_for_model(self.model, self.base_url, self.action)
-        if configured_effort:
-            return configured_effort
-        if self.action in {"memory_finalize", "memory_reconcile", "memory_repair", "logic_repair"}:
-            return "high"
-        return ""
+        # Covers expansion, checks, organization, memory, repairs, style and
+        # future novel actions without depending on a model/action allow-list.
+        return novel_reasoning_effort_for_model(self.model)
 
     def _json_transport_fallback_key(self):
         return (
@@ -6994,7 +7094,11 @@ class NovelWritingWorker(QThread):
                         if terminal_contract else ""
                     )
                 )
-            return common + _grounded_prose_contract() + (
+            prose_contract = _grounded_prose_contract(
+                style_active="【正文风格参考】" in self.context
+                or "【仿写优先级｜已加载文风档案】" in self.context,
+            )
+            return common + prose_contract + (
                 "\n正文写作要求：让人物的欲望、阻力、行动和后果自然形成推进与情绪变化；"
                 "需要时用具体动作、环境、感官或生活细节承接场景，不设细节数量配额。"
                 "人物当场作出的承诺、约定、挑战条件或规则判断，后续要用具体结果或明确原因接住；如果条件没有生效，要让正文交代是哪条规则、权限或意外阻止了它，不能让前后结果无解释地并列。"
@@ -7037,6 +7141,18 @@ class NovelWritingWorker(QThread):
 
     def _action_prompt(self):
         prompt = self._action_prompt_base()
+        if self.action in {"draft", "style_rewrite", "style_finalize", "script_to_novel"}:
+            scene_guidance = _prose_scene_grounding_guidance()
+            # Keep this exact prose block once across system and user context.
+            if scene_guidance.strip() in self.context:
+                prompt = prompt.replace(scene_guidance, "")
+            language_guidance = _prose_language_accuracy_guidance()
+            if language_guidance.strip() not in self.context:
+                prompt += "\n\n" + language_guidance
+        if self.action == "memory_finalize":
+            review_guidance = _prose_language_review_guidance()
+            if review_guidance.strip() not in self.context:
+                prompt += "\n\n" + review_guidance
         if self.action in _NOVEL_AUTHOR_STYLE_PROMPT_ACTIONS:
             if NOVEL_PROSE_START_MARKER not in prompt or NOVEL_PROSE_END_MARKER not in prompt:
                 boundary = (
@@ -7139,7 +7255,10 @@ class NovelWritingWorker(QThread):
                 "不得复制样本的人物、剧情、物件或原句；也不得为了展示文风硬塞口语、笑点、对白、短段或特殊词。"
                 "同一事实不要换词重复解释，不要替人物讲道理，不要写报告式推理或机械分镜。"
                 "只输出正文，不输出标题、前言、分区标签、审校说明、JSON或Markdown代码块。"
-                + _grounded_prose_contract()
+                + _grounded_prose_contract(
+                    style_active="【正文风格参考】" in self.context
+                    or "【仿写优先级｜已加载文风档案】" in self.context,
+                )
             )
         if self.action == "style_finalize":
             return (
@@ -7149,12 +7268,15 @@ class NovelWritingWorker(QThread):
                 "样本稳定重复的词在适用语境中应原样使用，不得为了词汇丰富强行替换。"
                 "结合角色卡语言方式落实不同功能角色的称呼、语气词和接话习惯，不能让所有人物一个腔调。"
                 "文风中的关键词强调、对白回环和情绪递进可以保留，但不得把状态资料、既有规则或已经完成的结论反复改写成正文；"
-                "同一信息只有出现新证据、新决定或新后果时才能再次展开。"
+                "同一信息在新证据、新决定、新后果、理解差异或情绪与关系需要时可以自然再提，但不为读者重复完整背景。"
                 "剧情事件、人物、设定、时间线和结尾要求必须完整保留；只修正错误和确有证据的写法偏差。"
                 "必须逐段核对时间顺序、因果、代词唯一指向和人物生死、清醒、位置、权限及物件持有状态；"
                 "提纲内部互斥时以已发布正文和当前已确认状态为准，不能把两种状态同时写入终稿。"
                 "必须严格使用用户上下文指定的输出分区，不输出审校报告、评分、修改说明、Markdown代码块或额外内容。"
-                + _grounded_prose_contract()
+                + _grounded_prose_contract(
+                    style_active="【正文风格参考】" in self.context
+                    or "【仿写优先级｜已加载文风档案】" in self.context,
+                )
             )
         if self.action == "style_audit":
             return (
@@ -7175,8 +7297,10 @@ class NovelWritingWorker(QThread):
             )
         if self.action == "memory_finalize":
             return (
-                "你是长篇小说连续性总编辑。最终正文是唯一事实来源；独立逐段检查正文并生成实际提纲、摘要、关键事实和版本2长篇记忆增量，"
-                "不得重写正文，不得把原提纲、未来规划、人物秘密或伏笔答案当成已经发生。"
+                "你是小说正文审读与连续性总编辑。最终正文是唯一事实来源；先按正文语言检查规则逐句审读对白和叙述，"
+                "把明确的词义搭配、句意和必要成分问题记入prose_review，并用repair_patches给出原意明确的局部替换；"
+                "再独立生成实际提纲、摘要、关键事实和版本2长篇记忆增量。"
+                "正文修补仅通过repair_patches提供局部替换，不输出整章正文；不得把原提纲、未来规划、人物秘密或伏笔答案当成已经发生。"
                 "在状态整理前必须额外做一次正文成品泄漏检查：识别正文中误写入的内部人物/设定/伏笔短引用、任务或状态字段名、JSON/代码片段、"
                 "AI推理、提示词、输出要求、校验说明和工作流程说明。只有它们明显不是故事内人物看到的界面文字、手机消息、文件内容或自然对白时才算泄漏；"
                 "不要把剧情中合理出现的全角括号提示、聊天消息、文件名、普通英文缩写或角色对内部内容的讨论误报为泄漏。"
@@ -7193,14 +7317,13 @@ class NovelWritingWorker(QThread):
                 "新增事实的临时引用只能填写在fact_updates各项的key字段，禁止改用temp_id或临时id。"
                 "每条operation不是keep的新增、更新、退出或替代事实，都必须至少被一个long_term_events.storage.fact_refs引用；"
                 "输出前逐项核对fact_updates，不能让会影响后文的事实脱离对应长期事件。"
-                "同时做一次不改写正文的读感诊断：只标出有明确原文位置的重复说明、无结果流程赘述、"
-                "机械短碎表达或局部语言冲突。没有明确可替换原文时必须不提出修补；不得把剧情选择、"
+                "同时标出有明确原文位置的重复说明、无结果流程赘述、机械短碎表达或局部语言冲突；不得把剧情选择、"
                 "文风偏好、现实流程不完整或正常留白当成问题。"
                 "审读还必须覆盖中文正文中的其他语种残留、未翻译外语句子、乱码、编码损坏、异常替代字符和无意义的字母数字符号混排；"
                 "不得把非ASCII字符本身、正常中文标点、单位/数学符号、合法专名、型号、代码标识、作者要求保留的原文、"
                 "确有必要的外语对白或故事内文件/界面内容误报为异常。普通旁白、对白和人物内心活动中的自然判断不是AI推理泄漏；"
                 "只有明确面向生成过程的推理、提示词、JSON/字段、校验、输出或工作流说明，或内部任务/状态资料直接进入正文，才报告为元信息泄漏。"
-                "prose_review中的issues只记录普通读感诊断；已确认的无必要非中文残留、乱码/编码损坏或AI推理/说明字段泄漏必须放入blocking_issues，"
+                "prose_review中的issues记录语言和读感问题；已确认的无必要非中文残留、乱码/编码损坏或AI推理/说明字段泄漏必须放入blocking_issues，"
                 "每项使用category、quote、reason，并且quote必须是正文逐字片段；只有确认排除后才能返回blocking_issues为空。"
                 "必须使用用户资料提供的短引用和当前修订号，所有动态更新都附正文逐字证据。"
                 "输出时必须先完成outline、summary、key_facts和long_form_memory四个核心字段，再输出logic_audit、prose_review和repair_patches。"
@@ -7251,7 +7374,10 @@ class NovelWritingWorker(QThread):
                 "严格使用用户指定的三个分区标题，不输出分析、状态JSON、Markdown代码块或额外内容。"
                 f"备用正文草稿必须使用{NOVEL_PROSE_START_MARKER}和{NOVEL_PROSE_END_MARKER}包住；"
                 "包络外不得输出思考、分析、计划或总结。"
-                + _grounded_prose_contract()
+                + _grounded_prose_contract(
+                    style_active="【正文风格参考】" in self.context
+                    or "【仿写优先级｜已加载文风档案】" in self.context,
+                )
             )
         if self.action in {"draft", "style_rewrite"} and "【正文风格参考】\n" in self.context:
             return (
@@ -7259,8 +7385,15 @@ class NovelWritingWorker(QThread):
                 "已经确定的人名、时间、地点、关系、物件、编号、人物状态和已发生事件随着当前章节自然延续。"
                 "把完整样本中的叙述、对白、情绪和场景组织方式自然转化为当前人物和当前事件，写出可直接进入小说的正文。"
                 f"只输出小说正文，并严格使用{NOVEL_PROSE_START_MARKER}和{NOVEL_PROSE_END_MARKER}包住正文；"
-                "包络外不得输出‘我会’‘接下来’‘本章将’等规划说明、分析、提纲、执行过程或致读者文字，"
-                "包络内也只能是可直接进入小说的正文。"
+                "正文呈现故事中的人物言行、心理和叙述；模型针对生成任务的计划、分析和执行说明留在正文之外，"
+                "包络外不输出任何说明。"
+                + _grounded_prose_contract(style_active=True)
+            )
+        if self.action == "style_rewrite":
+            return (
+                "你是小说正文修订编辑。依据上下文列出的问题修订完整正文，保留原有剧情、人物口吻、事件顺序和结果。"
+                "结合上下文重写确有语言问题的句子，正确句子与原段落原样保留，交付可直接进入小说的完整正文。"
+                "正文呈现故事中的人物言行、心理和叙述；模型针对生成任务的计划、分析和执行说明留在正文之外。"
                 + _grounded_prose_contract()
             )
         prompts = {
@@ -7287,9 +7420,9 @@ class NovelWritingWorker(QThread):
                 "参考【长篇进度 / 节奏】控制本章推进密度，避免开篇过早揭底、中段原地反复、后段新增大坑；"
                 "参考【本章写作长度】里的本次新增正文目标安排详略，它是质量优先的参考目标，不是硬性字数要求；"
                 "优先保证完整小场景、冲突收束和正文质量，不要为了贴字数截断或省略关键结尾；"
-                "多用动作和对话推进，不要写解释性分析。"
+                "动作、对话和必要的心理描写按场景、人物关系与事件压力自然配合；"
+                "保留有情绪或人物作用的铺垫、停顿与接话，不用作者式分析代替人物体验，也不要求每句台词立即推动行动。"
                 "只输出正文草稿，不输出标题、说明、分析或创作建议。"
-                + _grounded_prose_contract()
             ),
             "summary": (
                 "你是长篇小说连续性编辑。请基于当前章节正文提炼本章摘要。\n"
@@ -7396,7 +7529,6 @@ class NovelWritingWorker(QThread):
                 else 0.35
             )
             max_tokens = self._max_tokens_for_request()
-            self.diagnostics["max_output_tokens"] = max_tokens
             reasoning_effort = self._reasoning_effort_for_request()
             if reasoning_effort:
                 self.diagnostics["reasoning_effort_requested"] = reasoning_effort
@@ -7417,6 +7549,9 @@ class NovelWritingWorker(QThread):
             self.diagnostics["api_protocol"] = protocol
             self.api_protocol = protocol
             self.diagnostics["request_endpoint"] = url
+            self.diagnostics["max_output_tokens"] = _novel_reasoning_output_limit(
+                protocol, payload, max_tokens
+            )
             self.diagnostics["prompt_cache_key"] = str(
                 payload.get("prompt_cache_key", "") or ""
             )
@@ -8372,73 +8507,19 @@ class NovelChapterPlanWorker(NovelAnalysisWorker):
         if not isinstance(nodes, list) or not nodes:
             return ""
 
-        def compact(value, limit):
-            if isinstance(value, (dict, list)):
-                value = json.dumps(value, ensure_ascii=False, separators=(",", ":"))
-            text = re.sub(r"\s+", " ", str(value or "").strip())
-            return text[:limit].rstrip()
-
-        rows = []
-        for position, node in enumerate(nodes):
-            if not isinstance(node, dict):
-                continue
-            node_number = int(node.get("n", position + 1) or position + 1)
-            node_id = str(node.get("id", "") or "").strip()
-            node_range = node.get("range", [])
-            try:
-                range_text = f"第{int(node_range[0])}-{int(node_range[1])}章"
-            except (TypeError, ValueError, IndexError):
-                range_text = "当前节点范围"
-            event_text = compact(node.get("event", ""), 420)
-            result_text = compact(node.get("result", ""), 300)
-            preconditions = compact(node.get("preconditions", ""), 220)
-            state_delta = compact(node.get("state_delta", ""), 220)
-            parts = [
-                f"节点{node_number}{('/' + node_id) if node_id else ''}（{range_text}）",
-                f"当前事件：{event_text}" if event_text else "当前事件以节点资料为准",
-                f"前置条件：{preconditions}" if preconditions else "",
-                f"本节点结果上限：{result_text}" if result_text else "本节点结果以上一阶段资料和当前节点字段为准",
-                f"本节点状态变化：{state_delta}" if state_delta else "",
-            ]
-            next_node = nodes[position + 1] if position + 1 < len(nodes) else None
-            if isinstance(next_node, dict):
-                next_preconditions = compact(next_node.get("preconditions", ""), 220)
-                if next_preconditions:
-                    parts.append(
-                        "下一节点只作为当前章末入口，不在本节点执行："
-                        + next_preconditions
-                    )
-                else:
-                    parts.append("本节点结束后只留下下一节点入口，不提前执行下一节点结果")
-            elif bool(node.get("is_stage_final_node", False)):
-                if bool(schedule.get("stage_is_final", False)):
-                    parts.append(
-                        "这是全书最后阶段的阶段末节点；终局结果仍只能按已确认的高潮章位和收尾窗口兑现，"
-                        "普通节点不得提前执行终局"
-                    )
-                else:
-                    parts.append(
-                        "这是当前阶段最后节点；只在本节点范围内完成当前阶段出口，"
-                        "后续阶段只保留为新的压力入口"
-                    )
-            rows.append("；".join(part for part in parts if part) + "。")
-        if not rows:
-            return ""
-
-        stage_exit = compact(schedule.get("stage_exit_state", ""), 480)
-        exit_rule = (
-            "当前阶段出口只用于核对本阶段最后节点完成后的状态，不是普通节点可提前执行的剧情清单。"
-        )
-        if stage_exit:
-            exit_rule += "阶段出口参考：" + stage_exit + "。"
         return (
             "【当前阶段事件边界｜核心约束】"
+            "完整事件事实只读取wizard_framework.stage_plan.ordered_events，按节点id或n与locked_node_schedule的章位对应。"
             "当前节点的event、preconditions、result和state_delta组成一条不可越过的局部因果链。"
             "每章只能推进当前槽位所属节点；result是该节点允许完成的硬上限，不能把后续节点、阶段出口或全书终局提前写进当前节点。"
             "下一节点的前置条件只能作为当前节点形成的新压力、行动动机或章末入口，不能提前兑现下一节点结果。"
-            + exit_rule
-            + "\n"
-            + "\n".join(rows)
+            "下一节点只作为当前章末入口，不在本节点执行。"
+            "当前阶段出口只用于核对本阶段最后节点完成后的状态，不是普通节点可提前执行的剧情清单。"
+            + (
+                "这是全书最后阶段的阶段末节点；终局结果仍只能按已确认的高潮章位和收尾窗口兑现，普通节点不得提前执行终局。"
+                if schedule.get("stage_is_final") else
+                "当前阶段最后节点；只在本节点范围内完成当前阶段出口，后续阶段只保留为新的压力入口。"
+            )
         )
 
     def _analysis_prompt(self):
@@ -8591,6 +8672,12 @@ class NovelChapterPlanWorker(NovelAnalysisWorker):
                 "w、s、n、u、d等可由当前阶段和程序上下文确定，不要返回；b、q、x、f、v、z、h、k等重复结构不要返回。"
                 "导入项目只有在确实需要时才返回m=outline_mode和g=source_location。"
             )
+        if self.has_explicit_power_levels:
+            output_schema += (
+                '每章o的格式为"本章具体故事事实\\n本章境界推进：人物；章前真实境界→章末真实境界；变化依据或维持原因"。'
+                "隐藏实力、对外展示、伤势消耗与真实境界分别交代；展示较低实力不表示真实境界降低。"
+                "没有变化时沿用人物当前的明确境界名称，写明保持原因。"
+            )
         return (
             "你是这部长篇小说的作者助手。请根据用户已确认的规划基础，只生成当前批次的逐章提纲。\n"
             "必须只输出一个合法 JSON 对象，不要 Markdown，不要解释，不要注释，不要尾随逗号。JSON必须使用单行紧凑格式，"
@@ -8690,10 +8777,6 @@ class NovelChapterPlanWorker(NovelAnalysisWorker):
 
     def _chunk_user_text(self, chunk_text, chunk_index, total_chunks):
         return str(chunk_text or "")
-
-    def _reasoning_effort_for_request(self):
-        effort = super()._reasoning_effort_for_request()
-        return effort or ("high" if self.model.lower().startswith(("gpt-", "o1", "o3", "o4")) else "")
 
     def _analysis_progress_label(self):
         return "章节规划"

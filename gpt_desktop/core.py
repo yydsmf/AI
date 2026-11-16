@@ -747,7 +747,7 @@ def api_url(base_url, path):
 
 # Only models whose reasoning parameter support was verified through the
 # configured OpenAI-compatible providers are included here. The writing
-# pipeline below explicitly requests High; these mappings remain the
+# pipeline has its own policy; these mappings remain the
 # allow-list for other model-specific requests.
 _DEFAULT_REASONING_EFFORTS = {
     "gpt-5.6-luna": "high",
@@ -771,12 +771,12 @@ _PROVIDER_REASONING_EFFORTS = {
     },
 }
 
-# Novel writing requests that should always use the stable High reasoning tier.
+# Novel writing requests share the same model-aware reasoning policy.
 # This covers normal and automatic expansion, chapter checks, post-write
 # organization, state repair, and the ten-chapter boundary reconciliation.
 # Keep this list at the shared resolver so every active novel-writing pipeline
 # uses the same reasoning policy.
-_NOVEL_WRITING_HIGH_REASONING_ACTIONS = {
+_NOVEL_WRITING_REASONING_ACTIONS = {
     "draft",
     "outline",
     "summary",
@@ -799,11 +799,14 @@ _NOVEL_WRITING_HIGH_REASONING_ACTIONS = {
     "memory_reconcile",
     "memory_repair",
     "logic_repair",
+    "框架分类",
+    "章节规划",
 }
 
-# Keep import classification and both chapter-planning passes at the stable
-# High tier as well.
-_FIXED_HIGH_REASONING_ACTIONS = {"框架分类", "章节规划"}
+
+def novel_reasoning_effort_for_model(model):
+    """Use XHigh for novel tasks, retaining High for Gemini on any transport."""
+    return "high" if "gemini" in str(model or "").strip().lower() else "xhigh"
 
 
 def _reasoning_model_key(model):
@@ -826,14 +829,12 @@ def reasoning_effort_for_model(model, base_url="", action=""):
     except Exception:
         host = ""
     action_key = str(action or "").strip()
-    if action_key in _NOVEL_WRITING_HIGH_REASONING_ACTIONS:
-        return "high"
+    if action_key in _NOVEL_WRITING_REASONING_ACTIONS:
+        return novel_reasoning_effort_for_model(model)
     provider_levels = _PROVIDER_REASONING_EFFORTS.get(host, {})
     verified_level = provider_levels.get(model_key) or _DEFAULT_REASONING_EFFORTS.get(model_key, "")
     if not verified_level:
         return ""
-    if action_key in _FIXED_HIGH_REASONING_ACTIONS:
-        return "high"
     return "high"
 
 

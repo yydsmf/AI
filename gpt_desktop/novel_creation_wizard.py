@@ -461,8 +461,7 @@ CREATION_STAGE_EVENT_GUIDANCE = """
 
 CREATION_STAGE_LIFECYCLE_GUIDANCE = """
 【阶段性人物生命周期与时间一致性】
-核心动机可以贯穿全书，但除核心动机外，承担当前阶段主要推进作用的阶段性对手、关键推进人物目标和关系任务，都要在当前阶段形成一次可见兑现：目标达成、计划落空、身份揭开、关系定性、立场改变、退出当前冲突，或转化为后续会产生作用的既成后果。本规则只约束承担阶段主要推进作用的人物和关系任务，不要求普通配角、生活人物或仅承担局部陪衬功能的人物每次跨阶段出现时都改变位置。阶段性推进人物若继续出现，后续要以新的身份、利益位置、关系状态、行动目标或已兑现结果参与新的、更高强度的人物冲突，不把原来的争夺、救场、追查、试探或扩权循环换规模继续重复。
-兑现后的结果要通过人物冲突转化成新的、更高强度的场景事件：由人物新的目标、立场、关系、利益争夺、选择或正面/间接对抗推动，写清谁与谁发生了什么冲突以及冲突造成的直接后果；强度提升不只表现为异兽等级、范围、数量、地图或资源规模扩大。
+核心动机可以贯穿全书，但除核心动机外，承担当前阶段主要推进作用的阶段性对手、关键推进人物目标和关系任务，都要在当前阶段形成一次可见兑现：目标达成、计划落空、身份揭开、关系定性、立场改变、退出当前冲突，或转化为后续会产生作用的既成后果。本规则只约束承担阶段主要推进作用的人物和关系任务，不要求普通配角、生活人物或仅承担局部陪衬功能的人物每次跨阶段出现时都改变位置。
 阶段方向和阶段规划都要写清当前阶段的直接目标如何落地，以及兑现后打开了什么新的处境、选择、关系或代价。阶段之间承接的是已经成立的结果，不是把同一个阶段性目标延期到后面再完成；核心动机的持续推进与阶段性人物目标的阶段闭环要同时成立。
 第一步的核心动机、明确时间节点和结尾方向必须保持同一先后顺序。若核心动机写明某项阶段性结果发生在订婚、出发、决战或其它明确节点之前，结尾方向只补充全书最终结果，不能把同一项结果推迟到更晚的阶段；若故事确实需要推迟兑现，应同步调整核心动机中的节点和主线表述，让全书只有一套时间顺序。
 """.strip()
@@ -540,23 +539,26 @@ COMMON_CREATION_RULES = f"""
 
 
 CREATION_PREMISE_RULES = f"""
-{CREATION_CORE_QUALITY_GUIDANCE}
-
-根据作者灵感和已选参数，创作五个网络小说故事方向。
-创作重点：核心动机作为全书唯一主线；采用热门爆款网络小说风格；剧情压力和冲突强度随故事推进逐步递进；冲突通过人物的目标、选择、关系和行动落地。
-五个方向各有辨识度，探索不同的故事走向与人物选择。
+根据作者灵感和已选参数，生成五个有明显差异的网络小说故事简介。
+五个方向要分别形成不同的故事抓手、人物处境或主要矛盾，保持作者已选的题材、读者方向、主题、角色、情节、风格和主角起点；不要把五个方向写成同一故事的换名版本。
+每个方向同时提炼一条简短的核心动机，说明主角全书必须完成的唯一目标、围绕它形成的主要矛盾和失败代价；核心动机只作为后续阶段方向的主线参考，不写阶段事件、关键节点、伏笔安排或详细结局。
+第一步只保留书名、故事简介和核心动机，不提前生成主线契约之外的人物关系底子、阶段规划、伏笔安排或结局方案。
 参考 n 中已有姓名，为各方向选用自然、清晰、相互区分的姓名；同一方向内姓名保持一致。
-作者明确提供 requested_title 时沿用该书名；未提供时，为五个方向分别拟定贴合各自故事的书名。
+作者明确提供 requested_title 时沿用该书名；未提供时，为五个方向分别拟定贴合各自简介的书名。
+{CREATION_ENTITY_NAMING_GUIDANCE}
+{CREATION_CHINESE_OUTPUT_GUIDANCE}
 """.strip()
 
 
 STEP_PROMPTS = {
     "premise": f"""{CREATION_PREMISE_RULES}
 
-只返回一个合法 JSON 对象，字段按程序结构输出：t=书名，g=题材，a=读者方向，y=风格，h=一句话引子，d=故事简介，p=主角，m=核心动机，r=人物关系，e=结尾方向；s=默认选中序号。结构为 {{"c":{{"1":{{"t":"","g":"","a":"","y":"","h":"","d":"","p":"","m":"","r":"","e":""}},"2":{{"t":"","g":"","a":"","y":"","h":"","d":"","p":"","m":"","r":"","e":""}},"3":{{"t":"","g":"","a":"","y":"","h":"","d":"","p":"","m":"","r":"","e":""}},"4":{{"t":"","g":"","a":"","y":"","h":"","d":"","p":"","m":"","r":"","e":""}},"5":{{"t":"","g":"","a":"","y":"","h":"","d":"","p":"","m":"","r":"","e":""}}}},"s":0}}。""",
+只返回一个合法 JSON 对象。每个候选只返回 t=书名、d=故事简介、m=核心动机；s=默认选中序号。结构为 {{"c":{{"1":{{"t":"","d":"","m":""}},"2":{{"t":"","d":"","m":""}},"3":{{"t":"","d":"","m":""}},"4":{{"t":"","d":"","m":""}},"5":{{"t":"","d":"","m":""}}}},"s":0}}。""",
     "bible": f"""{COMMON_CREATION_RULES}
 
 现在和作者一起把已经选定的故事底盘搭好。下面的“已经选定的故事”是唯一的故事来源：稳住它的主角、处境、地点、核心悬念、主要关系和结尾方向，再补足长篇故事继续生长所需要的事实。新增人物、新势力和新秘密都要服务于原来的主线，并在后续事件中拥有具体作用。
+
+如果已经选定的故事中带有“核心动机”，它是第一步随简介确认的主线锚点。主线矛盾字段要沿用这条核心目标、主要阻力和失败代价，只把它整理成后续可执行的故事底盘；可以补足必要事实，但不能另起第二条总目标，也不能把核心动机拆成并行主线。
 
 {CREATION_RECENT_NAME_GUIDANCE}
 
@@ -605,19 +607,18 @@ STAGE_PLAN_OBJECT_OUTPUT_RULES = """
 这次使用对象协议，阶段和事件按字段名归位；只返回一个合法 JSON 对象。
 短键含义如下：k=全书底盘契约（其中的核心动机是唯一执行主线），s=当前阶段对象，f=当前阶段实际发生的伏笔端点。阶段对象中 i=阶段编号，n=阶段名称，r=章节范围，b=开始状态，e=按顺序发生的场景事件对象数组，x=结束状态，y=带入下一阶段的事实，u=本阶段主线压力递进摘要，m=可选的终局收尾方案。u使用scope、step、opponents、cost、exit_change五个字段，分别写冲突牵连范围、相较前阶段新增的压力、直接阻止主角的人物或人物集团、必须付出的不可逆代价、阶段结束后改变的处境或关系。状态对象中 t=时间，l=地点，c=人物状态，k=已经发生并被人物掌握的事实，q=仍会推动人物行动的问题。事件对象中 i=事件编号，r=允许章节范围，a=关联资料，p=前置条件，h=可直接扩写的场景事件，o=直接结果，d=实际状态变化。伏笔端点对象中 i=伏笔编号，k=setup或payoff，e=承载这个端点的事件编号，d=这一次在场景中发生的具体变化；一次只写一个端点。
 每个 h 都要像一段可以直接扩写的剧情节点：只写这件事真正需要的故事事实，必要时交代人物、场景、动作、阻力、选择或结果，尽量不用固定清单式要求，不为凑齐项目硬塞字段。剧情发动机由题材和人物处境决定，可以是正面碰撞、追逐逃避、关系变化、欲望争夺、环境失控、能力试探、秘密暴露或其它自然发生的压力；相邻事件要让人物处境产生新的变化，不把这些方式排成固定轮换。资料只有在人物正在做事、被迫应对或关系发生变化时进入场景。
-除 core_motive 外，承担当前阶段主要推进作用的阶段性对手、关键推进人物目标和关系任务，都要在本阶段事件中形成一次可见兑现，并把兑现后的新位置、立场、关系结果或现实后果转化为由人物目标、关系变化、利益争夺、选择或正面/间接对抗推动的更高强度新场景。普通配角、生活人物和局部陪衬人物不套用这条跨阶段兑现要求；阶段性推进人物可以继续出现，但后续事件使用的是兑现后的新目标或新处境。同一人物原先的争夺、救场、追查、试探、扩权或误会已经完成转化后，不能只换更大的对象继续循环。
  m 只在全书最后阶段返回，结构至少包含 closure_mode、closure_horizon、long_term_result、final_image、opening_echo、title_closure_intent、time_jump_allowed；同时补充一组与本书实际高潮有关的可选字段：climax_event_id、climax_chapter_range、climax_event、climax_result、post_climax_landing。高潮字段只引用已经建立的主线冲突、人物关系和阶段事件，不凭空添加新主线、新势力或新规则；climax_chapter_range 只写实际承载高潮最终兑现的章节范围，放在收尾窗口开始前的三章内，交锋和升级可以更早展开。closure_mode 从 immediate_verified、short_term_verified、long_term_epilogue、mirror_scene、mixed 中选择最适合本书的一种；不能为了统一格式强行使用远期跳跃。long_term_epilogue 或 mixed 必须给出可信的时间跨度和具体成果，mirror_scene 必须说明要呼应的开头地点、物件、动作或关系；所有模式都必须先让本部核心结果落地，再用最后画面收束。最后3章继续承担既有的收尾完结，不把高潮提前结束后留下的长篇余波塞成一串告别、拒绝邀请或成果展示；post_climax_landing 只安排必要且不重复的直接后果、关系落点和最终处境，不另开短线填篇幅。
 当前阶段发生的正式伏笔端点，都在承载事件的 a 中加入一次“F编号/setup”或“F编号/payoff”，并在 f 中用同一事件编号 e 关联。setup写线索第一次进入人物生活，payoff写线索在场景中产生决定性变化；同一条伏笔在其它事件中继续出现、深化、造成后果是正常的，这些事件只把它作为普通关联资料或写出“F编号”，不要重复标成正式 setup/payoff。程序以正式端点为准，再把后续事件中的具体变化交给章节规划继续使用；阶段之间允许继续铺开同一条暗线，程序会依据事件 r 的章节范围落下具体章号。
 实际返回的 f 使用单端点格式，例如 {"i":"F06","k":"payoff","e":"E04","d":"人物在现场做出选择后，线索改变了什么"}。全书契约保留长期事实、世界运行方式、人物底色和结尾方向；伏笔通过 setup 与 payoff 表达它在场景中的进入、变化和意义显现。
 
-返回结构示例（示例中的空数组和空字段实际可以省略）：{"v":"4","k":{"f":["不能改变的长期事实"],"w":["长期世界运行方式"],"c":["人物底色"],"e":["结尾方向"]},"s":{"i":"S05","n":"阶段名称","r":[137,167],"b":{"t":"时间","l":"地点","c":["人物处境"],"k":["已经发生并被人物掌握的事实"],"q":["仍会推动人物行动的问题"]},"e":[{"i":"E01","r":[137,140],"a":["F01/setup","关联资料"],"p":["前置条件"],"h":"时间、地点、人物、压力、动作、阻力、选择和现场结果组成的场景事件","o":"直接结果","d":["人物、关系、情绪或局势发生的实际变化"]}],"x":{"t":"结束时间","l":"结束地点","c":["结束时人物处境"],"k":["结束时已经发生的事实"],"q":["带入下一阶段的问题"]},"y":["带入下一阶段的事实"]},"f":[{"i":"F01","k":"setup","e":"E01","d":"线索在现场第一次出现并改变人物选择"}]}}。本次只生成当前阶段一个 s 对象，不要返回其它阶段；有意义的事实不能省略。
+返回结构示例（示例中的空数组和空字段实际可以省略）：{"v":"4","k":{"f":["不能改变的长期事实"],"w":["长期世界运行方式"],"c":["人物底色"],"e":["结尾方向"]},"s":{"i":"S05","n":"阶段名称","r":[137,167],"b":{"t":"时间","l":"地点","c":["人物处境"],"k":["已经发生并被人物掌握的事实"],"q":["仍会推动人物行动的问题"]},"e":[{"i":"E01","r":[137,138],"a":["F01/setup","关联资料"],"p":["前置条件"],"h":"时间、地点、人物、压力、动作、阻力、选择和现场结果组成的场景事件","o":"直接结果","d":["人物、关系、情绪或局势发生的实际变化"]}],"x":{"t":"结束时间","l":"结束地点","c":["结束时人物处境"],"k":["已经发生并被人物掌握的事实"],"q":["带入下一阶段的问题"]},"y":["带入下一阶段的事实"],"u":{"scope":"本阶段冲突范围","step":"相较前阶段新增的压力","opponents":"直接阻止主角的人物或人物集团","cost":"必须付出的不可逆代价","exit_change":"阶段结束后改变的处境或关系"}},"f":[{"i":"F01","k":"setup","e":"E01","d":"线索在现场第一次出现并改变人物选择"}]}。本次只生成当前阶段一个 s 对象，不要返回其它阶段；有意义的事实不能省略。示例中的阶段编号和章号仅用于说明字段，事件数组只展示一项；实际必须按当前阶段的编号和范围返回覆盖全部章节的完整事件数组。
 """.strip()
 
 STEP_PROMPTS["stage_plan"] = f"""{COMMON_CREATION_RULES}
 
 {CREATION_STAGE_EVENT_GUIDANCE}
 
-现在根据已经选定的故事、用户确认的阶段方向和完整故事底盘，制作唯一的十万字阶段规划。阶段方向是每个十万字阶段的宏观卖点和转场底稿，阶段规划必须把它落成具体人物、场景、冲突和结果，不能把阶段方向改成抽象口号，也不能让多个阶段循环处理同一具体矛盾；既有场景或人物可以延续，但阶段差异按上方公共核心约束落实。这里的内容是给后续章节规划和正文扩写读取的执行资料，不是发布简介，也不需要写成文学化段落。总字数和单章字数完全按照作者输入；章节总数按 total_words / average_chapter_words 向上取整，最后一章吸收余数。每约十万字为一个阶段，阶段从第1章连续覆盖到最后一章，事件范围按顺序衔接。全书始终围绕唯一的 core_motive 推进：主角为了完成具体目标主动采取行动，剧情阻碍这条行动链，主角付出代价解决当前问题，结果再打开下一道目标；不能把阶段写成主角被动不断遇到新事情。
+现在根据已经选定的故事、用户确认的阶段方向和完整故事底盘，制作唯一的十万字阶段规划。阶段方向是每个十万字阶段的宏观卖点和转场底稿，阶段规划必须把它落成具体人物、场景、冲突和结果，不能把阶段方向改成抽象口号，也不能让多个阶段循环处理同一具体矛盾；阶段差异按上方公共核心约束落实。这里的内容是给后续章节规划和正文扩写读取的执行资料，不是发布简介，也不需要写成文学化段落。总字数和单章字数完全按照作者输入；章节总数按 total_words / average_chapter_words 向上取整，最后一章吸收余数。每约十万字为一个阶段，阶段从第1章连续覆盖到最后一章，事件范围按顺序衔接。全书始终围绕唯一的 core_motive 推进：主角为了完成具体目标主动采取行动，剧情阻碍这条行动链，主角付出代价解决当前问题，结果再打开下一道目标；不能把阶段写成主角被动不断遇到新事情。
 阶段字段不要抢全书主线：阶段的 main_conflict 只写本阶段阻碍核心动机的具体问题、门槛、对手动作或代价升级；阶段 summary/end_state 要说明本阶段目标如何推进，以及结果打开的下一阶段目标。不要在每个阶段重新发明一条“主角真正要做的事”，也不要把主题、人物关系或伏笔名称填成阶段主线。阶段对象应优先返回 u（mainline_pressure），只记录本阶段相较前阶段的压力事实：scope、step、opponents、cost、exit_change。u 要在本阶段事件生成前先确定，并作为事件差异化和主线推进的因果底稿，不是事后总结或审核清单；阶段大事件差异按上方公共核心约束落实，压力增强本身不能代替该要求；不要凭空换地图、换势力或套固定层级。
 
 全书最后阶段必须额外规划“终局收尾方案”：根据题材、核心动机和故事规模，在即时结果型 immediate_verified、短期验证型 short_term_verified、远期成果型 long_term_epilogue、镜像回响型 mirror_scene、混合型 mixed 中选择一种，不要为了格式统一强行使用时间跳跃。若选择短期或远期验证，必须写出可信的时间跨度、已经持续存在的成果和一个能在场景中看见的验证；若选择镜像回响，必须写清呼应开头的地点、物件、动作或关系变化；若选择 mixed，先完成当前主线，再用时间落点或镜像画面确认成果。终局方案不是另开剧情，也不能用“多年后一切都变好了”的摘要替代具体场景。
@@ -747,7 +748,6 @@ def creation_meta_display_values(premise, existing_genre="", existing_style=""):
     )
     style = _creation_merge_display_parts(
         premise.get("style"),
-        premise.get("story_engine"),
         existing_style,
     )
     return {"genre": genre, "style": style}
@@ -776,9 +776,21 @@ def _creation_premise_name(value):
     text = _as_text(value)
     if not text:
         return ""
+    # A synopsis normally puts the protagonist name directly before a
+    # predicate, such as ``主角林澈卷入旧案``.  A greedy four-character
+    # capture would turn that into ``林澈卷入`` and pollute the name history.
+    # Keep the boundary list small and linguistic: it is only a naming hint,
+    # not a general Chinese word segmenter.
+    name_boundary = (
+        r"(?=(?:是|为|叫|卷入|被迫|面对|发现|决定|踏上|意外|重生|回到|"
+        r"身陷|带着|为了|开始|成为|拥有|觉醒|遭遇|收到|接到|接受|拒绝|"
+        r"想要|必须|即将|突然|被|在|与|和|却|但|便|就|"
+        r"[^\u4e00-\u9fff]|$))"
+    )
     patterns = (
-        r"(?:主角|男主|女主)(?:的名字|姓名|叫作|叫做|叫|是)?[：:\s]*([\u4e00-\u9fff]{2,4})",
-        r"(?:名字|姓名)[：:\s]*([\u4e00-\u9fff]{2,4})",
+        rf"(?:主角|男主|女主)(?:的名字|姓名|叫作|叫做|叫|是)?[：:\s]*"
+        rf"([\u4e00-\u9fff]{{2,4}}?){name_boundary}",
+        rf"(?:名字|姓名)[：:\s]*([\u4e00-\u9fff]{{2,4}}?){name_boundary}",
     )
     for pattern in patterns:
         match = re.search(pattern, text)
@@ -948,7 +960,7 @@ def _bootstrap_creation_name_history():
         candidates = payload.get("premise_candidates", []) if isinstance(payload, dict) else []
         for candidate in candidates if isinstance(candidates, list) else []:
             if isinstance(candidate, dict):
-                name = _creation_premise_name(candidate.get("protagonist"))
+                name = _creation_candidate_name(candidate)
                 if name:
                     records.append({"name": name, "created_at_ns": draft_updated_at})
         step_results = payload.get("step_results", {}) if isinstance(payload, dict) else {}
@@ -1182,7 +1194,7 @@ def _migrate_legacy_creation_wizard_draft():
         except (OSError, AttributeError):
             created_ns = time.time_ns()
         draft_id = f"{created_ns}-{uuid.uuid4().hex[:8]}"
-        migrated = deepcopy(legacy)
+        migrated = _clean_creation_wizard_premise_payload(legacy)
         migrated["draft_id"] = draft_id
         migrated["created_at"] = _as_text(migrated.get("created_at")) or now_str()
         migrated["created_at_ns"] = int(migrated.get("created_at_ns", created_ns) or created_ns)
@@ -1258,12 +1270,16 @@ def load_creation_wizard_draft(draft_id):
     _migrate_legacy_creation_wizard_draft()
     path = _creation_wizard_draft_path(draft_id)
     data = load_json_file(path, {}) if path else {}
+    cleaned = _clean_creation_wizard_premise_payload(data)
+    if path and cleaned != data:
+        save_json_file(path, cleaned)
+        data = cleaned
     return data if isinstance(data, dict) else {}
 
 
 def save_creation_wizard_draft(payload):
     _migrate_legacy_creation_wizard_draft()
-    payload = deepcopy(payload) if isinstance(payload, dict) else {}
+    payload = _clean_creation_wizard_premise_payload(payload)
     draft_id = _as_text(payload.get("draft_id")) or _new_creation_wizard_draft_id()
     payload["draft_id"] = draft_id
     payload.setdefault("created_at", now_str())
@@ -2864,15 +2880,8 @@ def _expand_foreshadow_transport(value):
 _PREMISE_SLOT_KEYS = ("1", "2", "3", "4", "5")
 _PREMISE_CANDIDATE_ALIASES = {
     "t": "title",
-    "g": "genre",
-    "a": "audience",
-    "y": "style",
-    "h": "one_sentence",
     "d": "synopsis",
-    "p": "protagonist",
-    "m": "main_line",
-    "r": "relationship_engine",
-    "e": "ending_direction",
+    "m": "core_motive",
 }
 
 
@@ -3001,13 +3010,7 @@ def _expand_premise_candidate_transport(value):
     if isinstance(value, dict):
         return _expand_transport_aliases(value, _PREMISE_CANDIDATE_ALIASES)
     if isinstance(value, list):
-        return _compact_record(
-            value,
-            (
-                "title", "genre", "audience", "style", "one_sentence", "synopsis",
-                "protagonist", "main_line", "relationship_engine", "ending_direction",
-            ),
-        )
+        return _compact_record(value, ("title", "synopsis", "core_motive"))
     return {}
 
 
@@ -3281,18 +3284,20 @@ def normalize_creation_result(
             item = _expand_premise_candidate_transport(item)
             candidate = {
                 "title": _as_text(_first_value(item, ("title", "name", "book_title", "书名"))),
-                "genre": _as_text(_first_value(item, ("genre", "类型"))),
-                "audience": _as_text(_first_value(item, ("audience", "pov", "频段", "男频女频"))),
-                "style": _as_text(_first_value(item, ("style", "风格"))),
-                "one_sentence": _as_text(_first_value(item, ("one_sentence", "hook", "一句话简介"))),
                 "synopsis": _as_text(_first_value(item, ("synopsis", "summary", "简介"))),
-                "protagonist": _as_text(_first_value(item, ("protagonist", "hero", "主角"))),
-                "main_line": _as_text(_first_value(
-                    item,
-                    ("core_motive", "main_motive", "main_line", "core_line", "核心动机", "核心动机主线", "主线"),
-                )),
-                "relationship_engine": _as_text(_first_value(item, ("relationship_engine", "关系线"))),
-                "ending_direction": _as_text(_first_value(item, ("ending_direction", "ending", "结局方向"))),
+                "core_motive": _as_text(
+                    _first_value(
+                        item,
+                        (
+                            "core_motive",
+                            "main_motive",
+                            "main_line",
+                            "核心动机",
+                            "核心动机主线",
+                            "主线",
+                        ),
+                    )
+                ),
             }
             if candidate["title"] or candidate["synopsis"]:
                 candidates.append(candidate)
@@ -3430,23 +3435,20 @@ def creation_wizard_payload_from_project_draft(project):
     framework = project.get("creation_framework", {})
     if not isinstance(framework, dict):
         return {}
+    framework = _clean_creation_framework_premise_fields(framework)
     state = project.get("creation_wizard_state", {})
     if isinstance(state, dict):
         status = _as_text(state.get("status")).lower()
         if status and status not in {"complete", "confirmed"}:
             return {}
-    candidates = [
-        deepcopy(item)
-        for item in framework.get("premise_candidates", [])
-        if isinstance(item, dict)
-    ]
+    candidates = _clean_premise_candidates(framework.get("premise_candidates", []))
     if not candidates:
         return {}
 
-    selected = framework.get("premise", {})
-    if not isinstance(selected, dict):
-        selected = {}
-    selected = deepcopy(selected)
+    selected = _clean_premise_candidate(
+        framework.get("premise", {}),
+        keep_author_choices=True,
+    )
     if not _as_text(selected.get("title")) or not _as_text(selected.get("synopsis")):
         selected = deepcopy(candidates[0])
     if not _as_text(selected.get("title")) or not _as_text(selected.get("synopsis")):
@@ -3492,9 +3494,12 @@ def creation_wizard_draft_from_project_draft(project):
     payload = creation_wizard_payload_from_project_draft(project)
     if not payload:
         return {}
-    framework = payload["creation_framework"]
-    candidates = deepcopy(framework.get("premise_candidates", []))
-    selected = deepcopy(framework.get("premise", {}))
+    framework = _clean_creation_framework_premise_fields(payload["creation_framework"])
+    candidates = _clean_premise_candidates(framework.get("premise_candidates", []))
+    selected = _clean_premise_candidate(
+        framework.get("premise", {}),
+        keep_author_choices=True,
+    )
     try:
         selected_index = max(
             0,
@@ -4336,16 +4341,14 @@ def build_chapter_plan_foundation(framework):
     bounds, total_chapters = _stage_chapter_bounds(stages, total_words, average_words)
     terminal_bounds = _terminal_window_bounds(total_chapters)
     framework_core_motive = _as_text(framework.get("core_motive", ""))
+    premise_core_motive = _as_text(premise.get("core_motive", ""))
     bible_main_conflict = _as_text(bible.get("main_conflict", ""))
-    premise_mainline = _as_text(premise.get("main_line", ""))
-    premise_core_motive = _as_text(premise.get("core_motive", "")) or premise_mainline
-    # Bible.main_conflict is the completed, user-confirmed core-motive
-    # contract.  The premise value is only a fallback for older or partial
-    # projects where the second step has not supplied it yet.
-    core_motive = framework_core_motive or bible_main_conflict or premise_core_motive
+    # Prefer the selected first-step anchor, then preserve compatibility with
+    # projects whose framework or Bible was created before that field existed.
+    core_motive = framework_core_motive or premise_core_motive or bible_main_conflict
     core_mainline = core_motive
-    relationship_engine = _as_text(premise.get("relationship_engine", ""))
-    reading_experience = _as_text(premise.get("one_sentence", "")) or _as_text(bible.get("reader_promise", ""))
+    relationship_engine = _as_text(bible.get("relationship_foundation", ""))
+    reading_experience = _as_text(bible.get("reader_promise", ""))
     profile = {
         "version": "creation_wizard_v1",
         "audience_direction": _as_text(premise.get("audience", "")),
@@ -4406,7 +4409,7 @@ def build_chapter_plan_foundation(framework):
     # The selected premise is the only early ending signal. The Bible no
     # longer generates a parallel ending field; stage directions and the final
     # stage planning refine the ending later in the existing workflow.
-    ending = _as_text(premise.get("ending_direction", ""))
+    ending = _as_text(bible.get("ending_direction", ""))
     boundaries = _as_text(bible.get("hard_boundaries", "")) or (
         "本部核心矛盾和主角当前目标在结尾形成明确结果，不添加结局之后的未来余味或待办事项。"
     )
@@ -4416,7 +4419,7 @@ def build_chapter_plan_foundation(framework):
         default={},
     )
     terminal_exit_state = terminal_stage.get("exit_state", {})
-    terminal_exit_state = terminal_exit_state if isinstance(terminal_exit_state, dict) else {}
+    terminal_exit_state = _normalize_stage_state(terminal_exit_state)
 
     def state_values(key):
         value = terminal_exit_state.get(key, [])
@@ -4434,12 +4437,18 @@ def build_chapter_plan_foundation(framework):
         ),
         {},
     )
+    terminal_result = (
+        _as_text(final_event.get("result", ""))
+        or _as_text(terminal_stage.get("end_state", ""))
+    )
+    if not ending and terminal_result:
+        ending = terminal_result
     required_results = []
     for value in (
         ending,
         _as_text(terminal_stage.get("end_state", "")),
         _as_text(final_event.get("result", "")),
-        *state_values("k"),
+        *state_values("known_facts"),
     ):
         if value and value not in required_results:
             required_results.append(value)
@@ -4460,8 +4469,8 @@ def build_chapter_plan_foundation(framework):
         "mainline_result": ending or _as_text(terminal_stage.get("end_state", "")),
         "conflict_result": _as_text(final_event.get("result", "")) or _as_text(terminal_stage.get("end_state", "")),
         "relationship_results": relationship_results,
-        "protagonist_final_state": "；".join(state_values("c")) or _as_text(terminal_stage.get("end_state", "")),
-        "world_final_state": "；".join(state_values("k")) or _as_text(terminal_stage.get("end_state", "")),
+        "protagonist_final_state": "；".join(state_values("character_states")) or _as_text(terminal_stage.get("end_state", "")),
+        "world_final_state": "；".join(state_values("known_facts")) or _as_text(terminal_stage.get("end_state", "")),
         "allowed_epilogue": "",
         "required_results": required_results,
         "evidence_requirements": [
@@ -4524,9 +4533,9 @@ def build_chapter_plan_foundation(framework):
         "creative_intent_contract": {
             "primary_line": core_motive,
             "core_motive": core_motive,
-            "core_relationships": _as_text(premise.get("relationship_engine", "")),
+            "core_relationships": relationship_engine,
             "stage_progression": "；".join(_as_text(item.get("name", "")) for item in stages if isinstance(item, dict)),
-            "reading_experience": _as_text(premise.get("one_sentence", "")),
+            "reading_experience": reading_experience,
             "ending_boundaries": ending,
             "mainline_pressure_curve": pressure_curve,
             "source": "creation_wizard",
@@ -4790,16 +4799,15 @@ def format_creation_context(context, premise_minimal=False):
             "本次是当前阶段的具体事件规划。前面阶段已经生成的事件、结果、状态和时间是已经成立的故事事实，"
             "当前阶段只能承接这些事实带来的后果、变化、新选择和新冲突，不重新完成已经兑现的事件、人物目标、关系结果或主线闭环；"
             "current_stage.stage_direction.summary是本阶段唯一宏观大事件；阶段差异按公共核心约束落实。"
-            "scene_change和character_change分别说明场景和关键人物的变化；沿用地点或人物时写清其实质变化；key_beats按因果顺序细化必要转折。"
-            "这些字段各司其职，不要求每个小事件机械更换阶段维度。"
-            "这些字段各司其职，不互相复述；节点是宏观转折，按故事因果细化为具体场景事件。"
+            "scene_change和character_change按公共核心约束填写；key_beats按因果顺序细化必要转折。"
+            "这些字段各司其职，不互相复述；阶段差异只约束阶段方向，不机械套用到每个小事件，节点按故事因果细化为具体场景事件。"
             "若当前阶段有climax_beat_indices，按末尾锚点安排高潮逼近、交锋/抉择与决定性兑现，最后一项必须落在实际高潮结果；此前节点不得先完成同一核心决战。"
             "完整的 confirmed.stage_directions 用于参照全书阶段边界和保持远期一致，不是当前批次的待执行事件清单；"
             "当前批次沿当前阶段目标落地，不提前兑现后续阶段或全书结局。"
             "尚未生成的后续阶段属于尚未发生的规划内容，当前批次只为它形成前置压力、入口条件或行动动机，"
             "不提前写出后续阶段的具体事件、结果、兑现或终局闭环。"
             "current_stage.stage_direction.result 是本阶段最后必须成立的阶段出口，next_pressure 只表示下一阶段从哪里继续，不能在本阶段提前完成。"
-            "main_line、relationship_engine 和 story_engine 描述全书冲突底盘，当前阶段把底盘推进到新的选择、关系、公开后果、资源代价或对手行动，"
+            "第一步选定的 core_motive 与第二步确认的 relationship_foundation、阶段方向共同描述全书冲突底盘；当前阶段把底盘推进到新的选择、关系、公开后果、资源代价或对手行动，"
             "每次事件根据当前题材自然选择推进方式。"
         )
     return (
@@ -5045,6 +5053,135 @@ def _normalize_foreshadow_endpoint_kind(value):
     if text in {"payoff", "resolve", "reveal", "回收", "揭示", "兑现", "终点"}:
         return "payoff"
     return ""
+
+
+def _creation_candidate_name(candidate):
+    """Extract a naming-history hint without turning the synopsis into a plan."""
+    candidate = candidate if isinstance(candidate, dict) else {}
+    return _creation_premise_name(candidate.get("synopsis"))
+
+
+_PREMISE_DOWNSTREAM_FIELDS = {
+    "title", "synopsis",
+    "core_motive",
+}
+
+
+def _creation_downstream_premise(value):
+    """Pass the selected synopsis and its single core-motive anchor downstream."""
+    value = value if isinstance(value, dict) else {}
+    return {
+        key: deepcopy(item)
+        for key, item in value.items()
+        if key in _PREMISE_DOWNSTREAM_FIELDS and item not in (None, "", [], {})
+    }
+
+
+_PREMISE_AUTHOR_CHOICE_FIELDS = {
+    "audience",
+    "genre",
+    "theme",
+    "role",
+    "plot",
+    "style",
+    "protagonist_route",
+    "protagonist_style",
+    "custom_protagonist_style",
+}
+
+
+def _clean_premise_candidate(value, keep_author_choices=False):
+    """Keep the synopsis, core-motive anchor, and program-owned choices."""
+    value = value if isinstance(value, dict) else {}
+    title = _as_text(_first_value(value, ("title", "name", "book_title", "书名")))
+    synopsis = _as_text(_first_value(value, ("synopsis", "summary", "简介")))
+    # Persistence accepts only the new field. Legacy aliases are accepted
+    # while normalizing a fresh model response, then removed on save/load.
+    core_motive = _as_text(value.get("core_motive", ""))
+    result = {
+        "title": title,
+        "synopsis": synopsis,
+        "core_motive": core_motive,
+    }
+    if keep_author_choices:
+        for key in _PREMISE_AUTHOR_CHOICE_FIELDS:
+            item = value.get(key)
+            if item not in (None, "", [], {}):
+                result[key] = deepcopy(item)
+    return result
+
+
+def _clean_premise_candidates(value):
+    """Drop all historical first-step planning fields from old drafts/results."""
+    if not isinstance(value, list):
+        return []
+    return [
+        candidate
+        for candidate in (_clean_premise_candidate(item) for item in value)
+        if candidate["title"] or candidate["synopsis"]
+    ]
+
+
+def _clean_premise_result(value):
+    """Normalize a stored first-step result without preserving legacy fields."""
+    value = value if isinstance(value, dict) else {}
+    candidates = _clean_premise_candidates(value.get("candidates", []))
+    try:
+        selected_index = int(value.get("selected_index", 0) or 0)
+    except (TypeError, ValueError):
+        selected_index = 0
+    result = {
+        "candidates": candidates,
+        "selected_index": max(0, min(selected_index, max(0, len(candidates) - 1))),
+    }
+    selected = _clean_premise_candidate(
+        value.get("selected", {}),
+        keep_author_choices=True,
+    )
+    if selected["title"] or selected["synopsis"]:
+        result["selected"] = selected
+    if _as_text(value.get("_candidate_protocol_error")):
+        result["_candidate_protocol_error"] = _as_text(
+            value.get("_candidate_protocol_error")
+        )
+    return result
+
+
+def _clean_creation_framework_premise_fields(value):
+    """Remove legacy first-step planning fields from a completed framework."""
+    framework = deepcopy(value) if isinstance(value, dict) else {}
+    framework["premise_candidates"] = _clean_premise_candidates(
+        framework.get("premise_candidates", [])
+    )
+    framework["premise"] = _clean_premise_candidate(
+        framework.get("premise", {}),
+        keep_author_choices=True,
+    )
+    return framework
+
+
+def _clean_creation_wizard_premise_payload(value):
+    """Persist wizard drafts with only the new first-step data contract."""
+    payload = deepcopy(value) if isinstance(value, dict) else {}
+    payload["premise_candidates"] = _clean_premise_candidates(
+        payload.get("premise_candidates", [])
+    )
+    step_results = payload.get("step_results", {})
+    if isinstance(step_results, dict):
+        step_results = deepcopy(step_results)
+        if isinstance(step_results.get("premise"), dict):
+            step_results["premise"] = _clean_premise_result(step_results["premise"])
+        payload["step_results"] = step_results
+    completed = payload.get("completed_result_payload", {})
+    if isinstance(completed, dict):
+        completed = deepcopy(completed)
+        framework = completed.get("creation_framework")
+        if isinstance(framework, dict):
+            completed["creation_framework"] = _clean_creation_framework_premise_fields(
+                framework
+            )
+        payload["completed_result_payload"] = completed
+    return payload
 
 
 def _foreshadow_key(value):
@@ -5867,18 +6004,18 @@ class NovelCreationWorker(NovelAnalysisWorker):
 
 {author_boundaries}
 
-本书共{total_words}字，严格按每十万字划分为{len(specs)}个阶段，范围为：{ranges}。按第一步选定故事中的 main_line 确定本部唯一目标，relationship_engine 确定人物关系的长线变化，ending_direction 确定本部闭环结果；简介里的细节用于具体化，不改写这三者已经确定的方向。第一步未设定拆分时物件保持完整，沿用已确定的用途；主线期限从同一起点累计，不另设或重置阶段倒计时；人物、物件及群体规模的增减，须由节点中的具体行动和结果承接。
+本书共{total_words}字，严格按每十万字划分为{len(specs)}个阶段，范围为：{ranges}。第一步只提供故事简介和作者已选参数，不预设本部的核心动机、人物关系路线或结尾方案；本次由你根据简介、题材和前后因果重新建立一条唯一核心动机，生成各阶段的大事件与阶段出口。简介中的人物、处境、地点和已发生事实要吸收，但不要把简介扩写成固定的全书事件清单。第一步未设定拆分时物件保持完整，沿用已确定的用途；主线期限从同一起点累计，不另设或重置阶段倒计时；人物、物件及群体规模的增减，须由节点中的具体行动和结果承接。
 
-先从本部结果倒推全书阶段，再按因果顺序展开。每阶段只设一个独特的大事件、一个首要目标和一条核心人物冲突；关键推进节点最多10项，只列促成事件结果不可省略的转折，数量依故事需要决定，不以达到上限为目标。同一连续行动链中的步骤合并为一个节点；相邻节点须带来新的处境或目标变化。节点推进至本阶段结果成立为止。每个节点让人物的行动、选择或关系改变主角推进目标的处境。前一阶段result已经成立后，后续阶段不得再次以达成同一结果作为大事件；若该结果仍影响主线，就从它造成的新处境发展新的未决冲突。场景、人物和利益关系的阶段差异按上方核心约束与压力递进同时落实，不规定统一顺序或事件类型。
+先从本部结果倒推全书阶段，再按因果顺序展开。每阶段只设一个独特的大事件、一个首要目标和一条核心人物冲突；关键推进节点最多10项，只列促成事件结果不可省略的转折，数量依故事需要决定，不以达到上限为目标。同一连续行动链中的步骤合并为一个节点；相邻节点须带来新的处境或目标变化。节点推进至本阶段核心目标和核心矛盾的结果成立为止；对末阶段，key_beats必须在本部核心目标实际兑现处结束，不能在高潮兑现后继续追加收尾事件。每个节点让人物的行动、选择或关系改变主角推进目标的处境。前一阶段result已经成立后，后续阶段不得再次以达成同一结果作为大事件；若该结果仍影响主线，就从它造成的新处境发展新的未决冲突。场景、人物和利益关系的阶段差异按上方核心约束与压力递进同时落实，不规定统一顺序或事件类型。
 
-字段按同一条故事链填写：summary 用1至2句话写本阶段待解的大事件；scene_change 和 character_change 分别说明场景与关键人物如何变化或升级，沿用既有地点或人物时交代其实质变化；key_beats 按事实发生顺序细化大事件的必要转折。上述字段共同落实公共核心约束中的阶段差异，不互相复述；result 汇总最后节点之后已经成立的出口状态；next_pressure 只写该出口自然带出的下一阶段阻力。后续阶段以紧邻前一阶段result为状态起点，已成立的胜负、生死、关系、势力归属、物件数量与去向不得重置或改写；任何新增变化都须由节点中的具体行动和结果承接，阶段出口不得提前于节点或与节点矛盾。
+字段按同一条故事链填写：summary 用1至2句话写本阶段待解的大事件；scene_change 和 character_change 分别说明相较前阶段更换的主要场景与阶段性关键人物。事件核心与人物冲突的实质更换须直接体现在summary和key_beats中；scene_change、character_change只说明场景和阶段性关键人物差异，不能替代事件核心与人物冲突的更换。key_beats 按事实发生顺序细化大事件的必要转折，并在核心目标兑现处收束；高潮之后的战后处置、关系落点、交接、返家或其它收尾行为不得再写入key_beats。上述字段共同落实公共核心约束中的阶段差异，不互相复述；result只概括本阶段最后一个关键推进节点后已经成立的阶段出口状态，末阶段以最后高潮节点兑现后的状态为准，不写一串后续事件、不把收尾过程改写成节点；next_pressure只承接该出口仍有效的压力，或由本阶段结果新造成的压力。填写result时须区分压力已解除、暂时受阻但仍有效、仍未解决；节点或前阶段已经明确解除、截断的同一威胁，不得没有新的行动及因果说明便重新列为未解决，若对手重新发动须写明新的行动及其因果。已完成的人物关系选择只承接其新后果，不再次把同一选择或决裂作为推进点。连续高潮节点以前序节点已经成立的结果为后续起点，不重复处理、达成或宣布既成结果。后续阶段以紧邻前一阶段result为状态起点，已成立的胜负、生死、关系、势力归属、物件数量与去向不得重置或改写；任何新增变化都须由节点中的具体行动和结果承接，阶段出口不得提前于节点或与节点矛盾。
 
-末阶段承载尚未解决的本部核心对抗，进入时胜负未定；非末阶段不得写终局对抗已经开打或进入决定性交锋，前一阶段须在核心交锋尚未发生时结束。规划末阶段时先确定最终由什么行动或选择兑现本部核心目标，再从其前选取1至2个不可省略的升级或交锋转折作为高潮前段；climax_beat_indices 标记这段连续2或3个节点，且高潮前至少保留1个铺垫/升级节点；若末阶段恰有3个节点，只标记第2、3项。索引从1开始计数，例如6个节点且高潮占末尾3项时为[4,5,6]，5个节点且占末尾2项时为[4,5]；节点数量仍按故事需要决定。最后一个高潮节点必须是 key_beats 最后一项，并直接写出本部核心目标及核心矛盾如何兑现；一次交锋或对手落败若尚未完成核心目标，不是高潮终点，随后仍在解决主线的行动或选择要保留在连续高潮节点中。只有核心目标兑现后、不再改变核心矛盾结果的收场行为才移入 result，例如战后处置、关系落点、交接或返家，承接最后3章收束。全书本部唯一核心目标须由末阶段高潮兑现；若前阶段已解决，须重排前阶段节点，不得另添结尾方向未设定的新主线或终局对抗。阶段方向不写具体章节号，高潮具体章位由第三步落实。
+末阶段承载尚未解决的本部核心对抗，进入时胜负未定；非末阶段不得写终局对抗已经开打或进入决定性交锋，前一阶段须在核心交锋尚未发生时结束。规划末阶段时先确定最终由什么行动或选择兑现本部核心目标，再从其前选取1至2个不可省略的升级或交锋转折作为高潮前段；climax_beat_indices 标记这段连续2或3个节点，且高潮前至少保留1个铺垫/升级节点；若末阶段恰有3个节点，只标记第2、3项。索引从1开始计数，例如6个节点且高潮占末尾3项时为[4,5,6]，5个节点且占末尾2项时为[4,5]；节点数量仍按故事需要决定。最后一个高潮节点必须是 key_beats 最后一项，并直接写出本部核心目标及核心矛盾如何兑现；一次交锋或对手落败若尚未完成核心目标，不是高潮终点，随后仍在解决主线的行动或选择仍属于高潮推进，必须留在连续高潮节点中。核心目标兑现后，只有不再改变核心矛盾结果的必要直接后果、关系落点、交接或返家可以写入 result，且只作为已成立的出口状态简要概括，不得扩写成一串高潮后事件、增加额外 key_beats 或用收尾过程凑篇幅。全书本部唯一核心目标须由末阶段高潮兑现；若前阶段已解决，须重排前阶段节点，不得另添结尾方向未设定的新主线或终局对抗。阶段方向不写具体章节号，高潮具体章位由第三步落实。
 
-只返回一个合法 JSON 对象，不要 Markdown 或解释：{{"stage_directions":[{{"id":"R01","name":"阶段名","word_range":[0,100000],"summary":"本阶段唯一大事件的待解冲突与核心卖点，1至2句话","scene_change":"阶段1可留空；从阶段2起写本阶段相较前阶段的主要场景更换或实质升级","character_change":"阶段1可留空；从阶段2起写关键人物、立场、关系或作用相较前阶段的实质更换或升级","key_beats":["按因果顺序推进大事件的必要转折，体现事件核心和人物冲突变化，末阶段列至决定性兑现即止"],"climax_beat_indices":[],"result":"节点兑现后的出口状态；末阶段同时容纳最后3章的关系落点及最终处境","next_pressure":"由本阶段结果自然带出的下一阶段入口处境；最后阶段可留空"}}]}}。普通阶段至少1个节点，末阶段至少3个节点，字段名必须保持不变，阶段顺序和字数范围必须与要求一致。"""
+只返回一个合法 JSON 对象，不要 Markdown 或解释：{{"stage_directions":[{{"id":"R01","name":"阶段名","word_range":[0,100000],"summary":"本阶段唯一大事件的待解冲突与核心卖点，1至2句话","scene_change":"阶段1可留空；从阶段2起写本阶段相较前阶段更换的主要场景","character_change":"阶段1可留空；从阶段2起写本阶段相较前阶段更换的阶段性关键人物；主角可持续出现","key_beats":["按因果顺序推进大事件的必要转折，末阶段只列到本部核心目标及核心矛盾实际兑现为止；高潮后的收尾事件不再新增节点"],"climax_beat_indices":[],"result":"本阶段最后一个关键推进节点后已成立的阶段出口状态；末阶段以最后高潮节点兑现后的状态为准，只写已成立状态，不写后续收尾事件序列","next_pressure":"由本阶段结果自然带出的下一阶段入口处境；最后阶段可留空"}}]}}。普通阶段至少1个节点，末阶段至少3个节点，字段名必须保持不变，阶段顺序和字数范围必须与要求一致。"""
         elif self.creation_batch == "bible_core":
             prompt = f"""{COMMON_CREATION_RULES}
-只根据作者已经选定的故事和用户确认的阶段方向，生成小说圣经和世界规则。阶段方向是全书大跨度推进的上游路线：圣经要为每个阶段提供人物动机、关系变化、场景落点和世界事实，但不能把阶段方向改写成另一条主线，也不能把所有阶段压缩成同一地点、同一类人物或同一类资源问题。小说圣经写整本书的核心矛盾、人物关系底子、贯穿全书并会随着人物选择不断变深的问题、主题和长期事实，让后面的阶段和场景都有清楚的根；本部结尾由第一步已选故事的结尾方向、第二步阶段方向和第三步阶段规划逐步细化，圣经不再另写一份结尾方案。结尾方向字段写成“本部闭环结果”：说明核心动机的最终结果、核心矛盾的解决或代价、主要关系的落点和主角最终处境；不写结局之后的未来余味、续作钩子或待办事项。主线矛盾字段必须完整承载核心动机契约：主角为什么非行动不可、要完成什么可验收的具体目标、期限或机会窗口是什么、失败会失去什么、阻碍来自谁或什么，以及开局与终局之间的主要反差；不能只写“赚钱、变强、复仇”这类抽象方向。主题字段只提炼这条故事要讨论的人性命题、价值冲突或情感认识，不重复具体任务、金额、期限、资源缺口、对手或执行步骤；不能用主题代替主线矛盾，也不能让主题变成另一条主线。还要写出解决当前目标后会自然打开的下一道具体阻碍或更高代价，保证后续阶段是在推进同一条主线，而不是不断换题。世界规则写世界长期怎样运转、日常生活、地点和社会关系、异常或能力的来源、触发条件、作用边界和代价；普通都市、灵异、悬疑、情感和现实题材，把规则落在空间、社会、异常与人物处境上；明确有修炼或境界的题材，再写力量来源和总边界，详细层次留给下一批的设定记录。
+只根据第一步的故事简介、作者已选参数和用户确认的阶段方向，生成小说圣经和世界规则。第一步只提供方向性故事资料，不再提供需要照抄的主线契约、关系路线或结尾方案；本步负责重新确定一条唯一核心动机、人物关系底子、长期事实和阶段承接方式。阶段方向是全书大跨度推进的上游路线：圣经要为每个阶段提供人物动机、关系变化、场景落点和世界事实，但不能把阶段方向改写成另一条主线，也不能把所有阶段压缩成同一地点、同一类人物或同一类资源问题。小说圣经写整本书的核心矛盾、人物关系底子、贯穿全书并会随着人物选择不断变深的问题、主题和长期事实，让后面的阶段和场景都有清楚的根；本部闭环由本步确认的核心动机、阶段方向和第三步阶段规划逐步细化，圣经不要再另写一份并行结尾方案。主线矛盾字段必须完整承载核心动机契约：主角为什么非行动不可、要完成什么可验收的具体目标、期限或机会窗口是什么、失败会失去什么、阻碍来自谁或什么，以及开局与终局之间的主要反差；不能只写“赚钱、变强、复仇”这类抽象方向。主题字段只提炼这条故事要讨论的人性命题、价值冲突或情感认识，不重复具体任务、金额、期限、资源缺口、对手或执行步骤；不能用主题代替主线矛盾，也不能让主题变成另一条主线。还要写出解决当前目标后会自然打开的下一道具体阻碍或更高代价，保证后续阶段是在推进同一条主线，而不是不断换题。世界规则写世界长期怎样运转、日常生活、地点和社会关系、异常或能力的来源、触发条件、作用边界和代价；普通都市、灵异、悬疑、情感和现实题材，把规则落在空间、社会、异常与人物处境上；明确有修炼或境界的题材，再写力量来源和总边界，详细层次留给下一批的设定记录。
 
 世界规则的五个位置都要形成可执行的事实：世界概况交代长期环境，力量或能力体系交代来源与总边界，长期规则数组写会反复成立的运行方式，代价限制数组写人物触碰这些规则后会承担的现实后果，地理与生活写人物平常真正会走进的地方和生活压力。每条规则都能影响人物选择，数组写实际内容，不用空泛的分类名。
 
@@ -5986,6 +6123,23 @@ c 中每项只能使用 n、r、g、s、p、v、q；l 中每项只能使用 n、
                 stage_end_number = int(end_chapter or 0)
             except (TypeError, ValueError):
                 stage_start_number, stage_end_number = 0, 0
+            event_capacity_guidance = ""
+            if 1 <= stage_start_number <= stage_end_number:
+                stage_chapters = stage_end_number - stage_start_number + 1
+                opening_events = 3 if opening_stage else 0
+                remaining_chapters = stage_chapters - opening_events
+                minimum_events = opening_events + (remaining_chapters + 1) // 2
+                capacity_basis = (
+                    f"前3章各用1个独立事件，剩余{remaining_chapters}章按每个事件最多两章计算"
+                    if opening_stage else "按每个事件最多两章计算"
+                )
+                event_capacity_guidance = (
+                    f"【当前阶段事件容量】当前阶段为第{stage_start_number}—{stage_end_number}章，"
+                    f"共{stage_chapters}章。{capacity_basis}，至少需要{minimum_events}个事件。"
+                    "所有事件的章节范围必须连续覆盖本阶段全部章节，不能遗漏中间或尾部章节。"
+                    "这是章节容量下限，不是固定事件数量；实际按剧情需要安排单章或两章事件，"
+                    "可以多于下限，不要机械安排两章事件或用重复剧情凑数。"
+                )
             terminal_overlap = None
             if terminal_bounds and stage_start_number and stage_end_number:
                 overlap_start = max(stage_start_number, terminal_bounds[0])
@@ -6036,13 +6190,17 @@ c 中每项只能使用 n、r、g、s、p、v、q；l 中每项只能使用 n、
             )
             prompt = f"""{COMMON_CREATION_RULES}
 
-读取作者选定的故事、完整故事底盘、已确认的全书阶段方向和已经完成的前面阶段，只生成当前第{stage_number}/{total_stages or '?'}阶段，范围为第{start_chapter}章到第{end_chapter}章。当前阶段方向的summary是本阶段唯一宏观大事件；阶段差异与压力递进按上方公共核心约束落实，事件内部的跨章变化不替代阶段要求。scene_change与character_change分别说明场景和关键人物的变化或升级；沿用地点或人物时写清其实质变化。阶段要求只约束阶段大事件，不机械套用到每个小事件。key_beats是供本阶段细化的必要推进锚点；这些字段各司其职，不互相复述，节点按故事因果细化为具体场景事件。若存在climax_beat_indices，按末尾锚点规划高潮逼近、交锋/抉择与最终兑现，最后一项必须在指定高潮章位形成已发生、可验证的结果，之前节点不得提前完成同一决战或主线闭环。{CREATION_STAGE_RESULT_OWNERSHIP_GUIDANCE}阶段方向的summary、key_beats、result和next_pressure共同描述同一条推进链；result 是本阶段结束时要达到的状态，不是 summary 之外的第二组事件；next_pressure 只从本阶段已经兑现的结果引出新的处境、选择、关系或代价，本阶段可以让它出现、形成或变得迫近，但不提前解决；后续阶段方向和第一步结尾只用于远期一致，不得提前执行其中的结果或全书结局。同一事实只安排一次实际发生，前阶段已成立的认知和关系从该状态继续发展。前阶段事件、结果、状态和时间构成本阶段的实际入口，当前阶段从这些事实带来的后果、选择和压力继续推进；人物已知的事情继续影响其行动，不重新当作第一次发现。此前阻止行动的条件改变时，用具体行动及结果衔接后续选择；当前阶段时间从前阶段最后一个事件的实际时间继续计算。当前阶段继续服务核心动机：先明确主角本阶段要完成的具体目标，再围绕行动、阻碍、选择、代价和结果展开；阶段性人物目标与关系任务要在当前阶段形成可见兑现，兑现后以新的位置、立场、关系或后果进入新的冲突，避免原冲突换名重演。{stage_progression_guidance}阶段规划使用结构化表达，写清人物正在经历的事情、事件顺序、直接结果和状态变化；字段服务于故事事实，不把每个事件套成同一张检查表。
+读取作者选定的故事、完整故事底盘、已确认的全书阶段方向和已经完成的前面阶段，只生成当前第{stage_number}/{total_stages or '?'}阶段，范围为第{start_chapter}章到第{end_chapter}章。当前阶段方向的summary是本阶段唯一宏观大事件；阶段差异与压力递进按上方公共核心约束落实，事件内部的跨章变化不替代阶段要求。scene_change与character_change按公共核心约束填写；阶段要求只约束阶段大事件，不机械套用到每个小事件。key_beats是供本阶段细化的必要推进锚点；这些字段各司其职，不互相复述，节点按故事因果细化为具体场景事件。若存在climax_beat_indices，按末尾锚点规划高潮逼近、交锋/抉择与最终兑现，最后一项必须在指定高潮章位形成已发生、可验证的结果，之前节点不得提前完成同一决战或主线闭环。{CREATION_STAGE_RESULT_OWNERSHIP_GUIDANCE}阶段方向的summary、key_beats、result和next_pressure共同描述同一条推进链；result 是本阶段结束时要达到的状态，不是 summary 之外的第二组事件；next_pressure 只从本阶段已经兑现的结果引出新的处境、选择、关系或代价，本阶段可以让它出现、形成或变得迫近，但不提前解决；后续阶段方向和第一步结尾只用于远期一致，不得提前执行其中的结果或全书结局。同一事实只安排一次实际发生，前阶段已成立的认知和关系从该状态继续发展。前阶段事件、结果、状态和时间构成本阶段的实际入口，当前阶段从这些事实带来的后果、选择和压力继续推进；人物已知的事情继续影响其行动，不重新当作第一次发现。此前阻止行动的条件改变时，用具体行动及结果衔接后续选择；当前阶段时间从前阶段最后一个事件的实际时间继续计算。当前阶段继续服务核心动机：先明确主角本阶段要完成的具体目标，再围绕行动、阻碍、选择、代价和结果展开。{stage_progression_guidance}阶段规划使用结构化表达，写清人物正在经历的事情、事件顺序、直接结果和状态变化；字段服务于故事事实，不把每个事件套成同一张检查表。
 
 输入资料中的 current_foreshadow_endpoints 是本阶段自然发生的正式暗线端点清单。每一项落到一个当前事件中；kind=setup 写线索怎样第一次进入人物生活，kind=payoff 写线索怎样在现场完成一个明确问题的回答，并产生可观察的直接结果。payoff不能只写推进、部分揭示、再次出现、冲突升级、确认“事情不简单”或留下新的问题；如果当前事件只能继续铺垫，就不能把它当成正式 payoff。清单为空时，场景仍然沿着人物和主线自然推进。同一条伏笔在其它事件里继续出现、深化或产生后果是正常的，但正式端点只在真正承担该变化的事件中标记一次；后续事件用普通关联资料或“F编号”继续承接，不重复写“F编号/setup”或“F编号/payoff”。承载正式端点的事件 references 加入对应标记，让程序可以把端点和事件稳定对应起来。
 
-阶段内事件以场景为核心，按实际需要写清人物正在经历的事实，不为凑齐固定项目逐项重复；事件长度由冲突本身决定，不为填满阶段范围机械使用两章事件。阶段超过20章时，尤其注意让能独立成立的人物选择、关系变化、对手行动或结果验证自然成为单章事件。单个事件的章节容量及跨章推进遵循上方单事件规则，不在此重复。生成事件数组前确认范围长度，不要把超长范围交给程序再落位。main_line、relationship_engine 和 story_engine 是全书冲突底盘，当前阶段通过符合题材的场景、人物选择、关系变化、公开后果或资源代价推进，不构成每阶段重复执行的固定事件顺序。伏笔只在实际发生的阶段返回，一次只返回一个当前正式端点；f中的每项写 i、k、e、d，其中 k 为 setup 或 payoff，e 是承载它的事件编号，d 是这一次在场景中发生的具体变化。后续事件可继续承接伏笔影响，但不重复标记同一种正式端点。程序会依据事件允许章节范围落下具体章号。{("同时返回全书长期事实 k。" if first_stage else "本阶段沿用前面已经确认的长期事实。")}
+阶段内事件以场景为核心，按实际需要写清人物正在经历的事实，不为凑齐固定项目逐项重复；事件长度由冲突本身决定，不为填满阶段范围机械使用两章事件。阶段超过20章时，尤其注意让能独立成立的人物选择、关系变化、对手行动或结果验证自然成为单章事件。单个事件的章节容量及跨章推进遵循上方单事件规则，不在此重复。生成事件数组前确认范围长度，不要把超长范围交给程序再落位。当前阶段以第一步选定的 core_motive、第二步确认的 relationship_foundation 和阶段方向为故事底盘，通过符合题材的场景、人物选择、关系变化、公开后果或资源代价推进，不构成每阶段重复执行的固定事件顺序。伏笔只在实际发生的阶段返回，一次只返回一个当前正式端点；f中的每项写 i、k、e、d，其中 k 为 setup 或 payoff，e 是承载它的事件编号，d 是这一次在场景中发生的具体变化。后续事件可继续承接伏笔影响，但不重复标记同一种正式端点。程序会依据事件允许章节范围落下具体章号。{("同时返回全书长期事实 k。" if first_stage else "本阶段沿用前面已经确认的长期事实。")}
 
             {opening_guidance}{subject_guidance}{final_stage_guidance}
+
+{event_capacity_guidance}
+
+本批次顶层字段规则：第一阶段必须同时返回 v、k、s、f；即使当前阶段没有正式伏笔端点，也必须返回 f=[]。第二阶段及以后必须返回 v、s；k 是第一阶段已经确认的全书长期事实契约，可以省略，程序会沿用已保存的首阶段契约；当前阶段没有正式伏笔端点时 f 可以省略，程序按空数组处理。不要省略当前阶段 s，也不要省略协议版本 v。
 
 {STAGE_PLAN_OBJECT_OUTPUT_RULES}
 """
@@ -6069,7 +6227,8 @@ c 中每项只能使用 n、r、g、s、p、v、q；l 中每项只能使用 n、
         else:
             prompt += (
                 "\n\n最终只返回紧凑合法 JSON：不使用 Markdown、缩进、空行或多余空格；"
-                "可省略空字符串、空数组和没有内容的可选字段，但不得删减任何有意义的事实或资料数量。"
+                "可省略空字符串、空数组和没有内容的可选字段，但不得删减任何有意义的事实或资料数量；"
+                "第三步阶段批次的顶层字段必须遵守上面的首阶段与后续阶段规则。"
             )
         return prompt
 
@@ -6090,7 +6249,12 @@ c 中每项只能使用 n、r、g、s、p、v、q；l 中每项只能使用 n、
 
     def _stream_json_candidate_required_keys(self):
         if self.creation_batch == "stage_plan_stage":
-            return ("v", "k", "s", "f")
+            # The first stage establishes the book-wide contract. Later
+            # stages continue from that saved contract and only need to
+            # return the protocol version and the current stage object.
+            if self.stage_index == 0:
+                return ("v", "k", "s", "f")
+            return ("v", "s")
         return super()._stream_json_candidate_required_keys()
 
     def _max_tokens_for_request(self):
@@ -6101,7 +6265,7 @@ c 中每项只能使用 n、r、g、s、p、v、q；l 中每项只能使用 n、
         if self.creation_batch == "bible_assets":
             return 30000
         if self.creation_batch == "stage_directions":
-            return 14000
+            return 18000
         if self.creation_batch == "stage_plan_stage":
             return 30000
         return {
@@ -6751,7 +6915,7 @@ class NovelCreationWizardDialog(QDialog):
         self.average_words_spin.valueChanged.connect(self._on_generation_scope_changed)
 
     def _draft_payload(self):
-        return {
+        payload = {
             "schema_version": 3,
             "draft_id": self.draft_id,
             "created_at": self.created_at or now_str(),
@@ -6771,6 +6935,7 @@ class NovelCreationWizardDialog(QDialog):
             "completed_result_payload": deepcopy(self.completed_result_payload),
             "updated_at": now_str(),
         }
+        return _clean_creation_wizard_premise_payload(payload)
 
     def _save_draft(self, *_args):
         if getattr(self, "_draft_restoring", False):
@@ -6915,9 +7080,7 @@ class NovelCreationWizardDialog(QDialog):
                     self._set_choice("chapter_words", f"{self.average_words_spin.value()}字")
 
             candidates = draft.get("premise_candidates", [])
-            self.premise_candidates = [
-                deepcopy(item) for item in candidates if isinstance(item, dict)
-            ] if isinstance(candidates, list) else []
+            self.premise_candidates = _clean_premise_candidates(candidates)
             try:
                 self.premise_selected_index = max(
                     0,
@@ -7146,7 +7309,6 @@ class NovelCreationWizardDialog(QDialog):
             self._selected_choice("genre"),
             premise.get("genre", "") if isinstance(premise, dict) else "",
             premise.get("synopsis", "") if isinstance(premise, dict) else "",
-            premise.get("main_line", "") if isinstance(premise, dict) else "",
         )
 
     def _normalize_step_result(self, step, payload, creation_batch=""):
@@ -8176,13 +8338,13 @@ class NovelCreationWizardDialog(QDialog):
         premise = self._current_premise() if step != "premise" else {}
         if step == "premise":
             current_names = [
-                _creation_premise_name(item.get("protagonist"))
+                _creation_candidate_name(item)
                 for item in self.premise_candidates
                 if isinstance(item, dict)
             ]
             context["naming_reference"] = _creation_name_references(current_names)
         if step != "premise":
-            context["selected_premise"] = premise
+            context["selected_premise"] = _creation_downstream_premise(premise)
         if step == "bible":
             context["confirmed"] = {
                 # Only the selected candidate is authoritative. It is already
@@ -8217,6 +8379,10 @@ class NovelCreationWizardDialog(QDialog):
             context["confirmed"] = {
                 "bible": confirmed_bible,
             }
+            if isinstance(stage_result, dict):
+                book_contract = _normalize_stage_book_contract(stage_result.get("book_contract", {}))
+                if book_contract:
+                    context["confirmed"]["book_contract"] = book_contract
             bible_result = self.step_results.get("bible", {})
             stage_directions = (
                 bible_result.get("stage_directions", [])
@@ -8348,7 +8514,10 @@ class NovelCreationWizardDialog(QDialog):
             ) if part
         )
         self.candidate_meta_label.setText(meta)
-        self.candidate_hook_label.setText(_as_text(item.get("one_sentence")))
+        core_motive = _as_text(item.get("core_motive"))
+        self.candidate_hook_label.setText(
+            f"核心动机：{core_motive}" if core_motive else ""
+        )
         self.candidate_synopsis_preview.setPlainText(_as_text(item.get("synopsis")))
         self._premise_loading_index = -1
 
@@ -9192,7 +9361,7 @@ class NovelCreationWizardDialog(QDialog):
             self._populate_candidate_list()
             remember_creation_wizard_names(
                 [
-                    _creation_premise_name(item.get("protagonist"))
+                    _creation_candidate_name(item)
                     for item in self.premise_candidates
                     if isinstance(item, dict)
                 ],
@@ -9337,28 +9506,24 @@ class NovelCreationWizardDialog(QDialog):
         if step == "premise":
             if not self.premise_candidates:
                 raise ValueError("请先生成至少一份故事方向。")
-            candidate = self._current_premise()
-            candidate["audience"] = self._selected_choice("audience")
-            candidate["genre"] = self._selected_choice("genre")
-            candidate["theme"] = self._selected_choice("theme")
-            candidate["role"] = self._selected_choice("role")
-            candidate["plot"] = self._selected_choice("plot")
-            candidate["style"] = candidate.get("style") or self._selected_choice("style")
-            candidate["protagonist_route"] = (
-                candidate.get("protagonist_route")
-                or self._selected_choice("protagonist_route")
-            )
-            candidate["story_engine"] = (
-                candidate.get("story_engine")
-                or self._selected_choice("style")
-            )
+            candidate = _clean_premise_candidate(self._current_premise())
             if not candidate.get("title") or not candidate.get("synopsis"):
                 raise ValueError("书名和完整简介不能为空。")
             self.premise_candidates[self.premise_selected_index] = deepcopy(candidate)
+            selected = deepcopy(candidate)
+            for key in _PREMISE_AUTHOR_CHOICE_FIELDS:
+                if key == "protagonist_style":
+                    value = self._selected_choice_display(key)
+                elif key == "custom_protagonist_style":
+                    value = self._selected_custom_protagonist_style()
+                else:
+                    value = self._selected_choice(key)
+                if value not in (None, "", [], {}):
+                    selected[key] = deepcopy(value)
             self.step_results[step] = {
                 "candidates": deepcopy(self.premise_candidates),
                 "selected_index": self.premise_selected_index,
-                "selected": candidate,
+                "selected": selected,
             }
             return
         if step == "stage_plan" and not self._has_stage_directions():
@@ -9480,26 +9645,17 @@ class NovelCreationWizardDialog(QDialog):
                 if isinstance(candidate, dict):
                     selected = deepcopy(candidate)
         if selected:
-            selected["audience"] = self._selected_choice("audience")
-            selected["genre"] = self._selected_choice("genre")
-            selected["theme"] = self._selected_choice("theme")
-            selected["role"] = self._selected_choice("role")
-            selected["plot"] = self._selected_choice("plot")
-            selected["style"] = selected.get("style") or self._selected_choice("style")
-            selected["protagonist_route"] = (
-                selected.get("protagonist_route")
-                or self._selected_choice("protagonist_route")
-            )
+            selected = _clean_premise_candidate(selected)
+            for key in ("audience", "genre", "theme", "role", "plot", "style", "protagonist_route"):
+                value = self._selected_choice(key)
+                if value not in (None, "", [], {}):
+                    selected[key] = value
             selected["protagonist_style"] = self._selected_choice_display("protagonist_style")
             custom_protagonist_style = self._selected_custom_protagonist_style()
             if custom_protagonist_style:
                 selected["custom_protagonist_style"] = custom_protagonist_style
             else:
                 selected.pop("custom_protagonist_style", None)
-            selected["story_engine"] = (
-                selected.get("story_engine")
-                or self._selected_choice("style")
-            )
         bible_result = self.step_results.get("bible", {})
         assets_result = deepcopy(bible_result) if isinstance(bible_result, dict) else {}
         # 兼容仍停留在旧版本向导草稿中的独立 story_assets。
@@ -9542,7 +9698,9 @@ class NovelCreationWizardDialog(QDialog):
             "source": "creation_wizard",
             "author_inspiration": _as_text(self.inspiration_edit.text()),
             "premise": deepcopy(selected),
-            "premise_candidates": deepcopy(premise_result.get("candidates", [])),
+            "premise_candidates": _clean_premise_candidates(
+                premise_result.get("candidates", [])
+            ),
             "bible": deepcopy(bible_result.get("bible", {})),
             "world_rules": deepcopy(bible_result.get("world_rules", {})),
             "characters": deepcopy(assets_result.get("characters", [])),
@@ -9564,10 +9722,11 @@ class NovelCreationWizardDialog(QDialog):
             "average_chapter_words": self.average_words_spin.value(),
             "completed_at": now_str(),
         }
-        # Store one canonical project-level mainline.  The fixed premise/Bible
-        # field names remain readable for old drafts, but downstream planning no
-        # longer has to choose between several competing line fields.
-        framework["core_motive"] = _as_text(
+        # Store one canonical project-level mainline.  The selected premise's
+        # core motive is the first-step anchor; the Bible remains the fallback
+        # for older or partially generated projects.
+        selected_core_motive = _as_text(selected.get("core_motive", ""))
+        framework["core_motive"] = selected_core_motive or _as_text(
             build_chapter_plan_foundation(framework).get("core_motive", "")
         )
         # Keep the confirmed book name as an explicit project-level value as

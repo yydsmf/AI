@@ -117,6 +117,7 @@ from .novel_utils import (
     _final_stage_climax_planning_guidance,
     _build_volume_opening_handoff_context,
     _build_chapter_logic_repair_context,
+    _build_chapter_prose_review_context,
     _build_long_form_memory_finalize_context,
     _build_long_form_memory_reconcile_context,
     _build_long_form_memory_repair_context,
@@ -220,6 +221,7 @@ from .novel_utils import (
     _parse_style_execution_result,
     _parse_style_finalize_result,
     _parse_chapter_logic_repair_result,
+    _parse_prose_review_result,
     _parse_memory_reconciliation_result,
     _parse_memory_repair_result,
     _prose_review_blocking_issues,
@@ -264,6 +266,7 @@ from .novel_creation_wizard import (
     migrate_creation_bible_display_text,
     mark_creation_wizard_draft_completed,
     normalize_creation_result,
+    _normalize_stage_scene_anchors,
     project_has_explicit_power_levels,
     story_requires_explicit_power_levels,
 )
@@ -303,6 +306,7 @@ _CHAPTER_AI_RETRY_STAGES = frozenset(
         "style_rewrite",
         "style_plot_extract",
         "style_finalize",
+        "prose_review",
         "memory_finalize",
         "memory_repair",
         "logic_repair",
@@ -1801,6 +1805,7 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
     MODEL_CONFIG_SECTION = "novel"
     FALLBACK_MODELS = ["gpt-4o-mini", "gpt-4.1-mini", "gpt-4o"]
     _MEMORY_POSTPROCESS_ACTIONS = frozenset({
+        "prose_review",
         "memory_finalize",
         "memory_reconcile",
         "memory_repair",
@@ -9575,7 +9580,7 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
                 key: deepcopy(item.get(key))
                 for key in (
                     "id", "name", "start_word", "end_word", "summary", "result",
-                    "next_pressure",
+                    "next_pressure", "main_scene_anchors",
                 )
                 if item.get(key) not in (None, "", [], {})
             })
@@ -9592,6 +9597,8 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
 
         stage_index = []
         scoped_stages = []
+        previous_main_scene_anchors = []
+        previous_anchor_names = set()
         for item in stages:
             if not isinstance(item, dict):
                 continue
@@ -9607,6 +9614,19 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
                 "start_chapter": stage_start,
                 "end_chapter": stage_end,
             })
+            if stage_end > 0 and stage_end < start_index:
+                stage_match = re.search(r"(\d+)$", str(stage_id or ""))
+                if stage_match:
+                    direction = direction_by_stage.get(int(stage_match.group(1)) - 1)
+                    for anchor in _normalize_stage_scene_anchors(
+                        direction.get("main_scene_anchors", [])
+                        if isinstance(direction, dict) else []
+                    ):
+                        anchor_name = str(anchor.get("name", "") or "").strip()
+                        if not anchor_name or anchor_name.casefold() in previous_anchor_names:
+                            continue
+                        previous_anchor_names.add(anchor_name.casefold())
+                        previous_main_scene_anchors.append(anchor)
             if stage_start <= end_index and stage_end >= start_index:
                 scoped_item = deepcopy(item)
                 stage_match = re.search(r"(\d+)$", str(stage_id or ""))
@@ -9617,6 +9637,8 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
                 scoped_stages.append(scoped_item)
         source["stage_index"] = stage_index
         source["stage_plan"] = scoped_stages
+        if previous_main_scene_anchors:
+            source["previous_main_scene_anchors"] = previous_main_scene_anchors
         return source
 
     def _chapter_plan_creation_transport_framework(
@@ -9657,7 +9679,10 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
                 if isinstance(direction, dict):
                     compact_stage["stage_direction"] = {
                         key: deepcopy(direction[key])
-                        for key in ("id", "name", "summary", "scene_change", "character_change", "result", "next_pressure")
+                        for key in (
+                            "id", "name", "summary", "main_scene_anchors",
+                            "scene_change", "character_change", "result", "next_pressure",
+                        )
                         if direction.get(key) not in (None, "", [], {})
                     }
                 events = []
@@ -9749,7 +9774,8 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
                 key: deepcopy(item.get(key))
                 for key in (
                     "id", "name", "start_word", "end_word", "summary",
-                    "scene_change", "character_change", "result", "next_pressure",
+                    "main_scene_anchors", "scene_change", "character_change",
+                    "result", "next_pressure",
                 )
                 if item.get(key) not in (None, "", [], {})
             }
@@ -10063,6 +10089,12 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
                     "通用前10%/中70%/后20%只控制节奏，不能触发题材切换。"
                 ),
                 "stage_boundary_rule": "当前阶段的事件、人物、关系和后果在本阶段自然展开，下一阶段承接上一阶段留下的变化继续发展。",
+                "stage_scene_rule": (
+                    "当前阶段的 main_scene_anchors 是本阶段主要事件的场景范围，应当是本书中能够再次明确指认的具体场所或稳定场域；"
+                    "场景类别、活动范围、敌人顺序或剧情用途不能代替具体场景名称，章节优先在这些场景中推进；"
+                    "前阶段已经使用的主要场景锚点不可继续作为当前阶段的主要推进场景，旧地点只能作为背景或行动过渡，"
+                    "不把锚点列表改写成逐章地点清单，也不为满足场景变化机械切换地点。"
+                ),
                 "material_rule": "项目资料是只读事实底稿，不重新生成，不把背景资料自动变成章节任务。",
                 "story_scene_rule": (
                     "遵循系统提示中的共享程序性事项边界；每章优先由当前题材的具体场景和人物行动推进，"
@@ -13111,7 +13143,7 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
         self._chapter_ai_style_candidate = candidate
         self.chapter_ai_preview.setPlainText(candidate)
         self._clear_transient_chapter_ai_retry("draft")
-        self._start_memory_finalize(candidate)
+        self._start_prose_review(candidate)
         return True
 
     def _auto_expand_chapter_has_committed_memory(self, chapter):
@@ -14169,12 +14201,17 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
         chapter = chapters[index]
         title = str(chapter.get("title", "") or f"第{index + 1}章").strip()
         has_body = bool(str(chapter.get("text", "") or "").strip())
-        has_checkpoint = bool(self._memory_finalize_checkpoint_text(chapter))
+        has_checkpoint = bool(
+            self._memory_finalize_checkpoint_text(chapter)
+            or self._memory_finalize_checkpoint_text(
+                chapter, allowed_stages={"prose_review"}
+            )
+        )
         if not has_checkpoint:
             checkpoint = chapter.get("ai_generation_checkpoint", {})
             has_checkpoint = bool(
                 isinstance(checkpoint, dict)
-                and str(checkpoint.get("stage", "") or "") in {"memory_repair", "logic_repair"}
+                and str(checkpoint.get("stage", "") or "") in {"prose_review", "memory_repair", "logic_repair"}
                 and str(checkpoint.get("final_text", "") or "").strip()
             )
         if not str(chapter.get("outline", "") or "").strip() and not has_body and not has_checkpoint:
@@ -14202,7 +14239,7 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
                 str(chapter.get("ai_generation_checkpoint", {}).get("stage", "") or "")
                 if isinstance(chapter.get("ai_generation_checkpoint"), dict)
                 and str(chapter.get("ai_generation_checkpoint", {}).get("stage", "") or "")
-                in {"memory_finalize", "memory_repair", "logic_repair", "memory_reconcile"}
+                in {"prose_review", "memory_finalize", "memory_repair", "logic_repair", "memory_reconcile"}
                 else "existing_body" if has_body else "new_draft"
             ),
         )
@@ -15089,7 +15126,8 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
             log_debug("小说AI生成检查点保存失败", e)
 
     def _store_memory_finalize_checkpoint(
-        self, final_text, status="pending", error="", prose_patch_rounds=0
+        self, final_text, status="pending", error="", prose_patch_rounds=0,
+        stage="memory_finalize",
     ):
         chapters = self.current_project.get("chapters", []) if isinstance(self.current_project, dict) else []
         if not (0 <= self.current_chapter_index < len(chapters)):
@@ -15109,7 +15147,7 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
         task = self._current_chapter_ai_task_context()
         checkpoint = {
             "version": 2,
-            "stage": "memory_finalize",
+            "stage": str(stage or "memory_finalize"),
             "status": str(status or "pending"),
             "project_path": str(
                 pending.get("project_path", "")
@@ -15149,10 +15187,7 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
                 or ""
             ),
             "prose_patch_rounds": max(0, int(prose_patch_rounds or 0)),
-            "prose_review_required": bool(
-                pending.get("prose_review_required", False)
-                or str(pending.get("stage", "") or "") == "memory_finalize"
-            ),
+            "prose_review_required": bool(pending.get("prose_review_required", False)),
             "created_at": str(previous.get("created_at", "") or now_str()),
             "updated_at": now_str(),
         }
@@ -15503,7 +15538,7 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
         )
         return deepcopy(checkpoint) if valid else None
 
-    def _memory_finalize_checkpoint_text(self, chapter):
+    def _memory_finalize_checkpoint_text(self, chapter, allowed_stages=None):
         if not isinstance(chapter, dict):
             return ""
         checkpoint = chapter.get("ai_generation_checkpoint", {})
@@ -15556,9 +15591,10 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
             or checkpoint_index == current_chapter_index
         )
         source_matches = checkpoint_source_hash == current_text_hash or current_text_hash == final_text_hash
+        allowed_stages = set(allowed_stages or {"memory_finalize"})
         valid = (
             checkpoint_version in {1, 2}
-            and str(checkpoint.get("stage", "") or "") == "memory_finalize"
+            and str(checkpoint.get("stage", "") or "") in allowed_stages
             and str(checkpoint.get("chapter_id", "") or "") == str(chapter.get("id", "") or "")
             and project_matches
             and chapter_index_matches
@@ -15579,6 +15615,15 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
         if not (0 <= self.current_chapter_index < len(chapters)):
             return ""
         return self._memory_finalize_checkpoint_text(chapters[self.current_chapter_index])
+
+    def _validated_prose_review_checkpoint(self):
+        chapters = self.current_project.get("chapters", []) if isinstance(self.current_project, dict) else []
+        if not (0 <= self.current_chapter_index < len(chapters)):
+            return ""
+        return self._memory_finalize_checkpoint_text(
+            chapters[self.current_chapter_index],
+            allowed_stages={"prose_review"},
+        )
 
     def _clear_memory_finalize_checkpoint(self, persist=False):
         chapters = self.current_project.get("chapters", []) if isinstance(self.current_project, dict) else []
@@ -15613,39 +15658,6 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
         if not text:
             self._fail_memory_sync("正文终稿为空，无法整理章节状态")
             return
-        repaired_text, literal_count_issues = _repair_literal_count_claims(text)
-        if literal_count_issues and repaired_text != text:
-            self._log_novel_diagnostic(
-                "literal_count_claim_normalized",
-                level="warning",
-                chapter_id=self._current_chapter_id(),
-                issue_count=len(literal_count_issues),
-                issues=[
-                    {
-                        "claimed": int(item.get("claimed", 0) or 0),
-                        "claim_text": str(item.get("claim_text", "") or ""),
-                        "replacement_text": str(item.get("replacement_text", "") or ""),
-                        "normalization": str(item.get("normalization", "") or ""),
-                    }
-                    for item in literal_count_issues[:5]
-                ],
-            )
-            text = repaired_text
-        text, replacements = _sanitize_prose_internal_references(
-            self.current_project if isinstance(self.current_project, dict) else {},
-            text,
-            strip_metadata=True,
-        )
-        if replacements:
-            self._log_novel_diagnostic(
-                "chapter_prose_internal_reference_sanitized",
-                level="warning",
-                chapter_id=self._current_chapter_id(),
-                replacements=replacements,
-                before_chars=len(str(final_text or "")),
-                after_chars=len(text),
-                source="memory_finalize_resume",
-            )
         self._chapter_ai_memory_finalize_attempted = True
         chapters = self.current_project.get("chapters", []) if isinstance(self.current_project, dict) else []
         checkpoint = (
@@ -15670,13 +15682,14 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
         )
         self._chapter_ai_memory_pending = {
             "chapter_id": self._current_chapter_id(),
+            "stage": "memory_finalize",
             "transaction_id": self._chapter_ai_memory_transaction_id,
             "final_text": text,
             "bundle": {},
             "errors": [],
-            "logic_audit_required": True,
+            "logic_audit_required": False,
             "reconciliation_started": False,
-            "prose_review_required": True,
+            "prose_review_required": False,
             "prose_patch_rounds": max(
                 prose_patch_rounds, 1 if prose_patch_applied else 0
             ),
@@ -15692,6 +15705,7 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
         self._store_memory_finalize_checkpoint(
             text,
             prose_patch_rounds=self._chapter_ai_memory_pending["prose_patch_rounds"],
+            stage="memory_finalize",
         )
         context = _build_long_form_memory_finalize_context(
             self._ai_project_snapshot(),
@@ -15702,19 +15716,20 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
             context = (
                 "【本次是状态整理重试】\n"
                 "上一次状态整理结果未能通过解析或完整校验，正文尚未提交长期状态。"
-                "本次必须先完整返回outline、summary、key_facts和long_form_memory，再返回三个审校字段；"
-                "不能只返回审校字段。请依据下方完整资料重新整理本章状态。\n\n"
+                "本次必须完整返回outline、summary、key_facts和long_form_memory。请依据下方完整资料重新整理本章状态。\n\n"
                 + context
             )
         self.chapter_ai_preview.setPlainText(text)
         self.chapter_ai_stream_text = ""
         status_text = (
-            "已应用必要的局部修补，正在重新整理状态并复核本章..."
+            "正文修补完成，正在提取章节摘要、关键事实和长期记忆..."
             if prose_patch_applied else
-            f"已识别后台保存的完整正文（{len(text)}字），不重写正文，正在补摘要和长期状态..."
+            f"已恢复审读后的完整正文（{len(text)}字），正在提取章节摘要、关键事实和长期记忆..."
             if resumed else
-            "正文已完成，正在整理摘要、关键事实、长期状态并检查本章读感..."
+            "正文审读完成，正在提取章节摘要、关键事实和长期记忆..."
         )
+        if transient_retry:
+            status_text = self._chapter_ai_retry_status("memory_finalize")
         worker_kwargs = {"transient_retry": True} if transient_retry else {}
         self._start_chapter_ai_worker(
             "memory_finalize",
@@ -15722,6 +15737,229 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
             status_text,
             **worker_kwargs,
         )
+
+    def _start_prose_review(self, final_text, resumed=False, transient_retry=False):
+        text = str(final_text or "").strip()
+        if not text:
+            self._fail_memory_sync("正文终稿为空，无法进行正文审读")
+            return
+        repaired_text, literal_count_issues = _repair_literal_count_claims(text)
+        if literal_count_issues and repaired_text != text:
+            text = repaired_text
+            self._log_novel_diagnostic(
+                "literal_count_claim_normalized",
+                level="warning",
+                action="prose_review",
+                chapter_id=self._current_chapter_id(),
+                issue_count=len(literal_count_issues),
+            )
+        text, replacements = _sanitize_prose_internal_references(
+            self.current_project if isinstance(self.current_project, dict) else {},
+            text,
+            strip_metadata=True,
+        )
+        if replacements:
+            self._log_novel_diagnostic(
+                "chapter_prose_internal_reference_sanitized",
+                level="warning",
+                action="prose_review",
+                chapter_id=self._current_chapter_id(),
+                replacements=replacements,
+                source="prose_review",
+            )
+        chapters = self.current_project.get("chapters", []) if isinstance(self.current_project, dict) else []
+        checkpoint = (
+            chapters[self.current_chapter_index].get("ai_generation_checkpoint", {})
+            if 0 <= self.current_chapter_index < len(chapters)
+            and isinstance(chapters[self.current_chapter_index], dict)
+            and isinstance(chapters[self.current_chapter_index].get("ai_generation_checkpoint"), dict)
+            else {}
+        )
+        transaction_id = str(
+            checkpoint.get("transaction_id", "")
+            or getattr(self, "_chapter_ai_memory_transaction_id", "")
+            or self._next_novel_diagnostic_request_id("prose-review")
+        )
+        self._chapter_ai_memory_transaction_id = transaction_id
+        self._chapter_ai_memory_pending = {
+            "chapter_id": self._current_chapter_id(),
+            "stage": "prose_review",
+            "transaction_id": transaction_id,
+            "final_text": text,
+            "bundle": {},
+            "errors": [],
+            "logic_audit_required": True,
+            "logic_issues": [],
+            "reconciliation_started": False,
+            "prose_review_required": True,
+            "prose_patch_rounds": 0,
+            "resumed_prose_review": bool(resumed),
+        }
+        self._store_memory_finalize_checkpoint(text, stage="prose_review")
+        context = _build_chapter_prose_review_context(
+            self._ai_project_snapshot(), self.current_chapter_index, text
+        )
+        if transient_retry:
+            context = (
+                "【本次是正文审读重试】\n"
+                "上一次审读结果无法解析或补丁未通过本地定位校验；本次仍只返回完整的logic_audit、prose_review和repair_patches。\n\n"
+                + context
+            )
+        self.chapter_ai_preview.setPlainText(text)
+        self.chapter_ai_stream_text = ""
+        status_text = self._chapter_ai_retry_status("prose_review") if transient_retry else (
+            "正在恢复正文审读..." if resumed else "正在审读并修补正文语义、对白和逻辑..."
+        )
+        worker_kwargs = {"transient_retry": True} if transient_retry else {}
+        self._start_chapter_ai_worker(
+            "prose_review",
+            context,
+            status_text,
+            **worker_kwargs,
+        )
+
+    def _handle_prose_review_ready(self, content):
+        pending = getattr(self, "_chapter_ai_memory_pending", {})
+        if not isinstance(pending, dict) or pending.get("chapter_id") != self._current_chapter_id():
+            self._fail_memory_sync("章节已切换，正文审读结果未应用")
+            return
+        final_text = str(pending.get("final_text", "") or "").strip()
+        parsed = _parse_prose_review_result(content)
+        review = parsed.get("prose_review", {}) if parsed.get("parsed") else {}
+        audit = parsed.get("logic_audit", {}) if parsed.get("parsed") else {}
+        patches = parsed.get("repair_patches", []) if parsed.get("parsed") else []
+        errors = []
+        if not parsed.get("parsed"):
+            errors.append("正文审读结果无法解析（JSON格式错误）")
+        else:
+            errors.extend(_chapter_logic_audit_validation_errors(final_text, audit))
+            errors.extend(_prose_review_validation_errors(review, present=True, final_text=final_text))
+            if not isinstance(patches, list):
+                errors.append("repair_patches必须为数组")
+        if errors:
+            if self._schedule_transient_chapter_ai_retry(
+                "prose_review",
+                "；".join(errors),
+                force_retry=True,
+                retry_callback=lambda tab: tab._start_prose_review(
+                    final_text, resumed=True, transient_retry=True
+                ),
+            ):
+                return
+            self._fail_memory_sync("；".join(errors))
+            return
+        bundle = {
+            "logic_audit": deepcopy(audit),
+            "prose_review": deepcopy(review),
+            "prose_review_present": True,
+            "repair_patches": deepcopy(patches),
+        }
+        original_logic_issues = _chapter_logic_audit_blocking_issues(audit)
+        logic_quotes = {
+            str(issue.get(field, "") or "")
+            for issue in original_logic_issues
+            for field in ("earlier_quote", "later_quote")
+            if isinstance(issue, dict) and str(issue.get(field, "") or "")
+        }
+        conflicting_patches = []
+        safe_patches = []
+        for patch in patches:
+            before = str(patch.get("before", "") or "") if isinstance(patch, dict) else ""
+            if before and any(quote in before or before in quote for quote in logic_quotes):
+                conflicting_patches.append(patch)
+            else:
+                safe_patches.append(patch)
+        if conflicting_patches:
+            bundle["repair_patches"] = safe_patches
+            self._log_novel_diagnostic(
+                "chapter_prose_patch_deferred_for_logic_repair",
+                level="info",
+                action="prose_review",
+                chapter_id=self._current_chapter_id(),
+                deferred_patch_count=len(conflicting_patches),
+                logic_issue_count=len(original_logic_issues),
+            )
+        repaired_text, patch_errors, patch_applied = self._apply_single_prose_review_patch(
+            final_text, bundle, "prose_review"
+        )
+        if patch_errors:
+            if self._schedule_transient_chapter_ai_retry(
+                "prose_review",
+                "正文修复补丁校验失败：" + "；".join(patch_errors),
+                force_retry=True,
+                retry_callback=lambda tab: tab._start_prose_review(
+                    final_text, resumed=True, transient_retry=True
+                ),
+            ):
+                return
+            self._fail_memory_sync("正文修复补丁校验失败：" + "；".join(patch_errors))
+            return
+        final_text = repaired_text if patch_applied else final_text
+        logic_issues = original_logic_issues
+        blocking = _prose_review_blocking_issues(review, final_text)
+        if blocking:
+            self._fail_memory_sync("正文审读确认存在未能安全修补的正文异常，已保留恢复检查点")
+            return
+        if logic_issues:
+            pending["final_text"] = final_text
+            pending["bundle"] = bundle
+            pending["logic_issues"] = logic_issues
+            self._chapter_ai_memory_pending = pending
+            self._clear_transient_chapter_ai_retry("prose_review")
+            self._start_chapter_logic_repair(final_text, bundle, logic_issues)
+            return
+        self._clear_transient_chapter_ai_retry("prose_review")
+        self.chapter_ai_preview.setPlainText(final_text)
+        self._start_memory_finalize(
+            final_text,
+            resumed=bool(patch_applied),
+            prose_patch_applied=bool(patch_applied),
+        )
+
+    def _apply_single_prose_review_patch(self, final_text, bundle, action):
+        """Apply one review's local prose patches without starting a second review."""
+        pending = getattr(self, "_chapter_ai_memory_pending", {})
+        if not isinstance(pending, dict) or not pending.get("prose_review_required"):
+            return str(final_text or "").strip(), [], False
+        patches = bundle.get("repair_patches", []) if isinstance(bundle, dict) else []
+        if not isinstance(patches, list) or not patches:
+            return str(final_text or "").strip(), [], False
+        try:
+            patch_rounds = int(pending.get("prose_patch_rounds", 0) or 0)
+        except (TypeError, ValueError):
+            patch_rounds = 0
+        if patch_rounds >= 1:
+            bundle["repair_patches"] = []
+            self._log_novel_diagnostic(
+                "chapter_prose_repair_single_pass_exhausted",
+                level="warning",
+                action=action,
+                chapter_id=self._current_chapter_id(),
+                patch_count=len(patches),
+                prose_review=deepcopy(bundle.get("prose_review", {})),
+            )
+            return str(final_text or "").strip(), [], False
+        repaired_text, errors = _apply_chapter_prose_repair_patches(final_text, patches)
+        if errors or repaired_text == str(final_text or "").strip():
+            return str(final_text or "").strip(), errors, False
+        bundle["repair_patches"] = []
+        pending["prose_patch_rounds"] = 1
+        pending["final_text"] = repaired_text
+        pending["bundle"] = deepcopy(bundle)
+        self._chapter_ai_memory_pending = pending
+        self.chapter_ai_preview.setPlainText(repaired_text)
+        self._log_novel_diagnostic(
+            "chapter_prose_repair_patch_applied",
+            level="info",
+            action=action,
+            chapter_id=self._current_chapter_id(),
+            patch_count=len(patches),
+            patch_round=1,
+            prose_review=deepcopy(bundle.get("prose_review", {})),
+            before_chars=len(str(final_text or "")),
+            after_chars=len(repaired_text),
+        )
+        return repaired_text, [], True
 
     def _start_memory_reconciliation(self, final_text, bundle, resumed=False):
         pending = getattr(self, "_chapter_ai_memory_pending", {})
@@ -15912,13 +16150,6 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
             "summary": str(parsed.get("summary", "") or "").strip(),
             "key_facts": str(parsed.get("key_facts", "") or "").strip(),
             "memory_update": memory_update,
-            "logic_audit": deepcopy(parsed.get("logic_audit", {}))
-            if isinstance(parsed.get("logic_audit"), dict) else {},
-            "prose_review": deepcopy(parsed.get("prose_review", {}))
-            if isinstance(parsed.get("prose_review"), dict) else {},
-            "prose_review_present": bool(parsed.get("prose_review_present")),
-            "repair_patches": deepcopy(parsed.get("repair_patches", []))
-            if isinstance(parsed.get("repair_patches"), list) else [],
         }
         final_text = str(pending.get("final_text", "") or "").strip()
         transaction_id = str(pending.get("transaction_id", "") or "")
@@ -15958,34 +16189,6 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
             ):
                 return
             self._fail_memory_sync("独立状态整理结果无法解析（JSON格式错误）")
-            return
-        prose_review_errors = _prose_review_validation_errors(
-            bundle.get("prose_review"),
-            present=bundle.get("prose_review_present", False),
-            final_text=final_text,
-        )
-        if prose_review_errors:
-            message = "；".join(prose_review_errors)
-            self._log_novel_diagnostic(
-                "memory_finalize_prose_review_incomplete",
-                level="warning",
-                action="memory_finalize",
-                transaction_id=transaction_id,
-                validation_errors=prose_review_errors,
-            )
-            if self._schedule_transient_chapter_ai_retry(
-                "memory_finalize",
-                message,
-                force_retry=True,
-                retry_callback=lambda tab: tab._start_memory_finalize(
-                    final_text,
-                    resumed=True,
-                    prose_patch_rounds=int(pending.get("prose_patch_rounds", 0) or 0),
-                    transient_retry=True,
-                ),
-            ):
-                return
-            self._fail_memory_sync(message)
             return
         package_summary = self._novel_memory_bundle_summary(bundle)
         package_count_groups = (
@@ -16035,19 +16238,8 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
                 return
             self._fail_memory_sync("独立状态整理结果为空，已保留正文并等待下次状态整理")
             return
-        audit_errors = _chapter_logic_audit_validation_errors(
-            final_text, bundle.get("logic_audit", {})
-        )
-        logic_issues = _chapter_logic_audit_blocking_issues(bundle.get("logic_audit", {}))
-        # A confirmed prose contradiction must be repaired before validating
-        # its derived state bundle: the repair may change the evidence that
-        # supports the summary and long-form memory update.
-        if logic_issues:
-            self._clear_transient_chapter_ai_retry("memory_finalize")
-            self._start_chapter_logic_repair(final_text, bundle, logic_issues)
-            return
         bundle_errors = self._memory_bundle_validation_errors(final_text, bundle)
-        validation_errors = list(dict.fromkeys(audit_errors + bundle_errors))
+        validation_errors = list(dict.fromkeys(bundle_errors))
         if validation_errors:
             self._log_novel_diagnostic(
                 "memory_finalize_validation_collected",
@@ -16057,7 +16249,6 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
                 validation_error_count=len(validation_errors),
                 validation_errors=validation_errors,
                 repair_targets=self._novel_memory_repair_targets(validation_errors),
-                audit_error_count=len(audit_errors),
                 bundle_error_count=len(bundle_errors),
             )
             # Structural validation failures are deterministic for this exact
@@ -16066,72 +16257,6 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
             # prompt already receives the concrete validation errors.
             self._clear_transient_chapter_ai_retry("memory_finalize")
             self._start_memory_repair(final_text, bundle, validation_errors)
-            return
-        patches = bundle.get("repair_patches", [])
-        blocking_prose_issues = _prose_review_blocking_issues(
-            bundle.get("prose_review", {})
-        )
-        prose_patch_rounds = int(pending.get("prose_patch_rounds", 0) or 0)
-        if pending.get("prose_review_required") and patches and prose_patch_rounds < 2:
-            repaired_text, patch_errors = _apply_chapter_prose_repair_patches(final_text, patches)
-            if not patch_errors and repaired_text != final_text:
-                self._log_novel_diagnostic(
-                    "chapter_prose_repair_patch_applied",
-                    level="info",
-                    chapter_id=self._current_chapter_id(),
-                    patch_count=len(patches),
-                    patch_round=prose_patch_rounds + 1,
-                    prose_review=deepcopy(bundle.get("prose_review", {})),
-                    before_chars=len(final_text),
-                    after_chars=len(repaired_text),
-                )
-                self.chapter_ai_preview.setPlainText(repaired_text)
-                self._clear_transient_chapter_ai_retry("memory_finalize")
-                self._start_memory_finalize(
-                    repaired_text,
-                    prose_patch_rounds=prose_patch_rounds + 1,
-                )
-                return
-            self._log_novel_diagnostic(
-                "chapter_prose_repair_patch_skipped",
-                level="warning",
-                chapter_id=self._current_chapter_id(),
-                patch_count=len(patches),
-                validation_errors=patch_errors,
-            )
-            if patch_errors:
-                if self._schedule_transient_chapter_ai_retry(
-                    "memory_finalize",
-                    "正文修复补丁校验失败：" + "；".join(patch_errors),
-                    force_retry=True,
-                ):
-                    return
-                self._fail_memory_sync("正文修复补丁校验失败：" + "；".join(patch_errors))
-                return
-        elif pending.get("prose_review_required") and patches:
-            message = "正文经过两轮局部修补后仍有未解决的审读问题，已停止提交并保留恢复检查点"
-            self._log_novel_diagnostic(
-                "chapter_prose_review_unresolved",
-                level="error",
-                action="memory_finalize",
-                chapter_id=self._current_chapter_id(),
-                patch_rounds=prose_patch_rounds,
-                patch_count=len(patches),
-                prose_review=deepcopy(bundle.get("prose_review", {})),
-            )
-            self._fail_memory_sync(message)
-            return
-        elif pending.get("prose_review_required") and blocking_prose_issues:
-            message = "正文审读确认仍有非中文异常、编码损坏或生成说明泄漏，但没有安全补丁；已停止提交并保留恢复检查点"
-            self._log_novel_diagnostic(
-                "chapter_prose_review_blocked",
-                level="error",
-                action="memory_finalize",
-                chapter_id=self._current_chapter_id(),
-                blocking_issue_count=len(blocking_prose_issues),
-                prose_review=deepcopy(bundle.get("prose_review", {})),
-            )
-            self._fail_memory_sync(message)
             return
         if (self.current_chapter_index + 1) % 10 == 0 and not pending.get("reconciliation_started"):
             self._clear_transient_chapter_ai_retry("memory_finalize")
@@ -16182,10 +16307,6 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
         transient_retry=False,
     ):
         previous_pending = getattr(self, "_chapter_ai_memory_pending", {})
-        logic_audit_required = bool(
-            previous_pending.get("logic_audit_required", False)
-            if isinstance(previous_pending, dict) else False
-        )
         attempts = int(getattr(self, "_chapter_ai_memory_repair_attempts", 0) or 0) + 1
         self._chapter_ai_memory_repair_attempts = attempts
         validation_errors = [str(item) for item in validation_errors or []]
@@ -16200,6 +16321,7 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
         )
         self._chapter_ai_memory_pending = {
             "chapter_id": self._current_chapter_id(),
+            "stage": "memory_repair",
             "transaction_id": str(
                 previous_pending.get("transaction_id", "")
                 or getattr(self, "_chapter_ai_memory_transaction_id", "")
@@ -16208,13 +16330,11 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
             "final_text": str(final_text or "").strip(),
             "bundle": deepcopy(bundle) if isinstance(bundle, dict) else {},
             "errors": validation_errors,
-            "logic_audit_required": logic_audit_required,
-            "prose_patch_rounds": int(
-                previous_pending.get("prose_patch_rounds", 0) or 0
-            ),
-            "prose_review_required": bool(
-                previous_pending.get("prose_review_required", False)
-            ),
+            "prose_patch_rounds": int(previous_pending.get("prose_patch_rounds", 0) or 0),
+            # State repair only repairs outline, summary, facts and memory.
+            # Prose and hard-logic work have their own stages.
+            "logic_audit_required": False,
+            "prose_review_required": False,
         }
         self._store_memory_repair_checkpoint(
             "memory_repair",
@@ -16231,7 +16351,7 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
             outline=(bundle or {}).get("outline", "") if isinstance(bundle, dict) else "",
             summary=(bundle or {}).get("summary", "") if isinstance(bundle, dict) else "",
             key_facts=(bundle or {}).get("key_facts", "") if isinstance(bundle, dict) else "",
-            logic_audit=(bundle or {}).get("logic_audit", {}) if isinstance(bundle, dict) else {},
+            logic_audit={},
             memory_update=(bundle or {}).get("memory_update", {}) if isinstance(bundle, dict) else {},
             validation_errors=validation_errors,
         )
@@ -16241,8 +16361,8 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
         self._start_chapter_ai_worker(
             "memory_repair",
             context,
-            f"正文终稿已保留，状态数据有{len(validation_errors)}项需修复，"
-            f"正在处理（阶段重试预算 {_CHAPTER_AI_MAX_RETRIES} 次）...",
+            self._chapter_ai_retry_status("memory_repair") if transient_retry else
+            f"正文终稿已保留，章节资料有{len(validation_errors)}项需修复，正在处理...",
             **worker_kwargs,
         )
 
@@ -16256,6 +16376,7 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
         issues = [deepcopy(item) for item in logic_issues if isinstance(item, dict)][:3]
         self._chapter_ai_memory_pending = {
             "chapter_id": self._current_chapter_id(),
+            "stage": "logic_repair",
             "transaction_id": str(
                 previous_pending.get("transaction_id", "")
             ) or self._next_novel_diagnostic_request_id("memory-sync"),
@@ -16267,9 +16388,7 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
             "prose_patch_rounds": int(
                 previous_pending.get("prose_patch_rounds", 0) or 0
             ),
-            "prose_review_required": bool(
-                previous_pending.get("prose_review_required", False)
-            ),
+            "prose_review_required": False,
         }
         if not issues:
             self._fail_memory_sync(
@@ -16306,8 +16425,8 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
         self._start_chapter_ai_worker(
             "logic_repair",
             context,
-            f"终稿审查发现{len(issues)}处有原文证据的逻辑矛盾，"
-            f"正在局部修复（阶段重试预算 {_CHAPTER_AI_MAX_RETRIES} 次）...",
+            self._chapter_ai_retry_status("logic_repair") if transient_retry else
+            f"终稿审查发现{len(issues)}处有原文证据的逻辑矛盾，正在局部修复...",
             **worker_kwargs,
         )
 
@@ -16399,15 +16518,30 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
             pending.get("transaction_id", "")
             if isinstance(pending, dict) else ""
         )
-        failure_action = str(getattr(self, "_chapter_ai_running_action", "") or "")
+        failure_action = str(
+            getattr(self, "_chapter_ai_running_action", "")
+            or pending.get("stage", "")
+            or ""
+        )
         repair_stage = ""
-        if failure_action == "logic_repair" or pending.get("logic_issues"):
+        if failure_action == "prose_review":
+            repair_stage = "prose_review"
+        elif failure_action == "logic_repair" or pending.get("logic_issues"):
             repair_stage = "logic_repair"
         elif failure_action == "memory_repair":
             repair_stage = "memory_repair"
+        elif failure_action == "memory_finalize":
+            repair_stage = "memory_finalize"
         if final_text:
             self.chapter_ai_preview.setPlainText(final_text)
-            if repair_stage:
+            if repair_stage == "prose_review":
+                self._store_memory_finalize_checkpoint(
+                    final_text,
+                    status="failed",
+                    error=str(message or ""),
+                    stage="prose_review",
+                )
+            elif repair_stage:
                 self._store_memory_repair_checkpoint(
                     repair_stage,
                     final_text,
@@ -16485,11 +16619,22 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
                 f"自动扩写已停止：第{self.current_chapter_index + 1}章正文完成，但状态同步失败。"
             )
         resume_action_text = {
+            "prose_review": "重新启动时会继续正文审读。",
+            "memory_finalize": "重新启动时会继续章节资料提取。",
             "memory_repair": "重新启动时会继续状态修复。",
             "logic_repair": "重新启动时会继续正文逻辑修复。",
         }.get(repair_stage, "重新启动时会继续整理状态。")
+        failure_status = {
+            "prose_review": "正文审读失败，已保留后台恢复检查点；",
+            "memory_finalize": "章节资料提取失败，正文终稿已保留在恢复检查点中；",
+            "memory_repair": "章节资料修复失败，正文终稿尚未写入章节，已保留在恢复检查点中；",
+            "logic_repair": "正文逻辑修复失败，终稿已保留在恢复检查点中；",
+        }.get(
+            repair_stage,
+            "正文终稿未写入章节：状态同步失败，已保留后台恢复检查点；",
+        )
         self.set_status_tip(
-            "正文终稿未写入章节：状态同步失败，已保留后台恢复检查点；"
+            failure_status
             + resume_action_text
             + f"{str(message or '')[:120]}"
         )
@@ -16536,11 +16681,6 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
             value = str(parsed.get(key, "") or "").strip()
             if value:
                 bundle[key] = value
-        if isinstance(parsed.get("logic_audit"), dict) and parsed.get("logic_audit"):
-            bundle["logic_audit"] = deepcopy(parsed.get("logic_audit", {}))
-        if parsed.get("prose_review_present"):
-            bundle["prose_review"] = deepcopy(parsed.get("prose_review", {}))
-            bundle["prose_review_present"] = True
         if parsed.get("repair_mode") == "patch":
             bundle["memory_update"] = _merge_long_form_memory_repair_patch(
                 bundle.get("memory_update", {}),
@@ -16552,13 +16692,8 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
                 parsed.get("memory_update", {}),
                 pending.get("errors", []),
             )
-        audit_errors = []
-        if pending.get("logic_audit_required"):
-            audit_errors.extend(_chapter_logic_audit_validation_errors(
-                final_text, bundle.get("logic_audit", {})
-            ))
         bundle_errors = self._memory_bundle_validation_errors(final_text, bundle)
-        validation_errors = list(dict.fromkeys(audit_errors + bundle_errors))
+        validation_errors = list(dict.fromkeys(bundle_errors))
         if validation_errors:
             pending["bundle"] = deepcopy(bundle)
             pending["errors"] = validation_errors
@@ -16578,7 +16713,6 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
                 validation_error_count=len(validation_errors),
                 validation_errors=validation_errors,
                 repair_targets=self._novel_memory_repair_targets(validation_errors),
-                audit_error_count=len(audit_errors),
                 bundle_error_count=len(bundle_errors),
             )
             if self._schedule_transient_chapter_ai_retry(
@@ -16594,60 +16728,6 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
             ):
                 return
             self._fail_memory_sync("；".join(validation_errors))
-            return
-        logic_issues = (
-            _chapter_logic_audit_blocking_issues(bundle.get("logic_audit", {}))
-            if pending.get("logic_audit_required") else []
-        )
-        if logic_issues:
-            self._clear_transient_chapter_ai_retry("memory_repair")
-            self._start_chapter_logic_repair(final_text, bundle, logic_issues)
-            return
-        # A memory repair may have fixed only the structured state package.
-        # Continue the original prose-review transaction before committing it.
-        patches = bundle.get("repair_patches", [])
-        blocking_prose_issues = _prose_review_blocking_issues(
-            bundle.get("prose_review", {})
-        )
-        prose_patch_rounds = int(pending.get("prose_patch_rounds", 0) or 0)
-        prose_review_required = bool(pending.get("prose_review_required", False))
-        if prose_review_required and patches and prose_patch_rounds < 2:
-            repaired_text, patch_errors = _apply_chapter_prose_repair_patches(
-                final_text, patches
-            )
-            if not patch_errors and repaired_text != final_text:
-                self._log_novel_diagnostic(
-                    "chapter_prose_repair_patch_applied",
-                    level="info",
-                    action="memory_repair",
-                    chapter_id=self._current_chapter_id(),
-                    patch_count=len(patches),
-                    patch_round=prose_patch_rounds + 1,
-                    prose_review=deepcopy(bundle.get("prose_review", {})),
-                    before_chars=len(final_text),
-                    after_chars=len(repaired_text),
-                )
-                self.chapter_ai_preview.setPlainText(repaired_text)
-                self._clear_transient_chapter_ai_retry("memory_repair")
-                self._start_memory_finalize(
-                    repaired_text,
-                    prose_patch_rounds=prose_patch_rounds + 1,
-                )
-                return
-            if patch_errors:
-                message = "正文修复补丁校验失败：" + "；".join(patch_errors)
-                self._fail_memory_sync(message)
-                return
-        elif prose_review_required and patches:
-            self._fail_memory_sync(
-                "正文经过两轮局部修补后仍有未解决的审读问题，已停止提交并保留恢复检查点"
-            )
-            return
-        elif prose_review_required and blocking_prose_issues:
-            self._fail_memory_sync(
-                "正文审读确认仍有非中文异常、编码损坏或生成说明泄漏，但没有安全补丁；"
-                "已停止提交并保留恢复检查点"
-            )
             return
         # A repair response is still a memory-finalize result. At a ten-chapter
         # boundary it must pass the same reconciliation gate as the first
@@ -16965,6 +17045,17 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
         index = min(attempt, len(_CHAPTER_AI_RETRY_DELAYS)) - 1
         return int(_CHAPTER_AI_RETRY_DELAYS[index])
 
+    def _chapter_ai_retry_status(self, stage):
+        chapter_id = str(
+            getattr(self, "_chapter_ai_running_chapter_id", "")
+            or self._current_chapter_id()
+            or ""
+        )
+        counts = getattr(self, "_chapter_ai_transient_retry_counts", {})
+        attempt = int(counts.get(f"{chapter_id}:{stage}", 0) or 0) if isinstance(counts, dict) else 0
+        label = self._status_action_label(stage) or "当前步骤"
+        return f"正在自动重试{label}（{attempt}/{_CHAPTER_AI_MAX_RETRIES}）..."
+
     def _schedule_transient_chapter_ai_retry(
         self,
         action,
@@ -17020,8 +17111,9 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
         self._chapter_ai_transient_retry_pending = True
         token = int(getattr(self, "_chapter_ai_transient_retry_token", 0) or 0) + 1
         self._chapter_ai_transient_retry_token = token
+        retry_label = self._status_action_label(stage) or self._status_action_label(action) or "当前步骤"
         self.set_status_tip(
-            f"当前步骤未通过，已丢弃本次结果；{delay_seconds} 秒后自动重试"
+            f"{retry_label}未通过，已丢弃本次结果；{delay_seconds} 秒后自动重试"
             f"（{attempt}/{max_retries}）..."
         )
 
@@ -17057,11 +17149,12 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
             if callable(retry_callback):
                 retry_callback(tab)
             else:
+                retry_label = tab._status_action_label(stage) or tab._status_action_label(action) or "当前步骤"
                 tab._start_chapter_ai_worker(
                     action,
                     context,
-                    f"正在自动重试当前步骤（{attempt}/{max_retries}）..." if not status_text else
-                    f"{status_text.rstrip('。.')}，自动重试 {attempt}/{max_retries}...",
+                    f"正在自动重试{retry_label}（{attempt}/{max_retries}）..." if not status_text else
+                    f"{status_text.rstrip('。.')}，自动重试{retry_label}（{attempt}/{max_retries}）...",
                     transient_retry=True,
                 )
 
@@ -17272,12 +17365,13 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
             str(chapter.get("ai_generation_checkpoint", {}).get("stage", "") or "")
             if isinstance(chapter.get("ai_generation_checkpoint"), dict) else ""
         )
+        prose_checkpoint_text = self._validated_prose_review_checkpoint()
         checkpoint_text = self._validated_memory_finalize_checkpoint()
         existing_body = str(chapter.get("text", "") or "").strip()
         rewrite_on_ready = False
-        if had_memory_checkpoint and not checkpoint_text:
+        if had_memory_checkpoint and not checkpoint_text and not prose_checkpoint_text:
             self._clear_memory_finalize_checkpoint(persist=True)
-            if checkpoint_stage in {"memory_repair", "logic_repair"}:
+            if checkpoint_stage in {"prose_review", "memory_repair", "logic_repair"}:
                 # A stale repair package must not force a prose rewrite. The
                 # current body is still usable; rebuild only its state data.
                 had_memory_checkpoint = False
@@ -17296,6 +17390,11 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
         self._set_partial_chapter_ai_preview_state(False)
         self._chapter_ai_resume_prefix = ""
         self.chapter_ai_preview.setPlainText("")
+        if prose_checkpoint_text:
+            self._mark_current_chapter_ai_sync_pending(chapter)
+            self._chapter_ai_style_workflow_active = True
+            self._start_prose_review(prose_checkpoint_text, resumed=True)
+            return
         if checkpoint_text:
             self._mark_current_chapter_ai_sync_pending(chapter)
             self._chapter_ai_style_workflow_active = True
@@ -17304,7 +17403,7 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
         if existing_body and not had_memory_checkpoint and not force_rewrite:
             self._mark_current_chapter_ai_sync_pending(chapter)
             self._chapter_ai_style_workflow_active = True
-            self._start_memory_finalize(
+            self._start_prose_review(
                 existing_body,
                 resumed=bool(getattr(self, "_auto_expand_all_active", False)),
             )
@@ -17433,7 +17532,9 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
             ) + 1
             self._reset_chapter_ai_sequence()
             self._set_chapter_ai_actions_enabled(True)
-            self.set_status_tip("AI 辅助生成已中止。")
+            action = str(getattr(self, "_chapter_ai_running_action", "") or "")
+            action_label = self._status_action_label(action) or "AI 辅助生成"
+            self.set_status_tip(f"{action_label}已中止。")
             return
         if (
             (worker is None or not worker.isRunning())
@@ -17458,13 +17559,17 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
                 self._set_chapter_ai_actions_enabled(True)
                 current_status = str(getattr(self, "_status_message", "") or "")
                 if "中止" not in current_status and "停止" not in current_status:
-                    self.set_status_tip("AI 辅助生成已中止。")
+                    action = str(getattr(self, "_chapter_ai_running_action", "") or "")
+                    action_label = self._status_action_label(action) or "AI 辅助生成"
+                    self.set_status_tip(f"{action_label}已中止。")
             return
         self._chapter_ai_stop_requested_by_user = True
         if not getattr(self, "_auto_expand_all_active", False):
             self._reset_chapter_ai_sequence()
             self._set_chapter_ai_actions_enabled(True)
-        self.set_status_tip("正在中止 AI 辅助生成...")
+        action = str(getattr(self, "_chapter_ai_running_action", "") or "")
+        action_label = self._status_action_label(action) or "AI 辅助生成"
+        self.set_status_tip(f"正在中止{action_label}...")
         try:
             if worker is not None and worker.isRunning():
                 if hasattr(worker, "stop"):
@@ -17488,6 +17593,7 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
     def _chapter_ai_output_is_user_facing(self, action=None):
         action = str(action or getattr(self, "_chapter_ai_running_action", "") or "")
         if action in {
+            "prose_review",
             "memory_finalize",
             "memory_reconcile",
             "memory_repair",
@@ -17743,17 +17849,23 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
         if final_text and self._chapter_ai_output_is_user_facing(action):
             self.chapter_ai_preview.setPlainText(final_text)
         if getattr(self, "_chapter_ai_stop_requested_by_user", False):
-            if action in {"memory_finalize", "logic_repair"}:
+            if action in {"prose_review", "memory_finalize", "memory_repair", "memory_reconcile", "logic_repair"}:
                 pending = getattr(self, "_chapter_ai_memory_pending", {})
                 kept_final = str(pending.get("final_text", "") or "").strip() if isinstance(pending, dict) else ""
                 if kept_final:
                     self.chapter_ai_preview.setPlainText(kept_final)
                 self._reset_chapter_ai_sequence()
                 self.set_status_tip(
-                    ("正文逻辑修复已中止，终稿已保留在预览和恢复检查点中；"
+                    ("正文审读已中止，终稿已保留在预览和恢复检查点中；"
+                     if action == "prose_review" else
+                     "正文逻辑修复已中止，终稿已保留在预览和恢复检查点中；"
                      if action == "logic_repair" else
-                     "状态整理已中止，正文终稿已保留在预览和恢复检查点中；")
-                    + "重新启动自动扩写时会继续整理状态。"
+                     "章节资料提取已中止，正文终稿已保留在预览和恢复检查点中；"
+                     if action == "memory_finalize" else
+                     "章节资料修复已中止，正文终稿已保留在预览和恢复检查点中；"
+                     if action == "memory_repair" else
+                     "十章边界对账已中止，已保留正文和状态包恢复检查点；")
+                    + "重新启动时会从当前阶段继续。"
                 )
                 return
             if final_text and self._chapter_ai_output_is_user_facing(action):
@@ -17772,6 +17884,9 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
             return
         if action == "memory_reconcile":
             self._handle_memory_reconciliation_ready(final_text)
+            return
+        if action == "prose_review":
+            self._handle_prose_review_ready(final_text)
             return
         if action == "memory_finalize":
             self._handle_memory_finalize_ready(final_text)
@@ -17961,7 +18076,7 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
             self._chapter_ai_style_fallback_text = ""
             self.chapter_ai_preview.setPlainText(selected)
             self._clear_transient_chapter_ai_retry("style_finalize")
-            self._start_memory_finalize(selected)
+            self._start_prose_review(selected)
             return
         if self._maybe_retry_draft_for_style(action, final_text):
             return
@@ -18104,7 +18219,7 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
                 "边界语义对账调用失败，已保留原本通过校验的状态包等待下次对账：" + clean_error_text(err)
             )
             return
-        if action in {"memory_finalize", "memory_repair", "logic_repair"}:
+        if action in {"prose_review", "memory_finalize", "memory_repair", "logic_repair"}:
             self._fail_memory_sync(clean_error_text(err))
             return
         if action in {"style_finalize", "style_audit", "style_rewrite", "style_plot_extract"} and getattr(self, "_chapter_ai_style_workflow_active", False):
@@ -21542,7 +21657,8 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
             "style_audit": "文风审校",
             "style_rewrite": "定向重写",
             "style_plot_extract": "剧情事实整理",
-            "memory_finalize": "状态整理",
+            "prose_review": "正文审读修补",
+            "memory_finalize": "章节资料提取",
             "memory_reconcile": "十章边界对账",
             "memory_repair": "状态修复",
             "logic_repair": "逻辑局部修复",
@@ -21562,6 +21678,15 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
             "自动扩写已中止",
             "自动扩写已停止",
             "章节 AI 已完成",
+            "正文审读失败",
+            "正文审读已中止",
+            "资料提取失败",
+            "章节资料提取失败",
+            "章节资料提取已中止",
+            "章节资料修复失败",
+            "章节资料修复已中止",
+            "状态修复已中止",
+            "逻辑局部修复已中止",
             "AI 写作失败",
             "正文终稿未写入章节",
             "状态整理已中止",
@@ -21578,6 +21703,15 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
             ("自动扩写已中止", "批次已中止", "auto_aborted"),
             ("自动扩写已停止", "批次已停止", "auto_stopped"),
             ("章节 AI 已完成", "本章完成", "chapter_complete"),
+            ("正文审读失败", "正文审读失败", "prose_review_failed"),
+            ("正文审读已中止", "正文审读已中止", "prose_review_aborted"),
+            ("章节资料提取失败", "章节资料提取失败", "memory_failed"),
+            ("资料提取失败", "资料提取失败", "memory_failed"),
+            ("章节资料提取已中止", "章节资料提取已中止", "memory_aborted"),
+            ("章节资料修复失败", "章节资料修复失败", "memory_repair_failed"),
+            ("章节资料修复已中止", "章节资料修复已中止", "memory_repair_aborted"),
+            ("状态修复已中止", "状态修复已中止", "memory_repair_aborted"),
+            ("逻辑局部修复已中止", "逻辑局部修复已中止", "logic_repair_aborted"),
             ("正文终稿未写入章节", "状态同步失败", "memory_failed"),
             ("AI 写作失败", "生成失败", "generation_failed"),
             ("状态整理已中止", "状态整理已中止", "memory_aborted"),
@@ -21589,8 +21723,23 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
         for marker, label, key in terminal_patterns:
             if marker in value:
                 return label, key
+        # Retry messages carry the real stage name so the status bar does not
+        # collapse every retry into a generic "waiting" state.
+        retry_stage_patterns = (
+            (("正文审读修补", "正文审读"), "正文审读修补", "prose_review"),
+            (("章节资料提取",), "章节资料提取", "memory_finalize"),
+            (("状态修复",), "状态修复", "memory_repair"),
+            (("十章边界对账",), "十章边界对账", "memory_reconcile"),
+            (("正文逻辑修复", "逻辑局部修复"), "逻辑局部修复", "logic_repair"),
+        )
+        if any(marker in value for marker in ("未通过", "自动重试", "秒后自动重试")):
+            for markers, label, key in retry_stage_patterns:
+                if any(marker in value for marker in markers):
+                    return label, key
         text_patterns = (
             (("秒后自动重试", "正在自动重试", "自动重试当前步骤"), "等待自动重试", "retry"),
+            (("正在中止正文审读修补", "正在中止正文审读"), "正在中止正文审读修补", "stopping"),
+            (("正在中止章节资料提取", "正在中止资料提取"), "正在中止章节资料提取", "stopping"),
             (("正在中止",), "正在中止", "stopping"),
             (("普通基准稿",), "文风基准稿", "style_baseline"),
             (("提取证据化写法", "作者写法"), "作者写法提取", "style_sheet"),
@@ -21604,10 +21753,13 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
             (("独立审校", "文风审校"), "文风审校", "style_audit"),
             (("定向重写", "自动重写一次"), "定向重写", "style_rewrite"),
             (("剧情事实",), "剧情事实整理", "style_plot_extract"),
+            # Extraction messages may mention the completed review. Match
+            # them before the broader "正文审读" pattern below.
+            (("资料提取", "提取章节摘要", "提取摘要、关键事实和长期记忆", "整理摘要、关键事实和长期记忆", "章节资料"), "章节资料提取", "memory_finalize"),
+            (("正文审读", "审读并修补正文语义", "正文语义"), "正文审读修补", "prose_review"),
             (("边界语义对账", "十章对账"), "十章边界对账", "memory_reconcile"),
             (("状态修复", "修复本章摘要", "正在修复"), "状态修复", "memory_repair"),
             (("逻辑矛盾", "局部修复正文逻辑", "逻辑局部修复"), "逻辑局部修复", "logic_repair"),
-            (("状态整理", "长期状态"), "状态整理", "memory_finalize"),
             (("章节提纲", "补提纲"), "章节提纲", "outline"),
             (("摘要/关键事实", "补摘要", "提炼摘要"), "摘要/关键事实", "summary"),
             (("准备下一章",), "准备下一章", "next_chapter"),
@@ -21815,6 +21967,7 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
             return 98
 
         ranges = {
+            "prose_review": (10, 78, 5000),
             "memory_finalize": (10, 78, 6000),
             "memory_repair": (80, 90, 5000),
             "logic_repair": (80, 90, 3500),

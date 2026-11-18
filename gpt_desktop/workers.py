@@ -65,7 +65,7 @@ from .novel_utils import (
     _grounded_prose_contract,
     _prose_language_accuracy_guidance,
     _prose_language_review_guidance,
-    _prose_scene_grounding_guidance,
+    _without_repeated_prose_guidance,
     _infer_foreshadow_status,
     _merge_text_lines_without_duplicates,
     _merge_foreshadow_description_without_bloat,
@@ -925,6 +925,7 @@ _NOVEL_JSON_RESULT_ACTIONS = {
     "style_technique_cards",
     "style_plot_extract",
     "style_audit",
+    "prose_review",
     "memory_finalize",
     "memory_reconcile",
     "memory_repair",
@@ -6885,6 +6886,8 @@ class NovelWritingWorker(QThread):
             return 2200
         if self.action == "style_plot_extract":
             return 1800
+        if self.action == "prose_review":
+            return 6500
         if self.action == "memory_finalize":
             return 9000
         if self.action == "memory_reconcile":
@@ -6901,14 +6904,14 @@ class NovelWritingWorker(QThread):
         # Normal ten-chapter boundary updates remain well below this ceiling.
         if self.action == "memory_finalize":
             return 36000
-        if self.action == "logic_repair":
+        if self.action in {"prose_review", "logic_repair"}:
             return 12000
         return 0
 
     def _uses_json_response_format(self):
         return (
             self.api_protocol != "anthropic"
-            and self.action in {"memory_finalize", "memory_reconcile", "memory_repair", "logic_repair"}
+            and self.action in {"prose_review", "memory_finalize", "memory_reconcile", "memory_repair", "logic_repair"}
         )
 
     def _reasoning_effort_for_request(self):
@@ -6990,7 +6993,8 @@ class NovelWritingWorker(QThread):
             "style_audit": "文风审校",
             "style_rewrite": "重写正文",
             "style_plot_extract": "剧情事实提取",
-            "memory_finalize": "章节状态整理",
+            "prose_review": "正文审读修补",
+            "memory_finalize": "章节资料提取",
             "memory_reconcile": "十章边界语义对账",
             "memory_repair": "章节状态修复",
             "logic_repair": "正文逻辑局部修复",
@@ -7037,7 +7041,8 @@ class NovelWritingWorker(QThread):
             "style_audit": "正在独立审校候选正文的文风...",
             "style_rewrite": "正在按审校结果定向重写正文...",
             "style_plot_extract": "正在提取候选正文的剧情事实...",
-            "memory_finalize": "正在独立整理本章摘要和长期状态...",
+            "prose_review": "正在审读并修补正文语义、对白和逻辑...",
+            "memory_finalize": "正在提取章节摘要、关键事实和长期记忆...",
             "memory_reconcile": "正在执行十章边界语义对账...",
             "memory_repair": "正在修复本章摘要和长篇状态...",
             "logic_repair": "正在按原文证据局部修复正文逻辑...",
@@ -7142,14 +7147,11 @@ class NovelWritingWorker(QThread):
     def _action_prompt(self):
         prompt = self._action_prompt_base()
         if self.action in {"draft", "style_rewrite", "style_finalize", "script_to_novel"}:
-            scene_guidance = _prose_scene_grounding_guidance()
-            # Keep this exact prose block once across system and user context.
-            if scene_guidance.strip() in self.context:
-                prompt = prompt.replace(scene_guidance, "")
+            prompt = _without_repeated_prose_guidance(prompt, self.context)
             language_guidance = _prose_language_accuracy_guidance()
             if language_guidance.strip() not in self.context:
                 prompt += "\n\n" + language_guidance
-        if self.action == "memory_finalize":
+        if self.action == "prose_review":
             review_guidance = _prose_language_review_guidance()
             if review_guidance.strip() not in self.context:
                 prompt += "\n\n" + review_guidance
@@ -7252,7 +7254,8 @@ class NovelWritingWorker(QThread):
                 "把提纲转化成人物在场景里的行动、反应、对白、关系变化和结果，不要显露提纲、任务清单或审校痕迹。"
                 "文风画像、原生词池和原文片段卡是本章唯一的写法标准：优先模仿其中真实可观察的口语、"
                 "动作反应、句法松紧、说话标签、接话方式、段落衔接和收束节奏。"
-                "不得复制样本的人物、剧情、物件或原句；也不得为了展示文风硬塞口语、笑点、对白、短段或特殊词。"
+                "口语、笑点、对白、短段和特殊词结合当前人物、场景、情绪与文风自然融入正文，让表达贴合样本也服务当前故事。"
+                "不复制样本的人物、剧情、物件或原句。"
                 "同一事实不要换词重复解释，不要替人物讲道理，不要写报告式推理或机械分镜。"
                 "只输出正文，不输出标题、前言、分区标签、审校说明、JSON或Markdown代码块。"
                 + _grounded_prose_contract(
@@ -7295,39 +7298,28 @@ class NovelWritingWorker(QThread):
                 "必须保留事件顺序、人物行为结果、对白传达的关键信息、设定事实、伤势、物品和结尾状态；"
                 "删除原文句式、修辞、氛围、节奏、段落和强调方式。用简短编号条目输出，不写分析、评价或改写后的正文。"
             )
+        if self.action == "prose_review":
+            return (
+                "你是独立的中文小说正文审读编辑。本次专注正文语义、对白、局部表达、硬逻辑和输出纯净性。"
+                "结合上下文逐句核对字面句意、行动者、动作、对象、分句归属和回应关系，按用户提供的审读规则和真实例句修补。"
+                "用准确、惯用、符合人物身份与交流情境的中文重组完整问题句，使相邻台词自然接续。"
+                "正文事实和已明确的人物关系是修补依据；保留人物态度、确定程度、承诺内容及剧情结果。"
+                "语言和读感问题记入prose_review，并提供逐项对应的repair_patches；有前后证据的硬矛盾单独记入logic_audit。"
+                "只返回logic_audit、prose_review、repair_patches三个字段，严格输出一个合法JSON对象。"
+            )
         if self.action == "memory_finalize":
             return (
-                "你是小说正文审读与连续性总编辑。最终正文是唯一事实来源；先按正文语言检查规则逐句审读对白和叙述，"
-                "把明确的词义搭配、句意和必要成分问题记入prose_review，并用repair_patches给出原意明确的局部替换；"
-                "再独立生成实际提纲、摘要、关键事实和版本2长篇记忆增量。"
-                "正文修补仅通过repair_patches提供局部替换，不输出整章正文；不得把原提纲、未来规划、人物秘密或伏笔答案当成已经发生。"
-                "在状态整理前必须额外做一次正文成品泄漏检查：识别正文中误写入的内部人物/设定/伏笔短引用、任务或状态字段名、JSON/代码片段、"
-                "AI推理、提示词、输出要求、校验说明和工作流程说明。只有它们明显不是故事内人物看到的界面文字、手机消息、文件内容或自然对白时才算泄漏；"
-                "不要把剧情中合理出现的全角括号提示、聊天消息、文件名、普通英文缩写或角色对内部内容的讨论误报为泄漏。"
-                "发现明确泄漏时，在repair_patches中用最终正文里唯一出现的连续原文做最小替换，改成符合上下文的自然叙事；"
-                "无法确定或需要猜测剧情时不要修，不要因为程序目录里存在某个C/L/F编号就强行替换。"
-                "生成状态前必须单独审查正文内部的硬逻辑矛盾，尤其是人物位置与清醒状态、物件撤走后再次出现、"
-                "开合/损毁/持有人互斥、时间因果、数字前后不一致、人物与组织关系混用、"
-                "把人数简称当成组织名称或把规划内容写成已发生事实，以及代词歧义；"
-                "同时对照【实体称谓与关系边界】检查正文，只有有前后逐字原文或明确资料对照的证据才报告，"
-                "不得把文风、剧情选择或现实流程不完整误报为逻辑错误。"
+                "你是小说连续性资料整理员。只依据已经审读修补完成的最终正文，提取实际提纲、摘要、关键事实和版本2长篇记忆增量。"
+                "本次只负责资料提取，返回outline、summary、key_facts、long_form_memory四个字段，不改写正文、不执行正文审读。"
+                "不得把原提纲、未来规划、人物秘密或伏笔答案当成已经发生。"
                 "必须识别所有会影响后文的命名人物行动、伤势与能力边界、关系变化、物件去向、未决任务、"
                 "新线索、证据异常、记录缺失或覆盖、未知来源、责任边界、设施规则、伏笔推进和章节结尾状态。"
                 "每项长期事件必须落到真实存储位置；更新旧事实时必须保留仍有效的数量、程度、范围和不确定性。"
                 "新增事实的临时引用只能填写在fact_updates各项的key字段，禁止改用temp_id或临时id。"
                 "每条operation不是keep的新增、更新、退出或替代事实，都必须至少被一个long_term_events.storage.fact_refs引用；"
                 "输出前逐项核对fact_updates，不能让会影响后文的事实脱离对应长期事件。"
-                "同时标出有明确原文位置的重复说明、无结果流程赘述、机械短碎表达或局部语言冲突；不得把剧情选择、"
-                "文风偏好、现实流程不完整或正常留白当成问题。"
-                "审读还必须覆盖中文正文中的其他语种残留、未翻译外语句子、乱码、编码损坏、异常替代字符和无意义的字母数字符号混排；"
-                "不得把非ASCII字符本身、正常中文标点、单位/数学符号、合法专名、型号、代码标识、作者要求保留的原文、"
-                "确有必要的外语对白或故事内文件/界面内容误报为异常。普通旁白、对白和人物内心活动中的自然判断不是AI推理泄漏；"
-                "只有明确面向生成过程的推理、提示词、JSON/字段、校验、输出或工作流说明，或内部任务/状态资料直接进入正文，才报告为元信息泄漏。"
-                "prose_review中的issues记录语言和读感问题；已确认的无必要非中文残留、乱码/编码损坏或AI推理/说明字段泄漏必须放入blocking_issues，"
-                "每项使用category、quote、reason，并且quote必须是正文逐字片段；只有确认排除后才能返回blocking_issues为空。"
                 "必须使用用户资料提供的短引用和当前修订号，所有动态更新都附正文逐字证据。"
-                "输出时必须先完成outline、summary、key_facts和long_form_memory四个核心字段，再输出logic_audit、prose_review和repair_patches。"
-                "这四个核心字段即使内容为空或没有动态更新也必须存在；禁止只返回审校字段，禁止先返回审校字段后停止。"
+                "outline、summary、key_facts和long_form_memory四个核心字段即使内容为空或没有动态更新也必须存在。"
                 "严格输出一个合法JSON对象，不输出Markdown、分析、说明或额外文字。"
                 "JSON字符串中出现英文双引号时必须写成\\\"，不能漏掉字符串末尾的英文双引号。"
             )
@@ -7523,7 +7515,7 @@ class NovelWritingWorker(QThread):
                     "style_persona", "style_cards", "style_rules", "style_finalize", "style_audit",
                     "style_semantic_vocabulary", "style_voice_cards", "style_technique_cards",
                     "style_runtime_voice_pack", "style_plot_extract", "style_rewrite", "memory_finalize",
-                    "memory_reconcile", "memory_repair", "logic_repair",
+                    "prose_review", "memory_reconcile", "memory_repair", "logic_repair",
                 )
                 else 1.5 if self.action in ("draft", "script_to_novel")
                 else 0.35
@@ -7845,14 +7837,14 @@ class NovelWritingWorker(QThread):
                     if response_char_limit and len(full) > response_char_limit:
                         self.diagnostics["response_char_limit_exceeded"] = True
                         raise Exception(
-                            "AI 章节状态整理输出异常膨胀"
-                            f"（已超过{response_char_limit}字），已中止本次结果。"
+                            ("AI 正文审读输出异常膨胀" if self.action == "prose_review" else "AI 章节状态整理输出异常膨胀")
+                            + f"（已超过{response_char_limit}字），已中止本次结果。"
                         )
                     if self.action not in {
                         "style_profile", "style_cards", "style_semantic_vocabulary", "style_voice_cards",
                         "style_technique_cards", "style_runtime_voice_pack", "style_finalize", "style_audit",
                         "style_plot_extract", "style_rewrite", "memory_finalize", "memory_reconcile",
-                        "memory_repair", "logic_repair",
+                        "prose_review", "memory_repair", "logic_repair",
                     }:
                         visible_piece = (
                             stream_boundary_filter.feed(piece)

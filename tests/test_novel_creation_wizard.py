@@ -451,6 +451,10 @@ class NovelCreationWizardPersistenceTests(unittest.TestCase):
                         "w": [0, 100000],
                         "s": "主角在宗族擂台觉醒并完成逆袭。",
                         "l": "家族大厅与宗族擂台",
+                        "a": [
+                            {"n": "家族大厅", "r": "承载退婚与家族公开压力"},
+                            {"n": "宗族擂台", "r": "承载主角首次正面逆袭"},
+                        ],
                         "c": "退婚者和族内天才",
                         "x": "主角拿回修炼资格",
                         "q": "必须进入更大的修炼场",
@@ -471,6 +475,13 @@ class NovelCreationWizardPersistenceTests(unittest.TestCase):
         self.assertEqual(direction["start_word"], 0)
         self.assertEqual(direction["end_word"], 100000)
         self.assertEqual(direction["scene_change"], "家族大厅与宗族擂台")
+        self.assertEqual(
+            direction["main_scene_anchors"],
+            [
+                {"name": "家族大厅", "role": "承载退婚与家族公开压力"},
+                {"name": "宗族擂台", "role": "承载主角首次正面逆袭"},
+            ],
+        )
         self.assertEqual(direction["character_change"], "退婚者和族内天才")
         self.assertEqual(direction["result"], "主角拿回修炼资格")
         self.assertEqual(
@@ -483,6 +494,8 @@ class NovelCreationWizardPersistenceTests(unittest.TestCase):
         preview = wizard._format_stage_directions_section_body(result)
         self.assertIn("阶段大事件：", preview)
         self.assertIn("场景变化：家族大厅与宗族擂台", preview)
+        self.assertIn("主要场景锚点：", preview)
+        self.assertIn("家族大厅：承载退婚与家族公开压力", preview)
         self.assertIn("人物变化：退婚者和族内天才", preview)
         self.assertIn("关键推进节点：", preview)
         self.assertIn("主角击败族内天才，取得进入都城的资格", preview)
@@ -531,12 +544,14 @@ class NovelCreationWizardPersistenceTests(unittest.TestCase):
             {
                 "summary": "赢下宗族比试",
                 "scene_change": "宗族擂台",
+                "main_scene_anchors": [{"name": "宗族擂台", "role": "承载本阶段正面比试"}],
                 "character_change": "旧对手承认败局",
                 "key_beats": ["主角正面击败族内天才"],
             },
             {
                 "summary": "在都城决战中解决核心冲突",
                 "scene_change": "都城决战场",
+                "main_scene_anchors": [{"name": "都城决战场", "role": "承载本阶段最终对抗"}],
                 "character_change": "同伴在决战前重新选择立场",
                 "key_beats": ["进入都城", "同伴选择参战", "对手逼近", "决战胜出"],
                 "climax_beat_indices": [3, 4],
@@ -591,6 +606,25 @@ class NovelCreationWizardPersistenceTests(unittest.TestCase):
                         {"stage_directions": directions}, "stage_directions"
                     )
                 self.assertEqual(dialog.step_results, previous)
+
+    def test_stage_direction_batch_rejects_missing_or_reused_main_scene_anchor(self):
+        dialog, directions = self._stage_direction_batch_dialog()
+        directions[1]["main_scene_anchors"] = []
+        with self.assertRaisesRegex(ValueError, "第2阶段缺少主要场景锚点"):
+            dialog._merge_bible_batch(
+                {"stage_directions": directions}, "stage_directions"
+            )
+
+        dialog, directions = self._stage_direction_batch_dialog()
+        directions[1]["main_scene_anchors"] = [
+            {"name": "宗族擂台", "role": "改名后仍是同一主要场景"}
+        ]
+        previous = deepcopy(dialog.step_results)
+        with self.assertRaisesRegex(ValueError, "跨阶段主要场景必须更换"):
+            dialog._merge_bible_batch(
+                {"stage_directions": directions}, "stage_directions"
+            )
+        self.assertEqual(dialog.step_results, previous)
 
     def test_stage_direction_climax_validation_feedback_is_specific_and_actionable(self):
         dialog, directions = self._stage_direction_batch_dialog()
@@ -938,18 +972,23 @@ class NovelCreationWizardPersistenceTests(unittest.TestCase):
         self.assertIn("跨入新阶段后，主要场景、阶段性关键人物、事件核心和人物冲突四方面均须更换", prompt)
         self.assertIn("完成全部阶段后还要回看非相邻阶段", prompt)
         self.assertIn("事件核心与人物冲突的实质更换须直接体现在summary和key_beats中", prompt)
-        self.assertIn("scene_change、character_change只说明场景和阶段性关键人物差异", prompt)
         self.assertIn(
-            "scene_change 和 character_change 分别说明相较前阶段更换的主要场景与阶段性关键人物",
+            "scene_change、main_scene_anchors、character_change各司其职",
+            prompt,
+        )
+        self.assertIn(
+            "scene_change 只写面向用户的简短场景差异说明",
             prompt,
         )
         self.assertEqual(prompt.count("前阶段的人物和地点也可以作为承接背景"), 1)
         self.assertNotIn("每个小事件机械更换四方面", prompt)
         self.assertNotIn("不要求两项都变化", prompt)
         self.assertIn("从第二阶段起，结合题材与前后因果", prompt)
+        self.assertIn("【当前阶段执行边界】", prompt)
+        self.assertIn("其它阶段只能作为尚未发生的压力来源、行动动机或未来方向出现", prompt)
         self.assertIn("自然提高至少两项，最终阶段达到全书峰值", wizard.CREATION_CORE_QUALITY_GUIDANCE)
         self.assertIn("四方面均须更换", wizard.CREATION_CORE_QUALITY_GUIDANCE)
-        self.assertIn("从阶段2起写本阶段相较前阶段更换的主要场景", prompt)
+        self.assertIn("从阶段2起写本阶段相较前阶段更换主要场景的简短说明", prompt)
         self.assertIn("从阶段2起写本阶段相较前阶段更换的阶段性关键人物", prompt)
         self.assertNotIn("主要场景更换或实质升级", prompt)
         self.assertIn("相邻阶段的大事件和关键推进不能只是同一任务换地点或加码重演", prompt)
@@ -1080,11 +1119,12 @@ class NovelCreationWizardPersistenceTests(unittest.TestCase):
                 self.assertEqual(
                     set(direction),
                     {"id", "name", "word_range", "summary", "scene_change",
-                     "character_change", "result", "next_pressure", "key_beats",
+                     "main_scene_anchors", "character_change", "result", "next_pressure", "key_beats",
                      "climax_beat_indices"},
                 )
                 self.assertIn("唯一大事件", direction["summary"])
                 self.assertIn("阶段1可留空", direction["scene_change"])
+                self.assertIn("具体场所或稳定场域", direction["main_scene_anchors"][0]["name"])
                 self.assertIn("阶段1可留空", direction["character_change"])
                 self.assertIn("本阶段最后一个关键推进节点后已成立的阶段出口状态", direction["result"])
                 self.assertIn("末阶段以最后高潮节点兑现后的状态为准", direction["result"])
@@ -1164,6 +1204,127 @@ class NovelCreationWizardPersistenceTests(unittest.TestCase):
         )
         self.assertEqual(worker._analysis_progress_label(), "全书阶段方向")
         self.assertEqual(worker._generation_progress_text(200000), "正在生成：全书阶段方向")
+
+    def test_stage_direction_validation_failure_keeps_reason_during_retry(self):
+        dialog = wizard.NovelCreationWizardDialog.__new__(
+            wizard.NovelCreationWizardDialog
+        )
+        dialog.current_step_index = 1
+        dialog._active_batch_kind = "stage_directions"
+        dialog._active_stage_index = -1
+        dialog._generation_retry_count = 0
+        dialog._generation_failed = False
+        dialog._pending_batch_kind = ""
+        dialog._pending_stage_index = -1
+        dialog._pending_retry_delay_ms = 0
+        dialog._retrying_same_request = False
+        dialog._last_worker_error = ""
+        dialog._generation_error_step = ""
+        dialog.worker = object()
+        statuses = []
+        saves = []
+        dialog._set_status_text = statuses.append
+        dialog._set_running = lambda _running: None
+        dialog._save_draft = lambda: saves.append(True)
+
+        self.assertTrue(
+            dialog._schedule_generation_retry(
+                "第5阶段关键推进节点需为3至10项，收到2项。",
+                "stage_directions",
+                -1,
+            )
+        )
+        self.assertEqual(dialog._generation_error_step, "bible")
+        self.assertIn("阶段方向生成失败", dialog._last_worker_error)
+        self.assertIn("第5阶段关键推进节点需为3至10项，收到2项", dialog._last_worker_error)
+        self.assertIn("自动重试当前批次（1/3）", dialog._last_worker_error)
+        self.assertEqual(statuses[-1], dialog._last_worker_error)
+        self.assertTrue(saves)
+
+        dialog._pending_batch_kind = "stage_directions"
+        dialog._set_status_text = statuses.append
+        dialog._on_worker_progress("AI 正在生成，请稍候……")
+        self.assertEqual(statuses[-1], dialog._last_worker_error)
+
+    def test_generation_failure_after_retry_limit_has_actionable_status(self):
+        dialog = wizard.NovelCreationWizardDialog.__new__(
+            wizard.NovelCreationWizardDialog
+        )
+        dialog.current_step_index = 1
+        dialog._active_batch_kind = "stage_directions"
+        dialog._active_stage_index = -1
+        dialog._generation_retry_count = 3
+        dialog._generation_failed = False
+        dialog._pending_batch_kind = "stage_directions"
+        dialog._pending_stage_index = -1
+        dialog._pending_retry_delay_ms = 10000
+        dialog._retrying_same_request = True
+        dialog._last_worker_error = ""
+        dialog._generation_error_step = ""
+        statuses = []
+        saves = []
+        dialog._set_status_text = statuses.append
+        dialog._set_running = lambda _running: None
+        dialog._save_draft = lambda: saves.append(True)
+
+        self.assertFalse(
+            dialog._schedule_generation_retry(
+                "返回内容未覆盖全部阶段。",
+                "stage_directions",
+                -1,
+            )
+        )
+        self.assertTrue(dialog._generation_failed)
+        self.assertIn("已自动重试3次", dialog._last_worker_error)
+        self.assertIn("AI 生成阶段方向", dialog._last_worker_error)
+        self.assertIn("返回内容未覆盖全部阶段", dialog._last_worker_error)
+        self.assertEqual(statuses[-1], dialog._last_worker_error)
+        self.assertTrue(saves)
+
+    def test_draft_payload_persists_failure_status_without_failed_content(self):
+        dialog = wizard.NovelCreationWizardDialog.__new__(
+            wizard.NovelCreationWizardDialog
+        )
+        dialog._generation_error_step = "bible"
+        dialog._last_worker_error = (
+            "阶段方向生成失败：第5阶段关键推进节点不足；"
+            "10秒后自动重试当前批次（1/3）。"
+        )
+        dialog.draft_id = "draft-status-test"
+        dialog.created_at = ""
+        dialog.created_at_ns = 0
+        dialog.project_name_hint = "测试项目"
+        dialog.current_step_index = 1
+        dialog.choice_values = {}
+        dialog.inspiration_edit = SimpleNamespace(text=lambda: "灵感")
+        dialog.target_words_spin = SimpleNamespace(value=lambda: 500000)
+        dialog.average_words_spin = SimpleNamespace(value=lambda: 3000)
+        dialog.premise_candidates = []
+        dialog.premise_selected_index = 0
+        dialog.step_results = {}
+        dialog.completion_status = ""
+        dialog.completed_at = ""
+        dialog.imported_project_path = ""
+        dialog.completed_result_payload = {}
+
+        payload = dialog._draft_payload()
+        self.assertEqual(payload["step_results"], {})
+        self.assertEqual(payload["generation_status"]["step"], "bible")
+        self.assertIn("本次返回未保存", payload["generation_status"]["message"])
+        self.assertNotIn("10秒后自动重试", payload["generation_status"]["message"])
+
+    def test_draft_summary_marks_persisted_generation_failure(self):
+        summary = wizard._creation_wizard_summary({
+            "draft_id": "draft-status-test",
+            "current_step_index": 1,
+            "step_results": {},
+            "generation_status": {
+                "step": "bible",
+                "message": "阶段方向生成失败：结构校验未通过。",
+            },
+        })
+        self.assertEqual(summary["step"], "故事底盘 · 生成失败")
+        self.assertEqual(summary["status_label"], "生成失败")
 
     def test_direct_stage_pressure_row_is_preserved_as_pressure_curve(self):
         curve = _normalize_mainline_pressure_curve({
@@ -1859,9 +2020,11 @@ class NovelCreationWizardPersistenceTests(unittest.TestCase):
             "http://example.test", "key", "model", "bible", {}, batch_kind="bible_core"
         )._analysis_prompt()
         self.assertIn(
-            "本部闭环由本步确认的核心动机、阶段方向和第三步阶段规划逐步细化",
+            "本部闭环由第一步 core_motive、用户确认的阶段方向和第三步阶段规划逐步细化",
             bible_prompt,
         )
+        self.assertIn("core_motive 是本书不可重写的唯一核心动机和主线契约", bible_prompt)
+        self.assertNotIn("本步负责重新确定一条唯一核心动机", bible_prompt)
         self.assertNotIn("结尾方向字段写成“本部闭环结果”", bible_prompt)
         self.assertNotIn("结尾之后仍可存在的余味", premise_prompt)
 

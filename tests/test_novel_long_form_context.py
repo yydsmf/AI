@@ -49,6 +49,7 @@ from gpt_desktop.novel_utils import (
     _build_project_timeline_draft,
     _build_writing_check_text,
     _concrete_prose_expression_guidance,
+    _grounded_prose_contract,
     _derive_mainline_pressure_curve,
     _mainline_pressure_context,
     _ensure_final_chapter_completion_marker,
@@ -68,6 +69,7 @@ from gpt_desktop.novel_utils import (
     _parse_memory_reconciliation_result,
     _prose_scene_grounding_guidance,
     _prose_language_review_guidance,
+    _prose_review_blocking_issues,
     _prose_review_validation_errors,
     _parse_style_technique_cards_result,
     _parse_style_voice_cards_result,
@@ -3050,7 +3052,8 @@ class NovelLongFormContextTests(unittest.TestCase):
         self.assertIn("不得把参考原文的人物、剧情、物件或句子带入当前正文", guidance)
         self.assertNotIn("空得很有存在感", draft_context)
         self.assertNotIn("沉默很有情绪", draft_context)
-        self.assertIn("【正文语言要求】", guidance)
+        self.assertIn("【正文语言要求】", draft_context)
+        self.assertNotIn("【正文语言要求】", guidance)
         self.assertIn("文学化意象、空泛比喻", draft_context)
         self.assertNotIn("比喻可以自由使用", guidance)
         expression_boundary = self._context_section(draft_context, "正文自然表达边界")
@@ -3095,6 +3098,14 @@ class NovelLongFormContextTests(unittest.TestCase):
         self.assertNotIn("旧说明，不应在最终上下文重复保留。", context)
         self.assertNotIn("旧样本文本，不应在最终上下文重复保留。", context)
         self.assertLess(context.find("【当前章节】"), context.rfind("【仿写使用说明】"))
+
+    def test_style_execution_dedup_keeps_rules_when_context_budget_clips_sources(self):
+        reference = "样本保留原段落。\n‘你先坐吧。’"
+        original = "【当前章节】\n" + "待承接的人物状态。" * 2000
+        context = _build_style_execution_context(original, style_reference=reference, limit=6000)
+        self.assertLessEqual(len(context), 6000)
+        self.assertIn(_grounded_prose_contract(style_active=True).strip(), context)
+        self.assertEqual(context.count("不得出现策划术语、抽象形容、文学化意象、空泛比喻"), 1)
 
     def test_draft_style_guidance_stays_simple_for_different_samples(self):
         current = _new_chapter(0)
@@ -3935,18 +3946,8 @@ class NovelLongFormContextTests(unittest.TestCase):
         self.assertIn("下一章边界（只用于选择需继承资料）", context)
         self.assertIn("女主回家处理融资危机", context)
         self.assertIn('"long_form_memory"', context)
-        self.assertIn('"logic_audit"', context)
-        self.assertIn("物件的存在、撤走、开合、损毁、移动和持有人", context)
-        self.assertIn("不得把人物判断失误", context)
-        self.assertIn("AI推理、提示词、输出要求", context)
-        self.assertIn("必须逐段检查中文正文中是否混入没有必要的非中文普通词汇", context)
-        self.assertIn("intermittently", context)
-        self.assertIn("非中文词汇混入", context)
-        self.assertIn("其他语种的无必要词句或残片", context)
-        self.assertIn("乱码、编码损坏", context)
-        self.assertIn("普通旁白、人物对白和人物内心活动中的自然解释不是AI推理泄漏", context)
-        self.assertIn("明确面向生成过程的元说明", context)
-        self.assertIn("无法确定或需要猜测剧情时不要修", context)
+        self.assertNotIn('"logic_audit"', context)
+        self.assertNotIn("人物判断失误", context)
 
     def test_logic_audit_requires_ordered_literal_evidence_and_supports_local_patch(self):
         final_text = (
@@ -4472,13 +4473,14 @@ class NovelLongFormContextTests(unittest.TestCase):
             validation_errors=["logic_audit.checked必须为true"],
         )
 
-        self.assertIn("【状态增量修复补丁】", context)
-        self.assertIn("每个需要修复的字段直接填写真实、完整、可校验的对象或数组", context)
-        self.assertIn("顶层使用long_form_memory_patch对象，其下使用replace对象", context)
-        self.assertIn("只有清单中的required_object_keys才能进入object_keys", context)
+        self.assertNotIn("【状态增量修复补丁】", context)
+        self.assertNotIn("每个需要修复的字段直接填写真实、完整、可校验的对象或数组", context)
+        self.assertNotIn("顶层使用long_form_memory_patch对象，其下使用replace对象", context)
+        self.assertNotIn("只有清单中的required_object_keys才能进入object_keys", context)
         self.assertNotIn('"logic_audit":{"checked":true,"issues":[]}', context)
         self.assertNotIn("【待修复的原状态字段】", context)
         self.assertNotIn("【机械引用清单】", context)
+        self.assertIn("只修复本章提纲、摘要、关键事实和长篇记忆增量", context)
 
     def test_memory_repair_patch_targets_include_cross_field_dependencies(self):
         targets = _memory_repair_patch_targets([
@@ -9666,8 +9668,21 @@ class NovelLongFormContextTests(unittest.TestCase):
         self.assertEqual(oversized, "甲" * 901)
         self.assertIn("替换范围过大", oversized_errors[0])
 
-        _, too_many_errors = _apply_chapter_prose_repair_patches(body, [{}] * 4)
-        self.assertEqual(too_many_errors, ["正文局部修补最多只能包含3项"])
+        _, too_many_errors = _apply_chapter_prose_repair_patches(body, [{}] * 7)
+        self.assertEqual(too_many_errors, ["正文局部修补最多只能包含6项"])
+
+        six_body = "\n".join(f"这是第{i}条需要修订的原句内容。" for i in range(1, 7))
+        six_patches = [
+            {
+                "before": f"这是第{i}条需要修订的原句内容。",
+                "after": f"这是第i条经过修订的原句内容。".replace("第i条", f"第{i}条"),
+                "reason": "句意不清",
+            }
+            for i in range(1, 7)
+        ]
+        six_repaired, six_errors = _apply_chapter_prose_repair_patches(six_body, six_patches)
+        self.assertEqual(six_errors, [])
+        self.assertEqual(six_repaired.count("经过修订"), 6)
 
         _, structured_errors = _apply_chapter_prose_repair_patches(body, [{
             "before": "她把杯子放回桌上，转身就走。",
@@ -9696,17 +9711,15 @@ class NovelLongFormContextTests(unittest.TestCase):
         self.assertNotIn("风格验收未通过", context)
         self.assertNotIn("贴近【正文风格参考】", context)
 
-    def test_existing_prose_review_carries_language_repair_rules_without_new_schema(self):
+    def test_memory_finalize_context_excludes_prose_review_rules(self):
         chapter = _new_chapter(0)
         context = _build_long_form_memory_finalize_context({"chapters": [chapter]}, 0, "原正文。")
-        self.assertEqual(context.count(_prose_language_review_guidance().strip()), 1)
-        self.assertLess(context.index("【正文语言审读与局部修补】"), context.index("【最终正文】\n"))
-        self.assertIn("搭配不当|句意不清|指代混乱", context)
-        self.assertIn("before逐字复制正文中唯一出现的连续原文", context)
-        self.assertIn("正文修补仅通过repair_patches提供局部替换，不输出整章正文", context)
-        self.assertNotIn("不得重写正文", context)
-        self.assertNotIn("repair_patches通常为空", context)
-        self.assertIn("最多3项", context)
+        self.assertNotIn("【正文语言审读与局部修补】", context)
+        self.assertNotIn("repair_patches", context)
+        self.assertNotIn("logic_audit", context)
+        self.assertNotIn("prose_review", context)
+        self.assertIn("只依据已经完成正文审读的【最终正文】", context)
+        self.assertIn("输出仅包含outline、summary、key_facts、long_form_memory四个资料字段", context)
 
     def test_style_finalize_context_omits_metrics_for_unseen_rejected_candidate(self):
         reference = "\n".join(
@@ -11206,6 +11219,18 @@ class NovelLongFormContextTests(unittest.TestCase):
                 "prose_review.blocking_issues第1项category无效",
                 "prose_review.blocking_issues第1项quote不是正文逐字原文",
             ],
+        )
+
+    def test_patched_blocking_quotes_no_longer_block_the_same_review_transaction(self):
+        review = {
+            "blocking_issues": [
+                {"category": "non_chinese", "quote": "旧句", "reason": "含有异常内容"},
+                {"category": "metadata_leak", "quote": "仍存在", "reason": "出现内部字段泄漏"},
+            ]
+        }
+        self.assertEqual(
+            _prose_review_blocking_issues(review, "新句，仍存在。"),
+            [review["blocking_issues"][1]],
         )
 
     def test_memory_repair_parser_does_not_require_prose_review(self):

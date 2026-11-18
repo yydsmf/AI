@@ -11221,9 +11221,9 @@ def _style_voice_priority_guidance():
         "如果上下文另有作者原生用词池或声纹卡，也与完整样本共同作为证据；没有这些分区时，直接从完整样本提取。"
         "争执、惊讶、委屈、紧张、暧昧、得意、恐惧或失控等情绪明显的场景，优先调用完整样本中"
         "适合当前人物的语气词、习惯短语、称呼、反问、停顿、重复、改口和接话方式；情绪平稳时也不要因此改成脱离样本的普通书面句。"
-        "同一处自然对白或叙述可以同时体现多个匹配的文风特征；但不能把不属于人物、"
-        "语境或样本使用层级的词硬塞，不能为了展示文风新增对白、剧情或重复口头禅。"
-        "通用语言约束与文风样本发生冲突时，只保留会影响事实、人物归属、内部字段泄露或明显重复的修正，其余以文风样本为准。\n"
+        "语气词、习惯短语、称呼、反问、停顿、重复、改口和接话方式，随当前人物的目的、关系和现场情绪自然承接；"
+        "人物声音、剧情事实和关系结果保持一致。"
+        "通用语言约束与文风样本发生冲突时，以当前项目事实、人物归属、语境准确和文风样本共同成立为准。\n"
     )
 
 
@@ -11256,14 +11256,33 @@ def _concrete_prose_expression_guidance(style_active=False, compact=False):
     )
 
 
+def _prose_dialogue_naturalness_guidance():
+    """Keep dialogue responsive and emotionally audible without a fixed speech template."""
+    return (
+        "【对白自然回应】\n"
+        "对白按人物身份、关系和现场情绪呈现为自然口语，先接住对方正在说的内容，再按人物当下的目的、关系和情绪自然回应；"
+        "人物有确认、迟疑、缓和、催促、试探、反问、惊讶或不耐烦等语气时，"
+        "让语气词、接话、停顿、改口、称呼变化和反问参与表达，使态度和回应关系落在台词里。"
+        "句式长短、口语省略和语气强弱随人物、场景和文风变化，由当下说话方式自然决定。\n"
+        "台词面向现场的听话人，用人物当下会说的词序和惯用说法表达；回应承接对方具体的疑问、情绪或态度，"
+        "让说明、解释和表态也带着人物此刻的说话口吻。\n"
+    )
+
+
 def _prose_language_accuracy_guidance():
     """Keep dialogue intelligible without imposing a fixed sentence style."""
     return (
         "【句意与词义搭配】\n"
         "正文使用词义搭配准确、句意清楚的中文表达；对白按人物当下真正想表达的意思，写成符合身份、时代、关系和情绪的自然口语。"
+        + _prose_dialogue_naturalness_guidance()
+        +
         "写完后核对可疑句中的行动者、动作、对象、条件和结果是否符合本意，量词与中心词是否搭配自然；"
         "需要补足时按日常中文补足必要信息，让对方直接听懂。"
         "主语或宾语在语境明确时可以自然省略，短答、停顿和修辞也按语境保留，不为补齐句子而硬扩写。"
+        "动词要和对象的惯用搭配相符，例如训练强度通常说‘提高’或‘加大’；人物作出承诺时，直接写明由谁采取什么做法，"
+        "如‘这笔债我会想办法解决’，不要让承诺者消失成‘债务会解决’；物件作为证据时，写明人物怎样用它证明事情，"
+        "如‘我拿这张照片证明当年的事’。照片只提供画面里实际拍到的内容，不能替人物说清照片没有记录的经历。"
+        "这些例句只说明施事、动作和对象的语义关系，不要求照搬成固定句式。"
         "物品或抽象概念作主语时，结合惯用搭配和上下文判断：表达自然、意思明确的保留；"
         "只有字面搭配与人物本意不符或造成理解别扭时，才按真实行动关系重组整句，写清人物实际要做什么、影响什么或会有什么结果。"
         "人物的反驳、承诺和表态用日常口语讲具体事情。"
@@ -11271,22 +11290,140 @@ def _prose_language_accuracy_guidance():
     )
 
 
+def _prose_abstract_expression_examples_guidance():
+    """Keep the approved source examples and their explanations intact."""
+    return """【抽象表达对照例句】
+将下列例句中的判断方法用于当前正文，具体表达结合当前人物、本意和交流情境组织。例句中的人物和情节属于参考作品；当前项目的人物、事实和修补位置以本次正文与资料为准。
+
+1. 照片替人物说清经历
+来源：《路人甲拒绝加戏》，第155章《照片不用替过去作证》。几个人翻看旧照，仍无法确认贺知微当年是否和她们一起经历了那些事。
+原句：照片没有替她们说清那段路。
+建议表达：看完照片，她们还是不能确定，那些事当年究竟是不是三个人一起经历的。
+说明：“照片能证明某件事”是正常表达；这里的问题在于“替她们说清那段路”把照片、讲述、道路和往事压成一层，没有说清究竟什么未能确认。改写明确人物仍然无法确认的内容，保留不确定性。
+
+2. 体面替学员接住气血
+来源：《离婚后，我回到了无敌势力》，第28章《乔妍亲自守武道场》。乔明川要求维持训练场面，乔妍担心学员在现有条件下冒险突破。
+原句：体面不能替学员接住失控的气血，也不能把停掉的设备重新开起来。
+建议表达：你想保住集团的体面，可学员气血失控了怎么办？那些停掉的设备，也不会因为我们要面子就重新开起来。
+说明：“接住失控的气血”没有准确表达学员受伤的风险；“体面”又被放在实施救助的位置。改为人物对冒险训练和设备停机的直接反驳。
+
+3. 为婚姻承担解释
+来源：《离婚后，我回到了无敌势力》，第34章《他重新拿回远方》。陆沉川留在玄曜宫处理自己的事务，没有回乔家。
+原句：他没有回乔家，也没有再替那段婚姻承担解释。
+建议表达：他没有回乔家，也没再向别人解释他和乔妍之间的事。
+说明：“承担解释”不是这里要表达的惯用动作；可以承担解释的责任，也可以向别人解释。原句将责任和解释行为压在一起，又以婚姻作为被代理的对象。改写恢复人物向别人解释事情的关系，不补写离婚原因。
+
+4. 替闻家承担体面
+来源：《全家都想蹭我的豪门》，第125章《老宅最后一次开口》。陶知意拒绝继续为展示婚姻稳定、家庭和睦而配合闻家的安排。
+原句：我不会继续替闻家承担体面，也不会替闻既白向任何人解释我们的婚姻。
+建议表达：我不会再为了给闻家留面子，勉强自己配合你们，也不会替闻既白向别人解释我们的婚姻。
+说明：这里实际承担的是配合安排、应付追问等事情，“体面”是闻家想保住的外在效果，“承担体面”将两者混成一个动作。改写保留人物拒绝配合的态度和原有拒绝范围。
+
+5. 站在名字旁边代人说话
+来源：《全家都想蹭我的豪门》，第122章《谁让她替闻家说话》。闻既白当众否认程雪宁有权代他与陶知意传话。
+原句：你可以作为朋友来参加活动，但不能站在我们的名字旁边替我们说话。
+建议表达：你可以作为朋友来参加活动。我和知意的事，没有我们的同意，你不能替我们往外传话。
+说明：现场争论的是程雪宁有没有得到当事人同意，不是她站在名字旁边的空间位置。原句没有交代对应的具体做法；改写直接说明她能参加活动，但不能擅自代当事人传话。
+
+6. 用婚姻填房子、工作和人情
+来源：《全家都想蹭我的豪门》，第23章《母亲哭着算亲情》。母亲和亲戚上门索求住处及工作帮助，陶知意拒绝持续让步。
+原句：是你们一次次把房子、工作和人情塞到我面前，非要我拿婚姻替你们填。
+建议表达：你们要房子、要工作，还要我帮亲戚办事。就因为我嫁进了闻家，这些事就都得替你们办吗？
+说明：“塞到面前”和“拿婚姻填”叠在一起，省去了到底要填什么、人物必须如何帮忙。改写说清家人因为她嫁进闻家而不断提出要求，不新增房子或工作已安排成功的结果。
+
+7. 婚姻替人承担后果
+来源：《全家都想蹭我的豪门》，第57章《她让每个人说清楚》。家人把未经同意的生意、许诺和闻家亲属身份绑定，想让夫妻二人承接风险。
+原句：然后等着这段婚姻替他们承担后果。
+建议表达：真出了事，他们就想让陶知意和闻既白替他们收拾残局。
+说明：上文已经写到把生意、授权和说法“塞进婚姻”，这里又让婚姻成为承担后果的主体，实际被指望兜底的人被藏在连续隐喻中。改写明确承担者，仍保持“真出了事”的条件，不写成风险已经发生。
+
+8. 把所有人的情绪收拾干净
+来源：《全家都想蹭我的豪门》，第108章《她把餐具推回去》。闻家要求陶知意向程雪宁赔礼道歉，陶知意质问为何每次都要自己让步。
+原句：那她舒服了，闻家就体面了，只有我负责把所有人的情绪收拾干净。
+建议表达：她倒是满意了，闻家的面子也保住了。可凭什么每次都要我道歉，哄你们高兴？
+说明：“把情绪收拾干净”把安抚他人、被迫道歉写成清理物件，掩盖了现场正在争论的要求。改写恢复人物对反复被要求道歉的不满。
+
+9. 下台阶、站稳、坐稳和踩委屈混在一起
+来源：《全家都想蹭我的豪门》，第108章《她把餐具推回去》。长辈声称要求道歉是在给陶知意台阶，她回绝这一说法。
+原句：闻先生，台阶是给站不稳的人下的。我现在坐得挺稳，不需要踩着程小姐的委屈往下走。
+建议表达：闻先生，我又没做错事，为什么要向程小姐赔礼道歉？
+说明：“给台阶下”本来是免于难堪的惯用说法；这里又将其展开为站不稳、坐得稳、踩委屈，几个不同的动作关系互相牵扯。修改直接反驳要求道歉的前提，保留人物强硬拒绝的态度。
+
+10. 借别人的肩膀替自己走路
+来源：《离婚后，我成了前妻高攀不起的人 第2卷》，第93章《不必借谁的肩膀》。程砚舟提醒苏晚晴面对自己公开承认仍在意陈景川之后的选择。
+原句：那就别借任何人的肩膀，替自己走完后面的路。
+建议表达：这是你自己的选择。往后遇到什么事，你也得自己面对，别指望别人替你承担后果。
+说明：“借肩膀”原本表达依靠，“替自己走路”又让代替者不清楚，组合后像由借来的肩膀替人走路。改写明确谁作出选择、谁面对后果，不新增人物的承诺。
+
+11. 替过去开口
+来源：《路人甲拒绝加戏》，正文原句。人物谈到没有任何人能替一段往事作出解释或定论。
+原句：只是从今天开始，再没有谁能坐在所有人中间，替这段过去开口。
+问题判断：句子把“坐在所有人中间”的位置关系和“替过去开口”的抽象动作直接连在一起，没有说清是谁不能再解释、判断或代表谁发言。
+审读方向：结合上下文写清人物失去的是解释往事、替他人发言或为过去定论的资格；保留原段落实际表达的关系结果。
+
+12. 关系替人解决旧伤
+来源：现有项目正文中的审读漏检句。人物关系发生变化，但过去造成的伤害和未来走向并未因此自动改变。
+原句：关系没有替他们解决旧伤，也没有替他们保证后来会走到哪里。
+问题判断：“关系”被写成替人物解决伤害、保证未来的行动者，抽象主语与人物要承担的具体行动和结果不对应。
+审读方向：按原意写清关系变化并未消除过去的伤害，也不能替人物决定或保证未来；明确人物与结果之间的关系。
+
+13. 分句主语错接
+来源：《离婚后，我成了前妻高攀不起的人 第2卷》，正文原句。说话者回忆对方说愿意继续认识自己时的反应。
+原句：我今天在现场看着你，说愿意继续认识我，还是会想很多。
+问题判断：前半句的“我”被连续带入后面的“说愿意继续认识我”，导致说话人变成“我”；上下文表达的实际说话者是“你”。
+审读方向：调整分句主语和语序，清楚表达“你说愿意继续认识我”以及“我听后仍会多想”的关系，不改变人物态度。
+"""
+
+
 def _prose_language_review_guidance():
-    """Review language in the existing local prose-patch transaction."""
+    """Review complete sentences before extracting derived chapter data."""
     return (
         "【正文语言审读与局部修补】\n"
+        "本次调用一次性审读整章并修补所有明确、可安全定位的问题，尽量在本次完成主要语言修正。"
         "逐句结合上下文检查对白和叙述的词义搭配、主谓与动宾关系、必要成分、指代和句意，"
         "找出搭配不当、成分缺失导致意思不清、指代混乱或修辞组合使意思难以理解的明确问题。"
+        "按完整句子核对谁在说话、谁采取行动、动作作用于谁或什么，以及产生什么结果；"
+        "分句转换时明确各分句的行动者，使字面句意准确表达人物本意。"
+        "对能猜出大意但动作关系错接、抽象词与具体动作硬拼的句子，也按实际关系重新表达整句。"
+        + _prose_dialogue_naturalness_guidance()
+        +
+        "先直接核对字面句意是否表达人物本意，再检查行动者、动作对象、承诺责任、指代和实际结果；"
+        "修补优先处理按字面理解会误认上述关系的句子，以及常用搭配明确不成立的表达；"
+        "原意清楚、人物声音成立的口语保留其表达效果，日常调侃、幽默和含蓄表达保留人物趣味。"
+        "涉及承诺、证据、问题处置或风险争论时，直接表达人物采取的做法、具体限制和实际后果；"
+        "人物承诺时写明由谁处理债务；物件作为证据时，写明它实际呈现的内容、人物怎样使用它，以及它能证明的具体事情。"
         "专项核对生硬拟人、抽象概念与具体动作硬拼，以及量词和中心词的搭配；即使能猜出大意，"
-        "搭配生硬的句子也要按人物实际要表达的具体意思重写。抽象概念替人完成具体动作的句子，"
+        "还要核对动词与对象是否惯用搭配，例如‘提高/加大训练强度’；搭配生硬的句子也要按人物实际要表达的具体意思重写。"
+        "抽象概念替人完成具体动作的句子，"
         "改为人物对实际做法、条件或后果的判断；按原意重新组织整句的主语、动作和对象，使表面句意与说话意图相符。"
-        "正常的口语短答、省略、停顿、含蓄表达和语境清楚的修辞保留原有语气。"
-        "把能够逐字定位的问题及原因记入prose_review.issues；原意能够由上下文确定时，"
-        "在repair_patches中提供符合人物口吻、词义搭配准确、句意完整的局部替换。"
+        "对白即使语法成立，也要结合人物身份、交流场景和相邻接话检查明显的书面说明腔、资料复述感、回应错位和衔接生硬；"
+        "原意与回应关系能够由上下文确定时，用符合人物身份、关系和现场情绪的日常说法作局部替换，"
+        "让台词接住对方正在问、担心或表达的内容。"
+        "prose_review.issues逐项记录可定位原文和具体问题；原意能够由上下文确定的语义、搭配或句意问题，"
+        "在repair_patches中提供逐项对应、符合人物口吻且词义准确的局部替换；"
+        "上述可定位的对白自然度问题也提供对应补丁；问题判断须结合正文、相邻接话和已明确的人物关系，"
+        "说明具体的搭配、句意或接话缺陷；书面程度、句式长短和含蓄程度结合人物身份与交流场景判断，"
+        "修补结合上下文保留人物身份、称谓指向、人物关系、说话目的和情绪态度。"
+        "存在问题的用词、搭配和句式，按准确、惯用、符合交流场景的中文重新表达；"
+        "对白采用贴合人物身份与当下情境的自然口语，让相邻接话衔接顺畅。"
         "以完整问题句为修补单位，必要时连同紧邻接话一起调整；before逐字复制正文中唯一出现的连续原文，"
         "不足8字时带上相邻原文以便唯一定位，after保留定位所带入的正确内容。"
         "修补保留说话人、事实、人物决定、确定程度、承诺强度、否定范围和剧情结果。"
-        "上下文不足以确定原意时只记录具体问题；正确内容保持原样。\n"
+        "证据不足的地方记录具体疑问和缺失的信息；正确内容保持原样。\n"
+        "【正文硬逻辑核对】\n"
+        "按正文先后核对人物生死、清醒、伤势、位置，物件存在、撤走、开合、损毁、移动和持有人，"
+        "以及进出场、时间因果、数字、人物与组织关系、明确知识、权限和事实边界。"
+        "logic_audit记录有前后逐字原文证明的互斥状态，每项附较早和较晚的正文证据及矛盾原因，最多3项critical或major问题。"
+        "硬矛盾交由已有逻辑局部修复处理；语言补丁处理句意、搭配和接话，保留已成立的剧情事实。\n"
+        "【正文输出纯净性】\n"
+        "逐段检查无必要的其他语种残留、未翻译普通词句、乱码、编码损坏、异常替代字符和无意义的字母数字符号混排。"
+        "例如中文叙述中的intermittently表达‘断断续续’时，采用自然中文替换。"
+        "核对项目明确使用的正式专名、型号、代码、原文引用、外语对白和故事内界面文字，保持其实际故事含义。"
+        "核对误入正文的内部人物/设定/伏笔引用、任务和状态字段、JSON/代码、AI推理、提示词、输出要求、校验和工作流程说明；"
+        "把面向生成过程的说明与故事内的消息、文件、界面、旁白和人物交流区分清楚。"
+        "已确认的非中文残留、编码损坏或生成元信息泄漏记入blocking_issues，每项填写category、正文逐字quote和具体reason；"
+        "可安全替换的同时提供repair_patches，未能安全替换的保留具体问题供后续处理。\n"
+        + _prose_abstract_expression_examples_guidance()
     )
 
 
@@ -11297,9 +11434,8 @@ def _grounded_prose_contract(style_active=False):
         if style_active else
         (
             "【自然语气与情绪】\n"
-            "情绪明确时，不要把人物台词全部改成平直的完整陈述句；可以按人物、关系和现场自然使用语气词、"
-            "口语接话、停顿、改口、称呼变化或反问，句式长短随语境变化。语气词、动作、心理、对白内容和现场结果共同完成情绪表达，"
-            "不能用语气词替代人物反应。\n"
+            "对白结合人物身份、关系和现场情绪自然使用语气词（如‘啊、吧、呢、呀’）、口语接话、停顿、改口、称呼变化或反问，"
+            "让人物交流更像当面说话；语气词、动作、心理、对白内容和现场结果共同呈现人物情绪与回应。\n"
         )
     )
     return (
@@ -11318,8 +11454,7 @@ def _grounded_prose_contract(style_active=False):
         + "【对白自然衔接】\n"
         "人物回答时，按当下的关系和语境自然接住对方，让前一句与下一句接得上。"
         "人物可以顺着对方的话解释、补充、反问、改口、调侃、试探、施压、让步或转开话题，这些表达由人物目的、关系和现场情绪决定。"
-        "句式长短、语气词、称呼变化和说话后的动作随人物身份、关系和情绪自然变化；"
-        "没有文风档案时，也要让语气词、停顿和接话方式从人物、关系和现场情绪中自然长出；"
+        "句式长短、称呼变化和说话后的动作随人物身份、关系和情绪自然变化；"
         "已加载文风档案时，应优先沿用档案中适合当前人物和场景的表达，不要主动抹平；"
         "也不要让所有人物采用同一种接话方式；不要为了向读者复述资料而让角色互相解释已经知道的事，因安抚、试探、误解或情绪变化而再次提起时应按人物需要自然表达。\n"
         "心理、动作和对白可以按场景需要交错、穿插，具体比例随人物、情绪和文风自然变化，不要求固定交替顺序。"
@@ -11350,7 +11485,8 @@ def _natural_expression_guidance(style_active=False):
         + (
             _style_voice_priority_guidance()
             if style_active else
-            "情绪明确时，不要把对白全压成平直陈述句；可以按人物和语境使用语气词、口语接话、停顿、改口或称呼变化，句式长短随语境变化。"
+            "对白结合人物身份、关系和现场情绪自然使用贴合人物口吻的语气词（如‘啊、吧、呢、呀’）、口语接话、停顿、改口或称呼变化，"
+            "让对白更像当面交流，句式长短随语境变化。"
             "语气词、动作、身体反应、心理判断和现场后果共同完成情绪表达。"
         )
         + "涉及气血、真气、灵力、内力、经脉、伤势、药剂等状态时，先核对变化，用稳定、恢复、运转、凝聚、消耗、紊乱、受损或不足等匹配表达；"
@@ -11360,7 +11496,29 @@ def _natural_expression_guidance(style_active=False):
     )
 
 
-def _build_full_style_imitation_guidance(style_reference):
+def _without_repeated_prose_guidance(guidance, existing_guidance):
+    """Remove only complete, unchanged program guidance already supplied elsewhere."""
+    contracts = [_grounded_prose_contract(style_active=value) for value in (False, True)]
+    blocks = contracts + [
+        _natural_expression_guidance(style_active=value) for value in (False, True)
+    ]
+    # Whole sections catch duplication even when a later section was clipped.
+    for contract in contracts:
+        blocks.extend(re.split(r"(?m)(?=^【)", contract))
+    blocks.extend([
+        _prose_scene_grounding_guidance(),
+        _prose_scene_grounding_guidance(compact=True),
+        _procedural_plot_guard_guidance(compact=True),
+        _style_voice_priority_guidance(),
+    ])
+    result = str(guidance or "")
+    for block in sorted({part.strip() for part in blocks if part.strip()}, key=len, reverse=True):
+        if block in existing_guidance:
+            result = result.replace(block, "")
+    return result.strip()
+
+
+def _build_full_style_imitation_guidance(style_reference, include_expression_guidance=True):
     """Describe how to imitate a complete sample without turning it into a rule sheet."""
     reference = str(style_reference or "").strip()
     if not reference:
@@ -11380,7 +11538,7 @@ def _build_full_style_imitation_guidance(style_reference):
         "关系与处境自然说话、行动和感受。样本的特色词、口头习惯、接话方式和叙述温度随着人物和场景自然出现，"
         "形成一篇属于当前故事、同时读起来像同一位作者写出的正文。\n"
         "不得把参考原文的人物、剧情、物件或句子带入当前正文。\n"
-        + _natural_expression_guidance(style_active=True)
+        + (_natural_expression_guidance(style_active=True) if include_expression_guidance else "")
     )
 
 
@@ -11423,7 +11581,9 @@ def _build_style_execution_context(
             original = original[:min(marker_positions)].rstrip()
         original = "\n\n".join(part for part in (
             original,
-            "【仿写使用说明】\n" + _build_full_style_imitation_guidance(reference),
+            "【仿写使用说明】\n" + _without_repeated_prose_guidance(
+                _build_full_style_imitation_guidance(reference), original,
+            ),
             "【正文风格参考】\n" + reference,
         ) if part)
     instruction = (
@@ -11434,11 +11594,12 @@ def _build_style_execution_context(
         f"输出必须严格使用{NOVEL_PROSE_START_MARKER}和{NOVEL_PROSE_END_MARKER}包住正文；"
         "正文呈现故事中的人物言行、心理和叙述；模型针对生成任务的计划、分析和执行说明留在正文之外，"
         "包络外不输出任何说明。\n"
-        + _grounded_prose_contract(style_active=bool(reference))
     )
-    budget = max(0, effective_limit - len(instruction) - 2)
+    contract = _grounded_prose_contract(style_active=bool(reference))
+    budget = max(0, effective_limit - len(instruction) - len(contract) - 2)
     if len(original) > budget:
         original = _clip_context_text(original, budget, keep_tail=False, preserve_lines=True)
+    instruction += _without_repeated_prose_guidance(contract, original)
     return "\n\n".join(part for part in (original, instruction) if part)[:effective_limit]
 
 
@@ -19461,8 +19622,6 @@ def _memory_repair_patch_targets(validation_errors):
     for error in validation_errors or []:
         text = str(error or "")
         lowered = text.lower()
-        if "logic_audit" in lowered or "逻辑审查" in text:
-            add(bundle_fields, "logic_audit")
         if "实际提纲" in text:
             add(bundle_fields, "outline")
         if "本章摘要" in text:
@@ -19782,6 +19941,44 @@ def _parse_memory_repair_result(value):
     }
 
 
+def _parse_prose_review_result(value):
+    """Parse the narrow, independent prose-review response contract."""
+    text = str(value or "").strip()
+    fence_match = re.match(r"^```(?:json)?\s*(.*?)\s*```$", text, re.IGNORECASE | re.DOTALL)
+    if fence_match:
+        text = fence_match.group(1).strip()
+    start = text.find("{")
+    if start < 0:
+        return {
+            "parsed": False,
+            "logic_audit": {},
+            "prose_review": {},
+            "repair_patches": [],
+        }
+    try:
+        data, _offset = json.JSONDecoder().raw_decode(text[start:])
+    except Exception:
+        return {
+            "parsed": False,
+            "logic_audit": {},
+            "prose_review": {},
+            "repair_patches": [],
+        }
+    if not isinstance(data, dict):
+        return {
+            "parsed": False,
+            "logic_audit": {},
+            "prose_review": {},
+            "repair_patches": [],
+        }
+    return {
+        "parsed": True,
+        "logic_audit": deepcopy(data.get("logic_audit", {})),
+        "prose_review": deepcopy(data.get("prose_review", {})),
+        "repair_patches": deepcopy(data.get("repair_patches")),
+    }
+
+
 def _prose_review_validation_errors(prose_review, present=True, final_text=""):
     if not present:
         return ["prose_review缺失，必须明确完成终稿审读"]
@@ -19813,11 +20010,22 @@ def _prose_review_validation_errors(prose_review, present=True, final_text=""):
     return errors
 
 
-def _prose_review_blocking_issues(prose_review):
+def _prose_review_blocking_issues(prose_review, final_text=None):
     if not isinstance(prose_review, dict):
         return []
     issues = prose_review.get("blocking_issues", [])
-    return [item for item in issues if isinstance(item, (dict, str))] if isinstance(issues, list) else []
+    if not isinstance(issues, list):
+        return []
+    body = None if final_text is None else str(final_text or "")
+    remaining = []
+    for item in issues:
+        if not isinstance(item, (dict, str)):
+            continue
+        quote = str(item.get("quote", "") or "").strip() if isinstance(item, dict) else ""
+        if body is not None and quote and quote not in body:
+            continue
+        remaining.append(item)
+    return remaining
 
 
 _CHAPTER_LOGIC_AUDIT_CATEGORIES = {
@@ -19900,8 +20108,8 @@ def _apply_chapter_prose_repair_patches(final_text, patches):
     if not patches:
         return body, []
     errors = []
-    if len(patches) > 3:
-        return body, ["正文局部修补最多只能包含3项"]
+    if len(patches) > 6:
+        return body, ["正文局部修补最多只能包含6项"]
     replacements = []
     for index, patch in enumerate(patches, 1):
         if not isinstance(patch, dict):
@@ -20688,7 +20896,6 @@ def _build_long_form_memory_patch_context(
         "outline": outline,
         "summary": summary,
         "key_facts": key_facts,
-        "logic_audit": deepcopy(logic_audit) if isinstance(logic_audit, dict) else {},
     }
     original_bundle = {
         key: deepcopy(bundle_values.get(key, ""))
@@ -20868,21 +21075,15 @@ def _build_long_form_memory_repair_context(
     error_text = "\n".join(f"- {str(item)}" for item in validation_errors or []) or "- 原终稿未返回可验证的版本2记忆增量"
     output_requirements = (
         "【输出要求】\n必须输出一个合法JSON对象，顶层结构为"
-        '{"logic_audit":{"checked":true,"issues":[]},"outline":"6-10条实际提纲",'
+        '{"outline":"6-10条实际提纲",'
         '"summary":"本章摘要","key_facts":["事实"],"long_form_memory":{...}}。'
-        "logic_audit必须独立逐段检查最终正文内部的时间因果、人物生死/清醒/位置、物件存在/移动/开合/持有人、"
-        "进出场、知识权限和代词指向；只报告有前后正文逐字证据的critical或major硬矛盾，最多3项。"
-        "每项结构为severity、category、earlier_quote、later_quote、explanation；没有明确矛盾时issues为空。"
-        "category只能使用chronology、causality、character_state、character_location、object_state、object_ownership、"
-        "spatial_state、pronoun_reference、knowledge_permission、numeric_consistency、entity_relationship或fact_boundary。"
-        "不能把文风、剧情选择、人物判断失误或现实流程不完整当成逻辑矛盾。"
         "每条evidence_quote必须从【最终正文】中原样复制一个连续子串，保留原文全部中文引号、标点和换行；"
         "尤其不得把正文中的“对白”改成不带引号的对白。输出前必须按字面检查该字符串能在最终正文中直接找到；"
         "找不到合格逐字证据时删除对应更新，不得概括、拼接或改写证据。"
         "long_form_memory严格执行以下契约：\n" + contract
     )
     source_sections = [
-        ("任务", "只修复本章逻辑审查、提纲、摘要、关键事实和长篇记忆增量，不得重写正文，不得新增正文没有发生的事件。", 700, False),
+        ("任务", "只修复本章提纲、摘要、关键事实和长篇记忆增量，不得重写正文，不得新增正文没有发生的事件。", 700, False),
         ("原结果问题", error_text, 6000, False),
         (
             "当前章节",
@@ -21008,27 +21209,9 @@ def _build_long_form_memory_finalize_context(project, chapter_index, final_text)
     contract = _long_form_update_contract_instructions(project, chapter_index, compact=True)
     stage_boundary = (chapter_index + 1) % 10 == 0
     task = (
-        "只读取已经完成的【最终正文】，独立生成实际提纲、本章摘要、需继承关键事实和版本2长篇记忆增量；"
-        "正文修补仅通过repair_patches提供局部替换，不输出整章正文；不得把原规划提纲或下一章资料中的未来事件写成已经发生。\n"
-        "状态整理前必须检查正文成品是否误写入内部人物/设定/伏笔短引用、任务或状态字段名、JSON/代码、AI推理、提示词、输出要求、校验说明或工作流程说明；"
-        "只有明确不是故事内界面文字、手机消息、文件内容或自然对白时才算泄漏。发现确定泄漏时才在repair_patches中给出最终正文里唯一出现的最小替换；"
-        "无法确定或需要猜测剧情时不要修，不要仅因项目目录存在某个C/L/F编号就替换。\n"
-        "还必须逐段检查中文正文中是否混入没有必要的非中文普通词汇，尤其是夹在中文叙述里的英文副词、形容词或短语；"
-        "例如 intermittently 这类英文若只是表达‘断断续续’，必须改成自然中文。确认属于误混时，在prose_review中指出，并在repair_patches中用正文唯一出现的最小完整语句作before，"
-        "只做保持原意的中文局部替换，reason填写‘非中文词汇混入’。不得误改项目明确规定的人名、组织名、品牌/作品名、专名、技能名、型号、等级代号、代码标识、"
-        "作者要求保留的原文引用、剧情中确有必要的外语对白，以及故事内真实存在的文件或界面内容；不确定是否为故事事实时不要改。"
-        "检查范围不只包括英文，还包括其他语种的无必要词句或残片、未翻译的外语句子、乱码、编码损坏、异常替代字符、"
-        "不可解释的字母/数字/符号混排和疑似模型输出残片；但不能把非ASCII字符本身、正常中文标点、数学或单位符号、"
-        "真实专名、型号、代码标识或作者明确保留的原文误判为异常。普通旁白、人物对白和人物内心活动中的自然解释不是AI推理泄漏；"
-        "只有出现‘我先分析/根据提示/输出JSON/校验结果/作为模型/下面给出答案’等明确面向生成过程的元说明，或把任务、状态、"
-        "字段、流程和审查过程直接写成正文，才记录为推理/说明字段泄漏。发现明确异常时必须给出可逐字定位的prose_review.issue，"
-        "并且只有能够保持原意的安全局部替换时才给repair_patches；不确定时只记录为已检查，不要猜测性改写。\n"
-        "生成状态资料前，先独立审查最终正文内部是否存在有前后逐字原文直接证明的硬矛盾。"
-        "重点检查同一人物的生死、清醒、伤势和位置，物件的存在、撤走、开合、损毁、移动和持有人，"
-        "人物进出场、时间先后、原因结果、明确知识或权限以及代词唯一指向。"
-        "只有前文已经建立一个确定状态、后文又在没有任何过渡的情况下使用互斥状态，才列为问题；"
-        "不得把人物判断失误、行为不够聪明、现实流程不完整、表达可优化、可能存在但没有证据的风险或单纯文风问题列为矛盾。"
-        "最多列3项critical或major问题，每项必须分别逐字引用较早和较晚的正文证据；没有明确硬矛盾时issues必须为空。\n"
+        "只依据已经完成正文审读的【最终正文】，提取实际提纲、本章摘要、需继承关键事实和版本2长篇记忆增量；"
+        "输出仅包含outline、summary、key_facts、long_form_memory四个资料字段，所有内容都以最终正文已经发生的事实为依据。"
+        "原规划提纲和下一章资料用于理解当前语境与后续承接，事实状态以最终正文为准。\n"
         "长篇记忆优先保存人物行动造成的最终结果，以及后文确实需要知道的状态变化。"
         "输出前逐段检查人物实际出场和带来的新信息，以及伤势、能力、关系、位置、关键物、未决任务、"
         "伏笔和章末持续风险是否真的发生变化；只记录后续章节若不知道就会写错的结果，不记录正文的办理过程。\n"
@@ -21067,34 +21250,11 @@ def _build_long_form_memory_finalize_context(project, chapter_index, final_text)
     )
     output_requirements = (
         "【输出要求】\n严格输出一个合法JSON对象，顶层结构为"
-        '{"outline":"6-10条实际提纲","summary":"本章摘要","key_facts":["事实"],"long_form_memory":{...},'
-        '"logic_audit":{"checked":true,"issues":[{"severity":"critical|major",'
-        '"category":"chronology|causality|character_state|character_location|object_state|object_ownership|spatial_state|pronoun_reference|knowledge_permission|numeric_consistency|entity_relationship|fact_boundary",'
-        '"earlier_quote":"较早的正文逐字原文","later_quote":"较晚的正文逐字原文","explanation":"两种状态为何不能同时成立"}]},'
-        '"prose_review":{"checked":true,"issues":["可逐字定位的语言或读感问题"],"blocking_issues":[{"category":"non_chinese|encoding_corruption|metadata_leak","quote":"异常正文逐字片段","reason":"确认的问题"}]},'
-        '"repair_patches":[{"before":"正文中唯一出现的原句片段","after":"局部替换文本","reason":"搭配不当|句意不清|指代混乱|重复说明|流程赘述|机械短碎|局部语言冲突|正文泄漏|非中文词汇混入"}]}。'
-        "输出顺序必须是outline、summary、key_facts、long_form_memory、logic_audit、prose_review、repair_patches。"
-        "outline、summary、key_facts和long_form_memory是必填的核心结果；即使没有逻辑问题、没有读感修补、"
-        "或本章没有新的长期状态变化，也绝不能只返回logic_audit、prose_review或repair_patches。"
-        "logic_audit没有问题时写checked:true、issues:[]；prose_review没有问题时写checked:true、issues:[]；"
-        "repair_patches没有必要时写[]。核心结果必须先完整写出，再写三个审校字段。"
-        "logic_audit必须同时检查最终正文内部的直接矛盾，以及正文与【实体称谓与关系边界】之间的明确冲突；不评价文风和剧情选择，checked必须为true。"
-        "prose_review还必须检查正文是否误写入内部人物/设定/伏笔短引用、任务或状态字段名、JSON/代码、AI推理、提示词、输出要求、校验说明或工作流程说明；"
-        "只有明确属于生成过程而不是故事内界面文字、手机消息、文件内容或自然对白时才记录为正文泄漏。"
-        "issues用于语言和读感诊断；blocking_issues只用于已经确认的无必要非中文残留、乱码/编码损坏或AI推理/说明字段泄漏，"
-        "每项必须是含category、quote、reason的对象，quote必须是正文逐字片段。确认的问题即使暂时没有安全替换，也必须放入blocking_issues；"
-        "只有正文复查确认全部排除后才能返回blocking_issues:[]。"
-        "prose_review还必须逐段检测中文叙述中无必要混入的英文副词、形容词和短语；例如 intermittently 若只表示‘断断续续’，必须指出并用repair_patches作自然中文的最小替换。"
-        "检查范围还包括其他语种残留、未翻译句子、乱码/编码损坏、异常替代字符和无意义的字母数字符号混排；"
-        "不能把非ASCII字符本身、正常中文标点、单位/数学符号或合法专名误判为异常。仅在资料确立的正式专名/代号/型号、作者要求保留的原文引用、"
-        "确有必要的外语对白或故事内文件/界面内容中保留外文；不能把普通外语词误当专名，也不能误改真实外语内容。"
-        "普通旁白、对白和人物内心活动中的自然判断不是AI推理泄漏；只有明确出现面向生成过程的推理、提示词、JSON/字段、校验、输出或工作流说明，"
-        "或把内部任务/状态资料直接写进正文，才记录为元信息泄漏。"
-        "prose_review同时记录有明确原文位置的重复说明、无结果流程赘述、机械短碎、局部语言冲突或确定的正文泄漏；"
-        "正常留白、剧情选择、文风偏好和现实流程不完整都不是问题。"
-        "只有确实需要修补且before在最终正文中逐字唯一出现时才返回，最多3项；不确定的疑似泄漏不要修。"
-        "每项只能做一处局部替换，不能改剧情事实、人物决定、时间线、关系结果、伏笔或章末结果，"
-        "替换范围限于问题句及必要的相邻接话，正确段落保持原样。"
+        '{"outline":"6-10条实际提纲","summary":"本章摘要","key_facts":["事实"],"long_form_memory":{...}}。'
+        "outline、summary、key_facts和long_form_memory必须全部返回；即使某项没有新增内容，也按既有资料契约返回对应空值或无更新结构。"
+        "每项资料只概括正文已经发生且有正文证据支持的结果。"
+        "严格输出一个合法JSON对象，不输出Markdown、分析、说明或额外文字。"
+        "JSON字符串中出现英文双引号时必须写成\\\"，不能漏掉字符串末尾的英文双引号。"
         "outline、summary和key_facts只能概括最终正文已经发生的内容。summary控制在500字以内；"
         "key_facts通常控制在3-8条，每条只保留一个后文必须继承的合并事实，同一事件的背景、过程、判断和结果不得拆成多条。"
         "确有超过8项彼此独立且都会影响后文时必须保留，不得为了数字上限丢失关键连续性。"
@@ -21115,7 +21275,6 @@ def _build_long_form_memory_finalize_context(project, chapter_index, final_text)
     ) if part)
     source_sections = [
         ("任务", task, 3600, False),
-        ("正文语言检查规则", _prose_language_review_guidance(), 1200, False),
         (
             "当前章节",
             f"第{chapter_index + 1}章《{chapter.get('title', '')}》\n"
@@ -21143,6 +21302,56 @@ def _build_long_form_memory_finalize_context(project, chapter_index, final_text)
             False,
         ),
         ("近期阶段档案", selected_memory["近期阶段档案"], 16000, True),
+    ]
+    return _assemble_bounded_long_form_context(source_sections, output_requirements)
+
+
+def _build_chapter_prose_review_context(project, chapter_index, final_text):
+    project = project if isinstance(project, dict) else {}
+    chapters = project.get("chapters", []) if isinstance(project.get("chapters"), list) else []
+    chapter = (
+        chapters[chapter_index]
+        if 0 <= chapter_index < len(chapters) and isinstance(chapters[chapter_index], dict)
+        else {}
+    )
+    selection = chapter.get("memory_selection", {})
+    selection, _planned_routes = _active_foreshadow_selection(
+        project,
+        chapter_index,
+        selection if isinstance(selection, dict) else {},
+    )
+    selected_memory = _long_form_memory_sections(project, selection)
+    task = (
+        f"对第{chapter_index + 1}章《{chapter.get('title', '')}》进行一次独立的正文审读。"
+        "审读覆盖全章语义、词义搭配、施事与动作对象、对白回应关系、局部逻辑和明确的正文元信息泄漏；"
+        "对原意明确且可安全定位的问题提供局部补丁。只依据正文及下方必要事实资料，不重写整章、不整理摘要或记忆。"
+    )
+    output_requirements = (
+        "【输出要求】\n严格输出一个合法JSON对象，顶层结构为"
+        '{"logic_audit":{"checked":true,"issues":[{"severity":"critical|major",'
+        '"category":"chronology|causality|character_state|character_location|object_state|object_ownership|spatial_state|pronoun_reference|knowledge_permission|numeric_consistency|entity_relationship|fact_boundary",'
+        '"earlier_quote":"较早的正文逐字原文","later_quote":"较晚的正文逐字原文","explanation":"两种状态为何不能同时成立"}]},'
+        '"prose_review":{"checked":true,"issues":["可定位的问题和具体原因"],"blocking_issues":[{"category":"non_chinese|encoding_corruption|metadata_leak","quote":"正文逐字片段","reason":"确认的问题"}]},'
+        '"repair_patches":[{"before":"正文中唯一出现的完整问题句或相邻接话","after":"局部替换文本","reason":"具体修补原因"}]}。'
+        "logic_audit与prose_review必须明确返回checked:true；无问题时issues返回空数组，repair_patches没有必要时返回空数组。"
+        "logic_audit最多报告3项有前后逐字证据的硬矛盾。修补最多6项，每项范围局部且before必须能在正文中逐字唯一定位。"
+        "严格只输出JSON，不输出审读报告、解释或Markdown。"
+    )
+    review_guidance = _prose_language_review_guidance()
+    source_sections = [
+        ("任务", task, 1400, False),
+        ("正文审读规则与真实例句", review_guidance, len(review_guidance), False),
+        (
+            "当前章节规划参考",
+            f"第{chapter_index + 1}章《{chapter.get('title', '')}》\n"
+            f"提纲（仅用于理解当前情境，不作为已发生事实）："
+            f"{_strip_static_foreshadow_outline_fields(chapter.get('outline', ''))}",
+            7000,
+            False,
+        ),
+        ("实体称谓与关系边界", _entity_naming_guidance(project), 4000, False),
+        ("相关连续性资料", selected_memory.get("活跃连续性事实", ""), 12000, False),
+        ("最终正文", final_text, 40000, True),
     ]
     return _assemble_bounded_long_form_context(source_sections, output_requirements)
 
@@ -24443,7 +24652,9 @@ def _build_chapter_ai_context(project, chapter_index, action):
         common_sections.insert(3, ("本章写作长度", chapter_length_section, 500, False))
         if style_reference:
             style_sections.extend([
-                ("仿写使用说明", _build_full_style_imitation_guidance(style_reference), 1200, False),
+                ("仿写使用说明", _build_full_style_imitation_guidance(
+                    style_reference, include_expression_guidance=False,
+                ), 1200, False),
                 ("正文风格参考", style_reference, len(style_reference) + 64, False),
             ])
         # Keep this after the raw sample so direct drafting receives it even
@@ -24533,9 +24744,8 @@ def _build_chapter_ai_context(project, chapter_index, action):
     out = []
     used = 0
     seen_context_lines = set()
-    # This short trailing guide intentionally repeats the corresponding part
-    # of the imitation note so it remains visible after the raw sample.
     raw_context_titles = {"当前章节", "正文风格参考", "正文自然表达边界"}
+    emitted_prose_task = ""
     style_titles = {title for title, _content, _limit, _keep_tail in style_sections}
     style_reserve = sum(
         min(len(content), limit) + len(title) + 8
@@ -24548,6 +24758,8 @@ def _build_chapter_ai_context(project, chapter_index, action):
             if is_style_section:
                 break
             continue
+        if title == "正文自然表达边界":
+            content = _without_repeated_prose_guidance(content, emitted_prose_task)
         section_content = content if title in raw_context_titles else _dedupe_text_lines(content)
         if action in story_layer_actions:
             section_content, _reference_replacements = _sanitize_prose_internal_references(
@@ -24576,6 +24788,8 @@ def _build_chapter_ai_context(project, chapter_index, action):
             keep_tail=keep_tail,
             preserve_lines=preserve_lines,
         ) or "暂无"
+        if title == "本次任务" and action == "draft":
+            emitted_prose_task = clipped
         block = f"【{title}】\n{clipped}"
         out.append(block)
         used += len(block) + 2

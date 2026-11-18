@@ -470,6 +470,17 @@ CREATION_STAGE_RESULT_OWNERSHIP_GUIDANCE = """
 【阶段结果归属】每个阶段方向的 result 只归该阶段完成，是该阶段唯一允许实际达成的出口；后续阶段方向中的 result 是尚未发生的未来结果，当前阶段不得把它完成或写成既成事实。当前阶段事件的 result、exit_state.known_facts 和 carry_over 都必须服从当前阶段方向的 result：事件可以推进后续结果所需的前置条件或压力，但不得越过本阶段出口；exit_state.known_facts 只记录本阶段实际完成的事实，carry_over 只交接本阶段出口之后仍未解决的入口压力。前阶段已经完成的结果只作为当前入口事实和后续影响，不重复完成。阶段出口说明该阶段最终状态，不是 summary 之外的另一组事件。
 """.strip()
 
+CREATION_STAGE_EXECUTION_BOUNDARY_GUIDANCE = """
+【当前阶段执行边界】当前阶段是本批次唯一允许实际发生和完成的阶段。其它阶段的 summary、result、next_pressure 和节点内容，只用于理解全书顺序与远期压力，不属于当前阶段的待执行事件。
+当前阶段不得让其它阶段的主要场景、阶段性关键人物、事件核心、人物冲突、高潮、决战、身份揭示、势力拆解、关系定性或阶段结果提前发生、提前兑现或形成既成事实。
+其它阶段只能作为尚未发生的压力来源、行动动机或未来方向出现。当前阶段只能围绕本阶段方向、前阶段已经成立的事实和本阶段 result 生成具体行动、选择、冲突与结果。
+""".strip()
+
+CREATION_STAGE_SCENE_ANCHOR_GUIDANCE = """
+【阶段主要场景锚点】main_scene_anchors 只列承载本阶段唯一大事件的主要场景，数量按故事需要决定，通常一至三项，不设固定数量，也不要求每个关键节点各对应一个场景。每项都要是本书中能够再次明确指认的具体场所或稳定场域，可以是具体建筑、街区、组织专属空间、特殊区域或题材对应的固定场域，并体现该地点自身的识别特征；例如“苏家大宅”“江城地下黑市”“龙国京城”“青云宗”这类名称能够明确指向故事中的具体空间，示例只用于说明场景的具体程度，实际名称按题材和故事内容生成。场景类别、活动范围、敌人顺序或剧情用途不能直接代替场景名称。每项写清场景名称及其在本阶段大事件中的承载作用，role 只说明大事件如何在该场景中发生，不代替具体场景；它是阶段主场景范围，不是逐章地点清单。
+跨阶段主要场景锚点必须更换。前阶段的主要场景不再作为后阶段的主要推进场景；旧地点可以作为背景或过渡，但不能继续承担后阶段的大事件核心。scene_change 只写面向用户的简短差异说明，不再另列一套场景清单。
+""".strip()
+
 
 def _creation_entity_naming_guidance(context):
     """Shared creation rules already contain the generic naming contract."""
@@ -1088,6 +1099,11 @@ def _creation_wizard_step_summary(payload):
     except (TypeError, ValueError):
         step_index = 0
     step, title = CREATION_WIZARD_STEPS[step_index]
+    generation_status = payload.get("generation_status", {})
+    if isinstance(generation_status, dict) and _as_text(
+        generation_status.get("message")
+    ):
+        return f"{title} · 生成失败"
     results = payload.get("step_results", {})
     result = results.get(step, {}) if isinstance(results, dict) else {}
     state = result.get("_generation_state", {}) if isinstance(result, dict) else {}
@@ -1152,6 +1168,10 @@ def _creation_wizard_summary(payload):
     except (TypeError, ValueError):
         created_at_ns = 0
     completion_status = _as_text(payload.get("completion_status")).lower()
+    generation_status = payload.get("generation_status", {})
+    has_generation_error = isinstance(generation_status, dict) and bool(
+        _as_text(generation_status.get("message"))
+    )
     is_completed = completion_status in {"completed", "complete", "已完成"} or bool(
         _as_text(payload.get("completed_at"))
     )
@@ -1164,7 +1184,13 @@ def _creation_wizard_summary(payload):
         "step": _creation_wizard_step_summary(payload),
         "current_step_index": step_index,
         "completion_status": "completed" if is_completed else "in_progress",
-        "status_label": "已完成" if is_completed else "进行中",
+        "status_label": (
+            "已完成"
+            if is_completed
+            else "生成失败"
+            if has_generation_error
+            else "进行中"
+        ),
         "completed_at": _as_text(payload.get("completed_at")),
         "imported_project_path": _as_text(payload.get("imported_project_path")),
     }
@@ -1261,6 +1287,7 @@ def create_creation_wizard_draft(project_name_hint=""):
         "premise_candidates": [],
         "premise_selected_index": 0,
         "step_results": {},
+        "generation_status": {},
     }
     save_creation_wizard_draft(payload)
     return draft_id
@@ -2891,6 +2918,7 @@ _STAGE_DIRECTION_ALIASES = {
     "w": "word_range",
     "s": "summary",
     "l": "scene_change",
+    "a": "main_scene_anchors",
     "c": "character_change",
     "x": "result",
     "q": "next_pressure",
@@ -2927,7 +2955,7 @@ def _expand_stage_direction_transport(value):
             (
                 "id", "name", "word_range", "summary", "scene_change",
                 "character_change", "result", "next_pressure", "key_beats",
-                "climax_beat_indices",
+                "climax_beat_indices", "main_scene_anchors",
             ),
         )
     return {}
@@ -2947,6 +2975,12 @@ def _normalize_stage_direction(value, total_words=500000):
         if not isinstance(item, (dict, list, tuple)) or index >= len(specs):
             continue
         item = _expand_stage_direction_transport(item)
+        if "main_scene_anchors" not in item:
+            item["main_scene_anchors"] = _first_value(
+                item,
+                ("main_scenes", "scene_anchors", "主要场景锚点"),
+                [],
+            )
         spec = specs[index]
         word_range = item.get("word_range", item.get("range", []))
         if isinstance(word_range, dict):
@@ -2971,6 +3005,9 @@ def _normalize_stage_direction(value, total_words=500000):
             "end_word": end_word,
             "summary": _as_text(item.get("summary")),
             "scene_change": _as_text(item.get("scene_change")),
+            "main_scene_anchors": _normalize_stage_scene_anchors(
+                item.get("main_scene_anchors", [])
+            ),
             "character_change": _as_text(item.get("character_change")),
             "result": _as_text(item.get("result")),
             "next_pressure": _as_text(item.get("next_pressure")),
@@ -2980,6 +3017,59 @@ def _normalize_stage_direction(value, total_words=500000):
             ),
         })
     return rows
+
+
+def _normalize_stage_scene_anchors(value):
+    """Normalize stage-level scene anchors without imposing a fixed count."""
+    if isinstance(value, dict):
+        value = _first_value(
+            value,
+            ("main_scene_anchors", "main_scenes", "scene_anchors", "anchors"),
+            [value],
+        )
+    if isinstance(value, str):
+        value = value.splitlines()
+    if not isinstance(value, (list, tuple)):
+        return []
+
+    anchors = []
+    seen = set()
+    for item in value:
+        if isinstance(item, dict):
+            name = _as_text(
+                _first_value(
+                    item,
+                    ("name", "scene", "location", "n", "主要场景", "场景"),
+                    "",
+                )
+            )
+            role = _as_text(
+                _first_value(
+                    item,
+                    ("role", "stage_role", "function", "r", "作用", "承载作用"),
+                    "",
+                )
+            )
+        else:
+            name = _as_text(item)
+            role = ""
+        if not name:
+            continue
+        key = name.casefold()
+        if key in seen:
+            continue
+        seen.add(key)
+        anchor = {"name": name}
+        if role:
+            anchor["role"] = role
+        anchors.append(anchor)
+    return anchors
+
+
+def _stage_scene_anchor_key(value):
+    """Build a conservative exact-match key for structural scene validation."""
+    text = _as_text(value).casefold()
+    return re.sub(r"[\s·•．.\-—_、，,。；;:：/（）()【】\[\]「」『』]+", "", text)
 
 
 def _normalize_stage_key_beats(value):
@@ -3713,6 +3803,17 @@ def _format_stage_directions_section_body(result):
             value = _as_text(item.get(key))
             if value:
                 lines.append(f"  {label}：{value}")
+        scene_anchors = _normalize_stage_scene_anchors(
+            item.get("main_scene_anchors", [])
+        )
+        if scene_anchors:
+            lines.append("  主要场景锚点：")
+            for anchor in scene_anchors:
+                name = _as_text(anchor.get("name"))
+                role = _as_text(anchor.get("role"))
+                lines.append(
+                    f"    - {name}" + (f"：{role}" if role else "")
+                )
         key_beats = _normalize_stage_key_beats(item.get("key_beats", []))
         if key_beats:
             lines.append("  关键推进节点：")
@@ -4663,6 +4764,8 @@ _CONTEXT_LABELS = {
     "stage_directions": "全书阶段方向",
     "stage_direction": "本阶段方向",
     "scene_change": "场景变化",
+    "main_scene_anchors": "主要场景锚点",
+    "previous_main_scene_anchors": "前面阶段已使用的主要场景锚点",
     "character_change": "人物变化",
     "next_pressure": "下一阶段压力",
     "stages": "全书分段故事",
@@ -4806,6 +4909,9 @@ def format_creation_context(context, premise_minimal=False):
             "当前批次沿当前阶段目标落地，不提前兑现后续阶段或全书结局。"
             "尚未生成的后续阶段属于尚未发生的规划内容，当前批次只为它形成前置压力、入口条件或行动动机，"
             "不提前写出后续阶段的具体事件、结果、兑现或终局闭环。"
+            "current_stage.stage_direction.main_scene_anchors是本阶段主要场景范围，锚点应理解为本书中能够再次明确指认的具体场所或稳定场域；"
+            "场景类别、活动范围、敌人顺序或剧情用途不能代替具体场景名称；"
+            "confirmed.previous_main_scene_anchors只用于避免跨阶段复用，不得继续作为本阶段主要推进场景。"
             "current_stage.stage_direction.result 是本阶段最后必须成立的阶段出口，next_pressure 只表示下一阶段从哪里继续，不能在本阶段提前完成。"
             "第一步选定的 core_motive 与第二步确认的 relationship_foundation、阶段方向共同描述全书冲突底盘；当前阶段把底盘推进到新的选择、关系、公开后果、资源代价或对手行动，"
             "每次事件根据当前题材自然选择推进方式。"
@@ -6004,18 +6110,20 @@ class NovelCreationWorker(NovelAnalysisWorker):
 
 {author_boundaries}
 
-本书共{total_words}字，严格按每十万字划分为{len(specs)}个阶段，范围为：{ranges}。第一步只提供故事简介和作者已选参数，不预设本部的核心动机、人物关系路线或结尾方案；本次由你根据简介、题材和前后因果重新建立一条唯一核心动机，生成各阶段的大事件与阶段出口。简介中的人物、处境、地点和已发生事实要吸收，但不要把简介扩写成固定的全书事件清单。第一步未设定拆分时物件保持完整，沿用已确定的用途；主线期限从同一起点累计，不另设或重置阶段倒计时；人物、物件及群体规模的增减，须由节点中的具体行动和结果承接。
+本书共{total_words}字，严格按每十万字划分为{len(specs)}个阶段，范围为：{ranges}。第一步已确认的 core_motive 是本书唯一核心动机和主线契约，必须沿用其目标、主要对手、失败代价和最终方向；第二步只能把它拆分为不同阶段的阻碍、行动、选择和结果，不得另起核心目标、改写最终方向或重新定义主线。第一步的简介、人物、处境、地点和已发生事实都要吸收，但不要把简介扩写成固定的全书事件清单。第一步未设定拆分时物件保持完整，沿用已确定的用途；主线期限从同一起点累计，不另设或重置阶段倒计时；人物、物件及群体规模的增减，须由节点中的具体行动和结果承接。
+
 
 先从本部结果倒推全书阶段，再按因果顺序展开。每阶段只设一个独特的大事件、一个首要目标和一条核心人物冲突；关键推进节点最多10项，只列促成事件结果不可省略的转折，数量依故事需要决定，不以达到上限为目标。同一连续行动链中的步骤合并为一个节点；相邻节点须带来新的处境或目标变化。节点推进至本阶段核心目标和核心矛盾的结果成立为止；对末阶段，key_beats必须在本部核心目标实际兑现处结束，不能在高潮兑现后继续追加收尾事件。每个节点让人物的行动、选择或关系改变主角推进目标的处境。前一阶段result已经成立后，后续阶段不得再次以达成同一结果作为大事件；若该结果仍影响主线，就从它造成的新处境发展新的未决冲突。场景、人物和利益关系的阶段差异按上方核心约束与压力递进同时落实，不规定统一顺序或事件类型。
 
-字段按同一条故事链填写：summary 用1至2句话写本阶段待解的大事件；scene_change 和 character_change 分别说明相较前阶段更换的主要场景与阶段性关键人物。事件核心与人物冲突的实质更换须直接体现在summary和key_beats中；scene_change、character_change只说明场景和阶段性关键人物差异，不能替代事件核心与人物冲突的更换。key_beats 按事实发生顺序细化大事件的必要转折，并在核心目标兑现处收束；高潮之后的战后处置、关系落点、交接、返家或其它收尾行为不得再写入key_beats。上述字段共同落实公共核心约束中的阶段差异，不互相复述；result只概括本阶段最后一个关键推进节点后已经成立的阶段出口状态，末阶段以最后高潮节点兑现后的状态为准，不写一串后续事件、不把收尾过程改写成节点；next_pressure只承接该出口仍有效的压力，或由本阶段结果新造成的压力。填写result时须区分压力已解除、暂时受阻但仍有效、仍未解决；节点或前阶段已经明确解除、截断的同一威胁，不得没有新的行动及因果说明便重新列为未解决，若对手重新发动须写明新的行动及其因果。已完成的人物关系选择只承接其新后果，不再次把同一选择或决裂作为推进点。连续高潮节点以前序节点已经成立的结果为后续起点，不重复处理、达成或宣布既成结果。后续阶段以紧邻前一阶段result为状态起点，已成立的胜负、生死、关系、势力归属、物件数量与去向不得重置或改写；任何新增变化都须由节点中的具体行动和结果承接，阶段出口不得提前于节点或与节点矛盾。
+{CREATION_STAGE_EXECUTION_BOUNDARY_GUIDANCE}
+字段按同一条故事链填写：summary 用1至2句话写本阶段待解的大事件；main_scene_anchors 按故事需要列出通常一至三项、真正承载本阶段大事件的主要场景，每项都写本书中能够再次明确指认的具体场所或稳定场域，以及它在本阶段的承载作用；场景类别、活动范围、敌人顺序或剧情用途不能直接代替场景名称，role 只说明大事件如何在该场景中发生；锚点不是逐章地点清单；scene_change 只写面向用户的简短场景差异说明，不再另列一套场景清单；character_change 说明相较前阶段更换的阶段性关键人物。跨阶段主要场景锚点必须更换，前阶段主要场景不能继续作为后阶段主要推进场景，旧地点只能作为背景或过渡。事件核心与人物冲突的实质更换须直接体现在summary和key_beats中；scene_change、main_scene_anchors、character_change各司其职，不能替代事件核心与人物冲突的更换。key_beats 按事实发生顺序细化大事件的必要转折，并在核心目标兑现处收束；高潮之后的战后处置、关系落点、交接、返家或其它收尾行为不得再写入key_beats。上述字段共同落实公共核心约束中的阶段差异，不互相复述；result只概括本阶段最后一个关键推进节点后已经成立的阶段出口状态，末阶段以最后高潮节点兑现后的状态为准，不写一串后续事件、不把收尾过程改写成节点；next_pressure只承接该出口仍有效的压力，或由本阶段结果新造成的压力。填写result时须区分压力已解除、暂时受阻但仍有效、仍未解决；节点或前阶段已经明确解除、截断的同一威胁，不得没有新的行动及因果说明便重新列为未解决，若对手重新发动须写明新的行动及其因果。已完成的人物关系选择只承接其新后果，不再次把同一选择或决裂作为推进点。连续高潮节点以前序节点已经成立的结果为后续起点，不重复处理、达成或宣布既成结果。后续阶段以紧邻前一阶段result为状态起点，已成立的胜负、生死、关系、势力归属、物件数量与去向不得重置或改写；任何新增变化都须由节点中的具体行动和结果承接，阶段出口不得提前于节点或与节点矛盾。
 
 末阶段承载尚未解决的本部核心对抗，进入时胜负未定；非末阶段不得写终局对抗已经开打或进入决定性交锋，前一阶段须在核心交锋尚未发生时结束。规划末阶段时先确定最终由什么行动或选择兑现本部核心目标，再从其前选取1至2个不可省略的升级或交锋转折作为高潮前段；climax_beat_indices 标记这段连续2或3个节点，且高潮前至少保留1个铺垫/升级节点；若末阶段恰有3个节点，只标记第2、3项。索引从1开始计数，例如6个节点且高潮占末尾3项时为[4,5,6]，5个节点且占末尾2项时为[4,5]；节点数量仍按故事需要决定。最后一个高潮节点必须是 key_beats 最后一项，并直接写出本部核心目标及核心矛盾如何兑现；一次交锋或对手落败若尚未完成核心目标，不是高潮终点，随后仍在解决主线的行动或选择仍属于高潮推进，必须留在连续高潮节点中。核心目标兑现后，只有不再改变核心矛盾结果的必要直接后果、关系落点、交接或返家可以写入 result，且只作为已成立的出口状态简要概括，不得扩写成一串高潮后事件、增加额外 key_beats 或用收尾过程凑篇幅。全书本部唯一核心目标须由末阶段高潮兑现；若前阶段已解决，须重排前阶段节点，不得另添结尾方向未设定的新主线或终局对抗。阶段方向不写具体章节号，高潮具体章位由第三步落实。
 
-只返回一个合法 JSON 对象，不要 Markdown 或解释：{{"stage_directions":[{{"id":"R01","name":"阶段名","word_range":[0,100000],"summary":"本阶段唯一大事件的待解冲突与核心卖点，1至2句话","scene_change":"阶段1可留空；从阶段2起写本阶段相较前阶段更换的主要场景","character_change":"阶段1可留空；从阶段2起写本阶段相较前阶段更换的阶段性关键人物；主角可持续出现","key_beats":["按因果顺序推进大事件的必要转折，末阶段只列到本部核心目标及核心矛盾实际兑现为止；高潮后的收尾事件不再新增节点"],"climax_beat_indices":[],"result":"本阶段最后一个关键推进节点后已成立的阶段出口状态；末阶段以最后高潮节点兑现后的状态为准，只写已成立状态，不写后续收尾事件序列","next_pressure":"由本阶段结果自然带出的下一阶段入口处境；最后阶段可留空"}}]}}。普通阶段至少1个节点，末阶段至少3个节点，字段名必须保持不变，阶段顺序和字数范围必须与要求一致。"""
+只返回一个合法 JSON 对象，不要 Markdown 或解释：{{"stage_directions":[{{"id":"R01","name":"阶段名","word_range":[0,100000],"summary":"本阶段唯一大事件的待解冲突与核心卖点，1至2句话","main_scene_anchors":[{{"name":"本书中能够再次明确指认的具体场所或稳定场域","role":"该场景在本阶段大事件中的承载作用"}}],"scene_change":"阶段1可留空；从阶段2起写本阶段相较前阶段更换主要场景的简短说明","character_change":"阶段1可留空；从阶段2起写本阶段相较前阶段更换的阶段性关键人物；主角可持续出现","key_beats":["按因果顺序推进大事件的必要转折，末阶段只列到本部核心目标及核心矛盾实际兑现为止；高潮后的收尾事件不再新增节点"],"climax_beat_indices":[],"result":"本阶段最后一个关键推进节点后已成立的阶段出口状态；末阶段以最后高潮节点兑现后的状态为准，只写已成立状态，不写后续收尾事件序列","next_pressure":"由本阶段结果自然带出的下一阶段入口处境；最后阶段可留空"}}]}}。main_scene_anchors 按故事需要填写，通常一至三项，不设固定数量；每项都要是本书中能够再次明确指认的具体场所或稳定场域，场景类别、活动范围、敌人顺序或剧情用途不能直接代替场景名称；每项写清其在本阶段大事件中的承载作用，不写逐章地点清单。普通阶段至少1个节点，末阶段至少3个节点，字段名必须保持不变，阶段顺序和字数范围必须与要求一致。"""
         elif self.creation_batch == "bible_core":
             prompt = f"""{COMMON_CREATION_RULES}
-只根据第一步的故事简介、作者已选参数和用户确认的阶段方向，生成小说圣经和世界规则。第一步只提供方向性故事资料，不再提供需要照抄的主线契约、关系路线或结尾方案；本步负责重新确定一条唯一核心动机、人物关系底子、长期事实和阶段承接方式。阶段方向是全书大跨度推进的上游路线：圣经要为每个阶段提供人物动机、关系变化、场景落点和世界事实，但不能把阶段方向改写成另一条主线，也不能把所有阶段压缩成同一地点、同一类人物或同一类资源问题。小说圣经写整本书的核心矛盾、人物关系底子、贯穿全书并会随着人物选择不断变深的问题、主题和长期事实，让后面的阶段和场景都有清楚的根；本部闭环由本步确认的核心动机、阶段方向和第三步阶段规划逐步细化，圣经不要再另写一份并行结尾方案。主线矛盾字段必须完整承载核心动机契约：主角为什么非行动不可、要完成什么可验收的具体目标、期限或机会窗口是什么、失败会失去什么、阻碍来自谁或什么，以及开局与终局之间的主要反差；不能只写“赚钱、变强、复仇”这类抽象方向。主题字段只提炼这条故事要讨论的人性命题、价值冲突或情感认识，不重复具体任务、金额、期限、资源缺口、对手或执行步骤；不能用主题代替主线矛盾，也不能让主题变成另一条主线。还要写出解决当前目标后会自然打开的下一道具体阻碍或更高代价，保证后续阶段是在推进同一条主线，而不是不断换题。世界规则写世界长期怎样运转、日常生活、地点和社会关系、异常或能力的来源、触发条件、作用边界和代价；普通都市、灵异、悬疑、情感和现实题材，把规则落在空间、社会、异常与人物处境上；明确有修炼或境界的题材，再写力量来源和总边界，详细层次留给下一批的设定记录。
+只根据第一步已确认的故事简介、core_motive、作者已选参数和用户确认的阶段方向，生成小说圣经和世界规则。第一步已确认的 core_motive 是本书不可重写的唯一核心动机和主线契约；本批次只能把它落实为核心矛盾、人物关系底子、长期事实和阶段承接方式，不得重新确定、改写、替换或另起一条核心动机、主线目标或结尾方向。阶段方向是全书大跨度推进的上游路线：圣经要为每个阶段提供人物动机、关系变化、场景落点和世界事实，但不能把阶段方向改写成另一条主线，也不能把所有阶段压缩成同一地点、同一类人物或同一类资源问题。小说圣经写整本书的核心矛盾、人物关系底子、贯穿全书并会随着人物选择不断变深的问题、主题和长期事实，让后面的阶段和场景都有清楚的根；本部闭环由第一步 core_motive、用户确认的阶段方向和第三步阶段规划逐步细化，圣经不要再另写一份并行结尾方案。主线矛盾字段必须完整承载核心动机契约：主角为什么非行动不可、要完成什么可验收的具体目标、期限或机会窗口是什么、失败会失去什么、阻碍来自谁或什么，以及开局与终局之间的主要反差；不能只写“赚钱、变强、复仇”这类抽象方向。主题字段只提炼这条故事要讨论的人性命题、价值冲突或情感认识，不重复具体任务、金额、期限、资源缺口、对手或执行步骤；不能用主题代替主线矛盾，也不能让主题变成另一条主线。还要写出解决当前目标后会自然打开的下一道具体阻碍或更高代价，保证后续阶段是在推进同一条主线，而不是不断换题。世界规则写世界长期怎样运转、日常生活、地点和社会关系、异常或能力的来源、触发条件、作用边界和代价；普通都市、灵异、悬疑、情感和现实题材，把规则落在空间、社会、异常与人物处境上；明确有修炼或境界的题材，再写力量来源和总边界，详细层次留给下一批的设定记录。
 
 世界规则的五个位置都要形成可执行的事实：世界概况交代长期环境，力量或能力体系交代来源与总边界，长期规则数组写会反复成立的运行方式，代价限制数组写人物触碰这些规则后会承担的现实后果，地理与生活写人物平常真正会走进的地方和生活压力。每条规则都能影响人物选择，数组写实际内容，不用空泛的分类名。
 
@@ -6183,10 +6291,10 @@ c 中每项只能使用 n、r、g、s、p、v、q；l 中每项只能使用 n、
             )
             stage_fact_boundary_guidance = (
                 CREATION_STAGE_RESULT_OWNERSHIP_GUIDANCE + " " +
+                CREATION_STAGE_EXECUTION_BOUNDARY_GUIDANCE + " " +
+                CREATION_STAGE_SCENE_ANCHOR_GUIDANCE + " " +
                 "已经生成的前面阶段是已经发生并确认的事实和结果，当前阶段只能承接这些结果带来的后果、变化、新选择和新冲突，"
                 "不重新完成前面已经兑现的事件、人物目标、关系结果或主线闭环。"
-                "尚未生成的后续阶段属于尚未发生的规划内容，当前阶段只能为它形成前置压力、入口条件或行动动机，"
-                "只生成当前阶段的事件和结果，不提前写出后续阶段的具体事件、结果、兑现或终局闭环。"
             )
             prompt = f"""{COMMON_CREATION_RULES}
 
@@ -6843,6 +6951,7 @@ class NovelCreationWizardDialog(QDialog):
         self._received_chars = 0
         self._status_step_index = -1
         self._last_worker_error = ""
+        self._generation_error_step = ""
         self._draft_restoring = True
         self.target_words_spin = QSpinBox()
         self.target_words_spin.setRange(10000, 3000000)
@@ -6915,6 +7024,22 @@ class NovelCreationWizardDialog(QDialog):
         self.average_words_spin.valueChanged.connect(self._on_generation_scope_changed)
 
     def _draft_payload(self):
+        generation_status = {}
+        error_step = _as_text(getattr(self, "_generation_error_step", ""))
+        error_message = _as_text(getattr(self, "_last_worker_error", ""))
+        if error_step and error_message:
+            # A queued retry is a live-window detail. If the app is reopened,
+            # it cannot resume that timer, so persist an actionable failure
+            # message instead of claiming that another retry is still queued.
+            persisted_message = error_message
+            if "秒后自动重试" in persisted_message:
+                persisted_message = persisted_message.split("；", 1)[0]
+                persisted_message += "；本次返回未保存，重新打开后请点击 AI 生成重试。"
+            generation_status = {
+                "kind": "error",
+                "step": error_step,
+                "message": persisted_message,
+            }
         payload = {
             "schema_version": 3,
             "draft_id": self.draft_id,
@@ -6933,6 +7058,7 @@ class NovelCreationWizardDialog(QDialog):
             "completed_at": self.completed_at,
             "imported_project_path": self.imported_project_path,
             "completed_result_payload": deepcopy(self.completed_result_payload),
+            "generation_status": generation_status,
             "updated_at": now_str(),
         }
         return _clean_creation_wizard_premise_payload(payload)
@@ -6956,6 +7082,10 @@ class NovelCreationWizardDialog(QDialog):
             start_index = step_names.index(step)
         except ValueError:
             return
+        error_step = _as_text(getattr(self, "_generation_error_step", ""))
+        if error_step in step_names and step_names.index(error_step) >= start_index:
+            self._last_worker_error = ""
+            self._generation_error_step = ""
         if step == "stage_plan":
             bible_result = self.step_results.get("bible")
             if isinstance(bible_result, dict):
@@ -7033,6 +7163,14 @@ class NovelCreationWizardDialog(QDialog):
             deepcopy(saved_completed_payload)
             if isinstance(saved_completed_payload, dict) else {}
         )
+        saved_generation_status = draft.get("generation_status", {})
+        if isinstance(saved_generation_status, dict):
+            saved_error = _as_text(saved_generation_status.get("message"))
+            saved_step = _as_text(saved_generation_status.get("step"))
+            valid_steps = {name for name, _title in CREATION_WIZARD_STEPS}
+            if saved_error and saved_step in valid_steps:
+                self._last_worker_error = saved_error
+                self._generation_error_step = saved_step
         self._draft_restoring = True
         try:
             saved_choices = draft.get("choice_values", {})
@@ -8124,6 +8262,9 @@ class NovelCreationWizardDialog(QDialog):
         if route_button is not None:
             route_button.setVisible(route_pending)
             route_button.setEnabled(route_pending and self.worker is None)
+        if self._generation_error_is_visible(step):
+            self._set_status_text(self._last_worker_error)
+            return
         if self.current_step_index == 0:
             self._set_status_text("先输入一点灵感，再选择题材和阅读感觉。")
         elif step in self.step_results:
@@ -8292,7 +8433,27 @@ class NovelCreationWizardDialog(QDialog):
         self.status_label.setText(display_text)
         self.status_label.setToolTip(display_text)
 
+    def _generation_error_is_visible(self, step=None):
+        """Keep the current batch's failure reason above generic UI refresh text."""
+        if step is None:
+            step = CREATION_WIZARD_STEPS[self.current_step_index][0]
+        error_step = _as_text(getattr(self, "_generation_error_step", ""))
+        error_message = _as_text(getattr(self, "_last_worker_error", ""))
+        if error_step != step or not error_message:
+            return False
+        # During a queued retry the worker can still emit a late progress or
+        # finished signal. Once reopened there is no worker, but the saved
+        # error must remain visible until the user starts a new request.
+        return bool(
+            self.worker is None
+            or getattr(self, "_generation_failed", False)
+            or getattr(self, "_pending_batch_kind", "")
+            or getattr(self, "_retrying_same_request", False)
+        )
+
     def _on_worker_progress(self, text):
+        if self._generation_error_is_visible():
+            return
         self._set_status_text(text)
 
     def _on_worker_output_chars(self, count):
@@ -8300,7 +8461,8 @@ class NovelCreationWizardDialog(QDialog):
             self._received_chars = max(0, int(count or 0))
         except (TypeError, ValueError):
             return
-        self._set_status_text(self._status_text)
+        if not self._generation_error_is_visible():
+            self._set_status_text(self._status_text)
 
     def _context_for_step(self, step, retry_feedback=""):
         inspiration = self.inspiration_edit.text().strip()
@@ -8395,6 +8557,22 @@ class NovelCreationWizardDialog(QDialog):
                         direction.pop("key_beats", None)
                         direction.pop("climax_beat_indices", None)
                 context["confirmed"]["stage_directions"] = direction_references
+                previous_scene_anchors = []
+                previous_anchor_names = set()
+                for direction in stage_directions[:stage_index]:
+                    for anchor in _normalize_stage_scene_anchors(
+                        direction.get("main_scene_anchors", [])
+                        if isinstance(direction, dict) else []
+                    ):
+                        name = _as_text(anchor.get("name"))
+                        if not name or name.casefold() in previous_anchor_names:
+                            continue
+                        previous_anchor_names.add(name.casefold())
+                        previous_scene_anchors.append(deepcopy(anchor))
+                if previous_scene_anchors:
+                    context["confirmed"]["previous_main_scene_anchors"] = (
+                        previous_scene_anchors
+                    )
             context["generation_batch"] = batch_kind
             if 0 <= stage_index < len(stage_directions):
                 current_stage = deepcopy(current_stage)
@@ -8637,6 +8815,7 @@ class NovelCreationWizardDialog(QDialog):
         self._pending_retry_delay_ms = 0
         self._generation_failed = False
         self._last_worker_error = ""
+        self._generation_error_step = ""
         self._received_chars = 0
         self._set_status_text("AI 正在连接并准备生成，请稍候……")
         self._save_draft()
@@ -8656,9 +8835,33 @@ class NovelCreationWizardDialog(QDialog):
                 raise ValueError(
                     f"阶段方向没有覆盖全部阶段：收到{len(directions)}项，需要{len(expected)}项。"
                 )
+            seen_scene_anchors = {}
             for index, item in enumerate(directions):
                 if not _as_text(item.get("summary")):
                     raise ValueError(f"第{index + 1}阶段缺少阶段方向摘要。")
+                scene_anchors = _normalize_stage_scene_anchors(
+                    item.get("main_scene_anchors", [])
+                )
+                if not scene_anchors:
+                    raise ValueError(
+                        f"第{index + 1}阶段缺少主要场景锚点；"
+                        "每个阶段至少需要一个承载本阶段大事件的主要场景。"
+                    )
+                for anchor in scene_anchors:
+                    anchor_name = _as_text(anchor.get("name"))
+                    anchor_key = _stage_scene_anchor_key(anchor_name)
+                    if not anchor_key:
+                        continue
+                    previous = seen_scene_anchors.get(anchor_key)
+                    if previous:
+                        previous_stage, previous_name = previous
+                        raise ValueError(
+                            f"第{index + 1}阶段主要场景锚点“{anchor_name}”"
+                            f"与第{previous_stage}阶段主要场景锚点“{previous_name}”重复；"
+                            "跨阶段主要场景必须更换，旧地点只能作为背景或过渡。"
+                        )
+                    seen_scene_anchors[anchor_key] = (index + 1, anchor_name)
+                item["main_scene_anchors"] = scene_anchors
                 beat_count = len(item.get("key_beats", []))
                 is_final_stage = index == len(expected) - 1
                 minimum_beats = 3 if is_final_stage else 1
@@ -9261,6 +9464,14 @@ class NovelCreationWizardDialog(QDialog):
         """Retry a failed post-response validation without saving bad content."""
         retry_number = int(self._generation_retry_count or 0) + 1
         detail = str(error or "返回内容未通过当前步骤校验。").strip()
+        step = CREATION_WIZARD_STEPS[self.current_step_index][0]
+        total_stages = len(self._stage_specs()) if step == "stage_plan" else 0
+        batch_name = _creation_batch_display_name(
+            batch_kind or self._active_batch_kind,
+            stage_index if stage_index is not None and stage_index >= 0 else self._active_stage_index,
+            total_stages,
+        ) or "当前批次"
+        self._generation_error_step = step
         if retry_number <= 3:
             self._generation_retry_count = retry_number
             self._pending_batch_kind = batch_kind or self._active_batch_kind
@@ -9272,11 +9483,13 @@ class NovelCreationWizardDialog(QDialog):
             self._retrying_same_request = True
             self._generation_failed = False
             self._last_worker_error = (
-                f"本次生成失败：{detail}；{retry_number * 10}秒后自动重试 "
-                f"{retry_number}/3。"
+                f"{batch_name}生成失败：{detail}\n"
+                f"本批次返回未保存；{retry_number * 10}秒后自动重试当前批次"
+                f"（{retry_number}/3）。"
             )
             self._set_status_text(self._last_worker_error)
             self._set_running(False)
+            self._save_draft()
             return True
 
         self._generation_failed = True
@@ -9285,10 +9498,14 @@ class NovelCreationWizardDialog(QDialog):
         self._pending_retry_delay_ms = 0
         self._retrying_same_request = False
         self._last_worker_error = (
-            f"生成失败：{detail}；已自动重试3次，请点击 AI 生成重试。"
+            f"{batch_name}生成失败：{detail}\n"
+            f"本批次返回未保存，已自动重试3次；请点击“"
+            f"{_creation_batch_action_text(batch_kind or self._active_batch_kind, stage_index, total_stages)}"
+            "”重新生成。"
         )
         self._set_status_text(self._last_worker_error)
         self._set_running(False)
+        self._save_draft()
         return False
 
     def _is_current_worker_signal(self):
@@ -9346,6 +9563,8 @@ class NovelCreationWizardDialog(QDialog):
                     )
                 self._schedule_generation_retry(detail, batch_kind, stage_index)
                 return
+            self._last_worker_error = ""
+            self._generation_error_step = ""
             self._invalidate_steps_from("bible")
             self.step_results[step] = deepcopy(result)
             self.premise_candidates = candidates
@@ -9385,6 +9604,8 @@ class NovelCreationWizardDialog(QDialog):
             except Exception as exc:
                 self._schedule_generation_retry(str(exc), batch_kind, stage_index)
                 return
+            self._last_worker_error = ""
+            self._generation_error_step = ""
             merged = deepcopy(self.step_results.get(step, {}))
             self._set_preview_result(step, merged)
 
@@ -9449,6 +9670,7 @@ class NovelCreationWizardDialog(QDialog):
             )
         else:
             message = raw_error
+        self._generation_error_step = CREATION_WIZARD_STEPS[self.current_step_index][0]
         self._last_worker_error = (
             f"生成失败：{message}\n已自动重试3次，请点击 AI 生成重试。"
         )

@@ -9,12 +9,17 @@ from gpt_desktop.core import reasoning_effort_for_model
 from gpt_desktop.novel_utils import (
     CORE_STORY_QUALITY_GUIDANCE,
     _build_chapter_ai_context,
+    _build_style_execution_context,
+    _grounded_prose_contract,
     _new_chapter,
     _parse_style_finalize_result,
+    _prose_dialogue_naturalness_guidance,
     _prose_scene_grounding_guidance,
     _prose_language_accuracy_guidance,
+    _prose_abstract_expression_examples_guidance,
     _prose_language_review_guidance,
     _build_long_form_memory_finalize_context,
+    _build_chapter_prose_review_context,
 )
 
 from gpt_desktop.workers import (
@@ -53,23 +58,90 @@ class NovelAnalysisWorkerTests(unittest.TestCase):
                     self.assertIn("短答、停顿和修辞也按语境保留", combined)
                     self.assertIn("主语或宾语在语境明确时可以自然省略", combined)
                     self.assertIn("表达自然、意思明确的保留", combined)
+                    self.assertIn("训练强度通常说‘提高’或‘加大’", combined)
+                    self.assertIn("人物作出承诺时，直接写明由谁采取什么做法", combined)
+                    self.assertIn("物件作为证据时，写明人物怎样用它证明事情", combined)
+                    self.assertIn("不能替人物说清照片没有记录的经历", combined)
+                    self.assertIn("不要让承诺者消失成‘债务会解决’", combined)
                     self.assertNotIn("涉及物品或抽象概念时，写清实际使用它的人", combined)
                     self.assertNotIn("包络内不写‘我会’", combined)
+                    self.assertNotIn("不必每句出现", combined)
+                    self.assertNotIn("不为增加数量而硬加", combined)
+                    self.assertNotIn("不得为了展示文风硬塞口语", combined)
                     if action == "style_rewrite" and not marker:
                         self.assertIn("小说正文修订编辑", combined)
                         self.assertNotIn("章节策划助手", combined)
+                    if "【正文风格参考】\n" in marker:
+                        self.assertIn("优先调用完整样本中", combined)
+                        self.assertNotIn("对白结合人物身份、关系和现场情绪自然使用语气词", combined)
+                    else:
+                        self.assertIn("对白结合人物身份、关系和现场情绪自然使用语气词", combined)
+                        if action == "draft" and marker:
+                            self.assertIn("口语、笑点、对白、短段和特殊词结合当前人物、场景、情绪与文风自然融入正文", combined)
 
-    def test_memory_finalize_language_review_is_shared_once_with_context(self):
+    def test_prose_review_owns_language_rules_and_memory_finalize_only_extracts_data(self):
         chapter = _new_chapter(0)
-        context = _build_long_form_memory_finalize_context(
-            {"chapters": [chapter]}, 0, "他答道：‘给我三天，这笔债我来处理。’",
+        review_context = _build_chapter_prose_review_context(
+            {"chapters": [chapter]}, 0, "他答道：‘给我三天，这笔债我来处理。’"
         )
-        for context in (context, "最终正文：‘知道了。’"):
-            worker = NovelWritingWorker("http://example.test", "key", "model", "memory_finalize", context)
-            combined = worker._action_prompt() + "\n" + context
-            self.assertEqual(combined.count("【正文语言审读与局部修补】"), 1)
-            self.assertIn(_prose_language_review_guidance(), combined)
-            self.assertNotIn("不改写正文的读感诊断", combined)
+        review_worker = NovelWritingWorker("http://example.test", "key", "model", "prose_review", review_context)
+        combined = review_worker._action_prompt() + "\n" + review_context
+        self.assertEqual(combined.count("【正文语言审读与局部修补】"), 1)
+        self.assertIn(_prose_language_review_guidance(), combined)
+        self.assertIn("直接核对字面句意是否表达人物本意", combined)
+        self.assertIn("对白按人物身份、关系和现场情绪呈现为自然口语", combined)
+        self.assertIn("在repair_patches中提供逐项对应", combined)
+        self.assertIn("修补保留说话人、事实、人物决定、确定程度、承诺强度、否定范围和剧情结果", combined)
+        self.assertNotIn("不为增加数量而硬加", combined)
+        self.assertNotIn("不改写正文的读感诊断", combined)
+        self.assertEqual(combined.count(_prose_abstract_expression_examples_guidance().strip()), 1)
+        self.assertEqual(combined.count("建议表达："), 10)
+        self.assertNotIn("文风偏好", combined)
+        self.assertNotIn("个人读感偏好", combined)
+        memory_context = _build_long_form_memory_finalize_context(
+            {"chapters": [chapter]}, 0, "他答道：‘给我三天，这笔债我来处理。’"
+        )
+        memory_worker = NovelWritingWorker("http://example.test", "key", "model", "memory_finalize", memory_context)
+        memory_combined = memory_worker._action_prompt() + "\n" + memory_context
+        self.assertNotIn("正文语言审读与局部修补", memory_combined)
+        self.assertNotIn("repair_patches", memory_combined)
+        self.assertNotIn("logic_audit", memory_combined)
+        self.assertNotIn("prose_review", memory_combined)
+        self.assertIn("只负责资料提取", memory_combined)
+
+    def test_prose_prompt_dedup_preserves_rules_and_sample_across_draft_entries(self):
+        for reference in ("", "作者样本：她把门留了一条缝。\n‘你还不走呀？’"):
+            for existing in ("", "她把杯子搁在桌上，等他开口。"):
+                chapter = _new_chapter(0)
+                chapter["outline"] = "争执后双方试着和解。"
+                chapter["text"] = existing
+                context = _build_chapter_ai_context(
+                    {"chapters": [chapter], "style_reference": reference}, 0, "draft",
+                )
+                contexts = [context]
+                if reference:
+                    contexts.append(_build_style_execution_context(context, style_reference=reference))
+                for context in contexts:
+                    with self.subTest(has_style=bool(reference), continuation=bool(existing), direct="【小说正文直写】" in context):
+                        worker = NovelWritingWorker("http://example.test", "key", "model", "draft", context)
+                        combined = worker._action_prompt() + "\n" + context
+                        self.assertEqual(combined.count("不得出现策划术语、抽象形容、文学化意象、空泛比喻"), 1)
+                        self.assertEqual(combined.count(_prose_scene_grounding_guidance().strip()), 1)
+                        self.assertEqual(combined.count("【仿写优先级｜已加载文风档案】"), int(bool(reference)))
+                        self.assertEqual(combined.count(_prose_dialogue_naturalness_guidance().strip()), 1)
+                        self.assertIn("人物需要解释、表达看法、拒绝、讥讽或不满时", combined)
+                        self.assertIn("不要用‘决定’‘选择’‘不代表’等抽象结论代替具体的人、物、动作、心理和反应", combined)
+                        self.assertIn("不要求每次心理变化立即变成行动", combined)
+                        if reference:
+                            self.assertIn(reference, context)
+
+    def test_prose_prompt_fallback_keeps_complete_contract_without_built_context(self):
+        for action in ("draft", "style_rewrite", "style_finalize", "script_to_novel"):
+            with self.subTest(action=action):
+                worker = NovelWritingWorker("http://example.test", "key", "model", action, "当前章节资料。")
+                prompt = worker._action_prompt()
+                self.assertIn(_grounded_prose_contract().strip(), prompt)
+                self.assertIn(_prose_dialogue_naturalness_guidance().strip(), prompt)
 
     def test_chapter_plan_prompt_uses_shared_story_quality_constraints_once(self):
         worker = NovelChapterPlanWorker(
@@ -1885,10 +1957,10 @@ class NovelAnalysisWorkerTests(unittest.TestCase):
                     self.assertIn("不要求每次心理变化立即变成行动", combined)
                     self.assertNotIn("每一轮说话都应", combined)
                     if reference:
-                        self.assertIn("完整文风正文样本是正文表达的最高标准", prompt)
+                        self.assertIn("完整文风正文样本是正文表达的最高标准", combined)
                         self.assertNotIn("【自然语气与情绪】", prompt)
                     else:
-                        self.assertIn("【自然语气与情绪】", prompt)
+                        self.assertIn("【自然语气与情绪】", combined)
                         self.assertNotIn("【仿写优先级｜已加载文风档案】", combined)
 
     def test_prose_and_finalize_worker_prompts_keep_scene_based_dialogue_rules(self):
@@ -2008,14 +2080,14 @@ class NovelAnalysisWorkerTests(unittest.TestCase):
         self.assertIn("逐字连续截取片段", cards_worker._action_prompt())
         self.assertEqual(cards_worker._max_tokens_for_request(), 7000)
         self.assertIn("当前章节资料", rules_worker._action_prompt())
-        self.assertIn("连续性总编辑", memory_finalize_worker._action_prompt())
+        self.assertIn("连续性资料整理员", memory_finalize_worker._action_prompt())
         self.assertIn("记录缺失或覆盖", memory_finalize_worker._action_prompt())
-        self.assertIn("正文成品泄漏检查", memory_finalize_worker._action_prompt())
-        self.assertIn("其他语种残留", memory_finalize_worker._action_prompt())
-        self.assertIn("乱码、编码损坏", memory_finalize_worker._action_prompt())
-        self.assertIn("人物内心活动中的自然判断不是AI推理泄漏", memory_finalize_worker._action_prompt())
-        self.assertIn("blocking_issues", memory_finalize_worker._action_prompt())
-        self.assertIn("无法确定或需要猜测剧情时不要修", memory_finalize_worker._action_prompt())
+        self.assertNotIn("正文成品泄漏检查", memory_finalize_worker._action_prompt())
+        self.assertNotIn("其他语种残留", memory_finalize_worker._action_prompt())
+        self.assertNotIn("乱码、编码损坏", memory_finalize_worker._action_prompt())
+        self.assertNotIn("人物内心活动中的自然判断不是AI推理泄漏", memory_finalize_worker._action_prompt())
+        self.assertNotIn("blocking_issues", memory_finalize_worker._action_prompt())
+        self.assertNotIn("无法确定或需要猜测剧情时不要修", memory_finalize_worker._action_prompt())
         self.assertIn("只能填写在fact_updates各项的key字段", memory_finalize_worker._action_prompt())
         self.assertIn("至少被一个long_term_events.storage.fact_refs引用", memory_finalize_worker._action_prompt())
         self.assertEqual(profile_worker._max_tokens_for_request(), 2800)

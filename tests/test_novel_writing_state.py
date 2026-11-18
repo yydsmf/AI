@@ -1645,11 +1645,40 @@ class NovelWritingStateTests(unittest.TestCase):
     def test_status_action_labels_cover_long_form_pipeline(self):
         self.assertEqual(NovelWritingTab._status_action_label("draft"), "正文直写")
         self.assertEqual(NovelWritingTab._status_action_label("style_finalize"), "终稿补救")
-        self.assertEqual(NovelWritingTab._status_action_label("memory_finalize"), "状态整理")
+        self.assertEqual(NovelWritingTab._status_action_label("prose_review"), "正文审读修补")
+        self.assertEqual(NovelWritingTab._status_action_label("memory_finalize"), "章节资料提取")
         self.assertEqual(NovelWritingTab._status_action_label("memory_reconcile"), "十章边界对账")
         self.assertEqual(NovelWritingTab._status_action_label("memory_repair"), "状态修复")
         tab = NovelWritingTab.__new__(NovelWritingTab)
         tab._chapter_ai_running_action = ""
+        self.assertEqual(
+            tab._status_stage_for_message("正文审读完成，正在提取章节摘要、关键事实和长期记忆..."),
+            ("章节资料提取", "memory_finalize"),
+        )
+        self.assertEqual(
+            tab._status_stage_for_message("正文审读修补当前步骤未通过，已丢弃本次结果；10 秒后自动重试（1/3）..."),
+            ("正文审读修补", "prose_review"),
+        )
+        self.assertEqual(
+            tab._status_stage_for_message("章节资料提取已中止。"),
+            ("章节资料提取已中止", "memory_aborted"),
+        )
+        self.assertEqual(
+            tab._status_stage_for_message("正文审读失败，终稿已保留在恢复检查点中。"),
+            ("正文审读失败", "prose_review_failed"),
+        )
+        self.assertEqual(
+            tab._status_stage_for_message("章节资料提取失败，正文终稿已保留。"),
+            ("章节资料提取失败", "memory_failed"),
+        )
+        self.assertEqual(
+            tab._status_stage_for_message("正在中止正文审读修补..."),
+            ("正在中止正文审读修补", "stopping"),
+        )
+        self.assertEqual(
+            tab._status_stage_for_message("正在中止章节资料提取..."),
+            ("正在中止章节资料提取", "stopping"),
+        )
         self.assertEqual(
             tab._status_stage_for_message("自动扩写 3/20（已丢弃半成品，重新生成）"),
             ("半成品重写", "partial_rewrite"),
@@ -1658,7 +1687,7 @@ class NovelWritingStateTests(unittest.TestCase):
     def test_status_progress_estimate_moves_from_waiting_to_receiving_and_repair(self):
         self.assertEqual(
             NovelWritingTab._status_progress_percent(
-                "正在独立整理本章摘要和长期状态...",
+                "正在提取章节摘要、关键事实和长期记忆...",
                 "memory_finalize",
                 received_chars=0,
                 active=True,
@@ -1666,7 +1695,7 @@ class NovelWritingStateTests(unittest.TestCase):
             10,
         )
         receiving = NovelWritingTab._status_progress_percent(
-            "正在独立整理本章摘要和长期状态...",
+            "正在提取章节摘要、关键事实和长期记忆...",
             "memory_finalize",
             received_chars=1999,
             active=True,
@@ -1694,9 +1723,9 @@ class NovelWritingStateTests(unittest.TestCase):
 
     def test_status_display_only_shows_received_chars_when_available(self):
         tab = NovelWritingTab.__new__(NovelWritingTab)
-        tab._status_message = "正在独立整理本章摘要和长期状态..."
+        tab._status_message = "正在提取章节摘要、关键事实和长期记忆..."
         tab._status_stage_key = "chapter-1:memory_finalize"
-        tab._status_stage_label = "状态整理"
+        tab._status_stage_label = "章节资料提取"
         tab._status_stage_active = True
         tab._status_stage_started_wall = 0.0
         tab._status_stage_started_at = 0.0
@@ -1722,7 +1751,7 @@ class NovelWritingStateTests(unittest.TestCase):
         self.assertNotIn("当前进度", tab.status_label.text)
         self.assertNotIn("%", tab.status_label.tooltip)
         self.assertIn("第1章", tab.status_meta_label.text)
-        self.assertIn("状态整理", tab.status_meta_label.text)
+        self.assertIn("章节资料提取", tab.status_meta_label.text)
 
         for stage, message in (
             ("draft", "正在直接扩写正文..."),
@@ -1737,6 +1766,96 @@ class NovelWritingStateTests(unittest.TestCase):
                 tab._refresh_status_display()
                 self.assertNotIn("%", tab.status_label.text)
                 self.assertNotIn("%", tab.status_label.tooltip)
+
+    def test_prose_pipeline_states_are_visible_in_bottom_status(self):
+        tab = NovelWritingTab.__new__(NovelWritingTab)
+        tab.current_project_path = "/tmp/prose-review-status.json"
+        tab._status_project_path = ""
+        tab.status_label = _FakeLabel()
+        tab.status_meta_label = _FakeLabel()
+        tab.setToolTip = lambda _text: None
+        tab._forward_chapter_task_signal = lambda *_args: False
+        active = [True]
+        tab._status_has_active_work = lambda: active[0]
+        tab._status_current_chapter_scope = lambda: ("chapter-1", "第1章《测试》")
+        tab._detached_auto_status_is_current = lambda *_args: False
+        tab._auto_expand_all_active = False
+        tab._auto_expand_all_chapter_progress = lambda: (0, 0)
+
+        cases = (
+            ("正在审读并修补正文语义、对白和逻辑...", True, "正文审读修补"),
+            ("正文审读修补未通过，10 秒后自动重试（1/3）...", True, "正文审读修补"),
+            ("正在恢复正文审读...", True, "正文审读修补"),
+            ("正文审读已中止，终稿已保留。", False, "正文审读已中止"),
+            ("正文审读失败，终稿已保留在恢复检查点中。", False, "正文审读失败"),
+            ("正文审读完成，正在提取章节摘要、关键事实和长期记忆...", True, "章节资料提取"),
+            ("章节资料提取未通过，10 秒后自动重试（1/3）...", True, "章节资料提取"),
+            ("正在恢复章节资料提取...", True, "章节资料提取"),
+            ("章节资料提取已中止，正文终稿已保留。", False, "章节资料提取已中止"),
+            ("章节资料提取失败，正文终稿已保留。", False, "章节资料提取失败"),
+        )
+        for message, is_active, expected_stage in cases:
+            with self.subTest(message=message):
+                active[0] = is_active
+                NovelWritingTab.set_status_tip(tab, message)
+                self.assertIn(message, tab.status_label.text)
+                self.assertIn("第1章《测试》", tab.status_meta_label.text)
+                self.assertIn(expected_stage, tab.status_meta_label.text)
+
+    def test_detached_runner_mirrors_prose_pipeline_stage_to_bottom_status(self):
+        class Runner:
+            current_project_path = "/tmp/detached-prose-status.json"
+            _status_message = "正在审读并修补正文语义、对白和逻辑..."
+            _status_stage_key = "chapter-8:prose_review"
+            _status_stage_label = "正文审读修补"
+            _status_stage_started_at = 1.0
+            _status_stage_started_wall = 2.0
+            _status_stage_scope_label = "第8章《试读》"
+            _status_stage_active = True
+            _status_history = []
+            _status_workflow_active = True
+            _status_workflow_kind = "auto_expand"
+            _status_workflow_started_at = 1.0
+            _status_workflow_started_wall = 2.0
+            _status_last_run_elapsed = 0.0
+            _status_received_chars = 1200
+
+            def _status_current_chapter_scope(self):
+                return "chapter-8", "第8章《试读》"
+
+            def _auto_expand_all_chapter_progress(self):
+                return 4, 10
+
+        runner = Runner()
+        tab = NovelWritingTab.__new__(NovelWritingTab)
+        tab._is_detached_auto_runner = False
+        tab.current_project_path = runner.current_project_path
+        tab.current_project = {"chapters": []}
+        tab.current_chapter_index = -1
+        tab._background_chapter_ai_runners = {
+            os.path.realpath(runner.current_project_path): runner,
+        }
+        tab._detached_auto_status_scope_id = ""
+        tab._detached_auto_status_scope_label = ""
+        tab._detached_auto_status_auto_progress = (0, 0)
+        tab._detached_auto_status_mirrored = False
+        tab.status_label = _FakeLabel()
+        tab.status_meta_label = _FakeLabel()
+        tab._status_has_active_work = lambda: True
+
+        self.assertTrue(tab._sync_detached_auto_status(runner))
+        self.assertIn("正在审读并修补正文语义", tab.status_label.text)
+        self.assertIn("自动扩写 4/10", tab.status_meta_label.text)
+        self.assertIn("第8章《试读》", tab.status_meta_label.text)
+        self.assertIn("正文审读修补", tab.status_meta_label.text)
+
+        runner._status_message = "正文审读完成，正在提取章节摘要、关键事实和长期记忆..."
+        runner._status_stage_key = "chapter-8:memory_finalize"
+        runner._status_stage_label = "章节资料提取"
+        runner._status_received_chars = 2400
+        self.assertTrue(tab._sync_detached_auto_status(runner))
+        self.assertIn("正在提取章节摘要", tab.status_label.text)
+        self.assertIn("章节资料提取", tab.status_meta_label.text)
 
     def test_stopping_worker_does_not_clear_completed_stage_history(self):
         class RunningWorker:
@@ -3262,7 +3381,7 @@ class NovelWritingStateTests(unittest.TestCase):
         tab._chapter_ai_context_with_preview = lambda _action: self.fail(
             "已有正文不应重新进入初稿流程"
         )
-        tab._start_memory_finalize = lambda text, resumed=False: started.append((text, resumed))
+        tab._start_prose_review = lambda text, resumed=False: started.append((text, resumed))
 
         tab._start_chapter_ai_sequence()
 
@@ -3356,7 +3475,7 @@ class NovelWritingStateTests(unittest.TestCase):
         )
         tab._persist_ai_generation_state = lambda: None
         finalized = []
-        tab._start_memory_finalize = lambda text, resumed=False: finalized.append((text, resumed))
+        tab._start_prose_review = lambda text, resumed=False: finalized.append((text, resumed))
 
         tab._start_chapter_ai_sequence()
 
@@ -5109,8 +5228,8 @@ class NovelWritingStateTests(unittest.TestCase):
         tab.on_chapter_ai_ready("draft", "AI 正文")
         self.assertEqual(tab.chapter_text.toPlainText(), "")
         self.assertEqual(tab.chapter_ai_preview.toPlainText(), "AI 正文")
-        self.assertEqual(started, ["draft"])
-        self.assertEqual(finalized, ["AI 正文"])
+        self.assertEqual(started, ["draft", "prose_review"])
+        self.assertEqual(finalized, [])
         self.assertTrue(tab._chapter_ai_sequence_active)
 
     def test_single_and_auto_expand_draft_share_the_same_commit_gate(self):
@@ -5168,10 +5287,10 @@ class NovelWritingStateTests(unittest.TestCase):
         single_tab, single_started, single_finalized, single_applied = run_flow(False)
         auto_tab, auto_started, auto_finalized, auto_applied = run_flow(True)
 
-        self.assertEqual(single_started, ["draft"])
-        self.assertEqual(auto_started, ["draft"])
-        self.assertEqual(single_finalized, ["统一流程正文"])
-        self.assertEqual(auto_finalized, ["统一流程正文"])
+        self.assertEqual(single_started, ["draft", "prose_review"])
+        self.assertEqual(auto_started, ["draft", "prose_review"])
+        self.assertEqual(single_finalized, [])
+        self.assertEqual(auto_finalized, [])
         self.assertEqual(single_applied, [])
         self.assertEqual(auto_applied, [])
         self.assertEqual(single_tab.chapter_text.toPlainText(), "")
@@ -5217,7 +5336,7 @@ class NovelWritingStateTests(unittest.TestCase):
                     tab._start_chapter_ai_worker = lambda action, *_args, **_kwargs: started.append(action)
                     tab._on_auto_expand_chapter_completed = completed.append
 
-                    tab.on_chapter_ai_ready("draft", final_text)
+                    tab._start_memory_finalize(final_text)
 
                     self.assertEqual(started, ["memory_finalize"])
                     self.assertEqual(tab.chapter_text.toPlainText(), "")
@@ -5241,8 +5360,6 @@ class NovelWritingStateTests(unittest.TestCase):
                             "next_stage_entry": "继续核实资料来源。",
                         }
                     result = {
-                        "logic_audit": {"checked": True, "issues": []},
-                        "prose_review": {"checked": True, "issues": []},
                         "outline": "赵明核对资料来源。", "summary": final_text,
                         "key_facts": ["资料来源仍然未知。"],
                         "long_form_memory": memory_update,
@@ -5397,14 +5514,13 @@ class NovelWritingStateTests(unittest.TestCase):
             "draft",
             candidate,
         )
-        self.assertEqual(started[-1][0], "memory_finalize")
-        self.assertIn("【最终正文】", started[-1][1])
+        self.assertEqual(started[-1][0], "prose_review")
         self.assertIn(candidate, started[-1][1])
         self.assertNotIn("【仿写终稿任务】", started[-1][1])
         normal_actions = [item[0] for item in started if item[0] in {
-            "style_rules", "draft", "style_finalize", "memory_finalize"
+            "style_rules", "draft", "style_finalize", "prose_review", "memory_finalize"
         }]
-        self.assertEqual(normal_actions, ["draft", "memory_finalize"])
+        self.assertEqual(normal_actions, ["draft", "prose_review"])
 
     def test_style_workflow_reuses_persisted_profile_after_restart(self):
         reference = "样本文风。" * 300
@@ -5529,7 +5645,7 @@ class NovelWritingStateTests(unittest.TestCase):
         self.assertEqual(snapshot["style_profile_cache"], {})
         self.assertEqual(tab.current_project["style_reference"], "仍需保留的项目样本。")
 
-    def test_style_finalize_starts_independent_memory_finalize_before_writing(self):
+    def test_style_finalize_starts_prose_review_before_memory_extraction(self):
         reference = "\n".join("样本连续叙述人物关系和事情缘由，并把信息自然放在段落中。" for _ in range(70))
         initial = "\n".join("初稿连续叙述人物关系和事情缘由，并把信息自然放在段落中。" for _ in range(70))
         revised = "\n".join("终稿连续叙述人物关系和事情缘由，并把信息自然放在段落中。" for _ in range(70))
@@ -5573,16 +5689,17 @@ class NovelWritingStateTests(unittest.TestCase):
 
         tab.on_chapter_ai_ready("style_finalize", terminal)
 
-        self.assertEqual([item[0] for item in started], ["memory_finalize"])
+        self.assertEqual([item[0] for item in started], ["prose_review"])
+        self.assertIn("【正文审读规则与真实例句】", started[0][1])
         self.assertIn("【最终正文】", started[0][1])
         self.assertIn(revised, started[0][1])
         self.assertEqual(tab.chapter_text.toPlainText(), "")
         self.assertEqual(tab.chapter_outline.toPlainText(), "原规划提纲")
         self.assertEqual(tab.chapter_summary.toPlainText(), "")
         self.assertEqual(tab._chapter_ai_memory_pending["final_text"], revised)
-        self.assertTrue(tab._chapter_ai_memory_finalize_attempted)
+        self.assertFalse(tab._chapter_ai_memory_finalize_attempted)
         checkpoint = tab.current_project["chapters"][0]["ai_generation_checkpoint"]
-        self.assertEqual(checkpoint["stage"], "memory_finalize")
+        self.assertEqual(checkpoint["stage"], "prose_review")
         self.assertEqual(checkpoint["final_text"], revised)
         self.assertEqual(checkpoint["base_memory_revision"], 0)
 
@@ -5643,7 +5760,7 @@ class NovelWritingStateTests(unittest.TestCase):
 
         tab.on_chapter_ai_ready("style_finalize", terminal)
 
-        self.assertEqual([item[0] for item in started], ["memory_finalize"])
+        self.assertEqual([item[0] for item in started], ["prose_review"])
         self.assertEqual(tab._chapter_ai_style_finalize_count, 1)
         self.assertEqual(tab._chapter_ai_style_pending_reasons, [])
 
@@ -5707,7 +5824,7 @@ class NovelWritingStateTests(unittest.TestCase):
             f"【终稿正文】\n<NOVEL_PROSE_START>\n{revised}\n<NOVEL_PROSE_END>\n\n【终稿验收】\n{acceptance}",
         )
 
-        self.assertEqual([item[0] for item in started], ["memory_finalize"])
+        self.assertEqual([item[0] for item in started], ["prose_review"])
         self.assertEqual(tab._chapter_ai_style_finalize_count, 1)
         self.assertTrue(any(
             "段落" in item or "短段" in item
@@ -5772,7 +5889,7 @@ class NovelWritingStateTests(unittest.TestCase):
             f"【终稿正文】\n<NOVEL_PROSE_START>\n{revised}\n<NOVEL_PROSE_END>\n\n【终稿验收】\n{acceptance}",
         )
 
-        self.assertEqual([item[0] for item in started], ["memory_finalize"])
+        self.assertEqual([item[0] for item in started], ["prose_review"])
         self.assertEqual(tab._chapter_ai_style_finalize_count, 1)
 
     def test_style_finalize_does_not_retry_for_missing_conditional_voice_scenes(self):
@@ -5828,7 +5945,7 @@ class NovelWritingStateTests(unittest.TestCase):
             f"【终稿正文】\n<NOVEL_PROSE_START>\n{revised}\n<NOVEL_PROSE_END>\n\n【终稿验收】\n{acceptance}",
         )
 
-        self.assertEqual([item[0] for item in started], ["memory_finalize"])
+        self.assertEqual([item[0] for item in started], ["prose_review"])
         self.assertNotIn("人物对白声纹没有终稿证据", started[0][1])
         self.assertNotIn("日常口语与喜剧没有终稿证据", started[0][1])
         self.assertEqual(tab._chapter_ai_style_finalize_count, 1)
@@ -5887,7 +6004,7 @@ class NovelWritingStateTests(unittest.TestCase):
 
         tab.on_chapter_ai_ready("style_finalize", response)
 
-        self.assertEqual([item[0] for item in started], ["memory_finalize"])
+        self.assertEqual([item[0] for item in started], ["prose_review"])
         self.assertEqual(tab._chapter_ai_style_finalize_count, 1)
 
     def test_chapter_sequence_resumes_valid_memory_checkpoint_without_rewriting_body(self):
@@ -6080,7 +6197,7 @@ class NovelWritingStateTests(unittest.TestCase):
         chapter["outline"] = "用户已经修改的提纲"
         tab.chapter_outline.setPlainText(chapter["outline"])
         resumed_calls = []
-        tab._start_memory_finalize = lambda text, resumed=False: resumed_calls.append((text, resumed))
+        tab._start_prose_review = lambda text, resumed=False: resumed_calls.append((text, resumed))
 
         tab._start_chapter_ai_sequence()
 
@@ -6279,7 +6396,7 @@ class NovelWritingStateTests(unittest.TestCase):
         self.assertEqual(completions, [True])
         self.assertEqual([item[0] for item in started], ["memory_finalize"])
 
-    def test_memory_finalize_hard_logic_issue_starts_local_repair_before_memory_validation(self):
+    def test_prose_review_hard_logic_issue_starts_local_repair_before_memory_extraction(self):
         chapter = _new_chapter(0)
         tab = NovelWritingTab.__new__(NovelWritingTab)
         tab.current_project = {"chapters": [chapter]}
@@ -6289,7 +6406,10 @@ class NovelWritingStateTests(unittest.TestCase):
             "chapter_id": chapter["id"],
             "final_text": final_text,
             "logic_audit_required": True,
+            "prose_review_required": True,
         }
+        tab._log_novel_diagnostic = lambda *_args, **_kwargs: None
+        tab._clear_transient_chapter_ai_retry = lambda *_args, **_kwargs: None
         started = []
         tab._start_chapter_logic_repair = lambda text, bundle, issues: started.append(
             (text, bundle, issues)
@@ -6312,47 +6432,60 @@ class NovelWritingStateTests(unittest.TestCase):
                 }],
             },
             "prose_review": {"checked": True, "issues": []},
+            "repair_patches": [],
             "outline": "1. 屏风被撤下。",
             "summary": "管事试图逃走。",
             "key_facts": ["屏风已经撤下。"],
             "long_form_memory": {"schema_version": 2},
         }, ensure_ascii=False)
 
-        tab._handle_memory_finalize_ready(result)
+        tab._handle_prose_review_ready(result)
 
         self.assertEqual(len(started), 1)
         self.assertEqual(started[0][0], final_text)
         self.assertEqual(started[0][2][0]["category"], "object_state")
 
-    def test_memory_finalize_rejects_missing_prose_review_instead_of_committing(self):
+    def test_memory_finalize_extracts_data_without_review_response_fields(self):
         chapter = _new_chapter(0)
         tab = NovelWritingTab.__new__(NovelWritingTab)
         tab.current_project = {"chapters": [chapter]}
         tab.current_chapter_index = 0
+        final_text = "她抬头看向门外。"
         tab._chapter_ai_memory_pending = {
             "chapter_id": chapter["id"],
             "transaction_id": "tx-prose-review",
-            "final_text": "她抬头看向门外。",
-            "logic_audit_required": True,
+            "final_text": final_text,
             "prose_patch_rounds": 0,
         }
-        tab._schedule_transient_chapter_ai_retry = lambda *_args, **_kwargs: False
         tab._log_novel_diagnostic = lambda *_args, **_kwargs: None
+        tab._clear_transient_chapter_ai_retry = lambda *_args, **_kwargs: None
+        tab._memory_bundle_validation_errors = lambda *_args, **_kwargs: []
+        tab._novel_memory_bundle_summary = lambda *_args, **_kwargs: {
+            "state_patch_counts": {}, "record_update_counts": {},
+            "reconciliation_counts": {}, "next_chapter_counts": {},
+            "fact_updates": 0, "long_term_events": 0,
+            "outline_chars": 1, "summary_chars": 1, "key_facts_chars": 1,
+        }
+        tab.chapter_ai_preview = _FakePlainTextEdit(final_text)
+        committed = []
+        tab._apply_style_final_result = lambda text, bundle, **kwargs: committed.append(
+            (text, bundle, kwargs)
+        )
         failures = []
         tab._fail_memory_sync = lambda message: failures.append(message)
 
         tab._handle_memory_finalize_ready(json.dumps({
-            "logic_audit": {"checked": True, "issues": []},
             "outline": "她看向门外。",
             "summary": "她抬头看向门外。",
             "key_facts": ["她看向门外。"],
             "long_form_memory": {},
         }, ensure_ascii=False))
 
-        self.assertEqual(failures, ["prose_review缺失，必须明确完成终稿审读"])
+        self.assertEqual(failures, [])
+        self.assertEqual(committed[0][0], final_text)
         self.assertEqual(chapter.get("text", ""), "")
 
-    def test_memory_finalize_stops_after_two_prose_patch_rounds(self):
+    def test_memory_finalize_ignores_review_fields_and_keeps_body_unchanged(self):
         chapter = _new_chapter(0)
         tab = NovelWritingTab.__new__(NovelWritingTab)
         tab.current_project = {
@@ -6368,13 +6501,25 @@ class NovelWritingStateTests(unittest.TestCase):
             "final_text": final_text,
             "logic_audit_required": True,
             "prose_review_required": True,
-            "prose_patch_rounds": 2,
+            "prose_patch_rounds": 0,
         }
         tab._log_novel_diagnostic = lambda *_args, **_kwargs: None
         tab._memory_bundle_validation_errors = lambda *_args, **_kwargs: []
         tab._clear_transient_chapter_ai_retry = lambda *_args, **_kwargs: None
-        tab._apply_style_final_result = lambda *_args, **_kwargs: self.fail(
-            "两轮正文修补后仍有问题时不应提交"
+        tab._store_memory_finalize_checkpoint = lambda *_args, **_kwargs: None
+        tab._novel_memory_bundle_summary = lambda *_args, **_kwargs: {
+            "state_patch_counts": {}, "record_update_counts": {},
+            "reconciliation_counts": {}, "next_chapter_counts": {},
+            "fact_updates": 0, "long_term_events": 0,
+            "outline_chars": 1, "summary_chars": 1, "key_facts_chars": 1,
+        }
+        tab.chapter_ai_preview = _FakePlainTextEdit(final_text)
+        tab._start_memory_finalize = lambda *_args, **_kwargs: self.fail(
+            "单次局部修补后不应重新调用状态整理和正文审读"
+        )
+        committed = []
+        tab._apply_style_final_result = lambda text, bundle, **kwargs: committed.append(
+            (text, bundle, kwargs)
         )
         failures = []
         tab._fail_memory_sync = lambda message: failures.append(message)
@@ -6386,13 +6531,13 @@ class NovelWritingStateTests(unittest.TestCase):
                 "issues": ["门外一处非中文残片仍需处理"],
                 "blocking_issues": [{
                     "category": "non_chinese",
-                    "quote": "门外",
+                    "quote": "她抬头看向门外，风从走廊尽头吹来。",
                     "reason": "中文叙述混入无必要外语残片",
                 }],
             },
             "repair_patches": [{
-                "before": "她抬头看向门外",
-                "after": "她抬头望向门外",
+                "before": "她抬头看向门外，风从走廊尽头吹来。",
+                "after": "她抬头望向门外，风从走廊尽头吹来。",
                 "reason": "非中文词汇混入",
             }],
             "outline": "她看向门外。",
@@ -6401,13 +6546,155 @@ class NovelWritingStateTests(unittest.TestCase):
             "long_form_memory": {},
         }, ensure_ascii=False))
 
-        self.assertEqual(
-            failures,
-            ["正文经过两轮局部修补后仍有未解决的审读问题，已停止提交并保留恢复检查点"],
-        )
-        self.assertEqual(chapter.get("text", ""), "")
+        self.assertEqual(failures, [])
+        self.assertEqual(len(committed), 1)
+        self.assertEqual(committed[0][0], final_text)
+        self.assertNotIn("repair_patches", committed[0][1])
+        self.assertTrue(committed[0][2]["memory_validated"])
+        self.assertEqual(tab._chapter_ai_memory_pending, {})
 
-    def test_memory_finalize_blocks_confirmed_prose_issue_without_safe_patch(self):
+    def test_memory_finalize_resume_does_not_repeat_prose_review(self):
+        chapter = _new_chapter(0)
+        tab = NovelWritingTab.__new__(NovelWritingTab)
+        final_text = "她抬头看向门外，风从走廊尽头吹来。"
+        tab.current_project = {"chapters": [chapter], "long_form_memory": {"revision": 0}}
+        tab.current_chapter_index = 0
+        tab.chapter_ai_preview = _FakePlainTextEdit(final_text)
+        tab._chapter_ai_memory_pending = {
+            "chapter_id": chapter["id"], "final_text": final_text,
+            "logic_audit_required": True, "prose_review_required": True,
+            "prose_patch_rounds": 1,
+        }
+        tab._log_novel_diagnostic = lambda *_args, **_kwargs: None
+        tab._memory_bundle_validation_errors = lambda *_args, **_kwargs: []
+        tab._clear_transient_chapter_ai_retry = lambda *_args, **_kwargs: None
+        tab._novel_memory_bundle_summary = lambda *_args, **_kwargs: {
+            "state_patch_counts": {}, "record_update_counts": {},
+            "reconciliation_counts": {}, "next_chapter_counts": {},
+            "fact_updates": 0, "long_term_events": 0,
+            "outline_chars": 1, "summary_chars": 1, "key_facts_chars": 1,
+        }
+        committed = []
+        tab._apply_style_final_result = lambda text, bundle, **kwargs: committed.append(
+            (text, bundle, kwargs)
+        )
+        failures = []
+        tab._fail_memory_sync = lambda message: failures.append(message)
+
+        tab._handle_memory_finalize_ready(json.dumps({
+            "logic_audit": {"checked": True, "issues": []},
+            "prose_review": {
+                "checked": True, "issues": ["门外仍有非中文残片"],
+                "blocking_issues": [{
+                    "category": "non_chinese", "quote": "门外",
+                    "reason": "中文叙述混入无必要外语残片",
+                }],
+            },
+            "repair_patches": [{
+                "before": "她抬头看向门外", "after": "她抬头望向门外",
+                "reason": "非中文词汇混入",
+            }],
+            "outline": "她看向门外。", "summary": "她抬头看向门外。",
+            "key_facts": ["她看向门外。"], "long_form_memory": {},
+        }, ensure_ascii=False))
+
+        self.assertEqual(failures, [])
+        self.assertEqual(len(committed), 1)
+        self.assertEqual(committed[0][0], final_text)
+        self.assertEqual(tab.chapter_ai_preview.toPlainText(), final_text)
+
+    def test_prose_review_applies_patch_before_memory_finalize(self):
+        chapter = _new_chapter(0)
+        tab = NovelWritingTab.__new__(NovelWritingTab)
+        original = "她抬头看向门外，风从走廊尽头吹来。"
+        repaired = "她抬头望向门外，风从走廊尽头吹来。"
+        tab.current_project = {"chapters": [chapter], "characters": [], "long_form_memory": {"revision": 0}}
+        tab.current_chapter_index = 0
+        tab.chapter_ai_preview = _FakePlainTextEdit(original)
+        tab._chapter_ai_memory_pending = {
+            "chapter_id": chapter["id"], "final_text": original,
+            "logic_audit_required": True, "prose_review_required": True,
+            "prose_patch_rounds": 0,
+        }
+        tab._log_novel_diagnostic = lambda *_args, **_kwargs: None
+        tab._clear_transient_chapter_ai_retry = lambda *_args, **_kwargs: None
+        tab._store_memory_finalize_checkpoint = lambda *_args, **_kwargs: None
+        finalized = []
+        tab._start_memory_finalize = lambda text, **kwargs: finalized.append((text, kwargs))
+        tab._start_chapter_logic_repair = lambda *_args, **_kwargs: self.fail(
+            "无逻辑矛盾时不应进入逻辑修复"
+        )
+
+        tab._handle_prose_review_ready(json.dumps({
+            "logic_audit": {"checked": True, "issues": []},
+            "prose_review": {"checked": True, "issues": ["明确语言问题"]},
+            "repair_patches": [{"before": original, "after": repaired, "reason": "句意不清"}],
+        }, ensure_ascii=False))
+
+        self.assertEqual(finalized, [(repaired, {"resumed": True, "prose_patch_applied": True})])
+        self.assertEqual(tab._chapter_ai_memory_pending["prose_patch_rounds"], 1)
+        self.assertEqual(tab._chapter_ai_memory_pending["final_text"], repaired)
+        self.assertEqual(tab.chapter_ai_preview.toPlainText(), repaired)
+
+    def test_reviewed_body_preserves_valid_long_form_memory_and_boundary_reconciliation(self):
+        original = "赵明取走桌上那封旧信。\n她抬头看向门外，风从走廊尽头吹来。"
+        repaired = original.replace("抬头看向", "抬头望向")
+        for chapter_index in (0, 9):
+            with self.subTest(chapter_index=chapter_index):
+                chapters = [_new_chapter(i) for i in range(chapter_index + 1)]
+                chapter = chapters[chapter_index]
+                tab = NovelWritingTab.__new__(NovelWritingTab)
+                tab.current_project = {
+                    "chapters": chapters, "characters": [], "lore": [], "foreshadow_items": [],
+                    "long_form_memory": {"schema_version": "2", "revision": 0},
+                }
+                tab.current_chapter_index = chapter_index
+                tab.chapter_ai_preview = _FakePlainTextEdit(repaired)
+                tab._chapter_ai_memory_pending = {
+                    "chapter_id": chapter["id"], "final_text": repaired,
+                    "prose_patch_rounds": 0,
+                }
+                tab._log_novel_diagnostic = lambda *_args, **_kwargs: None
+                tab._clear_transient_chapter_ai_retry = lambda *_args, **_kwargs: None
+                tab._store_memory_finalize_checkpoint = lambda *_args, **_kwargs: None
+                tab._start_memory_finalize = lambda *_args, **_kwargs: self.fail("不应再次审读正文")
+                tab._start_memory_repair = lambda _body, _bundle, errors: self.fail(
+                    "有效记忆不应重复整理：" + "；".join(errors)
+                )
+                destinations = []
+                tab._apply_style_final_result = lambda body, bundle, **kwargs: destinations.append(
+                    ("commit", body, bundle)
+                )
+                tab._start_memory_reconciliation = lambda body, bundle: destinations.append(
+                    ("reconcile", body, bundle)
+                )
+                controls = self._strict_memory_controls()
+                archive = None
+                if chapter_index == 9:
+                    controls["state_lifecycle_review"]["scope"] = "stage_boundary_delta"
+                    controls["fact_lifecycle_review"]["scope"] = "stage_boundary_delta"
+                    archive = {
+                        "summary": "赵明已经取得旧信。", "irreversible_facts": [],
+                        "relationship_changes": [], "unresolved_threads": [], "next_stage_entry": "继续阅读旧信。",
+                    }
+                tab._handle_memory_finalize_ready(json.dumps({
+                    "outline": "赵明取走旧信。", "summary": "赵明取走旧信。",
+                    "key_facts": ["赵明持有旧信。"],
+                    "long_form_memory": {
+                        "schema_version": 2, "base_revision": 0,
+                        "state_patch": {}, "state_retirements": {}, "state_delta": {},
+                        "fact_updates": [], "current_chapter_character_refs": [],
+                        "record_updates": {"characters": [], "lore": []},
+                        "foreshadow_updates": [], "stage_archive": archive,
+                        "next_chapter_memory": {}, **controls,
+                    },
+                }, ensure_ascii=False))
+                self.assertEqual(len(destinations), 1)
+                self.assertEqual(destinations[0][0], "reconcile" if chapter_index == 9 else "commit")
+                self.assertEqual(destinations[0][1], repaired)
+                self.assertNotIn("repair_patches", destinations[0][2])
+
+    def test_prose_review_blocks_confirmed_issue_without_safe_patch(self):
         chapter = _new_chapter(0)
         tab = NovelWritingTab.__new__(NovelWritingTab)
         tab.current_project = {
@@ -6426,15 +6713,16 @@ class NovelWritingStateTests(unittest.TestCase):
             "prose_patch_rounds": 0,
         }
         tab._log_novel_diagnostic = lambda *_args, **_kwargs: None
-        tab._memory_bundle_validation_errors = lambda *_args, **_kwargs: []
         tab._clear_transient_chapter_ai_retry = lambda *_args, **_kwargs: None
-        tab._apply_style_final_result = lambda *_args, **_kwargs: self.fail(
-            "存在已确认且未修复的正文问题时不应提交"
+        tab._store_memory_finalize_checkpoint = lambda *_args, **_kwargs: None
+        tab._start_memory_finalize = lambda *_args, **_kwargs: self.fail(
+            "阻断问题未修补时不应进入资料提取"
         )
+        tab._schedule_transient_chapter_ai_retry = lambda *_args, **_kwargs: False
         failures = []
         tab._fail_memory_sync = lambda message: failures.append(message)
 
-        tab._handle_memory_finalize_ready(json.dumps({
+        tab._handle_prose_review_ready(json.dumps({
             "logic_audit": {"checked": True, "issues": []},
             "prose_review": {
                 "checked": True,
@@ -6453,7 +6741,7 @@ class NovelWritingStateTests(unittest.TestCase):
         }, ensure_ascii=False))
 
         self.assertEqual(len(failures), 1)
-        self.assertIn("没有安全补丁", failures[0])
+        self.assertIn("未能安全修补", failures[0])
         self.assertEqual(chapter.get("text", ""), "")
 
     def test_local_logic_repair_restarts_independent_memory_finalize(self):
@@ -6841,7 +7129,7 @@ class NovelWritingStateTests(unittest.TestCase):
         tab._apply_style_final_result(final_text, invalid_bundle)
 
         self.assertEqual([item[0] for item in started], ["memory_repair"])
-        self.assertIn("状态数据有", started[0][2])
+        self.assertIn("章节资料有", started[0][2])
         self.assertIn("项需修复", started[0][2])
         self.assertEqual(tab.chapter_text.toPlainText(), "")
         self.assertEqual(tab._chapter_ai_memory_repair_attempts, 1)
@@ -7110,7 +7398,7 @@ class NovelWritingStateTests(unittest.TestCase):
         self.assertEqual(len(memory["active_facts"]), 2)
         self.assertEqual(memory["active_facts"][-1]["fact"], "赵明已经取得旧案卷宗")
 
-    def test_memory_repair_response_continues_prose_patch_review_before_commit(self):
+    def test_memory_repair_does_not_change_prose_or_run_another_review(self):
         chapter = _new_chapter(0)
         tab = NovelWritingTab.__new__(NovelWritingTab)
         tab.current_project = {
@@ -7151,11 +7439,13 @@ class NovelWritingStateTests(unittest.TestCase):
         tab._log_novel_diagnostic = lambda *_args, **_kwargs: None
         tab._memory_bundle_validation_errors = lambda *_args, **_kwargs: []
         tab._clear_transient_chapter_ai_retry = lambda *_args, **_kwargs: None
-        tab._start_memory_finalize = lambda text, **kwargs: setattr(
-            tab, "_restarted_finalize", (text, kwargs)
+        tab._store_memory_finalize_checkpoint = lambda *_args, **_kwargs: None
+        tab._start_memory_finalize = lambda *_args, **_kwargs: self.fail(
+            "单轮修补完成后不应再次审读"
         )
-        tab._apply_style_final_result = lambda *_args, **_kwargs: self.fail(
-            "状态修复后应先回到正文审读"
+        committed = []
+        tab._apply_style_final_result = lambda text, bundle, **kwargs: committed.append(
+            (text, bundle, kwargs)
         )
 
         tab._handle_memory_repair_ready(json.dumps({
@@ -7169,10 +7459,10 @@ class NovelWritingStateTests(unittest.TestCase):
             },
         }, ensure_ascii=False))
 
-        self.assertEqual(
-            tab._restarted_finalize,
-            ("她断断续续地看向门外。", {"prose_patch_rounds": 1}),
-        )
+        self.assertEqual(committed[0][0], "她看向门外 intermittently。")
+        self.assertEqual(len(committed), 1)
+        self.assertTrue(committed[0][2]["memory_validated"])
+        self.assertEqual(tab._chapter_ai_memory_pending, {})
 
     def test_memory_repair_saves_partial_progress_before_delayed_retry(self):
         chapter = _new_chapter(0)
@@ -7312,7 +7602,7 @@ class NovelWritingStateTests(unittest.TestCase):
             statuses.append(status_text) if status_text else None,
             started.append(action),
         )
-        tab._start_memory_finalize = lambda text: finalized.append(text)
+        tab._start_prose_review = lambda text: finalized.append(text)
 
         tab._start_chapter_ai_sequence()
         tab.chapter_ai_preview.setPlainText("AI 正文")
@@ -7363,7 +7653,7 @@ class NovelWritingStateTests(unittest.TestCase):
         started = []
         finalized = []
         tab._start_chapter_ai_worker = lambda action, _context, status_text="", resume_prefix="": started.append(action)
-        tab._start_memory_finalize = lambda text: finalized.append(text)
+        tab._start_prose_review = lambda text: finalized.append(text)
 
         tab.run_chapter_ai_action("draft")
         self.assertEqual(started, ["draft"])
@@ -7672,7 +7962,7 @@ class NovelWritingStateTests(unittest.TestCase):
 
         self.assertEqual(single_shot.call_count, 3)
         self.assertEqual([call.args[0] for call in single_shot.call_args_list], [10000, 20000, 30000])
-        self.assertIn("当前步骤未通过", statuses[0])
+        self.assertIn("终稿补救未通过", statuses[0])
         self.assertIn("（1/3）", statuses[0])
 
     def test_oversized_memory_output_uses_same_three_retry_budget(self):
@@ -7702,7 +7992,7 @@ class NovelWritingStateTests(unittest.TestCase):
 
         self.assertEqual(single_shot.call_count, 3)
         self.assertEqual([call.args[0] for call in single_shot.call_args_list], [10000, 20000, 30000])
-        self.assertIn("当前步骤未通过", statuses[0])
+        self.assertIn("章节资料提取未通过", statuses[0])
         self.assertIn("（1/3）", statuses[0])
         self.assertTrue(NovelWritingTab._is_transient_chapter_ai_error(error))
 
@@ -7733,7 +8023,7 @@ class NovelWritingStateTests(unittest.TestCase):
 
         self.assertEqual(single_shot.call_count, 3)
         self.assertEqual([call.args[0] for call in single_shot.call_args_list], [10000, 20000, 30000])
-        self.assertIn("当前步骤未通过", statuses[0])
+        self.assertIn("正文直写未通过", statuses[0])
 
     def test_empty_output_shares_budget_with_network_failures(self):
         chapter = _new_chapter(0)
@@ -7762,7 +8052,7 @@ class NovelWritingStateTests(unittest.TestCase):
             self.assertFalse(tab._schedule_transient_chapter_ai_retry("draft", empty_error))
 
         self.assertEqual(single_shot.call_count, 3)
-        self.assertIn("当前步骤未通过", statuses[-1])
+        self.assertIn("正文直写未通过", statuses[-1])
         self.assertIn("（3/3）", statuses[-1])
 
     def test_transient_retry_delay_is_fixed(self):

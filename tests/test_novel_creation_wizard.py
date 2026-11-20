@@ -320,6 +320,127 @@ class NovelCreationWizardPersistenceTests(unittest.TestCase):
             {"title": "方向2", "synopsis": "简介2", "core_motive": "核心动机2"},
         )
 
+    @staticmethod
+    def _editable_premise_dialog(candidates=None, selected_index=0):
+        dialog = wizard.NovelCreationWizardDialog.__new__(
+            wizard.NovelCreationWizardDialog
+        )
+        dialog.premise_candidates = candidates or [
+            {
+                "title": "方向一",
+                "synopsis": "原简介一",
+                "core_motive": "原动机一",
+            },
+            {
+                "title": "方向二",
+                "synopsis": "原简介二",
+                "core_motive": "原动机二",
+            },
+        ]
+        dialog.premise_selected_index = selected_index
+        dialog._premise_loading_index = -1
+        dialog.step_results = {}
+        dialog.json_editors = {}
+        dialog._save_draft = lambda: None
+        dialog.candidate_core_motive_edit = SimpleNamespace(
+            toPlainText=lambda: "手动修改后的核心动机",
+        )
+        dialog.candidate_synopsis_preview = SimpleNamespace(
+            toPlainText=lambda: "手动修改后的故事简介",
+        )
+        return dialog
+
+    def test_editable_premise_fields_write_back_to_selected_candidate(self):
+        dialog = self._editable_premise_dialog()
+
+        self.assertTrue(dialog._save_current_candidate())
+        self.assertEqual(
+            dialog.premise_candidates[0]["core_motive"],
+            "手动修改后的核心动机",
+        )
+        self.assertEqual(
+            dialog.premise_candidates[0]["synopsis"],
+            "手动修改后的故事简介",
+        )
+
+    def test_editing_premise_invalidates_only_dependent_steps(self):
+        dialog = self._editable_premise_dialog()
+        dialog.step_results = {
+            "premise": {"selected": {"title": "方向一"}},
+            "bible": {"characters": ["旧人物"]},
+            "stage_plan": {"stage_plan": ["旧阶段"]},
+        }
+        saved = []
+        dialog._save_draft = lambda: saved.append(True)
+
+        dialog._on_candidate_text_changed()
+
+        self.assertIn("premise", dialog.step_results)
+        self.assertNotIn("bible", dialog.step_results)
+        self.assertNotIn("stage_plan", dialog.step_results)
+        self.assertEqual(saved, [True])
+
+    def test_switching_candidates_saves_the_previous_manual_edit(self):
+        dialog = self._editable_premise_dialog()
+        dialog._load_candidate = lambda _index: None
+
+        dialog._on_candidate_changed(1)
+
+        self.assertEqual(
+            dialog.premise_candidates[0]["core_motive"],
+            "手动修改后的核心动机",
+        )
+        self.assertEqual(
+            dialog.premise_candidates[0]["synopsis"],
+            "手动修改后的故事简介",
+        )
+        self.assertEqual(dialog.premise_selected_index, 1)
+
+    def test_confirming_premise_uses_the_edited_values(self):
+        dialog = self._editable_premise_dialog()
+        dialog.current_step_index = 0
+        dialog.choice_values = {}
+        dialog.choice_display_values = {}
+        dialog._selected_custom_protagonist_style = lambda: {}
+
+        dialog._read_current_step()
+
+        selected = dialog.step_results["premise"]["selected"]
+        self.assertEqual(selected["core_motive"], "手动修改后的核心动机")
+        self.assertEqual(selected["synopsis"], "手动修改后的故事简介")
+
+    def test_edited_premise_enters_selected_premise_without_changing_cache_keys(self):
+        dialog = self._editable_premise_dialog()
+        dialog.inspiration_edit = SimpleNamespace(text=lambda: "作者灵感")
+        dialog.project_name_hint = ""
+        dialog.choice_values = {}
+        dialog.target_words_spin = SimpleNamespace(value=lambda: 300000)
+        dialog.average_words_spin = SimpleNamespace(value=lambda: 3000)
+        dialog._selected_custom_protagonist_style = lambda: {}
+        dialog._current_premise = lambda: {
+            "title": "方向一",
+            "synopsis": "手动修改后的故事简介",
+            "core_motive": "手动修改后的核心动机",
+        }
+        dialog.step_results = {}
+        dialog._next_generation_batch = lambda _step: ("stage_directions", -1)
+
+        context = dialog._context_for_step("bible")
+        formatted = wizard.format_creation_context(context)
+
+        self.assertEqual(
+            context["selected_premise"],
+            {
+                "title": "方向一",
+                "synopsis": "手动修改后的故事简介",
+                "core_motive": "手动修改后的核心动机",
+            },
+        )
+        self.assertIn('"p"', formatted)
+        self.assertNotIn('"selected_premise"', formatted)
+        self.assertIn("【缓存固定资料】", formatted)
+        self.assertIn("【缓存稳定资料结束】", formatted)
+
     def test_bible_assets_recovers_rows_mixed_under_compact_c_key(self):
         result = wizard.normalize_creation_result(
             "bible",
@@ -934,6 +1055,97 @@ class NovelCreationWizardPersistenceTests(unittest.TestCase):
                     self.assertIn("前3章各用1个独立事件", prompt)
                 else:
                     self.assertNotIn("前3章各用1个独立事件", prompt)
+
+    def test_stage_batch_system_prompt_keeps_rules_stable_and_moves_stage_values_to_tail(self):
+        stages = (
+            (0, 1, 34),
+            (1, 35, 68),
+            (4, 137, 167),
+        )
+        prompts = []
+        for stage_index, start, end in stages:
+            worker = wizard.NovelCreationWorker(
+                "http://example.test",
+                "key",
+                "model",
+                "stage_plan",
+                {
+                    "author_input": {
+                        "total_words": 500000,
+                        "average_chapter_words": 3000,
+                        "genre": "都市高武",
+                    },
+                    "selected_premise": {"genre": "都市高武"},
+                    "current_stage": {
+                        "number": stage_index + 1,
+                        "total_stages": 5,
+                        "start_chapter": start,
+                        "end_chapter": end,
+                    },
+                },
+                batch_kind="stage_plan_stage",
+                stage_index=stage_index,
+            )
+            prompt = worker._analysis_prompt()
+            self.assertIn(wizard.NOVEL_SYSTEM_DYNAMIC_MARKER, prompt)
+            fixed, dynamic = prompt.split(wizard.NOVEL_SYSTEM_DYNAMIC_MARKER, 1)
+            prompts.append((fixed, dynamic, prompt))
+
+        first_fixed, first_dynamic, first_prompt = prompts[0]
+        second_fixed, second_dynamic, second_prompt = prompts[1]
+        final_fixed, final_dynamic, final_prompt = prompts[2]
+        self.assertEqual(first_fixed, second_fixed)
+        self.assertEqual(first_fixed, final_fixed)
+        self.assertNotEqual(first_dynamic, second_dynamic)
+        self.assertNotEqual(second_dynamic, final_dynamic)
+
+        for prompt in (first_prompt, second_prompt, final_prompt):
+            with self.subTest(prompt=prompt[-100:]):
+                self.assertEqual(prompt.count("【当前阶段事件容量】"), 1)
+                self.assertIn("当前阶段动态规则", prompt)
+                self.assertIn("当前阶段事件容量", prompt)
+                self.assertEqual(prompt.count("本题材是高武或武道宗门故事"), 1)
+
+        self.assertIn("当前第1/5阶段，范围为第1章到第34章", first_dynamic)
+        self.assertIn("前3章各用1个独立事件", first_dynamic)
+        self.assertIn("同时返回全书长期事实 k", first_dynamic)
+        self.assertNotIn("前3章各用1个独立事件", second_dynamic)
+        self.assertIn("当前第2/5阶段，范围为第35章到第68章", second_dynamic)
+        self.assertIn("本阶段沿用前面已经确认的长期事实", second_dynamic)
+        self.assertIn("当前第5/5阶段，范围为第137章到第167章", final_dynamic)
+        self.assertIn("closure_plan", final_dynamic)
+        self.assertIn("最后3章并入高潮结果收束", final_dynamic)
+
+        retry_worker = wizard.NovelCreationWorker(
+            "http://example.test",
+            "key",
+            "model",
+            "stage_plan",
+            {
+                "author_input": {
+                    "total_words": 500000,
+                    "average_chapter_words": 3000,
+                    "genre": "都市高武",
+                },
+                "selected_premise": {"genre": "都市高武"},
+                "current_stage": {
+                    "number": 2,
+                    "total_stages": 5,
+                    "start_chapter": 35,
+                    "end_chapter": 68,
+                },
+                "generation_retry_feedback": "S02-E04 缺少直接结果。",
+            },
+            batch_kind="stage_plan_stage",
+            stage_index=1,
+        )
+        retry_prompt = retry_worker._analysis_prompt()
+        retry_fixed, retry_dynamic = retry_prompt.split(
+            wizard.NOVEL_SYSTEM_DYNAMIC_MARKER, 1
+        )
+        self.assertEqual(retry_fixed, second_fixed)
+        self.assertIn("S02-E04 缺少直接结果。", retry_dynamic)
+        self.assertIn("上一轮返回已经到达程序", retry_dynamic)
 
     def test_stage_batch_prompt_skips_capacity_for_missing_or_invalid_ranges(self):
         for current_stage in (

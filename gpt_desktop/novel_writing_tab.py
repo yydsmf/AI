@@ -103,6 +103,7 @@ from .novel_storage import (
     unique_project_backup_path,
     unique_project_path,
 )
+from .novel_cache_context import append_cache_dynamic, build_cache_context
 from .novel_utils import (
     CHAPTER_ANALYSIS_HASH_VERSION,
     IMPORT_TYPE_OPTIONS,
@@ -8701,6 +8702,7 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
 
     def _chapter_plan_bounded_context(self, instruction_prefix, payload, context_mode="master"):
         """Return a valid, priority-ordered plan request under the shared cap."""
+        self._chapter_plan_cache_context = ""
         payload = deepcopy(payload if isinstance(payload, dict) else {})
         budget = _CHAPTER_PLAN_CONTEXT_CHAR_BUDGET
         if context_mode == "batch":
@@ -8724,7 +8726,56 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
             budget = min(budget, NOVEL_AI_CONTEXT_LIMIT - system_size - 2000)
 
         def render():
-            return str(instruction_prefix or "") + json.dumps(
+            stable_keys = (
+                "task",
+                "planning_contract",
+                "meta",
+                "narrative_strategy_profile",
+                "mainline_pressure_curve",
+                "project_materials",
+                "characters",
+                "settings",
+                "foreshadow_catalog",
+                "entity_naming_guidance",
+                "terminal_contract",
+            )
+            if context_mode != "batch":
+                stable_keys += (
+                    "creative_intent_contract",
+                    "wizard_framework",
+                    "cross_volume_continuity",
+                    "framework_analysis",
+                    "original_framework_text",
+                )
+            stable_payload = {
+                key: deepcopy(payload[key])
+                for key in stable_keys
+                if key in payload
+            }
+            dynamic_payload = {
+                key: deepcopy(value)
+                for key, value in payload.items()
+                if key not in stable_keys
+            }
+            stable_text = str(instruction_prefix or "") + "\n" + json.dumps(
+                stable_payload,
+                ensure_ascii=False,
+                separators=(",", ": "),
+            )
+            dynamic_text = json.dumps(
+                dynamic_payload,
+                ensure_ascii=False,
+                separators=(",", ": "),
+            ) if dynamic_payload else ""
+            # Keep the marked envelope for the API adapter, but return the
+            # original single JSON context to callers and tests.  Cache
+            # boundaries are transport metadata, not part of the business
+            # context consumed by the chapter-planning code.
+            self._chapter_plan_cache_context = build_cache_context(
+                stable_text,
+                dynamic_text,
+            )
+            return str(instruction_prefix or "") + "\n" + json.dumps(
                 payload,
                 ensure_ascii=False,
                 separators=(",", ": "),
@@ -10058,7 +10109,20 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
                     batch_creative_intent_contract.get("core_motive", "") or ""
                 ),
             )
-        foreshadow_items = project.get("foreshadow_items", [])
+        all_foreshadow_items = project.get("foreshadow_items", [])
+        all_foreshadow_items = (
+            all_foreshadow_items
+            if isinstance(all_foreshadow_items, list) else []
+        )
+        foreshadow_catalog = self._chapter_plan_records(
+            all_foreshadow_items,
+            ("code", "name", "type"),
+            160,
+            240,
+            total_limit=8000,
+            minimal_fields=("name", "type"),
+        )
+        foreshadow_items = all_foreshadow_items
         if creation_wizard_source:
             foreshadow_items = self._chapter_plan_scoped_foreshadows(
                 foreshadow_items,
@@ -10125,6 +10189,7 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
             },
             "entity_naming_guidance": _entity_naming_guidance(project),
             "terminal_contract": terminal_contract,
+            "foreshadow_catalog": foreshadow_catalog,
             "target": {
                 "target_words": int(target_words or 0),
                 "average_chapter_words": int(average_chapter_words or 0),
@@ -11613,6 +11678,7 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
 
     def _chapter_plan_event_placement_context(self, stage_data):
         """Build a small placement-only request envelope."""
+        self._chapter_plan_cache_context = ""
         if not isinstance(stage_data, dict):
             return ""
         premise = {}
@@ -11654,6 +11720,28 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
         }
         if premise:
             payload["story_anchor"] = premise
+        stable_anchor = payload.get("story_anchor", {})
+        stable_text = "\n".join(
+            part for part in (
+                "请根据以下当前阶段资料安排剧情节点的章节范围。只处理节点位置，不重新创作故事。",
+                "【缓存稳定项目锚点】\n"
+                + json.dumps(stable_anchor, ensure_ascii=False, separators=(",", ":")),
+            )
+            if part
+        )
+        dynamic_text = "【本批动态节点资料】\n" + json.dumps(
+            {
+                key: value
+                for key, value in payload.items()
+                if key != "story_anchor"
+            },
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+        self._chapter_plan_cache_context = build_cache_context(
+            stable_text,
+            dynamic_text,
+        )
         return (
             "请根据以下当前阶段资料安排剧情节点的章节范围。只处理节点位置，不重新创作故事。\n"
             + json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
@@ -11873,6 +11961,7 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
         batch_start = int(stage_data.get("batch_start", 0) or 0)
         batch_end = int(stage_data.get("batch_end", 0) or 0)
         context = self._chapter_plan_event_placement_context(stage_data)
+        cache_context = str(getattr(self, "_chapter_plan_cache_context", "") or "")
         worker = NovelChapterEventPlacementWorker(
             provider.get("base_url", ""),
             provider.get("api_key", ""),
@@ -11884,6 +11973,7 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
             batch_end,
             provider.get("proxy_url", ""),
             self._provider_proxy_mode(provider),
+            request_context=cache_context,
         )
         self._chapter_plan_request_kind = "event_placement"
         state = deepcopy(state) if isinstance(state, dict) else {}
@@ -12155,6 +12245,7 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
                 return
         self._chapter_plan_request_kind = "batch"
         context = self._chapter_plan_batch_context(state, batch_count)
+        cache_context = str(getattr(self, "_chapter_plan_cache_context", "") or "")
         worker = NovelChapterPlanWorker(
             provider.get("base_url", ""),
             provider.get("api_key", ""),
@@ -12175,6 +12266,7 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
                 if stage_data else {}
             ),
             has_explicit_power_levels=project_has_explicit_power_levels(self.current_project),
+            request_context=cache_context,
         )
         status = f"正在规划第{absolute_start}-{absolute_end}章，共{state.get('total_chapter_count', 0)}章..."
         if state.get("master_plan", {}).get("source") == "imported_framework":
@@ -15713,11 +15805,11 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
             text,
         )
         if transient_retry:
-            context = (
+            context = append_cache_dynamic(
+                context,
                 "【本次是状态整理重试】\n"
                 "上一次状态整理结果未能通过解析或完整校验，正文尚未提交长期状态。"
-                "本次必须完整返回outline、summary、key_facts和long_form_memory。请依据下方完整资料重新整理本章状态。\n\n"
-                + context
+                "本次必须完整返回outline、summary、key_facts和long_form_memory。请依据完整固定资料和本轮正文重新整理本章状态。"
             )
         self.chapter_ai_preview.setPlainText(text)
         self.chapter_ai_stream_text = ""
@@ -15800,10 +15892,10 @@ class NovelWritingTab(SimpleModelBarMixin, QWidget):
             self._ai_project_snapshot(), self.current_chapter_index, text
         )
         if transient_retry:
-            context = (
+            context = append_cache_dynamic(
+                context,
                 "【本次是正文审读重试】\n"
-                "上一次审读结果无法解析或补丁未通过本地定位校验；本次仍只返回完整的logic_audit、prose_review和repair_patches。\n\n"
-                + context
+                "上一次审读结果无法解析或补丁未通过本地定位校验；本次仍只返回完整的logic_audit、prose_review和repair_patches。"
             )
         self.chapter_ai_preview.setPlainText(text)
         self.chapter_ai_stream_text = ""

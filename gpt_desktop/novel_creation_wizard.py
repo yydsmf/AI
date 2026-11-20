@@ -27,6 +27,7 @@ from PySide6.QtWidgets import (
 
 from .core import HISTORY_DIR, load_json_file, now_str, safe_remove_file, save_json_file
 from .novel_storage import load_character_style_library, remove_character_style
+from .novel_cache_context import append_cache_dynamic, build_cache_context
 from .novel_utils import (
     CORE_STORY_QUALITY_GUIDANCE,
     _core_motive_progression_guidance,
@@ -40,7 +41,7 @@ from .novel_utils import (
     _novel_chinese_output_guidance,
     _terminal_window_bounds,
 )
-from .workers import NovelAnalysisWorker
+from .workers import NOVEL_SYSTEM_DYNAMIC_MARKER, NovelAnalysisWorker
 
 
 CREATION_WIZARD_DRAFT_FILE = os.path.join(
@@ -4892,9 +4893,10 @@ def format_creation_context(context, premise_minimal=False):
         premise_transport = {"a": author_input} if author_input else {}
         if transport.get("n"):
             premise_transport["n"] = transport["n"]
-        return (
+        return build_cache_context(
             "a=作者灵感和已选参数；n=姓名参考。\n"
-            + json.dumps(premise_transport, ensure_ascii=False, separators=(",", ": "))
+            + json.dumps(premise_transport, ensure_ascii=False, separators=(",", ": ")),
+            "",
         )
     planning_guidance = ""
     if context.get("generation_batch") == "stage_plan_stage":
@@ -4916,18 +4918,50 @@ def format_creation_context(context, premise_minimal=False):
             "第一步选定的 core_motive 与第二步确认的 relationship_foundation、阶段方向共同描述全书冲突底盘；当前阶段把底盘推进到新的选择、关系、公开后果、资源代价或对手行动，"
             "每次事件根据当前题材自然选择推进方式。"
         )
-    return (
+    intro = (
         "下面是作者已经说过、或在前面亲自确认过的故事资料。"
         "只沿着这些资料往下写，不替作者改掉题材、人物选择、结尾方向和必须守住的边界。"
+        "输入资料分为缓存固定资料和本轮动态资料两段；两段 JSON 对象按原字段合并读取。"
         "输入 JSON 中 a=作者输入，p=已选故事，c=前面确认的资料，b=本次批次，"
         "s=当前阶段，h=前面阶段，f=暗线位置，n=命名参考；其余字段按原名读取。"
         "a.inspiration 是作者亲自写下的完整灵感原文，里面的书名、标签、简介、人物、关系、情节、场景、爽点和节奏要求都要逐项吸收；"
         "a.requested_title 是作者已经明确确定的书名；只有它非空时，后续返回中的书名才必须原样保留，不能改写、缩写或另起书名；如果它为空，说明作者没有指定书名，标题由每个候选方向分别创作；"
         "a 里的主分类、主题、角色、情节、读者方向、风格和主角起点是硬要求，不要只在标签里提到，也不要用相似题材替换。"
         + planning_guidance
-        + "不要逐条复述资料，直接写出人物和事情。\n"
-        + json.dumps(transport, ensure_ascii=False, separators=(",", ": "))
+        + "不要逐条复述资料，直接写出人物和事情。"
     )
+    stable_transport = {}
+    dynamic_transport = {}
+    stable_top_keys = {"a", "p", "n"}
+    for key, value in transport.items():
+        if key in stable_top_keys:
+            stable_transport[key] = value
+        elif key == "c" and isinstance(value, dict):
+            stable_confirmed = {}
+            dynamic_confirmed = {}
+            dynamic_confirmed_keys = {
+                "previous_stage_plan",
+                "previous_foreshadow_schedule",
+                "current_stage_plan",
+            }
+            for confirmed_key, confirmed_value in value.items():
+                if confirmed_key in dynamic_confirmed_keys:
+                    dynamic_confirmed[confirmed_key] = confirmed_value
+                else:
+                    stable_confirmed[confirmed_key] = confirmed_value
+            if stable_confirmed:
+                stable_transport[key] = stable_confirmed
+            if dynamic_confirmed:
+                dynamic_transport[key] = dynamic_confirmed
+        else:
+            dynamic_transport[key] = value
+    stable_text = intro + "\n" + json.dumps(
+        stable_transport, ensure_ascii=False, separators=(",", ": ")
+    )
+    dynamic_text = json.dumps(
+        dynamic_transport, ensure_ascii=False, separators=(",", ": ")
+    ) if dynamic_transport else ""
+    return build_cache_context(stable_text, dynamic_text)
 
 
 def _creation_scale_requirements(total_words):
@@ -6021,6 +6055,7 @@ class NovelCreationWorker(NovelAnalysisWorker):
         except (TypeError, ValueError):
             self.stage_index = 0
         self.creation_context = deepcopy(context if isinstance(context, dict) else {})
+        self._dynamic_analysis_guidance = ""
         text = format_creation_context(
             self.creation_context,
             premise_minimal=self.creation_step == "premise",
@@ -6064,6 +6099,7 @@ class NovelCreationWorker(NovelAnalysisWorker):
 
     def _analysis_prompt(self):
         prompt = STEP_PROMPTS.get(self.creation_step, COMMON_CREATION_RULES)
+        stage_dynamic_guidance = []
         author_input = self.creation_context.get("author_input", {})
         total_words = author_input.get("total_words", 500000) if isinstance(author_input, dict) else 500000
         try:
@@ -6289,6 +6325,20 @@ c 中每项只能使用 n、r、g、s、p、v、q；l 中每项只能使用 n、
                 if terminal_overlap else
                 "本阶段解决或暂时解决当前目标后，要在 x/y 或事件结果中留下下一阶段可执行的具体目标、缺口或更高代价，不能只写‘局势继续发展’。"
             )
+            stage_dynamic_guidance = [
+                f"本次只生成当前第{stage_number}/{total_stages or '?'}阶段，"
+                f"范围为第{start_chapter}章到第{end_chapter}章。",
+                stage_progression_guidance,
+                (
+                    "同时返回全书长期事实 k。"
+                    if first_stage else
+                    "本阶段沿用前面已经确认的长期事实。"
+                ),
+                opening_guidance,
+                subject_guidance,
+                final_stage_guidance,
+                event_capacity_guidance,
+            ]
             stage_fact_boundary_guidance = (
                 CREATION_STAGE_RESULT_OWNERSHIP_GUIDANCE + " " +
                 CREATION_STAGE_EXECUTION_BOUNDARY_GUIDANCE + " " +
@@ -6298,15 +6348,11 @@ c 中每项只能使用 n、r、g、s、p、v、q；l 中每项只能使用 n、
             )
             prompt = f"""{COMMON_CREATION_RULES}
 
-读取作者选定的故事、完整故事底盘、已确认的全书阶段方向和已经完成的前面阶段，只生成当前第{stage_number}/{total_stages or '?'}阶段，范围为第{start_chapter}章到第{end_chapter}章。当前阶段方向的summary是本阶段唯一宏观大事件；阶段差异与压力递进按上方公共核心约束落实，事件内部的跨章变化不替代阶段要求。scene_change与character_change按公共核心约束填写；阶段要求只约束阶段大事件，不机械套用到每个小事件。key_beats是供本阶段细化的必要推进锚点；这些字段各司其职，不互相复述，节点按故事因果细化为具体场景事件。若存在climax_beat_indices，按末尾锚点规划高潮逼近、交锋/抉择与最终兑现，最后一项必须在指定高潮章位形成已发生、可验证的结果，之前节点不得提前完成同一决战或主线闭环。{CREATION_STAGE_RESULT_OWNERSHIP_GUIDANCE}阶段方向的summary、key_beats、result和next_pressure共同描述同一条推进链；result 是本阶段结束时要达到的状态，不是 summary 之外的第二组事件；next_pressure 只从本阶段已经兑现的结果引出新的处境、选择、关系或代价，本阶段可以让它出现、形成或变得迫近，但不提前解决；后续阶段方向和第一步结尾只用于远期一致，不得提前执行其中的结果或全书结局。同一事实只安排一次实际发生，前阶段已成立的认知和关系从该状态继续发展。前阶段事件、结果、状态和时间构成本阶段的实际入口，当前阶段从这些事实带来的后果、选择和压力继续推进；人物已知的事情继续影响其行动，不重新当作第一次发现。此前阻止行动的条件改变时，用具体行动及结果衔接后续选择；当前阶段时间从前阶段最后一个事件的实际时间继续计算。当前阶段继续服务核心动机：先明确主角本阶段要完成的具体目标，再围绕行动、阻碍、选择、代价和结果展开。{stage_progression_guidance}阶段规划使用结构化表达，写清人物正在经历的事情、事件顺序、直接结果和状态变化；字段服务于故事事实，不把每个事件套成同一张检查表。
+读取作者选定的故事、完整故事底盘、已确认的全书阶段方向和已经完成的前面阶段。当前阶段方向的summary是本阶段唯一宏观大事件；阶段差异与压力递进按上方公共核心约束落实，事件内部的跨章变化不替代阶段要求。scene_change与character_change按公共核心约束填写；阶段要求只约束阶段大事件，不机械套用到每个小事件。key_beats是供本阶段细化的必要推进锚点；这些字段各司其职，不互相复述，节点按故事因果细化为具体场景事件。若存在climax_beat_indices，按末尾锚点规划高潮逼近、交锋/抉择与最终兑现，最后一项必须在指定高潮章位形成已发生、可验证的结果，之前节点不得提前完成同一决战或主线闭环。{CREATION_STAGE_RESULT_OWNERSHIP_GUIDANCE}阶段方向的summary、key_beats、result和next_pressure共同描述同一条推进链；result 是本阶段结束时要达到的状态，不是 summary 之外的第二组事件；next_pressure 只从本阶段已经兑现的结果引出新的处境、选择、关系或代价，本阶段可以让它出现、形成或变得迫近，但不提前解决；后续阶段方向和第一步结尾只用于远期一致，不得提前执行其中的结果或全书结局。同一事实只安排一次实际发生，前阶段已成立的认知和关系从该状态继续发展。前阶段事件、结果、状态和时间构成本阶段的实际入口，当前阶段从这些事实带来的后果、选择和压力继续推进；人物已知的事情继续影响其行动，不重新当作第一次发现。此前阻止行动的条件改变时，用具体行动及结果衔接后续选择；当前阶段时间从前阶段最后一个事件的实际时间继续计算。当前阶段继续服务核心动机：先明确主角本阶段要完成的具体目标，再围绕行动、阻碍、选择、代价和结果展开。阶段规划使用结构化表达，写清人物正在经历的事情、事件顺序、直接结果和状态变化；字段服务于故事事实，不把每个事件套成同一张检查表。
 
 输入资料中的 current_foreshadow_endpoints 是本阶段自然发生的正式暗线端点清单。每一项落到一个当前事件中；kind=setup 写线索怎样第一次进入人物生活，kind=payoff 写线索怎样在现场完成一个明确问题的回答，并产生可观察的直接结果。payoff不能只写推进、部分揭示、再次出现、冲突升级、确认“事情不简单”或留下新的问题；如果当前事件只能继续铺垫，就不能把它当成正式 payoff。清单为空时，场景仍然沿着人物和主线自然推进。同一条伏笔在其它事件里继续出现、深化或产生后果是正常的，但正式端点只在真正承担该变化的事件中标记一次；后续事件用普通关联资料或“F编号”继续承接，不重复写“F编号/setup”或“F编号/payoff”。承载正式端点的事件 references 加入对应标记，让程序可以把端点和事件稳定对应起来。
 
-阶段内事件以场景为核心，按实际需要写清人物正在经历的事实，不为凑齐固定项目逐项重复；事件长度由冲突本身决定，不为填满阶段范围机械使用两章事件。阶段超过20章时，尤其注意让能独立成立的人物选择、关系变化、对手行动或结果验证自然成为单章事件。单个事件的章节容量及跨章推进遵循上方单事件规则，不在此重复。生成事件数组前确认范围长度，不要把超长范围交给程序再落位。当前阶段以第一步选定的 core_motive、第二步确认的 relationship_foundation 和阶段方向为故事底盘，通过符合题材的场景、人物选择、关系变化、公开后果或资源代价推进，不构成每阶段重复执行的固定事件顺序。伏笔只在实际发生的阶段返回，一次只返回一个当前正式端点；f中的每项写 i、k、e、d，其中 k 为 setup 或 payoff，e 是承载它的事件编号，d 是这一次在场景中发生的具体变化。后续事件可继续承接伏笔影响，但不重复标记同一种正式端点。程序会依据事件允许章节范围落下具体章号。{("同时返回全书长期事实 k。" if first_stage else "本阶段沿用前面已经确认的长期事实。")}
-
-            {opening_guidance}{subject_guidance}{final_stage_guidance}
-
-{event_capacity_guidance}
+阶段内事件以场景为核心，按实际需要写清人物正在经历的事实，不为凑齐固定项目逐项重复；事件长度由冲突本身决定，不为填满阶段范围机械使用两章事件。阶段超过20章时，尤其注意让能独立成立的人物选择、关系变化、对手行动或结果验证自然成为单章事件。单个事件的章节容量及跨章推进遵循上方单事件规则，不在此重复。生成事件数组前确认范围长度，不要把超长范围交给程序再落位。当前阶段以第一步选定的 core_motive、第二步确认的 relationship_foundation 和阶段方向为故事底盘，通过符合题材的场景、人物选择、关系变化、公开后果或资源代价推进，不构成每阶段重复执行的固定事件顺序。伏笔只在实际发生的阶段返回，一次只返回一个当前正式端点；f中的每项写 i、k、e、d，其中 k 为 setup 或 payoff，e 是承载它的事件编号，d 是这一次在场景中发生的具体变化。后续事件可继续承接伏笔影响，但不重复标记同一种正式端点。程序会依据事件允许章节范围落下具体章号。
 
 本批次顶层字段规则：第一阶段必须同时返回 v、k、s、f；即使当前阶段没有正式伏笔端点，也必须返回 f=[]。第二阶段及以后必须返回 v、s；k 是第一阶段已经确认的全书长期事实契约，可以省略，程序会沿用已保存的首阶段契约；当前阶段没有正式伏笔端点时 f 可以省略，程序按空数组处理。不要省略当前阶段 s，也不要省略协议版本 v。
 
@@ -6320,13 +6366,18 @@ c 中每项只能使用 n、r、g、s、p、v、q；l 中每项只能使用 n、
         retry_feedback = _as_text(
             self.creation_context.get("generation_retry_feedback")
         ).strip()
+        retry_guidance = ""
         if retry_feedback:
-            prompt += (
+            retry_guidance = (
                 "\n\n上一轮返回已经到达程序，但未通过结构或资料完整性校验。"
                 "本次只根据下面的错误反馈修正缺口，仍然返回完整的当前批次 JSON；"
                 "不要解释错误，也不要只返回缺失项：\n"
                 + retry_feedback[:2000]
             )
+            if self.creation_batch == "stage_plan_stage":
+                stage_dynamic_guidance.append(retry_guidance.strip())
+            else:
+                prompt += retry_guidance
         project_entity_guidance = _creation_entity_naming_guidance(self.creation_context)
         if project_entity_guidance:
             prompt += "\n\n" + project_entity_guidance
@@ -6338,6 +6389,18 @@ c 中每项只能使用 n、r、g、s、p、v、q；l 中每项只能使用 n、
                 "可省略空字符串、空数组和没有内容的可选字段，但不得删减任何有意义的事实或资料数量；"
                 "第三步阶段批次的顶层字段必须遵守上面的首阶段与后续阶段规则。"
             )
+        # Keep stage-specific execution rules and validation feedback in the
+        # system prompt.  They are part of the generation contract and must be
+        # visible to both the model and the existing retry diagnostics.
+        self._dynamic_analysis_guidance = ""
+        if self.creation_batch == "stage_plan_stage":
+            dynamic_guidance = "\n\n".join(
+                str(item or "").strip()
+                for item in stage_dynamic_guidance
+                if str(item or "").strip()
+            )
+            if dynamic_guidance:
+                prompt += NOVEL_SYSTEM_DYNAMIC_MARKER + dynamic_guidance
         return prompt
 
     def _analysis_progress_label(self):
@@ -6392,8 +6455,15 @@ c 中每项只能使用 n、r、g、s、p、v、q；l 中每项只能使用 n、
 
     def _chunk_user_text(self, chunk_text, chunk_index, total_chunks):
         if self.creation_step == "premise":
-            return format_creation_context(self.creation_context, premise_minimal=True)
-        return format_creation_context(self.creation_context)
+            context = format_creation_context(self.creation_context, premise_minimal=True)
+        else:
+            context = format_creation_context(self.creation_context)
+        if self._dynamic_analysis_guidance:
+            context = append_cache_dynamic(
+                context,
+                "【本批动态执行规则】\n" + self._dynamic_analysis_guidance,
+            )
+        return context
 
     def _allow_retry_chunk_split(self):
         return False
@@ -7353,7 +7423,7 @@ class NovelCreationWizardDialog(QDialog):
     def _clear_candidate_preview(self):
         self.candidate_title_label.clear()
         self.candidate_meta_label.clear()
-        self.candidate_hook_label.clear()
+        self.candidate_core_motive_edit.clear()
         self.candidate_synopsis_preview.clear()
 
     def _show_empty_candidate_list(self, message="故事列表"):
@@ -8098,18 +8168,41 @@ class NovelCreationWizardDialog(QDialog):
         self.candidate_meta_label.setStyleSheet("color: #86b6df;")
         self.candidate_meta_label.setWordWrap(True)
         preview.addWidget(self.candidate_meta_label)
-        self.candidate_hook_label = QLabel()
-        self.candidate_hook_label.setStyleSheet("color: #d9dde4; font-weight: 600;")
-        self.candidate_hook_label.setWordWrap(True)
-        preview.addWidget(self.candidate_hook_label)
+        core_motive_title = QLabel("核心动机")
+        core_motive_title.setStyleSheet("color: #d9dde4; font-weight: 600;")
+        preview.addWidget(core_motive_title)
+        self.candidate_core_motive_edit = QPlainTextEdit()
+        self.candidate_core_motive_edit.setObjectName("creation_premise_core_motive")
+        # Keep this field compact because the core motive is normally one or
+        # two sentences. It intentionally uses the same inherited style as
+        # the synopsis editor below.
+        self.candidate_core_motive_edit.setSizePolicy(
+            QSizePolicy.Expanding,
+            QSizePolicy.Fixed,
+        )
+        self.candidate_core_motive_edit.setLineWrapMode(QPlainTextEdit.WidgetWidth)
+        self.candidate_core_motive_edit.setFixedHeight(58)
+        self.candidate_core_motive_edit.setPlaceholderText("可手动修改核心动机。")
+        self.candidate_core_motive_edit.textChanged.connect(
+            self._on_candidate_text_changed
+        )
+        # Keep the old attribute as an internal compatibility alias for code
+        # that only clears or inspects the first-step preview widget.
+        self.candidate_hook_label = self.candidate_core_motive_edit
+        preview.addWidget(self.candidate_core_motive_edit)
+        synopsis_title = QLabel("故事简介")
+        synopsis_title.setStyleSheet("color: #d9dde4; font-weight: 600;")
+        preview.addWidget(synopsis_title)
         self.candidate_synopsis_preview = QPlainTextEdit()
-        self.candidate_synopsis_preview.setReadOnly(True)
         self.candidate_synopsis_preview.setSizePolicy(
             QSizePolicy.Expanding,
             QSizePolicy.Expanding,
         )
         self.candidate_synopsis_preview.setMinimumHeight(96)
-        self.candidate_synopsis_preview.setPlaceholderText("选择左侧故事方向后，这里会显示简介。")
+        self.candidate_synopsis_preview.setPlaceholderText("可手动修改故事简介。")
+        self.candidate_synopsis_preview.textChanged.connect(
+            self._on_candidate_text_changed
+        )
         preview.addWidget(self.candidate_synopsis_preview, 1)
         body.addLayout(preview, 1)
         result_layout.addLayout(body, 1)
@@ -8672,8 +8765,37 @@ class NovelCreationWizardDialog(QDialog):
         return deepcopy(self.premise_candidates[index])
 
     def _save_current_candidate(self):
-        # 故事方向改为只读预览，避免用户在第一步重新填写一份策划案。
-        return
+        if not self.premise_candidates:
+            return False
+        index = max(
+            0,
+            min(self.premise_selected_index, len(self.premise_candidates) - 1),
+        )
+        item = self.premise_candidates[index]
+        if not isinstance(item, dict):
+            item = {}
+            self.premise_candidates[index] = item
+        core_motive_edit = getattr(self, "candidate_core_motive_edit", None)
+        synopsis_edit = getattr(self, "candidate_synopsis_preview", None)
+        if core_motive_edit is not None:
+            item["core_motive"] = core_motive_edit.toPlainText().strip()
+        if synopsis_edit is not None:
+            item["synopsis"] = synopsis_edit.toPlainText().strip()
+        return True
+
+    def _on_candidate_text_changed(self):
+        if getattr(self, "_premise_loading_index", -1) >= 0:
+            return
+        if not self._save_current_candidate():
+            return
+        # Later steps depend on the selected first-step story. A manual edit
+        # makes those derived results stale, so clear only dependent steps.
+        step_results = getattr(self, "step_results", {})
+        if isinstance(step_results, dict) and any(
+            step in step_results for step in ("bible", "stage_plan")
+        ):
+            self._invalidate_steps_from("bible")
+        self._save_draft()
 
     def _load_candidate(self, index):
         if index < 0 or index >= len(self.premise_candidates):
@@ -8693,9 +8815,7 @@ class NovelCreationWizardDialog(QDialog):
         )
         self.candidate_meta_label.setText(meta)
         core_motive = _as_text(item.get("core_motive"))
-        self.candidate_hook_label.setText(
-            f"核心动机：{core_motive}" if core_motive else ""
-        )
+        self.candidate_core_motive_edit.setPlainText(core_motive)
         self.candidate_synopsis_preview.setPlainText(_as_text(item.get("synopsis")))
         self._premise_loading_index = -1
 
@@ -8703,6 +8823,7 @@ class NovelCreationWizardDialog(QDialog):
         if self._premise_loading_index >= 0:
             return
         if index >= 0:
+            self._save_current_candidate()
             previous = self.premise_selected_index
             self.premise_selected_index = index
             self._load_candidate(index)
@@ -9728,6 +9849,7 @@ class NovelCreationWizardDialog(QDialog):
         if step == "premise":
             if not self.premise_candidates:
                 raise ValueError("请先生成至少一份故事方向。")
+            self._save_current_candidate()
             candidate = _clean_premise_candidate(self._current_premise())
             if not candidate.get("title") or not candidate.get("synopsis"):
                 raise ValueError("书名和完整简介不能为空。")

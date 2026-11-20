@@ -97,17 +97,29 @@ from .novel_import import (
     _is_framework_scope_title,
     _normalize_ai_candidates,
 )
+from .novel_cache_context import (
+    append_cache_dynamic,
+    anthropic_user_content,
+    cache_context_diagnostics,
+    gemini_user_parts,
+    openai_user_messages,
+)
 from .novel_storage import save_novel_raw_model_output
 
 _BLENDER_PROBE_CACHE = {}
 _CHAPTER_TITLE_MAX_CHARS = 15
+NOVEL_SYSTEM_DYNAMIC_MARKER = "\n\n【当前阶段动态规则】\n"
 
 
 def _with_novel_language_guidance(prompt):
     prompt = str(prompt or "")
     if "【中文表达与字符边界】" in prompt:
         return prompt
-    return prompt + "\n\n" + _novel_chinese_output_guidance()
+    guidance = _novel_chinese_output_guidance()
+    if NOVEL_SYSTEM_DYNAMIC_MARKER in prompt:
+        stable, dynamic = prompt.split(NOVEL_SYSTEM_DYNAMIC_MARKER, 1)
+        return stable + "\n\n" + guidance + NOVEL_SYSTEM_DYNAMIC_MARKER + dynamic
+    return prompt + "\n\n" + guidance
 
 
 # OpenAI-compatible gateways use several names for Claude thinking output.
@@ -158,6 +170,15 @@ def _novel_protocol_cache_key(base_url, model):
         str(base_url or "").strip().rstrip("/").lower(),
         str(model or "").strip().lower(),
     )
+
+
+def _novel_stream_usage_option_supported(base_url):
+    """Return whether this OpenAI relay accepts stream usage extensions."""
+    host = (urlsplit(str(base_url or "").strip()).hostname or "").lower()
+    # XCMAPI follows the Chat Completions streaming shape but rejects the
+    # optional stream_options/include_usage extension. Its backend still
+    # reports cache usage independently, so omit only this client-side field.
+    return not (host == "xcmapi.org" or host.endswith(".xcmapi.org"))
 
 
 def _novel_api_protocol(base_url, model):
@@ -285,15 +306,6 @@ def _remove_json_response_format(payload):
     return removed
 
 
-def _novel_openai_stream_usage_supported(base_url):
-    """Return whether the relay is documented to accept stream_options."""
-    host = (urlsplit(str(base_url or "").strip()).hostname or "").lower()
-    # xcmapi documents the basic Chat Completions body but does not document
-    # stream_options/include_usage. Avoid a guaranteed rejected first request;
-    # usage fields are still parsed when the relay includes them in its stream.
-    return host not in {"xcmapi.org", "www.xcmapi.com"}
-
-
 def _openai_cache_options_not_supported(status_code, error_text=""):
     try:
         status = int(status_code or 0)
@@ -354,7 +366,46 @@ def _remove_anthropic_cache_options(payload):
             text_parts.append(str(block))
     if changed:
         payload["system"] = "".join(text_parts)
+    messages = payload.get("messages")
+    if isinstance(messages, list):
+        for message in messages:
+            if not isinstance(message, dict):
+                continue
+            content = message.get("content")
+            if not isinstance(content, list):
+                continue
+            parts = []
+            content_changed = False
+            for block in content:
+                if isinstance(block, dict):
+                    if "cache_control" in block:
+                        content_changed = True
+                    text = block.get("text")
+                    if text is not None:
+                        parts.append(str(text))
+                elif block is not None:
+                    parts.append(str(block))
+            if content_changed:
+                message["content"] = "".join(parts)
+                changed = True
     return changed
+
+
+def _anthropic_user_content_with_cache(user_text):
+    return anthropic_user_content(user_text)
+
+
+def _openai_user_messages_with_cache(user_text):
+    return openai_user_messages(user_text)
+
+
+def _split_novel_system_prompt(system_prompt):
+    """Split an explicitly marked dynamic system tail from its stable prefix."""
+    text = str(system_prompt or "")
+    if NOVEL_SYSTEM_DYNAMIC_MARKER not in text:
+        return text, ""
+    stable, dynamic = text.split(NOVEL_SYSTEM_DYNAMIC_MARKER, 1)
+    return stable, NOVEL_SYSTEM_DYNAMIC_MARKER + dynamic
 
 
 def _normalize_novel_usage(data):
@@ -540,6 +591,10 @@ def _build_novel_generation_request(
     protocol=None,
 ):
     """Build an OpenAI, Anthropic, or Gemini native generation request."""
+    system_prompt_text = str(system_prompt or "")
+    stable_system_prompt, dynamic_system_prompt = _split_novel_system_prompt(
+        system_prompt_text
+    )
     protocol = str(protocol or _novel_api_protocol(base_url, model)).strip().lower()
     if protocol == "gemini" or _novel_model_protocol(model) == "gemini":
         # Apply model-version compatibility before native/compatible transport
@@ -570,12 +625,26 @@ def _build_novel_generation_request(
                 "max_tokens": output_limit,
                 # Native Anthropic prompt caching is enabled at a stable
                 # content boundary. The user turn remains outside the cache.
-                "system": [{
-                    "type": "text",
-                    "text": str(system_prompt or ""),
-                    "cache_control": {"type": "ephemeral"},
+                "system": (
+                    [{
+                        "type": "text",
+                        "text": stable_system_prompt,
+                        "cache_control": {"type": "ephemeral"},
+                    }, {
+                        "type": "text",
+                        "text": dynamic_system_prompt,
+                    }]
+                    if dynamic_system_prompt else
+                    [{
+                        "type": "text",
+                        "text": system_prompt_text,
+                        "cache_control": {"type": "ephemeral"},
+                    }]
+                ),
+                "messages": [{
+                    "role": "user",
+                    "content": _anthropic_user_content_with_cache(user_text),
                 }],
-                "messages": [{"role": "user", "content": str(user_text or "")}],
                 "stream": bool(stream),
                 **reasoning_options,
             },
@@ -607,11 +676,15 @@ def _build_novel_generation_request(
                 )
         payload = {
             "systemInstruction": {
-                "parts": [{"text": str(system_prompt or "")}],
+                "parts": (
+                    [{"text": stable_system_prompt}, {"text": dynamic_system_prompt}]
+                    if dynamic_system_prompt else
+                    [{"text": system_prompt_text}]
+                ),
             },
             "contents": [{
                 "role": "user",
-                "parts": [{"text": str(user_text or "")}],
+                "parts": gemini_user_parts(user_text),
             }],
         }
         if generation_config:
@@ -633,14 +706,15 @@ def _build_novel_generation_request(
             # Keep the reusable system prefix in the ordinary Chat
             # Completions shape. Compatible relays can apply implicit prompt
             # caching without receiving provider-specific cache extensions.
-            {"role": "system", "content": str(system_prompt or "")},
-            {"role": "user", "content": str(user_text or "")},
+            {"role": "system", "content": system_prompt_text},
+            *_openai_user_messages_with_cache(user_text),
         ],
     }
-    if stream:
+    if stream and _novel_stream_usage_option_supported(base_url):
         payload["stream"] = True
-        if _novel_openai_stream_usage_supported(base_url):
-            payload["stream_options"] = {"include_usage": True}
+        payload["stream_options"] = {"include_usage": True}
+    elif stream:
+        payload["stream"] = True
     if temperature is not None:
         payload["temperature"] = temperature
     if max_tokens:
@@ -2362,6 +2436,7 @@ class NovelAnalysisWorker(QThread):
         self.last_system_prompt = prompt
         self.last_user_text = user_text
         self.last_partial_output = ""
+        self.diagnostics.update(cache_context_diagnostics(user_text))
         user_bytes = user_text.encode("utf-8", errors="replace")
         prompt_bytes = prompt.encode("utf-8", errors="replace")
         attempt = {
@@ -8208,6 +8283,7 @@ class NovelChapterEventPlacementWorker(NovelAnalysisWorker):
         batch_end,
         proxy_url="",
         proxy_mode="不使用代理",
+        request_context="",
     ):
         super().__init__(
             base_url,
@@ -8223,6 +8299,8 @@ class NovelChapterEventPlacementWorker(NovelAnalysisWorker):
         self.stage_id = str(stage_id or "").strip().upper()
         self.batch_start = max(1, int(batch_start or 1))
         self.batch_end = max(self.batch_start, int(batch_end or self.batch_start))
+        self._request_context = str(request_context or "")
+        self._dynamic_analysis_guidance = ""
 
     @staticmethod
     def _number(value):
@@ -8248,21 +8326,42 @@ class NovelChapterEventPlacementWorker(NovelAnalysisWorker):
             ensure_ascii=False,
             separators=(",", ":"),
         )
-        return (
+        batch_guidance = (
+            f"当前批次是全书第{self.batch_start}-{self.batch_end}章，共{self.batch_end - self.batch_start + 1}章。"
+            f"当前阶段编号是{self.stage_id or '当前阶段'}。"
+        )
+        example_guidance = f"只返回类似{example}的对象，示例中的数量必须与输入节点数量一致。"
+        prompt = (
             "你只负责给当前阶段的既有剧情节点安排章节范围，不负责写章节提纲。\n"
             "必须只输出一个合法 JSON 对象，不要 Markdown，不要解释，不要注释，不要额外字段。"
             "JSON使用紧凑格式，只保留p、n、a、b四个字段。\n"
-            f"当前批次是全书第{self.batch_start}-{self.batch_end}章，共{self.batch_end - self.batch_start + 1}章。"
-            f"当前阶段编号是{self.stage_id or '当前阶段'}。"
-            "输入中的节点已经按剧情顺序排列，n只是节点序号，不是章节号。"
+            + batch_guidance
+            + "输入中的节点已经按剧情顺序排列，n只是节点序号，不是章节号。"
             "节点原有的允许范围决定每个节点的落点，节点顺序保持输入顺序。"
             "一个节点可以覆盖连续几章，前后节点通过人物行动、关系变化和现场后果自然衔接，"
             "每个节点的核心事件、关键变化和直接结果在自己的范围内完成。\n"
             "这里只安排已经存在的故事节点，不新增或拆分调查材料、核对记录、责任确认、协议谈判、签字验收等程序性剧情节点。"
-            f"只返回类似{example}的对象，示例中的数量必须与输入节点数量一致。"
-            "p中的项目数量必须与输入节点数量完全一致；n必须从1连续递增。"
+            + example_guidance
+            + "p中的项目数量必须与输入节点数量完全一致；n必须从1连续递增。"
             "a和b是全书绝对章号，不是批次内序号。不要返回节点文字、事件ID、章节标题或任何解释。"
         )
+        self._dynamic_analysis_guidance = "\n".join((batch_guidance, example_guidance))
+        prompt = prompt.replace(batch_guidance, "")
+        prompt = prompt.replace(example_guidance, "")
+        prompt += (
+            "\n当前批次范围、阶段编号和输出示例以用户消息中的本批动态执行规则为准；"
+            "必须严格按输入节点顺序和固定字段返回。"
+        )
+        return prompt
+
+    def _chunk_user_text(self, chunk_text, chunk_index, total_chunks):
+        context = self._request_context or str(chunk_text or "")
+        if self._dynamic_analysis_guidance:
+            context = append_cache_dynamic(
+                context,
+                "【本批节点定位动态执行规则】\n" + self._dynamic_analysis_guidance,
+            )
+        return context
 
     def _analysis_progress_label(self):
         return "章节节点安排"
@@ -8351,7 +8450,7 @@ class NovelChapterEventPlacementWorker(NovelAnalysisWorker):
             for structure_attempt in range(structure_attempts):
                 parsed, response_format_supported = self._analyze_chunk_with_retries(
                     self._analysis_prompt(),
-                    self.text,
+                    self._request_context or self.text,
                     1,
                     1,
                     response_format_supported,
@@ -8402,6 +8501,7 @@ class NovelChapterPlanWorker(NovelAnalysisWorker):
         creation_wizard_mode=False,
         locked_node_schedule=None,
         has_explicit_power_levels=False,
+        request_context="",
     ):
         super().__init__(
             base_url,
@@ -8425,6 +8525,7 @@ class NovelChapterPlanWorker(NovelAnalysisWorker):
         self.locked_node_schedule = deepcopy(
             locked_node_schedule if isinstance(locked_node_schedule, dict) else {}
         )
+        self._request_context = str(request_context or "")
 
     def _chapter_slot_node_map_guidance(self, absolute_start, absolute_end):
         """Expand locked absolute node ranges into one row per chapter slot.
@@ -8768,7 +8869,7 @@ class NovelChapterPlanWorker(NovelAnalysisWorker):
         )
 
     def _chunk_user_text(self, chunk_text, chunk_index, total_chunks):
-        return str(chunk_text or "")
+        return self._request_context or str(chunk_text or "")
 
     def _analysis_progress_label(self):
         return "章节规划"
@@ -9111,7 +9212,7 @@ class NovelChapterPlanWorker(NovelAnalysisWorker):
             for structure_attempt in range(structure_attempts):
                 parsed, response_format_supported = self._analyze_chunk_with_retries(
                     analysis_prompt,
-                    self.text,
+                    self._request_context or self.text,
                     1,
                     1,
                     response_format_supported,

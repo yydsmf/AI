@@ -176,6 +176,19 @@ class OpenAICacheDiagnosticsTests(unittest.TestCase):
         self.assertNotIn("prompt_cache_key", payload)
         self.assertEqual(payload["messages"][0], {"role": "system", "content": "system"})
 
+    def test_other_openai_relays_keep_stream_usage_extension(self):
+        _, _, payload, protocol = workers._build_novel_generation_request(
+            "https://provider.example/v1",
+            "key",
+            MODEL,
+            "system",
+            "user",
+            stream=True,
+        )
+
+        self.assertEqual(protocol, "openai")
+        self.assertEqual(payload["stream_options"], {"include_usage": True})
+
     def test_writing_stream_records_cache_usage(self):
         session = Session(Response(lines=openai_stream_lines(
             "<NOVEL_OUTPUT_START>Result.<NOVEL_OUTPUT_END>",

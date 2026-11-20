@@ -213,6 +213,60 @@ class NovelAnalysisWorkerTests(unittest.TestCase):
             "cache_control": {"type": "ephemeral"},
         }])
 
+    def test_marked_system_tail_stays_in_system_and_splits_by_native_protocol(self):
+        marker = workers_module.NOVEL_SYSTEM_DYNAMIC_MARKER
+        stable = "固定阶段规划规则"
+        dynamic = "当前阶段范围为第35—68章。"
+        system_prompt = stable + marker + dynamic
+
+        _, _, openai_payload, _ = workers_module._build_novel_generation_request(
+            "https://provider.example/v1", "key", "gpt-6.2-sol",
+            system_prompt, "用户", stream=True, protocol="openai",
+        )
+        self.assertEqual(openai_payload["messages"][0], {
+            "role": "system", "content": system_prompt,
+        })
+        self.assertEqual(
+            sum(message["role"] == "system" for message in openai_payload["messages"]),
+            1,
+        )
+
+        _, _, anthropic_payload, _ = workers_module._build_novel_generation_request(
+            "https://provider.example/v1", "key", "claude-sonnet-5-5",
+            system_prompt, "用户", stream=True, protocol="anthropic",
+        )
+        self.assertEqual(anthropic_payload["system"], [
+            {
+                "type": "text",
+                "text": stable,
+                "cache_control": {"type": "ephemeral"},
+            },
+            {"type": "text", "text": marker + dynamic},
+        ])
+        fallback_payload = {"system": anthropic_payload["system"]}
+        self.assertTrue(workers_module._remove_anthropic_cache_options(fallback_payload))
+        self.assertEqual(fallback_payload["system"], system_prompt)
+
+        _, _, gemini_payload, _ = workers_module._build_novel_generation_request(
+            "https://generativelanguage.googleapis.com", "key", "gemini-2.5-flash",
+            system_prompt, "用户", stream=True, protocol="gemini",
+        )
+        self.assertEqual(gemini_payload["systemInstruction"], {
+            "parts": [
+                {"text": stable},
+                {"text": marker + dynamic},
+            ],
+        })
+
+    def test_language_guidance_is_kept_before_marked_dynamic_system_tail(self):
+        marker = workers_module.NOVEL_SYSTEM_DYNAMIC_MARKER
+        prompt = "固定规则" + marker + "当前阶段规则"
+        result = workers_module._with_novel_language_guidance(prompt)
+        stable, dynamic = result.split(marker, 1)
+        self.assertIn("【中文表达与字符边界】", stable)
+        self.assertNotIn("【中文表达与字符边界】", dynamic)
+        self.assertEqual(dynamic, "当前阶段规则")
+
     def test_anthropic_cache_marker_can_fall_back_to_legacy_system_string(self):
         payload = {
             "system": [{

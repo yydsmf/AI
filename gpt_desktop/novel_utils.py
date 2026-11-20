@@ -10,6 +10,12 @@ from collections import Counter
 from difflib import SequenceMatcher
 
 from .core import now_str
+from .novel_cache_context import (
+    CACHE_STABLE_END_MARKER,
+    CACHE_STABLE_START_MARKER,
+    build_cache_context,
+    split_cache_context,
+)
 
 CHAPTER_ANALYSIS_HASH_VERSION = "2"
 CHAPTER_ANALYSIS_STATUS_VERSION = "1"
@@ -11557,6 +11563,7 @@ def _build_style_execution_context(
     effective_limit = int(limit or NOVEL_AI_CONTEXT_LIMIT)
     original = str(original_context or "").strip()
     reference = str(style_reference or "").strip()
+    style_context = ""
     if reference:
         style_markers = (
             "【AI文风画像】",
@@ -11579,13 +11586,33 @@ def _build_style_execution_context(
         ]
         if marker_positions:
             original = original[:min(marker_positions)].rstrip()
-        original = "\n\n".join(part for part in (
-            original,
+        style_context = "\n\n".join(part for part in (
             "【仿写使用说明】\n" + _without_repeated_prose_guidance(
                 _build_full_style_imitation_guidance(reference), original,
             ),
             "【正文风格参考】\n" + reference,
         ) if part)
+    original_priority_context = "\n\n".join(part for part in (
+        original, style_context,
+    ) if part)
+    if style_context:
+        sections = split_cache_context(original_context)
+        stable_project = sections["stable"] if sections["marked"] else ""
+        if stable_project:
+            if stable_project.startswith(CACHE_STABLE_START_MARKER):
+                stable_project = stable_project[len(CACHE_STABLE_START_MARKER):]
+            if CACHE_STABLE_END_MARKER in stable_project:
+                stable_project = stable_project.rsplit(CACHE_STABLE_END_MARKER, 1)[0]
+            stable_project = stable_project.strip()
+        dynamic_project = sections["dynamic"] if sections["marked"] else original
+        if stable_project:
+            original = build_cache_context(
+                stable_project,
+                "\n\n".join(part for part in (dynamic_project, style_context) if part),
+                visible_value=original_priority_context,
+            )
+        else:
+            original = original_priority_context
     instruction = (
         "【小说正文直写】\n"
         "根据当前章节资料和前面的完整原样本，写出本章可直接进入小说的正文。"
@@ -11598,7 +11625,46 @@ def _build_style_execution_context(
     contract = _grounded_prose_contract(style_active=bool(reference))
     budget = max(0, effective_limit - len(instruction) - len(contract) - 2)
     if len(original) > budget:
-        original = _clip_context_text(original, budget, keep_tail=False, preserve_lines=True)
+        if budget <= 0:
+            original = ""
+            instruction += _without_repeated_prose_guidance(contract, original)
+            return "\n\n".join(part for part in (original, instruction) if part)[:effective_limit]
+        sections = split_cache_context(original)
+        if sections["marked"]:
+            stable = sections["stable"]
+            if stable.startswith(CACHE_STABLE_START_MARKER):
+                stable = stable[len(CACHE_STABLE_START_MARKER):]
+            if CACHE_STABLE_END_MARKER in stable:
+                stable = stable.rsplit(CACHE_STABLE_END_MARKER, 1)[0]
+            stable = stable.strip()
+            dynamic = sections["dynamic"]
+            dynamic_budget = min(len(dynamic), max(600, budget // 3)) if dynamic else 0
+            stable_budget = max(0, budget - dynamic_budget)
+            clipped_stable = (
+                _clip_context_text(
+                    stable, stable_budget, keep_tail=False, preserve_lines=True,
+                ) if stable_budget > 0 else ""
+            )
+            stable_length = len(clipped_stable)
+            dynamic_budget = max(0, budget - stable_length - 2)
+            clipped_dynamic = (
+                _clip_context_text(
+                    dynamic, dynamic_budget, keep_tail=True, preserve_lines=True,
+                ) if dynamic_budget > 0 else ""
+            )
+            original = build_cache_context(clipped_stable, clipped_dynamic)
+            if len(original) > budget:
+                clipped_dynamic = _clip_context_text(
+                    clipped_dynamic,
+                    max(0, dynamic_budget - (len(original) - budget)),
+                    keep_tail=True,
+                    preserve_lines=True,
+                )
+                original = build_cache_context(clipped_stable, clipped_dynamic)
+        else:
+            original = _clip_context_text(
+                original_priority_context, budget, keep_tail=False, preserve_lines=True,
+            )
     instruction += _without_repeated_prose_guidance(contract, original)
     return "\n\n".join(part for part in (original, instruction) if part)[:effective_limit]
 
@@ -20826,6 +20892,8 @@ def _assemble_bounded_long_form_context(
     source_sections,
     output_requirements,
     limit=LONG_FORM_CONTEXT_SOFT_LIMIT,
+    stable_titles=None,
+    stable_requirements=False,
 ):
     hard_limit = max(1000, min(int(limit or 0), NOVEL_AI_CONTEXT_LIMIT))
     requirements = str(output_requirements or "").strip()
@@ -20835,15 +20903,56 @@ def _assemble_bounded_long_form_context(
             hard_limit // 2,
             preserve_lines=True,
         )
-    source_budget = max(0, hard_limit - len(requirements) - 2)
-    blocks = []
-    used = 0
-    for title, content, section_limit, keep_tail in source_sections:
-        title = str(title or "").strip()
+    stable_titles = {
+        str(title or "").strip()
+        for title in (stable_titles or ())
+        if str(title or "").strip()
+    }
+    source_items = []
+    for raw_title, raw_content, raw_limit, raw_keep_tail in source_sections:
+        title = str(raw_title or "").strip()
         if not title:
             continue
-        separator_length = 2 if blocks else 0
-        remaining = source_budget - used - separator_length
+        source_items.append((
+            title,
+            raw_content,
+            raw_limit,
+            bool(raw_keep_tail),
+            title in stable_titles,
+        ))
+
+    stable_count = sum(1 for item in source_items if item[4])
+    dynamic_count = len(source_items) - stable_count
+    # Keep the original source order.  A fixed block that appears after the
+    # first dynamic block remains in the dynamic tail so caching cannot move
+    # instructions or facts ahead of the material that introduced them.
+    stable_requirement_count = 0
+    dynamic_part_count = dynamic_count + (1 if requirements else 0)
+    part_count = stable_count + stable_requirement_count + dynamic_part_count
+    has_stable = stable_count > 0
+    has_dynamic = dynamic_part_count > 0
+    wrapper_budget = 0
+    if has_stable:
+        wrapper_budget = (
+            len(CACHE_STABLE_START_MARKER)
+            + len(CACHE_STABLE_END_MARKER)
+            + 2
+        )
+        if has_dynamic:
+            wrapper_budget += 2 + len("【本轮动态资料】") + 1
+    separator_budget = 2 * max(0, part_count - 1)
+    source_budget = max(
+        0,
+        hard_limit - len(requirements) - wrapper_budget - separator_budget,
+    )
+    stable_blocks = []
+    dynamic_blocks = []
+    used = 0
+    ordered_items = source_items
+    stable_prefix_open = True
+    visible_blocks = []
+    for title, content, section_limit, keep_tail, is_stable in ordered_items:
+        remaining = source_budget - used
         prefix = f"【{title}】\n"
         if remaining <= len(prefix):
             break
@@ -20864,10 +20973,25 @@ def _assemble_bounded_long_form_context(
             )
         if len(block) > remaining:
             break
-        blocks.append(block)
-        used += separator_length + len(block)
-    parts = blocks + ([requirements] if requirements else [])
-    context = "\n\n".join(part for part in parts if part)
+        visible_blocks.append(block)
+        if is_stable and stable_prefix_open:
+            stable_blocks.append(block)
+        else:
+            stable_prefix_open = False
+            dynamic_blocks.append(block)
+        used += len(block)
+    stable_context = "\n\n".join(stable_blocks)
+    dynamic_context = "\n\n".join(
+        part for part in (*dynamic_blocks, requirements) if part
+    )
+    visible_context = "\n\n".join(
+        part for part in (*visible_blocks, requirements) if part
+    )
+    context = build_cache_context(
+        stable_context,
+        dynamic_context,
+        visible_value=visible_context,
+    )
     if len(context) > hard_limit:
         raise ValueError("长篇上下文组装超过软上限")
     return context
@@ -21024,7 +21148,14 @@ def _build_long_form_memory_patch_context(
             6000,
             False,
         ))
-    return _assemble_bounded_long_form_context(sections, requirements)
+    return _assemble_bounded_long_form_context(
+        sections,
+        requirements,
+        stable_titles={
+            "任务",
+            "实体称谓与关系边界",
+        },
+    )
 
 
 def _build_long_form_memory_repair_context(
@@ -21120,7 +21251,14 @@ def _build_long_form_memory_repair_context(
         ("已有关键事实", key_facts, 6000, False),
         ("近期阶段档案", memory_sections["近期阶段档案"], 16000, True),
     ]
-    return _assemble_bounded_long_form_context(source_sections, output_requirements)
+    return _assemble_bounded_long_form_context(
+        source_sections,
+        output_requirements,
+        stable_titles={
+            "任务",
+            "实体称谓与关系边界",
+        },
+    )
 
 
 def _build_chapter_logic_repair_context(project, chapter_index, final_text, issues):
@@ -21161,7 +21299,14 @@ def _build_chapter_logic_repair_context(project, chapter_index, final_text, issu
         ("实体称谓与关系边界", _entity_naming_guidance(project), 2600, False),
         ("最终正文", final_text, 40000, True),
     ]
-    return _assemble_bounded_long_form_context(sections, requirements)
+    return _assemble_bounded_long_form_context(
+        sections,
+        requirements,
+        stable_titles={
+            "实体称谓与关系边界",
+        },
+        stable_requirements=True,
+    )
 
 
 def _build_long_form_memory_finalize_context(project, chapter_index, final_text):
@@ -21303,7 +21448,14 @@ def _build_long_form_memory_finalize_context(project, chapter_index, final_text)
         ),
         ("近期阶段档案", selected_memory["近期阶段档案"], 16000, True),
     ]
-    return _assemble_bounded_long_form_context(source_sections, output_requirements)
+    return _assemble_bounded_long_form_context(
+        source_sections,
+        output_requirements,
+        stable_titles={
+            "任务",
+            "实体称谓与关系边界",
+        },
+    )
 
 
 def _build_chapter_prose_review_context(project, chapter_index, final_text):
@@ -21353,7 +21505,15 @@ def _build_chapter_prose_review_context(project, chapter_index, final_text):
         ("相关连续性资料", selected_memory.get("活跃连续性事实", ""), 12000, False),
         ("最终正文", final_text, 40000, True),
     ]
-    return _assemble_bounded_long_form_context(source_sections, output_requirements)
+    return _assemble_bounded_long_form_context(
+        source_sections,
+        output_requirements,
+        stable_titles={
+            "正文审读规则与真实例句",
+            "实体称谓与关系边界",
+        },
+        stable_requirements=True,
+    )
 
 
 def _parse_memory_reconciliation_result(value):
@@ -21978,6 +22138,10 @@ def _build_long_form_memory_reconcile_context(
         source_sections,
         output_requirements,
         limit=LONG_FORM_RECONCILIATION_CONTEXT_LIMIT,
+        stable_titles={
+            "任务",
+        },
+        stable_requirements=True,
     )
 
 
@@ -24740,8 +24904,29 @@ def _build_chapter_ai_context(project, chapter_index, action):
         sections = common_sections + knowledge_sections + [current_section_item]
     if style_sections:
         sections = sections + style_sections
+    stable_titles = {
+        "项目核心信息",
+        "项目基础",
+        "小说圣经",
+        "世界观 / 规则",
+        "正文语言要求",
+        "正文剧情推进边界",
+        "信息落地与场景反应",
+        "连续对白与反应",
+        "对白自然衔接",
+        "具体表达边界",
+        "自然语气与情绪",
+        "具体状态词搭配",
+        "仿写使用说明",
+        "正文风格参考",
+        "正文自然表达边界",
+        "信息落地与对白边界",
+    }
     max_context_chars = NOVEL_AI_CONTEXT_LIMIT
-    out = []
+    stable_out = []
+    dynamic_out = []
+    visible_out = []
+    stable_prefix_open = True
     used = 0
     seen_context_lines = set()
     raw_context_titles = {"当前章节", "正文风格参考", "正文自然表达边界"}
@@ -24791,6 +24976,20 @@ def _build_chapter_ai_context(project, chapter_index, action):
         if title == "本次任务" and action == "draft":
             emitted_prose_task = clipped
         block = f"【{title}】\n{clipped}"
-        out.append(block)
+        visible_out.append(block)
+        if stable_prefix_open and title in stable_titles and action in {
+            "draft", "summary", "outline", "script_to_novel", "novel_to_script",
+            "novel_to_storyboard", "script_to_storyboard",
+        }:
+            stable_out.append(block)
+        else:
+            stable_prefix_open = False
+            dynamic_out.append(block)
         used += len(block) + 2
-    return "\n\n".join(out)
+    stable_context = "\n\n".join(stable_out)
+    dynamic_context = "\n\n".join(dynamic_out)
+    return build_cache_context(
+        stable_context,
+        dynamic_context,
+        visible_value="\n\n".join(visible_out),
+    )
